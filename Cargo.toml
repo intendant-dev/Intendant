@@ -24,6 +24,8 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 html2text = "0.12"
 portable-pty = "0.8"
 dotenvy = "0.15"
+toml = "0.8"
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Command {
     pub function: String,
     pub command: Option<String>,
@@ -31,36 +31,17 @@ pub struct Command {
     pub question: Option<String>,
     // execPty field
     pub shell_id: Option<String>,
-}
-
-impl Default for Command {
-    fn default() -> Self {
-        Self {
-            function: String::new(),
-            nonce: 0,
-            command: None,
-            depending_nonce: None,
-            expected_status: None,
-            wait: None,
-            return_stdout: None,
-            return_stderr: None,
-            display: None,
-            status_type: None,
-            path: None,
-            offset: None,
-            limit: None,
-            file_path: None,
-            operation: None,
-            content: None,
-            match_content: None,
-            line_number: None,
-            end_line: None,
-            url: None,
-            wait_for_port: None,
-            question: None,
-            shell_id: None,
-        }
-    }
+    // storeSkill fields
+    pub skill_name: Option<String>,
+    pub skill_description: Option<String>,
+    pub skill_content: Option<String>,
+    pub skill_scope: Option<String>,
+    pub project_dir: Option<String>,
+    // storeMemory / recallMemory fields
+    pub memory_key: Option<String>,
+    pub memory_summary: Option<String>,
+    pub memory_query: Option<String>,
+    pub memory_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
