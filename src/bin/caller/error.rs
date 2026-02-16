@@ -2,23 +2,25 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum CallerError {
-    OpenAI(String),
+    Provider(String),
     Agent(String),
     Io(std::io::Error),
     Json(serde_json::Error),
     Http(reqwest::Error),
     Config(String),
+    Toml(String),
 }
 
 impl fmt::Display for CallerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CallerError::OpenAI(msg) => write!(f, "OpenAI error: {}", msg),
+            CallerError::Provider(msg) => write!(f, "Provider error: {}", msg),
             CallerError::Agent(msg) => write!(f, "Agent error: {}", msg),
             CallerError::Io(e) => write!(f, "IO error: {}", e),
             CallerError::Json(e) => write!(f, "JSON error: {}", e),
             CallerError::Http(e) => write!(f, "HTTP error: {}", e),
             CallerError::Config(msg) => write!(f, "Config error: {}", msg),
+            CallerError::Toml(msg) => write!(f, "TOML error: {}", msg),
         }
     }
 }
@@ -48,9 +50,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openai_error_display() {
-        let err = CallerError::OpenAI("rate limited".to_string());
-        assert_eq!(format!("{}", err), "OpenAI error: rate limited");
+    fn provider_error_display() {
+        let err = CallerError::Provider("rate limited".to_string());
+        assert_eq!(format!("{}", err), "Provider error: rate limited");
     }
 
     #[test]
@@ -63,6 +65,12 @@ mod tests {
     fn config_error_display() {
         let err = CallerError::Config("missing key".to_string());
         assert_eq!(format!("{}", err), "Config error: missing key");
+    }
+
+    #[test]
+    fn toml_error_display() {
+        let err = CallerError::Toml("invalid syntax".to_string());
+        assert_eq!(format!("{}", err), "TOML error: invalid syntax");
     }
 
     #[test]

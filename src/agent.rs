@@ -896,6 +896,165 @@ impl Agent {
         }
     }
 
+    fn store_skill(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
+        let name = cmd.skill_name.as_ref().ok_or_else(|| {
+            AgentError::Process("storeSkill requires skill_name".to_string())
+        })?;
+        let content = cmd.skill_content.as_ref().ok_or_else(|| {
+            AgentError::Process("storeSkill requires skill_content".to_string())
+        })?;
+
+        let description = cmd.skill_description.as_deref().unwrap_or("");
+        let scope = cmd.skill_scope.as_deref().unwrap_or("global");
+
+        let dir = match scope {
+            "project" => {
+                let project_dir = cmd.project_dir.as_ref().ok_or_else(|| {
+                    AgentError::Process("storeSkill with project scope requires project_dir".to_string())
+                })?;
+                PathBuf::from(project_dir).join("skills")
+            }
+            _ => {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+                PathBuf::from(home).join(".agent").join("skills")
+            }
+        };
+
+        fs::create_dir_all(&dir)?;
+
+        let filename = format!("{}.md", name);
+        let file_path = dir.join(&filename);
+
+        let mut file_content = String::from("---\n");
+        file_content.push_str(&format!("name: {}\n", name));
+        if !description.is_empty() {
+            file_content.push_str(&format!("description: {}\n", description));
+        }
+        file_content.push_str("---\n");
+        file_content.push_str(content);
+
+        fs::write(&file_path, &file_content)?;
+
+        Ok(serde_json::json!({
+            "success": true,
+            "path": file_path.to_string_lossy(),
+            "scope": scope
+        }).to_string())
+    }
+
+    fn store_memory(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
+        let key = cmd.memory_key.as_ref().ok_or_else(|| {
+            AgentError::Process("storeMemory requires memory_key".to_string())
+        })?;
+        let summary = cmd.memory_summary.as_ref().ok_or_else(|| {
+            AgentError::Process("storeMemory requires memory_summary".to_string())
+        })?;
+        let memory_file = cmd.memory_file.as_ref().ok_or_else(|| {
+            AgentError::Process("storeMemory requires memory_file".to_string())
+        })?;
+
+        let path = PathBuf::from(memory_file);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut data: serde_json::Value = if path.exists() {
+            let content = fs::read_to_string(&path)?;
+            serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({"entries": {}}))
+        } else {
+            serde_json::json!({"entries": {}})
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let already_exists = data.get("entries")
+            .and_then(|e| e.get(key.as_str()))
+            .is_some();
+
+        let created_at = data.get("entries")
+            .and_then(|e| e.get(key.as_str()))
+            .and_then(|e| e.get("created_at"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(now);
+
+        data["entries"][key.as_str()] = serde_json::json!({
+            "summary": summary,
+            "created_at": created_at,
+            "updated_at": now
+        });
+
+        fs::write(&path, serde_json::to_string_pretty(&data).unwrap())?;
+
+        Ok(serde_json::json!({
+            "success": true,
+            "key": key,
+            "action": if already_exists { "updated" } else { "created" }
+        }).to_string())
+    }
+
+    fn recall_memory(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
+        let query = cmd.memory_query.as_ref().ok_or_else(|| {
+            AgentError::Process("recallMemory requires memory_query".to_string())
+        })?;
+        let memory_file = cmd.memory_file.as_ref().ok_or_else(|| {
+            AgentError::Process("recallMemory requires memory_file".to_string())
+        })?;
+
+        let path = PathBuf::from(memory_file);
+        if !path.exists() {
+            return Ok(serde_json::json!({
+                "success": true,
+                "results": []
+            }).to_string());
+        }
+
+        let content = fs::read_to_string(&path)?;
+        let data: serde_json::Value = serde_json::from_str(&content)
+            .unwrap_or_else(|_| serde_json::json!({"entries": {}}));
+
+        let query_lower = query.to_lowercase();
+        let keywords: Vec<&str> = query_lower.split_whitespace().collect();
+
+        let mut results: Vec<serde_json::Value> = Vec::new();
+
+        if let Some(entries) = data.get("entries").and_then(|e| e.as_object()) {
+            for (key, value) in entries {
+                let key_lower = key.to_lowercase();
+                let summary_lower = value.get("summary")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+
+                let score: usize = keywords.iter()
+                    .filter(|kw| key_lower.contains(*kw) || summary_lower.contains(*kw))
+                    .count();
+
+                if score > 0 {
+                    results.push(serde_json::json!({
+                        "key": key,
+                        "summary": value.get("summary").and_then(|s| s.as_str()).unwrap_or(""),
+                        "score": score,
+                        "updated_at": value.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0)
+                    }));
+                }
+            }
+        }
+
+        results.sort_by(|a, b| {
+            let sa = a["score"].as_u64().unwrap_or(0);
+            let sb = b["score"].as_u64().unwrap_or(0);
+            sb.cmp(&sa)
+        });
+
+        Ok(serde_json::json!({
+            "success": true,
+            "results": results
+        }).to_string())
+    }
+
     pub async fn process_input(&self, input: AgentInput) -> Result<Vec<String>, AgentError> {
         let mut results = Vec::new();
 
@@ -973,6 +1132,24 @@ impl Agent {
                 }
                 "execPty" => {
                     match self.exec_pty(&cmd).await {
+                        Ok(result) => results.push(result),
+                        Err(e) => results.push(format!("Error: {}", e)),
+                    }
+                }
+                "storeSkill" => {
+                    match self.store_skill(&cmd) {
+                        Ok(result) => results.push(result),
+                        Err(e) => results.push(format!("Error: {}", e)),
+                    }
+                }
+                "storeMemory" => {
+                    match self.store_memory(&cmd) {
+                        Ok(result) => results.push(result),
+                        Err(e) => results.push(format!("Error: {}", e)),
+                    }
+                }
+                "recallMemory" => {
+                    match self.recall_memory(&cmd) {
                         Ok(result) => results.push(result),
                         Err(e) => results.push(format!("Error: {}", e)),
                     }
@@ -2505,5 +2682,348 @@ mod tests {
         assert_eq!(parsed["success"], true);
         let output = parsed["output"].as_str().unwrap();
         assert!(output.contains("integration_test"), "got: {}", output);
+    }
+
+    // storeSkill tests
+
+    #[tokio::test]
+    async fn store_skill_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let skill_home = dir.path().join("home");
+        std::env::set_var("HOME", skill_home.to_str().unwrap());
+
+        let cmd = AgentCommand {
+            function: "storeSkill".to_string(),
+            nonce: 1,
+            skill_name: Some("test-skill".to_string()),
+            skill_description: Some("A test skill".to_string()),
+            skill_content: Some("Always test your code.".to_string()),
+            ..Default::default()
+        };
+
+        let result = agent.store_skill(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["scope"], "global");
+
+        let skill_path = skill_home.join(".agent").join("skills").join("test-skill.md");
+        assert!(skill_path.exists());
+        let content = std::fs::read_to_string(&skill_path).unwrap();
+        assert!(content.contains("name: test-skill"));
+        assert!(content.contains("description: A test skill"));
+        assert!(content.contains("Always test your code."));
+    }
+
+    #[tokio::test]
+    async fn store_skill_project_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let cmd = AgentCommand {
+            function: "storeSkill".to_string(),
+            nonce: 1,
+            skill_name: Some("proj-skill".to_string()),
+            skill_content: Some("Project-specific content.".to_string()),
+            skill_scope: Some("project".to_string()),
+            project_dir: Some(project_dir.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        let result = agent.store_skill(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["scope"], "project");
+
+        let skill_path = project_dir.join("skills").join("proj-skill.md");
+        assert!(skill_path.exists());
+    }
+
+    #[tokio::test]
+    async fn store_skill_missing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let cmd = AgentCommand {
+            function: "storeSkill".to_string(),
+            nonce: 1,
+            skill_content: Some("content".to_string()),
+            ..Default::default()
+        };
+
+        assert!(agent.store_skill(&cmd).is_err());
+    }
+
+    #[tokio::test]
+    async fn store_skill_missing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let cmd = AgentCommand {
+            function: "storeSkill".to_string(),
+            nonce: 1,
+            skill_name: Some("test".to_string()),
+            ..Default::default()
+        };
+
+        assert!(agent.store_skill(&cmd).is_err());
+    }
+
+    // storeMemory tests
+
+    #[tokio::test]
+    async fn store_memory_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let memory_file = dir.path().join("agent").join("memory.json");
+        let cmd = AgentCommand {
+            function: "storeMemory".to_string(),
+            nonce: 1,
+            memory_key: Some("db-config".to_string()),
+            memory_summary: Some("Database uses PostgreSQL on port 5432".to_string()),
+            memory_file: Some(memory_file.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        let result = agent.store_memory(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["key"], "db-config");
+        assert_eq!(parsed["action"], "created");
+
+        assert!(memory_file.exists());
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&memory_file).unwrap()).unwrap();
+        assert_eq!(
+            content["entries"]["db-config"]["summary"],
+            "Database uses PostgreSQL on port 5432"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_memory_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let memory_file = dir.path().join("memory.json");
+
+        // Create first
+        let cmd = AgentCommand {
+            function: "storeMemory".to_string(),
+            nonce: 1,
+            memory_key: Some("key1".to_string()),
+            memory_summary: Some("version 1".to_string()),
+            memory_file: Some(memory_file.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        agent.store_memory(&cmd).unwrap();
+
+        // Update
+        let cmd2 = AgentCommand {
+            function: "storeMemory".to_string(),
+            nonce: 2,
+            memory_key: Some("key1".to_string()),
+            memory_summary: Some("version 2".to_string()),
+            memory_file: Some(memory_file.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let result = agent.store_memory(&cmd2).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["action"], "updated");
+
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&memory_file).unwrap()).unwrap();
+        assert_eq!(content["entries"]["key1"]["summary"], "version 2");
+    }
+
+    #[tokio::test]
+    async fn store_memory_missing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let cmd = AgentCommand {
+            function: "storeMemory".to_string(),
+            nonce: 1,
+            memory_summary: Some("summary".to_string()),
+            memory_file: Some("/tmp/test.json".to_string()),
+            ..Default::default()
+        };
+        assert!(agent.store_memory(&cmd).is_err());
+    }
+
+    // recallMemory tests
+
+    #[tokio::test]
+    async fn recall_memory_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let memory_file = dir.path().join("nonexistent.json");
+        let cmd = AgentCommand {
+            function: "recallMemory".to_string(),
+            nonce: 1,
+            memory_query: Some("anything".to_string()),
+            memory_file: Some(memory_file.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        let result = agent.recall_memory(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert!(parsed["results"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_memory_finds_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let memory_file = dir.path().join("memory.json");
+
+        // Store some memories
+        for (key, summary) in &[
+            ("db-config", "PostgreSQL on port 5432"),
+            ("api-auth", "Uses JWT tokens for authentication"),
+            ("db-migration", "Run migrations with cargo sqlx"),
+        ] {
+            let cmd = AgentCommand {
+                function: "storeMemory".to_string(),
+                nonce: 1,
+                memory_key: Some(key.to_string()),
+                memory_summary: Some(summary.to_string()),
+                memory_file: Some(memory_file.to_string_lossy().to_string()),
+                ..Default::default()
+            };
+            agent.store_memory(&cmd).unwrap();
+        }
+
+        // Recall with "db" query
+        let cmd = AgentCommand {
+            function: "recallMemory".to_string(),
+            nonce: 1,
+            memory_query: Some("db".to_string()),
+            memory_file: Some(memory_file.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        let result = agent.recall_memory(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        let results = parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recall_memory_missing_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let cmd = AgentCommand {
+            function: "recallMemory".to_string(),
+            nonce: 1,
+            memory_file: Some("/tmp/test.json".to_string()),
+            ..Default::default()
+        };
+        assert!(agent.recall_memory(&cmd).is_err());
+    }
+
+    #[tokio::test]
+    async fn store_skill_process_input_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let skill_home = dir.path().join("home2");
+        std::env::set_var("HOME", skill_home.to_str().unwrap());
+
+        let input = AgentInput {
+            commands: vec![AgentCommand {
+                function: "storeSkill".to_string(),
+                nonce: 1,
+                skill_name: Some("integration-test".to_string()),
+                skill_content: Some("Test content".to_string()),
+                ..Default::default()
+            }],
+            wait_for_status: None,
+        };
+        let results = agent.process_input(input).await.unwrap();
+        assert_eq!(results.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(parsed["success"], true);
+    }
+
+    #[tokio::test]
+    async fn store_memory_process_input_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let memory_file = dir.path().join("mem.json");
+        let input = AgentInput {
+            commands: vec![AgentCommand {
+                function: "storeMemory".to_string(),
+                nonce: 1,
+                memory_key: Some("test".to_string()),
+                memory_summary: Some("summary".to_string()),
+                memory_file: Some(memory_file.to_string_lossy().to_string()),
+                ..Default::default()
+            }],
+            wait_for_status: None,
+        };
+        let results = agent.process_input(input).await.unwrap();
+        assert_eq!(results.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(parsed["success"], true);
+    }
+
+    #[tokio::test]
+    async fn recall_memory_process_input_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let memory_file = dir.path().join("mem2.json");
+        let input = AgentInput {
+            commands: vec![AgentCommand {
+                function: "recallMemory".to_string(),
+                nonce: 1,
+                memory_query: Some("test".to_string()),
+                memory_file: Some(memory_file.to_string_lossy().to_string()),
+                ..Default::default()
+            }],
+            wait_for_status: None,
+        };
+        let results = agent.process_input(input).await.unwrap();
+        assert_eq!(results.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(parsed["success"], true);
     }
 }
