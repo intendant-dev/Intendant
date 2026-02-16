@@ -42,3 +42,62 @@ impl From<reqwest::Error> for CallerError {
         CallerError::Http(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openai_error_display() {
+        let err = CallerError::OpenAI("rate limited".to_string());
+        assert_eq!(format!("{}", err), "OpenAI error: rate limited");
+    }
+
+    #[test]
+    fn agent_error_display() {
+        let err = CallerError::Agent("spawn failed".to_string());
+        assert_eq!(format!("{}", err), "Agent error: spawn failed");
+    }
+
+    #[test]
+    fn config_error_display() {
+        let err = CallerError::Config("missing key".to_string());
+        assert_eq!(format!("{}", err), "Config error: missing key");
+    }
+
+    #[test]
+    fn io_error_display() {
+        let err = CallerError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "not found",
+        ));
+        let msg = format!("{}", err);
+        assert!(msg.contains("IO error"));
+    }
+
+    #[test]
+    fn from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken");
+        let caller_err: CallerError = io_err.into();
+        match caller_err {
+            CallerError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe),
+            _ => panic!("expected Io variant"),
+        }
+    }
+
+    #[test]
+    fn from_json_error() {
+        let json_err = serde_json::from_str::<String>("bad").unwrap_err();
+        let caller_err: CallerError = json_err.into();
+        match caller_err {
+            CallerError::Json(_) => {}
+            _ => panic!("expected Json variant"),
+        }
+    }
+
+    #[test]
+    fn error_is_std_error() {
+        let err = CallerError::Config("test".to_string());
+        let _: &dyn std::error::Error = &err;
+    }
+}

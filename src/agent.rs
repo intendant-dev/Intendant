@@ -32,6 +32,55 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Create an agent with custom paths, used for testing.
+    #[cfg(test)]
+    pub fn new_with_paths(
+        shared_mem_path: &str,
+        log_dir: PathBuf,
+    ) -> Result<Self, AgentError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(shared_mem_path)?;
+        file.set_len(SHARED_MEM_SIZE as u64)?;
+
+        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        let process_map = Self::rebuild_process_map(&mmap);
+        let shared_mem = Arc::new(RwLock::new(mmap));
+        let process_map = Arc::new(RwLock::new(process_map));
+
+        fs::create_dir_all(&log_dir)?;
+
+        let (status_tx, mut status_rx) = mpsc::channel::<StatusUpdate>(1024);
+
+        let shared_mem_clone = shared_mem.clone();
+        let process_map_clone = process_map.clone();
+        tokio::spawn(async move {
+            while let Some(update) = status_rx.recv().await {
+                if let Err(e) = Self::update_process_status(
+                    shared_mem_clone.clone(),
+                    update.nonce,
+                    update.status,
+                    update.exit_code,
+                ) {
+                    eprintln!("Failed to update process status: {}", e);
+                }
+                let info_size = size_of::<ProcessInfo>();
+                let offset = (update.nonce as usize % MAX_PROCESSES) * info_size;
+                process_map_clone.write().unwrap().insert(update.nonce, offset);
+            }
+        });
+
+        Ok(Self {
+            shared_mem,
+            process_map,
+            log_dir,
+            status_tx,
+        })
+    }
+
     pub fn new() -> Result<Self, AgentError> {
         // Create shared memory file
         let file = OpenOptions::new()
@@ -121,9 +170,14 @@ impl Agent {
         let info_size = size_of::<ProcessInfo>();
         let offset = (nonce as usize % MAX_PROCESSES) * info_size;
 
+        // Read existing entry to preserve PID
+        let existing = unsafe {
+            std::ptr::read(mmap[offset..offset + info_size].as_ptr() as *const ProcessInfo)
+        };
+
         let info = ProcessInfo {
             nonce,
-            pid: 0, // We don't need to update PID here
+            pid: existing.pid,
             status,
             exit_code,
             timestamp: SystemTime::now()
@@ -301,11 +355,11 @@ impl Agent {
             }
             "stdout" => {
                 let path = self.log_dir.join(format!("{}_stdout.log", cmd.nonce));
-                Ok(fs::read_to_string(path)?)
+                Ok(fs::read_to_string(path).unwrap_or_default())
             }
             "stderr" => {
                 let path = self.log_dir.join(format!("{}_stderr.log", cmd.nonce));
-                Ok(fs::read_to_string(path)?)
+                Ok(fs::read_to_string(path).unwrap_or_default())
             }
             "exit_code" => {
                 let info = self.get_process_info(cmd.nonce)?;
@@ -506,13 +560,15 @@ impl Agent {
                         ProcessStatus::Completed if info.exit_code == expected_status => {
                             return Ok(true)
                         }
-                        ProcessStatus::Failed | ProcessStatus::Skipped => {
+                        ProcessStatus::Completed | ProcessStatus::Failed | ProcessStatus::Skipped => {
+                            // Terminal states - no point retrying
                             return Ok(false)
                         }
                         _ if !wait => {
                             return Ok(false)
                         }
-                        _ => {tokio::time::sleep(Duration::from_millis(100)).await;
+                        _ => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                             retries -= 1;
                             continue;
                         }
@@ -554,3 +610,593 @@ impl Agent {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Create a test agent with temp directories
+    fn create_test_agent() -> (Agent, TempDir, TempDir) {
+        let shm_dir = TempDir::new().unwrap();
+        let log_dir = TempDir::new().unwrap();
+        let shm_path = shm_dir.path().join("test_processes");
+        let agent = Agent::new_with_paths(
+            shm_path.to_str().unwrap(),
+            log_dir.path().to_path_buf(),
+        )
+        .unwrap();
+        (agent, shm_dir, log_dir)
+    }
+
+    #[tokio::test]
+    async fn update_and_get_process_info() {
+        let (agent, _shm, _log) = create_test_agent();
+        agent
+            .update_process_info(1, 1234, ProcessStatus::Running, 0)
+            .unwrap();
+        let info = agent.get_process_info(1).unwrap();
+        assert_eq!(info.nonce, 1);
+        assert_eq!(info.pid, 1234);
+        assert_eq!(info.status, ProcessStatus::Running);
+        assert_eq!(info.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn get_process_info_invalid_nonce() {
+        let (agent, _shm, _log) = create_test_agent();
+        let result = agent.get_process_info(999);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AgentError::InvalidNonce(n) => assert_eq!(n, 999),
+            other => panic!("expected InvalidNonce, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_nonce_refs_single() {
+        let (agent, _shm, _log) = create_test_agent();
+        agent
+            .update_process_info(1, 4567, ProcessStatus::Running, 0)
+            .unwrap();
+        let result = agent.replace_nonce_refs("kill $NONCE[1]").unwrap();
+        assert_eq!(result, "kill 4567");
+    }
+
+    #[tokio::test]
+    async fn replace_nonce_refs_multiple() {
+        let (agent, _shm, _log) = create_test_agent();
+        agent
+            .update_process_info(1, 100, ProcessStatus::Running, 0)
+            .unwrap();
+        agent
+            .update_process_info(2, 200, ProcessStatus::Running, 0)
+            .unwrap();
+        let result = agent
+            .replace_nonce_refs("echo $NONCE[1] and $NONCE[2]")
+            .unwrap();
+        assert_eq!(result, "echo 100 and 200");
+    }
+
+    #[tokio::test]
+    async fn replace_nonce_refs_no_refs() {
+        let (agent, _shm, _log) = create_test_agent();
+        let result = agent.replace_nonce_refs("echo hello").unwrap();
+        assert_eq!(result, "echo hello");
+    }
+
+    #[tokio::test]
+    async fn replace_nonce_refs_invalid_nonce() {
+        let (agent, _shm, _log) = create_test_agent();
+        let result = agent.replace_nonce_refs("kill $NONCE[999]");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn inspect_path_existing_file() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("test.txt");
+        fs::write(&file_path, "hello").unwrap();
+
+        let cmd = AgentCommand {
+            function: "inspectPath".to_string(),
+            command: None,
+            nonce: 1,
+            depending_nonce: None,
+            expected_status: None,
+            wait: None,
+            return_stdout: None,
+            return_stderr: None,
+            display: None,
+            status_type: None,
+            path: Some(file_path.to_string_lossy().to_string()),
+        };
+        let result = agent.inspect_path(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["exists"], true);
+        assert_eq!(parsed["type"], "file");
+        assert_eq!(parsed["size"], 5);
+    }
+
+    #[tokio::test]
+    async fn inspect_path_nonexistent() {
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "inspectPath".to_string(),
+            command: None,
+            nonce: 1,
+            depending_nonce: None,
+            expected_status: None,
+            wait: None,
+            return_stdout: None,
+            return_stderr: None,
+            display: None,
+            status_type: None,
+            path: Some("/nonexistent/path/xyz".to_string()),
+        };
+        let result = agent.inspect_path(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["exists"], false);
+    }
+
+    #[tokio::test]
+    async fn inspect_path_directory() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let cmd = AgentCommand {
+            function: "inspectPath".to_string(),
+            command: None,
+            nonce: 1,
+            depending_nonce: None,
+            expected_status: None,
+            wait: None,
+            return_stdout: None,
+            return_stderr: None,
+            display: None,
+            status_type: None,
+            path: Some(tmp.path().to_string_lossy().to_string()),
+        };
+        let result = agent.inspect_path(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["exists"], true);
+        assert_eq!(parsed["type"], "directory");
+    }
+
+    #[tokio::test]
+    async fn inspect_path_missing_path_field() {
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "inspectPath".to_string(),
+            command: None,
+            nonce: 1,
+            depending_nonce: None,
+            expected_status: None,
+            wait: None,
+            return_stdout: None,
+            return_stderr: None,
+            display: None,
+            status_type: None,
+            path: None,
+        };
+        let result = agent.inspect_path(&cmd);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_status_returns_status_char() {
+        let (agent, _shm, _log) = create_test_agent();
+        agent
+            .update_process_info(5, 1000, ProcessStatus::Running, 0)
+            .unwrap();
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            command: None,
+            nonce: 5,
+            depending_nonce: None,
+            expected_status: None,
+            wait: None,
+            return_stdout: None,
+            return_stderr: None,
+            display: None,
+            status_type: Some("status".to_string()),
+            path: None,
+        };
+        let result = agent.fetch_status(&cmd).unwrap();
+        assert_eq!(result, "r");
+    }
+
+    #[tokio::test]
+    async fn fetch_status_returns_exit_code() {
+        let (agent, _shm, _log) = create_test_agent();
+        agent
+            .update_process_info(5, 1000, ProcessStatus::Failed, 127)
+            .unwrap();
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            command: None,
+            nonce: 5,
+            depending_nonce: None,
+            expected_status: None,
+            wait: None,
+            return_stdout: None,
+            return_stderr: None,
+            display: None,
+            status_type: Some("exit_code".to_string()),
+            path: None,
+        };
+        let result = agent.fetch_status(&cmd).unwrap();
+        assert_eq!(result, "127");
+    }
+
+    #[tokio::test]
+    async fn fetch_status_stdout_reads_log() {
+        let (agent, _shm, log_dir) = create_test_agent();
+        agent
+            .update_process_info(3, 100, ProcessStatus::Completed, 0)
+            .unwrap();
+        // Create the log file manually
+        fs::write(log_dir.path().join("3_stdout.log"), "hello world").unwrap();
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            command: None,
+            nonce: 3,
+            depending_nonce: None,
+            expected_status: None,
+            wait: None,
+            return_stdout: None,
+            return_stderr: None,
+            display: None,
+            status_type: Some("stdout".to_string()),
+            path: None,
+        };
+        let result = agent.fetch_status(&cmd).unwrap();
+        assert_eq!(result, "hello world");
+    }
+
+    #[tokio::test]
+    async fn fetch_status_missing_status_type() {
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            command: None,
+            nonce: 1,
+            depending_nonce: None,
+            expected_status: None,
+            wait: None,
+            return_stdout: None,
+            return_stderr: None,
+            display: None,
+            status_type: None,
+            path: None,
+        };
+        let result = agent.fetch_status(&cmd);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_status_invalid_status_type() {
+        let (agent, _shm, _log) = create_test_agent();
+        agent
+            .update_process_info(1, 100, ProcessStatus::Running, 0)
+            .unwrap();
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            command: None,
+            nonce: 1,
+            depending_nonce: None,
+            expected_status: None,
+            wait: None,
+            return_stdout: None,
+            return_stderr: None,
+            display: None,
+            status_type: Some("invalid".to_string()),
+            path: None,
+        };
+        let result = agent.fetch_status(&cmd);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_status_stdout_missing_log_file() {
+        let (agent, _shm, _log) = create_test_agent();
+        agent
+            .update_process_info(99, 100, ProcessStatus::Waiting, 0)
+            .unwrap();
+        // Don't create the log file - it doesn't exist for Waiting processes
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            command: None,
+            nonce: 99,
+            depending_nonce: None,
+            expected_status: None,
+            wait: None,
+            return_stdout: None,
+            return_stderr: None,
+            display: None,
+            status_type: Some("stdout".to_string()),
+            path: None,
+        };
+        let result = agent.fetch_status(&cmd).unwrap();
+        assert_eq!(result, "", "should return empty string for missing log file");
+    }
+
+    #[tokio::test]
+    async fn check_dependency_completed_matching_exit() {
+        let (agent, _shm, _log) = create_test_agent();
+        agent
+            .update_process_info(1, 100, ProcessStatus::Completed, 0)
+            .unwrap();
+        let result = agent.check_dependency(1, 0, false).await.unwrap();
+        assert!(result, "should pass when exit code matches");
+    }
+
+    #[tokio::test]
+    async fn check_dependency_completed_wrong_exit_no_wait() {
+        let (agent, _shm, _log) = create_test_agent();
+        agent
+            .update_process_info(1, 100, ProcessStatus::Completed, 1)
+            .unwrap();
+        let result = agent.check_dependency(1, 0, false).await.unwrap();
+        assert!(!result, "should fail when exit code doesn't match");
+    }
+
+    #[tokio::test]
+    async fn check_dependency_completed_wrong_exit_with_wait() {
+        let (agent, _shm, _log) = create_test_agent();
+        agent
+            .update_process_info(1, 100, ProcessStatus::Completed, 1)
+            .unwrap();
+        let start = std::time::Instant::now();
+        let result = agent.check_dependency(1, 0, true).await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(!result, "should fail when exit code doesn't match");
+        // Completed is a terminal state, should return immediately even with wait=true
+        assert!(
+            elapsed.as_secs() < 2,
+            "check_dependency took {:?} - should be instant for completed process with wrong exit code",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn check_dependency_failed() {
+        let (agent, _shm, _log) = create_test_agent();
+        agent
+            .update_process_info(1, 100, ProcessStatus::Failed, 1)
+            .unwrap();
+        let result = agent.check_dependency(1, 0, true).await.unwrap();
+        assert!(!result, "should fail on Failed status");
+    }
+
+    #[tokio::test]
+    async fn check_dependency_skipped() {
+        let (agent, _shm, _log) = create_test_agent();
+        agent
+            .update_process_info(1, 100, ProcessStatus::Skipped, 0)
+            .unwrap();
+        let result = agent.check_dependency(1, 0, true).await.unwrap();
+        assert!(!result, "should fail on Skipped status");
+    }
+
+    #[tokio::test]
+    async fn check_dependency_invalid_nonce_no_wait() {
+        let (agent, _shm, _log) = create_test_agent();
+        let result = agent.check_dependency(999, 0, false).await.unwrap();
+        assert!(!result, "should fail for invalid nonce without wait");
+    }
+
+    #[tokio::test]
+    async fn process_input_exec_returns_running() {
+        let (agent, _shm, _log) = create_test_agent();
+        let input = AgentInput {
+            commands: vec![AgentCommand {
+                function: "execAsAgent".to_string(),
+                command: Some("echo hello".to_string()),
+                nonce: 1,
+                depending_nonce: None,
+                expected_status: None,
+                wait: None,
+                return_stdout: None,
+                return_stderr: None,
+                display: Some(1),
+                status_type: None,
+                path: None,
+            }],
+            wait_for_status: None,
+        };
+        let results = agent.process_input(input).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "1r0");
+    }
+
+    #[tokio::test]
+    async fn process_input_exec_with_dependency_returns_waiting() {
+        let (agent, _shm, _log) = create_test_agent();
+        let input = AgentInput {
+            commands: vec![AgentCommand {
+                function: "execAsAgent".to_string(),
+                command: Some("echo hello".to_string()),
+                nonce: 2,
+                depending_nonce: Some(1),
+                expected_status: Some(0),
+                wait: Some(true),
+                return_stdout: None,
+                return_stderr: None,
+                display: Some(1),
+                status_type: None,
+                path: None,
+            }],
+            wait_for_status: None,
+        };
+        let results = agent.process_input(input).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "2w0");
+    }
+
+    #[tokio::test]
+    async fn process_input_unknown_function() {
+        let (agent, _shm, _log) = create_test_agent();
+        let input = AgentInput {
+            commands: vec![AgentCommand {
+                function: "unknownFunc".to_string(),
+                command: None,
+                nonce: 1,
+                depending_nonce: None,
+                expected_status: None,
+                wait: None,
+                return_stdout: None,
+                return_stderr: None,
+                display: None,
+                status_type: None,
+                path: None,
+            }],
+            wait_for_status: None,
+        };
+        let result = agent.process_input(input).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn process_input_inspect_path() {
+        let (agent, _shm, _log) = create_test_agent();
+        let input = AgentInput {
+            commands: vec![AgentCommand {
+                function: "inspectPath".to_string(),
+                command: None,
+                nonce: 1,
+                depending_nonce: None,
+                expected_status: None,
+                wait: None,
+                return_stdout: None,
+                return_stderr: None,
+                display: None,
+                status_type: None,
+                path: Some("/tmp".to_string()),
+            }],
+            wait_for_status: None,
+        };
+        let results = agent.process_input(input).await.unwrap();
+        assert_eq!(results.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(parsed["exists"], true);
+        assert_eq!(parsed["type"], "directory");
+    }
+
+    #[tokio::test]
+    async fn process_input_with_wait_for_status() {
+        let (agent, _shm, _log) = create_test_agent();
+        let input = AgentInput {
+            commands: vec![AgentCommand {
+                function: "execAsAgent".to_string(),
+                command: Some("echo fast".to_string()),
+                nonce: 1,
+                depending_nonce: None,
+                expected_status: None,
+                wait: None,
+                return_stdout: None,
+                return_stderr: None,
+                display: Some(1),
+                status_type: None,
+                path: None,
+            }],
+            wait_for_status: Some(200),
+        };
+        let start = std::time::Instant::now();
+        let results = agent.process_input(input).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(results.len(), 1);
+        // Should have waited at least 200ms
+        assert!(elapsed.as_millis() >= 150, "should have waited ~200ms, took {:?}", elapsed);
+    }
+
+    #[tokio::test]
+    async fn exec_as_agent_creates_log_files() {
+        let (agent, _shm, log_dir) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "execAsAgent".to_string(),
+            command: Some("echo test_output".to_string()),
+            nonce: 10,
+            depending_nonce: None,
+            expected_status: None,
+            wait: None,
+            return_stdout: None,
+            return_stderr: None,
+            display: Some(1),
+            status_type: None,
+            path: None,
+        };
+        agent.exec_as_agent(&cmd).await.unwrap();
+        // Give the command time to complete
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let stdout_path = log_dir.path().join("10_stdout.log");
+        let stderr_path = log_dir.path().join("10_stderr.log");
+        assert!(stdout_path.exists(), "stdout log should be created");
+        assert!(stderr_path.exists(), "stderr log should be created");
+        let stdout_content = fs::read_to_string(stdout_path).unwrap();
+        assert_eq!(stdout_content.trim(), "test_output");
+    }
+
+    #[tokio::test]
+    async fn exec_as_agent_missing_command() {
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "execAsAgent".to_string(),
+            command: None,
+            nonce: 1,
+            depending_nonce: None,
+            expected_status: None,
+            wait: None,
+            return_stdout: None,
+            return_stderr: None,
+            display: None,
+            status_type: None,
+            path: None,
+        };
+        let result = agent.exec_as_agent(&cmd).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn update_process_status_preserves_pid() {
+        let (agent, _shm, _log) = create_test_agent();
+        // Set a process with a real PID
+        agent
+            .update_process_info(1, 9999, ProcessStatus::Running, 0)
+            .unwrap();
+
+        // Simulate status update (what happens when process completes)
+        Agent::update_process_status(
+            agent.shared_mem.clone(),
+            1,
+            ProcessStatus::Completed,
+            0,
+        )
+        .unwrap();
+
+        // Read the process info back - PID should still be 9999
+        let info = agent.get_process_info(1).unwrap();
+        assert_eq!(info.status, ProcessStatus::Completed);
+        assert_eq!(
+            info.pid, 9999,
+            "PID should be preserved after status update"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_process_map_finds_existing_entries() {
+        let (agent, _shm, _log) = create_test_agent();
+        agent
+            .update_process_info(10, 100, ProcessStatus::Running, 0)
+            .unwrap();
+        agent
+            .update_process_info(20, 200, ProcessStatus::Completed, 0)
+            .unwrap();
+
+        let mmap = agent.shared_mem.read().unwrap();
+        let map = Agent::rebuild_process_map(&mmap);
+        assert!(map.contains_key(&10));
+        assert!(map.contains_key(&20));
+        assert!(!map.contains_key(&30));
+    }
+}

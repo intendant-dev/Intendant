@@ -90,6 +90,17 @@ Commands can be chained using `depending_nonce`, `wait`, and `expected_status`. 
 
 Use `$NONCE[id]` in command strings to reference the PID of a previously launched nonce. For example, `kill -9 $NONCE[10]` kills the process started by nonce 10.
 
+## Testing
+
+```bash
+cargo test
+```
+
+Tests cover both binaries:
+
+- **Agent binary:** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, and command processing.
+- **Caller binary:** JSON extraction from code fences and bare text, conversation management, and error types.
+
 ## Session Management
 
 State persists across binary restarts via `/dev/shm/`:

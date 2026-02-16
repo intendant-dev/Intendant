@@ -54,6 +54,91 @@ fn extract_json(text: &str) -> Option<&str> {
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_json_from_json_fence() {
+        let text = r#"Here is the command:
+```json
+{"commands": [{"function": "execAsAgent", "nonce": 1}]}
+```
+Done."#;
+        let json = extract_json(text).unwrap();
+        assert!(json.starts_with('{'));
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert!(parsed["commands"].is_array());
+    }
+
+    #[test]
+    fn extract_json_from_generic_fence() {
+        let text = r#"Result:
+```
+{"commands": []}
+```"#;
+        let json = extract_json(text).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert!(parsed["commands"].is_array());
+    }
+
+    #[test]
+    fn extract_json_bare() {
+        let text = r#"I'll run this: {"commands": [{"function": "inspectPath", "nonce": 1, "path": "/tmp"}]} end"#;
+        let json = extract_json(text).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed["commands"][0]["function"], "inspectPath");
+    }
+
+    #[test]
+    fn extract_json_no_json() {
+        let text = "This is just plain text with no JSON.";
+        assert!(extract_json(text).is_none());
+    }
+
+    #[test]
+    fn extract_json_invalid_bare_json() {
+        let text = "Some text with {broken json} here";
+        assert!(extract_json(text).is_none());
+    }
+
+    #[test]
+    fn extract_json_nested_braces() {
+        let text = r#"```json
+{"commands": [{"function": "execAsAgent", "command": "echo {hello}", "nonce": 1}]}
+```"#;
+        let json = extract_json(text).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed["commands"][0]["command"], "echo {hello}");
+    }
+
+    #[test]
+    fn extract_json_prefers_json_fence() {
+        let text = r#"```json
+{"source": "json_fence"}
+```
+Also: {"source": "bare"}"#;
+        let json = extract_json(text).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed["source"], "json_fence");
+    }
+
+    #[test]
+    fn extract_json_empty_fence() {
+        let text = "```json\n```";
+        // Empty fence - no JSON starting with {
+        assert!(extract_json(text).is_none());
+    }
+
+    #[test]
+    fn extract_json_fence_with_whitespace() {
+        let text = "```json\n  {\"key\": \"value\"}  \n```";
+        let json = extract_json(text).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed["key"], "value");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), CallerError> {
     dotenvy::dotenv().ok();

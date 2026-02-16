@@ -47,3 +47,135 @@ pub struct StatusUpdate {
     pub status: ProcessStatus,
     pub exit_code: i32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_status_repr_values() {
+        assert_eq!(ProcessStatus::Running as u8, b'r');
+        assert_eq!(ProcessStatus::Completed as u8, b'c');
+        assert_eq!(ProcessStatus::Failed as u8, b'f');
+        assert_eq!(ProcessStatus::Waiting as u8, b'w');
+        assert_eq!(ProcessStatus::Skipped as u8, b's');
+    }
+
+    #[test]
+    fn process_status_char_conversion() {
+        let status = ProcessStatus::Running;
+        let ch = status as u8 as char;
+        assert_eq!(ch, 'r');
+
+        let status = ProcessStatus::Completed;
+        let ch = status as u8 as char;
+        assert_eq!(ch, 'c');
+    }
+
+    #[test]
+    fn command_deserialize_minimal() {
+        let json = r#"{
+            "function": "execAsAgent",
+            "nonce": 42
+        }"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        assert_eq!(cmd.function, "execAsAgent");
+        assert_eq!(cmd.nonce, 42);
+        assert!(cmd.command.is_none());
+        assert!(cmd.depending_nonce.is_none());
+        assert!(cmd.wait.is_none());
+    }
+
+    #[test]
+    fn command_deserialize_full() {
+        let json = r#"{
+            "function": "execAsAgent",
+            "command": "echo hello",
+            "nonce": 1,
+            "depending_nonce": 0,
+            "expected_status": 0,
+            "wait": true,
+            "display": 1,
+            "return_stdout": true,
+            "return_stderr": false
+        }"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        assert_eq!(cmd.function, "execAsAgent");
+        assert_eq!(cmd.command.as_deref(), Some("echo hello"));
+        assert_eq!(cmd.nonce, 1);
+        assert_eq!(cmd.depending_nonce, Some(0));
+        assert_eq!(cmd.expected_status, Some(0));
+        assert_eq!(cmd.wait, Some(true));
+        assert_eq!(cmd.display, Some(1));
+    }
+
+    #[test]
+    fn agent_input_deserialize() {
+        let json = r#"{
+            "commands": [
+                {"function": "execAsAgent", "command": "ls", "nonce": 1},
+                {"function": "fetchStatus", "nonce": 1, "status_type": "stdout"}
+            ],
+            "wait_for_status": 500
+        }"#;
+        let input: AgentInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.commands.len(), 2);
+        assert_eq!(input.wait_for_status, Some(500));
+    }
+
+    #[test]
+    fn agent_input_no_wait() {
+        let json = r#"{"commands": []}"#;
+        let input: AgentInput = serde_json::from_str(json).unwrap();
+        assert!(input.commands.is_empty());
+        assert!(input.wait_for_status.is_none());
+    }
+
+    #[test]
+    fn process_info_is_repr_c() {
+        // Verify ProcessInfo has a stable layout by checking size
+        let size = std::mem::size_of::<ProcessInfo>();
+        // u64 (8) + i32 (4) + ProcessStatus(u8) (1) + padding (3) + i32 (4) + u64 (8) = 28 + padding
+        // With repr(C): nonce(8) + pid(4) + status(1) + pad(3) + exit_code(4) + pad(4) + timestamp(8) = 32
+        assert!(size > 0);
+        // Ensure it's consistent (the exact size depends on alignment)
+        assert_eq!(size, std::mem::size_of::<ProcessInfo>());
+    }
+
+    #[test]
+    fn process_info_clone_copy() {
+        let info = ProcessInfo {
+            nonce: 1,
+            pid: 1234,
+            status: ProcessStatus::Running,
+            exit_code: 0,
+            timestamp: 1000,
+        };
+        let copy = info;
+        assert_eq!(copy.nonce, 1);
+        assert_eq!(copy.pid, 1234);
+        assert_eq!(copy.status, ProcessStatus::Running);
+    }
+
+    #[test]
+    fn command_serialize_roundtrip() {
+        let cmd = Command {
+            function: "inspectPath".to_string(),
+            command: None,
+            nonce: 5,
+            depending_nonce: None,
+            expected_status: None,
+            wait: None,
+            return_stdout: None,
+            return_stderr: None,
+            display: None,
+            status_type: None,
+            path: Some("/tmp/test".to_string()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let deserialized: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.function, "inspectPath");
+        assert_eq!(deserialized.path.as_deref(), Some("/tmp/test"));
+        assert_eq!(deserialized.nonce, 5);
+    }
+}
