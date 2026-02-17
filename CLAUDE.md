@@ -147,7 +147,7 @@ Commands chain via `depending_nonce`, `wait`, and `expected_status`. When `wait`
 ## Environment Requirements
 
 - **OS**: Linux (requires `/dev/shm` for shared memory)
-- **Permissions**: Root access expected
+- **Permissions**: Runs as unprivileged user with passwordless sudo
 - **For caller**: `.env` file with `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, optional `PROVIDER` and `MODEL_NAME`
 - **For captureScreen**: ImageMagick `import` command and DISPLAY environment variable (defaults to `:1`)
 
