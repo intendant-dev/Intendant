@@ -1,13 +1,7 @@
 use crate::error::CallerError;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
-
-#[derive(Debug, Deserialize, Default)]
-pub struct SkillsConfig {
-    #[serde(default)]
-    pub enabled: Vec<String>,
-}
 
 #[derive(Debug, Deserialize)]
 pub struct MemoryConfig {
@@ -27,8 +21,6 @@ fn default_true() -> bool {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ProjectConfig {
-    #[serde(default)]
-    pub skills: SkillsConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
 }
@@ -52,10 +44,6 @@ impl Project {
             ProjectConfig::default()
         };
         Ok(Self { root, config })
-    }
-
-    pub fn skills_dir(&self) -> PathBuf {
-        self.root.join("skills")
     }
 
     pub fn memory_path(&self) -> PathBuf {
@@ -85,16 +73,6 @@ fn detect_project_root() -> Result<PathBuf, CallerError> {
         .map_err(|e| CallerError::Config(format!("Failed to get current directory: {}", e)))
 }
 
-pub fn global_skills_dir() -> PathBuf {
-    dirs_fallback().join("skills")
-}
-
-fn dirs_fallback() -> PathBuf {
-    std::env::var("HOME")
-        .map(|h| Path::new(&h).join(".agent"))
-        .unwrap_or_else(|_| PathBuf::from("/root/.agent"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,40 +80,33 @@ mod tests {
     #[test]
     fn default_project_config() {
         let config = ProjectConfig::default();
-        assert!(config.skills.enabled.is_empty());
         assert!(config.memory.enabled);
     }
 
     #[test]
     fn parse_full_config() {
         let toml_str = r#"
-[skills]
-enabled = ["rust-conventions", "docker-deploy"]
-
 [memory]
 enabled = true
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.skills.enabled, vec!["rust-conventions", "docker-deploy"]);
         assert!(config.memory.enabled);
     }
 
     #[test]
     fn parse_empty_config() {
         let config: ProjectConfig = toml::from_str("").unwrap();
-        assert!(config.skills.enabled.is_empty());
         assert!(config.memory.enabled); // default_true
     }
 
     #[test]
     fn parse_partial_config() {
         let toml_str = r#"
-[skills]
-enabled = ["test"]
+[memory]
+enabled = false
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.skills.enabled, vec!["test"]);
-        assert!(config.memory.enabled); // default_true
+        assert!(!config.memory.enabled);
     }
 
     #[test]
@@ -144,15 +115,7 @@ enabled = ["test"]
             root: PathBuf::from("/tmp/myproject"),
             config: ProjectConfig::default(),
         };
-        assert_eq!(project.skills_dir(), PathBuf::from("/tmp/myproject/skills"));
         assert_eq!(project.memory_path(), PathBuf::from("/tmp/myproject/.agent/memory.json"));
         assert_eq!(project.agent_dir(), PathBuf::from("/tmp/myproject/.agent"));
-    }
-
-    #[test]
-    fn global_skills_dir_is_under_home() {
-        let dir = global_skills_dir();
-        let dir_str = dir.to_string_lossy();
-        assert!(dir_str.ends_with(".agent/skills"));
     }
 }

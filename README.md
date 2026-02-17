@@ -1,6 +1,6 @@
 # Agent
 
-A Rust runtime that executes commands on behalf of an AI agent, plus an AI caller that drives the agent via the OpenAI or Anthropic API. The runtime manages process lifecycles via shared memory (SHM), streams status updates, and persists logs across binary restarts. The caller includes a skills system, persistent project memory, active context management, and multi-provider support.
+A Rust runtime that executes commands on behalf of an AI agent, plus an AI caller that drives the agent via the OpenAI or Anthropic API. The runtime manages process lifecycles via shared memory (SHM), streams status updates, and persists logs across binary restarts. The caller includes persistent project memory, active context management, and multi-provider support.
 
 ## Architecture
 
@@ -13,10 +13,10 @@ stdin (JSON) --> Agent --> spawns bash commands
                   |
                   +--> StatusMonitor --> stdout (status lines)
 
-Caller --> detects project root (git) --> loads skills + memory
+Caller --> detects project root (git) --> loads memory
   |
   +--> selects provider (OpenAI / Anthropic)
-  +--> injects skills + memory into conversation
+  +--> injects memory into conversation
   +--> main loop: model -> extract JSON -> apply context directives -> agent -> repeat
 ```
 
@@ -93,13 +93,6 @@ echo '{"commands":[{"function":"execPty","nonce":1,"command":"cd /tmp"},{"functi
   | ./target/release/agent
 ```
 
-Store a skill:
-
-```bash
-echo '{"commands":[{"function":"storeSkill","nonce":1,"skill_name":"rust-fmt","skill_content":"Always run cargo fmt before committing.","skill_scope":"project","project_dir":"/path/to/project"}]}' \
-  | ./target/release/agent
-```
-
 Store and recall memory:
 
 ```bash
@@ -124,7 +117,6 @@ echo '{"commands":[{"function":"recallMemory","nonce":1,"memory_query":"database
 | `browse` | Fetch URL and convert HTML to text | `url` |
 | `askHuman` | Ask the operator a question and wait for response | `question` |
 | `execPty` | Run command in a persistent PTY session | `command`, `shell_id` |
-| `storeSkill` | Save a reusable skill as a markdown file | `skill_name`, `skill_content`, `skill_description`, `skill_scope`, `project_dir` |
 | `storeMemory` | Store a key-value memory entry for the project | `memory_key`, `memory_summary`, `memory_file` |
 | `recallMemory` | Search project memory by keyword | `memory_query`, `memory_file` |
 
@@ -166,32 +158,6 @@ The model can include a `context` field alongside `commands` to manage conversat
 - **`summarize`**: Replace a range of messages with a single summary.
 - Context-only turns (empty commands) are supported for pruning without executing anything.
 
-## Skills System
-
-Skills are reusable instruction sets loaded automatically at session start.
-
-### Skill Format
-
-Markdown files with YAML frontmatter in `~/.agent/skills/` (global) or `<project>/skills/` (project-scoped, overrides global by name):
-
-```markdown
----
-name: rust-conventions
-description: Rust coding standards
----
-Always use `cargo fmt` and `cargo clippy` before committing.
-Prefer `thiserror` for error types.
-```
-
-### Configuration
-
-Skills can be filtered in `<project>/agent.toml`:
-
-```toml
-[skills]
-enabled = ["rust-conventions", "docker-deploy"]  # empty = load all
-```
-
 ## Memory System
 
 Project memory persists key-value entries across sessions in `<project>/.agent/memory.json`.
@@ -214,8 +180,8 @@ cargo test
 
 175 tests cover both binaries:
 
-- **Agent binary (109 tests):** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, skill storage, memory storage, and memory recall.
-- **Caller binary (66 tests):** JSON extraction, conversation management, context directives (drop/summarize), error types, project detection, config parsing, skill loading/parsing/formatting, memory loading/formatting, and provider selection.
+- **Agent binary:** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage, and memory recall.
+- **Caller binary:** JSON extraction, conversation management, context directives (drop/summarize), error types, project detection, config parsing, memory loading/formatting, and provider selection.
 
 ## Session Management
 
@@ -232,7 +198,7 @@ rm -f /dev/shm/agent_processes /dev/shm/agent_session
 
 ## AI Caller
 
-The caller binary detects the project, loads skills and memory, sends the task to an AI model, and feeds the model's JSON output to the agent binary in a loop.
+The caller binary detects the project, loads memory, sends the task to an AI model, and feeds the model's JSON output to the agent binary in a loop.
 
 ### Setup
 
@@ -266,15 +232,14 @@ MODEL_NAME=gpt-4o        # optional, provider-specific default used if omitted
 1. Loads `.env` and selects the API provider (OpenAI or Anthropic)
 2. Detects the project root (via `git rev-parse --show-toplevel`, falls back to cwd)
 3. Reads `SysPrompt.md` as the system message
-4. Loads skills from `~/.agent/skills/` and `<project>/skills/`, injects into conversation
-5. Loads memory from `<project>/.agent/memory.json`, injects into conversation
-6. Sends the task to the chat API
-7. Extracts JSON from the model's response (handles code fences and bare JSON)
-8. Applies context directives (`drop_turns`, `summarize`) to the conversation
-9. Injects project context (`memory_file`, `project_dir`) into relevant commands
-10. Pipes the JSON to the agent binary, reads stdout/stderr with idle timeout (3s) and hard timeout (30s)
-11. Feeds the agent output back as the next user message
-12. Repeats until the model responds with no JSON (task complete) or 50 turns are reached
+4. Loads memory from `<project>/.agent/memory.json`, injects into conversation
+5. Sends the task to the chat API
+6. Extracts JSON from the model's response (handles code fences and bare JSON)
+7. Applies context directives (`drop_turns`, `summarize`) to the conversation
+8. Injects project context (`memory_file`) into relevant commands
+9. Pipes the JSON to the agent binary, reads stdout/stderr with idle timeout (3s) and hard timeout (30s)
+10. Feeds the agent output back as the next user message
+11. Repeats until the model responds with no JSON (task complete) or 50 turns are reached
 
 ## Environment
 
@@ -301,9 +266,6 @@ Increase timeouts when using `askHuman` (e.g., `AGENT_HARD_TIMEOUT=600`).
 Create `agent.toml` in the project root:
 
 ```toml
-[skills]
-enabled = ["rust-conventions"]  # empty array or omit to load all skills
-
 [memory]
 enabled = true  # default: true
 ```

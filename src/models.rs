@@ -31,12 +31,6 @@ pub struct Command {
     pub question: Option<String>,
     // execPty field
     pub shell_id: Option<String>,
-    // storeSkill fields
-    pub skill_name: Option<String>,
-    pub skill_description: Option<String>,
-    pub skill_content: Option<String>,
-    pub skill_scope: Option<String>,
-    pub project_dir: Option<String>,
     // storeMemory / recallMemory fields
     pub memory_key: Option<String>,
     pub memory_summary: Option<String>,
