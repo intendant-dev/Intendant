@@ -178,7 +178,7 @@ enabled = false  # default: true
 cargo test
 ```
 
-175 tests cover both binaries:
+161 tests cover both binaries:
 
 - **Agent binary:** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage, and memory recall.
 - **Caller binary:** JSON extraction, conversation management, context directives (drop/summarize), error types, project detection, config parsing, memory loading/formatting, and provider selection.
