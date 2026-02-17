@@ -4,7 +4,6 @@ mod error;
 mod memory;
 mod project;
 mod provider;
-mod skills;
 
 use conversation::Conversation;
 use error::CallerError;
@@ -120,16 +119,10 @@ fn inject_project_context(
 
     if let Some(commands) = value.get_mut("commands").and_then(|c| c.as_array_mut()) {
         let memory_file = project.memory_path().to_string_lossy().to_string();
-        let project_dir = project.root.to_string_lossy().to_string();
 
         for cmd in commands.iter_mut() {
             if let Some(func) = cmd.get("function").and_then(|f| f.as_str()) {
                 match func {
-                    "storeSkill" => {
-                        if cmd.get("project_dir").is_none() {
-                            cmd["project_dir"] = serde_json::Value::String(project_dir.clone());
-                        }
-                    }
                     "storeMemory" | "recallMemory" => {
                         if cmd.get("memory_file").is_none() {
                             cmd["memory_file"] = serde_json::Value::String(memory_file.clone());
@@ -310,21 +303,6 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn inject_project_context_adds_project_dir() {
-        let project = Project {
-            root: std::path::PathBuf::from("/tmp/proj"),
-            config: project::ProjectConfig::default(),
-        };
-        let input = r#"{"commands":[{"function":"storeSkill","nonce":1,"skill_name":"test","skill_content":"hello"}]}"#;
-        let result = inject_project_context(input, &project);
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(
-            parsed["commands"][0]["project_dir"].as_str().unwrap(),
-            "/tmp/proj"
-        );
-    }
-
-    #[test]
     fn inject_project_context_preserves_existing() {
         let project = Project {
             root: std::path::PathBuf::from("/tmp/proj"),
@@ -384,14 +362,6 @@ async fn main() -> Result<(), CallerError> {
 
     let mut conversation = Conversation::new(system_prompt);
 
-    // Inject skills
-    let all_skills = skills::load_available_skills(&project);
-    let selected = skills::select_skills(all_skills, &project.config.skills.enabled);
-    if let Some(skills_msg) = skills::format_skills_message(&selected) {
-        conversation.add_user(skills_msg);
-        conversation.add_assistant("Acknowledged. I will follow the active skills.".to_string());
-    }
-
     // Inject memory
     if let Some(store) = memory::load_memory(&project) {
         if let Some(memory_msg) = memory::format_memory_message(&store) {
@@ -433,7 +403,7 @@ async fn main() -> Result<(), CallerError> {
             continue;
         }
 
-        // Inject project context (memory_file, project_dir) into commands
+        // Inject project context (memory_file) into commands
         let json_str = inject_project_context(&json_str, &project);
 
         println!("[Turn {}] Running agent...", turn);

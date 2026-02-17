@@ -901,52 +901,6 @@ impl Agent {
         }
     }
 
-    fn store_skill(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
-        let name = cmd.skill_name.as_ref().ok_or_else(|| {
-            AgentError::Process("storeSkill requires skill_name".to_string())
-        })?;
-        let content = cmd.skill_content.as_ref().ok_or_else(|| {
-            AgentError::Process("storeSkill requires skill_content".to_string())
-        })?;
-
-        let description = cmd.skill_description.as_deref().unwrap_or("");
-        let scope = cmd.skill_scope.as_deref().unwrap_or("global");
-
-        let dir = match scope {
-            "project" => {
-                let project_dir = cmd.project_dir.as_ref().ok_or_else(|| {
-                    AgentError::Process("storeSkill with project scope requires project_dir".to_string())
-                })?;
-                PathBuf::from(project_dir).join("skills")
-            }
-            _ => {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-                PathBuf::from(home).join(".agent").join("skills")
-            }
-        };
-
-        fs::create_dir_all(&dir)?;
-
-        let filename = format!("{}.md", name);
-        let file_path = dir.join(&filename);
-
-        let mut file_content = String::from("---\n");
-        file_content.push_str(&format!("name: {}\n", name));
-        if !description.is_empty() {
-            file_content.push_str(&format!("description: {}\n", description));
-        }
-        file_content.push_str("---\n");
-        file_content.push_str(content);
-
-        fs::write(&file_path, &file_content)?;
-
-        Ok(serde_json::json!({
-            "success": true,
-            "path": file_path.to_string_lossy(),
-            "scope": scope
-        }).to_string())
-    }
-
     fn store_memory(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
         let key = cmd.memory_key.as_ref().ok_or_else(|| {
             AgentError::Process("storeMemory requires memory_key".to_string())
@@ -1171,18 +1125,6 @@ impl Agent {
                 }
                 "execPty" => {
                     match self.exec_pty(&cmd).await {
-                        Ok(result) => {
-                            results.push(result);
-                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
-                        }
-                        Err(e) => {
-                            results.push(format!("Error: {}", e));
-                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
-                        }
-                    }
-                }
-                "storeSkill" => {
-                    match self.store_skill(&cmd) {
                         Ok(result) => {
                             results.push(result);
                             self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
@@ -2786,103 +2728,6 @@ mod tests {
         assert!(output.contains("integration_test"), "got: {}", output);
     }
 
-    // storeSkill tests
-
-    #[tokio::test]
-    async fn store_skill_global() {
-        let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
-        let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
-
-        let skill_home = dir.path().join("home");
-        std::env::set_var("HOME", skill_home.to_str().unwrap());
-
-        let cmd = AgentCommand {
-            function: "storeSkill".to_string(),
-            nonce: 1,
-            skill_name: Some("test-skill".to_string()),
-            skill_description: Some("A test skill".to_string()),
-            skill_content: Some("Always test your code.".to_string()),
-            ..Default::default()
-        };
-
-        let result = agent.store_skill(&cmd).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["success"], true);
-        assert_eq!(parsed["scope"], "global");
-
-        let skill_path = skill_home.join(".agent").join("skills").join("test-skill.md");
-        assert!(skill_path.exists());
-        let content = std::fs::read_to_string(&skill_path).unwrap();
-        assert!(content.contains("name: test-skill"));
-        assert!(content.contains("description: A test skill"));
-        assert!(content.contains("Always test your code."));
-    }
-
-    #[tokio::test]
-    async fn store_skill_project_scope() {
-        let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
-        let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
-
-        let project_dir = dir.path().join("project");
-        std::fs::create_dir_all(&project_dir).unwrap();
-
-        let cmd = AgentCommand {
-            function: "storeSkill".to_string(),
-            nonce: 1,
-            skill_name: Some("proj-skill".to_string()),
-            skill_content: Some("Project-specific content.".to_string()),
-            skill_scope: Some("project".to_string()),
-            project_dir: Some(project_dir.to_string_lossy().to_string()),
-            ..Default::default()
-        };
-
-        let result = agent.store_skill(&cmd).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["success"], true);
-        assert_eq!(parsed["scope"], "project");
-
-        let skill_path = project_dir.join("skills").join("proj-skill.md");
-        assert!(skill_path.exists());
-    }
-
-    #[tokio::test]
-    async fn store_skill_missing_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
-        let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
-
-        let cmd = AgentCommand {
-            function: "storeSkill".to_string(),
-            nonce: 1,
-            skill_content: Some("content".to_string()),
-            ..Default::default()
-        };
-
-        assert!(agent.store_skill(&cmd).is_err());
-    }
-
-    #[tokio::test]
-    async fn store_skill_missing_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
-        let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
-
-        let cmd = AgentCommand {
-            function: "storeSkill".to_string(),
-            nonce: 1,
-            skill_name: Some("test".to_string()),
-            ..Default::default()
-        };
-
-        assert!(agent.store_skill(&cmd).is_err());
-    }
-
     // storeMemory tests
 
     #[tokio::test]
@@ -3052,32 +2897,6 @@ mod tests {
             ..Default::default()
         };
         assert!(agent.recall_memory(&cmd).is_err());
-    }
-
-    #[tokio::test]
-    async fn store_skill_process_input_integration() {
-        let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
-        let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
-
-        let skill_home = dir.path().join("home2");
-        std::env::set_var("HOME", skill_home.to_str().unwrap());
-
-        let input = AgentInput {
-            commands: vec![AgentCommand {
-                function: "storeSkill".to_string(),
-                nonce: 1,
-                skill_name: Some("integration-test".to_string()),
-                skill_content: Some("Test content".to_string()),
-                ..Default::default()
-            }],
-            wait_for_status: None,
-        };
-        let results = agent.process_input(input).await.unwrap();
-        assert_eq!(results.len(), 1);
-        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
-        assert_eq!(parsed["success"], true);
     }
 
     #[tokio::test]
