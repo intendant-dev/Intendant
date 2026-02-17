@@ -157,7 +157,8 @@ impl Agent {
             }
         }
         let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-        let log_dir = PathBuf::from(format!("/var/log/agent/{}", timestamp));
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let log_dir = PathBuf::from(format!("{}/.agent/logs/{}", home, timestamp));
         fs::create_dir_all(&log_dir)?;
         fs::write(SESSION_FILE_PATH, log_dir.to_string_lossy().as_bytes())?;
         Ok(log_dir)

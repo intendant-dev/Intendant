@@ -246,7 +246,7 @@ MODEL_NAME=gpt-4o        # optional, provider-specific default used if omitted
 - **OS:** Debian 12+
 - **Runtime:** Tokio async
 - **Display:** DISPLAY is automatically set to `:1` (configurable via `display` field) for GUI commands
-- **Permissions:** Runs as root with full system access
+- **Permissions:** Runs as unprivileged user with passwordless sudo
 
 ### Caller Environment Variables
 
