@@ -446,7 +446,7 @@ Also: {"source": "bare"}"#;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
             parsed["commands"][0]["memory_file"].as_str().unwrap(),
-            "/tmp/proj/.agent/memory.json"
+            "/tmp/proj/.intendant/memory.json"
         );
     }
 
@@ -620,7 +620,7 @@ async fn run_agent_loop(
         // Write sub-agent progress periodically
         if let Some((id, _role)) = sub_agent_mode {
             if turn % PROGRESS_INTERVAL == 0 {
-                if let Ok(progress_path) = env::var("AGENT_PROGRESS_FILE") {
+                if let Ok(progress_path) = env::var("INTENDANT_PROGRESS_FILE") {
                     let last_action = response.content.chars().take(200).collect::<String>();
                     let progress = sub_agent::SubAgentProgress {
                         id: id.clone(),
@@ -830,7 +830,7 @@ fn get_task_from_flags_or_env(flags: &CliFlags) -> Result<String, CallerError> {
     if let Some(ref task) = flags.task {
         return Ok(task.clone());
     }
-    if let Ok(task) = env::var("AGENT_TASK") {
+    if let Ok(task) = env::var("INTENDANT_TASK") {
         return Ok(task);
     }
     print!("Enter task: ");
@@ -844,7 +844,7 @@ fn get_task_from_flags_or_env(flags: &CliFlags) -> Result<String, CallerError> {
 fn get_task() -> Result<String, CallerError> {
     if env::args().len() > 1 {
         Ok(env::args().skip(1).collect::<Vec<_>>().join(" "))
-    } else if let Ok(task) = env::var("AGENT_TASK") {
+    } else if let Ok(task) = env::var("INTENDANT_TASK") {
         Ok(task)
     } else {
         print!("Enter task: ");
@@ -874,7 +874,7 @@ async fn run_sub_agent_mode(
     let mut conversation = Conversation::new(system_prompt, provider.context_window());
 
     // Inject memory if inherited
-    if env::var("AGENT_INHERIT_MEMORY").is_ok() {
+    if env::var("INTENDANT_INHERIT_MEMORY").is_ok() {
         if let Some(store) = memory::load_memory(&project) {
             if let Some(memory_msg) = memory::format_memory_message(&store) {
                 conversation.add_user(memory_msg);
@@ -903,7 +903,7 @@ async fn run_sub_agent_mode(
     ).await;
 
     // Write result file
-    if let Ok(result_path) = env::var("AGENT_RESULT_FILE") {
+    if let Ok(result_path) = env::var("INTENDANT_RESULT_FILE") {
         let (status, summary) = match &result {
             Ok(()) => (
                 sub_agent::SubAgentStatus::Completed,
@@ -1035,12 +1035,12 @@ fn is_simple_task(task: &str) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<(), CallerError> {
-    // Load .env: cwd (+ parents) first, then project root, then ~/.config/agent/
+    // Load .env: cwd (+ parents) first, then project root, then ~/.config/intendant/
     dotenvy::dotenv().ok();
     let project = Project::detect()?;
     dotenvy::from_path(project.root.join(".env")).ok();
     if let Some(config_dir) = dirs::config_dir() {
-        dotenvy::from_path(config_dir.join("agent").join(".env")).ok();
+        dotenvy::from_path(config_dir.join("intendant").join(".env")).ok();
     }
 
     // Override env vars from CLI flags before provider selection

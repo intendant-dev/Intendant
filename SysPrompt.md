@@ -146,11 +146,11 @@ Fetches a URL and converts HTML to readable text. This is synchronous (blocks un
 Asks the human operator a question and waits for their response. Use this as an escape hatch when you're stuck or need clarification.
 
 * **Required field:** `question` — the question to ask.
-* Writes the question to `/dev/shm/agent_human_question` and waits up to 5 minutes for a response at `/dev/shm/agent_human_response`.
+* Writes the question to `/dev/shm/intendant_human_question` and waits up to 5 minutes for a response at `/dev/shm/intendant_human_response`.
 * The question is also printed to stderr so the caller/operator sees it immediately.
 * **Returns:** JSON: `{"success":true,"question":"...","response":"..."}` or `{"success":false,"error":"Timed out..."}`.
 * Files are cleaned up after reading or on timeout.
-* **Note:** The caller's idle/hard timeouts should be increased via `AGENT_IDLE_TIMEOUT` and `AGENT_HARD_TIMEOUT` env vars when using askHuman (e.g., set to 300+ seconds).
+* **Note:** The caller's idle/hard timeouts should be increased via `INTENDANT_IDLE_TIMEOUT` and `INTENDANT_HARD_TIMEOUT` env vars when using askHuman (e.g., set to 300+ seconds).
 
 ### 8. `execPty`
 

@@ -273,7 +273,7 @@ impl App {
                 if let Some(ref textarea) = self.human_textarea {
                     let response = textarea.lines().join("\n");
                     if !response.trim().is_empty() {
-                        let _ = std::fs::write("/dev/shm/agent_human_response", &response);
+                        let _ = std::fs::write("/dev/shm/intendant_human_response", &response);
                         self.log(LogLevel::Info, format!("Human response sent: {}", truncate_str(&response, 80)));
                     }
                 }

@@ -16,8 +16,8 @@ fn has_ask_human(json_input: &str) -> bool {
 pub async fn run_agent(json_input: &str) -> Result<AgentOutput, CallerError> {
     let agent_path = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("agent")))
-        .unwrap_or_else(|| std::path::PathBuf::from("./target/debug/agent"));
+        .and_then(|p| p.parent().map(|d| d.join("intendant-runtime")))
+        .unwrap_or_else(|| std::path::PathBuf::from("./target/debug/intendant-runtime"));
 
     let mut child = Command::new(&agent_path)
         .stdin(Stdio::piped())
@@ -43,13 +43,13 @@ pub async fn run_agent(json_input: &str) -> Result<AgentOutput, CallerError> {
         let default_hard = if ask_human { 600 } else { 30 };
 
         let idle_timeout = Duration::from_secs(
-            std::env::var("AGENT_IDLE_TIMEOUT")
+            std::env::var("INTENDANT_IDLE_TIMEOUT")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(default_idle),
         );
         let hard_timeout = Duration::from_secs(
-            std::env::var("AGENT_HARD_TIMEOUT")
+            std::env::var("INTENDANT_HARD_TIMEOUT")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(default_hard),

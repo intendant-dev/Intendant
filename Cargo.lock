@@ -18,32 +18,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627"
 
 [[package]]
-name = "agent"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "crossterm",
- "dirs",
- "dotenvy",
- "env_logger",
- "html2text",
- "memmap2",
- "portable-pty",
- "ratatui",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "toml",
- "tui-textarea",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -835,6 +809,32 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "intendant"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "crossterm",
+ "dirs",
+ "dotenvy",
+ "env_logger",
+ "html2text",
+ "memmap2",
+ "portable-pty",
+ "ratatui",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tui-textarea",
 ]
 
 [[package]]

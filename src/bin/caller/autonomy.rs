@@ -105,7 +105,7 @@ impl Default for ApprovalRule {
     }
 }
 
-/// Category-level approval rules parsed from agent.toml [approval] section.
+/// Category-level approval rules parsed from intendant.toml [approval] section.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApprovalConfig {
     #[serde(default = "default_auto")]

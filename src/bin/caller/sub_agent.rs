@@ -76,18 +76,18 @@ pub struct SubAgentProgress {
 pub fn build_spawn_command(spec: &SubAgentSpec, caller_path: &Path) -> String {
     let caller = caller_path.to_string_lossy();
     let mut env_parts = vec![
-        format!("AGENT_ROLE={}", spec.role.as_str()),
-        format!("AGENT_ID={}", spec.id),
-        format!("AGENT_RESULT_FILE={}", spec.result_file.to_string_lossy()),
-        format!("AGENT_PROGRESS_FILE={}", spec.progress_file.to_string_lossy()),
+        format!("INTENDANT_ROLE={}", spec.role.as_str()),
+        format!("INTENDANT_ID={}", spec.id),
+        format!("INTENDANT_RESULT_FILE={}", spec.result_file.to_string_lossy()),
+        format!("INTENDANT_PROGRESS_FILE={}", spec.progress_file.to_string_lossy()),
     ];
 
     if spec.inherit_memory {
-        env_parts.push("AGENT_INHERIT_MEMORY=1".to_string());
+        env_parts.push("INTENDANT_INHERIT_MEMORY=1".to_string());
     }
 
     if let Some(ref prompt) = spec.system_prompt {
-        env_parts.push(format!("AGENT_SYSTEM_PROMPT={}", prompt));
+        env_parts.push(format!("INTENDANT_SYSTEM_PROMPT={}", prompt));
     }
 
     let env_str = env_parts.join(" ");
@@ -170,8 +170,8 @@ pub fn format_result_message(result: &SubAgentResult) -> String {
 }
 
 pub fn detect_sub_agent_mode() -> Option<(String, SubAgentRole)> {
-    let role = std::env::var("AGENT_ROLE").ok()?;
-    let id = std::env::var("AGENT_ID").unwrap_or_else(|_| "unnamed".to_string());
+    let role = std::env::var("INTENDANT_ROLE").ok()?;
+    let id = std::env::var("INTENDANT_ID").unwrap_or_else(|_| "unnamed".to_string());
     Some((id, SubAgentRole::from_str(&role)))
 }
 
@@ -210,8 +210,8 @@ mod tests {
             task: "Investigate the database schema".to_string(),
             role: SubAgentRole::Research,
             working_dir: PathBuf::from("/tmp/project"),
-            result_file: PathBuf::from("/tmp/project/.agent/subagents/research-1/result.json"),
-            progress_file: PathBuf::from("/tmp/project/.agent/subagents/research-1/progress.json"),
+            result_file: PathBuf::from("/tmp/project/.intendant/subagents/research-1/result.json"),
+            progress_file: PathBuf::from("/tmp/project/.intendant/subagents/research-1/progress.json"),
             system_prompt: None,
             inherit_memory: true,
         }
@@ -233,14 +233,14 @@ mod tests {
     #[test]
     fn build_spawn_command_format() {
         let spec = make_spec();
-        let cmd = build_spawn_command(&spec, Path::new("/usr/local/bin/caller"));
+        let cmd = build_spawn_command(&spec, Path::new("/usr/local/bin/intendant"));
 
-        assert!(cmd.contains("AGENT_ROLE=research"));
-        assert!(cmd.contains("AGENT_ID=research-1"));
-        assert!(cmd.contains("AGENT_RESULT_FILE="));
-        assert!(cmd.contains("AGENT_PROGRESS_FILE="));
-        assert!(cmd.contains("AGENT_INHERIT_MEMORY=1"));
-        assert!(cmd.contains("/usr/local/bin/caller"));
+        assert!(cmd.contains("INTENDANT_ROLE=research"));
+        assert!(cmd.contains("INTENDANT_ID=research-1"));
+        assert!(cmd.contains("INTENDANT_RESULT_FILE="));
+        assert!(cmd.contains("INTENDANT_PROGRESS_FILE="));
+        assert!(cmd.contains("INTENDANT_INHERIT_MEMORY=1"));
+        assert!(cmd.contains("/usr/local/bin/intendant"));
         assert!(cmd.contains("Investigate the database schema"));
     }
 
@@ -248,16 +248,16 @@ mod tests {
     fn build_spawn_command_no_inherit() {
         let mut spec = make_spec();
         spec.inherit_memory = false;
-        let cmd = build_spawn_command(&spec, Path::new("/usr/local/bin/caller"));
-        assert!(!cmd.contains("AGENT_INHERIT_MEMORY"));
+        let cmd = build_spawn_command(&spec, Path::new("/usr/local/bin/intendant"));
+        assert!(!cmd.contains("INTENDANT_INHERIT_MEMORY"));
     }
 
     #[test]
     fn build_spawn_command_with_system_prompt() {
         let mut spec = make_spec();
         spec.system_prompt = Some("Custom prompt".to_string());
-        let cmd = build_spawn_command(&spec, Path::new("/usr/local/bin/caller"));
-        assert!(cmd.contains("AGENT_SYSTEM_PROMPT=Custom prompt"));
+        let cmd = build_spawn_command(&spec, Path::new("/usr/local/bin/intendant"));
+        assert!(cmd.contains("INTENDANT_SYSTEM_PROMPT=Custom prompt"));
     }
 
     #[test]
@@ -462,8 +462,8 @@ mod tests {
 
     #[test]
     fn detect_sub_agent_mode_not_set() {
-        // This test is sensitive to env; in normal test runs AGENT_ROLE is not set
-        std::env::remove_var("AGENT_ROLE");
+        // This test is sensitive to env; in normal test runs INTENDANT_ROLE is not set
+        std::env::remove_var("INTENDANT_ROLE");
         assert!(detect_sub_agent_mode().is_none());
     }
 

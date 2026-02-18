@@ -45,7 +45,7 @@ pub fn format_progress_for_user(progress: &SubAgentProgress) -> String {
 }
 
 pub fn relay_user_input(spec: &SubAgentSpec, input: &str) -> Result<(), CallerError> {
-    let command_file = spec.working_dir.join(".agent").join("user_input.txt");
+    let command_file = spec.working_dir.join(".intendant").join("user_input.txt");
     if let Some(parent) = command_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -56,8 +56,8 @@ pub fn relay_user_input(spec: &SubAgentSpec, input: &str) -> Result<(), CallerEr
 pub fn get_caller_path() -> PathBuf {
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("caller")))
-        .unwrap_or_else(|| PathBuf::from("./target/debug/caller"))
+        .and_then(|p| p.parent().map(|d| d.join("intendant")))
+        .unwrap_or_else(|| PathBuf::from("./target/debug/intendant"))
 }
 
 #[cfg(test)]
@@ -151,7 +151,7 @@ mod tests {
 
         relay_user_input(&spec, "Use PostgreSQL").unwrap();
 
-        let content = std::fs::read_to_string(dir.path().join(".agent/user_input.txt")).unwrap();
+        let content = std::fs::read_to_string(dir.path().join(".intendant/user_input.txt")).unwrap();
         assert_eq!(content, "Use PostgreSQL");
     }
 

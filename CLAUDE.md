@@ -2,17 +2,17 @@
 
 ## Project Overview
 
-This is **Agent**, a Rust runtime for autonomous AI agents with process lifecycle management. It executes bash commands on behalf of AI agents, tracks process state via shared memory, streams status updates, and persists logs across binary restarts.
+This is **Intendant**, a Rust runtime for autonomous AI agents with process lifecycle management. It executes bash commands on behalf of AI agents, tracks process state via shared memory, streams status updates, and persists logs across binary restarts.
 
 The project produces two binaries:
-- **agent** — Command runtime that reads JSON from stdin, spawns bash commands, and writes status lines to stdout
-- **caller** — AI integration layer that drives the agent via the OpenAI Responses API or Anthropic Messages API in a loop
+- **intendant-runtime** — Command runtime that reads JSON from stdin, spawns bash commands, and writes status lines to stdout
+- **intendant** — AI integration layer (CLI/TUI) that drives the runtime via the OpenAI Responses API or Anthropic Messages API in a loop
 
 ## Repository Structure
 
 ```
 src/
-├── main.rs              # Agent binary entry point (tokio async main)
+├── main.rs              # intendant-runtime binary entry point (tokio async main)
 ├── agent.rs             # Core agent implementation (~3000 lines)
 │                        #   - Shared memory management
 │                        #   - Command execution (execAsAgent)
@@ -31,19 +31,19 @@ src/
 ├── status_monitor.rs    # Background task polling shared memory every 100ms
 └── bin/
     └── caller/
-        ├── main.rs          # Caller entry point: 3 modes (user/sub-agent/direct), budget-aware loop, TUI init
+        ├── main.rs          # intendant entry point: 3 modes (user/sub-agent/direct), budget-aware loop, TUI init
         ├── provider.rs      # Multi-provider API client (OpenAI Responses API + Anthropic), structured output, reasoning controls
         ├── conversation.rs  # Message management with layer protection, drop/summarize, budget tracking
-        ├── agent_runner.rs  # Spawns agent subprocess, manages I/O with timeouts (askHuman-aware)
+        ├── agent_runner.rs  # Spawns intendant-runtime subprocess, manages I/O with timeouts (askHuman-aware)
         ├── knowledge.rs     # Tagged knowledge store with pub/sub channels, cursor-based routing
         ├── memory.rs        # Backward-compatible memory wrapper delegating to knowledge.rs
         ├── sub_agent.rs     # Sub-agent spawning, result/progress I/O, role-specific configuration
         ├── worktree.rs      # Git worktree management for isolated implementation agents
         ├── user_mode.rs     # User-mode orchestrator spawning, progress monitoring, input relay
         ├── prompts.rs       # System prompt resolution: compile-time defaults (include_str!) + 3-layer cascade
-        ├── project.rs       # Project detection (git root), config parsing (agent.toml + [approval])
+        ├── project.rs       # Project detection (git root), config parsing (intendant.toml + [approval])
         ├── autonomy.rs      # Autonomy levels, action categories, approval rules, command classification
-        ├── control.rs       # Unix control socket server (JSON-line protocol at /tmp/agent-<pid>.sock)
+        ├── control.rs       # Unix control socket server (JSON-line protocol at /tmp/intendant-<pid>.sock)
         ├── error.rs         # CallerError enum (includes Tui variant)
         └── tui/
             ├── mod.rs       # Tui struct: terminal init/restore, panic hook, render+event loop
@@ -62,23 +62,23 @@ SysPrompt_implementation.md  # Implementation sub-agent prompt
 ## Build and Run
 
 ```bash
-cargo build --release     # Produces target/release/agent and target/release/caller
+cargo build --release     # Produces target/release/intendant-runtime and target/release/intendant
 cargo build               # Debug build
 cargo check               # Type-check without building
 ```
 
-Running the agent:
+Running the runtime:
 ```bash
-echo '{"commands":[{"function":"execAsAgent","nonce":1,"command":"echo hello"}]}' | ./target/release/agent
+echo '{"commands":[{"function":"execAsAgent","nonce":1,"command":"echo hello"}]}' | ./target/release/intendant-runtime
 ```
 
-Running the caller (requires `.env` with API key):
+Running the CLI (requires `.env` with API key):
 ```bash
-./target/release/caller "List the files in /tmp"
-./target/release/caller --no-tui "echo hello"          # Headless (no TUI)
-./target/release/caller --autonomy low "rm /tmp/test"   # Ask before every command
-./target/release/caller --provider anthropic --model claude-sonnet-4-5-20250929 "task"
-echo "task" | ./target/release/caller                   # Auto-detects non-TTY, runs headless
+./target/release/intendant "List the files in /tmp"
+./target/release/intendant --no-tui "echo hello"          # Headless (no TUI)
+./target/release/intendant --autonomy low "rm /tmp/test"   # Ask before every command
+./target/release/intendant --provider anthropic --model claude-sonnet-4-5-20250929 "task"
+echo "task" | ./target/release/intendant                   # Auto-detects non-TTY, runs headless
 ```
 
 ## Testing
@@ -120,7 +120,7 @@ Test coverage includes:
 
 ### Shared Memory
 
-Process state lives in `/dev/shm/agent_processes` — a fixed-size array of 1024 `ProcessInfo` slots (repr(C) structs). Each slot holds: nonce (u64), PID (i32), status (u8), exit code (i32), timestamp (u64). This survives binary restarts since `/dev/shm` is tmpfs.
+Process state lives in `/dev/shm/intendant_processes` — a fixed-size array of 1024 `ProcessInfo` slots (repr(C) structs). Each slot holds: nonce (u64), PID (i32), status (u8), exit code (i32), timestamp (u64). This survives binary restarts since `/dev/shm` is tmpfs.
 
 The process map (`HashMap<u64, usize>`) is rebuilt from shared memory on every startup by scanning all 1024 slots for non-zero nonces.
 
@@ -128,7 +128,7 @@ All command nonces (both async and synchronous) are pre-registered in shared mem
 
 ### Session Persistence
 
-`/dev/shm/agent_session` stores the log directory path. Consecutive runs reuse the same log directory (`/var/log/agent/<timestamp>/`). To reset: `rm -f /dev/shm/agent_processes /dev/shm/agent_session`.
+`/dev/shm/intendant_session` stores the log directory path. Consecutive runs reuse the same log directory (`/var/log/intendant/<timestamp>/`). To reset: `rm -f /dev/shm/intendant_processes /dev/shm/intendant_session`.
 
 ### Status Protocol
 
@@ -144,24 +144,24 @@ Commands chain via `depending_nonce`, `wait`, and `expected_status`. When `wait`
 
 `$NONCE[id]` in command strings is replaced with the PID of the process launched by that nonce. Handled by regex-based substitution in `replace_nonce_refs()`.
 
-### Caller Flow
+### Intendant Flow
 
-The caller operates in three modes based on environment:
+`intendant` operates in three modes based on environment:
 
-**Sub-Agent Mode** (`AGENT_ROLE` set): Runs with scoped task, writes progress/results to files, uses role-specific system prompt.
+**Sub-Agent Mode** (`INTENDANT_ROLE` set): Runs with scoped task, writes progress/results to files, uses role-specific system prompt.
 
-**User Mode** (complex task, no `AGENT_ROLE`): Spawns orchestrator sub-agent, monitors progress, relays to user. User-layer messages are protected from auto-pruning.
+**User Mode** (complex task, no `INTENDANT_ROLE`): Spawns orchestrator sub-agent, monitors progress, relays to user. User-layer messages are protected from auto-pruning.
 
-**Direct Mode** (simple task, no `AGENT_ROLE`): Single-loop execution:
+**Direct Mode** (simple task, no `INTENDANT_ROLE`): Single-loop execution:
 1. Selects API provider (OpenAI or Anthropic) from env, configures structured output and reasoning controls
-2. Detects project root via git, loads `agent.toml` config
+2. Detects project root via git, loads `intendant.toml` config
 3. Reads role-appropriate system prompt
 4. Injects project knowledge into conversation
 5. Budget-aware loop (stops at context exhaustion, `done` signal, or 500-turn safety cap): send to model -> extract JSON -> check done signal -> apply context directives -> inject project context -> pipe to agent -> append budget summary -> feed output back
 
 ### TUI Mode
 
-When stdin is a TTY and `--no-tui` is not set, the caller launches a ratatui-based terminal UI:
+When stdin is a TTY and `--no-tui` is not set, `intendant` launches a ratatui-based terminal UI:
 - **Status bar**: Provider, model, turn count, budget percentage, autonomy level
 - **Action panel**: Current phase (Thinking/RunningAgent/WaitingApproval/WaitingHuman/Done) with spinner
 - **Log panel**: Scrollable chronological log of all events with color-coded levels
@@ -176,14 +176,14 @@ The agent loop runs in a background tokio task and communicates with the TUI via
 Three-layer autonomy control:
 
 1. **Global level** (`--autonomy` flag, +/- keys in TUI): Low/Medium/High/Full
-2. **Category rules** (`[approval]` section in agent.toml): per-category Auto/Ask/Deny
+2. **Category rules** (`[approval]` section in intendant.toml): per-category Auto/Ask/Deny
 3. **Per-action approval** (TUI only): approve/skip/approve-all/deny
 
 Commands are classified into categories (FileRead, FileWrite, FileDelete, CommandExec, NetworkRequest, Destructive, HumanInput) by `autonomy::classify_command()`. Shell commands are further classified by inspecting the command string for destructive patterns (rm, kill), network tools (curl, wget, git), and file writes (redirects, tee, mv, cp).
 
 ### Control Socket
 
-A Unix socket server at `/tmp/agent-<pid>.sock` enables programmatic control. JSON-line protocol supports: status, approve, deny, input, set_autonomy, quit. Outbound events are broadcast to all connected clients.
+A Unix socket server at `/tmp/intendant-<pid>.sock` enables programmatic control. JSON-line protocol supports: status, approve, deny, input, set_autonomy, quit. Outbound events are broadcast to all connected clients.
 
 ### OpenAI API Features
 
@@ -218,7 +218,7 @@ A Unix socket server at `/tmp/agent-<pid>.sock` enables programmatic control. JS
 | `html2text` | HTML to plain text conversion for browse |
 | `portable-pty` | PTY session management for execPty |
 | `dotenvy` | .env file loading |
-| `toml` | agent.toml config parsing |
+| `toml` | intendant.toml config parsing |
 | `async-trait` | Async trait support for ChatProvider |
 | `ratatui` | Terminal UI framework |
 | `crossterm` | Terminal input/output backend (event-stream feature) |
@@ -230,7 +230,7 @@ A Unix socket server at `/tmp/agent-<pid>.sock` enables programmatic control. JS
 
 - **OS**: Linux (requires `/dev/shm` for shared memory)
 - **Permissions**: Runs as unprivileged user with passwordless sudo
-- **For caller**: `.env` file with `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, optional `PROVIDER`, `MODEL_NAME`, `STRUCTURED_OUTPUT`, `REASONING_EFFORT`, `REASONING_SUMMARY`
+- **For intendant**: `.env` file with `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, optional `PROVIDER`, `MODEL_NAME`, `STRUCTURED_OUTPUT`, `REASONING_EFFORT`, `REASONING_SUMMARY`
 - **For captureScreen**: ImageMagick `import` command and DISPLAY environment variable (defaults to `:1`)
 
 ## CI/CD
