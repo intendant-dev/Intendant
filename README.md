@@ -193,10 +193,10 @@ enabled = false  # default: true
 cargo test
 ```
 
-273 tests cover both binaries:
+289 tests cover both binaries:
 
 - **Agent binary (114 tests):** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
-- **Caller binary (159 tests):** JSON extraction, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, and knowledge pub/sub system.
+- **Caller binary (175 tests):** JSON extraction, done signal handling, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, and knowledge pub/sub system.
 
 ## Session Management
 
@@ -265,16 +265,18 @@ The caller operates in one of three modes, selected automatically:
 ### How it works
 
 1. Loads `.env` and selects the API provider (OpenAI or Anthropic). OpenAI gpt-5+/o3/o4 models use the Responses API (`/v1/responses`); legacy models use Chat Completions
-2. Detects the project root (via `git rev-parse --show-toplevel`, falls back to cwd)
-3. Reads role-appropriate system prompt (e.g., `SysPrompt.md`, `SysPrompt_orchestrator.md`)
-4. Loads knowledge from `<project>/.agent/memory.json`, injects into conversation
-5. Sends the task to the chat API
-6. Extracts JSON from the model's response (handles code fences and bare JSON)
-7. Applies context directives (`drop_turns`, `summarize`) to the conversation
-8. Injects project context (`memory_file`) into relevant commands
-9. Pipes the JSON to the agent binary, reads stdout/stderr with idle timeout (3s) and hard timeout (30s)
-10. Feeds the agent output back as the next user message, appending a token budget summary
-11. Repeats until the model responds with no JSON (task complete) or the context budget is exhausted
+2. Configures structured output (JSON mode), reasoning controls, and max output tokens based on model capabilities and env vars
+3. Detects the project root (via `git rev-parse --show-toplevel`, falls back to cwd)
+4. Reads role-appropriate system prompt (e.g., `SysPrompt.md`, `SysPrompt_orchestrator.md`)
+5. Loads knowledge from `<project>/.agent/memory.json`, injects into conversation
+6. Sends the task to the chat API (with `max_tokens`/`max_output_tokens`, optional `reasoning`, and optional JSON format)
+7. Extracts JSON from the model's response (handles structured output, code fences, and bare JSON)
+8. Checks for explicit `done` signal (`{"done": true}`) for task completion in JSON mode
+9. Applies context directives (`drop_turns`, `summarize`) to the conversation
+10. Injects project context (`memory_file`) into relevant commands
+11. Pipes the JSON to the agent binary, reads stdout/stderr with idle timeout (3s) and hard timeout (30s)
+12. Feeds the agent output back as the next user message, appending a token budget summary
+13. Repeats until the model signals done, responds with no JSON, or the context budget is exhausted
 
 ## Environment
 
@@ -294,7 +296,10 @@ The caller operates in one of three modes, selected automatically:
 | `AGENT_IDLE_TIMEOUT` | `3` | Seconds to wait for agent output before assuming idle |
 | `AGENT_HARD_TIMEOUT` | `30` | Maximum seconds to wait for agent output |
 | `MODEL_CONTEXT_WINDOW` | per-model default | Context window size in tokens |
-| `MAX_OUTPUT_TOKENS` | per-model default | Max output tokens per API call |
+| `MAX_OUTPUT_TOKENS` | per-model default | Max output tokens per API call (sent to API) |
+| `STRUCTURED_OUTPUT` | `true` for gpt-5+/gpt-4o/o3/o4 | Enable JSON object mode for deterministic parsing |
+| `REASONING_EFFORT` | — | Reasoning effort for GPT-5/o3/o4 models (`low`, `medium`, `high`) |
+| `REASONING_SUMMARY` | — | Reasoning summary mode (`auto`, `concise`, `detailed`) |
 | `AGENT_ROLE` | — | Sub-agent role (`orchestrator`, `research`, `implementation`, `testing`) |
 | `AGENT_ID` | — | Unique sub-agent identifier |
 | `AGENT_RESULT_FILE` | — | Path for sub-agent to write final results |
