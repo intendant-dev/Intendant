@@ -1,4 +1,6 @@
 mod agent_runner;
+mod autonomy;
+mod control;
 mod conversation;
 mod error;
 mod knowledge;
@@ -6,18 +8,108 @@ mod memory;
 mod project;
 mod provider;
 mod sub_agent;
+mod tui;
 mod user_mode;
 mod worktree;
 
+use autonomy::{AutonomyLevel, AutonomyState, SharedAutonomy};
 use conversation::Conversation;
 use error::CallerError;
 use project::Project;
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Write, IsTerminal};
+use tui::event::{AppEvent, EventBus};
 
 const SAFETY_CAP: usize = 500;
 const MIN_BUDGET_TOKENS: u64 = 4096;
 const BUDGET_WARNING_THRESHOLD: f64 = 0.85;
+
+/// CLI flags parsed from command-line arguments.
+struct CliFlags {
+    task: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    verbose: bool,
+    no_tui: bool,
+    autonomy: AutonomyLevel,
+    log_file: Option<String>,
+    control_socket: bool,
+}
+
+fn parse_cli_flags() -> CliFlags {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut flags = CliFlags {
+        task: None,
+        provider: None,
+        model: None,
+        verbose: false,
+        no_tui: false,
+        autonomy: AutonomyLevel::Medium,
+        log_file: None,
+        control_socket: false,
+    };
+
+    let mut task_parts = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--provider" => {
+                if i + 1 < args.len() {
+                    flags.provider = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--model" => {
+                if i + 1 < args.len() {
+                    flags.model = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--verbose" | "-v" => {
+                flags.verbose = true;
+                i += 1;
+            }
+            "--no-tui" => {
+                flags.no_tui = true;
+                i += 1;
+            }
+            "--autonomy" => {
+                if i + 1 < args.len() {
+                    flags.autonomy = AutonomyLevel::from_str_loose(&args[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--log-file" => {
+                if i + 1 < args.len() {
+                    flags.log_file = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--control-socket" => {
+                flags.control_socket = true;
+                i += 1;
+            }
+            other => {
+                task_parts.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+
+    if !task_parts.is_empty() {
+        flags.task = Some(task_parts.join(" "));
+    }
+
+    flags
+}
 
 fn extract_json(text: &str) -> Option<&str> {
     // Try to find JSON in ```json code fences
@@ -142,6 +234,15 @@ fn inject_project_context(
     }
 
     serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
+}
+
+/// Macro-like helper for conditional output: TUI event bus or println.
+fn emit(bus: &Option<EventBus>, event_fn: impl FnOnce() -> AppEvent, fallback: impl FnOnce()) {
+    if let Some(bus) = bus {
+        bus.send(event_fn());
+    } else {
+        fallback();
+    }
 }
 
 #[cfg(test)]
@@ -409,6 +510,47 @@ Also: {"source": "bare"}"#;
     fn is_simple_task_multiline() {
         assert!(!is_simple_task("line1\nline2\nline3\nline4"));
     }
+
+    #[test]
+    fn parse_cli_flags_empty() {
+        // Can't easily test parse_cli_flags since it reads env::args(),
+        // but we can test the struct defaults
+        let flags = CliFlags {
+            task: None,
+            provider: None,
+            model: None,
+            verbose: false,
+            no_tui: false,
+            autonomy: AutonomyLevel::Medium,
+            log_file: None,
+            control_socket: false,
+        };
+        assert!(!flags.verbose);
+        assert!(!flags.no_tui);
+        assert_eq!(flags.autonomy, AutonomyLevel::Medium);
+    }
+
+    #[test]
+    fn emit_with_bus() {
+        let (bus, mut rx) = EventBus::new();
+        let bus_opt = Some(bus);
+        emit(&bus_opt, || AppEvent::Tick, || panic!("should not be called"));
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            match rx.recv().await.unwrap() {
+                AppEvent::Tick => {}
+                _ => panic!("expected Tick"),
+            }
+        });
+    }
+
+    #[test]
+    fn emit_without_bus() {
+        let bus_opt: Option<EventBus> = None;
+        let mut called = false;
+        emit(&bus_opt, || AppEvent::Tick, || called = true);
+        assert!(called);
+    }
 }
 
 const PROGRESS_INTERVAL: usize = 5;
@@ -418,30 +560,58 @@ async fn run_agent_loop(
     conversation: &mut Conversation,
     project: &Project,
     sub_agent_mode: Option<&(String, sub_agent::SubAgentRole)>,
+    bus: Option<EventBus>,
+    autonomy: SharedAutonomy,
 ) -> Result<(), CallerError> {
     let mut budget_warning_shown = false;
 
     for turn in 1..=SAFETY_CAP {
         // Check budget before sending
         if conversation.remaining_budget() <= MIN_BUDGET_TOKENS {
-            println!("--- Context budget exhausted ({} tokens remaining) ---", conversation.remaining_budget());
+            let remaining = conversation.remaining_budget();
+            emit(
+                &bus,
+                || AppEvent::BudgetExhausted { remaining },
+                || println!("--- Context budget exhausted ({} tokens remaining) ---", remaining),
+            );
             break;
         }
 
         conversation.increment_turn();
+        let budget_pct = conversation.usage_fraction() * 100.0;
+        let remaining = conversation.remaining_budget();
 
-        println!("[Turn {}] Sending to model... {}", turn, conversation.budget_summary());
+        emit(
+            &bus,
+            || AppEvent::TurnStarted { turn, budget_pct, remaining },
+            || println!("[Turn {}] Sending to model... {}", turn, conversation.budget_summary()),
+        );
 
-        let response = provider.chat(conversation.messages()).await?;
+        let response = match provider.chat(conversation.messages()).await {
+            Ok(r) => r,
+            Err(e) => {
+                emit(
+                    &bus,
+                    || AppEvent::LoopError(e.to_string()),
+                    || eprintln!("Error: {}", e),
+                );
+                return Err(e);
+            }
+        };
         conversation.set_usage(response.usage.clone());
         conversation.add_assistant(response.content.clone());
 
         // Check budget warning
         if !budget_warning_shown && conversation.usage_fraction() >= BUDGET_WARNING_THRESHOLD {
-            eprintln!(
-                "WARNING: Context budget is running low ({:.0}% used, {} tokens remaining)",
-                conversation.usage_fraction() * 100.0,
-                conversation.remaining_budget()
+            let pct = conversation.usage_fraction() * 100.0;
+            let remaining = conversation.remaining_budget();
+            emit(
+                &bus,
+                || AppEvent::BudgetWarning { pct, remaining },
+                || eprintln!(
+                    "WARNING: Context budget is running low ({:.0}% used, {} tokens remaining)",
+                    pct, remaining,
+                ),
             );
             budget_warning_shown = true;
         }
@@ -463,25 +633,53 @@ async fn run_agent_loop(
             }
         }
 
-        println!("Model response:\n{}", response.content);
-        println!();
+        emit(
+            &bus,
+            || AppEvent::ModelResponse {
+                content: response.content.clone(),
+                usage: response.usage.clone(),
+            },
+            || {
+                println!("Model response:\n{}", response.content);
+                println!();
+            },
+        );
 
         // Extract JSON from response
         let json_str = match extract_json(&response.content) {
             Some(json) => json.to_string(),
             None => {
-                println!("--- Task complete ---");
+                emit(
+                    &bus,
+                    || AppEvent::TaskComplete { reason: "Task complete".to_string() },
+                    || println!("--- Task complete ---"),
+                );
                 break;
             }
         };
 
+        emit(
+            &bus,
+            || AppEvent::JsonExtracted {
+                preview: json_str.chars().take(100).collect(),
+            },
+            || {},
+        );
+
         // Check for explicit done signal (used in structured output / JSON mode)
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
             if parsed.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
-                if let Some(msg) = parsed.get("message").and_then(|m| m.as_str()) {
-                    println!("{}", msg);
-                }
-                println!("--- Task complete ---");
+                let message = parsed.get("message").and_then(|m| m.as_str()).map(String::from);
+                emit(
+                    &bus,
+                    || AppEvent::DoneSignal { message: message.clone() },
+                    || {
+                        if let Some(ref msg) = message {
+                            println!("{}", msg);
+                        }
+                        println!("--- Task complete ---");
+                    },
+                );
                 break;
             }
         }
@@ -493,12 +691,20 @@ async fn run_agent_loop(
         if json_str.is_empty() {
             if had_context {
                 // Context directives were applied, but no commands — context management turn
-                println!("[Turn {}] Context management only, continuing...", turn);
+                emit(
+                    &bus,
+                    || AppEvent::ContextManagement { turn },
+                    || println!("[Turn {}] Context management only, continuing...", turn),
+                );
                 conversation.add_user("Context updated.".to_string());
                 continue;
             } else {
                 // No commands and no context directives — task complete
-                println!("--- Task complete ---");
+                emit(
+                    &bus,
+                    || AppEvent::TaskComplete { reason: "Task complete".to_string() },
+                    || println!("--- Task complete ---"),
+                );
                 break;
             }
         }
@@ -506,13 +712,84 @@ async fn run_agent_loop(
         // Inject project context (memory_file) into commands
         let json_str = inject_project_context(&json_str, project);
 
-        println!("[Turn {}] Running agent...", turn);
+        // Check autonomy / approval for commands
+        let needs_approval = {
+            let classifications = autonomy::classify_batch(&json_str);
+            let autonomy_state = autonomy.read().await;
+            let mut need = None;
+            for (_idx, categories) in &classifications {
+                for &cat in categories {
+                    if autonomy_state.needs_approval(cat) {
+                        need = Some(cat);
+                        break;
+                    }
+                }
+                if need.is_some() {
+                    break;
+                }
+            }
+            need
+        }; // autonomy_state read lock dropped here
+
+        let mut should_skip = false;
+        if let Some(cat) = needs_approval {
+            if let Some(ref bus_ref) = bus {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let preview = json_str.chars().take(200).collect::<String>();
+                bus_ref.send(AppEvent::ApprovalRequired {
+                    id: turn as u64,
+                    command_preview: preview,
+                    category: cat,
+                    responder: tx,
+                });
+                match rx.await {
+                    Ok(tui::event::ApprovalResponse::Approve) => {}
+                    Ok(tui::event::ApprovalResponse::ApproveAll) => {
+                        let mut state = autonomy.write().await;
+                        state.level = AutonomyLevel::Full;
+                    }
+                    Ok(tui::event::ApprovalResponse::Skip) => {
+                        should_skip = true;
+                    }
+                    Ok(tui::event::ApprovalResponse::Deny) | Err(_) => {
+                        emit(
+                            &bus,
+                            || AppEvent::TaskComplete { reason: "Denied by user".to_string() },
+                            || println!("--- Denied by user ---"),
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            // In headless mode, just proceed (no approval UI)
+        }
+
+        if should_skip {
+            conversation.add_user("Command skipped by user.".to_string());
+            continue;
+        }
+
+        emit(
+            &bus,
+            || AppEvent::AgentStarted { turn },
+            || println!("[Turn {}] Running agent...", turn),
+        );
+
         let output = agent_runner::run_agent(&json_str).await?;
 
-        println!("Agent stdout:\n{}", output.stdout);
-        if !output.stderr.is_empty() {
-            eprintln!("Agent stderr:\n{}", output.stderr);
-        }
+        emit(
+            &bus,
+            || AppEvent::AgentOutput {
+                stdout: output.stdout.clone(),
+                stderr: output.stderr.clone(),
+            },
+            || {
+                println!("Agent stdout:\n{}", output.stdout);
+                if !output.stderr.is_empty() {
+                    eprintln!("Agent stderr:\n{}", output.stderr);
+                }
+            },
+        );
 
         // Check for completed sub-agent results
         let sub_agent_dir = project.sub_agent_dir();
@@ -520,7 +797,11 @@ async fn run_agent_loop(
             let results = sub_agent::scan_completed_results(&sub_agent_dir);
             for result in &results {
                 let msg = sub_agent::format_result_message(result);
-                println!("{}", msg);
+                emit(
+                    &bus,
+                    || AppEvent::SubAgentResult { formatted: msg.clone() },
+                    || println!("{}", msg),
+                );
             }
         }
 
@@ -533,13 +814,32 @@ async fn run_agent_loop(
         conversation.add_user(user_msg);
 
         if turn == SAFETY_CAP {
-            println!("--- Safety cap ({}) reached ---", SAFETY_CAP);
+            emit(
+                &bus,
+                || AppEvent::SafetyCapReached,
+                || println!("--- Safety cap ({}) reached ---", SAFETY_CAP),
+            );
         }
     }
 
     Ok(())
 }
 
+fn get_task_from_flags_or_env(flags: &CliFlags) -> Result<String, CallerError> {
+    if let Some(ref task) = flags.task {
+        return Ok(task.clone());
+    }
+    if let Ok(task) = env::var("AGENT_TASK") {
+        return Ok(task);
+    }
+    print!("Enter task: ");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+/// Legacy get_task for sub-agent mode (doesn't use CliFlags).
 fn get_task() -> Result<String, CallerError> {
     if env::args().len() > 1 {
         Ok(env::args().skip(1).collect::<Vec<_>>().join(" "))
@@ -586,12 +886,19 @@ async fn run_sub_agent_mode(
     println!("Task: {}", task);
     println!("---");
 
+    let autonomy = autonomy::shared_autonomy(AutonomyState::new(
+        AutonomyLevel::Full, // sub-agents run fully autonomous
+        autonomy::ApprovalConfig::default(),
+    ));
+
     let sub_agent_info = (id.clone(), role);
     let result = run_agent_loop(
         provider.as_ref(),
         &mut conversation,
         &project,
         Some(&sub_agent_info),
+        None, // no TUI for sub-agents
+        autonomy,
     ).await;
 
     // Write result file
@@ -625,11 +932,15 @@ async fn run_user_mode(
     provider: Box<dyn provider::ChatProvider>,
     task: String,
     project: Project,
+    bus: Option<EventBus>,
+    autonomy: SharedAutonomy,
 ) -> Result<(), CallerError> {
     let system_prompt = user_mode::resolve_system_prompt(&sub_agent::SubAgentRole::Custom("user".to_string()))?;
 
-    println!("Provider: {} (context window: {})", provider.name(), provider.context_window());
-    println!("Mode: user (orchestrator will be spawned for complex tasks)");
+    if bus.is_none() {
+        println!("Provider: {} (context window: {})", provider.name(), provider.context_window());
+        println!("Mode: user (orchestrator will be spawned for complex tasks)");
+    }
 
     let mut conversation = Conversation::new(system_prompt, provider.context_window());
     conversation.set_protect_user_layer(true);
@@ -643,16 +954,18 @@ async fn run_user_mode(
     }
 
     conversation.add_user_with_layer(task.clone(), conversation::MessageLayer::User);
-    println!("Task: {}", task);
-    println!("---");
+    if bus.is_none() {
+        println!("Task: {}", task);
+        println!("---");
+    }
 
-    // In user mode, run the loop which will handle orchestrator spawning
-    // The model (with user system prompt) decides whether to handle directly or spawn orchestrator
     run_agent_loop(
         provider.as_ref(),
         &mut conversation,
         &project,
         None,
+        bus,
+        autonomy,
     ).await
 }
 
@@ -660,11 +973,15 @@ async fn run_direct_mode(
     provider: Box<dyn provider::ChatProvider>,
     task: String,
     project: Project,
+    bus: Option<EventBus>,
+    autonomy: SharedAutonomy,
 ) -> Result<(), CallerError> {
     let system_prompt = std::fs::read_to_string("SysPrompt.md")
         .map_err(|e| CallerError::Config(format!("Failed to read SysPrompt.md: {}", e)))?;
 
-    println!("Provider: {} (context window: {})", provider.name(), provider.context_window());
+    if bus.is_none() {
+        println!("Provider: {} (context window: {})", provider.name(), provider.context_window());
+    }
 
     let mut conversation = Conversation::new(system_prompt, provider.context_window());
 
@@ -677,14 +994,18 @@ async fn run_direct_mode(
     }
 
     conversation.add_user(task.clone());
-    println!("Task: {}", task);
-    println!("---");
+    if bus.is_none() {
+        println!("Task: {}", task);
+        println!("---");
+    }
 
     run_agent_loop(
         provider.as_ref(),
         &mut conversation,
         &project,
         None,
+        bus,
+        autonomy,
     ).await
 }
 
@@ -716,24 +1037,103 @@ fn is_simple_task(task: &str) -> bool {
 async fn main() -> Result<(), CallerError> {
     dotenvy::dotenv().ok();
 
+    // Override env vars from CLI flags before provider selection
+    let flags = parse_cli_flags();
+    if let Some(ref p) = flags.provider {
+        env::set_var("PROVIDER", p);
+    }
+    if let Some(ref m) = flags.model {
+        env::set_var("MODEL_NAME", m);
+    }
+
     let provider = provider::select_provider()?;
 
-    // Check if running as a sub-agent
+    // Check if running as a sub-agent (headless, no TUI)
     if let Some((id, role)) = sub_agent::detect_sub_agent_mode() {
         return run_sub_agent_mode(provider, id, role).await;
     }
 
     let project = Project::detect()?;
-    let task = get_task()?;
+    let task = get_task_from_flags_or_env(&flags)?;
 
     if task.is_empty() {
         return Err(CallerError::Config("No task provided".to_string()));
     }
 
-    // Decide mode: user mode (complex tasks) or direct mode (simple tasks)
-    if is_simple_task(&task) {
-        run_direct_mode(provider, task, project).await
+    // Determine whether to use TUI
+    let use_tui = !flags.no_tui && io::stdin().is_terminal();
+
+    // Build autonomy state from project config + CLI flags
+    let autonomy_state = AutonomyState::new(
+        flags.autonomy,
+        project.config.approval.clone(),
+    );
+    let autonomy = autonomy::shared_autonomy(autonomy_state);
+
+    if use_tui {
+        // TUI mode
+        let (bus, event_rx) = EventBus::new();
+
+        // Spawn background tasks
+        let _crossterm_handle = tui::event::spawn_crossterm_reader(bus.clone());
+        let _tick_handle = tui::event::spawn_tick_timer(bus.clone(), 100);
+        let _human_monitor = tui::event::spawn_human_question_monitor(bus.clone());
+
+        // Spawn control socket
+        let (_control_handle, _control_tx) = control::spawn_control_server(bus.clone());
+
+        // Create TUI
+        let mut terminal = tui::Tui::new()
+            .map_err(|e| CallerError::Tui(format!("Failed to initialize TUI: {}", e)))?;
+
+        // Create app state
+        let mut app = tui::app::App::new(
+            provider.name().to_string(),
+            format!("{}", env::var("MODEL_NAME").unwrap_or_else(|_| "default".to_string())),
+            autonomy.clone(),
+        );
+        app.verbose = flags.verbose;
+
+        app.log(tui::app::LogLevel::Info, format!("Task: {}", task));
+
+        // Spawn the agent loop in a background task
+        let bus_clone = bus.clone();
+        let autonomy_clone = autonomy.clone();
+        let task_clone = task.clone();
+        let loop_handle = tokio::spawn(async move {
+            let result = if is_simple_task(&task_clone) {
+                run_direct_mode(provider, task_clone, project, Some(bus_clone.clone()), autonomy_clone).await
+            } else {
+                run_user_mode(provider, task_clone, project, Some(bus_clone.clone()), autonomy_clone).await
+            };
+
+            match result {
+                Ok(()) => {
+                    bus_clone.send(AppEvent::TaskComplete {
+                        reason: "Task complete".to_string(),
+                    });
+                }
+                Err(e) => {
+                    bus_clone.send(AppEvent::LoopError(e.to_string()));
+                }
+            }
+        });
+
+        // Run the TUI event loop (blocks until quit)
+        let _ = terminal.run(&mut app, event_rx).await;
+
+        // Clean up
+        loop_handle.abort();
+        control::cleanup();
+        terminal.restore().map_err(|e| CallerError::Tui(e.to_string()))?;
     } else {
-        run_user_mode(provider, task, project).await
+        // Headless mode (--no-tui or non-TTY)
+        if is_simple_task(&task) {
+            run_direct_mode(provider, task, project, None, autonomy).await?;
+        } else {
+            run_user_mode(provider, task, project, None, autonomy).await?;
+        }
     }
+
+    Ok(())
 }

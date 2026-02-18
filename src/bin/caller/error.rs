@@ -10,6 +10,7 @@ pub enum CallerError {
     Http(reqwest::Error),
     Config(String),
     Toml(String),
+    Tui(String),
 }
 
 impl fmt::Display for CallerError {
@@ -23,6 +24,7 @@ impl fmt::Display for CallerError {
             CallerError::Http(e) => write!(f, "HTTP error: {}", e),
             CallerError::Config(msg) => write!(f, "Config error: {}", msg),
             CallerError::Toml(msg) => write!(f, "TOML error: {}", msg),
+            CallerError::Tui(msg) => write!(f, "TUI error: {}", msg),
         }
     }
 }
@@ -79,6 +81,12 @@ mod tests {
     fn toml_error_display() {
         let err = CallerError::Toml("invalid syntax".to_string());
         assert_eq!(format!("{}", err), "TOML error: invalid syntax");
+    }
+
+    #[test]
+    fn tui_error_display() {
+        let err = CallerError::Tui("terminal init failed".to_string());
+        assert_eq!(format!("{}", err), "TUI error: terminal init failed");
     }
 
     #[test]

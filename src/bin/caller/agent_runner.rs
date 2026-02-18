@@ -9,6 +9,10 @@ pub struct AgentOutput {
     pub stderr: String,
 }
 
+fn has_ask_human(json_input: &str) -> bool {
+    json_input.contains("\"askHuman\"")
+}
+
 pub async fn run_agent(json_input: &str) -> Result<AgentOutput, CallerError> {
     let agent_path = std::env::current_exe()
         .ok()
@@ -32,18 +36,23 @@ pub async fn run_agent(json_input: &str) -> Result<AgentOutput, CallerError> {
     let mut stderr_buf = String::new();
 
     // Read stdout with idle timeout and hard timeout (configurable via env vars)
+    // When askHuman is present, extend timeouts to allow human response time
     if let Some(mut stdout) = child.stdout.take() {
+        let ask_human = has_ask_human(json_input);
+        let default_idle = if ask_human { 330 } else { 3 };
+        let default_hard = if ask_human { 600 } else { 30 };
+
         let idle_timeout = Duration::from_secs(
             std::env::var("AGENT_IDLE_TIMEOUT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(3),
+                .unwrap_or(default_idle),
         );
         let hard_timeout = Duration::from_secs(
             std::env::var("AGENT_HARD_TIMEOUT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(30),
+                .unwrap_or(default_hard),
         );
 
         let _ = timeout(hard_timeout, async {
@@ -77,4 +86,27 @@ pub async fn run_agent(json_input: &str) -> Result<AgentOutput, CallerError> {
         stdout: stdout_buf,
         stderr: stderr_buf,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn has_ask_human_detects_function() {
+        let json = r#"{"commands":[{"function":"askHuman","nonce":1,"question":"Which DB?"}]}"#;
+        assert!(has_ask_human(json));
+    }
+
+    #[test]
+    fn has_ask_human_false_for_other() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}]}"#;
+        assert!(!has_ask_human(json));
+    }
+
+    #[test]
+    fn has_ask_human_mixed_commands() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"},{"function":"askHuman","nonce":2,"question":"ok?"}]}"#;
+        assert!(has_ask_human(json));
+    }
 }
