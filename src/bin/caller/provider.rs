@@ -29,6 +29,8 @@ pub trait ChatProvider: Send + Sync {
 
 // --- OpenAI ---
 
+// Chat Completions API types (gpt-4o and older)
+
 #[derive(Serialize)]
 struct OpenAIChatRequest {
     model: String,
@@ -58,6 +60,50 @@ struct OpenAIUsage {
     total_tokens: u64,
 }
 
+// Responses API types (gpt-5+ models)
+
+#[derive(Serialize)]
+struct OpenAIResponsesRequest {
+    model: String,
+    input: Vec<ResponsesInputMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ResponsesInputMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct OpenAIResponsesResponse {
+    output_text: Option<String>,
+    output: Option<Vec<ResponsesOutputItem>>,
+    usage: Option<ResponsesUsage>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesOutputItem {
+    content: Option<Vec<ResponsesContentItem>>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesContentItem {
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+}
+
+fn uses_responses_api(model: &str) -> bool {
+    model.starts_with("gpt-5") || model.starts_with("o3") || model.starts_with("o4")
+}
+
 pub struct OpenAIProvider {
     client: Client,
     api_key: String,
@@ -77,11 +123,8 @@ impl OpenAIProvider {
             max_output_tokens,
         }
     }
-}
 
-#[async_trait]
-impl ChatProvider for OpenAIProvider {
-    async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
+    async fn chat_completions(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
         let request = OpenAIChatRequest {
             model: self.model.clone(),
             messages: messages.to_vec(),
@@ -118,6 +161,81 @@ impl ChatProvider for OpenAIProvider {
             .unwrap_or_default();
 
         Ok(ChatResponse { content, usage })
+    }
+
+    async fn responses_api(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
+        // Extract system/developer instructions and convert messages
+        let instructions = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.clone());
+
+        let input: Vec<ResponsesInputMessage> = messages
+            .iter()
+            .filter(|m| m.role == "user" || m.role == "assistant")
+            .map(|m| ResponsesInputMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect();
+
+        let request = OpenAIResponsesRequest {
+            model: self.model.clone(),
+            input,
+            instructions,
+        };
+
+        let response = self
+            .client
+            .post("https://api.openai.com/v1/responses")
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(CallerError::Provider(format!("{}: {}", status, body)));
+        }
+
+        let resp: OpenAIResponsesResponse = response.json().await?;
+
+        // Prefer output_text, fall back to digging into output array
+        let content = resp
+            .output_text
+            .or_else(|| {
+                resp.output.as_ref().and_then(|items| {
+                    items.iter().find_map(|item| {
+                        item.content.as_ref().and_then(|contents| {
+                            contents.iter().find_map(|c| c.text.clone())
+                        })
+                    })
+                })
+            })
+            .ok_or_else(|| CallerError::Provider("No response content".to_string()))?;
+
+        let usage = resp
+            .usage
+            .map(|u| TokenUsage {
+                prompt_tokens: u.input_tokens,
+                completion_tokens: u.output_tokens,
+                total_tokens: u.total_tokens,
+            })
+            .unwrap_or_default();
+
+        Ok(ChatResponse { content, usage })
+    }
+}
+
+#[async_trait]
+impl ChatProvider for OpenAIProvider {
+    async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
+        if uses_responses_api(&self.model) {
+            self.responses_api(messages).await
+        } else {
+            self.chat_completions(messages).await
+        }
     }
 
     fn name(&self) -> &str {
@@ -264,6 +382,7 @@ impl ChatProvider for AnthropicProvider {
 
 fn default_context_window(model: &str) -> u64 {
     match model {
+        m if m.starts_with("gpt-5") => 400_000,
         m if m.starts_with("gpt-4o") => 128_000,
         m if m.starts_with("gpt-4-turbo") => 128_000,
         m if m.starts_with("gpt-4") => 8_192,
@@ -276,6 +395,7 @@ fn default_context_window(model: &str) -> u64 {
 
 fn default_max_output_tokens(model: &str) -> u64 {
     match model {
+        m if m.starts_with("gpt-5") => 128_000,
         m if m.starts_with("gpt-4o") => 16_384,
         m if m.starts_with("gpt-4-turbo") => 4_096,
         m if m.starts_with("gpt-4") => 8_192,
@@ -321,13 +441,13 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
             Ok(Box::new(AnthropicProvider::new(ant, model, ctx, max_out)))
         }
         (Some(oai), Some(_ant), Some("openai")) | (Some(oai), Some(_ant), None) => {
-            let model = env::var("MODEL_NAME").unwrap_or_else(|_| "gpt-4o".to_string());
+            let model = env::var("MODEL_NAME").unwrap_or_else(|_| "gpt-5.2-codex".to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
             Ok(Box::new(OpenAIProvider::new(oai, model, ctx, max_out)))
         }
         (Some(oai), None, _) => {
-            let model = env::var("MODEL_NAME").unwrap_or_else(|_| "gpt-4o".to_string());
+            let model = env::var("MODEL_NAME").unwrap_or_else(|_| "gpt-5.2-codex".to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
             Ok(Box::new(OpenAIProvider::new(oai, model, ctx, max_out)))
@@ -357,7 +477,7 @@ mod tests {
 
     #[test]
     fn openai_provider_name() {
-        let provider = OpenAIProvider::new("key".to_string(), "gpt-4o".to_string(), 128_000, 16_384);
+        let provider = OpenAIProvider::new("key".to_string(), "gpt-5.2-codex".to_string(), 400_000, 128_000);
         assert_eq!(provider.name(), "openai");
     }
 
@@ -495,6 +615,8 @@ mod tests {
 
     #[test]
     fn default_context_window_known_models() {
+        assert_eq!(default_context_window("gpt-5.2-codex"), 400_000);
+        assert_eq!(default_context_window("gpt-5"), 400_000);
         assert_eq!(default_context_window("gpt-4o"), 128_000);
         assert_eq!(default_context_window("gpt-4o-mini"), 128_000);
         assert_eq!(default_context_window("gpt-4-turbo-preview"), 128_000);
@@ -510,6 +632,8 @@ mod tests {
 
     #[test]
     fn default_max_output_known_models() {
+        assert_eq!(default_max_output_tokens("gpt-5.2-codex"), 128_000);
+        assert_eq!(default_max_output_tokens("gpt-5"), 128_000);
         assert_eq!(default_max_output_tokens("gpt-4o"), 16_384);
         assert_eq!(default_max_output_tokens("claude-sonnet-4-5-20250929"), 8_192);
         assert_eq!(default_max_output_tokens("o1-preview"), 100_000);
@@ -517,12 +641,118 @@ mod tests {
 
     #[test]
     fn context_window_methods() {
-        let provider = OpenAIProvider::new("key".to_string(), "gpt-4o".to_string(), 128_000, 16_384);
-        assert_eq!(provider.context_window(), 128_000);
-        assert_eq!(provider.max_output_tokens(), 16_384);
+        let provider = OpenAIProvider::new("key".to_string(), "gpt-5.2-codex".to_string(), 400_000, 128_000);
+        assert_eq!(provider.context_window(), 400_000);
+        assert_eq!(provider.max_output_tokens(), 128_000);
 
         let provider = AnthropicProvider::new("key".to_string(), "claude-sonnet-4-5-20250929".to_string(), 200_000, 8_192);
         assert_eq!(provider.context_window(), 200_000);
         assert_eq!(provider.max_output_tokens(), 8_192);
+    }
+
+    #[test]
+    fn uses_responses_api_gpt5_models() {
+        assert!(uses_responses_api("gpt-5.2-codex"));
+        assert!(uses_responses_api("gpt-5"));
+        assert!(uses_responses_api("gpt-5.1-codex"));
+        assert!(uses_responses_api("gpt-5-mini"));
+        assert!(uses_responses_api("o3"));
+        assert!(uses_responses_api("o3-mini"));
+        assert!(uses_responses_api("o4-mini"));
+    }
+
+    #[test]
+    fn uses_chat_completions_legacy_models() {
+        assert!(!uses_responses_api("gpt-4o"));
+        assert!(!uses_responses_api("gpt-4o-mini"));
+        assert!(!uses_responses_api("gpt-4-turbo"));
+        assert!(!uses_responses_api("gpt-3.5-turbo"));
+    }
+
+    #[test]
+    fn responses_api_response_deserialization() {
+        let json = r#"{
+            "id": "resp_123",
+            "object": "response",
+            "output_text": "Hello from Responses API!",
+            "output": [
+                {
+                    "content": [
+                        {
+                            "text": "Hello from Responses API!",
+                            "type": "output_text"
+                        }
+                    ],
+                    "role": "assistant",
+                    "type": "message"
+                }
+            ],
+            "usage": {"input_tokens": 25, "output_tokens": 8, "total_tokens": 33}
+        }"#;
+        let resp: OpenAIResponsesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.output_text.as_deref(), Some("Hello from Responses API!"));
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.input_tokens, 25);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.total_tokens, 33);
+    }
+
+    #[test]
+    fn responses_api_fallback_to_output_array() {
+        let json = r#"{
+            "id": "resp_456",
+            "object": "response",
+            "output": [
+                {
+                    "content": [
+                        {
+                            "text": "Fallback text",
+                            "type": "output_text"
+                        }
+                    ],
+                    "role": "assistant",
+                    "type": "message"
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        }"#;
+        let resp: OpenAIResponsesResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.output_text.is_none());
+        let text = resp.output.as_ref().and_then(|items| {
+            items.iter().find_map(|item| {
+                item.content.as_ref().and_then(|contents| {
+                    contents.iter().find_map(|c| c.text.clone())
+                })
+            })
+        });
+        assert_eq!(text.as_deref(), Some("Fallback text"));
+    }
+
+    #[test]
+    fn responses_api_request_serialization() {
+        let request = OpenAIResponsesRequest {
+            model: "gpt-5.2-codex".to_string(),
+            input: vec![
+                ResponsesInputMessage { role: "user".to_string(), content: "Hello".to_string() },
+            ],
+            instructions: Some("Be helpful.".to_string()),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"model\":\"gpt-5.2-codex\""));
+        assert!(json.contains("\"instructions\":\"Be helpful.\""));
+        assert!(json.contains("\"role\":\"user\""));
+    }
+
+    #[test]
+    fn responses_api_request_omits_null_instructions() {
+        let request = OpenAIResponsesRequest {
+            model: "gpt-5.2-codex".to_string(),
+            input: vec![
+                ResponsesInputMessage { role: "user".to_string(), content: "Hi".to_string() },
+            ],
+            instructions: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("instructions"));
     }
 }
