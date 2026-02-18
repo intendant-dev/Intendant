@@ -1,6 +1,6 @@
 # Agent
 
-A Rust runtime that executes commands on behalf of an AI agent, plus an AI caller that drives the agent via the OpenAI or Anthropic API. The runtime manages process lifecycles via shared memory (SHM), streams status updates, and persists logs across binary restarts. The caller supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
+A Rust runtime that executes commands on behalf of an AI agent, plus an AI caller that drives the agent via the OpenAI or Anthropic API. The runtime manages process lifecycles via shared memory (SHM), streams status updates, and persists logs across binary restarts. The caller features a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
 
 ## Architecture
 
@@ -19,6 +19,9 @@ Caller (3 modes) --> detects project root (git) --> loads memory/knowledge
   +--> Sub-Agent Mode:  scoped task, writes results/progress, isolated context
   +--> Direct Mode:     single-loop execution for simple tasks
   |
+  +--> Ratatui TUI:     status bar, scrollable log, approval panel, askHuman input
+  +--> Autonomy system: Low/Medium/High/Full + per-category rules from agent.toml
+  +--> Control socket:  /tmp/agent-<pid>.sock (JSON-line protocol)
   +--> Token budget tracking (context-window-aware loop termination)
   +--> Sub-agent spawning via env vars (AGENT_ROLE, AGENT_ID, etc.)
   +--> Git worktree isolation for implementation agents
@@ -193,10 +196,10 @@ enabled = false  # default: true
 cargo test
 ```
 
-289 tests cover both binaries:
+395 tests cover both binaries:
 
 - **Agent binary (114 tests):** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
-- **Caller binary (175 tests):** JSON extraction, done signal handling, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, and knowledge pub/sub system.
+- **Caller binary (281 tests):** JSON extraction, done signal handling, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, and control socket serialization.
 
 ## Session Management
 
@@ -235,12 +238,38 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 ### Running
 
 ```bash
-# With a task as CLI argument
+# With a task as CLI argument (launches TUI)
 ./target/release/caller "List the files in /tmp"
+
+# Headless mode (no TUI, plain text output)
+./target/release/caller --no-tui "List the files in /tmp"
+
+# With autonomy level
+./target/release/caller --autonomy low "rm -rf /tmp/test"
+
+# Specify provider and model
+./target/release/caller --provider anthropic --model claude-sonnet-4-5-20250929 "List files"
 
 # Interactive mode (prompts for task on stdin)
 ./target/release/caller
+
+# Verbose output (show debug-level log entries)
+./target/release/caller --verbose "echo hello"
 ```
+
+### CLI Flags
+
+| Flag | Description |
+|------|-------------|
+| `--provider <name>` | Force provider (`openai` or `anthropic`) |
+| `--model <name>` | Override model name |
+| `--verbose` | Show debug-level log entries in TUI |
+| `--no-tui` | Disable TUI, use plain text output |
+| `--autonomy <level>` | Set autonomy level (`low`, `medium`, `high`, `full`) |
+| `--log-file <path>` | Write log output to file |
+| `--control-socket` | Enable control socket in headless mode |
+
+The TUI launches automatically when stdin is a terminal. When piping input or in sub-agent mode, the caller falls back to headless mode.
 
 ### Execution Modes
 
@@ -274,9 +303,11 @@ The caller operates in one of three modes, selected automatically:
 8. Checks for explicit `done` signal (`{"done": true}`) for task completion in JSON mode
 9. Applies context directives (`drop_turns`, `summarize`) to the conversation
 10. Injects project context (`memory_file`) into relevant commands
-11. Pipes the JSON to the agent binary, reads stdout/stderr with idle timeout (3s) and hard timeout (30s)
-12. Feeds the agent output back as the next user message, appending a token budget summary
-13. Repeats until the model signals done, responds with no JSON, or the context budget is exhausted
+11. Classifies commands by action category (file read/write/delete, exec, network, destructive) and checks autonomy rules
+12. If approval is required, emits an approval request to the TUI and waits for user response
+13. Pipes the JSON to the agent binary, reads stdout/stderr with idle timeout (3s, or 330s for askHuman) and hard timeout (30s, or 600s for askHuman)
+14. Feeds the agent output back as the next user message, appending a token budget summary
+15. Repeats until the model signals done, responds with no JSON, or the context budget is exhausted
 
 ## Environment
 
@@ -307,7 +338,7 @@ The caller operates in one of three modes, selected automatically:
 | `AGENT_TASK` | — | Task description for sub-agent mode |
 | `AGENT_PARENT_KNOWLEDGE` | — | Path to parent's knowledge store for inheritance |
 
-Increase timeouts when using `askHuman` (e.g., `AGENT_HARD_TIMEOUT=600`).
+Timeouts are automatically extended when `askHuman` is detected in the command batch (idle: 330s, hard: 600s). Manual override via env vars is still supported.
 
 ### Project Configuration
 
@@ -324,4 +355,100 @@ max_output_tokens = 8192      # override per-model default
 [orchestrator]
 max_parallel_agents = 4       # max concurrent sub-agents
 sub_agent_dir = ".agent/subagents"  # where sub-agent workspaces are created
+
+[approval]
+file_read = "auto"            # auto-approve file reads
+file_write = "ask"            # ask before file writes (default)
+file_delete = "ask"           # ask before file deletes (default)
+command_exec = "auto"         # auto-approve command execution
+network = "auto"              # auto-approve network requests
+destructive = "ask"           # ask before destructive commands (default)
+```
+
+## TUI
+
+The caller includes a ratatui-based terminal UI that launches automatically when stdin is a terminal. The TUI provides real-time monitoring and control of the agent loop.
+
+### Layout
+
+```
+┌─────────────────────────────────────────────┐
+│ StatusBar: provider │ model │ turn │ budget  │  1 line
+├─────────────────────────────────────────────┤
+│ ActionPanel: phase + spinner + key hints    │  1-3 lines
+├─────────────────────────────────────────────┤
+│                                             │
+│ LogPanel: scrollable, color-coded entries   │  fills remaining
+│                                             │
+├─────────────────────────────────────────────┤
+│ ApprovalPanel / InputPanel (conditional)    │  3-4 lines
+└─────────────────────────────────────────────┘
+```
+
+### Key Bindings
+
+| Key | Action |
+|-----|--------|
+| `q` / `Ctrl-C` | Quit |
+| `v` | Toggle verbose mode |
+| `?` | Help overlay |
+| `+` / `-` | Cycle autonomy level |
+| `Up`/`Down`/`PgUp`/`PgDn` | Scroll log |
+| `Home` / `End` | Jump to top/bottom of log |
+| `1`-`3` | Toggle panels (status, action, log) |
+| `y` / `Enter` | Approve pending action |
+| `s` | Skip pending action |
+| `a` | Auto-approve all remaining |
+| `n` | Deny and stop |
+
+## Autonomy System
+
+The autonomy system controls which actions require human approval. It operates on three layers:
+
+**Layer 1 — Global level** (CLI `--autonomy`, toggleable in TUI with `+`/`-`):
+
+| Level | Behavior |
+|-------|----------|
+| Low | Ask before every command execution |
+| Medium | Ask before writes, network, destructive (default) |
+| High | Only ask for unavoidable human input |
+| Full | Never ask (fully autonomous) |
+
+**Layer 2 — Per-category rules** (from `agent.toml` `[approval]` section):
+Override the global level for specific action categories. Rules: `auto` (always approve), `ask` (require approval), `deny` (always deny).
+
+**Layer 3 — Per-action approval** (TUI panel):
+When approval is needed, the agent loop pauses and the TUI shows the command preview. The user can approve, skip, deny, or switch to auto-approve mode.
+
+Action categories are determined by analyzing command JSON: shell commands are classified by inspecting for destructive patterns (`rm`, `kill`, `dd`, `mkfs`), network operations (`curl`, `wget`, `ssh`), file operations, etc.
+
+## Control Socket
+
+When the TUI is active, a Unix domain socket is created at `/tmp/agent-<pid>.sock` for programmatic control. Use `--control-socket` to enable in headless mode.
+
+### Inbound Commands (JSON-line)
+
+```json
+{"action": "status"}
+{"action": "approve", "id": 123}
+{"action": "deny", "id": 123}
+{"action": "input", "text": "answer to askHuman"}
+{"action": "set_autonomy", "level": "high"}
+{"action": "quit"}
+```
+
+### Outbound Events (streamed to connected clients)
+
+```json
+{"event": "turn_started", "turn": 5, "budget_pct": 12.3}
+{"event": "agent_output", "stdout": "...", "stderr": "..."}
+{"event": "approval_required", "id": 123, "command": "rm -rf /tmp/test"}
+{"event": "ask_human", "question": "Which database?"}
+{"event": "task_complete", "reason": "done signal"}
+{"event": "status", "turn": 3, "phase": "thinking", "autonomy": "medium"}
+```
+
+Example usage:
+```bash
+echo '{"action":"status"}' | socat - UNIX:/tmp/agent-$(pgrep caller).sock
 ```

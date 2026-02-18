@@ -31,17 +31,26 @@ src/
 ├── status_monitor.rs    # Background task polling shared memory every 100ms
 └── bin/
     └── caller/
-        ├── main.rs          # Caller entry point: 3 modes (user/sub-agent/direct), budget-aware loop
+        ├── main.rs          # Caller entry point: 3 modes (user/sub-agent/direct), budget-aware loop, TUI init
         ├── provider.rs      # Multi-provider API client (OpenAI Responses API + Anthropic), structured output, reasoning controls
         ├── conversation.rs  # Message management with layer protection, drop/summarize, budget tracking
-        ├── agent_runner.rs  # Spawns agent subprocess, manages I/O with timeouts
+        ├── agent_runner.rs  # Spawns agent subprocess, manages I/O with timeouts (askHuman-aware)
         ├── knowledge.rs     # Tagged knowledge store with pub/sub channels, cursor-based routing
         ├── memory.rs        # Backward-compatible memory wrapper delegating to knowledge.rs
         ├── sub_agent.rs     # Sub-agent spawning, result/progress I/O, role-specific configuration
         ├── worktree.rs      # Git worktree management for isolated implementation agents
         ├── user_mode.rs     # User-mode orchestrator spawning, progress monitoring, input relay
-        ├── project.rs       # Project detection (git root), config parsing (agent.toml)
-        └── error.rs         # CallerError enum
+        ├── project.rs       # Project detection (git root), config parsing (agent.toml + [approval])
+        ├── autonomy.rs      # Autonomy levels, action categories, approval rules, command classification
+        ├── control.rs       # Unix control socket server (JSON-line protocol at /tmp/agent-<pid>.sock)
+        ├── error.rs         # CallerError enum (includes Tui variant)
+        └── tui/
+            ├── mod.rs       # Tui struct: terminal init/restore, panic hook, render+event loop
+            ├── app.rs       # App state machine, event dispatch, askHuman/approval modes
+            ├── event.rs     # AppEvent enum, EventBus (mpsc wrapper), crossterm adapter, askHuman monitor
+            ├── widgets.rs   # StatusBar, LogPanel, ActionPanel, InputPanel, ApprovalPanel rendering
+            ├── layout.rs    # Panel sizing with constraints, responsive to terminal size
+            └── theme.rs     # Color/style constants (Catppuccin Mocha-inspired)
 SysPrompt.md                 # Default system prompt (direct mode)
 SysPrompt_user.md            # User-facing mode prompt
 SysPrompt_orchestrator.md    # Orchestrator agent prompt
@@ -65,12 +74,16 @@ echo '{"commands":[{"function":"execAsAgent","nonce":1,"command":"echo hello"}]}
 Running the caller (requires `.env` with API key):
 ```bash
 ./target/release/caller "List the files in /tmp"
+./target/release/caller --no-tui "echo hello"          # Headless (no TUI)
+./target/release/caller --autonomy low "rm /tmp/test"   # Ask before every command
+./target/release/caller --provider anthropic --model claude-sonnet-4-5-20250929 "task"
+echo "task" | ./target/release/caller                   # Auto-detects non-TTY, runs headless
 ```
 
 ## Testing
 
 ```bash
-cargo test                # Run all 289 tests
+cargo test                # Run all 395 tests (114 agent + 281 caller)
 cargo test -- --list      # List all test names
 ```
 
@@ -81,16 +94,25 @@ Test coverage includes:
 - **models.rs**: Serialization roundtrips, deserialization of minimal/full commands, repr(C) layout
 - **error.rs**: Display formatting, From conversions
 - **utils.rs**: Timestamp validity, status output formatting
-- **caller/main.rs** (175 tests total across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification
+- **caller/main.rs** (281 tests total across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification, CLI flags, EventBus emit
 - **caller/conversation.rs**: Message ordering, serialization, drop/summarize turns, message layer protection, budget tracking
 - **caller/knowledge.rs**: Pub/sub lifecycle, subscription/cursor tracking, tag/channel/keyword filtering, old format migration, save/load roundtrip, knowledge routing
 - **caller/sub_agent.rs**: Spawn command generation, result/progress I/O, serialization, role roundtrips, directory scanning
 - **caller/worktree.rs**: Full lifecycle (create/list/merge/remove), conflict handling
 - **caller/user_mode.rs**: Orchestrator spec generation, progress formatting, input relay, prompt resolution
-- **caller/project.rs**: Config parsing, project paths, sub-agent directory
+- **caller/project.rs**: Config parsing, project paths, sub-agent directory, approval config parsing
 - **caller/memory.rs**: Memory/knowledge loading, formatting, format migration
 - **caller/provider.rs**: Provider selection, token usage parsing, context window defaults, Responses API types, structured output, reasoning controls, role mapping
-- **caller/error.rs**: Display formatting, type conversions
+- **caller/error.rs**: Display formatting, type conversions (including Tui variant)
+- **caller/autonomy.rs**: Autonomy levels (display, parse, cycle), action categories, approval rules, needs_approval logic, command classification (exec, destructive, network, file write, askHuman, browse), batch classification
+- **caller/control.rs**: Socket path, outbound event serialization, broadcast, server lifecycle
+- **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses), event dispatch (all AppEvent variants), bottom panel heights
+- **caller/tui/event.rs**: EventBus send/receive/clone, ControlMsg deserialization (all variants), serialization roundtrip, ApprovalResponse variants
+- **caller/tui/layout.rs**: Layout calculation (all panel combos, with/without bottom panel, hidden panels, small terminal)
+- **caller/tui/widgets.rs**: Log entry formatting (all levels, verbose/non-verbose), string truncation
+- **caller/tui/theme.rs**: Budget color thresholds, spinner frames, action style variants, autonomy color variants
+- **caller/tui/mod.rs**: TestBackend rendering (default state, log entries, approval panel, help overlay, all phases, verbose modes, small terminal)
+- **caller/agent_runner.rs**: askHuman detection in JSON input
 
 ## Architecture Details
 
@@ -135,6 +157,32 @@ The caller operates in three modes based on environment:
 4. Injects project knowledge into conversation
 5. Budget-aware loop (stops at context exhaustion, `done` signal, or 500-turn safety cap): send to model -> extract JSON -> check done signal -> apply context directives -> inject project context -> pipe to agent -> append budget summary -> feed output back
 
+### TUI Mode
+
+When stdin is a TTY and `--no-tui` is not set, the caller launches a ratatui-based terminal UI:
+- **Status bar**: Provider, model, turn count, budget percentage, autonomy level
+- **Action panel**: Current phase (Thinking/RunningAgent/WaitingApproval/WaitingHuman/Done) with spinner
+- **Log panel**: Scrollable chronological log of all events with color-coded levels
+- **Approval panel**: Shown when an action needs user approval (y/s/a/n keys)
+- **Input panel**: Shown when askHuman is triggered (tui-textarea for response)
+- **Help overlay**: Key bindings reference (? key)
+
+The agent loop runs in a background tokio task and communicates with the TUI via an `EventBus` (unbounded mpsc channel of `AppEvent`). When `bus` is `None` (headless mode), all output goes to stdout/stderr as before.
+
+### Autonomy System
+
+Three-layer autonomy control:
+
+1. **Global level** (`--autonomy` flag, +/- keys in TUI): Low/Medium/High/Full
+2. **Category rules** (`[approval]` section in agent.toml): per-category Auto/Ask/Deny
+3. **Per-action approval** (TUI only): approve/skip/approve-all/deny
+
+Commands are classified into categories (FileRead, FileWrite, FileDelete, CommandExec, NetworkRequest, Destructive, HumanInput) by `autonomy::classify_command()`. Shell commands are further classified by inspecting the command string for destructive patterns (rm, kill), network tools (curl, wget, git), and file writes (redirects, tee, mv, cp).
+
+### Control Socket
+
+A Unix socket server at `/tmp/agent-<pid>.sock` enables programmatic control. JSON-line protocol supports: status, approve, deny, input, set_autonomy, quit. Outbound events are broadcast to all connected clients.
+
 ### OpenAI API Features
 
 - **Structured output**: JSON object mode (`text.format`) is enabled by default for capable models (gpt-5+, o3, o4). Controlled via `STRUCTURED_OUTPUT` env var. Eliminates brittle free-text JSON extraction.
@@ -170,6 +218,10 @@ The caller operates in three modes based on environment:
 | `dotenvy` | .env file loading |
 | `toml` | agent.toml config parsing |
 | `async-trait` | Async trait support for ChatProvider |
+| `ratatui` | Terminal UI framework |
+| `crossterm` | Terminal input/output backend (event-stream feature) |
+| `tui-textarea` | Text input widget for askHuman responses |
+| `tokio-stream` | Stream utilities for crossterm EventStream |
 | `tempfile` (dev) | Temporary directories in tests |
 
 ## Environment Requirements

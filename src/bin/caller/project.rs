@@ -1,3 +1,4 @@
+use crate::autonomy::ApprovalConfig;
 use crate::error::CallerError;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -42,6 +43,8 @@ pub struct ProjectConfig {
     pub model: ModelConfig,
     #[serde(default)]
     pub orchestrator: OrchestratorConfig,
+    #[serde(default)]
+    pub approval: ApprovalConfig,
 }
 
 #[derive(Debug)]
@@ -200,5 +203,31 @@ max_parallel_agents = 8
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.orchestrator.max_parallel_agents, Some(8));
         assert!(config.orchestrator.sub_agent_dir.is_none());
+    }
+
+    #[test]
+    fn parse_approval_config() {
+        let toml_str = r#"
+[approval]
+file_read = "auto"
+file_write = "ask"
+file_delete = "deny"
+command_exec = "auto"
+network = "ask"
+destructive = "deny"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.approval.file_read, crate::autonomy::ApprovalRule::Auto);
+        assert_eq!(config.approval.file_write, crate::autonomy::ApprovalRule::Ask);
+        assert_eq!(config.approval.file_delete, crate::autonomy::ApprovalRule::Deny);
+        assert_eq!(config.approval.destructive, crate::autonomy::ApprovalRule::Deny);
+    }
+
+    #[test]
+    fn parse_approval_config_defaults() {
+        let config: ProjectConfig = toml::from_str("").unwrap();
+        assert_eq!(config.approval.file_read, crate::autonomy::ApprovalRule::Auto);
+        assert_eq!(config.approval.file_write, crate::autonomy::ApprovalRule::Ask);
+        assert_eq!(config.approval.command_exec, crate::autonomy::ApprovalRule::Auto);
     }
 }
