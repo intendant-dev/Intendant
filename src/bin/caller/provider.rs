@@ -453,7 +453,7 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
         }
         (None, None, _) => Err(CallerError::Config(
             "No API key found. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in your environment, \
-             a .env file in your project root, or ~/.config/agent/.env for global use.".to_string(),
+             a .env file in your project root, or ~/.config/intendant/.env for global use.".to_string(),
         )),
     }
 }

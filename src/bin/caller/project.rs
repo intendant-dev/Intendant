@@ -56,12 +56,12 @@ pub struct Project {
 impl Project {
     pub fn detect() -> Result<Self, CallerError> {
         let root = detect_project_root()?;
-        let config_path = root.join("agent.toml");
+        let config_path = root.join("intendant.toml");
         let config = if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)
-                .map_err(|e| CallerError::Config(format!("Failed to read agent.toml: {}", e)))?;
+                .map_err(|e| CallerError::Config(format!("Failed to read intendant.toml: {}", e)))?;
             toml::from_str(&content)
-                .map_err(|e| CallerError::Toml(format!("Failed to parse agent.toml: {}", e)))?
+                .map_err(|e| CallerError::Toml(format!("Failed to parse intendant.toml: {}", e)))?
         } else {
             ProjectConfig::default()
         };
@@ -69,18 +69,18 @@ impl Project {
     }
 
     pub fn memory_path(&self) -> PathBuf {
-        self.root.join(".agent").join("memory.json")
+        self.root.join(".intendant").join("memory.json")
     }
 
     #[allow(dead_code)]
     pub fn agent_dir(&self) -> PathBuf {
-        self.root.join(".agent")
+        self.root.join(".intendant")
     }
 
     pub fn sub_agent_dir(&self) -> PathBuf {
         match &self.config.orchestrator.sub_agent_dir {
             Some(dir) => self.root.join(dir),
-            None => self.root.join(".agent").join("subagents"),
+            None => self.root.join(".intendant").join("subagents"),
         }
     }
 }
@@ -175,9 +175,9 @@ context_window = 128000
             root: PathBuf::from("/tmp/myproject"),
             config: ProjectConfig::default(),
         };
-        assert_eq!(project.memory_path(), PathBuf::from("/tmp/myproject/.agent/memory.json"));
-        assert_eq!(project.agent_dir(), PathBuf::from("/tmp/myproject/.agent"));
-        assert_eq!(project.sub_agent_dir(), PathBuf::from("/tmp/myproject/.agent/subagents"));
+        assert_eq!(project.memory_path(), PathBuf::from("/tmp/myproject/.intendant/memory.json"));
+        assert_eq!(project.agent_dir(), PathBuf::from("/tmp/myproject/.intendant"));
+        assert_eq!(project.sub_agent_dir(), PathBuf::from("/tmp/myproject/.intendant/subagents"));
     }
 
     #[test]

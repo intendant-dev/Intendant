@@ -29,7 +29,7 @@ To spawn an orchestrator, output JSON with an `execAsAgent` command that runs th
   "commands": [{
     "function": "execAsAgent",
     "nonce": 1,
-    "command": "AGENT_ROLE=orchestrator AGENT_ID=orch-1 AGENT_RESULT_FILE=<path> AGENT_PROGRESS_FILE=<path> <caller_binary> <task>"
+    "command": "INTENDANT_ROLE=orchestrator INTENDANT_ID=orch-1 INTENDANT_RESULT_FILE=<path> INTENDANT_PROGRESS_FILE=<path> <caller_binary> <task>"
   }]
 }
 ```

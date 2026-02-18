@@ -28,15 +28,15 @@ struct PtySession {
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
-const HUMAN_QUESTION_PATH: &str = "/dev/shm/agent_human_question";
-const HUMAN_RESPONSE_PATH: &str = "/dev/shm/agent_human_response";
+const HUMAN_QUESTION_PATH: &str = "/dev/shm/intendant_human_question";
+const HUMAN_RESPONSE_PATH: &str = "/dev/shm/intendant_human_response";
 const HUMAN_TIMEOUT_MS: u64 = 5 * 60 * 1000; // 5 minutes
 const HUMAN_POLL_MS: u64 = 500;
 
 const MAX_PROCESSES: usize = 1024;
 const SHARED_MEM_SIZE: usize = size_of::<ProcessInfo>() * MAX_PROCESSES;
-const SHARED_MEM_PATH: &str = "/dev/shm/agent_processes";
-const SESSION_FILE_PATH: &str = "/dev/shm/agent_session";
+const SHARED_MEM_PATH: &str = "/dev/shm/intendant_processes";
+const SESSION_FILE_PATH: &str = "/dev/shm/intendant_session";
 
 #[derive(Clone)]
 pub struct Agent {
@@ -159,7 +159,7 @@ impl Agent {
         }
         let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let log_dir = PathBuf::from(format!("{}/.agent/logs/{}", home, timestamp));
+        let log_dir = PathBuf::from(format!("{}/.intendant/logs/{}", home, timestamp));
         fs::create_dir_all(&log_dir)?;
         fs::write(SESSION_FILE_PATH, log_dir.to_string_lossy().as_bytes())?;
         Ok(log_dir)

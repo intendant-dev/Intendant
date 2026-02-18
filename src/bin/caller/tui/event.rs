@@ -163,7 +163,7 @@ pub fn spawn_human_question_monitor(bus: EventBus) -> tokio::task::JoinHandle<()
     use tokio::time::{interval, Duration};
 
     tokio::spawn(async move {
-        let question_path = Path::new("/dev/shm/agent_human_question");
+        let question_path = Path::new("/dev/shm/intendant_human_question");
         let mut interval = interval(Duration::from_millis(250));
         let mut last_seen = false;
 

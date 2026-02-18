@@ -11,7 +11,7 @@ const DEFAULT_IMPLEMENTATION_PROMPT: &str = include_str!("../../../SysPrompt_imp
 
 /// Resolve a prompt file using a 3-layer cascade:
 /// 1. Project root (`<project_root>/<filename>`)
-/// 2. Global config (`~/.config/agent/<filename>`)
+/// 2. Global config (`~/.config/intendant/<filename>`)
 /// 3. Compiled-in default
 fn resolve_prompt(filename: &str, default: &str, project_root: Option<&Path>) -> String {
     // 1. Check project root
@@ -22,9 +22,9 @@ fn resolve_prompt(filename: &str, default: &str, project_root: Option<&Path>) ->
         }
     }
 
-    // 2. Check ~/.config/agent/
+    // 2. Check ~/.config/intendant/
     if let Some(config_dir) = dirs::config_dir() {
-        let path = config_dir.join("agent").join(filename);
+        let path = config_dir.join("intendant").join(filename);
         if let Ok(content) = std::fs::read_to_string(&path) {
             return content;
         }

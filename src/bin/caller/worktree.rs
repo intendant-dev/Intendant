@@ -19,7 +19,7 @@ pub enum MergeResult {
 
 pub fn create(project_root: &Path, branch: &str, base: &str) -> Result<Worktree, CallerError> {
     let worktree_path = project_root
-        .join(".agent")
+        .join(".intendant")
         .join("worktrees")
         .join(branch);
 

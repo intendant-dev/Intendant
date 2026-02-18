@@ -1,36 +1,36 @@
-# Agent
+# Intendant
 
-A Rust runtime that executes commands on behalf of an AI agent, plus an AI caller that drives the agent via the OpenAI or Anthropic API. The runtime manages process lifecycles via shared memory (SHM), streams status updates, and persists logs across binary restarts. The caller features a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
+A Rust runtime that executes commands on behalf of an AI agent, plus an AI integration layer that drives the runtime via the OpenAI or Anthropic API. The runtime manages process lifecycles via shared memory (SHM), streams status updates, and persists logs across binary restarts. The CLI features a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
 
 ## Architecture
 
 ```
-stdin (JSON) --> Agent --> spawns bash commands
+stdin (JSON) --> intendant-runtime --> spawns bash commands
                   |
-                  +--> /dev/shm/agent_processes  (process state, survives restarts)
-                  +--> /dev/shm/agent_session     (log directory path, survives restarts)
-                  +--> /var/log/agent/<timestamp>/ (stdout/stderr logs per nonce)
+                  +--> /dev/shm/intendant_processes  (process state, survives restarts)
+                  +--> /dev/shm/intendant_session     (log directory path, survives restarts)
+                  +--> /var/log/intendant/<timestamp>/ (stdout/stderr logs per nonce)
                   |
                   +--> StatusMonitor --> stdout (status lines)
 
-Caller (3 modes) --> detects project root (git) --> loads memory/knowledge
+intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
   |
   +--> User Mode:       spawns orchestrator, monitors progress, relays to user
   +--> Sub-Agent Mode:  scoped task, writes results/progress, isolated context
   +--> Direct Mode:     single-loop execution for simple tasks
   |
   +--> Ratatui TUI:     status bar, scrollable log, approval panel, askHuman input
-  +--> Autonomy system: Low/Medium/High/Full + per-category rules from agent.toml
-  +--> Control socket:  /tmp/agent-<pid>.sock (JSON-line protocol)
+  +--> Autonomy system: Low/Medium/High/Full + per-category rules from intendant.toml
+  +--> Control socket:  /tmp/intendant-<pid>.sock (JSON-line protocol)
   +--> Token budget tracking (context-window-aware loop termination)
-  +--> Sub-agent spawning via env vars (AGENT_ROLE, AGENT_ID, etc.)
+  +--> Sub-agent spawning via env vars (INTENDANT_ROLE, INTENDANT_ID, etc.)
   +--> Git worktree isolation for implementation agents
   +--> Tagged knowledge store with pub/sub channels between agents
 ```
 
-- **Shared Memory (`/dev/shm/agent_processes`):** Fixed-size array of `ProcessInfo` structs (1024 slots). Each slot stores nonce, PID, status, exit code, and timestamp. Survives binary restarts since it lives on tmpfs.
-- **Session File (`/dev/shm/agent_session`):** Stores the log directory path so consecutive runs reuse the same directory.
-- **Log Directory (`/var/log/agent/<timestamp>/`):** Per-nonce stdout and stderr log files. Created once per session.
+- **Shared Memory (`/dev/shm/intendant_processes`):** Fixed-size array of `ProcessInfo` structs (1024 slots). Each slot stores nonce, PID, status, exit code, and timestamp. Survives binary restarts since it lives on tmpfs.
+- **Session File (`/dev/shm/intendant_session`):** Stores the log directory path so consecutive runs reuse the same directory.
+- **Log Directory (`/var/log/intendant/<timestamp>/`):** Per-nonce stdout and stderr log files. Created once per session.
 - **Status Monitor:** Background task that polls SHM for status changes and writes update lines to stdout.
 
 ## Building
@@ -40,8 +40,8 @@ cargo build --release
 ```
 
 Two binaries are produced:
-- `./target/release/agent` — the command runtime
-- `./target/release/caller` — the AI caller
+- `./target/release/intendant-runtime` — the command runtime
+- `./target/release/intendant` — the AI CLI/TUI
 
 ### Installing
 
@@ -49,7 +49,7 @@ Two binaries are produced:
 cargo install --path .
 ```
 
-Both binaries are installed to `~/.cargo/bin/`. The caller embeds default system prompts at compile time, so it works immediately from any directory without needing the source tree.
+Both binaries are installed to `~/.cargo/bin/`. The `intendant` binary embeds default system prompts at compile time, so it works immediately from any directory without needing the source tree.
 
 ## Usage
 
@@ -57,7 +57,7 @@ The agent reads a single JSON object from stdin and writes status lines to stdou
 
 ```bash
 echo '{"commands":[{"function":"execAsAgent","nonce":1,"command":"echo hello"}]}' \
-  | ./target/release/agent
+  | ./target/release/intendant-runtime
 ```
 
 Output:
@@ -71,58 +71,58 @@ Retrieve results in a subsequent run (returns JSON with `content`, `total_size`,
 
 ```bash
 echo '{"commands":[{"function":"fetchStatus","nonce":1,"status_type":"stdout"}]}' \
-  | ./target/release/agent
+  | ./target/release/intendant-runtime
 ```
 
 Read only the last 1024 bytes of a log:
 
 ```bash
 echo '{"commands":[{"function":"fetchStatus","nonce":1,"status_type":"stdout","limit":1024}]}' \
-  | ./target/release/agent
+  | ./target/release/intendant-runtime
 ```
 
 Inspect a file path:
 
 ```bash
 echo '{"commands":[{"function":"inspectPath","nonce":1,"path":"/etc/hosts"}]}' \
-  | ./target/release/agent
+  | ./target/release/intendant-runtime
 ```
 
 Edit a file:
 
 ```bash
 echo '{"commands":[{"function":"editFile","nonce":1,"file_path":"/tmp/test.txt","operation":"write","content":"hello"}]}' \
-  | ./target/release/agent
+  | ./target/release/intendant-runtime
 ```
 
 Fetch a web page as text:
 
 ```bash
 echo '{"commands":[{"function":"browse","nonce":1,"url":"https://example.com"}]}' \
-  | ./target/release/agent
+  | ./target/release/intendant-runtime
 ```
 
 Run stateful commands in a persistent PTY:
 
 ```bash
 echo '{"commands":[{"function":"execPty","nonce":1,"command":"cd /tmp"},{"function":"execPty","nonce":2,"command":"pwd"}]}' \
-  | ./target/release/agent
+  | ./target/release/intendant-runtime
 ```
 
 Store and recall memory (supports tagged knowledge with channels):
 
 ```bash
 # Basic store
-echo '{"commands":[{"function":"storeMemory","nonce":1,"memory_key":"db-config","memory_summary":"PostgreSQL on port 5432","memory_file":"/path/to/.agent/memory.json"}]}' \
-  | ./target/release/agent
+echo '{"commands":[{"function":"storeMemory","nonce":1,"memory_key":"db-config","memory_summary":"PostgreSQL on port 5432","memory_file":"/path/to/.intendant/memory.json"}]}' \
+  | ./target/release/intendant-runtime
 
 # Store with tags and channel
-echo '{"commands":[{"function":"storeMemory","nonce":1,"memory_key":"db-config","memory_summary":"PostgreSQL on port 5432","memory_tags":"database,config","memory_channel":"findings","memory_source":"research-1","memory_file":"/path/to/.agent/memory.json"}]}' \
-  | ./target/release/agent
+echo '{"commands":[{"function":"storeMemory","nonce":1,"memory_key":"db-config","memory_summary":"PostgreSQL on port 5432","memory_tags":"database,config","memory_channel":"findings","memory_source":"research-1","memory_file":"/path/to/.intendant/memory.json"}]}' \
+  | ./target/release/intendant-runtime
 
 # Recall with filters
-echo '{"commands":[{"function":"recallMemory","nonce":1,"memory_query":"database","memory_tags":"config","memory_channel":"findings","memory_file":"/path/to/.agent/memory.json"}]}' \
-  | ./target/release/agent
+echo '{"commands":[{"function":"recallMemory","nonce":1,"memory_query":"database","memory_tags":"config","memory_channel":"findings","memory_file":"/path/to/.intendant/memory.json"}]}' \
+  | ./target/release/intendant-runtime
 ```
 
 ## Protocol
@@ -182,7 +182,7 @@ The model can include a `context` field alongside `commands` to manage conversat
 
 ## Knowledge System
 
-Project knowledge persists tagged entries across sessions in `<project>/.agent/memory.json`. The system supports both the legacy key-value format and the new tagged knowledge format with automatic migration.
+Project knowledge persists tagged entries across sessions in `<project>/.intendant/memory.json`. The system supports both the legacy key-value format and the new tagged knowledge format with automatic migration.
 
 - **`storeMemory`**: Creates or updates an entry with key, summary, tags, channel, and source. Backward-compatible with old format.
 - **`recallMemory`**: Searches entries by keyword with optional filters (tags, channel, source, since timestamp).
@@ -191,7 +191,7 @@ Project knowledge persists tagged entries across sessions in `<project>/.agent/m
   - Agents publish findings to named channels (e.g., `"findings"`, `"decisions"`)
   - The orchestrator routes knowledge between sibling agents via subscriptions
   - Cursor-based tracking ensures agents only see new entries
-- Can be disabled in `agent.toml`:
+- Can be disabled in `intendant.toml`:
 
 ```toml
 [memory]
@@ -213,18 +213,18 @@ cargo test
 
 State persists across binary restarts via `/dev/shm/`:
 
-- **Process state** is stored in `/dev/shm/agent_processes` — the process map is rebuilt from SHM on each startup.
-- **Log directory** is stored in `/dev/shm/agent_session` — subsequent runs reuse the same log directory.
+- **Process state** is stored in `/dev/shm/intendant_processes` — the process map is rebuilt from SHM on each startup.
+- **Log directory** is stored in `/dev/shm/intendant_session` — subsequent runs reuse the same log directory.
 
 To reset all state (start a fresh session):
 
 ```bash
-rm -f /dev/shm/agent_processes /dev/shm/agent_session
+rm -f /dev/shm/intendant_processes /dev/shm/intendant_session
 ```
 
 ## AI Caller
 
-The caller binary detects the project, loads memory, sends the task to an AI model, and feeds the model's JSON output to the agent binary in a loop.
+The `intendant` binary detects the project, loads memory, sends the task to an AI model, and feeds the model's JSON output to the `intendant-runtime` binary in a loop.
 
 ### Setup
 
@@ -232,9 +232,9 @@ Create a `.env` file or export the variables. The caller searches for `.env` in 
 
 1. **Current directory** (and parent directories)
 2. **Project root** (git root)
-3. **Global config** (`~/.config/agent/.env`)
+3. **Global config** (`~/.config/intendant/.env`)
 
-For global use after `cargo install`, put your keys in `~/.config/agent/.env`:
+For global use after `cargo install`, put your keys in `~/.config/intendant/.env`:
 
 ```bash
 # OpenAI
@@ -253,22 +253,22 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 
 ```bash
 # With a task as CLI argument (launches TUI)
-./target/release/caller "List the files in /tmp"
+./target/release/intendant "List the files in /tmp"
 
 # Headless mode (no TUI, plain text output)
-./target/release/caller --no-tui "List the files in /tmp"
+./target/release/intendant --no-tui "List the files in /tmp"
 
 # With autonomy level
-./target/release/caller --autonomy low "rm -rf /tmp/test"
+./target/release/intendant --autonomy low "rm -rf /tmp/test"
 
 # Specify provider and model
-./target/release/caller --provider anthropic --model claude-sonnet-4-5-20250929 "List files"
+./target/release/intendant --provider anthropic --model claude-sonnet-4-5-20250929 "List files"
 
 # Interactive mode (prompts for task on stdin)
-./target/release/caller
+./target/release/intendant
 
 # Verbose output (show debug-level log entries)
-./target/release/caller --verbose "echo hello"
+./target/release/intendant --verbose "echo hello"
 ```
 
 ### CLI Flags
@@ -283,25 +283,25 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 | `--log-file <path>` | Write log output to file |
 | `--control-socket` | Enable control socket in headless mode |
 
-The TUI launches automatically when stdin is a terminal. When piping input or in sub-agent mode, the caller falls back to headless mode.
+The TUI launches automatically when stdin is a terminal. When piping input or in sub-agent mode, `intendant` falls back to headless mode.
 
 ### Execution Modes
 
-The caller operates in one of three modes, selected automatically:
+`intendant` operates in one of three modes, selected automatically:
 
-**Sub-Agent Mode** (when `AGENT_ROLE` env var is set):
+**Sub-Agent Mode** (when `INTENDANT_ROLE` env var is set):
 - Runs as a child agent with a scoped task
-- Writes periodic progress to `AGENT_PROGRESS_FILE`
-- Writes final results (summary, findings, artifacts, token usage) to `AGENT_RESULT_FILE`
+- Writes periodic progress to `INTENDANT_PROGRESS_FILE`
+- Writes final results (summary, findings, artifacts, token usage) to `INTENDANT_RESULT_FILE`
 - Uses role-specific system prompts (`SysPrompt_research.md`, `SysPrompt_implementation.md`, etc.)
 
-**User Mode** (complex tasks without `AGENT_ROLE`):
+**User Mode** (complex tasks without `INTENDANT_ROLE`):
 - Spawns an orchestrator sub-agent to handle the task
 - Monitors orchestrator progress, relays status to user
 - User conversation is protected from auto-pruning (message layer protection)
 - Supports relaying user input to the orchestrator
 
-**Direct Mode** (simple tasks without `AGENT_ROLE`):
+**Direct Mode** (simple tasks without `INTENDANT_ROLE`):
 - Single-loop execution similar to the original behavior
 - Used for short, single-line tasks that don't need orchestration
 
@@ -310,8 +310,8 @@ The caller operates in one of three modes, selected automatically:
 1. Loads `.env` and selects the API provider (OpenAI or Anthropic). All OpenAI models use the Responses API (`/v1/responses`)
 2. Configures structured output (JSON mode), reasoning controls, and max output tokens based on model capabilities and env vars
 3. Detects the project root (via `git rev-parse --show-toplevel`, falls back to cwd)
-4. Resolves role-appropriate system prompt via cascade: project root → `~/.config/agent/` → compiled-in default
-5. Loads knowledge from `<project>/.agent/memory.json`, injects into conversation
+4. Resolves role-appropriate system prompt via cascade: project root → `~/.config/intendant/` → compiled-in default
+5. Loads knowledge from `<project>/.intendant/memory.json`, injects into conversation
 6. Sends the task to the chat API (with `max_tokens`/`max_output_tokens`, optional `reasoning`, and optional JSON format)
 7. Extracts JSON from the model's response (handles structured output, code fences, and bare JSON)
 8. Checks for explicit `done` signal (`{"done": true}`) for task completion in JSON mode
@@ -319,7 +319,7 @@ The caller operates in one of three modes, selected automatically:
 10. Injects project context (`memory_file`) into relevant commands
 11. Classifies commands by action category (file read/write/delete, exec, network, destructive) and checks autonomy rules
 12. If approval is required, emits an approval request to the TUI and waits for user response
-13. Pipes the JSON to the agent binary, reads stdout/stderr with idle timeout (3s, or 330s for askHuman) and hard timeout (30s, or 600s for askHuman)
+13. Pipes the JSON to the `intendant-runtime` binary, reads stdout/stderr with idle timeout (3s, or 330s for askHuman) and hard timeout (30s, or 600s for askHuman)
 14. Feeds the agent output back as the next user message, appending a token budget summary
 15. Repeats until the model signals done, responds with no JSON, or the context budget is exhausted
 
@@ -330,7 +330,7 @@ The caller operates in one of three modes, selected automatically:
 - **Display:** DISPLAY is automatically set to `:1` (configurable via `display` field) for GUI commands
 - **Permissions:** Runs as unprivileged user with passwordless sudo
 
-### Caller Environment Variables
+### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -338,25 +338,25 @@ The caller operates in one of three modes, selected automatically:
 | `ANTHROPIC_API_KEY` / `ANTHROPIC` | — | Anthropic API key |
 | `PROVIDER` | auto-detect | `"openai"` or `"anthropic"` (used when both keys are set) |
 | `MODEL_NAME` | `gpt-5.2-codex` / `claude-sonnet-4-5-20250929` | Model to use (default depends on provider) |
-| `AGENT_IDLE_TIMEOUT` | `3` | Seconds to wait for agent output before assuming idle |
-| `AGENT_HARD_TIMEOUT` | `30` | Maximum seconds to wait for agent output |
+| `INTENDANT_IDLE_TIMEOUT` | `3` | Seconds to wait for agent output before assuming idle |
+| `INTENDANT_HARD_TIMEOUT` | `30` | Maximum seconds to wait for agent output |
 | `MODEL_CONTEXT_WINDOW` | per-model default | Context window size in tokens |
 | `MAX_OUTPUT_TOKENS` | per-model default | Max output tokens per API call (sent to API) |
 | `STRUCTURED_OUTPUT` | `true` for gpt-5+/o3/o4 | Enable JSON object mode for deterministic parsing |
 | `REASONING_EFFORT` | — | Reasoning effort for GPT-5/o3/o4 models (`low`, `medium`, `high`) |
 | `REASONING_SUMMARY` | — | Reasoning summary mode (`auto`, `concise`, `detailed`) |
-| `AGENT_ROLE` | — | Sub-agent role (`orchestrator`, `research`, `implementation`, `testing`) |
-| `AGENT_ID` | — | Unique sub-agent identifier |
-| `AGENT_RESULT_FILE` | — | Path for sub-agent to write final results |
-| `AGENT_PROGRESS_FILE` | — | Path for sub-agent to write periodic progress |
-| `AGENT_TASK` | — | Task description for sub-agent mode |
-| `AGENT_PARENT_KNOWLEDGE` | — | Path to parent's knowledge store for inheritance |
+| `INTENDANT_ROLE` | — | Sub-agent role (`orchestrator`, `research`, `implementation`, `testing`) |
+| `INTENDANT_ID` | — | Unique sub-agent identifier |
+| `INTENDANT_RESULT_FILE` | — | Path for sub-agent to write final results |
+| `INTENDANT_PROGRESS_FILE` | — | Path for sub-agent to write periodic progress |
+| `INTENDANT_TASK` | — | Task description for sub-agent mode |
+| `INTENDANT_PARENT_KNOWLEDGE` | — | Path to parent's knowledge store for inheritance |
 
 Timeouts are automatically extended when `askHuman` is detected in the command batch (idle: 330s, hard: 600s). Manual override via env vars is still supported.
 
 ### Project Configuration
 
-Create `agent.toml` in the project root:
+Create `intendant.toml` in the project root:
 
 ```toml
 [memory]
@@ -368,7 +368,7 @@ max_output_tokens = 8192      # override per-model default
 
 [orchestrator]
 max_parallel_agents = 4       # max concurrent sub-agents
-sub_agent_dir = ".agent/subagents"  # where sub-agent workspaces are created
+sub_agent_dir = ".intendant/subagents"  # where sub-agent workspaces are created
 
 [approval]
 file_read = "auto"            # auto-approve file reads
@@ -381,19 +381,19 @@ destructive = "ask"           # ask before destructive commands (default)
 
 ### System Prompts
 
-System prompts (`SysPrompt.md` and role-specific variants) are compiled into the binary at build time, so the caller works from any directory without needing the source tree. Prompts are resolved using a 3-layer cascade (highest priority first):
+System prompts (`SysPrompt.md` and role-specific variants) are compiled into the binary at build time, so `intendant` works from any directory without needing the source tree. Prompts are resolved using a 3-layer cascade (highest priority first):
 
 1. **Project root** — `<git-root>/SysPrompt.md` (per-project customization)
-2. **Global config** — `~/.config/agent/SysPrompt.md` (user-wide customization)
+2. **Global config** — `~/.config/intendant/SysPrompt.md` (user-wide customization)
 3. **Compiled-in default** — always available, zero-config
 
 Role-specific prompts (`SysPrompt_orchestrator.md`, `SysPrompt_research.md`, `SysPrompt_implementation.md`) follow the same cascade and are appended to the base prompt.
 
-To customize prompts for a specific project, place your modified `.md` files in the project's git root. For user-wide customization, place them in `~/.config/agent/`.
+To customize prompts for a specific project, place your modified `.md` files in the project's git root. For user-wide customization, place them in `~/.config/intendant/`.
 
 ## TUI
 
-The caller includes a ratatui-based terminal UI that launches automatically when stdin is a terminal. The TUI provides real-time monitoring and control of the agent loop.
+`intendant` includes a ratatui-based terminal UI that launches automatically when stdin is a terminal. The TUI provides real-time monitoring and control of the agent loop.
 
 ### Layout
 
@@ -440,7 +440,7 @@ The autonomy system controls which actions require human approval. It operates o
 | High | Only ask for unavoidable human input |
 | Full | Never ask (fully autonomous) |
 
-**Layer 2 — Per-category rules** (from `agent.toml` `[approval]` section):
+**Layer 2 — Per-category rules** (from `intendant.toml` `[approval]` section):
 Override the global level for specific action categories. Rules: `auto` (always approve), `ask` (require approval), `deny` (always deny).
 
 **Layer 3 — Per-action approval** (TUI panel):
@@ -450,7 +450,7 @@ Action categories are determined by analyzing command JSON: shell commands are c
 
 ## Control Socket
 
-When the TUI is active, a Unix domain socket is created at `/tmp/agent-<pid>.sock` for programmatic control. Use `--control-socket` to enable in headless mode.
+When the TUI is active, a Unix domain socket is created at `/tmp/intendant-<pid>.sock` for programmatic control. Use `--control-socket` to enable in headless mode.
 
 ### Inbound Commands (JSON-line)
 
@@ -476,5 +476,5 @@ When the TUI is active, a Unix domain socket is created at `/tmp/agent-<pid>.soc
 
 Example usage:
 ```bash
-echo '{"action":"status"}' | socat - UNIX:/tmp/agent-$(pgrep caller).sock
+echo '{"action":"status"}' | socat - UNIX:/tmp/intendant-$(pgrep intendant).sock
 ```

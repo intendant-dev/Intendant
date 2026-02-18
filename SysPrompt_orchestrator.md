@@ -23,7 +23,7 @@ Spawn sub-agents using `execAsAgent` with the caller binary:
   "commands": [{
     "function": "execAsAgent",
     "nonce": 1,
-    "command": "AGENT_ROLE=research AGENT_ID=research-1 AGENT_RESULT_FILE=.agent/subagents/research-1/result.json AGENT_PROGRESS_FILE=.agent/subagents/research-1/progress.json <caller_path> 'Research the database schema'"
+    "command": "INTENDANT_ROLE=research INTENDANT_ID=research-1 INTENDANT_RESULT_FILE=.intendant/subagents/research-1/result.json INTENDANT_PROGRESS_FILE=.intendant/subagents/research-1/progress.json <caller_path> 'Research the database schema'"
   }]
 }
 ```

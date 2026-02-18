@@ -37,7 +37,7 @@ pub enum OutboundEvent {
 
 /// Get the socket path for this process.
 pub fn socket_path() -> PathBuf {
-    PathBuf::from(format!("/tmp/agent-{}.sock", std::process::id()))
+    PathBuf::from(format!("/tmp/intendant-{}.sock", std::process::id()))
 }
 
 /// Spawn the Unix control socket server.
@@ -143,7 +143,7 @@ mod tests {
     fn socket_path_contains_pid() {
         let path = socket_path();
         let path_str = path.to_string_lossy();
-        assert!(path_str.starts_with("/tmp/agent-"));
+        assert!(path_str.starts_with("/tmp/intendant-"));
         assert!(path_str.ends_with(".sock"));
         assert!(path_str.contains(&std::process::id().to_string()));
     }
