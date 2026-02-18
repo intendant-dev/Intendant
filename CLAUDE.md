@@ -32,7 +32,7 @@ src/
 └── bin/
     └── caller/
         ├── main.rs          # Caller entry point: 3 modes (user/sub-agent/direct), budget-aware loop
-        ├── provider.rs      # Multi-provider API client (Chat Completions + Responses API), ChatProvider trait
+        ├── provider.rs      # Multi-provider API client (Chat Completions + Responses API), structured output, reasoning controls
         ├── conversation.rs  # Message management with layer protection, drop/summarize, budget tracking
         ├── agent_runner.rs  # Spawns agent subprocess, manages I/O with timeouts
         ├── knowledge.rs     # Tagged knowledge store with pub/sub channels, cursor-based routing
@@ -70,7 +70,7 @@ Running the caller (requires `.env` with API key):
 ## Testing
 
 ```bash
-cargo test                # Run all 273 tests
+cargo test                # Run all 289 tests
 cargo test -- --list      # List all test names
 ```
 
@@ -81,7 +81,7 @@ Test coverage includes:
 - **models.rs**: Serialization roundtrips, deserialization of minimal/full commands, repr(C) layout
 - **error.rs**: Display formatting, From conversions
 - **utils.rs**: Timestamp validity, status output formatting
-- **caller/main.rs** (159 tests total across caller modules): JSON extraction, context directives, budget constants, task classification
+- **caller/main.rs** (175 tests total across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification
 - **caller/conversation.rs**: Message ordering, serialization, drop/summarize turns, message layer protection, budget tracking
 - **caller/knowledge.rs**: Pub/sub lifecycle, subscription/cursor tracking, tag/channel/keyword filtering, old format migration, save/load roundtrip, knowledge routing
 - **caller/sub_agent.rs**: Spawn command generation, result/progress I/O, serialization, role roundtrips, directory scanning
@@ -89,7 +89,7 @@ Test coverage includes:
 - **caller/user_mode.rs**: Orchestrator spec generation, progress formatting, input relay, prompt resolution
 - **caller/project.rs**: Config parsing, project paths, sub-agent directory
 - **caller/memory.rs**: Memory/knowledge loading, formatting, format migration
-- **caller/provider.rs**: Provider selection, token usage parsing, context window defaults, Responses API types and routing
+- **caller/provider.rs**: Provider selection, token usage parsing, context window defaults, Responses API types and routing, structured output, reasoning controls, role mapping
 - **caller/error.rs**: Display formatting, type conversions
 
 ## Architecture Details
@@ -129,11 +129,19 @@ The caller operates in three modes based on environment:
 **User Mode** (complex task, no `AGENT_ROLE`): Spawns orchestrator sub-agent, monitors progress, relays to user. User-layer messages are protected from auto-pruning.
 
 **Direct Mode** (simple task, no `AGENT_ROLE`): Single-loop execution:
-1. Selects API provider (OpenAI or Anthropic) from env
+1. Selects API provider (OpenAI or Anthropic) from env, configures structured output and reasoning controls
 2. Detects project root via git, loads `agent.toml` config
 3. Reads role-appropriate system prompt
 4. Injects project knowledge into conversation
-5. Budget-aware loop (stops at context exhaustion or 500-turn safety cap): send to model -> extract JSON -> apply context directives -> inject project context -> pipe to agent -> append budget summary -> feed output back
+5. Budget-aware loop (stops at context exhaustion, `done` signal, or 500-turn safety cap): send to model -> extract JSON -> check done signal -> apply context directives -> inject project context -> pipe to agent -> append budget summary -> feed output back
+
+### OpenAI API Features
+
+- **Structured output**: JSON object mode (`response_format`/`text.format`) is enabled by default for capable models (gpt-5+, gpt-4o, o3, o4). Controlled via `STRUCTURED_OUTPUT` env var. Eliminates brittle free-text JSON extraction.
+- **Reasoning controls**: For reasoning models (gpt-5+, o3, o4), `REASONING_EFFORT` ("low"/"medium"/"high") and `REASONING_SUMMARY` ("auto"/"concise"/"detailed") tune quality/cost tradeoffs.
+- **Max output tokens**: Sent on all OpenAI requests (`max_tokens` for Chat Completions, `max_output_tokens` for Responses API).
+- **Role mapping**: Responses API passes through all non-system roles (user, assistant, developer, tool) instead of filtering to user/assistant only.
+- **Done signal**: With structured output enabled, models signal task completion via `{"commands": [], "done": true}` instead of prose responses.
 
 ## Code Conventions
 
@@ -168,7 +176,7 @@ The caller operates in three modes based on environment:
 
 - **OS**: Linux (requires `/dev/shm` for shared memory)
 - **Permissions**: Runs as unprivileged user with passwordless sudo
-- **For caller**: `.env` file with `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, optional `PROVIDER` and `MODEL_NAME`
+- **For caller**: `.env` file with `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, optional `PROVIDER`, `MODEL_NAME`, `STRUCTURED_OUTPUT`, `REASONING_EFFORT`, `REASONING_SUMMARY`
 - **For captureScreen**: ImageMagick `import` command and DISPLAY environment variable (defaults to `:1`)
 
 ## CI/CD

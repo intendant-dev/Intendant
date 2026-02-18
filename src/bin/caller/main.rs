@@ -62,16 +62,22 @@ fn extract_json(text: &str) -> Option<&str> {
     None
 }
 
+/// Returns (json_string, had_context_directives).
+/// Empty json_string means no commands to execute.
 fn apply_context_directives(
     json_str: &str,
     conversation: &mut Conversation,
-) -> String {
+) -> (String, bool) {
     let mut value: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
-        Err(_) => return json_str.to_string(),
+        Err(_) => return (json_str.to_string(), false),
     };
 
+    let mut had_context = false;
+
     if let Some(context) = value.get("context").cloned() {
+        had_context = true;
+
         // Apply drop_turns
         if let Some(drops) = context.get("drop_turns").and_then(|d| d.as_array()) {
             let indices: Vec<usize> = drops
@@ -101,17 +107,17 @@ fn apply_context_directives(
         }
     }
 
-    // Check if there are commands; if not, return empty to signal context-only turn
+    // Check if there are commands; if not, return empty to signal no commands
     let has_commands = value
         .get("commands")
         .and_then(|c| c.as_array())
         .is_some_and(|a| !a.is_empty());
 
     if !has_commands {
-        return String::new();
+        return (String::new(), had_context);
     }
 
-    serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
+    (serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string()), had_context)
 }
 
 fn inject_project_context(
@@ -233,10 +239,11 @@ Also: {"source": "bare"}"#;
         conv.add_assistant("a3".to_string());
 
         let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}],"context":{"drop_turns":[1,2]}}"#;
-        let result = apply_context_directives(json, &mut conv);
+        let (result, had_context) = apply_context_directives(json, &mut conv);
 
         // Messages 1,2 dropped (u1, a1)
         assert_eq!(conv.len(), 5);
+        assert!(had_context);
         // context field stripped
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed.get("context").is_none());
@@ -254,10 +261,11 @@ Also: {"source": "bare"}"#;
         conv.add_assistant("a3".to_string());
 
         let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}],"context":{"summarize":{"turns":[1,2,3,4],"summary":"Setup phase"}}}"#;
-        let result = apply_context_directives(json, &mut conv);
+        let (result, had_context) = apply_context_directives(json, &mut conv);
 
         assert_eq!(conv.len(), 4); // sys + summary + u3 + a3
         assert!(conv.messages()[1].content.contains("Setup phase"));
+        assert!(had_context);
         assert!(!result.is_empty());
     }
 
@@ -272,8 +280,9 @@ Also: {"source": "bare"}"#;
         conv.add_assistant("a3".to_string());
 
         let json = r#"{"commands":[],"context":{"drop_turns":[1,2]}}"#;
-        let result = apply_context_directives(json, &mut conv);
-        assert!(result.is_empty()); // no commands = context-only
+        let (result, had_context) = apply_context_directives(json, &mut conv);
+        assert!(result.is_empty()); // no commands
+        assert!(had_context); // but context was applied
     }
 
     #[test]
@@ -283,9 +292,45 @@ Also: {"source": "bare"}"#;
         conv.add_assistant("a1".to_string());
 
         let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}]}"#;
-        let result = apply_context_directives(json, &mut conv);
+        let (result, had_context) = apply_context_directives(json, &mut conv);
         assert_eq!(conv.len(), 3); // unchanged
+        assert!(!had_context);
         assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn apply_context_directives_empty_commands_no_context() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_user("u1".to_string());
+        conv.add_assistant("a1".to_string());
+
+        let json = r#"{"commands":[]}"#;
+        let (result, had_context) = apply_context_directives(json, &mut conv);
+        assert!(result.is_empty()); // no commands
+        assert!(!had_context); // no context directives — signals task complete
+    }
+
+    #[test]
+    fn done_signal_detected() {
+        let json = r#"{"commands":[],"done":true,"message":"All tasks completed"}"#;
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert!(parsed.get("done").and_then(|d| d.as_bool()).unwrap_or(false));
+        assert_eq!(parsed.get("message").and_then(|m| m.as_str()), Some("All tasks completed"));
+    }
+
+    #[test]
+    fn done_signal_without_message() {
+        let json = r#"{"commands":[],"done":true}"#;
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert!(parsed.get("done").and_then(|d| d.as_bool()).unwrap_or(false));
+        assert!(parsed.get("message").and_then(|m| m.as_str()).is_none());
+    }
+
+    #[test]
+    fn no_done_signal_continues() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}]}"#;
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert!(!parsed.get("done").and_then(|d| d.as_bool()).unwrap_or(false));
     }
 
     #[test]
@@ -430,14 +475,32 @@ async fn run_agent_loop(
             }
         };
 
-        // Apply context directives (drop_turns, summarize) before sending to agent
-        let json_str = apply_context_directives(&json_str, conversation);
+        // Check for explicit done signal (used in structured output / JSON mode)
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
+            if parsed.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+                if let Some(msg) = parsed.get("message").and_then(|m| m.as_str()) {
+                    println!("{}", msg);
+                }
+                println!("--- Task complete ---");
+                break;
+            }
+        }
 
-        // Context-only turn (no commands)
+        // Apply context directives (drop_turns, summarize) before sending to agent
+        let (json_str, had_context) = apply_context_directives(&json_str, conversation);
+
+        // No commands to execute
         if json_str.is_empty() {
-            println!("[Turn {}] Context management only, continuing...", turn);
-            conversation.add_user("Context updated.".to_string());
-            continue;
+            if had_context {
+                // Context directives were applied, but no commands — context management turn
+                println!("[Turn {}] Context management only, continuing...", turn);
+                conversation.add_user("Context updated.".to_string());
+                continue;
+            } else {
+                // No commands and no context directives — task complete
+                println!("--- Task complete ---");
+                break;
+            }
         }
 
         // Inject project context (memory_file) into commands

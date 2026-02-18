@@ -23,7 +23,6 @@ pub trait ChatProvider: Send + Sync {
     async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError>;
     fn name(&self) -> &str;
     fn context_window(&self) -> u64;
-    #[allow(dead_code)]
     fn max_output_tokens(&self) -> u64;
 }
 
@@ -35,6 +34,15 @@ pub trait ChatProvider: Send + Sync {
 struct OpenAIChatRequest {
     model: String,
     messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat>,
+}
+
+#[derive(Serialize)]
+struct ResponseFormat {
+    r#type: String,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +76,29 @@ struct OpenAIResponsesRequest {
     input: Vec<ResponsesInputMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<TextConfig>,
+}
+
+#[derive(Serialize, Clone)]
+struct ReasoningConfig {
+    effort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TextConfig {
+    format: TextFormat,
+}
+
+#[derive(Serialize)]
+struct TextFormat {
+    r#type: String,
 }
 
 #[derive(Serialize)]
@@ -109,25 +140,41 @@ pub struct OpenAIProvider {
     api_key: String,
     model: String,
     context_window: u64,
-    #[allow(dead_code)]
     max_output_tokens: u64,
+    structured_output: bool,
+    reasoning: Option<ReasoningConfig>,
 }
 
 impl OpenAIProvider {
     pub fn new(api_key: String, model: String, context_window: u64, max_output_tokens: u64) -> Self {
+        let structured_output = resolve_structured_output(&model);
+        let reasoning = resolve_reasoning(&model);
+
         Self {
             client: Client::new(),
             api_key,
             model,
             context_window,
             max_output_tokens,
+            structured_output,
+            reasoning,
         }
     }
 
     async fn chat_completions(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
+        let response_format = if self.structured_output {
+            Some(ResponseFormat {
+                r#type: "json_object".to_string(),
+            })
+        } else {
+            None
+        };
+
         let request = OpenAIChatRequest {
             model: self.model.clone(),
             messages: messages.to_vec(),
+            max_tokens: Some(self.max_output_tokens),
+            response_format,
         };
 
         let response = self
@@ -164,25 +211,39 @@ impl OpenAIProvider {
     }
 
     async fn responses_api(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
-        // Extract system/developer instructions and convert messages
+        // Extract system instructions
         let instructions = messages
             .iter()
             .find(|m| m.role == "system")
             .map(|m| m.content.clone());
 
+        // Pass through all non-system roles (user, assistant, developer, tool)
         let input: Vec<ResponsesInputMessage> = messages
             .iter()
-            .filter(|m| m.role == "user" || m.role == "assistant")
+            .filter(|m| m.role != "system")
             .map(|m| ResponsesInputMessage {
                 role: m.role.clone(),
                 content: m.content.clone(),
             })
             .collect();
 
+        let text = if self.structured_output {
+            Some(TextConfig {
+                format: TextFormat {
+                    r#type: "json_object".to_string(),
+                },
+            })
+        } else {
+            None
+        };
+
         let request = OpenAIResponsesRequest {
             model: self.model.clone(),
             input,
             instructions,
+            max_output_tokens: Some(self.max_output_tokens),
+            reasoning: self.reasoning.clone(),
+            text,
         };
 
         let response = self
@@ -387,7 +448,7 @@ fn default_context_window(model: &str) -> u64 {
         m if m.starts_with("gpt-4-turbo") => 128_000,
         m if m.starts_with("gpt-4") => 8_192,
         m if m.starts_with("gpt-3.5") => 16_385,
-        m if m.starts_with("o1") || m.starts_with("o3") => 200_000,
+        m if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") => 200_000,
         m if m.contains("claude") => 200_000,
         _ => 128_000,
     }
@@ -400,7 +461,7 @@ fn default_max_output_tokens(model: &str) -> u64 {
         m if m.starts_with("gpt-4-turbo") => 4_096,
         m if m.starts_with("gpt-4") => 8_192,
         m if m.starts_with("gpt-3.5") => 4_096,
-        m if m.starts_with("o1") || m.starts_with("o3") => 100_000,
+        m if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") => 100_000,
         m if m.contains("claude") => 8_192,
         _ => 8_192,
     }
@@ -418,6 +479,33 @@ fn resolve_max_output_tokens(model: &str) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| default_max_output_tokens(model))
+}
+
+fn supports_structured_output(model: &str) -> bool {
+    model.starts_with("gpt-5")
+        || model.starts_with("gpt-4o")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+}
+
+fn resolve_structured_output(model: &str) -> bool {
+    env::var("STRUCTURED_OUTPUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| supports_structured_output(model))
+}
+
+fn supports_reasoning(model: &str) -> bool {
+    model.starts_with("gpt-5") || model.starts_with("o3") || model.starts_with("o4")
+}
+
+fn resolve_reasoning(model: &str) -> Option<ReasoningConfig> {
+    if !supports_reasoning(model) {
+        return None;
+    }
+    let effort = env::var("REASONING_EFFORT").ok().filter(|s| !s.is_empty())?;
+    let summary = env::var("REASONING_SUMMARY").ok().filter(|s| !s.is_empty());
+    Some(ReasoningConfig { effort, summary })
 }
 
 pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
@@ -736,10 +824,14 @@ mod tests {
                 ResponsesInputMessage { role: "user".to_string(), content: "Hello".to_string() },
             ],
             instructions: Some("Be helpful.".to_string()),
+            max_output_tokens: Some(128_000),
+            reasoning: None,
+            text: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"model\":\"gpt-5.2-codex\""));
         assert!(json.contains("\"instructions\":\"Be helpful.\""));
+        assert!(json.contains("\"max_output_tokens\":128000"));
         assert!(json.contains("\"role\":\"user\""));
     }
 
@@ -751,8 +843,183 @@ mod tests {
                 ResponsesInputMessage { role: "user".to_string(), content: "Hi".to_string() },
             ],
             instructions: None,
+            max_output_tokens: None,
+            reasoning: None,
+            text: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("instructions"));
+        assert!(!json.contains("max_output_tokens"));
+        assert!(!json.contains("reasoning"));
+        assert!(!json.contains("text"));
+    }
+
+    #[test]
+    fn responses_api_request_with_reasoning() {
+        let request = OpenAIResponsesRequest {
+            model: "gpt-5.2-codex".to_string(),
+            input: vec![
+                ResponsesInputMessage { role: "user".to_string(), content: "Hi".to_string() },
+            ],
+            instructions: None,
+            max_output_tokens: Some(128_000),
+            reasoning: Some(ReasoningConfig {
+                effort: "high".to_string(),
+                summary: Some("auto".to_string()),
+            }),
+            text: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"reasoning\""));
+        assert!(json.contains("\"effort\":\"high\""));
+        assert!(json.contains("\"summary\":\"auto\""));
+    }
+
+    #[test]
+    fn responses_api_request_reasoning_without_summary() {
+        let request = OpenAIResponsesRequest {
+            model: "o3-mini".to_string(),
+            input: vec![
+                ResponsesInputMessage { role: "user".to_string(), content: "Hi".to_string() },
+            ],
+            instructions: None,
+            max_output_tokens: Some(100_000),
+            reasoning: Some(ReasoningConfig {
+                effort: "medium".to_string(),
+                summary: None,
+            }),
+            text: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"effort\":\"medium\""));
+        assert!(!json.contains("\"summary\""));
+    }
+
+    #[test]
+    fn responses_api_request_with_structured_output() {
+        let request = OpenAIResponsesRequest {
+            model: "gpt-5.2-codex".to_string(),
+            input: vec![
+                ResponsesInputMessage { role: "user".to_string(), content: "Hi".to_string() },
+            ],
+            instructions: None,
+            max_output_tokens: Some(128_000),
+            reasoning: None,
+            text: Some(TextConfig {
+                format: TextFormat {
+                    r#type: "json_object".to_string(),
+                },
+            }),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"text\""));
+        assert!(json.contains("\"json_object\""));
+    }
+
+    #[test]
+    fn chat_completions_request_serialization() {
+        let request = OpenAIChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                Message { role: "user".to_string(), content: "Hello".to_string(), ..Default::default() },
+            ],
+            max_tokens: Some(16_384),
+            response_format: Some(ResponseFormat { r#type: "json_object".to_string() }),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"max_tokens\":16384"));
+        assert!(json.contains("\"json_object\""));
+    }
+
+    #[test]
+    fn chat_completions_request_omits_optional_fields() {
+        let request = OpenAIChatRequest {
+            model: "gpt-3.5-turbo".to_string(),
+            messages: vec![
+                Message { role: "user".to_string(), content: "Hi".to_string(), ..Default::default() },
+            ],
+            max_tokens: None,
+            response_format: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("max_tokens"));
+        assert!(!json.contains("response_format"));
+    }
+
+    #[test]
+    fn supports_structured_output_models() {
+        assert!(supports_structured_output("gpt-5.2-codex"));
+        assert!(supports_structured_output("gpt-5"));
+        assert!(supports_structured_output("gpt-4o"));
+        assert!(supports_structured_output("gpt-4o-mini"));
+        assert!(supports_structured_output("o3-mini"));
+        assert!(supports_structured_output("o4-mini"));
+        assert!(!supports_structured_output("gpt-4-turbo"));
+        assert!(!supports_structured_output("gpt-3.5-turbo"));
+        assert!(!supports_structured_output("claude-sonnet-4-5-20250929"));
+    }
+
+    #[test]
+    fn supports_reasoning_models() {
+        assert!(supports_reasoning("gpt-5.2-codex"));
+        assert!(supports_reasoning("gpt-5"));
+        assert!(supports_reasoning("o3-mini"));
+        assert!(supports_reasoning("o4-mini"));
+        assert!(!supports_reasoning("gpt-4o"));
+        assert!(!supports_reasoning("gpt-4-turbo"));
+        assert!(!supports_reasoning("claude-sonnet-4-5-20250929"));
+    }
+
+    #[test]
+    fn default_context_window_o4() {
+        assert_eq!(default_context_window("o4-mini"), 200_000);
+        assert_eq!(default_context_window("o4"), 200_000);
+    }
+
+    #[test]
+    fn default_max_output_o4() {
+        assert_eq!(default_max_output_tokens("o4-mini"), 100_000);
+        assert_eq!(default_max_output_tokens("o4"), 100_000);
+    }
+
+    #[test]
+    fn responses_role_mapping_preserves_developer() {
+        let messages = vec![
+            Message { role: "system".to_string(), content: "System prompt".to_string(), ..Default::default() },
+            Message { role: "developer".to_string(), content: "Developer note".to_string(), ..Default::default() },
+            Message { role: "user".to_string(), content: "Hello".to_string(), ..Default::default() },
+            Message { role: "assistant".to_string(), content: "Hi".to_string(), ..Default::default() },
+        ];
+
+        let instructions = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.clone());
+        assert_eq!(instructions.as_deref(), Some("System prompt"));
+
+        let input: Vec<ResponsesInputMessage> = messages
+            .iter()
+            .filter(|m| m.role != "system")
+            .map(|m| ResponsesInputMessage { role: m.role.clone(), content: m.content.clone() })
+            .collect();
+
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0].role, "developer");
+        assert_eq!(input[1].role, "user");
+        assert_eq!(input[2].role, "assistant");
+    }
+
+    #[test]
+    fn openai_provider_stores_config() {
+        let provider = OpenAIProvider::new("key".to_string(), "gpt-5.2-codex".to_string(), 400_000, 128_000);
+        assert_eq!(provider.max_output_tokens(), 128_000);
+        // gpt-5 supports structured output by default
+        assert!(provider.structured_output);
+    }
+
+    #[test]
+    fn openai_provider_legacy_model_no_structured_output() {
+        let provider = OpenAIProvider::new("key".to_string(), "gpt-3.5-turbo".to_string(), 16_385, 4_096);
+        assert!(!provider.structured_output);
     }
 }
