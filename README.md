@@ -193,10 +193,10 @@ enabled = false  # default: true
 cargo test
 ```
 
-267 tests cover both binaries:
+273 tests cover both binaries:
 
 - **Agent binary (114 tests):** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
-- **Caller binary (153 tests):** JSON extraction, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing, memory/knowledge loading and formatting, provider selection with token usage tracking, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, and knowledge pub/sub system.
+- **Caller binary (159 tests):** JSON extraction, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, and knowledge pub/sub system.
 
 ## Session Management
 
@@ -229,7 +229,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 # If both are set, choose one:
 PROVIDER=openai          # or "anthropic"
 
-MODEL_NAME=gpt-4o        # optional, provider-specific default used if omitted
+MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 ```
 
 ### Running
@@ -264,7 +264,7 @@ The caller operates in one of three modes, selected automatically:
 
 ### How it works
 
-1. Loads `.env` and selects the API provider (OpenAI or Anthropic)
+1. Loads `.env` and selects the API provider (OpenAI or Anthropic). OpenAI gpt-5+/o3/o4 models use the Responses API (`/v1/responses`); legacy models use Chat Completions
 2. Detects the project root (via `git rev-parse --show-toplevel`, falls back to cwd)
 3. Reads role-appropriate system prompt (e.g., `SysPrompt.md`, `SysPrompt_orchestrator.md`)
 4. Loads knowledge from `<project>/.agent/memory.json`, injects into conversation
@@ -290,7 +290,7 @@ The caller operates in one of three modes, selected automatically:
 | `OPENAI_API_KEY` / `OPENAI` | — | OpenAI API key |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC` | — | Anthropic API key |
 | `PROVIDER` | auto-detect | `"openai"` or `"anthropic"` (used when both keys are set) |
-| `MODEL_NAME` | `gpt-4o` / `claude-sonnet-4-5-20250929` | Model to use (default depends on provider) |
+| `MODEL_NAME` | `gpt-5.2-codex` / `claude-sonnet-4-5-20250929` | Model to use (default depends on provider) |
 | `AGENT_IDLE_TIMEOUT` | `3` | Seconds to wait for agent output before assuming idle |
 | `AGENT_HARD_TIMEOUT` | `30` | Maximum seconds to wait for agent output |
 | `MODEL_CONTEXT_WINDOW` | per-model default | Context window size in tokens |
