@@ -32,7 +32,7 @@ src/
 └── bin/
     └── caller/
         ├── main.rs          # Caller entry point: 3 modes (user/sub-agent/direct), budget-aware loop
-        ├── provider.rs      # Multi-provider API client with token usage tracking, ChatProvider trait
+        ├── provider.rs      # Multi-provider API client (Chat Completions + Responses API), ChatProvider trait
         ├── conversation.rs  # Message management with layer protection, drop/summarize, budget tracking
         ├── agent_runner.rs  # Spawns agent subprocess, manages I/O with timeouts
         ├── knowledge.rs     # Tagged knowledge store with pub/sub channels, cursor-based routing
@@ -70,7 +70,7 @@ Running the caller (requires `.env` with API key):
 ## Testing
 
 ```bash
-cargo test                # Run all 267 tests
+cargo test                # Run all 273 tests
 cargo test -- --list      # List all test names
 ```
 
@@ -81,7 +81,7 @@ Test coverage includes:
 - **models.rs**: Serialization roundtrips, deserialization of minimal/full commands, repr(C) layout
 - **error.rs**: Display formatting, From conversions
 - **utils.rs**: Timestamp validity, status output formatting
-- **caller/main.rs** (153 tests total across caller modules): JSON extraction, context directives, budget constants, task classification
+- **caller/main.rs** (159 tests total across caller modules): JSON extraction, context directives, budget constants, task classification
 - **caller/conversation.rs**: Message ordering, serialization, drop/summarize turns, message layer protection, budget tracking
 - **caller/knowledge.rs**: Pub/sub lifecycle, subscription/cursor tracking, tag/channel/keyword filtering, old format migration, save/load roundtrip, knowledge routing
 - **caller/sub_agent.rs**: Spawn command generation, result/progress I/O, serialization, role roundtrips, directory scanning
@@ -89,7 +89,7 @@ Test coverage includes:
 - **caller/user_mode.rs**: Orchestrator spec generation, progress formatting, input relay, prompt resolution
 - **caller/project.rs**: Config parsing, project paths, sub-agent directory
 - **caller/memory.rs**: Memory/knowledge loading, formatting, format migration
-- **caller/provider.rs**: Provider selection, token usage parsing, context window defaults
+- **caller/provider.rs**: Provider selection, token usage parsing, context window defaults, Responses API types and routing
 - **caller/error.rs**: Display formatting, type conversions
 
 ## Architecture Details
