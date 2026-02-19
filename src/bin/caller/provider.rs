@@ -16,12 +16,15 @@ pub struct TokenUsage {
 pub struct ChatResponse {
     pub content: String,
     pub usage: TokenUsage,
+    pub reasoning_summary: Option<String>,
+    pub reasoning_content: Option<String>,
 }
 
 #[async_trait]
 pub trait ChatProvider: Send + Sync {
     async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError>;
     fn name(&self) -> &str;
+    fn model(&self) -> &str;
     fn context_window(&self) -> u64;
     #[allow(dead_code)]
     fn max_output_tokens(&self) -> u64;
@@ -75,11 +78,21 @@ struct OpenAIResponsesResponse {
 
 #[derive(Deserialize)]
 struct ResponsesOutputItem {
+    #[serde(rename = "type")]
+    item_type: Option<String>,
     content: Option<Vec<ResponsesContentItem>>,
+    summary: Option<Vec<ResponsesSummaryItem>>,
 }
 
 #[derive(Deserialize)]
 struct ResponsesContentItem {
+    #[serde(rename = "type")]
+    item_type: Option<String>,
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesSummaryItem {
     text: Option<String>,
 }
 
@@ -101,7 +114,12 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
-    pub fn new(api_key: String, model: String, context_window: u64, max_output_tokens: u64) -> Self {
+    pub fn new(
+        api_key: String,
+        model: String,
+        context_window: u64,
+        max_output_tokens: u64,
+    ) -> Self {
         let structured_output = resolve_structured_output(&model);
         let reasoning = resolve_reasoning(&model);
 
@@ -139,10 +157,14 @@ impl ChatProvider for OpenAIProvider {
         // When structured output is enabled, OpenAI requires the word "json" in the
         // input messages (instructions alone don't count). Inject a developer message.
         if self.structured_output {
-            input.insert(0, ResponsesInputMessage {
-                role: "developer".to_string(),
-                content: "Always respond with valid JSON matching the command schema.".to_string(),
-            });
+            input.insert(
+                0,
+                ResponsesInputMessage {
+                    role: "developer".to_string(),
+                    content: "Always respond with valid JSON matching the command schema."
+                        .to_string(),
+                },
+            );
         }
 
         let text = if self.structured_output {
@@ -186,9 +208,9 @@ impl ChatProvider for OpenAIProvider {
             .or_else(|| {
                 resp.output.as_ref().and_then(|items| {
                     items.iter().find_map(|item| {
-                        item.content.as_ref().and_then(|contents| {
-                            contents.iter().find_map(|c| c.text.clone())
-                        })
+                        item.content
+                            .as_ref()
+                            .and_then(|contents| contents.iter().find_map(|c| c.text.clone()))
                     })
                 })
             })
@@ -203,11 +225,77 @@ impl ChatProvider for OpenAIProvider {
             })
             .unwrap_or_default();
 
-        Ok(ChatResponse { content, usage })
+        // Extract reasoning summary and full content if present in Responses output.
+        let reasoning_summary = resp.output.as_ref().and_then(|items| {
+            let parts: Vec<String> = items
+                .iter()
+                .filter(|item| item.item_type.as_deref() == Some("reasoning"))
+                .flat_map(|item| {
+                    if let Some(summary) = &item.summary {
+                        summary
+                            .iter()
+                            .filter_map(|s| s.text.clone())
+                            .collect::<Vec<String>>()
+                    } else if let Some(content) = &item.content {
+                        content
+                            .iter()
+                            .filter(|c| {
+                                c.item_type
+                                    .as_deref()
+                                    .is_some_and(|t| t.contains("summary"))
+                            })
+                            .filter_map(|c| c.text.clone())
+                            .collect::<Vec<String>>()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        });
+
+        // Extract full reasoning content (all text from reasoning items, not just summaries).
+        let reasoning_content = resp.output.as_ref().and_then(|items| {
+            let parts: Vec<String> = items
+                .iter()
+                .filter(|item| item.item_type.as_deref() == Some("reasoning"))
+                .flat_map(|item| {
+                    let mut texts = Vec::new();
+                    if let Some(content) = &item.content {
+                        for c in content {
+                            if let Some(text) = &c.text {
+                                texts.push(text.clone());
+                            }
+                        }
+                    }
+                    texts
+                })
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        });
+
+        Ok(ChatResponse {
+            content,
+            usage,
+            reasoning_summary,
+            reasoning_content,
+        })
     }
 
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
     }
 
     fn context_window(&self) -> u64 {
@@ -261,7 +349,12 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: String, model: String, context_window: u64, max_output_tokens: u64) -> Self {
+    pub fn new(
+        api_key: String,
+        model: String,
+        context_window: u64,
+        max_output_tokens: u64,
+    ) -> Self {
         Self {
             client: Client::new(),
             api_key,
@@ -330,11 +423,20 @@ impl ChatProvider for AnthropicProvider {
             })
             .unwrap_or_default();
 
-        Ok(ChatResponse { content, usage })
+        Ok(ChatResponse {
+            content,
+            usage,
+            reasoning_summary: None,
+            reasoning_content: None,
+        })
     }
 
     fn name(&self) -> &str {
         "anthropic"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
     }
 
     fn context_window(&self) -> u64 {
@@ -381,9 +483,7 @@ fn resolve_max_output_tokens(model: &str) -> u64 {
 }
 
 fn supports_structured_output(model: &str) -> bool {
-    model.starts_with("gpt-5")
-        || model.starts_with("o3")
-        || model.starts_with("o4")
+    model.starts_with("gpt-5") || model.starts_with("o3") || model.starts_with("o4")
 }
 
 fn resolve_structured_output(model: &str) -> bool {
@@ -401,8 +501,28 @@ fn resolve_reasoning(model: &str) -> Option<ReasoningConfig> {
     if !supports_reasoning(model) {
         return None;
     }
-    let effort = env::var("REASONING_EFFORT").ok().filter(|s| !s.is_empty())?;
-    let summary = env::var("REASONING_SUMMARY").ok().filter(|s| !s.is_empty());
+    let effort = env::var("REASONING_EFFORT")
+        .ok()
+        .and_then(|v| {
+            let v = v.trim().to_string();
+            if v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(v)
+            }
+        })
+        .unwrap_or_else(|| "low".to_string());
+    let summary = env::var("REASONING_SUMMARY")
+        .ok()
+        .and_then(|s| {
+            let s = s.trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        })
+        .or_else(|| Some("auto".to_string()));
     Some(ReasoningConfig { effort, summary })
 }
 
@@ -420,8 +540,8 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
         // Both available, check PROVIDER preference
         (Some(oai), Some(ant), Some("anthropic")) => {
             let _ = oai;
-            let model = env::var("MODEL_NAME")
-                .unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string());
+            let model =
+                env::var("MODEL_NAME").unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
             Ok(Box::new(AnthropicProvider::new(ant, model, ctx, max_out)))
@@ -439,21 +559,20 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
             Ok(Box::new(OpenAIProvider::new(oai, model, ctx, max_out)))
         }
         (None, Some(ant), _) => {
-            let model = env::var("MODEL_NAME")
-                .unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string());
+            let model =
+                env::var("MODEL_NAME").unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
             Ok(Box::new(AnthropicProvider::new(ant, model, ctx, max_out)))
         }
-        (Some(_oai), Some(_ant), Some(other)) => {
-            Err(CallerError::Config(format!(
-                "Unknown PROVIDER value: '{}'. Expected 'openai' or 'anthropic'.",
-                other
-            )))
-        }
+        (Some(_oai), Some(_ant), Some(other)) => Err(CallerError::Config(format!(
+            "Unknown PROVIDER value: '{}'. Expected 'openai' or 'anthropic'.",
+            other
+        ))),
         (None, None, _) => Err(CallerError::Config(
             "No API key found. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in your environment, \
-             a .env file in your project root, or ~/.config/intendant/.env for global use.".to_string(),
+             a .env file in your project root, or ~/.config/intendant/.env for global use."
+                .to_string(),
         )),
     }
 }
@@ -464,13 +583,23 @@ mod tests {
 
     #[test]
     fn openai_provider_name() {
-        let provider = OpenAIProvider::new("key".to_string(), "gpt-5.2-codex".to_string(), 400_000, 128_000);
+        let provider = OpenAIProvider::new(
+            "key".to_string(),
+            "gpt-5.2-codex".to_string(),
+            400_000,
+            128_000,
+        );
         assert_eq!(provider.name(), "openai");
     }
 
     #[test]
     fn anthropic_provider_name() {
-        let provider = AnthropicProvider::new("key".to_string(), "claude-sonnet-4-5-20250929".to_string(), 200_000, 8_192);
+        let provider = AnthropicProvider::new(
+            "key".to_string(),
+            "claude-sonnet-4-5-20250929".to_string(),
+            200_000,
+            8_192,
+        );
         assert_eq!(provider.name(), "anthropic");
     }
 
@@ -581,7 +710,10 @@ mod tests {
     fn default_context_window_known_models() {
         assert_eq!(default_context_window("gpt-5.2-codex"), 400_000);
         assert_eq!(default_context_window("gpt-5"), 400_000);
-        assert_eq!(default_context_window("claude-sonnet-4-5-20250929"), 200_000);
+        assert_eq!(
+            default_context_window("claude-sonnet-4-5-20250929"),
+            200_000
+        );
         assert_eq!(default_context_window("o1-preview"), 200_000);
         assert_eq!(default_context_window("o3-mini"), 200_000);
     }
@@ -595,17 +727,30 @@ mod tests {
     fn default_max_output_known_models() {
         assert_eq!(default_max_output_tokens("gpt-5.2-codex"), 128_000);
         assert_eq!(default_max_output_tokens("gpt-5"), 128_000);
-        assert_eq!(default_max_output_tokens("claude-sonnet-4-5-20250929"), 8_192);
+        assert_eq!(
+            default_max_output_tokens("claude-sonnet-4-5-20250929"),
+            8_192
+        );
         assert_eq!(default_max_output_tokens("o1-preview"), 100_000);
     }
 
     #[test]
     fn context_window_methods() {
-        let provider = OpenAIProvider::new("key".to_string(), "gpt-5.2-codex".to_string(), 400_000, 128_000);
+        let provider = OpenAIProvider::new(
+            "key".to_string(),
+            "gpt-5.2-codex".to_string(),
+            400_000,
+            128_000,
+        );
         assert_eq!(provider.context_window(), 400_000);
         assert_eq!(provider.max_output_tokens(), 128_000);
 
-        let provider = AnthropicProvider::new("key".to_string(), "claude-sonnet-4-5-20250929".to_string(), 200_000, 8_192);
+        let provider = AnthropicProvider::new(
+            "key".to_string(),
+            "claude-sonnet-4-5-20250929".to_string(),
+            200_000,
+            8_192,
+        );
         assert_eq!(provider.context_window(), 200_000);
         assert_eq!(provider.max_output_tokens(), 8_192);
     }
@@ -631,7 +776,10 @@ mod tests {
             "usage": {"input_tokens": 25, "output_tokens": 8, "total_tokens": 33}
         }"#;
         let resp: OpenAIResponsesResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.output_text.as_deref(), Some("Hello from Responses API!"));
+        assert_eq!(
+            resp.output_text.as_deref(),
+            Some("Hello from Responses API!")
+        );
         let usage = resp.usage.unwrap();
         assert_eq!(usage.input_tokens, 25);
         assert_eq!(usage.output_tokens, 8);
@@ -661,9 +809,9 @@ mod tests {
         assert!(resp.output_text.is_none());
         let text = resp.output.as_ref().and_then(|items| {
             items.iter().find_map(|item| {
-                item.content.as_ref().and_then(|contents| {
-                    contents.iter().find_map(|c| c.text.clone())
-                })
+                item.content
+                    .as_ref()
+                    .and_then(|contents| contents.iter().find_map(|c| c.text.clone()))
             })
         });
         assert_eq!(text.as_deref(), Some("Fallback text"));
@@ -673,9 +821,10 @@ mod tests {
     fn responses_api_request_serialization() {
         let request = OpenAIResponsesRequest {
             model: "gpt-5.2-codex".to_string(),
-            input: vec![
-                ResponsesInputMessage { role: "user".to_string(), content: "Hello".to_string() },
-            ],
+            input: vec![ResponsesInputMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
             instructions: Some("Be helpful.".to_string()),
             max_output_tokens: Some(128_000),
             reasoning: None,
@@ -692,9 +841,10 @@ mod tests {
     fn responses_api_request_omits_null_instructions() {
         let request = OpenAIResponsesRequest {
             model: "gpt-5.2-codex".to_string(),
-            input: vec![
-                ResponsesInputMessage { role: "user".to_string(), content: "Hi".to_string() },
-            ],
+            input: vec![ResponsesInputMessage {
+                role: "user".to_string(),
+                content: "Hi".to_string(),
+            }],
             instructions: None,
             max_output_tokens: None,
             reasoning: None,
@@ -711,9 +861,10 @@ mod tests {
     fn responses_api_request_with_reasoning() {
         let request = OpenAIResponsesRequest {
             model: "gpt-5.2-codex".to_string(),
-            input: vec![
-                ResponsesInputMessage { role: "user".to_string(), content: "Hi".to_string() },
-            ],
+            input: vec![ResponsesInputMessage {
+                role: "user".to_string(),
+                content: "Hi".to_string(),
+            }],
             instructions: None,
             max_output_tokens: Some(128_000),
             reasoning: Some(ReasoningConfig {
@@ -732,9 +883,10 @@ mod tests {
     fn responses_api_request_reasoning_without_summary() {
         let request = OpenAIResponsesRequest {
             model: "o3-mini".to_string(),
-            input: vec![
-                ResponsesInputMessage { role: "user".to_string(), content: "Hi".to_string() },
-            ],
+            input: vec![ResponsesInputMessage {
+                role: "user".to_string(),
+                content: "Hi".to_string(),
+            }],
             instructions: None,
             max_output_tokens: Some(100_000),
             reasoning: Some(ReasoningConfig {
@@ -752,9 +904,10 @@ mod tests {
     fn responses_api_request_with_structured_output() {
         let request = OpenAIResponsesRequest {
             model: "gpt-5.2-codex".to_string(),
-            input: vec![
-                ResponsesInputMessage { role: "user".to_string(), content: "Hi".to_string() },
-            ],
+            input: vec![ResponsesInputMessage {
+                role: "user".to_string(),
+                content: "Hi".to_string(),
+            }],
             instructions: None,
             max_output_tokens: Some(128_000),
             reasoning: None,
@@ -803,10 +956,26 @@ mod tests {
     #[test]
     fn responses_role_mapping_preserves_developer() {
         let messages = vec![
-            Message { role: "system".to_string(), content: "System prompt".to_string(), ..Default::default() },
-            Message { role: "developer".to_string(), content: "Developer note".to_string(), ..Default::default() },
-            Message { role: "user".to_string(), content: "Hello".to_string(), ..Default::default() },
-            Message { role: "assistant".to_string(), content: "Hi".to_string(), ..Default::default() },
+            Message {
+                role: "system".to_string(),
+                content: "System prompt".to_string(),
+                ..Default::default()
+            },
+            Message {
+                role: "developer".to_string(),
+                content: "Developer note".to_string(),
+                ..Default::default()
+            },
+            Message {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: "Hi".to_string(),
+                ..Default::default()
+            },
         ];
 
         let instructions = messages
@@ -818,7 +987,10 @@ mod tests {
         let input: Vec<ResponsesInputMessage> = messages
             .iter()
             .filter(|m| m.role != "system")
-            .map(|m| ResponsesInputMessage { role: m.role.clone(), content: m.content.clone() })
+            .map(|m| ResponsesInputMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
             .collect();
 
         assert_eq!(input.len(), 3);
@@ -829,7 +1001,12 @@ mod tests {
 
     #[test]
     fn openai_provider_stores_config() {
-        let provider = OpenAIProvider::new("key".to_string(), "gpt-5.2-codex".to_string(), 400_000, 128_000);
+        let provider = OpenAIProvider::new(
+            "key".to_string(),
+            "gpt-5.2-codex".to_string(),
+            400_000,
+            128_000,
+        );
         assert_eq!(provider.max_output_tokens(), 128_000);
         // gpt-5 supports structured output by default
         assert!(provider.structured_output);

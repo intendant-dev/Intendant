@@ -4,8 +4,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-const SESSION_FILE_PATH: &str = "/dev/shm/intendant_session";
-
 /// Structured event written as one JSON line in session.jsonl.
 #[derive(Serialize)]
 struct LogEvent {
@@ -65,7 +63,10 @@ impl SessionLog {
             turn: None,
             event: "session_start".to_string(),
             level: Some("info".to_string()),
-            message: Some(format!("Session started at {}", Local::now().format("%Y-%m-%d %H:%M:%S"))),
+            message: Some(format!(
+                "Session started at {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S")
+            )),
             data: None,
             file: None,
             file2: None,
@@ -75,27 +76,50 @@ impl SessionLog {
 
     /// Resolve the session log directory.
     /// If `override_path` is set (via --log-file), use that as the directory.
-    /// Otherwise, use the shared session directory.
+    /// Otherwise, create a fresh session directory for this run and publish
+    /// it in shared memory so runtime-side components can join the same session.
     pub fn resolve_path(override_path: Option<&str>) -> PathBuf {
         if let Some(path) = override_path {
-            return PathBuf::from(path);
+            let dir = PathBuf::from(path);
+            let _ = fs::create_dir_all(&dir);
+            let _ = fs::write(session_file_path(), dir.to_string_lossy().as_bytes());
+            return dir;
         }
 
-        // Reuse existing session directory if present
-        if let Ok(existing) = fs::read_to_string(SESSION_FILE_PATH) {
+        // Create a new session directory for each top-level caller invocation.
+        let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+        let unique = format!("{}_{}", timestamp, std::process::id());
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let dir = PathBuf::from(format!("{}/.intendant/logs/{}", home, unique));
+        let _ = fs::create_dir_all(&dir);
+        let _ = fs::write(session_file_path(), dir.to_string_lossy().as_bytes());
+        dir
+    }
+
+    /// Resolve a previously-created session directory for resume mode.
+    ///
+    /// Priority:
+    /// 1) `override_path` if provided and exists.
+    /// 2) shared session marker path if it points to an existing directory.
+    pub fn resolve_resume_path(override_path: Option<&str>) -> Option<PathBuf> {
+        if let Some(path) = override_path {
+            let dir = PathBuf::from(path);
+            if dir.is_dir() {
+                let _ = fs::write(session_file_path(), dir.to_string_lossy().as_bytes());
+                return Some(dir);
+            }
+            return None;
+        }
+
+        if let Ok(existing) = fs::read_to_string(session_file_path()) {
             let dir = PathBuf::from(existing.trim());
             if dir.is_dir() {
-                return dir;
+                let _ = fs::write(session_file_path(), dir.to_string_lossy().as_bytes());
+                return Some(dir);
             }
         }
 
-        // Create a new session directory
-        let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let dir = PathBuf::from(format!("{}/.intendant/logs/{}", home, timestamp));
-        let _ = fs::create_dir_all(&dir);
-        let _ = fs::write(SESSION_FILE_PATH, dir.to_string_lossy().as_bytes());
-        dir
+        None
     }
 
     pub fn dir(&self) -> &Path {
@@ -129,7 +153,11 @@ impl SessionLog {
     pub fn info(&mut self, msg: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "info".to_string(),
             level: Some("info".to_string()),
             message: Some(msg.to_string()),
@@ -142,7 +170,11 @@ impl SessionLog {
     pub fn warn(&mut self, msg: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "warn".to_string(),
             level: Some("warn".to_string()),
             message: Some(msg.to_string()),
@@ -155,7 +187,11 @@ impl SessionLog {
     pub fn error(&mut self, msg: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "error".to_string(),
             level: Some("error".to_string()),
             message: Some(msg.to_string()),
@@ -168,7 +204,11 @@ impl SessionLog {
     pub fn debug(&mut self, msg: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "debug".to_string(),
             level: Some("debug".to_string()),
             message: Some(msg.to_string()),
@@ -192,6 +232,23 @@ impl SessionLog {
                 "remaining_tokens": remaining,
             })),
             file: None,
+            file2: None,
+        });
+    }
+
+    /// Log the full messages array sent to the API for this turn.
+    pub fn messages_input(&mut self, messages_json: &str) {
+        let file = self.write_turn_file("messages.json", messages_json);
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: Some(self.current_turn),
+            event: "messages_input".to_string(),
+            level: Some("debug".to_string()),
+            message: Some(format!("Messages logged ({} bytes)", messages_json.len())),
+            data: Some(serde_json::json!({
+                "json_length": messages_json.len(),
+            })),
+            file,
             file2: None,
         });
     }
@@ -241,7 +298,11 @@ impl SessionLog {
             .and_then(|v| v.get("commands")?.as_array().cloned())
             .unwrap_or_default()
             .iter()
-            .filter_map(|cmd| cmd.get("function").and_then(|f| f.as_str()).map(String::from))
+            .filter_map(|cmd| {
+                cmd.get("function")
+                    .and_then(|f| f.as_str())
+                    .map(String::from)
+            })
             .collect();
 
         self.emit(LogEvent {
@@ -277,7 +338,11 @@ impl SessionLog {
             ts: Self::ts(),
             turn: Some(self.current_turn),
             event: "agent_output".to_string(),
-            level: if stderr.is_empty() { Some("info".to_string()) } else { Some("warn".to_string()) },
+            level: if stderr.is_empty() {
+                Some("info".to_string())
+            } else {
+                Some("warn".to_string())
+            },
             message: if stdout.is_empty() && stderr.is_empty() {
                 Some("(no output)".to_string())
             } else {
@@ -289,6 +354,25 @@ impl SessionLog {
             })),
             file,
             file2,
+        });
+    }
+
+    /// Log reasoning content from the model (full reasoning, not just summary).
+    pub fn reasoning_content(&mut self, summary: Option<&str>, full_content: Option<&str>) {
+        let file = full_content.and_then(|c| self.write_turn_file("reasoning.txt", c));
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: Some(self.current_turn),
+            event: "reasoning".to_string(),
+            level: Some("info".to_string()),
+            message: summary.map(|s| s.to_string()),
+            data: Some(serde_json::json!({
+                "has_summary": summary.is_some(),
+                "has_full_content": full_content.is_some(),
+                "full_content_length": full_content.map(|c| c.len()).unwrap_or(0),
+            })),
+            file,
+            file2: None,
         });
     }
 
@@ -318,7 +402,11 @@ impl SessionLog {
             .and_then(|v| v.get("commands")?.as_array().cloned())
             .unwrap_or_default()
             .iter()
-            .filter_map(|cmd| cmd.get("function").and_then(|f| f.as_str()).map(String::from))
+            .filter_map(|cmd| {
+                cmd.get("function")
+                    .and_then(|f| f.as_str())
+                    .map(String::from)
+            })
             .collect();
 
         let done = serde_json::from_str::<serde_json::Value>(json)
@@ -332,7 +420,11 @@ impl SessionLog {
             event: "json_extracted".to_string(),
             level: Some("debug".to_string()),
             message: Some(if functions.is_empty() {
-                if done { "done signal".to_string() } else { "no commands".to_string() }
+                if done {
+                    "done signal".to_string()
+                } else {
+                    "no commands".to_string()
+                }
             } else {
                 functions.join(", ")
             }),
@@ -364,12 +456,36 @@ impl SessionLog {
             turn: None,
             event: "session_end".to_string(),
             level: Some("info".to_string()),
-            message: Some(format!("Session ended: {} ({} turns)", outcome, total_turns)),
+            message: Some(format!(
+                "Session ended: {} ({} turns)",
+                outcome, total_turns
+            )),
             data: None,
             file: Some("summary.json".to_string()),
             file2: None,
         });
     }
+}
+
+fn session_file_path() -> PathBuf {
+    shared_file_path("intendant_session")
+}
+
+fn shared_file_path(name: &str) -> PathBuf {
+    let base = std::env::var("INTENDANT_SHARED_DIR")
+        .map(PathBuf::from)
+        .ok()
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            let shm = PathBuf::from("/dev/shm");
+            if shm.exists() {
+                Some(shm)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(name)
 }
 
 #[cfg(test)]
@@ -559,5 +675,56 @@ mod tests {
         assert!(log_dir.join("turns/turn_002_stdout.txt").exists());
         assert!(!log_dir.join("turns/turn_001_stderr.txt").exists());
         assert!(log_dir.join("turns/turn_002_stderr.txt").exists());
+    }
+
+    #[test]
+    fn messages_input_writes_turn_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 200_000);
+        log.messages_input(r#"[{"role":"system","content":"You are an AI."},{"role":"user","content":"Hello"}]"#);
+        drop(log);
+
+        let messages_file = log_dir.join("turns/turn_001_messages.json");
+        assert!(messages_file.exists());
+        let content = fs::read_to_string(&messages_file).unwrap();
+        assert!(content.contains("system"));
+        assert!(content.contains("Hello"));
+    }
+
+    #[test]
+    fn reasoning_content_writes_turn_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 200_000);
+        log.reasoning_content(
+            Some("The model is thinking about X"),
+            Some("Full detailed reasoning about X and Y"),
+        );
+        drop(log);
+
+        let reasoning_file = log_dir.join("turns/turn_001_reasoning.txt");
+        assert!(reasoning_file.exists());
+        let content = fs::read_to_string(&reasoning_file).unwrap();
+        assert!(content.contains("Full detailed reasoning"));
+
+        let session = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        assert!(session.contains("\"event\":\"reasoning\""));
+        assert!(session.contains("has_summary"));
+    }
+
+    #[test]
+    fn reasoning_content_summary_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 200_000);
+        log.reasoning_content(Some("Summary only"), None);
+        drop(log);
+
+        // No reasoning file created when no full content
+        assert!(!log_dir.join("turns/turn_001_reasoning.txt").exists());
     }
 }
