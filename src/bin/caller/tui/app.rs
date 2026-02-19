@@ -1,5 +1,6 @@
 use crate::autonomy::SharedAutonomy;
-use crate::tui::event::{AppEvent, ApprovalResponse};
+use crate::control::{self, OutboundEvent};
+use crate::tui::event::{AppEvent, ApprovalResponse, ControlMsg};
 use crate::tui::layout::PanelConfig;
 use chrono::Local;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -133,6 +134,7 @@ pub struct App {
 
     // Shared autonomy state
     pub autonomy: SharedAutonomy,
+    pub control_tx: Option<tokio::sync::broadcast::Sender<String>>,
 
     // Animation
     pub tick_count: usize,
@@ -159,8 +161,13 @@ impl App {
             human_textarea: None,
             pending_approval: None,
             autonomy,
+            control_tx: None,
             tick_count: 0,
         }
+    }
+
+    pub fn set_control_socket(&mut self, tx: tokio::sync::broadcast::Sender<String>) {
+        self.control_tx = Some(tx);
     }
 
     pub fn log(&mut self, level: LogLevel, content: String) {
@@ -471,7 +478,7 @@ impl App {
                         return true;
                     }
 
-                    match std::fs::write("/dev/shm/intendant_human_response", &response) {
+                    match std::fs::write(shared_file_path("intendant_human_response"), &response) {
                         Ok(_) => {
                             self.log(
                                 LogLevel::Info,
@@ -525,6 +532,75 @@ impl App {
         }
     }
 
+    fn set_autonomy_level(&self, level: &str) {
+        let parsed = crate::autonomy::AutonomyLevel::from_str_loose(level);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let autonomy = self.autonomy.clone();
+            handle.spawn(async move {
+                let mut state = autonomy.write().await;
+                state.level = parsed;
+            });
+        }
+    }
+
+    fn broadcast_control(&self, event: OutboundEvent) {
+        if let Some(tx) = &self.control_tx {
+            control::broadcast_event(tx, &event);
+        }
+    }
+
+    fn handle_control_command(&mut self, msg: ControlMsg) {
+        match msg {
+            ControlMsg::Status => {
+                self.broadcast_control(OutboundEvent::Status {
+                    turn: self.turn,
+                    phase: format!("{:?}", self.current_phase).to_lowercase(),
+                    autonomy: self.autonomy_display.to_lowercase(),
+                });
+            }
+            ControlMsg::Approve { id } => {
+                if let Some(pending) = self.pending_approval.take() {
+                    if pending.id == id {
+                        let _ = pending.responder.send(ApprovalResponse::Approve);
+                        self.mode = AppMode::Normal;
+                        self.current_phase = Phase::RunningAgent;
+                    } else {
+                        self.pending_approval = Some(pending);
+                    }
+                }
+            }
+            ControlMsg::Deny { id } => {
+                if let Some(pending) = self.pending_approval.take() {
+                    if pending.id == id {
+                        let _ = pending.responder.send(ApprovalResponse::Deny);
+                        self.mode = AppMode::Normal;
+                        self.current_phase = Phase::Done;
+                    } else {
+                        self.pending_approval = Some(pending);
+                    }
+                }
+            }
+            ControlMsg::Input { text } => {
+                if self.mode == AppMode::AskHuman {
+                    let _ = std::fs::write(
+                        shared_file_path("intendant_human_response"),
+                        text.as_bytes(),
+                    );
+                    self.human_textarea = None;
+                    self.human_question = None;
+                    self.mode = AppMode::Normal;
+                    self.current_phase = Phase::RunningAgent;
+                }
+            }
+            ControlMsg::SetAutonomy { level } => {
+                self.set_autonomy_level(&level);
+            }
+            ControlMsg::Quit => {
+                self.should_quit = true;
+            }
+        }
+    }
+
     /// Process an AppEvent and update state accordingly.
     pub fn handle_event(&mut self, event: AppEvent) {
         match event {
@@ -534,6 +610,7 @@ impl App {
                 self.turn = turn;
                 self.budget_pct = budget_pct;
                 self.current_phase = Phase::Thinking;
+                self.broadcast_control(OutboundEvent::TurnStarted { turn, budget_pct });
                 self.log(
                     LogLevel::Debug,
                     format!("Turn {} started ({:.0}% budget)", turn, budget_pct),
@@ -546,21 +623,20 @@ impl App {
                 reasoning,
             } => {
                 self.turn = turn;
-                let preview = truncate_str(&content, 200);
-                self.log(LogLevel::Model, preview.to_string());
-                if let Some(summary) = reasoning {
-                    self.log(LogLevel::Model, format!("Reasoning: {}", summary));
-                } else {
-                    self.log(
-                        LogLevel::Debug,
-                        "Reasoning summary unavailable for this response".to_string(),
-                    );
-                }
+                // Show human-readable command summary at Model level (visible at Normal verbosity)
+                let summary = format_model_summary(&content);
                 self.log(
                     LogLevel::Model,
+                    format!("T{}: {}", turn, summary),
+                );
+                if let Some(ref reasoning_text) = reasoning {
+                    self.log(LogLevel::Model, format!("Reasoning: {}", reasoning_text));
+                }
+                self.log(
+                    LogLevel::Info,
                     format!(
-                        "T{} tokens: prompt={} completion={} total={}",
-                        turn, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+                        "tokens: prompt={} completion={} total={}",
+                        usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
                     ),
                 );
                 self.log(LogLevel::Debug, format!("Raw model response: {}", content));
@@ -579,6 +655,10 @@ impl App {
                 self.log(LogLevel::Debug, format!("Agent running (turn {})", turn));
             }
             AppEvent::AgentOutput { stdout, stderr } => {
+                self.broadcast_control(OutboundEvent::AgentOutput {
+                    stdout: stdout.clone(),
+                    stderr: stderr.clone(),
+                });
                 if !stdout.is_empty() {
                     for line in stdout.lines() {
                         self.log(LogLevel::Agent, line.to_string());
@@ -601,6 +681,9 @@ impl App {
             }
             AppEvent::TaskComplete { reason } => {
                 self.current_phase = Phase::Done;
+                self.broadcast_control(OutboundEvent::TaskComplete {
+                    reason: reason.clone(),
+                });
                 self.log(LogLevel::Info, format!("--- {} ---", reason));
             }
             AppEvent::BudgetWarning { pct, remaining } => {
@@ -630,6 +713,9 @@ impl App {
                 self.human_question = Some(question.clone());
                 self.current_phase = Phase::WaitingHuman;
                 self.mode = AppMode::AskHuman;
+                self.broadcast_control(OutboundEvent::AskHuman {
+                    question: question.clone(),
+                });
                 let mut textarea = tui_textarea::TextArea::default();
                 textarea.set_cursor_line_style(ratatui::style::Style::default());
                 self.human_textarea = Some(textarea);
@@ -660,9 +746,13 @@ impl App {
                         truncate_str(&command_preview, 80)
                     ),
                 );
+                self.broadcast_control(OutboundEvent::ApprovalRequired {
+                    id,
+                    command: command_preview,
+                });
             }
             AppEvent::ControlCommand(msg) => {
-                self.log(LogLevel::Debug, format!("Control: {:?}", msg));
+                self.handle_control_command(msg);
             }
             AppEvent::Tick => {
                 self.tick_count += 1;
@@ -683,12 +773,140 @@ impl App {
     }
 }
 
+/// Format a human-readable summary of a model's JSON response.
+/// Extracts command functions and their key parameters (command strings, paths, etc.)
+/// instead of showing raw JSON.
+fn format_model_summary(content: &str) -> String {
+    let parsed: serde_json::Value = match serde_json::from_str(content) {
+        Ok(v) => v,
+        Err(_) => {
+            // Not valid JSON; just show a truncated preview
+            let preview = truncate_str(content, 200);
+            return preview.to_string();
+        }
+    };
+
+    let commands = match parsed.get("commands").and_then(|c| c.as_array()) {
+        Some(cmds) if !cmds.is_empty() => cmds,
+        _ => {
+            if parsed
+                .get("done")
+                .and_then(|d| d.as_bool())
+                .unwrap_or(false)
+            {
+                return "done signal".to_string();
+            }
+            return "no commands".to_string();
+        }
+    };
+
+    let summaries: Vec<String> = commands
+        .iter()
+        .map(|cmd| {
+            let func = cmd.get("function").and_then(|f| f.as_str()).unwrap_or("?");
+            match func {
+                "execAsAgent" => {
+                    let command = cmd
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("?");
+                    let truncated = truncate_str(command, 120);
+                    format!("exec: {}", truncated)
+                }
+                "fetchStatus" => {
+                    let st = cmd
+                        .get("status_type")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("?");
+                    let dep = cmd
+                        .get("depending_nonce")
+                        .and_then(|n| n.as_u64())
+                        .map(|n| format!(" (nonce {})", n))
+                        .unwrap_or_default();
+                    format!("fetch: {}{}", st, dep)
+                }
+                "editFile" => {
+                    let path = cmd
+                        .get("file_path")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("?");
+                    let op = cmd
+                        .get("operation")
+                        .and_then(|o| o.as_str())
+                        .unwrap_or("?");
+                    format!("edit: {} ({})", path, op)
+                }
+                "inspectPath" => {
+                    let path = cmd.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+                    format!("inspect: {}", path)
+                }
+                "browse" => {
+                    let url = cmd.get("url").and_then(|u| u.as_str()).unwrap_or("?");
+                    format!("browse: {}", truncate_str(url, 80))
+                }
+                "askHuman" => {
+                    let q = cmd
+                        .get("question")
+                        .and_then(|q| q.as_str())
+                        .unwrap_or("?");
+                    format!("ask: {}", truncate_str(q, 100))
+                }
+                "storeMemory" => {
+                    let key = cmd
+                        .get("memory_key")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("?");
+                    format!("store: {}", key)
+                }
+                "recallMemory" => {
+                    let q = cmd
+                        .get("memory_query")
+                        .and_then(|q| q.as_str())
+                        .unwrap_or("?");
+                    format!("recall: {}", q)
+                }
+                "execPty" => {
+                    let command = cmd
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("?");
+                    format!("pty: {}", truncate_str(command, 120))
+                }
+                _ => func.to_string(),
+            }
+        })
+        .collect();
+
+    summaries.join(" | ")
+}
+
 fn truncate_str(s: &str, max: usize) -> &str {
     if s.len() <= max {
         s
     } else {
-        &s[..max]
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
     }
+}
+
+fn shared_file_path(name: &str) -> std::path::PathBuf {
+    let base = std::env::var("INTENDANT_SHARED_DIR")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            let shm = std::path::PathBuf::from("/dev/shm");
+            if shm.exists() {
+                Some(shm)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(name)
 }
 
 #[cfg(test)]
@@ -990,6 +1208,58 @@ mod tests {
     #[test]
     fn truncate_str_long() {
         assert_eq!(truncate_str("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn format_model_summary_exec() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls -la /tmp"}]}"#;
+        let summary = format_model_summary(json);
+        assert!(summary.contains("exec: ls -la /tmp"));
+    }
+
+    #[test]
+    fn format_model_summary_fetch() {
+        let json = r#"{"commands":[{"function":"fetchStatus","nonce":2,"status_type":"stdout","depending_nonce":1}]}"#;
+        let summary = format_model_summary(json);
+        assert!(summary.contains("fetch: stdout (nonce 1)"));
+    }
+
+    #[test]
+    fn format_model_summary_edit() {
+        let json = r#"{"commands":[{"function":"editFile","nonce":3,"file_path":"/tmp/test.rs","operation":"write","content":"fn main(){}"}]}"#;
+        let summary = format_model_summary(json);
+        assert!(summary.contains("edit: /tmp/test.rs (write)"));
+    }
+
+    #[test]
+    fn format_model_summary_multiple() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"},{"function":"fetchStatus","nonce":2,"status_type":"stdout"}]}"#;
+        let summary = format_model_summary(json);
+        assert!(summary.contains("exec: ls"));
+        assert!(summary.contains("fetch: stdout"));
+        assert!(summary.contains(" | "));
+    }
+
+    #[test]
+    fn format_model_summary_done() {
+        let json = r#"{"commands":[],"done":true}"#;
+        let summary = format_model_summary(json);
+        assert_eq!(summary, "done signal");
+    }
+
+    #[test]
+    fn format_model_summary_invalid_json() {
+        let text = "This is not JSON";
+        let summary = format_model_summary(text);
+        assert_eq!(summary, "This is not JSON");
+    }
+
+    #[test]
+    fn format_model_summary_ask_human() {
+        let json =
+            r#"{"commands":[{"function":"askHuman","nonce":1,"question":"What should I do?"}]}"#;
+        let summary = format_model_summary(json);
+        assert!(summary.contains("ask: What should I do?"));
     }
 
     #[test]

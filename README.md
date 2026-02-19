@@ -30,8 +30,8 @@ intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
 
 - **Shared Process State (`intendant_processes`):** Fixed-size array of `ProcessInfo` structs (1024 slots). Each slot stores nonce, PID, status, exit code, and timestamp. Path resolves via `INTENDANT_SHARED_DIR`, then `/dev/shm` if available, else OS temp dir.
 - **Session File (`intendant_session`):** Stores the log directory path so consecutive runs reuse the same directory. Uses the same shared-dir resolution.
-- **Log Directory (`~/.intendant/logs/<timestamp>/`):** Per-nonce stdout and stderr log files. Created once per session.
-- **Status Monitor:** Background task that polls SHM for status changes and writes update lines to stdout.
+- **Log Directory (`~/.intendant/logs/<timestamp>/`):** Per-nonce stdout and stderr log files, plus structured session logs. Created once per session.
+- **Status Monitor:** Background task that polls SHM for status changes and writes update lines to stdout. Status lines are filtered caller-side to only include nonces from the current command batch.
 
 ## Building
 
@@ -207,8 +207,60 @@ cargo test
 
 The test suite covers both binaries with several hundred unit/integration tests:
 
-- **Agent binary (114 tests):** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
-- **Caller binary (292 tests):** JSON extraction, done signal handling, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults), TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, and control socket serialization.
+- **Agent binary (115 tests):** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
+- **Caller binary (338 tests):** JSON extraction, done signal handling, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults), TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, control socket serialization, status line filtering, auto-fetch detection, session log file creation, and model summary formatting.
+
+## Session Logging
+
+Each `intendant` invocation creates a structured session log directory at `~/.intendant/logs/<timestamp>_<pid>/`. The log provides full observability for debugging and post-session analysis.
+
+### Directory Structure
+
+```
+~/.intendant/logs/20260219_040037_119700/
+├── session.jsonl                    # Structured event log (one JSON per line)
+├── summary.json                     # Post-session summary (task, outcome, turns)
+├── 1_stdout.log                     # Runtime stdout for nonce 1
+├── 1_stderr.log                     # Runtime stderr for nonce 1
+└── turns/
+    ├── turn_001_messages.json       # Full messages array sent to API
+    ├── turn_001_model.txt           # Full model response
+    ├── turn_001_reasoning.txt       # Full reasoning content (if available)
+    ├── turn_001_agent_in.json       # Commands sent to runtime (pretty-printed)
+    ├── turn_001_stdout.txt          # Agent stdout for this turn
+    └── turn_001_stderr.txt          # Agent stderr (only if non-empty)
+```
+
+### Event Types in session.jsonl
+
+| Event | Description |
+|-------|-------------|
+| `session_start` | Session initialization |
+| `turn_start` | Turn boundary with budget % and remaining tokens |
+| `messages_input` | Full API input logged (file reference to messages.json) |
+| `model_response` | Model output with token counts (200-char preview, full in file) |
+| `reasoning` | Reasoning summary and full content (if available from API) |
+| `json_extracted` | Extracted command JSON with function names |
+| `agent_input` | Commands sent to runtime |
+| `agent_output` | Runtime stdout/stderr |
+| `approval` | Approval decisions (category, preview, decision) |
+| `session_end` | Summary with outcome and turn count |
+
+### Querying Logs
+
+```bash
+# Overview of a session
+cat ~/.intendant/logs/<session>/session.jsonl | jq -r '.event'
+
+# See what the model received on turn 5
+cat ~/.intendant/logs/<session>/turns/turn_005_messages.json | jq .
+
+# See model reasoning on turn 3
+cat ~/.intendant/logs/<session>/turns/turn_003_reasoning.txt
+
+# Find all commands executed
+grep '"event":"agent_input"' ~/.intendant/logs/<session>/session.jsonl | jq -r '.message'
+```
 
 ## Session Management
 
@@ -321,23 +373,28 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 2. Configures structured output (JSON mode), reasoning controls, and max output tokens based on model capabilities and env vars
 3. Detects the project root (via `git rev-parse --show-toplevel`, falls back to cwd)
 4. Resolves role-appropriate system prompt via cascade: project root → `~/.config/intendant/` → compiled-in default
-5. Loads knowledge from `<project>/.intendant/memory.json`, injects into conversation
-6. Sends the task to the chat API (with `max_tokens`/`max_output_tokens`, optional `reasoning`, and optional JSON format)
-7. Extracts JSON from the model's response (handles structured output, code fences, and bare JSON)
-8. Checks for explicit `done` signal (`{"done": true}`) for task completion in JSON mode
-9. Applies context directives (`drop_turns`, `summarize`) to the conversation
-10. Injects project context (`memory_file`) into relevant commands
-11. Classifies commands by action category (file read/write/delete, exec, network, destructive) and checks autonomy rules
-12. If approval is required:
+5. Injects the project working directory into the conversation so the model knows which project to work in
+6. Loads knowledge from `<project>/.intendant/memory.json`, injects into conversation
+7. Logs the full messages array to `turn_NNN_messages.json` before each API call
+8. Sends the task to the chat API (with `max_tokens`/`max_output_tokens`, optional `reasoning`, and optional JSON format)
+9. Logs reasoning content (both summary and full text) to `turn_NNN_reasoning.txt` when available
+10. Extracts JSON from the model's response (handles structured output, code fences, and bare JSON)
+11. Checks for explicit `done` signal (`{"done": true}`) for task completion in JSON mode
+12. Applies context directives (`drop_turns`, `summarize`) to the conversation
+13. Injects project context (`memory_file`) into relevant commands
+14. Classifies commands by action category (file read/write/delete, exec, network, destructive) and checks autonomy rules
+15. If approval is required:
     - TUI mode: emits an approval request and waits for user response
     - Headless mode: denies execution (no implicit auto-approve fallback)
-13. Pipes the JSON to the `intendant-runtime` binary, reads stdout/stderr with adaptive timeouts:
+16. Pipes the JSON to the `intendant-runtime` binary, reads stdout/stderr with adaptive timeouts:
     - Default: idle-before-first `2s`, idle-after-first `1s`, hard `30s`
     - `fetchStatus(wait=true)`: idle-before-first `15s`, hard `45s`
     - `askHuman`: idle-before-first `330s`, idle-after-first `1s`, hard `600s`
-14. Feeds the agent output back as the next user message, appending a token budget summary
-15. Repeats until the model signals done, responds with no JSON, or the context budget is exhausted
-16. In headless mode, if the model emits `askHuman`, the loop now sends a recovery prompt back to the model (continue with explicit assumptions) instead of blocking on human-input timeout
+17. Filters agent status lines to only include nonces from the current command batch (reduces noise)
+18. For single standalone `execAsAgent` commands that complete successfully, auto-appends stdout (saves the model a `fetchStatus` round-trip)
+19. Feeds the agent output back as the next user message, appending a token budget summary
+20. Repeats until the model signals done, responds with no JSON, or the context budget is exhausted
+21. In headless mode, if the model emits `askHuman`, the loop now sends a recovery prompt back to the model (continue with explicit assumptions) instead of blocking on human-input timeout
 
 ## Environment
 

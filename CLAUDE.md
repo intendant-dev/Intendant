@@ -84,18 +84,18 @@ echo "task" | ./target/release/intendant                   # Auto-detects non-TT
 ## Testing
 
 ```bash
-cargo test                # Run all 406 tests (114 agent + 292 caller)
+cargo test                # Run all 453 tests (115 agent + 338 caller)
 cargo test -- --list      # List all test names
 ```
 
 All tests are inline `#[cfg(test)]` modules in the same files as the code they test. Async tests use `#[tokio::test]`. The `tempfile` crate provides isolated temporary directories for tests that touch the filesystem or shared memory.
 
 Test coverage includes:
-- **agent.rs** (114 tests): Process info operations, dependency checking, command execution, status fetching with log tail, path inspection, nonce reference replacement, process mapping, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters, synchronous command shared memory registration, cross-command-type dependency chaining
+- **agent.rs** (115 tests): Process info operations, dependency checking, command execution, status fetching with log tail, path inspection, nonce reference replacement, process mapping, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters, synchronous command shared memory registration, cross-command-type dependency chaining
 - **models.rs**: Serialization roundtrips, deserialization of minimal/full commands, repr(C) layout
 - **error.rs**: Display formatting, From conversions
 - **utils.rs**: Timestamp validity, status output formatting
-- **caller/main.rs** (292 tests total across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification, CLI flags, EventBus emit
+- **caller/main.rs** (338 tests total across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification, CLI flags, EventBus emit, status line filtering, auto-fetch nonce detection, batch nonce extraction
 - **caller/conversation.rs**: Message ordering, serialization, drop/summarize turns, message layer protection, budget tracking
 - **caller/knowledge.rs**: Pub/sub lifecycle, subscription/cursor tracking, tag/channel/keyword filtering, old format migration, save/load roundtrip, knowledge routing
 - **caller/sub_agent.rs**: Spawn command generation, result/progress I/O, serialization, role roundtrips, directory scanning
@@ -108,13 +108,14 @@ Test coverage includes:
 - **caller/error.rs**: Display formatting, type conversions (including Tui variant)
 - **caller/autonomy.rs**: Autonomy levels (display, parse, cycle), action categories, approval rules, needs_approval logic, command classification (exec, destructive, network, file write, askHuman, browse), batch classification
 - **caller/control.rs**: Socket path, outbound event serialization, broadcast, server lifecycle
-- **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses), event dispatch (all AppEvent variants), bottom panel heights
+- **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses), event dispatch (all AppEvent variants), bottom panel heights, model summary formatting (exec, fetch, edit, multiple commands, done signal, askHuman, invalid JSON)
 - **caller/tui/event.rs**: EventBus send/receive/clone, ControlMsg deserialization (all variants), serialization roundtrip, ApprovalResponse variants
 - **caller/tui/layout.rs**: Layout calculation (all panel combos, with/without bottom panel, hidden panels, small terminal)
 - **caller/tui/widgets.rs**: Log entry formatting (all levels, verbose/non-verbose), string truncation
 - **caller/tui/theme.rs**: Budget color thresholds, spinner frames, action style variants, autonomy color variants
 - **caller/tui/mod.rs**: TestBackend rendering (default state, log entries, approval panel, help overlay, all phases, verbose modes, small terminal)
 - **caller/agent_runner.rs**: askHuman detection in JSON input
+- **caller/session_log.rs**: Directory structure creation, JSONL event validity, turn tracking, model response file creation, agent input pretty-printing, agent output file creation (stdout/stderr split), approval log searchability, JSON extraction logging, summary file creation, multi-turn file separation, messages input logging, reasoning content logging (full and summary-only)
 
 ## Architecture Details
 

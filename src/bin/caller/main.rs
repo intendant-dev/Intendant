@@ -95,7 +95,7 @@ fn print_help() {
     println!("    REASONING_SUMMARY     Reasoning summary: auto, concise, detailed");
 }
 
-fn parse_cli_flags() -> CliFlags {
+fn parse_cli_flags() -> Result<CliFlags, CallerError> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut flags = CliFlags {
         task: None,
@@ -122,7 +122,9 @@ fn parse_cli_flags() -> CliFlags {
                     flags.provider = Some(args[i + 1].clone());
                     i += 2;
                 } else {
-                    i += 1;
+                    return Err(CallerError::Config(
+                        "Missing value for --provider".to_string(),
+                    ));
                 }
             }
             "--model" => {
@@ -130,7 +132,7 @@ fn parse_cli_flags() -> CliFlags {
                     flags.model = Some(args[i + 1].clone());
                     i += 2;
                 } else {
-                    i += 1;
+                    return Err(CallerError::Config("Missing value for --model".to_string()));
                 }
             }
             "--verbose" | "-v" => {
@@ -146,7 +148,9 @@ fn parse_cli_flags() -> CliFlags {
                     flags.autonomy = AutonomyLevel::from_str_loose(&args[i + 1]);
                     i += 2;
                 } else {
-                    i += 1;
+                    return Err(CallerError::Config(
+                        "Missing value for --autonomy".to_string(),
+                    ));
                 }
             }
             "--log-file" => {
@@ -154,7 +158,9 @@ fn parse_cli_flags() -> CliFlags {
                     flags.log_file = Some(args[i + 1].clone());
                     i += 2;
                 } else {
-                    i += 1;
+                    return Err(CallerError::Config(
+                        "Missing value for --log-file".to_string(),
+                    ));
                 }
             }
             "--resume" => {
@@ -171,6 +177,12 @@ fn parse_cli_flags() -> CliFlags {
                 i += 1;
             }
             other => {
+                if other.starts_with('-') {
+                    return Err(CallerError::Config(format!(
+                        "Unknown CLI flag: {}. Use --help to see valid options.",
+                        other
+                    )));
+                }
                 task_parts.push(other.to_string());
                 i += 1;
             }
@@ -181,7 +193,7 @@ fn parse_cli_flags() -> CliFlags {
         flags.task = Some(task_parts.join(" "));
     }
 
-    flags
+    Ok(flags)
 }
 
 fn extract_json(text: &str) -> Option<&str> {
@@ -366,6 +378,103 @@ fn format_command_preview(json_str: &str) -> String {
     }
     // Fallback: first 200 chars of raw JSON
     json_str.chars().take(200).collect()
+}
+
+/// Extract nonces from a command batch JSON, including depending_nonce references.
+fn extract_batch_nonces(json_str: &str) -> std::collections::HashSet<u64> {
+    let mut nonces = std::collections::HashSet::new();
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+        if let Some(commands) = parsed.get("commands").and_then(|c| c.as_array()) {
+            for cmd in commands {
+                if let Some(n) = cmd.get("nonce").and_then(|v| v.as_u64()) {
+                    nonces.insert(n);
+                }
+                if let Some(n) = cmd.get("depending_nonce").and_then(|v| v.as_u64()) {
+                    nonces.insert(n);
+                }
+            }
+        }
+    }
+    nonces
+}
+
+/// Check if a command batch is a single standalone execAsAgent (no dependencies),
+/// and if so return its nonce. Used for auto-fetch optimization.
+fn single_exec_nonce(json_str: &str) -> Option<u64> {
+    let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let commands = parsed.get("commands")?.as_array()?;
+    if commands.len() != 1 {
+        return None;
+    }
+    let cmd = &commands[0];
+    let func = cmd.get("function")?.as_str()?;
+    if func != "execAsAgent" {
+        return None;
+    }
+    // Skip if it has dependencies (it's part of a chain)
+    if cmd.get("depending_nonce").is_some() {
+        return None;
+    }
+    cmd.get("nonce")?.as_u64()
+}
+
+/// Read the stdout log file for a completed nonce directly from the session log directory.
+fn read_nonce_stdout(session_dir: &std::path::Path, nonce: u64) -> Option<String> {
+    let path = session_dir.join(format!("{}_stdout.log", nonce));
+    std::fs::read_to_string(path).ok().filter(|s| !s.is_empty())
+}
+
+/// Filter agent stdout to only include status lines for relevant nonces
+/// and any non-status-line content (JSON from fetchStatus, etc.).
+/// Status lines match the pattern `<nonce><status_char><exit_code>` (e.g., "1c0", "42f1").
+fn filter_status_lines(stdout: &str, relevant_nonces: &std::collections::HashSet<u64>) -> String {
+    // If no nonces to filter by, return as-is (safety fallback)
+    if relevant_nonces.is_empty() {
+        return stdout.to_string();
+    }
+
+    let status_line_re =
+        regex::Regex::new(r"^(\d+)([rcfswRCFSW])(\d+)$").expect("valid status line regex");
+
+    stdout
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            if let Some(caps) = status_line_re.captures(trimmed) {
+                // This is a status line — only keep if nonce is relevant
+                if let Ok(nonce) = caps[1].parse::<u64>() {
+                    return relevant_nonces.contains(&nonce);
+                }
+                false
+            } else {
+                // Not a status line (JSON output, etc.) — always keep
+                true
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_command_batch(json_str: &str) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return json_str.to_string(),
+    };
+
+    let Some(commands) = value.get_mut("commands").and_then(|c| c.as_array_mut()) else {
+        return json_str.to_string();
+    };
+
+    for cmd in commands {
+        if cmd.get("function").and_then(|f| f.as_str()) == Some("writeFile") {
+            cmd["function"] = serde_json::Value::String("editFile".to_string());
+            if cmd.get("operation").is_none() {
+                cmd["operation"] = serde_json::Value::String("write".to_string());
+            }
+        }
+    }
+
+    serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
 }
 
 /// Macro-like helper for conditional output: TUI event bus or println.
@@ -724,8 +833,7 @@ Also: {"source": "bare"}"#;
 
     #[test]
     fn has_ask_human_command_true() {
-        let json =
-            r#"{"commands":[{"function":"execAsAgent","nonce":1},{"function":"askHuman","nonce":2}]}"#;
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1},{"function":"askHuman","nonce":2}]}"#;
         assert!(has_ask_human_command(json));
     }
 
@@ -767,6 +875,84 @@ Also: {"source": "bare"}"#;
         emit(&bus_opt, || AppEvent::Tick, || called = true);
         assert!(called);
     }
+
+    #[test]
+    fn extract_batch_nonces_single() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":42,"command":"ls"}]}"#;
+        let nonces = extract_batch_nonces(json);
+        assert_eq!(nonces.len(), 1);
+        assert!(nonces.contains(&42));
+    }
+
+    #[test]
+    fn extract_batch_nonces_with_dependency() {
+        let json = r#"{"commands":[{"function":"fetchStatus","nonce":5,"depending_nonce":3}]}"#;
+        let nonces = extract_batch_nonces(json);
+        assert_eq!(nonces.len(), 2);
+        assert!(nonces.contains(&5));
+        assert!(nonces.contains(&3));
+    }
+
+    #[test]
+    fn extract_batch_nonces_invalid_json() {
+        let nonces = extract_batch_nonces("not json");
+        assert!(nonces.is_empty());
+    }
+
+    #[test]
+    fn filter_status_lines_keeps_relevant() {
+        let stdout = "1r0\n2c0\n3c0\n1c0\n";
+        let mut nonces = std::collections::HashSet::new();
+        nonces.insert(1);
+        let result = filter_status_lines(stdout, &nonces);
+        assert!(result.contains("1r0"));
+        assert!(result.contains("1c0"));
+        assert!(!result.contains("2c0"));
+        assert!(!result.contains("3c0"));
+    }
+
+    #[test]
+    fn filter_status_lines_keeps_json() {
+        let stdout = "1c0\n{\"agent_id\":\"runtime\",\"ok\":true}\n2c0\n";
+        let mut nonces = std::collections::HashSet::new();
+        nonces.insert(1);
+        let result = filter_status_lines(stdout, &nonces);
+        assert!(result.contains("1c0"));
+        assert!(result.contains("agent_id"));
+        assert!(!result.contains("2c0"));
+    }
+
+    #[test]
+    fn filter_status_lines_empty_nonces_returns_all() {
+        let stdout = "1c0\n2c0\n";
+        let nonces = std::collections::HashSet::new();
+        let result = filter_status_lines(stdout, &nonces);
+        assert_eq!(result, stdout);
+    }
+
+    #[test]
+    fn single_exec_nonce_single_exec() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":7,"command":"ls"}]}"#;
+        assert_eq!(single_exec_nonce(json), Some(7));
+    }
+
+    #[test]
+    fn single_exec_nonce_with_dependency() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":7,"command":"ls","depending_nonce":3}]}"#;
+        assert_eq!(single_exec_nonce(json), None);
+    }
+
+    #[test]
+    fn single_exec_nonce_multiple_commands() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1},{"function":"execAsAgent","nonce":2}]}"#;
+        assert_eq!(single_exec_nonce(json), None);
+    }
+
+    #[test]
+    fn single_exec_nonce_not_exec() {
+        let json = r#"{"commands":[{"function":"fetchStatus","nonce":5}]}"#;
+        assert_eq!(single_exec_nonce(json), None);
+    }
 }
 
 const PROGRESS_INTERVAL: usize = 5;
@@ -783,6 +969,8 @@ async fn run_agent_loop(
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
     let mut loop_stats = LoopStats::default();
+    let mut seen_sub_agent_results: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for turn in 1..=SAFETY_CAP {
         // Check budget before sending
@@ -829,6 +1017,13 @@ async fn run_agent_loop(
             },
         );
 
+        // Log the full messages array being sent to the API
+        slog(&session_log, |l| {
+            if let Ok(json) = serde_json::to_string_pretty(conversation.messages()) {
+                l.messages_input(&json);
+            }
+        });
+
         let response = match provider.chat(conversation.messages()).await {
             Ok(r) => r,
             Err(e) => {
@@ -857,6 +1052,16 @@ async fn run_agent_loop(
                 response.usage.total_tokens,
             )
         });
+
+        // Log reasoning content if available
+        if response.reasoning_summary.is_some() || response.reasoning_content.is_some() {
+            slog(&session_log, |l| {
+                l.reasoning_content(
+                    response.reasoning_summary.as_deref(),
+                    response.reasoning_content.as_deref(),
+                )
+            });
+        }
 
         // Check budget warning
         if !budget_warning_shown && conversation.usage_fraction() >= BUDGET_WARNING_THRESHOLD {
@@ -1026,8 +1231,8 @@ async fn run_agent_loop(
         }
         empty_command_streak = 0;
 
-        // Inject project context (memory_file) into commands
-        let json_str = inject_project_context(&json_str, project);
+        // Inject project context (memory_file) into commands and normalize aliases.
+        let json_str = normalize_command_batch(&inject_project_context(&json_str, project));
 
         // In headless mode there is no askHuman input panel.
         // Avoid blocking on runtime human-input timeout; ask the model to continue with assumptions.
@@ -1054,8 +1259,13 @@ Proceed with explicit assumptions and continue without additional questions."
                     if cat == autonomy::ActionCategory::HumanInput {
                         continue;
                     }
+                    let rule = autonomy_state.rules.rule_for(cat);
+                    if matches!(rule, autonomy::ApprovalRule::Deny) {
+                        need = Some((cat, true));
+                        break;
+                    }
                     if autonomy_state.needs_approval(cat) {
-                        need = Some(cat);
+                        need = Some((cat, false));
                         break;
                     }
                 }
@@ -1067,11 +1277,25 @@ Proceed with explicit assumptions and continue without additional questions."
         }; // autonomy_state read lock dropped here
 
         let mut should_skip = false;
-        if let Some(cat) = needs_approval {
+        if let Some((cat, denied_by_policy)) = needs_approval {
             let preview = format_command_preview(&json_str);
             slog(&session_log, |l| {
                 l.approval(&cat.to_string(), &preview, "waiting")
             });
+
+            if denied_by_policy {
+                slog(&session_log, |l| {
+                    l.approval(&cat.to_string(), &preview, "denied-policy")
+                });
+                emit(
+                    &bus,
+                    || AppEvent::TaskComplete {
+                        reason: format!("Denied by policy ({})", cat),
+                    },
+                    || println!("--- Denied by policy ({}) ---", cat),
+                );
+                return Ok(loop_stats);
+            }
 
             if let Some(ref bus_ref) = bus {
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1115,7 +1339,20 @@ Proceed with explicit assumptions and continue without additional questions."
                     }
                 }
             }
-            // In headless mode, just proceed (no approval UI)
+            // In headless mode, approval-required actions cannot proceed without an approver.
+            if bus.is_none() {
+                slog(&session_log, |l| {
+                    l.approval(&cat.to_string(), &preview, "denied-no-approver")
+                });
+                emit(
+                    &bus,
+                    || AppEvent::TaskComplete {
+                        reason: format!("Approval required in headless mode ({})", cat),
+                    },
+                    || println!("--- Approval required in headless mode ({}) ---", cat),
+                );
+                return Ok(loop_stats);
+            }
         }
 
         if should_skip {
@@ -1134,7 +1371,29 @@ Proceed with explicit assumptions and continue without additional questions."
 
         let output = agent_runner::run_agent(&json_str).await?;
 
-        // Log full agent output (no truncation)
+        // Filter status lines to only include relevant nonces (current batch + dependencies)
+        let batch_nonces = extract_batch_nonces(&json_str);
+        let mut filtered_stdout = filter_status_lines(&output.stdout, &batch_nonces);
+
+        // Auto-fetch stdout for single standalone execAsAgent commands that completed successfully.
+        // This saves the model from needing a separate fetchStatus turn.
+        if let Some(nonce) = single_exec_nonce(&json_str) {
+            // Check if the nonce completed successfully (look for "<nonce>c0" in filtered output)
+            let success_marker = format!("{}c0", nonce);
+            if filtered_stdout.lines().any(|l| l.trim() == success_marker) {
+                let session_dir = session_log.lock().ok().map(|l| l.dir().to_path_buf());
+                if let Some(dir) = session_dir {
+                    if let Some(stdout_content) = read_nonce_stdout(&dir, nonce) {
+                        filtered_stdout.push_str(&format!(
+                            "\n--- stdout (nonce {}) ---\n{}\n--- end stdout ---",
+                            nonce, stdout_content
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Log full agent output (no truncation, unfiltered for debugging)
         slog(&session_log, |l| {
             l.agent_output(&output.stdout, &output.stderr)
         });
@@ -1142,11 +1401,11 @@ Proceed with explicit assumptions and continue without additional questions."
         emit(
             &bus,
             || AppEvent::AgentOutput {
-                stdout: output.stdout.clone(),
+                stdout: filtered_stdout.clone(),
                 stderr: output.stderr.clone(),
             },
             || {
-                println!("Agent stdout:\n{}", output.stdout);
+                println!("Agent stdout:\n{}", filtered_stdout);
                 if !output.stderr.is_empty() {
                     eprintln!("Agent stderr:\n{}", output.stderr);
                 }
@@ -1158,6 +1417,10 @@ Proceed with explicit assumptions and continue without additional questions."
         if sub_agent_dir.exists() {
             let results = sub_agent::scan_completed_results(&sub_agent_dir);
             for result in &results {
+                let key = format!("{}::{}", result.id, result.summary);
+                if !seen_sub_agent_results.insert(key) {
+                    continue;
+                }
                 let msg = sub_agent::format_result_message(result);
                 slog(&session_log, |l| {
                     l.info(&format!("Sub-agent result: {}", msg))
@@ -1173,7 +1436,8 @@ Proceed with explicit assumptions and continue without additional questions."
         }
 
         // Format agent output as next user message, include budget summary
-        let mut user_msg = format!("Agent output:\n{}", output.stdout);
+        // Use filtered stdout so the model only sees relevant status lines
+        let mut user_msg = format!("Agent output:\n{}", filtered_stdout);
         if !output.stderr.is_empty() {
             user_msg.push_str(&format!("\nStderr:\n{}", output.stderr));
         }
@@ -1255,6 +1519,14 @@ async fn run_sub_agent_mode(
     );
 
     let mut conversation = Conversation::new(system_prompt, provider.context_window());
+
+    // Inject project root so the model knows which directory to work in
+    conversation.add_user(format!(
+        "Working directory: {}\nThis is the project you should examine and modify. \
+All relative paths and commands execute from this directory.",
+        project.root.display()
+    ));
+    conversation.add_assistant("Understood. I will work within the specified project directory.".to_string());
 
     // Inject memory if inherited
     if env::var("INTENDANT_INHERIT_MEMORY").is_ok() {
@@ -1350,6 +1622,27 @@ async fn run_user_mode(
     let mut conversation = Conversation::new(system_prompt, provider.context_window());
     conversation.set_protect_user_layer(true);
 
+    // Inject project root so the model knows which directory to work in
+    conversation.add_user_with_layer(
+        format!(
+            "Working directory: {}\nThis is the project you should examine and modify. \
+All relative paths and commands execute from this directory.",
+            project.root.display()
+        ),
+        conversation::MessageLayer::User,
+    );
+    conversation.add_assistant("Understood. I will work within the specified project directory.".to_string());
+
+    if let Some(max_parallel) = project.config.orchestrator.max_parallel_agents {
+        conversation.add_user_with_layer(
+            format!(
+                "Orchestrator constraint: at most {} sub-agents may run in parallel.",
+                max_parallel
+            ),
+            conversation::MessageLayer::User,
+        );
+    }
+
     // Inject memory
     if let Some(store) = memory::load_memory(&project) {
         if let Some(memory_msg) = memory::format_memory_message(&store) {
@@ -1406,6 +1699,14 @@ async fn run_direct_mode(
     }
 
     let mut conversation = Conversation::new(system_prompt, provider.context_window());
+
+    // Inject project root so the model knows which directory to work in
+    conversation.add_user(format!(
+        "Working directory: {}\nThis is the project you should examine and modify. \
+All relative paths and commands execute from this directory.",
+        project.root.display()
+    ));
+    conversation.add_assistant("Understood. I will work within the specified project directory.".to_string());
 
     // Inject memory
     if let Some(store) = memory::load_memory(&project) {
@@ -1478,12 +1779,26 @@ async fn main() -> Result<(), CallerError> {
     }
 
     // Override env vars from CLI flags before provider selection
-    let flags = parse_cli_flags();
+    let flags = parse_cli_flags()?;
     if let Some(ref p) = flags.provider {
         env::set_var("PROVIDER", p);
     }
     if let Some(ref m) = flags.model {
         env::set_var("MODEL_NAME", m);
+    }
+    // Apply project model config when CLI/env did not override.
+    if env::var("MODEL_CONTEXT_WINDOW").is_err() {
+        if let Some(ctx) = project.config.model.context_window {
+            env::set_var("MODEL_CONTEXT_WINDOW", ctx.to_string());
+        }
+    }
+    if env::var("MAX_OUTPUT_TOKENS").is_err() {
+        if let Some(max_out) = project.config.model.max_output_tokens {
+            env::set_var("MAX_OUTPUT_TOKENS", max_out.to_string());
+        }
+    }
+    if let Some(max_parallel) = project.config.orchestrator.max_parallel_agents {
+        env::set_var("INTENDANT_MAX_PARALLEL_AGENTS", max_parallel.to_string());
     }
 
     // Create or resume session log.
@@ -1545,7 +1860,7 @@ async fn main() -> Result<(), CallerError> {
     slog(&session_log, |l| l.info(&format!("Task: {}", task)));
 
     // Determine whether to use TUI
-    let use_tui = !flags.no_tui && io::stdin().is_terminal();
+    let use_tui = !flags.no_tui && io::stdin().is_terminal() && io::stdout().is_terminal();
 
     // Build autonomy state from project config + CLI flags
     let autonomy_state = AutonomyState::new(flags.autonomy, project.config.approval.clone());
@@ -1559,9 +1874,6 @@ async fn main() -> Result<(), CallerError> {
         let _crossterm_handle = tui::event::spawn_crossterm_reader(bus.clone());
         let _tick_handle = tui::event::spawn_tick_timer(bus.clone(), 100);
         let _human_monitor = tui::event::spawn_human_question_monitor(bus.clone());
-
-        // Spawn control socket
-        let (_control_handle, _control_tx) = control::spawn_control_server(bus.clone());
 
         // Create TUI
         let mut terminal = tui::Tui::new()
@@ -1578,6 +1890,14 @@ async fn main() -> Result<(), CallerError> {
         } else {
             tui::app::Verbosity::Normal
         };
+        if flags.control_socket {
+            let (_control_handle, control_tx) = control::spawn_control_server(bus.clone());
+            app.set_control_socket(control_tx);
+            app.log(
+                tui::app::LogLevel::Info,
+                format!("Control socket: {}", control::socket_path().display()),
+            );
+        }
 
         app.log(tui::app::LogLevel::Info, format!("Task: {}", task));
 
