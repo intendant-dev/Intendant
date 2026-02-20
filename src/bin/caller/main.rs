@@ -13,6 +13,7 @@ mod sub_agent;
 mod tools;
 mod tui;
 mod user_mode;
+mod vision;
 mod worktree;
 
 use autonomy::{AutonomyLevel, AutonomyState, SharedAutonomy};
@@ -54,6 +55,7 @@ struct CliFlags {
     log_file: Option<String>,
     resume: bool,
     control_socket: bool,
+    vision: bool,
 }
 
 fn print_help() {
@@ -72,6 +74,7 @@ fn print_help() {
     println!("    --no-tui              Disable TUI, run headless");
     println!("    --verbose, -v         Enable verbose output");
     println!("    --control-socket      Enable Unix control socket");
+    println!("    --vision              Launch Xvfb virtual display for captureScreen");
     println!("    --help, -h            Show this help message");
     println!();
     println!("SESSION LOGS:");
@@ -109,6 +112,7 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         log_file: None,
         resume: false,
         control_socket: false,
+        vision: false,
     };
 
     let mut task_parts = Vec::new();
@@ -173,6 +177,10 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                 } else {
                     i += 1;
                 }
+            }
+            "--vision" => {
+                flags.vision = true;
+                i += 1;
             }
             "--control-socket" => {
                 flags.control_socket = true;
@@ -782,10 +790,12 @@ Also: {"source": "bare"}"#;
             log_file: None,
             resume: false,
             control_socket: false,
+            vision: false,
         };
         assert!(!flags.verbose);
         assert!(!flags.no_tui);
         assert!(!flags.resume);
+        assert!(!flags.vision);
         assert_eq!(flags.autonomy, AutonomyLevel::Medium);
     }
 
@@ -2585,6 +2595,20 @@ async fn main() -> Result<(), CallerError> {
         l.info(&format!("Project root: {}", project.root.display()));
         l.info(&format!("Autonomy: {}", flags.autonomy));
     });
+
+    // Launch Xvfb virtual display if --vision flag is set
+    let _xvfb_guard = if flags.vision {
+        let config = vision::display_config_for_provider(provider.name());
+        slog(&session_log, |l| {
+            l.info(&format!(
+                "Vision mode: launching Xvfb :{} at {}x{}",
+                config.display_id, config.width, config.height
+            ))
+        });
+        Some(vision::launch_display(&config).await?)
+    } else {
+        None
+    };
 
     // Check if running as a sub-agent (headless, no TUI)
     if let Some((id, role)) = sub_agent::detect_sub_agent_mode() {

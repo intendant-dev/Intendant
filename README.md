@@ -347,6 +347,7 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 | `--autonomy <level>` | Set autonomy level (`low`, `medium`, `high`, `full`) |
 | `--log-file <dir>` | Override session log directory |
 | `--control-socket` | Enable Unix control socket (TUI mode) |
+| `--vision` | Launch Xvfb virtual display sized for the provider's vision model |
 
 The TUI launches only when both stdin and stdout are terminals. When piping input/output or in sub-agent mode, `intendant` falls back to headless mode.
 
