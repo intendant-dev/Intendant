@@ -3,8 +3,10 @@ mod autonomy;
 mod control;
 mod conversation;
 mod error;
+mod frontend;
 mod knowledge;
 mod memory;
+mod mcp;
 mod project;
 mod prompts;
 mod provider;
@@ -51,6 +53,7 @@ struct CliFlags {
     model: Option<String>,
     verbose: bool,
     no_tui: bool,
+    mcp: bool,
     autonomy: AutonomyLevel,
     log_file: Option<String>,
     resume: bool,
@@ -72,6 +75,7 @@ fn print_help() {
     println!("    --log-file <DIR>      Override session log directory (default: ~/.intendant/logs/<ts>/)");
     println!("    --resume [DIR]        Resume previous session (or specific log dir)");
     println!("    --no-tui              Disable TUI, run headless");
+    println!("    --mcp                 Run as MCP server on stdio (replaces TUI)");
     println!("    --verbose, -v         Enable verbose output");
     println!("    --control-socket      Enable Unix control socket");
     println!("    --vision              Launch Xvfb virtual display for captureScreen");
@@ -108,6 +112,7 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         model: None,
         verbose: false,
         no_tui: false,
+        mcp: false,
         autonomy: AutonomyLevel::Medium,
         log_file: None,
         resume: false,
@@ -177,6 +182,10 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                 } else {
                     i += 1;
                 }
+            }
+            "--mcp" => {
+                flags.mcp = true;
+                i += 1;
             }
             "--vision" => {
                 flags.vision = true;
@@ -786,6 +795,7 @@ Also: {"source": "bare"}"#;
             model: None,
             verbose: false,
             no_tui: false,
+            mcp: false,
             autonomy: AutonomyLevel::Medium,
             log_file: None,
             resume: false,
@@ -794,6 +804,7 @@ Also: {"source": "bare"}"#;
         };
         assert!(!flags.verbose);
         assert!(!flags.no_tui);
+        assert!(!flags.mcp);
         assert!(!flags.resume);
         assert!(!flags.vision);
         assert_eq!(flags.autonomy, AutonomyLevel::Medium);
@@ -2638,13 +2649,81 @@ async fn main() -> Result<(), CallerError> {
     slog(&session_log, |l| l.info(&format!("Task: {}", task)));
 
     // Determine whether to use TUI
-    let use_tui = !flags.no_tui && io::stdin().is_terminal() && io::stdout().is_terminal();
+    let use_tui = !flags.no_tui && !flags.mcp && io::stdin().is_terminal() && io::stdout().is_terminal();
 
     // Build autonomy state from project config + CLI flags
     let autonomy_state = AutonomyState::new(flags.autonomy, project.config.approval.clone());
     let autonomy = autonomy::shared_autonomy(autonomy_state);
 
-    if use_tui {
+    if flags.mcp {
+        // MCP mode — speaks Model Context Protocol on stdio.
+        // This is architecturally a peer of the TUI: same EventBus, same UserAction contract.
+        let (bus, event_rx) = EventBus::new();
+        let _human_monitor = tui::event::spawn_human_question_monitor(bus.clone());
+
+        let mcp_state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            mcp::McpAppState::new(
+                provider.name().to_string(),
+                provider.model().to_string(),
+                autonomy.clone(),
+            ),
+        ));
+
+        // Spawn the agent loop in a background task
+        let bus_clone = bus.clone();
+        let autonomy_clone = autonomy.clone();
+        let task_clone = task.clone();
+        let task_for_summary = task.clone();
+        let session_log_clone = session_log.clone();
+        let session_log_summary = session_log.clone();
+        let _loop_handle = tokio::spawn(async move {
+            let result = if is_simple_task(&task_clone) {
+                run_direct_mode(
+                    provider,
+                    task_clone,
+                    project,
+                    Some(bus_clone.clone()),
+                    autonomy_clone,
+                    session_log_clone,
+                )
+                .await
+            } else {
+                run_user_mode(
+                    provider,
+                    task_clone,
+                    project,
+                    Some(bus_clone.clone()),
+                    autonomy_clone,
+                    session_log_clone,
+                )
+                .await
+            };
+
+            match result {
+                Ok(stats) => {
+                    slog(&session_log_summary, |l| {
+                        l.write_summary(&task_for_summary, "completed", stats.turns)
+                    });
+                    bus_clone.send(AppEvent::TaskComplete {
+                        reason: "Task complete".to_string(),
+                    });
+                }
+                Err(e) => {
+                    slog(&session_log_summary, |l| {
+                        l.write_summary(&task_for_summary, &format!("error: {}", e), 0)
+                    });
+                    bus_clone.send(AppEvent::LoopError(e.to_string()));
+                }
+            }
+        });
+
+        // Run the MCP server on stdio (blocks until client disconnects or quit)
+        if let Err(e) = mcp::run_mcp_server(mcp_state, event_rx).await {
+            slog(&session_log, |l| {
+                l.info(&format!("MCP server ended: {}", e))
+            });
+        }
+    } else if use_tui {
         // TUI mode
         let (bus, event_rx) = EventBus::new();
 
