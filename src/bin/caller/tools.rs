@@ -69,7 +69,7 @@ fn dependency_properties() -> Value {
         },
         "wait": {
             "type": "boolean",
-            "description": "If true, block until the dependency finishes. If false, skip if not done yet."
+            "description": "If true, block until the dependency completes (exits). If false, skip immediately if not yet completed. Long-running daemons never complete — see exec_command for the correct pattern."
         }
     })
 }
@@ -104,7 +104,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
 
         tools.push(ToolDefinition {
             name: "exec_command".to_string(),
-            description: "Execute a Bash command in the background. Stdout/stderr are logged to disk; use fetch_status to read them. DISPLAY and XAUTHORITY are set automatically. Reference a previous command's PID with $NONCE[id].".to_string(),
+            description: "Execute a Bash command in the background. Stdout/stderr are logged to disk; use fetch_status to read them. DISPLAY and XAUTHORITY are set automatically. Reference a previous command's PID with $NONCE[id]. For daemons/servers that run indefinitely, background them in the shell (e.g. `Xvfb :50 ... & sleep 1 && test -e /tmp/.X50-lock`) with `wait: true`, so the nonce completes while the daemon keeps running. Never use `depending_nonce` pointing at a nonce that won't exit.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,

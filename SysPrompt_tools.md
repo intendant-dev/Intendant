@@ -14,6 +14,8 @@ All tool calls in a single turn are dispatched simultaneously at `t=0`. To creat
 - **`expected_status`**: Required exit code of the dependency (default: 0).
 - **`wait`**: If true, hold until dependency finishes. If false, skip immediately if dependency isn't done.
 
+**Daemons/servers:** `depending_nonce` requires the dependency to *complete* (exit). Long-running processes never complete, so dependents get skipped. Background the daemon in the shell: `Xvfb :50 ... & sleep 1 && test -e /tmp/.X50-lock` with `wait: true` — the shell exits (nonce completes) while the daemon keeps running.
+
 ### Nonce Variables
 
 Reference the PID of a previous command using **`$NONCE[id]`** in command strings.
