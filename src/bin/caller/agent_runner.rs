@@ -25,13 +25,17 @@ fn has_ask_human(json_input: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub async fn run_agent(json_input: &str) -> Result<AgentOutput, CallerError> {
+pub async fn run_agent(
+    json_input: &str,
+    log_dir: &std::path::Path,
+) -> Result<AgentOutput, CallerError> {
     let agent_path = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("intendant-runtime")))
         .unwrap_or_else(|| std::path::PathBuf::from("./target/debug/intendant-runtime"));
 
     let mut child = Command::new(&agent_path)
+        .env("INTENDANT_LOG_DIR", log_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

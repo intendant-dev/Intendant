@@ -137,6 +137,9 @@ pub struct App {
     pub autonomy: SharedAutonomy,
     pub control_tx: Option<tokio::sync::broadcast::Sender<String>>,
 
+    // Session log directory for askHuman files
+    pub log_dir: std::path::PathBuf,
+
     // Token tracking
     pub session_tokens: u64,
 
@@ -145,7 +148,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(provider_name: String, model_name: String, autonomy: SharedAutonomy) -> Self {
+    pub fn new(
+        provider_name: String,
+        model_name: String,
+        autonomy: SharedAutonomy,
+        log_dir: std::path::PathBuf,
+    ) -> Self {
         Self {
             log_entries: Vec::new(),
             scroll_offset: 0,
@@ -166,6 +174,7 @@ impl App {
             pending_approval: None,
             autonomy,
             control_tx: None,
+            log_dir,
             session_tokens: 0,
             tick_count: 0,
         }
@@ -483,7 +492,7 @@ impl App {
                         return true;
                     }
 
-                    match std::fs::write(shared_file_path("intendant_human_response"), &response) {
+                    match std::fs::write(self.log_dir.join("human_response"), &response) {
                         Ok(_) => {
                             self.log(
                                 LogLevel::Info,
@@ -588,7 +597,7 @@ impl App {
             ControlMsg::Input { text } => {
                 if self.mode == AppMode::AskHuman {
                     let _ = std::fs::write(
-                        shared_file_path("intendant_human_response"),
+                        self.log_dir.join("human_response"),
                         text.as_bytes(),
                     );
                     self.human_textarea = None;
@@ -900,22 +909,6 @@ fn truncate_str(s: &str, max: usize) -> &str {
     }
 }
 
-fn shared_file_path(name: &str) -> std::path::PathBuf {
-    let base = std::env::var("INTENDANT_SHARED_DIR")
-        .map(std::path::PathBuf::from)
-        .ok()
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| {
-            let shm = std::path::PathBuf::from("/dev/shm");
-            if shm.exists() {
-                Some(shm)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(std::env::temp_dir);
-    base.join(name)
-}
 
 #[cfg(test)]
 mod tests {
@@ -924,7 +917,12 @@ mod tests {
 
     fn test_app() -> App {
         let autonomy = autonomy::shared_autonomy(AutonomyState::default());
-        App::new("openai".to_string(), "gpt-5".to_string(), autonomy)
+        App::new(
+            "openai".to_string(),
+            "gpt-5".to_string(),
+            autonomy,
+            std::path::PathBuf::from("/tmp/test_session"),
+        )
     }
 
     #[test]

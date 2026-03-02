@@ -63,7 +63,7 @@ Fetches a URL and converts HTML to readable text.
 Asks the human operator a question and waits for their response. Use this as an escape hatch when you're stuck or need clarification.
 
 * **Required field:** `question` — the question to ask.
-* Writes the question to `/dev/shm/intendant_human_question` and waits up to 5 minutes for a response at `/dev/shm/intendant_human_response`.
+* Writes the question to the session directory and waits up to 5 minutes for a response.
 * The question is also printed to stderr so the caller/operator sees it immediately.
 * **Returns:** JSON: `{"success":true,"question":"...","response":"..."}` or `{"success":false,"error":"Timed out..."}`.
 * Files are cleaned up after reading or on timeout.

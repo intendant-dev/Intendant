@@ -69,25 +69,17 @@ pub fn all_tools() -> Vec<ToolDefinition> {
             "command": {
                 "type": "string",
                 "description": "The Bash command to run."
-            },
-            "display": {
-                "type": "integer",
-                "description": "X11 display number for GUI commands. Omit to auto-discover (skips :0, the user's workspace). Launch your own Xvfb for GUI automation: start it via exec_command, then pass that display number."
-            },
-            "wait_for_port": {
-                "type": "integer",
-                "description": "TCP port to wait for (up to 30s) before executing."
             }
         });
 
         tools.push(ToolDefinition {
             name: "exec_command".to_string(),
-            description: "Execute a Bash command and wait for completion. Returns exit code, stdout tail (last 10KB), and stderr tail directly. DISPLAY and XAUTHORITY are set automatically. Reference a previous command's PID with $NONCE[id]. For daemons, background in bash (`cmd &`) — the shell exits and the tool returns while the daemon keeps running.".to_string(),
+            description: "Execute a Bash command and wait for completion. Returns exit code, stdout tail (last 10KB), and stderr tail directly. DISPLAY and XAUTHORITY are set automatically. Reference a previous command's PID with $NONCE[id]. For daemons, background in bash (`cmd &`) — the shell exits and the tool returns while the daemon keeps running. Optional fields (omit unless needed): `display` (integer) — X11 display number for GUI commands; `wait_for_port` (integer) — TCP port to wait for before executing.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
                 "required": ["nonce", "command"],
-                "additionalProperties": false
+                "additionalProperties": true
             }),
         });
     }
@@ -98,21 +90,17 @@ pub fn all_tools() -> Vec<ToolDefinition> {
             "nonce": {
                 "type": "integer",
                 "description": "Unique identifier for this command."
-            },
-            "display": {
-                "type": "integer",
-                "description": "X11 display number to capture. Omit to auto-discover (skips :0, the user's workspace)."
             }
         });
 
         tools.push(ToolDefinition {
             name: "capture_screen".to_string(),
-            description: "Capture a screenshot of an X11 display. Screenshots are saved to the log directory. The runtime auto-discovers active displays, skipping :0. Chain after UI interactions to verify success.".to_string(),
+            description: "Capture a screenshot of an X11 display. Screenshots are saved to the log directory. The runtime auto-discovers active displays, skipping :0. Chain after UI interactions to verify success. Optional: `display` (integer) — X11 display number, omit to auto-discover.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
                 "required": ["nonce"],
-                "additionalProperties": false
+                "additionalProperties": true
             }),
         });
     }
@@ -161,29 +149,17 @@ pub fn all_tools() -> Vec<ToolDefinition> {
             "content": {
                 "type": "string",
                 "description": "Content to write, append, insert, or use as replacement."
-            },
-            "match_content": {
-                "type": "string",
-                "description": "Text to find (required for 'replace' operation)."
-            },
-            "line_number": {
-                "type": "integer",
-                "description": "0-based line number (required for 'insert_at' and 'replace_lines')."
-            },
-            "end_line": {
-                "type": "integer",
-                "description": "End line (exclusive) for 'replace_lines' operation."
             }
         });
 
         tools.push(ToolDefinition {
             name: "edit_file".to_string(),
-            description: "Perform structured file editing (write, append, replace, insert_at, replace_lines) without spawning a shell.".to_string(),
+            description: "Perform structured file editing (write, append, replace, insert_at, replace_lines) without spawning a shell. Operation-specific fields (include only when needed): `match_content` (string) — text to find for 'replace'; `line_number` (integer) — 0-based line for 'insert_at'/'replace_lines'; `end_line` (integer) — end line (exclusive) for 'replace_lines'.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
                 "required": ["nonce", "file_path", "operation"],
-                "additionalProperties": false
+                "additionalProperties": true
             }),
         });
     }
@@ -223,21 +199,17 @@ pub fn all_tools() -> Vec<ToolDefinition> {
             "question": {
                 "type": "string",
                 "description": "Question to ask the human operator."
-            },
-            "timeout_ms": {
-                "type": "integer",
-                "description": "Timeout in milliseconds (default: 300000 = 5 minutes)."
             }
         });
 
         tools.push(ToolDefinition {
             name: "ask_human".to_string(),
-            description: "Ask the human operator a question and wait for their response. Use when stuck or need clarification.".to_string(),
+            description: "Ask the human operator a question and wait for their response. Use when stuck or need clarification. Optional: `timeout_ms` (integer) — timeout in milliseconds (default: 300000 = 5 minutes).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
                 "required": ["nonce", "question"],
-                "additionalProperties": false
+                "additionalProperties": true
             }),
         });
     }
@@ -252,21 +224,17 @@ pub fn all_tools() -> Vec<ToolDefinition> {
             "command": {
                 "type": "string",
                 "description": "Command to run in the PTY session."
-            },
-            "shell_id": {
-                "type": "string",
-                "description": "PTY session identifier (default: 'default'). Use different IDs for independent sessions."
             }
         });
 
         tools.push(ToolDefinition {
             name: "exec_pty".to_string(),
-            description: "Execute a command in a persistent PTY session where shell state (cwd, env vars) persists between calls within the same turn.".to_string(),
+            description: "Execute a command in a persistent PTY session where shell state (cwd, env vars) persists between calls within the same turn. Optional: `shell_id` (string) — session identifier (default: 'default'), use different IDs for independent sessions.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
                 "required": ["nonce", "command"],
-                "additionalProperties": false
+                "additionalProperties": true
             }),
         });
     }
@@ -285,25 +253,17 @@ pub fn all_tools() -> Vec<ToolDefinition> {
             "memory_summary": {
                 "type": "string",
                 "description": "Summary/value of the memory entry."
-            },
-            "memory_tags": {
-                "type": "string",
-                "description": "Comma-separated tags for categorization."
-            },
-            "memory_channel": {
-                "type": "string",
-                "description": "Channel/namespace for the memory entry."
             }
         });
 
         tools.push(ToolDefinition {
             name: "store_memory".to_string(),
-            description: "Store a key-value memory entry that persists across sessions for this project.".to_string(),
+            description: "Store a key-value memory entry that persists across sessions for this project. Optional: `memory_tags` (string) — comma-separated tags; `memory_channel` (string) — channel/namespace.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
                 "required": ["nonce", "memory_key", "memory_summary"],
-                "additionalProperties": false
+                "additionalProperties": true
             }),
         });
     }
@@ -318,29 +278,17 @@ pub fn all_tools() -> Vec<ToolDefinition> {
             "memory_query": {
                 "type": "string",
                 "description": "Space-separated keywords to search the memory store."
-            },
-            "memory_tags": {
-                "type": "string",
-                "description": "Comma-separated tags to filter results."
-            },
-            "memory_channel": {
-                "type": "string",
-                "description": "Channel/namespace to search within."
-            },
-            "memory_since": {
-                "type": "integer",
-                "description": "Only return entries created after this Unix timestamp."
             }
         });
 
         tools.push(ToolDefinition {
             name: "recall_memory".to_string(),
-            description: "Search the project's memory store by keywords, optionally filtered by tags or channel.".to_string(),
+            description: "Search the project's memory store by keywords, optionally filtered by tags or channel. Optional: `memory_tags` (string) — comma-separated tags; `memory_channel` (string) — channel/namespace; `memory_since` (integer) — Unix timestamp filter.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
                 "required": ["nonce", "memory_query"],
-                "additionalProperties": false
+                "additionalProperties": true
             }),
         });
     }

@@ -74,6 +74,8 @@ pub struct McpAppState {
     pub pending_approval: Option<PendingApprovalState>,
     pub human_question: Option<String>,
     pub should_quit: bool,
+    /// Session log directory for askHuman files.
+    pub log_dir: std::path::PathBuf,
     /// Optional launcher for starting tasks via MCP. Set by main.rs.
     pub launcher: Option<Arc<TaskLauncher>>,
     /// Handle to the currently running agent loop, if any.
@@ -89,7 +91,12 @@ pub struct PendingApprovalState {
 }
 
 impl McpAppState {
-    pub fn new(provider_name: String, model_name: String, autonomy: SharedAutonomy) -> Self {
+    pub fn new(
+        provider_name: String,
+        model_name: String,
+        autonomy: SharedAutonomy,
+        log_dir: std::path::PathBuf,
+    ) -> Self {
         Self {
             provider_name,
             model_name,
@@ -105,6 +112,7 @@ impl McpAppState {
             pending_approval: None,
             human_question: None,
             should_quit: false,
+            log_dir,
             launcher: None,
             task_handle: None,
         }
@@ -596,8 +604,8 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
         }
         UserAction::RespondHuman { text } => {
             if state.human_question.is_some() {
-                // Write response to shared file (same mechanism as TUI)
-                let response_path = shared_file_path("intendant_human_response");
+                // Write response to session-scoped file (same mechanism as TUI)
+                let response_path = state.log_dir.join("human_response");
                 if std::fs::write(&response_path, &text).is_ok() {
                     state.human_question = None;
                     state.set_phase(Phase::RunningAgent);
@@ -635,23 +643,6 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
             ActionOutcome::Ok
         }
     }
-}
-
-fn shared_file_path(name: &str) -> std::path::PathBuf {
-    let base = std::env::var("INTENDANT_SHARED_DIR")
-        .map(std::path::PathBuf::from)
-        .ok()
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| {
-            let shm = std::path::PathBuf::from("/dev/shm");
-            if shm.exists() {
-                Some(shm)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(std::env::temp_dir);
-    base.join(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,6 +1069,7 @@ mod tests {
             "openai".to_string(),
             "gpt-5".to_string(),
             autonomy,
+            std::path::PathBuf::from("/tmp/test_session"),
         )))
     }
 

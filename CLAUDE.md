@@ -76,6 +76,8 @@ Running the CLI (requires `.env` with API key):
 ./target/release/intendant --no-tui "echo hello"          # Headless (no TUI)
 ./target/release/intendant --autonomy low "rm /tmp/test"   # Ask before every command
 ./target/release/intendant --provider anthropic --model claude-sonnet-4-5-20250929 "task"
+./target/release/intendant --continue "fix that bug"       # Resume most recent session
+./target/release/intendant --resume abc123 "continue"      # Resume specific session by ID
 echo "task" | ./target/release/intendant                   # Auto-detects non-TTY, runs headless
 ```
 
@@ -94,7 +96,7 @@ Test coverage includes:
 - **error.rs**: Display formatting, From conversions
 - **utils.rs**: Timestamp validity
 - **caller/main.rs** (tests across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification, CLI flags, EventBus emit, batch assembly, tool name mapping
-- **caller/conversation.rs**: Message ordering, serialization, drop/summarize turns, message layer protection, budget tracking
+- **caller/conversation.rs**: Message ordering, serialization, drop/summarize turns, message layer protection, budget tracking, save/load JSONL roundtrip
 - **caller/knowledge.rs**: Pub/sub lifecycle, subscription/cursor tracking, tag/channel/keyword filtering, old format migration, save/load roundtrip, knowledge routing
 - **caller/sub_agent.rs**: Spawn command generation, result/progress I/O, serialization, role roundtrips, directory scanning
 - **caller/worktree.rs**: Full lifecycle (create/list/merge/remove), conflict handling
@@ -113,7 +115,7 @@ Test coverage includes:
 - **caller/tui/theme.rs**: Budget color thresholds, spinner frames, action style variants, autonomy color variants
 - **caller/tui/mod.rs**: TestBackend rendering (default state, log entries, approval panel, help overlay, all phases, verbose modes, small terminal)
 - **caller/agent_runner.rs**: askHuman detection in JSON input
-- **caller/session_log.rs**: Directory structure creation, JSONL event validity, turn tracking, model response file creation, agent input pretty-printing, agent output file creation (stdout/stderr split), approval log searchability, JSON extraction logging, summary file creation, multi-turn file separation, messages input logging, reasoning content logging (full and summary-only)
+- **caller/session_log.rs**: UUID-based session directories, session metadata (write_meta, find_latest_session, find_session_by_id), directory structure creation, JSONL event validity, turn tracking, model response file creation, agent input pretty-printing, agent output file creation (stdout/stderr split), approval log searchability, JSON extraction logging, summary file creation, multi-turn file separation, messages input logging, reasoning content logging (full and summary-only)
 
 ## Architecture Details
 
@@ -123,9 +125,18 @@ Process state lives in `/dev/shm/intendant_processes` — a fixed-size array of 
 
 The process map (`HashMap<u64, usize>`) is rebuilt from shared memory on every startup by scanning all 1024 slots for non-zero nonces.
 
-### Session Persistence
+### Session Management
 
-`/dev/shm/intendant_session` stores the log directory path. Consecutive runs reuse the same log directory (`/var/log/intendant/<timestamp>/`). To reset: `rm -f /dev/shm/intendant_processes /dev/shm/intendant_session`.
+Each invocation creates an isolated session with a UUID-based directory at `~/.intendant/logs/<uuid>/`. No global state is used for session tracking. The log directory is passed to the runtime via the `INTENDANT_LOG_DIR` environment variable.
+
+Each session directory contains:
+- `session_meta.json` — session metadata (session_id, created_at, project_root, task, status, last_turn)
+- `session.jsonl` — structured event log
+- `conversation.jsonl` — serialized conversation for resume support
+- `human_question` / `human_response` — askHuman IPC files (session-scoped)
+- `turns/` — per-turn model responses and agent I/O
+
+Sessions can be resumed with `--continue` (most recent session for the project) or `--resume <id>` (specific session by ID or prefix). To reset shared memory: `rm -f /dev/shm/intendant_processes`.
 
 ### Execution Model
 
@@ -221,7 +232,7 @@ A Unix socket server at `/tmp/intendant-<pid>.sock` enables programmatic control
 
 - **OS**: Linux (requires `/dev/shm` for shared memory)
 - **Permissions**: Runs as unprivileged user with passwordless sudo
-- **For intendant**: `.env` file with `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, optional `PROVIDER`, `MODEL_NAME`, `STRUCTURED_OUTPUT`, `REASONING_EFFORT`, `REASONING_SUMMARY`
+- **For intendant**: `.env` file with `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, optional `PROVIDER`, `MODEL_NAME`, `STRUCTURED_OUTPUT`, `REASONING_EFFORT`, `REASONING_SUMMARY`, `INTENDANT_LOG_DIR` (set automatically by caller for the runtime)
 - **For captureScreen**: ImageMagick `import` command and DISPLAY environment variable (defaults to `:1`)
 
 ## CI/CD

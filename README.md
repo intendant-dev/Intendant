@@ -340,7 +340,7 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 
 ### `askHuman` Behavior (Important)
 
-- In **TUI mode**, `askHuman` opens the input panel and writes your answer to the shared response file (`intendant_human_response` in the shared state dir).
+- In **TUI mode**, `askHuman` opens the input panel and writes your answer to the session-scoped response file.
 - Empty submit is rejected in the TUI; you must provide non-empty input or press `Esc` to cancel.
 - In **headless mode** (`--no-tui` or non-interactive stdin), `askHuman` cannot be answered interactively. The loop now tells the model to continue with explicit assumptions instead of waiting for the runtime timeout.
 - Runtime-level timeout for unanswered `askHuman` remains `5 minutes`.
