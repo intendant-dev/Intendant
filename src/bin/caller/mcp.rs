@@ -222,7 +222,8 @@ impl ControllerRestartState {
 
     fn new(params: &ScheduleControllerRestartParams) -> Self {
         let now = Self::now_string();
-        let restart_after = parse_restart_after(params.restart_after.as_deref());
+        let restart_after = parse_restart_after(params.restart_after.as_deref())
+            .expect("restart_after must be validated before creating ControllerRestartState");
         Self {
             restart_id: Uuid::new_v4().to_string(),
             controller_id: params.controller_id.clone(),
@@ -237,8 +238,8 @@ impl ControllerRestartState {
             handoff_summary: None,
             completion_status: None,
             restart_command: params.restart_command.clone(),
-            auto_start_task: params.auto_start_task.unwrap_or(true),
-            max_attempts: params.max_attempts.unwrap_or(1).max(1),
+            auto_start_task: params.auto_start_task.unwrap_or(false),
+            max_attempts: params.max_attempts.unwrap_or(1),
             cooldown_sec: params.cooldown_sec.unwrap_or(30),
             attempts: 0,
             created_at: now.clone(),
@@ -250,11 +251,31 @@ impl ControllerRestartState {
     }
 }
 
-fn parse_restart_after(raw: Option<&str>) -> RestartAfter {
+fn parse_restart_after(raw: Option<&str>) -> Result<RestartAfter, String> {
     match raw.map(str::trim).map(str::to_lowercase).as_deref() {
-        Some("now") => RestartAfter::Now,
-        _ => RestartAfter::TurnEnd,
+        None | Some("") | Some("turn_end") => Ok(RestartAfter::TurnEnd),
+        Some("now") => Ok(RestartAfter::Now),
+        Some(other) => Err(format!(
+            "Invalid request: restart_after must be 'turn_end' or 'now' (got '{}')",
+            other
+        )),
     }
+}
+
+fn validate_schedule_controller_restart_params(
+    params: &ScheduleControllerRestartParams,
+) -> Result<(), String> {
+    if params.controller_id.trim().is_empty() {
+        return Err("Invalid request: controller_id must not be empty".to_string());
+    }
+    if params.north_star_goal.trim().is_empty() {
+        return Err("Invalid request: north_star_goal must not be empty".to_string());
+    }
+    parse_restart_after(params.restart_after.as_deref())?;
+    if matches!(params.max_attempts, Some(0)) {
+        return Err("Invalid request: max_attempts must be >= 1".to_string());
+    }
+    Ok(())
 }
 
 fn restart_state_path(log_dir: &std::path::Path) -> std::path::PathBuf {
@@ -561,17 +582,6 @@ async fn handle_control_command_mcp(
             max_attempts,
             cooldown_sec,
         } => {
-            if controller_id.trim().is_empty() || north_star_goal.trim().is_empty() {
-                emit_control_result(
-                    control_tx,
-                    "schedule_controller_restart",
-                    false,
-                    "controller_id and north_star_goal are required".to_string(),
-                    None,
-                );
-                return Some(RESOURCE_RESTART_URI);
-            }
-
             let params = ScheduleControllerRestartParams {
                 controller_id,
                 north_star_goal,
@@ -582,6 +592,11 @@ async fn handle_control_command_mcp(
                 max_attempts,
                 cooldown_sec,
             };
+
+            if let Err(e) = validate_schedule_controller_restart_params(&params) {
+                emit_control_result(control_tx, "schedule_controller_restart", false, e, None);
+                return Some(RESOURCE_RESTART_URI);
+            }
 
             let restart = {
                 let mut s = state.write().await;
@@ -625,6 +640,8 @@ async fn handle_control_command_mcp(
                 "turn_complete_token": restart.turn_complete_token,
                 "phase": restart.phase,
             });
+            let mut command_ok = true;
+            let mut command_message = "ok".to_string();
 
             if matches!(restart.restart_after, RestartAfter::Now) {
                 match run_scheduled_controller_restart_with_state(state, bus).await {
@@ -636,6 +653,8 @@ async fn handle_control_command_mcp(
                         });
                     }
                     Err(e) => {
+                        command_ok = false;
+                        command_message = "restart execution failed".to_string();
                         payload["execution_error"] = serde_json::Value::String(e);
                     }
                 }
@@ -644,8 +663,8 @@ async fn handle_control_command_mcp(
             emit_control_result(
                 control_tx,
                 "schedule_controller_restart",
-                true,
-                "ok".to_string(),
+                command_ok,
+                command_message,
                 Some(payload),
             );
             Some(RESOURCE_RESTART_URI)
@@ -1169,7 +1188,7 @@ pub struct ScheduleControllerRestartParams {
     /// Optional command to spawn for controller restart.
     #[serde(default)]
     pub restart_command: Option<String>,
-    /// Auto-start the next intendant task with north_star_goal (default: true).
+    /// Auto-start the next intendant task with north_star_goal (default: false).
     #[serde(default)]
     pub auto_start_task: Option<bool>,
     /// Maximum restart attempts before failing (default: 1).
@@ -1548,11 +1567,8 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<ScheduleControllerRestartParams>,
     ) -> String {
-        if params.controller_id.trim().is_empty() {
-            return "Invalid request: controller_id must not be empty".to_string();
-        }
-        if params.north_star_goal.trim().is_empty() {
-            return "Invalid request: north_star_goal must not be empty".to_string();
+        if let Err(e) = validate_schedule_controller_restart_params(&params) {
+            return e;
         }
 
         let restart = {
@@ -1589,7 +1605,9 @@ impl IntendantServer {
             "restart_id": restart.restart_id,
             "turn_complete_token": restart.turn_complete_token,
             "phase": restart.phase,
+            "ok": true,
         });
+        let mut command_ok = true;
 
         if matches!(restart.restart_after, RestartAfter::Now) {
             match self.run_scheduled_controller_restart().await {
@@ -1601,10 +1619,12 @@ impl IntendantServer {
                     });
                 }
                 Err(e) => {
+                    command_ok = false;
                     output["execution_error"] = serde_json::Value::String(e);
                 }
             }
         }
+        output["ok"] = serde_json::Value::Bool(command_ok);
 
         serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
     }
@@ -2177,14 +2197,20 @@ pub async fn run_mcp_server(
 mod tests {
     use super::*;
     use crate::autonomy::{self, AutonomyState};
+    use tempfile::tempdir;
+    use tokio::time::{timeout, Duration};
 
     fn test_state() -> SharedMcpState {
+        test_state_with_log_dir(std::path::PathBuf::from("/tmp/test_session"))
+    }
+
+    fn test_state_with_log_dir(log_dir: std::path::PathBuf) -> SharedMcpState {
         let autonomy = autonomy::shared_autonomy(AutonomyState::default());
         Arc::new(RwLock::new(McpAppState::new(
             "openai".to_string(),
             "gpt-5".to_string(),
             autonomy,
-            std::path::PathBuf::from("/tmp/test_session"),
+            log_dir,
         )))
     }
 
@@ -2456,9 +2482,18 @@ mod tests {
 
     #[test]
     fn parse_restart_after_defaults_to_turn_end() {
-        assert_eq!(parse_restart_after(None), RestartAfter::TurnEnd);
-        assert_eq!(parse_restart_after(Some("turn_end")), RestartAfter::TurnEnd);
-        assert_eq!(parse_restart_after(Some("NOW")), RestartAfter::Now);
+        assert_eq!(parse_restart_after(None).unwrap(), RestartAfter::TurnEnd);
+        assert_eq!(
+            parse_restart_after(Some("turn_end")).unwrap(),
+            RestartAfter::TurnEnd
+        );
+        assert_eq!(parse_restart_after(Some("NOW")).unwrap(), RestartAfter::Now);
+    }
+
+    #[test]
+    fn parse_restart_after_rejects_invalid_value() {
+        let err = parse_restart_after(Some("later")).unwrap_err();
+        assert!(err.contains("restart_after must be 'turn_end' or 'now'"));
     }
 
     #[test]
@@ -2478,7 +2513,7 @@ mod tests {
         assert_eq!(state.phase, RestartPhase::AwaitingTurnComplete);
         assert_eq!(state.max_attempts, 1);
         assert_eq!(state.cooldown_sec, 30);
-        assert!(state.auto_start_task);
+        assert!(!state.auto_start_task);
     }
 
     #[test]
@@ -2601,5 +2636,145 @@ mod tests {
             let snap = s.human_question_snapshot().unwrap();
             assert_eq!(snap.question, "Which database?");
         });
+    }
+
+    #[tokio::test]
+    async fn schedule_restart_now_reports_ok_false_on_execution_error() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let server = IntendantServer::new(state, bus);
+
+        let output = server
+            .schedule_controller_restart(Parameters(ScheduleControllerRestartParams {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("now".to_string()),
+                restart_command: None,
+                auto_start_task: Some(false),
+                max_attempts: None,
+                cooldown_sec: None,
+            }))
+            .await;
+
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json.get("ok").and_then(|v| v.as_bool()), Some(false));
+        assert!(json.get("execution_error").is_some());
+    }
+
+    #[tokio::test]
+    async fn control_schedule_restart_now_emits_not_ok_on_execution_error() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let (control_tx, mut control_rx) = broadcast::channel::<String>(8);
+
+        let resource = handle_control_command_mcp(
+            &state,
+            &bus,
+            &Some(control_tx),
+            ControlMsg::ScheduleControllerRestart {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("now".to_string()),
+                restart_command: None,
+                auto_start_task: Some(false),
+                max_attempts: None,
+                cooldown_sec: None,
+            },
+        )
+        .await;
+
+        assert_eq!(resource, Some(RESOURCE_RESTART_URI));
+
+        let event = timeout(Duration::from_millis(200), control_rx.recv())
+            .await
+            .expect("timed out waiting for command_result")
+            .expect("broadcast recv failed");
+        let json: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(
+            json.get("event").and_then(|v| v.as_str()),
+            Some("command_result")
+        );
+        assert_eq!(
+            json.get("action").and_then(|v| v.as_str()),
+            Some("schedule_controller_restart")
+        );
+        assert_eq!(json.get("ok").and_then(|v| v.as_bool()), Some(false));
+        assert!(json
+            .get("data")
+            .and_then(|d| d.get("execution_error"))
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn schedule_restart_rejects_invalid_restart_after() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let server = IntendantServer::new(state, bus);
+
+        let output = server
+            .schedule_controller_restart(Parameters(ScheduleControllerRestartParams {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("later".to_string()),
+                restart_command: None,
+                auto_start_task: Some(false),
+                max_attempts: None,
+                cooldown_sec: None,
+            }))
+            .await;
+
+        assert!(output.contains("restart_after must be 'turn_end' or 'now'"));
+    }
+
+    #[tokio::test]
+    async fn control_schedule_restart_rejects_zero_max_attempts() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let (control_tx, mut control_rx) = broadcast::channel::<String>(8);
+
+        let resource = handle_control_command_mcp(
+            &state,
+            &bus,
+            &Some(control_tx),
+            ControlMsg::ScheduleControllerRestart {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("turn_end".to_string()),
+                restart_command: None,
+                auto_start_task: Some(false),
+                max_attempts: Some(0),
+                cooldown_sec: None,
+            },
+        )
+        .await;
+
+        assert_eq!(resource, Some(RESOURCE_RESTART_URI));
+
+        let event = timeout(Duration::from_millis(200), control_rx.recv())
+            .await
+            .expect("timed out waiting for command_result")
+            .expect("broadcast recv failed");
+        let json: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(
+            json.get("event").and_then(|v| v.as_str()),
+            Some("command_result")
+        );
+        assert_eq!(
+            json.get("action").and_then(|v| v.as_str()),
+            Some("schedule_controller_restart")
+        );
+        assert_eq!(json.get("ok").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            json.get("message").and_then(|v| v.as_str()),
+            Some("Invalid request: max_attempts must be >= 1")
+        );
     }
 }

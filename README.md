@@ -567,6 +567,8 @@ Current status:
 {"event": "command_result", "action": "get_restart_status", "ok": true, "message": "ok", "data": {...}}
 ```
 
+`command_result.ok` is `false` when a control action fails (for example, `schedule_controller_restart` with `restart_after="now"` and no executable restart action configured).
+
 Example usage:
 ```bash
 echo '{"action":"status"}' | socat - UNIX:/tmp/intendant-$(pgrep intendant).sock
@@ -623,7 +625,7 @@ All tools mirror TUI actions. The server enforces compile-time parity — adding
 | `set_verbosity` | Set log verbosity (TUI: `v`) | `level`: `"quiet"`, `"normal"`, `"verbose"`, `"debug"` |
 | `quit` | Shut down the agent (TUI: `q`) | — |
 | `start_task` | Start a new agent task | `task` |
-| `schedule_controller_restart` | Schedule a controller restart/autonomous re-init workflow | `controller_id`, `north_star_goal`, `reason?`, `restart_after?` (`"turn_end"` or `"now"`), `restart_command?`, `auto_start_task?`, `max_attempts?`, `cooldown_sec?` |
+| `schedule_controller_restart` | Schedule a controller restart/autonomous re-init workflow | `controller_id`, `north_star_goal`, `reason?`, `restart_after?` (`"turn_end"` or `"now"`), `restart_command?`, `auto_start_task?` (default `false`), `max_attempts?`, `cooldown_sec?` |
 | `controller_turn_complete` | Final handshake from controller; validates token and executes scheduled restart | `restart_id`, `turn_complete_token`, `status?`, `handoff_summary?` |
 | `get_restart_status` | Get current controller restart state (or null) | — |
 | `cancel_controller_restart` | Cancel scheduled restart | `restart_id?` |
@@ -661,12 +663,36 @@ Use this when you want Intendant to trigger a controller re-init cycle safely.
 2. Before ending the controlling agent turn, call `controller_turn_complete` with both values.
 3. Intendant executes restart actions:
    - spawn `restart_command` (if provided), and/or
-   - start a fresh Intendant task using `north_star_goal` (`auto_start_task=true` by default).
+   - start a fresh Intendant task using `north_star_goal` (`auto_start_task=false` by default; opt in for E2E testing).
 4. Inspect state via `get_restart_status` or `intendant://controller-restart`.
 
 Notes:
 - Restart state is persisted to the current session dir as `controller_restart.json`.
 - `restart_after` defaults to `"turn_end"`.
+- `restart_after` accepts only `"turn_end"` or `"now"`; other values are rejected.
+- `max_attempts` must be `>= 1`; `0` is rejected.
+- If `restart_after="now"` and execution fails, `schedule_controller_restart` reports `"ok": false` and includes `execution_error`.
+
+Controller recursion profile (recommended for Codex/Claude-style controllers):
+- Set `auto_start_task=false` (or omit it, since `false` is the default).
+- Use `restart_command` to relaunch the external controller process.
+- Treat `start_task` as optional E2E testing only, not the default recursion path.
+
+Controller loop monitoring files (for `restart_command` scripts):
+- Write run artifacts under `.intendant/controller-loop/<run_id>/`.
+- Maintain stable pointers:
+  - `.intendant/controller-loop/latest` (symlink to current/latest run)
+  - `.intendant/controller-loop/latest.pid` (wrapper script PID)
+  - `.intendant/controller-loop/latest.status.json` (latest status snapshot)
+  - `.intendant/controller-loop/latest.jsonl` (path to latest JSONL output file)
+- Recommended commands:
+  - `tail -f .intendant/controller-loop/latest/codex.jsonl`
+  - `watch -n 2 'cat .intendant/controller-loop/latest/heartbeat.txt'`
+  - `cat .intendant/controller-loop/latest.status.json`
+- Intervention controls:
+  - Graceful stop current run: `touch .intendant/controller-loop/request_stop`
+  - Immediate abort current run: `touch .intendant/controller-loop/request_abort`
+  - Intervention history: `cat .intendant/controller-loop/latest/intervention.log`
 
 ### Typical Agent Workflow
 
