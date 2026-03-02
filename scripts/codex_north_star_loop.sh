@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Ensure each loop cycle runs in its own detached session. This prevents
+# parent/session teardown from sending TERM to newly spawned cycles.
+if [[ "${INTENDANT_LOOP_DETACHED:-0}" != "1" ]]; then
+  SELF_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid -f env INTENDANT_LOOP_DETACHED=1 bash "$SELF_PATH" "$@" \
+      </dev/null >/dev/null 2>&1 &
+  else
+    nohup env INTENDANT_LOOP_DETACHED=1 bash "$SELF_PATH" "$@" \
+      </dev/null >/dev/null 2>&1 &
+  fi
+  exit 0
+fi
+
 ROOT="/home/user/projects/intendant-codex-fork"
 LOG_DIR="${ROOT}/.intendant/controller-loop"
 RUN_TS="$(date -u +"%Y%m%dT%H%M%SZ")"

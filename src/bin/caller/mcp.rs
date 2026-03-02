@@ -545,13 +545,25 @@ async fn run_scheduled_controller_restart_with_state(
     }
 
     if restart.auto_start_task {
-        start_task_with_state(
+        if let Err(e) = start_task_with_state(
             state,
             bus,
             restart.north_star_goal.clone(),
             "controller_restart",
         )
-        .await?;
+        .await
+        {
+            let failure = format!("Failed to start follow-up task: {}", e);
+            let mut s = state.write().await;
+            if let Some(active) = s.controller_restart.as_mut() {
+                active.phase = RestartPhase::Failed;
+                active.last_error = Some(failure.clone());
+                active.updated_at = ControllerRestartState::now_string();
+            }
+            let snapshot = s.controller_restart.clone();
+            persist_restart_state(&log_dir, &snapshot);
+            return Err(failure);
+        }
         result_parts.push("started autonomous follow-up task".to_string());
     }
 
@@ -3164,6 +3176,69 @@ mod tests {
         assert_eq!(json["restart_id"].as_str(), Some(restart_id.as_str()));
         assert_eq!(json["phase"].as_str(), Some("completed"));
         assert!(json["execution"].as_str().unwrap_or("").contains("spawned"));
+    }
+
+    #[tokio::test]
+    async fn controller_turn_complete_marks_restart_failed_when_auto_start_task_fails() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let server = IntendantServer::new(state.clone(), bus);
+
+        let scheduled = server
+            .schedule_controller_restart(Parameters(ScheduleControllerRestartParams {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("turn_end".to_string()),
+                restart_command: None,
+                auto_start_task: Some(true),
+                max_attempts: None,
+                cooldown_sec: None,
+            }))
+            .await;
+        let scheduled_json: serde_json::Value = serde_json::from_str(&scheduled).unwrap();
+        let restart_id = scheduled_json["restart_id"].as_str().unwrap().to_string();
+        let token = scheduled_json["turn_complete_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        {
+            let mut s = state.write().await;
+            s.set_phase(Phase::RunningAgent);
+        }
+
+        let output = server
+            .controller_turn_complete(Parameters(ControllerTurnCompleteParams {
+                restart_id: restart_id.clone(),
+                turn_complete_token: token,
+                status: None,
+                handoff_summary: None,
+            }))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json["ok"].as_bool(), Some(false));
+        assert_eq!(json["status"].as_str(), Some("restart_pending"));
+        assert_eq!(json["phase"].as_str(), Some("failed"));
+        assert!(json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Failed to start follow-up task"));
+
+        let restart_path = restart_state_path(dir.path());
+        let persisted = std::fs::read_to_string(restart_path).expect("restart file should exist");
+        let persisted_json: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        let restart_json = persisted_json.as_object().expect("restart should persist");
+        assert_eq!(
+            restart_json.get("phase").and_then(|v| v.as_str()),
+            Some("failed")
+        );
+        assert!(restart_json
+            .get("last_error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("Failed to start follow-up task"));
     }
 
     #[tokio::test]
