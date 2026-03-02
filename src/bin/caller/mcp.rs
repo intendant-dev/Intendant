@@ -870,10 +870,7 @@ async fn handle_control_command_mcp(
                     );
                     return Some(RESOURCE_RESTART_URI);
                 }
-                if !matches!(
-                    active.phase,
-                    RestartPhase::AwaitingTurnComplete | RestartPhase::Ready
-                ) {
+                if !matches!(active.phase, RestartPhase::AwaitingTurnComplete) {
                     emit_control_result(
                         control_tx,
                         "controller_turn_complete",
@@ -1843,10 +1840,7 @@ impl IntendantServer {
                     "turn_complete_token is invalid".to_string(),
                 );
             }
-            if !matches!(
-                active.phase,
-                RestartPhase::AwaitingTurnComplete | RestartPhase::Ready
-            ) {
+            if !matches!(active.phase, RestartPhase::AwaitingTurnComplete) {
                 return restart_error_response(
                     "rejected",
                     &params.restart_id,
@@ -3473,6 +3467,60 @@ mod tests {
             json["error"].as_str(),
             Some("turn_complete_token is invalid")
         );
+    }
+
+    #[tokio::test]
+    async fn controller_turn_complete_rejects_ready_phase() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let server = IntendantServer::new(state.clone(), bus);
+
+        let scheduled = server
+            .schedule_controller_restart(Parameters(ScheduleControllerRestartParams {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("turn_end".to_string()),
+                restart_command: Some("true".to_string()),
+                auto_start_task: Some(false),
+                max_attempts: None,
+                cooldown_sec: None,
+            }))
+            .await;
+        let scheduled_json: serde_json::Value = serde_json::from_str(&scheduled).unwrap();
+        let restart_id = scheduled_json["restart_id"].as_str().unwrap().to_string();
+        let token = scheduled_json["turn_complete_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        {
+            let mut s = state.write().await;
+            let restart = s
+                .controller_restart
+                .as_mut()
+                .expect("restart should be tracked");
+            restart.phase = RestartPhase::Ready;
+        }
+
+        let output = server
+            .controller_turn_complete(Parameters(ControllerTurnCompleteParams {
+                restart_id: restart_id.clone(),
+                turn_complete_token: token,
+                status: None,
+                handoff_summary: None,
+            }))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json["ok"].as_bool(), Some(false));
+        assert_eq!(json["status"].as_str(), Some("rejected"));
+        assert_eq!(json["restart_id"].as_str(), Some(restart_id.as_str()));
+        assert_eq!(json["phase"].as_str(), Some("ready"));
+        assert!(json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Restart is not awaiting completion"));
     }
 
     #[tokio::test]

@@ -684,6 +684,7 @@ Notes:
 - `controller_turn_complete` reports JSON results:
   - success: `"status": "completed"`, `"ok": true`, plus `"execution"` and `"phase"`.
   - rejection/pending: `"ok": false`, with `"status"` (`"rejected"` or `"restart_pending"`) and `"error"`.
+- `controller_turn_complete` only accepts restarts in `"awaiting_turn_complete"`; duplicate or late handshakes (for example `"phase": "ready"`) are rejected to prevent duplicate restart execution.
 - `cancel_controller_restart` reports JSON results:
   - success: `"status": "cancelled"`, `"ok": true`, plus `"restart_id"` and `"phase": "cancelled"`.
   - rejection: `"status": "rejected"`, `"ok": false`, with `"error"` (and optional `"restart_id"`/`"phase"` context).
