@@ -216,6 +216,7 @@ pub fn spawn_event_listener(
     state: SharedMcpState,
     mut event_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     peer: Arc<Mutex<Option<rmcp::Peer<RoleServer>>>>,
+    human_question_path: Option<crate::tui::event::SharedQuestionPath>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
@@ -422,6 +423,16 @@ pub fn spawn_event_listener(
                             responder: Some(responder),
                         });
                         resource_changed = Some("intendant://pending-approval");
+                    }
+
+                    AppEvent::SessionDirChanged { ref path } => {
+                        s.log_dir = path.clone();
+                        // Update the human question monitor's watched path
+                        if let Some(ref hqp) = human_question_path {
+                            if let Ok(mut p) = hqp.try_write() {
+                                *p = path.join("human_question");
+                            }
+                        }
                     }
 
                     AppEvent::ControlCommand(_) => {
@@ -902,7 +913,7 @@ impl IntendantServer {
         let args: Vec<String> = std::env::args().collect();
         tokio::spawn(async move {
             // Give rmcp time to write the response
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
             // Flush stdout to ensure the response is delivered
             use std::io::Write;
@@ -1267,6 +1278,7 @@ pub async fn run_mcp_server(
     bus: EventBus,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     reloaded: bool,
+    human_question_path: Option<crate::tui::event::SharedQuestionPath>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server = IntendantServer::new(state.clone(), bus);
 
@@ -1285,7 +1297,7 @@ pub async fn run_mcp_server(
     let peer = Arc::new(Mutex::new(Some(running.peer().clone())));
 
     // Spawn event listener that mirrors AppEvents into McpAppState
-    let _listener = spawn_event_listener(state, event_rx, peer);
+    let _listener = spawn_event_listener(state, event_rx, peer, human_question_path);
 
     // Wait until the service finishes (client disconnects or quit)
     running.waiting().await?;

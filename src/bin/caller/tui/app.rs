@@ -783,6 +783,9 @@ impl App {
             AppEvent::ControlCommand(msg) => {
                 self.handle_control_command(msg);
             }
+            AppEvent::SessionDirChanged { .. } => {
+                // Only relevant for MCP mode; TUI ignores this.
+            }
             AppEvent::Tick => {
                 self.tick_count += 1;
                 // Update autonomy display
