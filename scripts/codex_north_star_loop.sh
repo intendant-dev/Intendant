@@ -5,6 +5,10 @@ ROOT="/home/user/projects/intendant-codex-fork"
 LOG_DIR="${ROOT}/.intendant/controller-loop"
 HALT_FILE="${LOG_DIR}/request_halt"
 HALT_AFTER_CYCLE_FILE="${LOG_DIR}/request_halt_after_cycle"
+LOCK_DIR="${LOG_DIR}/active.lock"
+LOCK_PID_FILE="${LOCK_DIR}/pid"
+LOCK_RUN_FILE="${LOCK_DIR}/run_id"
+LOCK_TS_FILE="${LOCK_DIR}/acquired_at"
 
 # Persistent graceful halt gate: when armed, refuse to start a new cycle.
 if [[ -f "$HALT_FILE" ]]; then
@@ -44,6 +48,7 @@ LATEST_OUT_FILE="${LOG_DIR}/latest.jsonl"
 LATEST_STATUS_FILE="${LOG_DIR}/latest.status.json"
 LATEST_RUN_ID_FILE="${LOG_DIR}/latest.run_id"
 CODEX_PID_FILE="${RUN_DIR}/codex.pid"
+WRAPPER_PID_FILE="${RUN_DIR}/wrapper.pid"
 INTERVENTION_LOG="${RUN_DIR}/intervention.log"
 STOP_FILE="${LOG_DIR}/request_stop"
 ABORT_FILE="${LOG_DIR}/request_abort"
@@ -53,6 +58,37 @@ CODEX_PID=""
 CONTROL_PID=""
 FINALIZED="0"
 STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+acquire_lock() {
+  mkdir -p "$LOG_DIR"
+  local owner_pid
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK_PID_FILE"
+    printf '%s\n' "$RUN_ID" > "$LOCK_RUN_FILE"
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$LOCK_TS_FILE"
+    return 0
+  fi
+
+  owner_pid="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+  if [[ -n "$owner_pid" ]] && ! kill -0 "$owner_pid" >/dev/null 2>&1; then
+    rm -rf "$LOCK_DIR"
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$LOCK_PID_FILE"
+      printf '%s\n' "$RUN_ID" > "$LOCK_RUN_FILE"
+      date -u +"%Y-%m-%dT%H:%M:%SZ" > "$LOCK_TS_FILE"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+release_lock() {
+  local owner_pid
+  owner_pid="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+  if [[ -n "$owner_pid" && "$owner_pid" == "$$" ]]; then
+    rm -rf "$LOCK_DIR"
+  fi
+}
 
 log_intervention() {
   printf '%s %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$*" >> "$INTERVENTION_LOG"
@@ -76,12 +112,19 @@ write_status() {
   local exit_code="$2"
   local reason="${3:-}"
   local finished_at
+  local tmp_status tmp_latest tmp_summary
   finished_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  tmp_status="${STATUS_FILE}.tmp.$$"
+  tmp_latest="${LATEST_STATUS_FILE}.tmp.$$"
+  tmp_summary="${SUMMARY_FILE}.tmp.$$"
   printf '{"run_id":"%s","state":"%s","pid":%s,"codex_pid":"%s","exit_code":%s,"started_at":"%s","finished_at":"%s","reason":"%s","output":"%s"}\n' \
-    "$RUN_ID" "$state" "$$" "${CODEX_PID:-}" "$exit_code" "$STARTED_AT" "$finished_at" "$reason" "$OUT_FILE" > "$STATUS_FILE"
-  cp "$STATUS_FILE" "$LATEST_STATUS_FILE"
+    "$RUN_ID" "$state" "$$" "${CODEX_PID:-}" "$exit_code" "$STARTED_AT" "$finished_at" "$reason" "$OUT_FILE" > "$tmp_status"
+  mv -f "$tmp_status" "$STATUS_FILE"
+  cp "$STATUS_FILE" "$tmp_latest"
+  mv -f "$tmp_latest" "$LATEST_STATUS_FILE"
   printf '{"run_id":"%s","state":"%s","exit_code":%s,"finished_at":"%s"}\n' \
-    "$RUN_ID" "$state" "$exit_code" "$finished_at" > "$SUMMARY_FILE"
+    "$RUN_ID" "$state" "$exit_code" "$finished_at" > "$tmp_summary"
+  mv -f "$tmp_summary" "$SUMMARY_FILE"
 }
 
 cleanup() {
@@ -118,6 +161,7 @@ cleanup() {
   fi
   write_status "$state" "$exit_code" "$reason"
   log_intervention "cleanup_end state=$state exit_code=$exit_code reason=${reason:-none}"
+  release_lock
 }
 
 on_signal() {
@@ -125,6 +169,19 @@ on_signal() {
   capture_signal_diagnostics "$sig"
   cleanup "signaled" 143 "$sig"
   exit 143
+}
+
+on_exit() {
+  local exit_code="$?"
+  if [[ "$FINALIZED" != "1" ]]; then
+    local state="failed"
+    local reason="unexpected_exit"
+    if [[ "$exit_code" -eq 0 ]]; then
+      state="exited"
+      reason="exit_trap"
+    fi
+    cleanup "$state" "$exit_code" "$reason"
+  fi
 }
 
 read -r -d '' PROMPT <<'EOF' || true
@@ -138,6 +195,7 @@ Execution policy:
 - If E2E or regression tests fail, fix the bugs in the same cycle before scheduling restart.
 - The repository may already contain uncommitted changes from prior loop cycles; treat those as expected baseline context, not as unexpected external edits.
 - Do not stop only because `git status` is dirty at turn start; continue from current workspace state.
+- Do not modify `scripts/codex_north_star_loop.sh` unless the operator explicitly requests loop-infrastructure changes.
 - Commit each completed cycle before restart handshake.
 - Use one commit per cycle with message format: `loop: <short summary> [run <YYYYMMDDTHHMMSSZ>]`.
 - Do not amend prior commits.
@@ -155,9 +213,13 @@ Controller recursion policy:
 - Do not use start_task for normal work loops (only explicit E2E testing).
 EOF
 
+if ! acquire_lock; then
+  exit 0
+fi
 mkdir -p "$RUN_DIR"
 ln -sfn "$RUN_DIR" "$LATEST_LINK"
 printf '%s\n' "$$" > "$LATEST_PID_FILE"
+printf '%s\n' "$$" > "$WRAPPER_PID_FILE"
 printf '%s\n' "$OUT_FILE" > "$LATEST_OUT_FILE"
 printf '%s\n' "$RUN_ID" > "$LATEST_RUN_ID_FILE"
 # Clear stale operator intervention requests from prior runs.
@@ -203,17 +265,18 @@ trap 'on_signal TERM' TERM
 trap 'on_signal INT' INT
 trap 'on_signal HUP' HUP
 trap 'on_signal QUIT' QUIT
+trap 'on_exit' EXIT
 
 set +e
 codex exec \
   --cd "$ROOT" \
-  --sandbox workspace-write \
-  --full-auto \
+  --dangerously-bypass-approvals-and-sandbox \
   --json \
   "$PROMPT" >> "$OUT_FILE" 2>&1 &
 CODEX_PID="$!"
 printf '%s\n' "$CODEX_PID" > "$CODEX_PID_FILE"
 log_intervention "codex_started codex_pid=$CODEX_PID"
+write_status "running" -1 ""
 wait "$CODEX_PID"
 EXIT_CODE=$?
 set -e

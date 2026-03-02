@@ -537,7 +537,7 @@ When `--control-socket` is enabled, a Unix domain socket is created at `/tmp/int
 
 Current status:
 - Outbound event broadcast is implemented.
-- Inbound command handling is implemented for status, approval, denial, human input, autonomy change, quit, and controller-restart workflow commands (in MCP mode).
+- Inbound command handling is implemented for status, approval, denial, human input, autonomy change, quit, controller-restart workflow commands, and controller-loop intervention commands (in MCP mode).
 - Socket server is opt-in via `--control-socket`.
 
 ### Inbound Commands (JSON-line)
@@ -552,6 +552,10 @@ Current status:
 {"action": "controller_turn_complete", "restart_id":"<id>", "turn_complete_token":"<token>", "status":"ok", "handoff_summary":"..."}
 {"action": "get_restart_status"}
 {"action": "cancel_controller_restart", "restart_id":"<id>"}
+{"action": "request_controller_loop_halt", "persistent": true}
+{"action": "clear_controller_loop_halt"}
+{"action": "intervene_controller_loop", "mode":"stop"}
+{"action": "get_controller_loop_status"}
 {"action": "quit"}
 ```
 
@@ -629,6 +633,10 @@ All tools mirror TUI actions. The server enforces compile-time parity — adding
 | `controller_turn_complete` | Final handshake from controller; validates token and executes scheduled restart | `restart_id`, `turn_complete_token`, `status?`, `handoff_summary?` |
 | `get_restart_status` | Get current controller restart state (or null) | — |
 | `cancel_controller_restart` | Cancel scheduled restart | `restart_id?` |
+| `request_controller_loop_halt` | Request loop halt (`persistent=true` blocks all future cycles; `persistent=false` requests one-shot halt-after-cycle) | `persistent?` |
+| `clear_controller_loop_halt` | Clear loop halt flags so restarts can proceed again | — |
+| `intervene_controller_loop` | Request intervention for active loop process | `mode`: `"stop"` or `"abort"` |
+| `get_controller_loop_status` | Unified loop health snapshot (flags, lock owner, latest run pointers, active PID counts) | — |
 | `reload` | Rebuild binary and hot-reload the MCP server via exec() | — |
 
 `schedule_controller_restart`, `controller_turn_complete`, and `cancel_controller_restart` return JSON payloads with an `ok` boolean and status fields. Rejections are returned as JSON (`ok: false`) with an `error` message instead of plain text.
@@ -656,6 +664,7 @@ Resources provide push-based state observation via subscriptions. The server sen
 | `intendant://pending-approval` | Current pending approval request, if any |
 | `intendant://pending-input` | Current pending human question, if any |
 | `intendant://controller-restart` | Current controller restart workflow state, if any |
+| `intendant://controller-loop` | Loop health snapshot (intervention flags, singleton lock owner, active wrapper/codex PIDs, latest run pointers) |
 
 ### Controller Restart Workflow
 
@@ -688,7 +697,8 @@ Notes:
 - `cancel_controller_restart` reports JSON results:
   - success: `"status": "cancelled"`, `"ok": true`, plus `"restart_id"` and `"phase": "cancelled"`.
   - rejection: `"status": "rejected"`, `"ok": false`, with `"error"` (and optional `"restart_id"`/`"phase"` context).
-- Control-socket `command_result.data` mirrors structured restart payloads for `schedule_controller_restart`, `controller_turn_complete`, and `cancel_controller_restart` (including `status`, `restart_id`, `phase`, and `error`/`execution` fields).
+- `request_controller_loop_halt`, `clear_controller_loop_halt`, `intervene_controller_loop`, and `get_controller_loop_status` return/emit normalized loop health data (flags, lock owner PID/aliveness, latest run pointers, and active PID counts).
+- Control-socket `command_result.data` mirrors structured payloads for restart actions (`schedule_controller_restart`, `controller_turn_complete`, `cancel_controller_restart`) and loop-control actions (`request_controller_loop_halt`, `clear_controller_loop_halt`, `intervene_controller_loop`, `get_controller_loop_status`).
 - `get_restart_status` (MCP tool and control-socket `command_result.data`) and `intendant://controller-restart` redact `turn_complete_token` as `"[redacted]"`; only `schedule_controller_restart` returns the raw token for the final handshake call.
 
 Controller recursion profile (recommended for Codex/Claude-style controllers):
@@ -703,6 +713,7 @@ Controller loop monitoring files (for `restart_command` scripts):
   - `.intendant/controller-loop/latest.pid` (wrapper script PID)
   - `.intendant/controller-loop/latest.status.json` (latest status snapshot)
   - `.intendant/controller-loop/latest.jsonl` (path to latest JSONL output file)
+  - `.intendant/controller-loop/active.lock/` (singleton lock: `pid`, `run_id`, `acquired_at`)
 - Recommended commands:
   - `tail -f .intendant/controller-loop/latest/codex.jsonl`
   - `watch -n 2 'cat .intendant/controller-loop/latest/heartbeat.txt'`
@@ -713,6 +724,9 @@ Controller loop monitoring files (for `restart_command` scripts):
   - Graceful stop current run: `touch .intendant/controller-loop/request_stop`
   - Immediate abort current run: `touch .intendant/controller-loop/request_abort`
   - Intervention history: `cat .intendant/controller-loop/latest/intervention.log`
+- Per-run PID files:
+  - `.intendant/controller-loop/<run_id>/wrapper.pid`
+  - `.intendant/controller-loop/<run_id>/codex.pid`
 
 ### Typical Agent Workflow
 

@@ -153,6 +153,15 @@ pub enum ControlMsg {
         #[serde(default)]
         restart_id: Option<String>,
     },
+    RequestControllerLoopHalt {
+        #[serde(default)]
+        persistent: Option<bool>,
+    },
+    ClearControllerLoopHalt,
+    InterveneControllerLoop {
+        mode: String,
+    },
+    GetControllerLoopStatus,
     Quit,
 }
 
@@ -400,6 +409,27 @@ mod tests {
     }
 
     #[test]
+    fn control_msg_controller_loop_variants_deserialize() {
+        let halt: ControlMsg =
+            serde_json::from_str(r#"{"action":"request_controller_loop_halt","persistent":false}"#)
+                .unwrap();
+        match halt {
+            ControlMsg::RequestControllerLoopHalt { persistent } => {
+                assert_eq!(persistent, Some(false));
+            }
+            _ => panic!("expected RequestControllerLoopHalt"),
+        }
+
+        let intervene: ControlMsg =
+            serde_json::from_str(r#"{"action":"intervene_controller_loop","mode":"stop"}"#)
+                .unwrap();
+        match intervene {
+            ControlMsg::InterveneControllerLoop { mode } => assert_eq!(mode, "stop"),
+            _ => panic!("expected InterveneControllerLoop"),
+        }
+    }
+
+    #[test]
     fn control_msg_serialize_roundtrip() {
         let msgs = vec![
             ControlMsg::Status,
@@ -429,6 +459,14 @@ mod tests {
             },
             ControlMsg::GetRestartStatus,
             ControlMsg::CancelControllerRestart { restart_id: None },
+            ControlMsg::RequestControllerLoopHalt {
+                persistent: Some(true),
+            },
+            ControlMsg::ClearControllerLoopHalt,
+            ControlMsg::InterveneControllerLoop {
+                mode: "stop".to_string(),
+            },
+            ControlMsg::GetControllerLoopStatus,
             ControlMsg::Quit,
         ];
         for msg in msgs {
