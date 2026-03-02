@@ -166,11 +166,14 @@ pub fn spawn_tick_timer(bus: EventBus, interval_ms: u64) -> tokio::task::JoinHan
 }
 
 /// Spawns a file monitor for askHuman question files.
-pub fn spawn_human_question_monitor(bus: EventBus) -> tokio::task::JoinHandle<()> {
+/// The `question_path` is the session-scoped path to the human_question file.
+pub fn spawn_human_question_monitor(
+    bus: EventBus,
+    question_path: std::path::PathBuf,
+) -> tokio::task::JoinHandle<()> {
     use tokio::time::{interval, Duration};
 
     tokio::spawn(async move {
-        let question_path = shared_file_path("intendant_human_question");
         let mut interval = interval(Duration::from_millis(250));
         let mut last_seen = false;
 
@@ -195,23 +198,6 @@ pub fn spawn_human_question_monitor(bus: EventBus) -> tokio::task::JoinHandle<()
             }
         }
     })
-}
-
-fn shared_file_path(name: &str) -> std::path::PathBuf {
-    let base = std::env::var("INTENDANT_SHARED_DIR")
-        .map(std::path::PathBuf::from)
-        .ok()
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| {
-            let shm = std::path::PathBuf::from("/dev/shm");
-            if shm.exists() {
-                Some(shm)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(std::env::temp_dir);
-    base.join(name)
 }
 
 #[cfg(test)]

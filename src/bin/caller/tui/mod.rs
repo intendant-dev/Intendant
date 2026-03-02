@@ -137,7 +137,12 @@ mod tests {
 
     fn test_app() -> App {
         let autonomy = autonomy::shared_autonomy(AutonomyState::default());
-        App::new("openai".to_string(), "gpt-5".to_string(), autonomy)
+        App::new(
+            "openai".to_string(),
+            "gpt-5".to_string(),
+            autonomy,
+            std::path::PathBuf::from("/tmp/test_session"),
+        )
     }
 
     #[test]

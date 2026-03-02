@@ -24,6 +24,7 @@ use error::CallerError;
 use project::Project;
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tui::event::{AppEvent, EventBus};
 
@@ -56,7 +57,10 @@ struct CliFlags {
     mcp: bool,
     autonomy: AutonomyLevel,
     log_file: Option<String>,
-    resume: bool,
+    /// --continue / -c: resume the most recent session for this project.
+    continue_last: bool,
+    /// --resume / -r [id]: resume a specific session by ID or path.
+    resume_id: Option<String>,
     control_socket: bool,
     vision: bool,
 }
@@ -72,8 +76,9 @@ fn print_help() {
     println!("    --provider <NAME>     API provider (openai, anthropic, or gemini)");
     println!("    --model <NAME>        Model name to use");
     println!("    --autonomy <LEVEL>    Autonomy level: low, medium, high, full");
-    println!("    --log-file <DIR>      Override session log directory (default: ~/.intendant/logs/<ts>/)");
-    println!("    --resume [DIR]        Resume previous session (or specific log dir)");
+    println!("    --log-file <DIR>      Override session log directory (default: ~/.intendant/logs/<uuid>/)");
+    println!("    --continue, -c        Resume the most recent session for this project");
+    println!("    --resume, -r [ID]     Resume a specific session by ID, prefix, or path");
     println!("    --no-tui              Disable TUI, run headless");
     println!("    --mcp                 Run as MCP server on stdio (replaces TUI)");
     println!("    --verbose, -v         Enable verbose output");
@@ -115,7 +120,8 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         mcp: false,
         autonomy: AutonomyLevel::Medium,
         log_file: None,
-        resume: false,
+        continue_last: false,
+        resume_id: None,
         control_socket: false,
         vision: false,
     };
@@ -174,12 +180,17 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                     ));
                 }
             }
-            "--resume" => {
-                flags.resume = true;
+            "--continue" | "-c" => {
+                flags.continue_last = true;
+                i += 1;
+            }
+            "--resume" | "-r" => {
                 if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    flags.log_file = Some(args[i + 1].clone());
+                    flags.resume_id = Some(args[i + 1].clone());
                     i += 2;
                 } else {
+                    // --resume without argument acts like --continue
+                    flags.continue_last = true;
                     i += 1;
                 }
             }
@@ -719,14 +730,16 @@ Also: {"source": "bare"}"#;
             mcp: false,
             autonomy: AutonomyLevel::Medium,
             log_file: None,
-            resume: false,
+            continue_last: false,
+            resume_id: None,
             control_socket: false,
             vision: false,
         };
         assert!(!flags.verbose);
         assert!(!flags.no_tui);
         assert!(!flags.mcp);
-        assert!(!flags.resume);
+        assert!(!flags.continue_last);
+        assert!(flags.resume_id.is_none());
         assert!(!flags.vision);
         assert_eq!(flags.autonomy, AutonomyLevel::Medium);
     }
@@ -1271,6 +1284,7 @@ async fn run_agent_loop(
     bus: Option<EventBus>,
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
+    log_dir: &std::path::Path,
 ) -> Result<LoopStats, CallerError> {
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
@@ -1640,7 +1654,7 @@ async fn run_agent_loop(
                 || println!("[Turn {}] Running agent...", turn),
             );
 
-            let output = agent_runner::run_agent(&json_str).await?;
+            let output = agent_runner::run_agent(&json_str, log_dir).await?;
 
             // Log agent output
             slog(&session_log, |l| l.agent_output(&output.stdout, &output.stderr));
@@ -1921,7 +1935,7 @@ Proceed with explicit assumptions and continue without additional questions."
                 || println!("[Turn {}] Running agent...", turn),
             );
 
-            let output = agent_runner::run_agent(&json_str).await?;
+            let output = agent_runner::run_agent(&json_str, log_dir).await?;
 
             // Log agent output
             slog(&session_log, |l| {
@@ -1974,6 +1988,14 @@ Proceed with explicit assumptions and continue without additional questions."
             conversation.add_user(user_msg);
         } // end tool_calls vs text branch
 
+        // Auto-save conversation for resume capability
+        let conv_path = log_dir.join("conversation.jsonl");
+        if let Err(e) = conversation.save_to_file(&conv_path) {
+            slog(&session_log, |l| {
+                l.debug(&format!("Failed to save conversation: {}", e))
+            });
+        }
+
         if turn == SAFETY_CAP {
             slog(&session_log, |l| {
                 l.warn(&format!("Safety cap ({}) reached", SAFETY_CAP))
@@ -2024,6 +2046,7 @@ async fn run_sub_agent_mode(
     id: String,
     role: sub_agent::SubAgentRole,
     session_log: SharedSessionLog,
+    log_dir: PathBuf,
 ) -> Result<LoopStats, CallerError> {
     let project = Project::detect()?;
     let system_prompt = if provider.use_tools() {
@@ -2092,6 +2115,7 @@ All relative paths and commands execute from this directory.",
         None, // no TUI for sub-agents
         autonomy,
         session_log,
+        &log_dir,
     )
     .await;
 
@@ -2302,6 +2326,7 @@ async fn run_direct_mode(
     bus: Option<EventBus>,
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
+    log_dir: PathBuf,
 ) -> Result<LoopStats, CallerError> {
     let role = sub_agent::SubAgentRole::Custom("direct".to_string());
     let system_prompt = if provider.use_tools() {
@@ -2325,26 +2350,40 @@ async fn run_direct_mode(
         );
     }
 
-    let mut conversation = Conversation::new(system_prompt, provider.context_window());
-
-    // Inject project root so the model knows which directory to work in
-    conversation.add_user(format!(
-        "Working directory: {}\nThis is the project you should examine and modify. \
-All relative paths and commands execute from this directory.",
-        project.root.display()
-    ));
-    conversation.add_assistant("Understood. I will work within the specified project directory.".to_string());
-
-    // Inject memory
-    if let Some(store) = memory::load_memory(&project) {
-        if let Some(memory_msg) = memory::format_memory_message(&store) {
-            conversation.add_user(memory_msg);
-            conversation
-                .add_assistant("Acknowledged. I have loaded the project memory.".to_string());
+    // Try to resume from saved conversation if it exists in this session dir
+    let conv_path = log_dir.join("conversation.jsonl");
+    let mut conversation = if conv_path.exists() {
+        match Conversation::load_from_file(&conv_path, provider.context_window()) {
+            Ok(mut conv) => {
+                slog(&session_log, |l| {
+                    l.info(&format!(
+                        "Resumed conversation ({} messages, turn {})",
+                        conv.len(),
+                        conv.turn()
+                    ))
+                });
+                // Append the new task as a continuation message
+                conv.add_user(format!(
+                    "[Session resumed] Continue with: {}",
+                    task
+                ));
+                conv
+            }
+            Err(e) => {
+                slog(&session_log, |l| {
+                    l.warn(&format!("Failed to load conversation, starting fresh: {}", e))
+                });
+                let mut conv = Conversation::new(system_prompt, provider.context_window());
+                setup_fresh_conversation(&mut conv, &project, &task);
+                conv
+            }
         }
-    }
+    } else {
+        let mut conv = Conversation::new(system_prompt, provider.context_window());
+        setup_fresh_conversation(&mut conv, &project, &task);
+        conv
+    };
 
-    conversation.add_user(task.clone());
     if bus.is_none() {
         println!("Task: {}", task);
         println!("---");
@@ -2358,8 +2397,33 @@ All relative paths and commands execute from this directory.",
         bus,
         autonomy,
         session_log,
+        &log_dir,
     )
     .await
+}
+
+/// Set up a fresh conversation with project context, memory, and task.
+fn setup_fresh_conversation(conv: &mut Conversation, project: &Project, task: &str) {
+    // Inject project root so the model knows which directory to work in
+    conv.add_user(format!(
+        "Working directory: {}\nThis is the project you should examine and modify. \
+All relative paths and commands execute from this directory.",
+        project.root.display()
+    ));
+    conv.add_assistant(
+        "Understood. I will work within the specified project directory.".to_string(),
+    );
+
+    // Inject memory
+    if let Some(store) = memory::load_memory(project) {
+        if let Some(memory_msg) = memory::format_memory_message(&store) {
+            conv.add_user(memory_msg);
+            conv.add_assistant("Acknowledged. I have loaded the project memory.".to_string());
+        }
+    }
+
+    // Add the task
+    conv.add_user(task.to_string());
 }
 
 fn is_simple_task(task: &str) -> bool {
@@ -2429,11 +2493,24 @@ async fn main() -> Result<(), CallerError> {
     }
 
     // Create or resume session log.
-    let log_dir = if flags.resume {
-        session_log::SessionLog::resolve_resume_path(flags.log_file.as_deref())
+    let _is_resume = flags.continue_last || flags.resume_id.is_some();
+    let log_dir = if let Some(ref session_id) = flags.resume_id {
+        // --resume <id>: find a specific session by ID or path
+        session_log::SessionLog::find_session_by_id(session_id)
+            .ok_or_else(|| {
+                CallerError::Config(format!(
+                    "Resume requested, but session '{}' was not found",
+                    session_id
+                ))
+            })?
+    } else if flags.continue_last {
+        // --continue: find the most recent session for this project
+        session_log::SessionLog::find_latest_session(&project.root)
+            .map(|(_, dir)| dir)
             .ok_or_else(|| {
                 CallerError::Config(
-                    "Resume requested, but no existing session directory was found".to_string(),
+                    "Continue requested, but no existing session was found for this project"
+                        .to_string(),
                 )
             })?
     } else {
@@ -2442,6 +2519,7 @@ async fn main() -> Result<(), CallerError> {
     let session_log: SharedSessionLog = match session_log::SessionLog::open(log_dir.clone()) {
         Ok(log) => {
             eprintln!("Session log: {}/session.jsonl", log.dir().display());
+            eprintln!("Session ID: {}", log.session_id());
             Arc::new(Mutex::new(log))
         }
         Err(e) => {
@@ -2451,7 +2529,7 @@ async fn main() -> Result<(), CallerError> {
                 e
             );
             // Fallback to /tmp
-            let fallback = std::path::PathBuf::from("/tmp/intendant_session");
+            let fallback = PathBuf::from("/tmp/intendant_session");
             let log = session_log::SessionLog::open(fallback)
                 .map_err(|e| CallerError::Config(format!("Cannot create session log: {}", e)))?;
             eprintln!(
@@ -2461,6 +2539,11 @@ async fn main() -> Result<(), CallerError> {
             Arc::new(Mutex::new(log))
         }
     };
+
+    // Write session metadata (project root, task will be filled in later if available).
+    slog(&session_log, |l| {
+        l.write_meta(Some(&project.root), None);
+    });
 
     let provider = provider::select_provider()?;
     slog(&session_log, |l| {
@@ -2486,7 +2569,7 @@ async fn main() -> Result<(), CallerError> {
 
     // Check if running as a sub-agent (headless, no TUI)
     if let Some((id, role)) = sub_agent::detect_sub_agent_mode() {
-        run_sub_agent_mode(provider, id, role, session_log).await?;
+        run_sub_agent_mode(provider, id, role, session_log, log_dir).await?;
         return Ok(());
     }
 
@@ -2519,7 +2602,10 @@ async fn main() -> Result<(), CallerError> {
         // MCP mode — speaks Model Context Protocol on stdio.
         // This is architecturally a peer of the TUI: same EventBus, same UserAction contract.
         let (bus, event_rx) = EventBus::new();
-        let _human_monitor = tui::event::spawn_human_question_monitor(bus.clone());
+        let _human_monitor = tui::event::spawn_human_question_monitor(
+            bus.clone(),
+            log_dir.join("human_question"),
+        );
         let _tick_handle = tui::event::spawn_tick_timer(bus.clone(), 1000);
 
         let mcp_state = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -2527,6 +2613,7 @@ async fn main() -> Result<(), CallerError> {
                 provider.name().to_string(),
                 provider.model().to_string(),
                 autonomy.clone(),
+                log_dir.clone(),
             ),
         ));
 
@@ -2537,10 +2624,12 @@ async fn main() -> Result<(), CallerError> {
         let approval_config = project.config.approval.clone();
         let cli_autonomy = flags.autonomy;
         let session_log_for_launcher = session_log.clone();
+        let log_dir_for_launcher = log_dir.clone();
         let launcher: mcp::TaskLauncher = Box::new(move |task_str: String, bus: EventBus| {
             let project_root = project_root.clone();
             let approval_config = approval_config.clone();
             let session_log = session_log_for_launcher.clone();
+            let log_dir = log_dir_for_launcher.clone();
             Box::pin(async move {
                 // Create a fresh provider for this task
                 let provider = match provider::select_provider() {
@@ -2581,6 +2670,7 @@ async fn main() -> Result<(), CallerError> {
                         Some(bus_clone.clone()),
                         autonomy,
                         session_log,
+                        log_dir,
                     )
                     .await;
 
@@ -2643,7 +2733,10 @@ async fn main() -> Result<(), CallerError> {
         // Spawn background tasks
         let _crossterm_handle = tui::event::spawn_crossterm_reader(bus.clone());
         let _tick_handle = tui::event::spawn_tick_timer(bus.clone(), 100);
-        let _human_monitor = tui::event::spawn_human_question_monitor(bus.clone());
+        let _human_monitor = tui::event::spawn_human_question_monitor(
+            bus.clone(),
+            log_dir.join("human_question"),
+        );
 
         // Create TUI
         let mut terminal = tui::Tui::new()
@@ -2654,6 +2747,7 @@ async fn main() -> Result<(), CallerError> {
             provider.name().to_string(),
             provider.model().to_string(),
             autonomy.clone(),
+            log_dir.clone(),
         );
         app.verbosity = if flags.verbose {
             tui::app::Verbosity::Debug
@@ -2678,6 +2772,7 @@ async fn main() -> Result<(), CallerError> {
         let task_for_summary = task.clone();
         let session_log_clone = session_log.clone();
         let session_log_summary = session_log.clone();
+        let log_dir_clone = log_dir.clone();
         let loop_handle = tokio::spawn(async move {
             let result = if is_simple_task(&task_clone) {
                 run_direct_mode(
@@ -2687,6 +2782,7 @@ async fn main() -> Result<(), CallerError> {
                     Some(bus_clone.clone()),
                     autonomy_clone,
                     session_log_clone,
+                    log_dir_clone,
                 )
                 .await
             } else {
@@ -2741,6 +2837,7 @@ async fn main() -> Result<(), CallerError> {
                 None,
                 autonomy,
                 session_log.clone(),
+                log_dir,
             )
             .await
         } else {

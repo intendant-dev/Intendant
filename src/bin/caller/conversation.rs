@@ -1,5 +1,6 @@
 use crate::provider::TokenUsage;
 use serde::{Deserialize, Serialize};
+use std::io::{BufRead, Write};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
@@ -278,6 +279,54 @@ impl Conversation {
                 ..Default::default()
             },
         );
+    }
+
+    /// Save conversation messages to a JSONL file (one JSON object per line).
+    /// Note: `raw_output` and `layer` are `#[serde(skip)]` and will be lost on roundtrip.
+    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        for msg in &self.messages {
+            let json = serde_json::to_string(msg)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            writeln!(writer, "{}", json)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Load conversation from a JSONL file. Creates a new Conversation with the
+    /// given context window and populates it with the saved messages.
+    /// Note: `raw_output` and `layer` are lost on roundtrip (they are `#[serde(skip)]`).
+    pub fn load_from_file(
+        path: &std::path::Path,
+        context_window: u64,
+    ) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        let mut messages = Vec::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let msg: Message = serde_json::from_str(trimmed)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            messages.push(msg);
+        }
+
+        // Count non-system user+assistant pairs to estimate turn count
+        let turn = messages.iter().filter(|m| m.role == "assistant").count();
+
+        Ok(Self {
+            messages,
+            last_usage: None,
+            context_window,
+            turn,
+            protect_user_layer: false,
+        })
     }
 }
 
@@ -714,5 +763,87 @@ mod tests {
         assert!(!json.contains("tool_calls"));
         assert!(!json.contains("tool_call_id"));
         assert!(!json.contains("tool_name"));
+    }
+
+    // --- Save/load tests ---
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let mut conv = Conversation::new("You are a helper.".to_string(), 200_000);
+        conv.add_user("Hello".to_string());
+        conv.add_assistant("Hi there!".to_string());
+        conv.add_user("What is 2+2?".to_string());
+        conv.add_assistant("4".to_string());
+        conv.increment_turn();
+        conv.increment_turn();
+
+        conv.save_to_file(&path).unwrap();
+
+        let loaded = Conversation::load_from_file(&path, 200_000).unwrap();
+        assert_eq!(loaded.messages().len(), 5);
+        assert_eq!(loaded.messages()[0].role, "system");
+        assert_eq!(loaded.messages()[0].content, "You are a helper.");
+        assert_eq!(loaded.messages()[1].role, "user");
+        assert_eq!(loaded.messages()[1].content, "Hello");
+        assert_eq!(loaded.messages()[4].content, "4");
+        // Turn count is estimated from assistant messages
+        assert_eq!(loaded.turn(), 2);
+    }
+
+    #[test]
+    fn save_and_load_with_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_assistant_tool_calls(
+            "Running command.".to_string(),
+            vec![ToolCallRef {
+                id: "fc_1".to_string(),
+                call_id: "call_1".to_string(),
+                name: "exec_command".to_string(),
+                arguments: r#"{"nonce":1,"command":"ls"}"#.to_string(),
+            }],
+            None,
+        );
+        conv.add_tool_result("call_1", "exec_command", "file1.txt\nfile2.txt");
+
+        conv.save_to_file(&path).unwrap();
+        let loaded = Conversation::load_from_file(&path, 128_000).unwrap();
+
+        assert_eq!(loaded.messages().len(), 3);
+        let assistant = &loaded.messages()[1];
+        assert!(assistant.tool_calls.is_some());
+        assert_eq!(assistant.tool_calls.as_ref().unwrap()[0].name, "exec_command");
+
+        let tool_result = &loaded.messages()[2];
+        assert_eq!(tool_result.role, "tool");
+        assert_eq!(tool_result.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn load_nonexistent_file_fails() {
+        let result = Conversation::load_from_file(
+            std::path::Path::new("/tmp/nonexistent_conversation.jsonl"),
+            128_000,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn save_and_load_empty_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let conv = Conversation::new("system prompt".to_string(), 100_000);
+        conv.save_to_file(&path).unwrap();
+
+        let loaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(loaded.messages().len(), 1);
+        assert_eq!(loaded.messages()[0].role, "system");
+        assert_eq!(loaded.turn(), 0);
     }
 }

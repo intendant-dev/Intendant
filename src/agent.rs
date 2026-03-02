@@ -38,13 +38,6 @@ pub struct Agent {
 }
 
 impl Agent {
-    fn current_session_id() -> Option<String> {
-        fs::read_to_string(session_file_path())
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    }
-
     /// Create an agent with custom paths, used for testing.
     #[cfg(test)]
     pub fn new_with_paths(log_dir: PathBuf) -> Result<Self, AgentError> {
@@ -81,17 +74,21 @@ impl Agent {
     }
 
     fn resolve_log_dir() -> Result<PathBuf, AgentError> {
-        if let Ok(existing) = fs::read_to_string(session_file_path()) {
-            let path = PathBuf::from(existing.trim());
+        // Prefer INTENDANT_LOG_DIR env var set by the caller binary
+        if let Ok(dir_str) = std::env::var("INTENDANT_LOG_DIR") {
+            let path = PathBuf::from(dir_str);
             if path.is_dir() {
                 return Ok(path);
             }
+            // Dir specified but doesn't exist yet — create it
+            fs::create_dir_all(&path)?;
+            return Ok(path);
         }
+        // Fallback: create a fresh temp directory
         let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let log_dir = PathBuf::from(format!("{}/.intendant/logs/{}", home, timestamp));
         fs::create_dir_all(&log_dir)?;
-        fs::write(session_file_path(), log_dir.to_string_lossy().as_bytes())?;
         Ok(log_dir)
     }
 
@@ -242,8 +239,8 @@ impl Agent {
             AgentError::Process("Command string is required for execAsAgent".to_string())
         })?;
 
-        // Wait for port if requested
-        if let Some(port) = cmd.wait_for_port {
+        // Wait for port if requested (port 0 means no wait)
+        if let Some(port) = cmd.wait_for_port.filter(|&p| p > 0) {
             if !self.wait_for_port(port).await? {
                 return Ok(serde_json::json!({
                     "nonce": cmd.nonce,
@@ -634,8 +631,8 @@ impl Agent {
     async fn ask_human(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
         self.ask_human_with_paths(
             cmd,
-            &human_question_path(),
-            &human_response_path(),
+            &self.log_dir.join("human_question"),
+            &self.log_dir.join("human_response"),
             HUMAN_TIMEOUT_MS,
             HUMAN_POLL_MS,
         )
@@ -1313,38 +1310,6 @@ impl Agent {
 
         Ok(result)
     }
-}
-
-fn shared_dir() -> PathBuf {
-    std::env::var("INTENDANT_SHARED_DIR")
-        .map(PathBuf::from)
-        .ok()
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| {
-            let shm = PathBuf::from("/dev/shm");
-            if shm.exists() {
-                Some(shm)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(std::env::temp_dir)
-}
-
-fn shared_path(name: &str) -> PathBuf {
-    shared_dir().join(name)
-}
-
-fn session_file_path() -> PathBuf {
-    shared_path("intendant_session")
-}
-
-fn human_question_path() -> PathBuf {
-    shared_path("intendant_human_question")
-}
-
-fn human_response_path() -> PathBuf {
-    shared_path("intendant_human_response")
 }
 
 fn truncate_utf8_by_bytes(s: &str, max: usize) -> &str {
