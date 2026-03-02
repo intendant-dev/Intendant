@@ -613,11 +613,14 @@ impl App {
             ControlMsg::ScheduleControllerRestart { .. }
             | ControlMsg::ControllerTurnComplete { .. }
             | ControlMsg::GetRestartStatus
-            | ControlMsg::CancelControllerRestart { .. } => {
+            | ControlMsg::CancelControllerRestart { .. }
+            | ControlMsg::RequestControllerLoopHalt { .. }
+            | ControlMsg::ClearControllerLoopHalt
+            | ControlMsg::InterveneControllerLoop { .. }
+            | ControlMsg::GetControllerLoopStatus => {
                 self.log(
                     LogLevel::Warn,
-                    "Controller-restart control commands are only supported in MCP mode"
-                        .to_string(),
+                    "Controller control commands are only supported in MCP mode".to_string(),
                 );
             }
             ControlMsg::Quit => {

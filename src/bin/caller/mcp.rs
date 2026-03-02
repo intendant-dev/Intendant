@@ -445,6 +445,238 @@ fn restart_state_public_value(state: Option<&ControllerRestartState>) -> serde_j
     value
 }
 
+fn controller_loop_dir() -> std::path::PathBuf {
+    if let Ok(root) = std::env::var("INTENDANT_PROJECT_ROOT") {
+        return std::path::PathBuf::from(root).join(".intendant/controller-loop");
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".intendant/controller-loop")
+}
+
+fn read_trimmed(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    std::path::PathBuf::from("/proc")
+        .join(pid.to_string())
+        .exists()
+}
+
+fn parse_pid_file(path: &std::path::Path) -> Option<u32> {
+    read_trimmed(path)?.parse::<u32>().ok()
+}
+
+fn loop_run_dirs(loop_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut runs: Vec<std::path::PathBuf> = std::fs::read_dir(loop_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("20"))
+                .unwrap_or(false)
+        })
+        .collect();
+    runs.sort();
+    runs
+}
+
+fn read_json_file(path: &std::path::Path) -> serde_json::Value {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return serde_json::Value::Null;
+    };
+    serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
+}
+
+fn intervention_order_report(run_dir: &std::path::Path) -> serde_json::Value {
+    let path = run_dir.join("intervention.log");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return serde_json::json!({
+            "has_log": false,
+            "order_ok": true,
+        });
+    };
+
+    let mut run_started: Option<usize> = None;
+    let mut codex_started: Option<usize> = None;
+    let mut cleanup_begin: Option<usize> = None;
+    let mut cleanup_end: Option<usize> = None;
+
+    for (idx, line) in text.lines().enumerate() {
+        if run_started.is_none() && line.contains(" run_started ") {
+            run_started = Some(idx);
+        }
+        if codex_started.is_none() && line.contains(" codex_started ") {
+            codex_started = Some(idx);
+        }
+        if cleanup_begin.is_none() && line.contains(" cleanup_begin ") {
+            cleanup_begin = Some(idx);
+        }
+        if cleanup_end.is_none() && line.contains(" cleanup_end ") {
+            cleanup_end = Some(idx);
+        }
+    }
+
+    let order_ok = match (run_started, codex_started, cleanup_begin, cleanup_end) {
+        (Some(a), Some(b), Some(c), Some(d)) => a <= b && b <= c && c <= d,
+        _ => true,
+    };
+
+    serde_json::json!({
+        "has_log": true,
+        "order_ok": order_ok,
+        "run_started_line": run_started,
+        "codex_started_line": codex_started,
+        "cleanup_begin_line": cleanup_begin,
+        "cleanup_end_line": cleanup_end,
+    })
+}
+
+fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Value {
+    let halt = loop_dir.join("request_halt").exists();
+    let halt_after_cycle = loop_dir.join("request_halt_after_cycle").exists();
+    let stop_requested = loop_dir.join("request_stop").exists();
+    let abort_requested = loop_dir.join("request_abort").exists();
+
+    let lock_dir = loop_dir.join("active.lock");
+    let lock_owner_pid = parse_pid_file(&lock_dir.join("pid"));
+    let lock_owner_alive = lock_owner_pid.map(pid_is_alive).unwrap_or(false);
+
+    let mut active_wrappers = Vec::new();
+    let mut active_codex = Vec::new();
+    for run in loop_run_dirs(loop_dir) {
+        let run_id = run
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if let Some(pid) = parse_pid_file(&run.join("wrapper.pid")) {
+            if pid_is_alive(pid) {
+                active_wrappers.push(serde_json::json!({
+                    "run_id": run_id,
+                    "pid": pid
+                }));
+            }
+        }
+        if let Some(pid) = parse_pid_file(&run.join("codex.pid")) {
+            if pid_is_alive(pid) {
+                active_codex.push(serde_json::json!({
+                    "run_id": run_id,
+                    "pid": pid
+                }));
+            }
+        }
+    }
+
+    let latest_run_id = read_trimmed(&loop_dir.join("latest.run_id"));
+    let latest_status = read_json_file(&loop_dir.join("latest.status.json"));
+    let latest_target_path = std::fs::read_link(loop_dir.join("latest")).ok().map(|p| {
+        if p.is_absolute() {
+            p
+        } else {
+            loop_dir.join(p)
+        }
+    });
+    let latest_target = latest_target_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string());
+    let latest_pid = parse_pid_file(&loop_dir.join("latest.pid"));
+    let intervention_order = latest_target_path
+        .as_ref()
+        .map(|p| intervention_order_report(p))
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "has_log": false,
+                "order_ok": true,
+            })
+        });
+
+    serde_json::json!({
+        "loop_dir": loop_dir.to_string_lossy(),
+        "flags": {
+            "halt": halt,
+            "halt_after_cycle": halt_after_cycle,
+            "stop_requested": stop_requested,
+            "abort_requested": abort_requested,
+        },
+        "lock": {
+            "present": lock_dir.exists(),
+            "owner_pid": lock_owner_pid,
+            "owner_alive": lock_owner_alive,
+        },
+        "latest": {
+            "run_id": latest_run_id,
+            "pid": latest_pid,
+            "status": latest_status,
+            "target": latest_target,
+            "intervention_order": intervention_order,
+        },
+        "active": {
+            "wrapper_count": active_wrappers.len(),
+            "codex_count": active_codex.len(),
+            "wrappers": active_wrappers,
+            "codex": active_codex,
+        }
+    })
+}
+
+fn request_loop_halt_marker(loop_dir: &std::path::Path, persistent: bool) -> Result<(), String> {
+    std::fs::create_dir_all(loop_dir).map_err(|e| format!("Failed to create loop dir: {}", e))?;
+    if persistent {
+        std::fs::write(loop_dir.join("request_halt"), b"")
+            .map_err(|e| format!("Failed to write request_halt: {}", e))?;
+    } else {
+        std::fs::write(loop_dir.join("request_halt_after_cycle"), b"")
+            .map_err(|e| format!("Failed to write request_halt_after_cycle: {}", e))?;
+    }
+    Ok(())
+}
+
+fn clear_loop_halt_markers(loop_dir: &std::path::Path) -> Result<(), String> {
+    std::fs::remove_file(loop_dir.join("request_halt")).ok();
+    std::fs::remove_file(loop_dir.join("request_halt_after_cycle")).ok();
+    Ok(())
+}
+
+fn normalize_intervention_mode(mode: &str) -> String {
+    mode.trim().to_lowercase()
+}
+
+fn request_loop_intervention_marker(
+    loop_dir: &std::path::Path,
+    mode: &str,
+) -> Result<&'static str, String> {
+    std::fs::create_dir_all(loop_dir).map_err(|e| format!("Failed to create loop dir: {}", e))?;
+    match normalize_intervention_mode(mode).as_str() {
+        "stop" => {
+            std::fs::write(loop_dir.join("request_stop"), b"")
+                .map_err(|e| format!("Failed to write request_stop: {}", e))?;
+            Ok("stop")
+        }
+        "abort" => {
+            std::fs::write(loop_dir.join("request_abort"), b"")
+                .map_err(|e| format!("Failed to write request_abort: {}", e))?;
+            Ok("abort")
+        }
+        other => Err(format!(
+            "Invalid mode '{}': expected 'stop' or 'abort'",
+            other
+        )),
+    }
+}
+
 async fn spawn_detached_restart_command(cmd: &str) -> Result<u32, String> {
     use std::process::Stdio;
     use tokio::process::Command;
@@ -1061,6 +1293,80 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_RESTART_URI)
         }
+        ControlMsg::RequestControllerLoopHalt { persistent } => {
+            let loop_dir = controller_loop_dir();
+            let persistent = persistent.unwrap_or(true);
+            match request_loop_halt_marker(&loop_dir, persistent) {
+                Ok(()) => {
+                    let data = collect_controller_loop_status(&loop_dir);
+                    emit_control_result(
+                        control_tx,
+                        "request_controller_loop_halt",
+                        true,
+                        if persistent {
+                            "persistent halt requested".to_string()
+                        } else {
+                            "halt-after-cycle requested".to_string()
+                        },
+                        Some(data),
+                    );
+                }
+                Err(e) => {
+                    emit_control_result(control_tx, "request_controller_loop_halt", false, e, None);
+                }
+            }
+            Some(RESOURCE_LOOP_URI)
+        }
+        ControlMsg::ClearControllerLoopHalt => {
+            let loop_dir = controller_loop_dir();
+            match clear_loop_halt_markers(&loop_dir) {
+                Ok(()) => {
+                    let data = collect_controller_loop_status(&loop_dir);
+                    emit_control_result(
+                        control_tx,
+                        "clear_controller_loop_halt",
+                        true,
+                        "halt flags cleared".to_string(),
+                        Some(data),
+                    );
+                }
+                Err(e) => {
+                    emit_control_result(control_tx, "clear_controller_loop_halt", false, e, None);
+                }
+            }
+            Some(RESOURCE_LOOP_URI)
+        }
+        ControlMsg::InterveneControllerLoop { mode } => {
+            let loop_dir = controller_loop_dir();
+            match request_loop_intervention_marker(&loop_dir, &mode) {
+                Ok(applied) => {
+                    let data = collect_controller_loop_status(&loop_dir);
+                    emit_control_result(
+                        control_tx,
+                        "intervene_controller_loop",
+                        true,
+                        format!("{} requested", applied),
+                        Some(data),
+                    );
+                }
+                Err(e) => {
+                    emit_control_result(control_tx, "intervene_controller_loop", false, e, None);
+                }
+            }
+            Some(RESOURCE_LOOP_URI)
+        }
+        ControlMsg::GetControllerLoopStatus => {
+            let loop_dir = controller_loop_dir();
+            let data = collect_controller_loop_status(&loop_dir);
+            emit_control_result(
+                control_tx,
+                "get_controller_loop_status",
+                true,
+                "ok".to_string(),
+                Some(data),
+            );
+            Some(RESOURCE_LOOP_URI)
+        }
         ControlMsg::Quit => {
             let action = UserAction::Quit;
             let mut s = state.write().await;
@@ -1472,6 +1778,20 @@ pub struct CancelControllerRestartParams {
     /// Optional restart ID guard. If provided and mismatched, cancellation is rejected.
     #[serde(default)]
     pub restart_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RequestControllerLoopHaltParams {
+    /// When true (default), block all future loop cycles until cleared.
+    /// When false, request a one-shot halt after the next cycle boundary.
+    #[serde(default)]
+    pub persistent: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InterveneControllerLoopParams {
+    /// Intervention mode: "stop" (graceful TERM) or "abort" (immediate KILL).
+    pub mode: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2049,6 +2369,68 @@ impl IntendantServer {
     }
 
     #[tool(
+        description = "Request graceful controller-loop halt. By default this blocks all future cycles until cleared; set persistent=false for one-shot halt-after-cycle behavior."
+    )]
+    async fn request_controller_loop_halt(
+        &self,
+        Parameters(params): Parameters<RequestControllerLoopHaltParams>,
+    ) -> String {
+        let loop_dir = controller_loop_dir();
+        let persistent = params.persistent.unwrap_or(true);
+        if let Err(e) = request_loop_halt_marker(&loop_dir, persistent) {
+            return serde_json::json!({
+                "ok": false,
+                "error": e,
+            })
+            .to_string();
+        }
+        collect_controller_loop_status(&loop_dir).to_string()
+    }
+
+    #[tool(description = "Clear controller-loop halt flags so future cycles may start again.")]
+    async fn clear_controller_loop_halt(&self) -> String {
+        let loop_dir = controller_loop_dir();
+        if let Err(e) = clear_loop_halt_markers(&loop_dir) {
+            return serde_json::json!({
+                "ok": false,
+                "error": e,
+            })
+            .to_string();
+        }
+        collect_controller_loop_status(&loop_dir).to_string()
+    }
+
+    #[tool(
+        description = "Intervene in the active controller loop: mode='stop' requests graceful stop; mode='abort' requests immediate kill."
+    )]
+    async fn intervene_controller_loop(
+        &self,
+        Parameters(params): Parameters<InterveneControllerLoopParams>,
+    ) -> String {
+        let loop_dir = controller_loop_dir();
+        match request_loop_intervention_marker(&loop_dir, &params.mode) {
+            Ok(mode) => serde_json::json!({
+                "ok": true,
+                "mode": mode,
+                "status": collect_controller_loop_status(&loop_dir),
+            })
+            .to_string(),
+            Err(e) => serde_json::json!({
+                "ok": false,
+                "error": e,
+            })
+            .to_string(),
+        }
+    }
+
+    #[tool(
+        description = "Get normalized controller-loop health: latest run pointers, halt/intervention flags, lock owner, and active wrapper/codex PID counts."
+    )]
+    async fn get_controller_loop_status(&self) -> String {
+        collect_controller_loop_status(&controller_loop_dir()).to_string()
+    }
+
+    #[tool(
         description = "Rebuild the intendant binary from source and hot-reload the MCP server. The server process is replaced in-place via exec() — the MCP connection survives seamlessly. Use this after making code changes so the running server picks them up without restarting Claude Code."
     )]
     async fn reload(&self) -> String {
@@ -2149,6 +2531,7 @@ const RESOURCE_LOGS_URI: &str = "intendant://logs";
 const RESOURCE_APPROVAL_URI: &str = "intendant://pending-approval";
 const RESOURCE_INPUT_URI: &str = "intendant://pending-input";
 const RESOURCE_RESTART_URI: &str = "intendant://controller-restart";
+const RESOURCE_LOOP_URI: &str = "intendant://controller-loop";
 
 fn make_resource(uri: &str, name: &str, description: &str) -> Resource {
     Resource {
@@ -2193,6 +2576,11 @@ fn resource_definitions() -> Vec<Resource> {
             "controller-restart",
             "Controller restart schedule / execution state",
         ),
+        make_resource(
+            RESOURCE_LOOP_URI,
+            "controller-loop",
+            "Controller loop health and intervention state",
+        ),
     ]
 }
 
@@ -2209,7 +2597,9 @@ impl ServerHandler for IntendantServer {
                  and observations as the TUI. Use tools to control the agent (approve, \
                  deny, respond, set_autonomy, quit), manage controller restarts \
                  (schedule_controller_restart, controller_turn_complete, \
-                 get_restart_status, cancel_controller_restart), and observe state \
+                 get_restart_status, cancel_controller_restart), manage loop \
+                 intervention (request_controller_loop_halt, clear_controller_loop_halt, \
+                 intervene_controller_loop, get_controller_loop_status), and observe state \
                  (get_status, get_logs, get_pending_approval, get_pending_input). \
                  Resources provide push-based state updates via subscriptions."
                     .into(),
@@ -2252,6 +2642,14 @@ impl ServerHandler for IntendantServer {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
+        if request.uri == RESOURCE_LOOP_URI {
+            let value = collect_controller_loop_status(&controller_loop_dir());
+            let json = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".to_string());
+            return Ok(ReadResourceResult {
+                contents: vec![ResourceContents::text(json, request.uri)],
+            });
+        }
+
         let s = self.state.read().await;
         let json = match request.uri.as_str() {
             RESOURCE_STATUS_URI => {
@@ -2883,9 +3281,94 @@ mod tests {
     }
 
     #[test]
-    fn resource_definitions_has_five_entries() {
+    fn controller_loop_halt_markers_roundtrip() {
+        let dir = tempdir().unwrap();
+        let loop_dir = dir.path().join(".intendant/controller-loop");
+
+        request_loop_halt_marker(&loop_dir, true).expect("persistent halt should succeed");
+        assert!(loop_dir.join("request_halt").exists());
+
+        request_loop_halt_marker(&loop_dir, false).expect("one-shot halt should succeed");
+        assert!(loop_dir.join("request_halt_after_cycle").exists());
+
+        clear_loop_halt_markers(&loop_dir).expect("clear halt should succeed");
+        assert!(!loop_dir.join("request_halt").exists());
+        assert!(!loop_dir.join("request_halt_after_cycle").exists());
+    }
+
+    #[test]
+    fn controller_loop_status_reports_live_pid_counts() {
+        let dir = tempdir().unwrap();
+        let loop_dir = dir.path().join(".intendant/controller-loop");
+        let run_dir = loop_dir.join("20260101T000000Z-1234");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("wrapper.pid"), std::process::id().to_string()).unwrap();
+        std::fs::write(run_dir.join("codex.pid"), std::process::id().to_string()).unwrap();
+        std::fs::write(loop_dir.join("latest.run_id"), "20260101T000000Z-1234").unwrap();
+        std::fs::write(
+            loop_dir.join("latest.status.json"),
+            r#"{"run_id":"20260101T000000Z-1234","state":"running"}"#,
+        )
+        .unwrap();
+
+        let status = collect_controller_loop_status(&loop_dir);
+        assert_eq!(
+            status
+                .get("active")
+                .and_then(|v| v.get("wrapper_count"))
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            status
+                .get("active")
+                .and_then(|v| v.get("codex_count"))
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            status
+                .get("latest")
+                .and_then(|v| v.get("run_id"))
+                .and_then(|v| v.as_str()),
+            Some("20260101T000000Z-1234")
+        );
+    }
+
+    #[test]
+    fn controller_loop_intervention_mode_validation() {
+        let dir = tempdir().unwrap();
+        let loop_dir = dir.path().join(".intendant/controller-loop");
+        let mode = request_loop_intervention_marker(&loop_dir, "stop").unwrap();
+        assert_eq!(mode, "stop");
+        assert!(loop_dir.join("request_stop").exists());
+
+        let err = request_loop_intervention_marker(&loop_dir, "bad").unwrap_err();
+        assert!(err.contains("expected 'stop' or 'abort'"));
+    }
+
+    #[test]
+    fn intervention_order_report_detects_out_of_order_events() {
+        let dir = tempdir().unwrap();
+        let run_dir = dir.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("intervention.log"),
+            "2026-01-01T00:00:00Z run_started run_id=x\n\
+             2026-01-01T00:00:01Z cleanup_begin state=exited\n\
+             2026-01-01T00:00:02Z codex_started codex_pid=1\n\
+             2026-01-01T00:00:03Z cleanup_end state=exited\n",
+        )
+        .unwrap();
+        let report = intervention_order_report(&run_dir);
+        assert_eq!(report["has_log"].as_bool(), Some(true));
+        assert_eq!(report["order_ok"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn resource_definitions_has_six_entries() {
         let defs = resource_definitions();
-        assert_eq!(defs.len(), 5);
+        assert_eq!(defs.len(), 6);
     }
 
     #[test]
