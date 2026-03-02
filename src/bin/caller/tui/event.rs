@@ -80,6 +80,11 @@ pub enum AppEvent {
         responder: tokio::sync::oneshot::Sender<ApprovalResponse>,
     },
 
+    // Session directory changed (MCP per-task isolation)
+    SessionDirChanged {
+        path: std::path::PathBuf,
+    },
+
     // Control socket
     ControlCommand(ControlMsg),
 
@@ -167,9 +172,16 @@ pub fn spawn_tick_timer(bus: EventBus, interval_ms: u64) -> tokio::task::JoinHan
 
 /// Spawns a file monitor for askHuman question files.
 /// The `question_path` is the session-scoped path to the human_question file.
+/// Shared path that can be updated when MCP tasks change session directories.
+pub type SharedQuestionPath = std::sync::Arc<tokio::sync::RwLock<std::path::PathBuf>>;
+
+pub fn shared_question_path(path: std::path::PathBuf) -> SharedQuestionPath {
+    std::sync::Arc::new(tokio::sync::RwLock::new(path))
+}
+
 pub fn spawn_human_question_monitor(
     bus: EventBus,
-    question_path: std::path::PathBuf,
+    question_path: SharedQuestionPath,
 ) -> tokio::task::JoinHandle<()> {
     use tokio::time::{interval, Duration};
 
@@ -180,9 +192,10 @@ pub fn spawn_human_question_monitor(
         loop {
             interval.tick().await;
 
-            if question_path.exists() {
+            let path = question_path.read().await.clone();
+            if path.exists() {
                 if !last_seen {
-                    if let Ok(question) = tokio::fs::read_to_string(&question_path).await {
+                    if let Ok(question) = tokio::fs::read_to_string(&path).await {
                         let question = question.trim().to_string();
                         if !question.is_empty() {
                             bus.send(AppEvent::HumanQuestionDetected { question });

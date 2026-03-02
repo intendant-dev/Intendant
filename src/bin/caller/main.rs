@@ -2602,9 +2602,12 @@ async fn main() -> Result<(), CallerError> {
         // MCP mode — speaks Model Context Protocol on stdio.
         // This is architecturally a peer of the TUI: same EventBus, same UserAction contract.
         let (bus, event_rx) = EventBus::new();
+        let human_question_path = tui::event::shared_question_path(
+            log_dir.join("human_question"),
+        );
         let _human_monitor = tui::event::spawn_human_question_monitor(
             bus.clone(),
-            log_dir.join("human_question"),
+            human_question_path.clone(),
         );
         let _tick_handle = tui::event::spawn_tick_timer(bus.clone(), 1000);
 
@@ -2621,13 +2624,12 @@ async fn main() -> Result<(), CallerError> {
         // This captures the provider factory parameters (not the provider itself,
         // since providers are not Clone) so each start_task creates a fresh provider.
         let project_root = project.root.clone();
-        let approval_config = project.config.approval.clone();
-        let cli_autonomy = flags.autonomy;
+        let autonomy_for_launcher = autonomy.clone();
         let session_log_for_launcher = session_log.clone();
         let log_dir_for_launcher = log_dir.clone();
         let launcher: mcp::TaskLauncher = Box::new(move |task_str: String, bus: EventBus| {
             let project_root = project_root.clone();
-            let approval_config = approval_config.clone();
+            let autonomy = autonomy_for_launcher.clone();
             let session_log = session_log_for_launcher.clone();
             let _parent_log_dir = log_dir_for_launcher.clone();
             Box::pin(async move {
@@ -2642,6 +2644,11 @@ async fn main() -> Result<(), CallerError> {
                         if let Ok(mut guard) = session_log.lock() {
                             *guard = l;
                         }
+                        // Notify MCP state of the new session dir so askHuman
+                        // response files are written to the correct location.
+                        bus.send(AppEvent::SessionDirChanged {
+                            path: task_log_dir.clone(),
+                        });
                     }
                     Err(e) => {
                         bus.send(AppEvent::LoopError(format!(
@@ -2674,10 +2681,6 @@ async fn main() -> Result<(), CallerError> {
                         return tokio::spawn(async {});
                     }
                 };
-                let autonomy = autonomy::shared_autonomy(AutonomyState::new(
-                    cli_autonomy,
-                    approval_config.clone(),
-                ));
                 let bus_clone = bus.clone();
                 let task_for_summary = task_str.clone();
                 let session_log_summary = session_log.clone();
@@ -2701,9 +2704,8 @@ async fn main() -> Result<(), CallerError> {
                             slog(&session_log_summary, |l| {
                                 l.write_summary(&task_for_summary, "completed", stats.turns)
                             });
-                            bus_clone.send(AppEvent::TaskComplete {
-                                reason: "Task complete".to_string(),
-                            });
+                            // Note: TaskComplete is already emitted by run_agent_loop
+                            // when it breaks (done signal, no JSON, etc.)
                         }
                         Err(e) => {
                             slog(&session_log_summary, |l| {
@@ -2748,7 +2750,7 @@ async fn main() -> Result<(), CallerError> {
                 l.info("MCP server reloaded via exec (injecting synthetic init)");
             });
         }
-        if let Err(e) = mcp::run_mcp_server(mcp_state, bus, event_rx, reloaded).await {
+        if let Err(e) = mcp::run_mcp_server(mcp_state, bus, event_rx, reloaded, Some(human_question_path)).await {
             slog(&session_log, |l| {
                 l.info(&format!("MCP server ended: {}", e))
             });
@@ -2765,7 +2767,7 @@ async fn main() -> Result<(), CallerError> {
         let _tick_handle = tui::event::spawn_tick_timer(bus.clone(), 100);
         let _human_monitor = tui::event::spawn_human_question_monitor(
             bus.clone(),
-            log_dir.join("human_question"),
+            tui::event::shared_question_path(log_dir.join("human_question")),
         );
 
         // Create TUI
