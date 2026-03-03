@@ -1914,6 +1914,18 @@ async fn run_agent_loop(
                     );
                     return Ok(loop_stats);
                 }
+            } else {
+                // Commands auto-approved — log for visibility at Normal verbosity
+                let preview = format_command_preview(&json_str);
+                if !preview.is_empty() {
+                    emit(
+                        &bus,
+                        || AppEvent::AutoApproved {
+                            preview: preview.clone(),
+                        },
+                        || {},
+                    );
+                }
             }
 
             if should_skip {
@@ -2204,6 +2216,18 @@ Proceed with explicit assumptions and continue without additional questions."
                     );
                     return Ok(loop_stats);
                 }
+            } else {
+                // Commands auto-approved — log for visibility at Normal verbosity
+                let preview = format_command_preview(&json_str);
+                if !preview.is_empty() {
+                    emit(
+                        &bus,
+                        || AppEvent::AutoApproved {
+                            preview: preview.clone(),
+                        },
+                        || {},
+                    );
+                }
             }
 
             if should_skip {
@@ -2352,6 +2376,7 @@ async fn run_sub_agent_mode(
     }
 
     slog(&session_log, |l| {
+        l.write_meta_with_role(Some(&project.root), None, Some(role.as_str()));
         l.info(&format!("Sub-agent mode: {} (role: {})", id, role.as_str()));
         l.info(&format!(
             "Provider: {} (context window: {})",
@@ -2917,6 +2942,8 @@ async fn main() -> Result<(), CallerError> {
                 if let Ok(mut log) = signal_session_log.lock() {
                     log.mark_interrupted();
                 }
+                // Clean up control socket
+                control::cleanup();
                 // Restore terminal (best-effort) so the shell isn't left in raw mode
                 let _ = crossterm::terminal::disable_raw_mode();
                 let _ = crossterm::execute!(

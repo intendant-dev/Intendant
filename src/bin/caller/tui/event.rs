@@ -92,6 +92,11 @@ pub enum AppEvent {
     // Control socket
     ControlCommand(ControlMsg),
 
+    // Auto-approved command visibility
+    AutoApproved {
+        preview: String,
+    },
+
     // TUI internal
     Tick,
     #[allow(dead_code)]
@@ -118,10 +123,19 @@ pub enum ControlMsg {
     Deny {
         id: u64,
     },
+    Skip {
+        id: u64,
+    },
+    ApproveAll {
+        id: u64,
+    },
     Input {
         text: String,
     },
     SetAutonomy {
+        level: String,
+    },
+    SetVerbosity {
         level: String,
     },
     ScheduleControllerRestart {
@@ -438,8 +452,13 @@ mod tests {
             ControlMsg::Input {
                 text: "hello".to_string(),
             },
+            ControlMsg::Skip { id: 3 },
+            ControlMsg::ApproveAll { id: 4 },
             ControlMsg::SetAutonomy {
                 level: "low".to_string(),
+            },
+            ControlMsg::SetVerbosity {
+                level: "verbose".to_string(),
             },
             ControlMsg::ScheduleControllerRestart {
                 controller_id: "codex".to_string(),
@@ -472,6 +491,36 @@ mod tests {
         for msg in msgs {
             let json = serde_json::to_string(&msg).unwrap();
             let _: ControlMsg = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    #[test]
+    fn control_msg_skip_deserialize() {
+        let json = r#"{"action":"skip","id":5}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::Skip { id } => assert_eq!(id, 5),
+            _ => panic!("expected Skip"),
+        }
+    }
+
+    #[test]
+    fn control_msg_approve_all_deserialize() {
+        let json = r#"{"action":"approve_all","id":10}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ApproveAll { id } => assert_eq!(id, 10),
+            _ => panic!("expected ApproveAll"),
+        }
+    }
+
+    #[test]
+    fn control_msg_set_verbosity_deserialize() {
+        let json = r#"{"action":"set_verbosity","level":"verbose"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::SetVerbosity { level } => assert_eq!(level, "verbose"),
+            _ => panic!("expected SetVerbosity"),
         }
     }
 

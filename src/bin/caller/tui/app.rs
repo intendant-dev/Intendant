@@ -615,6 +615,35 @@ impl App {
                     }
                 }
             }
+            ControlMsg::Skip { id } => {
+                if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
+                    let pending = self.pending_approvals.remove(pos).unwrap();
+                    self.log(
+                        LogLevel::Info,
+                        format!("Skipped via control socket (turn {})", id),
+                    );
+                    let _ = pending.responder.send(ApprovalResponse::Skip);
+                    if self.pending_approvals.is_empty() {
+                        self.mode = AppMode::Normal;
+                        self.current_phase = Phase::RunningAgent;
+                    }
+                }
+            }
+            ControlMsg::ApproveAll { id } => {
+                if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
+                    let pending = self.pending_approvals.remove(pos).unwrap();
+                    self.log(
+                        LogLevel::Info,
+                        format!("Approve-all via control socket (turn {})", id),
+                    );
+                    let _ = pending.responder.send(ApprovalResponse::ApproveAll);
+                    self.set_autonomy_level("full");
+                    if self.pending_approvals.is_empty() {
+                        self.mode = AppMode::Normal;
+                        self.current_phase = Phase::RunningAgent;
+                    }
+                }
+            }
             ControlMsg::Input { text } => {
                 if self.mode == AppMode::AskHuman {
                     let _ = std::fs::write(self.log_dir.join("human_response"), text.as_bytes());
@@ -626,6 +655,27 @@ impl App {
             }
             ControlMsg::SetAutonomy { level } => {
                 self.set_autonomy_level(&level);
+            }
+            ControlMsg::SetVerbosity { level } => {
+                let new_verbosity = match level.to_lowercase().as_str() {
+                    "quiet" => Verbosity::Quiet,
+                    "normal" => Verbosity::Normal,
+                    "verbose" => Verbosity::Verbose,
+                    "debug" => Verbosity::Debug,
+                    _ => {
+                        self.log(
+                            LogLevel::Warn,
+                            format!("Unknown verbosity level: {}", level),
+                        );
+                        return;
+                    }
+                };
+                self.verbosity = new_verbosity;
+                self.clamp_view_to_filtered();
+                self.log(
+                    LogLevel::Info,
+                    format!("Verbosity set to {} via control socket", new_verbosity.label()),
+                );
             }
             ControlMsg::ScheduleControllerRestart { .. }
             | ControlMsg::ControllerTurnComplete { .. }
@@ -821,6 +871,9 @@ impl App {
             }
             AppEvent::ControlCommand(msg) => {
                 self.handle_control_command(msg);
+            }
+            AppEvent::AutoApproved { preview } => {
+                self.log(LogLevel::Info, format!("auto-approved: {}", preview));
             }
             AppEvent::SessionDirChanged { .. } => {
                 // Only relevant for MCP mode; TUI ignores this.

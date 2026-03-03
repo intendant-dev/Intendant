@@ -13,8 +13,8 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     let autonomy_str = app.autonomy_display.clone();
     let autonomy_color = theme::autonomy_color(&autonomy_str);
 
-    let budget_pct_display = if app.budget_pct > 0.0 {
-        format!(" {:.0}%", app.budget_pct)
+    let budget_pct_display = if app.session_tokens > 0 {
+        format!(" {:.1}%", app.budget_pct)
     } else {
         String::new()
     };
