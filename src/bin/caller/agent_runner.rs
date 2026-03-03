@@ -103,8 +103,9 @@ async fn run_agent_inner(
         // stdin dropped here, closing the pipe
     }
 
-    // Hard timeout: 120s default, 600s for askHuman
-    let hard_timeout_secs: u64 = if has_ask_human(json_input) { 600 } else { 120 };
+    // Hard timeout: 120s default, no timeout for askHuman (polls indefinitely)
+    let has_human = has_ask_human(json_input);
+    let hard_timeout_secs: u64 = if has_human { u64::MAX / 2 } else { 120 };
     let hard_timeout = Duration::from_secs(hard_timeout_secs);
 
     // Read stdout and stderr (bounded), then wait for exit, all under a single hard timeout
