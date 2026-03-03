@@ -324,11 +324,16 @@ pub fn render_approval_panel(f: &mut Frame, area: Rect, command: &str, category:
         ])
         .split(inner);
 
-    // Command preview (with word wrap)
-    let cmd_lines = vec![Line::from(vec![Span::styled(
-        format!(" {}", command),
-        Style::default().fg(theme::APPROVAL_CMD_FG),
-    )])];
+    // Command preview — one Line per sub-command for multi-line commands
+    let cmd_lines: Vec<Line> = command
+        .split('\n')
+        .map(|line| {
+            Line::from(vec![Span::styled(
+                format!(" {}", line),
+                Style::default().fg(theme::APPROVAL_CMD_FG),
+            )])
+        })
+        .collect();
     let cmd_widget = Paragraph::new(cmd_lines)
         .wrap(Wrap { trim: false })
         .style(Style::default().bg(theme::APPROVAL_BG));

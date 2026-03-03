@@ -69,15 +69,19 @@ impl SessionLog {
         fs::create_dir_all(&dir)?;
         fs::create_dir_all(dir.join("turns"))?;
 
-        // Try to read existing session_id from meta, or generate a new one
+        // Try to read existing session_id from meta, or derive from directory name
         let session_id = if let Ok(meta_str) = fs::read_to_string(dir.join("session_meta.json")) {
             if let Ok(meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
                 meta.session_id
             } else {
-                Uuid::new_v4().to_string()
+                dir.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| Uuid::new_v4().to_string())
             }
         } else {
-            Uuid::new_v4().to_string()
+            dir.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| Uuid::new_v4().to_string())
         };
 
         let file = OpenOptions::new()
@@ -597,6 +601,27 @@ impl SessionLog {
     }
 }
 
+impl Drop for SessionLog {
+    fn drop(&mut self) {
+        // Flush any buffered log data
+        let _ = self.writer.flush();
+
+        // If the session is still "running", mark it as "interrupted"
+        let meta_path = self.dir.join("session_meta.json");
+        if let Ok(meta_str) = fs::read_to_string(&meta_path) {
+            if let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
+                if meta.status.as_deref() == Some("running") {
+                    meta.status = Some("interrupted".to_string());
+                    meta.last_turn = Some(self.current_turn);
+                    if let Ok(json) = serde_json::to_string_pretty(&meta) {
+                        let _ = fs::write(&meta_path, &json);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,13 +636,20 @@ mod tests {
     }
 
     #[test]
-    fn open_generates_session_id() {
+    fn open_uses_directory_name_as_session_id() {
         let dir = tempfile::tempdir().unwrap();
-        let log_dir = dir.path().join("session");
+        let log_dir = dir.path().join("my-custom-session");
         let log = SessionLog::open(log_dir).unwrap();
-        assert!(!log.session_id().is_empty());
-        // UUID v4 format: 8-4-4-4-12 hex chars
-        assert_eq!(log.session_id().len(), 36);
+        assert_eq!(log.session_id(), "my-custom-session");
+    }
+
+    #[test]
+    fn open_with_uuid_dir_uses_uuid_as_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = Uuid::new_v4().to_string();
+        let log_dir = dir.path().join(&uuid);
+        let log = SessionLog::open(log_dir).unwrap();
+        assert_eq!(log.session_id(), uuid);
     }
 
     #[test]
@@ -975,5 +1007,37 @@ mod tests {
 
         // No reasoning file created when no full content
         assert!(!log_dir.join("turns/turn_001_reasoning.txt").exists());
+    }
+
+    #[test]
+    fn drop_updates_running_to_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp")), Some("task"));
+        log.turn_start(3, 10.0, 180_000);
+        drop(log);
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.status.as_deref(), Some("interrupted"));
+        assert_eq!(meta.last_turn, Some(3));
+    }
+
+    #[test]
+    fn drop_does_not_overwrite_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp")), Some("task"));
+        log.write_summary("task", "completed", 5);
+        drop(log);
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.status.as_deref(), Some("completed"));
+        assert_eq!(meta.last_turn, Some(5));
     }
 }

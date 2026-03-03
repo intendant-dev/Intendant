@@ -3185,9 +3185,7 @@ async fn main() -> Result<(), CallerError> {
                     slog(&session_log_summary, |l| {
                         l.write_summary(&task_for_summary, "completed", stats.turns)
                     });
-                    bus_clone.send(AppEvent::TaskComplete {
-                        reason: "Task complete".to_string(),
-                    });
+                    // Note: TaskComplete is already emitted by run_agent_loop
                 }
                 Err(e) => {
                     slog(&session_log_summary, |l| {

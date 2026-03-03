@@ -248,7 +248,16 @@ impl App {
     /// Get the height available for the bottom panel (0 if none active).
     pub fn bottom_panel_height(&self) -> u16 {
         match self.mode {
-            AppMode::Approval => 6,
+            AppMode::Approval => {
+                // Dynamic height: command lines + 3 (border top/bottom + hint line)
+                let cmd_lines = self
+                    .pending_approvals
+                    .front()
+                    .map(|p| p.command_preview.split('\n').count())
+                    .unwrap_or(3);
+                let height = (cmd_lines + 3) as u16;
+                height.clamp(6, 20)
+            }
             AppMode::AskHuman => 5,
             _ => 0,
         }
@@ -1208,6 +1217,37 @@ mod tests {
         let mut app = test_app();
         app.mode = AppMode::AskHuman;
         assert_eq!(app.bottom_panel_height(), 5);
+    }
+
+    #[test]
+    fn bottom_panel_height_approval_multiline() {
+        let mut app = test_app();
+        app.mode = AppMode::Approval;
+        let (tx, _rx) = oneshot::channel();
+        app.pending_approvals.push_back(PendingApproval {
+            id: 1,
+            command_preview: "echo a\necho b\necho c\necho d\necho e".to_string(),
+            category: "command_exec".to_string(),
+            responder: tx,
+        });
+        // 5 lines + 3 = 8
+        assert_eq!(app.bottom_panel_height(), 8);
+    }
+
+    #[test]
+    fn bottom_panel_height_approval_clamped() {
+        let mut app = test_app();
+        app.mode = AppMode::Approval;
+        let (tx, _rx) = oneshot::channel();
+        let long_cmd = (0..30).map(|i| format!("echo {}", i)).collect::<Vec<_>>().join("\n");
+        app.pending_approvals.push_back(PendingApproval {
+            id: 1,
+            command_preview: long_cmd,
+            category: "command_exec".to_string(),
+            responder: tx,
+        });
+        // 30 lines + 3 = 33, but clamped to 20
+        assert_eq!(app.bottom_panel_height(), 20);
     }
 
     #[test]

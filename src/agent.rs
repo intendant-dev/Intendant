@@ -30,7 +30,6 @@ struct PtySession {
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
-const HUMAN_TIMEOUT_MS: u64 = 5 * 60 * 1000; // 5 minutes
 const HUMAN_POLL_MS: u64 = 500;
 const LOG_TAIL_BYTES: u64 = 10 * 1024; // 10KB
 
@@ -629,7 +628,6 @@ impl Agent {
         cmd: &AgentCommand,
         question_path: &Path,
         response_path: &Path,
-        timeout_ms: u64,
         poll_ms: u64,
     ) -> Result<String, AgentError> {
         let question = cmd
@@ -642,9 +640,7 @@ impl Agent {
         // Also write to stderr so caller/user sees it
         eprintln!("[askHuman] {}", question);
 
-        // Poll for response
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_millis(timeout_ms);
+        // Poll indefinitely for response — the human may be away
         let poll_interval = Duration::from_millis(poll_ms);
 
         loop {
@@ -661,28 +657,15 @@ impl Agent {
                 .to_string());
             }
 
-            if start.elapsed() >= timeout {
-                // Cleanup
-                let _ = fs::remove_file(question_path);
-                let _ = fs::remove_file(response_path);
-                return Ok(serde_json::json!({
-                    "success": false,
-                    "error": "Timed out waiting for human response"
-                })
-                .to_string());
-            }
-
             tokio::time::sleep(poll_interval).await;
         }
     }
 
     async fn ask_human(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
-        let timeout_ms = cmd.timeout_ms.unwrap_or(HUMAN_TIMEOUT_MS);
         self.ask_human_with_paths(
             cmd,
             &self.log_dir.join("human_question"),
             &self.log_dir.join("human_response"),
-            timeout_ms,
             HUMAN_POLL_MS,
         )
         .await
@@ -1987,7 +1970,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let q = tmp.path().join("q");
         let r = tmp.path().join("r");
-        let result = agent.ask_human_with_paths(&cmd, &q, &r, 1000, 100).await;
+        let result = agent.ask_human_with_paths(&cmd, &q, &r, 100).await;
         assert!(result.is_err());
     }
 
@@ -2005,32 +1988,12 @@ mod tests {
             ..Default::default()
         };
         let result = agent
-            .ask_human_with_paths(&cmd, &q, &r, 1000, 100)
+            .ask_human_with_paths(&cmd, &q, &r, 100)
             .await
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], true);
         assert_eq!(parsed["response"], "yes");
-    }
-
-    #[tokio::test]
-    async fn ask_human_timeout() {
-        let (agent, _log) = create_test_agent();
-        let tmp = TempDir::new().unwrap();
-        let q = tmp.path().join("q");
-        let r = tmp.path().join("r");
-        let cmd = AgentCommand {
-            function: "askHuman".to_string(),
-            nonce: 1,
-            question: Some("hello?".to_string()),
-            ..Default::default()
-        };
-        let result = agent
-            .ask_human_with_paths(&cmd, &q, &r, 200, 50)
-            .await
-            .unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["success"], false);
     }
 
     // --- execPty tests ---

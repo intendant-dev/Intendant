@@ -187,6 +187,15 @@ impl AutonomyState {
             return false;
         }
 
+        // Low autonomy asks for everything except FileRead (unless Deny overrides)
+        if self.level == AutonomyLevel::Low {
+            let rule = self.rules.rule_for(category);
+            if rule == ApprovalRule::Deny {
+                return true;
+            }
+            return category != ActionCategory::FileRead;
+        }
+
         // Check category-level rule (overrides global level)
         let rule = self.rules.rule_for(category);
         match rule {
@@ -195,7 +204,6 @@ impl AutonomyState {
             ApprovalRule::Ask => {
                 // Apply global autonomy level
                 match self.level {
-                    AutonomyLevel::Low => true, // ask for everything
                     AutonomyLevel::Medium => {
                         // Ask for writes, deletes, destructive, network
                         matches!(
@@ -207,7 +215,7 @@ impl AutonomyState {
                         )
                     }
                     AutonomyLevel::High => false,
-                    AutonomyLevel::Full => false, // unreachable, handled above
+                    _ => false, // Low and Full handled above
                 }
             }
         }
@@ -239,9 +247,45 @@ pub fn classify_command(cmd: &serde_json::Value) -> Vec<ActionCategory> {
     }
 }
 
-/// Classify a shell command string into action categories.
-fn classify_shell_command(cmd: &str) -> Vec<ActionCategory> {
-    let mut categories = vec![ActionCategory::CommandExec];
+/// Split a compound shell command into individual sub-commands.
+fn split_shell_commands(cmd: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    for line in cmd.split('\n') {
+        // Split on &&, ||, and ; while preserving non-empty segments
+        let mut remaining = line;
+        while !remaining.is_empty() {
+            if let Some(pos) = remaining.find("&&") {
+                let part = remaining[..pos].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                remaining = remaining[pos + 2..].trim_start();
+            } else if let Some(pos) = remaining.find("||") {
+                let part = remaining[..pos].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                remaining = remaining[pos + 2..].trim_start();
+            } else if let Some(pos) = remaining.find(';') {
+                let part = remaining[..pos].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                remaining = remaining[pos + 1..].trim_start();
+            } else {
+                let part = remaining.trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                break;
+            }
+        }
+    }
+    parts
+}
+
+/// Classify a single shell sub-command into action categories.
+fn classify_single_command(cmd: &str, categories: &mut Vec<ActionCategory>) {
     let lower = cmd.to_lowercase();
     let tokens: Vec<&str> = lower.split_whitespace().collect();
 
@@ -294,7 +338,16 @@ fn classify_shell_command(cmd: &str) -> Vec<ActionCategory> {
     {
         categories.push(ActionCategory::FileWrite);
     }
+}
 
+/// Classify a shell command string into action categories.
+/// Splits compound commands (&&, ||, ;, newlines) and classifies each part.
+fn classify_shell_command(cmd: &str) -> Vec<ActionCategory> {
+    let mut categories = vec![ActionCategory::CommandExec];
+    for sub_cmd in split_shell_commands(cmd) {
+        classify_single_command(sub_cmd, &mut categories);
+    }
+    categories.dedup();
     categories
 }
 
@@ -412,14 +465,16 @@ destructive = "deny"
     }
 
     #[test]
-    fn low_autonomy_asks_for_ask_rules() {
+    fn low_autonomy_asks_for_everything_except_file_read() {
         let state = AutonomyState::new(AutonomyLevel::Low, ApprovalConfig::default());
-        // file_read and command_exec are Auto in default config, so not asked
+        // FileRead is never gated even at Low
         assert!(!state.needs_approval(ActionCategory::FileRead));
-        assert!(!state.needs_approval(ActionCategory::CommandExec));
-        // file_write is Ask, and Low asks for everything with Ask rule
+        // Everything else needs approval at Low, regardless of Auto rules
+        assert!(state.needs_approval(ActionCategory::CommandExec));
         assert!(state.needs_approval(ActionCategory::FileWrite));
         assert!(state.needs_approval(ActionCategory::Destructive));
+        assert!(state.needs_approval(ActionCategory::NetworkRequest));
+        assert!(state.needs_approval(ActionCategory::FileDelete));
     }
 
     #[test]
@@ -444,12 +499,12 @@ destructive = "deny"
     }
 
     #[test]
-    fn category_rule_auto_overrides_low_autonomy() {
+    fn low_autonomy_overrides_auto_rules() {
         let mut rules = ApprovalConfig::default();
         rules.file_write = ApprovalRule::Auto;
         let state = AutonomyState::new(AutonomyLevel::Low, rules);
-        // file_write is Auto, so even Low autonomy won't ask
-        assert!(!state.needs_approval(ActionCategory::FileWrite));
+        // Low overrides Auto — still asks for file_write
+        assert!(state.needs_approval(ActionCategory::FileWrite));
     }
 
     #[test]
@@ -566,6 +621,62 @@ destructive = "deny"
     fn classify_batch_no_commands() {
         let result = classify_batch(r#"{"commands":[]}"#);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn classify_multiline_rm() {
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "execAsAgent",
+            "nonce": 1,
+            "command": "echo hello\nrm -rf /tmp/test"
+        });
+        let cats = classify_command(&cmd);
+        assert!(cats.contains(&ActionCategory::CommandExec));
+        assert!(cats.contains(&ActionCategory::Destructive));
+    }
+
+    #[test]
+    fn classify_chained_commands() {
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "execAsAgent",
+            "nonce": 1,
+            "command": "echo hello && rm -rf /tmp/test"
+        });
+        let cats = classify_command(&cmd);
+        assert!(cats.contains(&ActionCategory::Destructive));
+    }
+
+    #[test]
+    fn classify_semicolon_separated() {
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "execAsAgent",
+            "nonce": 1,
+            "command": "echo hello; curl https://example.com"
+        });
+        let cats = classify_command(&cmd);
+        assert!(cats.contains(&ActionCategory::NetworkRequest));
+    }
+
+    #[test]
+    fn classify_or_chain() {
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "execAsAgent",
+            "nonce": 1,
+            "command": "ls /nonexist || rm -rf /tmp/bad"
+        });
+        let cats = classify_command(&cmd);
+        assert!(cats.contains(&ActionCategory::Destructive));
+    }
+
+    #[test]
+    fn classify_bare_rm() {
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "execAsAgent",
+            "nonce": 1,
+            "command": "rm file.txt"
+        });
+        let cats = classify_command(&cmd);
+        assert!(cats.contains(&ActionCategory::Destructive));
     }
 
     #[test]
