@@ -938,6 +938,30 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_INPUT_URI)
         }
+        ControlMsg::Skip { id } => {
+            let mut s = state.write().await;
+            let outcome = process_action_sync(&mut s, UserAction::Skip { id });
+            emit_control_result(
+                control_tx,
+                "skip",
+                matches!(outcome, ActionOutcome::Ok),
+                format_outcome(outcome),
+                None,
+            );
+            Some(RESOURCE_APPROVAL_URI)
+        }
+        ControlMsg::ApproveAll { id } => {
+            let mut s = state.write().await;
+            let outcome = process_action_sync(&mut s, UserAction::ApproveAll { id });
+            emit_control_result(
+                control_tx,
+                "approve_all",
+                matches!(outcome, ActionOutcome::Ok),
+                format_outcome(outcome),
+                None,
+            );
+            Some(RESOURCE_APPROVAL_URI)
+        }
         ControlMsg::SetAutonomy { level } => {
             let parsed = AutonomyLevel::from_str_loose(&level);
             {
@@ -954,6 +978,35 @@ async fn handle_control_command_mcp(
                 format!("Autonomy set to {}", parsed),
                 None,
             );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetVerbosity { level } => {
+            let parsed = match level.to_lowercase().as_str() {
+                "quiet" => Some(Verbosity::Quiet),
+                "normal" => Some(Verbosity::Normal),
+                "verbose" => Some(Verbosity::Verbose),
+                "debug" => Some(Verbosity::Debug),
+                _ => None,
+            };
+            if let Some(v) = parsed {
+                let mut s = state.write().await;
+                s.verbosity = v;
+                emit_control_result(
+                    control_tx,
+                    "set_verbosity",
+                    true,
+                    format!("Verbosity set to {}", v.label()),
+                    None,
+                );
+            } else {
+                emit_control_result(
+                    control_tx,
+                    "set_verbosity",
+                    false,
+                    format!("Unknown verbosity level: {}", level),
+                    None,
+                );
+            }
             Some(RESOURCE_STATUS_URI)
         }
         ControlMsg::ScheduleControllerRestart {
@@ -1660,6 +1713,14 @@ pub fn spawn_event_listener(
                                 *p = path.join("human_question");
                             }
                         }
+                    }
+
+                    AppEvent::AutoApproved { ref preview } => {
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("auto-approved: {}", preview),
+                        );
+                        resource_changed = Some("intendant://logs");
                     }
 
                     AppEvent::ControlCommand(msg) => deferred_control_msg = Some(msg),

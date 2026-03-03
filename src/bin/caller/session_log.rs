@@ -39,6 +39,8 @@ pub struct SessionMeta {
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_turn: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// Comprehensive structured session logger.
@@ -113,6 +115,16 @@ impl SessionLog {
     /// Write session metadata to `session_meta.json`.
     /// Call after open() to persist session identity and context.
     pub fn write_meta(&self, project_root: Option<&Path>, task: Option<&str>) {
+        self.write_meta_with_role(project_root, task, None);
+    }
+
+    /// Write session metadata with an optional role field.
+    pub fn write_meta_with_role(
+        &self,
+        project_root: Option<&Path>,
+        task: Option<&str>,
+        role: Option<&str>,
+    ) {
         let meta = SessionMeta {
             session_id: self.session_id.clone(),
             created_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -120,6 +132,7 @@ impl SessionLog {
             task: task.map(|t| t.to_string()),
             status: Some("running".to_string()),
             last_turn: None,
+            role: role.map(|r| r.to_string()),
         };
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             if let Err(e) = fs::write(self.dir.join("session_meta.json"), json) {
@@ -167,6 +180,15 @@ impl SessionLog {
                 }
                 if let Ok(meta_str) = fs::read_to_string(&meta_path) {
                     if let Ok(meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
+                        // Skip sub-agent sessions (they shouldn't be resumed as top-level)
+                        if let Some(ref role) = meta.role {
+                            match role.as_str() {
+                                "orchestrator" | "research" | "implementation" | "testing" => {
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
                         if meta.project_root.as_deref() == Some(&project_root_str) {
                             let dominated = match &best {
                                 Some((_, _, best_created)) => meta.created_at > *best_created,
@@ -684,6 +706,7 @@ mod tests {
             task: None,
             status: None,
             last_turn: None,
+            role: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),
@@ -902,6 +925,7 @@ mod tests {
             task: Some("task 1".to_string()),
             status: Some("completed".to_string()),
             last_turn: Some(5),
+            role: None,
         };
         fs::write(
             s1_dir.join("session_meta.json"),
@@ -918,6 +942,7 @@ mod tests {
             task: Some("task 2".to_string()),
             status: Some("completed".to_string()),
             last_turn: Some(3),
+            role: None,
         };
         fs::write(
             s2_dir.join("session_meta.json"),

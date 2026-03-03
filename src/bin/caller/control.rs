@@ -94,6 +94,10 @@ pub fn spawn_control_server(
                         let (reader, mut writer) = stream.into_split();
                         let mut reader = BufReader::new(reader);
 
+                        // Per-client channel for sending error responses from reader to writer
+                        let (error_tx, mut error_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<String>();
+
                         // Read inbound commands in one task
                         let bus_inbound = bus.clone();
                         let inbound = tokio::spawn(async move {
@@ -105,10 +109,20 @@ pub fn spawn_control_server(
                                     Ok(_) => {
                                         let trimmed = line.trim();
                                         if !trimmed.is_empty() {
-                                            if let Ok(msg) =
-                                                serde_json::from_str::<ControlMsg>(trimmed)
-                                            {
-                                                bus_inbound.send(AppEvent::ControlCommand(msg));
+                                            match serde_json::from_str::<ControlMsg>(trimmed) {
+                                                Ok(msg) => {
+                                                    bus_inbound
+                                                        .send(AppEvent::ControlCommand(msg));
+                                                }
+                                                Err(e) => {
+                                                    let err_json = serde_json::json!({
+                                                        "event": "error",
+                                                        "ok": false,
+                                                        "message": format!("Invalid message: {}", e),
+                                                    });
+                                                    let _ = error_tx
+                                                        .send(err_json.to_string());
+                                                }
                                             }
                                         }
                                     }
@@ -117,19 +131,30 @@ pub fn spawn_control_server(
                             }
                         });
 
-                        // Write outbound events in another task
+                        // Write outbound events and error responses in another task
                         let outbound = tokio::spawn(async move {
                             loop {
-                                match outbound_rx.recv().await {
-                                    Ok(line) => {
-                                        let mut data = line.into_bytes();
+                                tokio::select! {
+                                    result = outbound_rx.recv() => {
+                                        match result {
+                                            Ok(line) => {
+                                                let mut data = line.into_bytes();
+                                                data.push(b'\n');
+                                                if writer.write_all(&data).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            Err(broadcast::error::RecvError::Closed) => break,
+                                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                        }
+                                    }
+                                    Some(err_line) = error_rx.recv() => {
+                                        let mut data = err_line.into_bytes();
                                         data.push(b'\n');
                                         if writer.write_all(&data).await.is_err() {
                                             break;
                                         }
                                     }
-                                    Err(broadcast::error::RecvError::Closed) => break,
-                                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
                                 }
                             }
                         });
