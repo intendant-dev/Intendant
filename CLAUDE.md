@@ -47,7 +47,7 @@ src/
         ├── mcp.rs           # MCP server implementation (rmcp-based, stdio transport, hot-reload)
         ├── mcp_client.rs    # MCP client: connects to external MCP servers, discovers tools, proxies calls
         ├── sandbox.rs       # Landlock filesystem sandboxing (Linux): read/write path policies, process restriction
-        ├── vision.rs        # Xvfb display management, per-provider resolution, display accessibility probe
+        ├── vision.rs        # Xvfb display management, x11vnc co-process, per-provider resolution, display :99 preference with orphan reclaim
         ├── session_log.rs   # UUID-based session directories, structured event logging, conversation persistence
         ├── error.rs         # CallerError enum (includes Tui variant)
         └── tui/
@@ -133,7 +133,7 @@ Test coverage includes:
 - **caller/tools.rs**: Tool definitions, provider format conversion, tool count validation
 - **caller/tool_batch.rs** (tests in caller/main.rs): Batch assembly from tool calls (single exec, signal_done, manage_context, mixed tools, unknown tools, duplicate nonce detection, tool name mapping), result routing
 - **caller/frontend.rs**: UserAction enum completeness, state query types, log level parsing
-- **caller/vision.rs**: Xvfb display configuration per provider, dynamic display allocation, display accessibility probe
+- **caller/vision.rs**: Xvfb display configuration per provider, dynamic display allocation with :99 preference and orphan reclaim, x11vnc co-process launch, VNC port tracking, display accessibility probe
 - **caller/mcp.rs**: MCP state management, process_action_sync, resource definitions, tool parameter schemas, event-to-state mappings
 - **caller/mcp_client.rs**: Tool name parsing (`mcp__<server>_<tool>`), routing validation, connection lifecycle
 - **caller/sandbox.rs**: Default config construction, disabled config skip, write path setup
@@ -291,7 +291,9 @@ The `--vision` flag explicitly launches an Xvfb virtual display at startup with 
 4. Auto-launch Xvfb, store guard, set `DISPLAY`
 5. On failure → log warning, let `captureScreen` fail naturally
 
-The `XvfbGuard` kills the Xvfb process on drop, ensuring cleanup when the session ends.
+Display allocation prefers `:99` for a predictable VNC port (5999). If `:99` is locked by a live Xvfb process from a previous session, it is automatically killed and reclaimed (detected via `/proc/<pid>/cmdline`). If `:99` is held by a non-Xvfb process, allocation falls through to `:100+`.
+
+An `x11vnc` server is launched alongside Xvfb as a best-effort co-process (port = `5900 + display_id`). If `x11vnc` is not installed, the display still works normally. The VNC URL is logged to the TUI/stderr on success. Both Xvfb and x11vnc are killed on drop via `XvfbGuard`.
 
 ## Code Conventions
 
