@@ -88,6 +88,10 @@ pub struct McpAppState {
     pub next_task_orchestrate: Option<bool>,
     /// Pending or completed controller restart plan.
     pub controller_restart: Option<ControllerRestartState>,
+    /// Current round number (for multi-round support).
+    pub round: usize,
+    /// Sender for follow-up messages (multi-round support).
+    pub follow_up_tx: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 /// Tracks a pending approval along with the oneshot sender.
@@ -125,6 +129,8 @@ impl McpAppState {
             task_handle: None,
             controller_restart: None,
             next_task_orchestrate: None,
+            round: 0,
+            follow_up_tx: None,
         }
     }
 
@@ -160,6 +166,7 @@ impl McpAppState {
             autonomy: "unknown".to_string(), // filled by caller with async read
             verbosity: verbosity_to_str(self.verbosity).to_string(),
             session_tokens: self.session_tokens,
+            round: self.round,
         }
     }
 
@@ -406,6 +413,25 @@ async fn start_task_with_state(
                 "agent is currently in '{}' phase",
                 phase_to_str(&s.phase)
             ));
+        }
+        Phase::WaitingFollowUp => {
+            // Send follow-up message to the existing round loop
+            if let Some(ref tx) = s.follow_up_tx {
+                let tx = tx.clone();
+                let task_clone = task.clone();
+                s.set_phase(Phase::Thinking);
+                s.push_log(
+                    LogLevel::Info,
+                    format!("Follow-up submitted via {}: {}", source, task),
+                );
+                drop(s);
+                tx.send(task_clone)
+                    .await
+                    .map_err(|_| "follow-up channel closed".to_string())?;
+                return Ok(());
+            } else {
+                // No follow-up channel — treat as fresh start
+            }
         }
         Phase::Idle | Phase::Done => {}
     }
@@ -1427,6 +1453,54 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_LOOP_URI)
         }
+        ControlMsg::FollowUp { text } => {
+            let mut s = state.write().await;
+            if s.phase != Phase::WaitingFollowUp {
+                emit_control_result(
+                    control_tx,
+                    "follow_up",
+                    false,
+                    format!(
+                        "Not waiting for follow-up (phase: {})",
+                        phase_to_str(&s.phase)
+                    ),
+                    None,
+                );
+                return Some(RESOURCE_STATUS_URI);
+            }
+            if let Some(ref tx) = s.follow_up_tx {
+                let tx = tx.clone();
+                s.set_phase(Phase::Thinking);
+                s.push_log(LogLevel::Info, format!("Follow-up via socket: {}", text));
+                drop(s);
+                if tx.send(text).await.is_err() {
+                    emit_control_result(
+                        control_tx,
+                        "follow_up",
+                        false,
+                        "follow-up channel closed".to_string(),
+                        None,
+                    );
+                } else {
+                    emit_control_result(
+                        control_tx,
+                        "follow_up",
+                        true,
+                        "ok".to_string(),
+                        None,
+                    );
+                }
+            } else {
+                emit_control_result(
+                    control_tx,
+                    "follow_up",
+                    false,
+                    "no follow-up channel available".to_string(),
+                    None,
+                );
+            }
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::Quit => {
             let action = UserAction::Quit;
             let mut s = state.write().await;
@@ -1452,6 +1526,7 @@ fn phase_to_str(phase: &Phase) -> &'static str {
         Phase::Orchestrating => "orchestrating",
         Phase::WaitingApproval => "waiting_approval",
         Phase::WaitingHuman => "waiting_human",
+        Phase::WaitingFollowUp => "waiting_follow_up",
         Phase::Idle => "idle",
         Phase::Done => "done",
     }
@@ -1721,6 +1796,22 @@ pub fn spawn_event_listener(
                             format!("auto-approved: {}", preview),
                         );
                         resource_changed = Some("intendant://logs");
+                    }
+
+                    AppEvent::RoundComplete {
+                        round,
+                        turns_in_round,
+                    } => {
+                        s.round = round;
+                        s.set_phase(Phase::WaitingFollowUp);
+                        s.push_log(
+                            LogLevel::Info,
+                            format!(
+                                "Round {} complete ({} turns). Awaiting follow-up.",
+                                round, turns_in_round
+                            ),
+                        );
+                        resource_changed = Some("intendant://status");
                     }
 
                     AppEvent::ControlCommand(msg) => deferred_control_msg = Some(msg),
@@ -2015,6 +2106,12 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
                 format!("Verbosity set to {} by MCP agent", verbosity_to_str(level)),
             );
             ActionOutcome::Ok
+        }
+        UserAction::SubmitFollowUp { .. } => {
+            // Follow-up is handled asynchronously via the channel, not here.
+            ActionOutcome::NoOp {
+                reason: "SubmitFollowUp must be sent via follow-up channel".to_string(),
+            }
         }
         UserAction::Quit => {
             state.should_quit = true;
@@ -3278,6 +3375,7 @@ mod tests {
         assert_eq!(phase_to_str(&Phase::Orchestrating), "orchestrating");
         assert_eq!(phase_to_str(&Phase::WaitingApproval), "waiting_approval");
         assert_eq!(phase_to_str(&Phase::WaitingHuman), "waiting_human");
+        assert_eq!(phase_to_str(&Phase::WaitingFollowUp), "waiting_follow_up");
         assert_eq!(phase_to_str(&Phase::Idle), "idle");
         assert_eq!(phase_to_str(&Phase::Done), "done");
     }

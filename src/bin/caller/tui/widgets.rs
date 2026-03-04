@@ -111,6 +111,7 @@ pub fn render_action_panel(f: &mut Frame, area: Rect, app: &App) {
         Phase::Orchestrating => ("Orchestrating...".to_string(), "running"),
         Phase::WaitingApproval => ("Waiting for approval...".to_string(), "waiting"),
         Phase::WaitingHuman => ("Waiting for human input...".to_string(), "waiting"),
+        Phase::WaitingFollowUp => ("Awaiting follow-up...".to_string(), "waiting"),
         Phase::Idle => ("Idle".to_string(), "done"),
         Phase::Done => ("Done".to_string(), "done"),
     };
@@ -388,6 +389,51 @@ pub fn render_input_panel(f: &mut Frame, area: Rect, question: &str, app: &mut A
     // Hint
     let hint = Line::from(vec![Span::styled(
         " Enter=submit  Esc=cancel",
+        Style::default().fg(theme::INPUT_HINT_FG),
+    )]);
+    f.render_widget(
+        Paragraph::new(hint).style(Style::default().bg(theme::INPUT_BG)),
+        chunks[2],
+    );
+}
+
+/// Render the follow-up input panel (conditional, at bottom).
+pub fn render_follow_up_panel(f: &mut Frame, area: Rect, app: &mut App) {
+    let chunks = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Min(1),
+            ratatui::layout::Constraint::Length(1),
+        ])
+        .split(area);
+
+    // Prompt
+    let prompt_line = Line::from(vec![
+        Span::styled(
+            " Follow-up: ",
+            Style::default()
+                .fg(theme::INPUT_QUESTION_FG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("(round {})", app.round),
+            Style::default().fg(theme::LOG_DIM_FG),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(prompt_line).style(Style::default().bg(theme::INPUT_BG)),
+        chunks[0],
+    );
+
+    // Text area
+    if let Some(ref textarea) = app.follow_up_textarea {
+        f.render_widget(textarea, chunks[1]);
+    }
+
+    // Hint
+    let hint = Line::from(vec![Span::styled(
+        " Enter=submit | Shift+Enter=newline | Esc/q=quit",
         Style::default().fg(theme::INPUT_HINT_FG),
     )]);
     f.render_widget(
