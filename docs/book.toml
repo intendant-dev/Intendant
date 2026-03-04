@@ -5,4 +5,4 @@ language = "en"
 src = "src"
 
 [output.html]
-git-repository-url = "https://github.com/anthropics/intendant"
+git-repository-url = "https://github.com/lovon-spec/intendant"
