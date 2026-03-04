@@ -69,9 +69,9 @@ cargo test
 
 ## Documentation
 
-See the [full documentation](docs/src/SUMMARY.md) for detailed guides on configuration, the runtime protocol, TUI & autonomy, MCP server, integrations, and session logging.
+**[Read the full documentation](https://lovon-spec.github.io/intendant/)** — covers configuration, runtime protocol, TUI & autonomy, MCP server, integrations, and session logging.
 
-Build the docs locally with [mdBook](https://rust-lang.github.io/mdBook/):
+Or build locally with [mdBook](https://rust-lang.github.io/mdBook/):
 
 ```bash
 mdbook serve docs
