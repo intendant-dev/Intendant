@@ -318,6 +318,8 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 | `--vision` | Launch Xvfb virtual display at startup (auto-allocated `:99+`) sized for the provider's vision model. Without this flag, Xvfb is auto-launched lazily on the first `captureScreen` call if no accessible display exists |
 | `--json` | JSONL structured output to stdout (implies `--no-tui`) |
 | `--sandbox` | Enable Landlock filesystem sandboxing (Linux kernel 5.13+) |
+| `--direct` | Force single-agent direct mode (skip orchestrator even for complex tasks) |
+| `--control-socket` | Enable Unix control socket at `/tmp/intendant-<pid>.sock` |
 
 The TUI launches only when both stdin and stdout are terminals. When piping input/output or in sub-agent mode, `intendant` falls back to headless mode.
 

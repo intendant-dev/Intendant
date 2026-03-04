@@ -43,6 +43,7 @@ src/
         ├── control.rs       # Unix control socket server (JSON-line protocol at /tmp/intendant-<pid>.sock)
         ├── frontend.rs      # Shared frontend contract for TUI and MCP (UserAction enum, state queries)
         ├── tools.rs         # Native tool definitions (11 tools), provider format conversion, extra tool registration for MCP client
+        ├── tool_batch.rs    # Tool call batch assembly/disassembly: separates runtime vs caller-handled vs MCP tool calls, maps results back to per-tool responses
         ├── mcp.rs           # MCP server implementation (rmcp-based, stdio transport, hot-reload)
         ├── mcp_client.rs    # MCP client: connects to external MCP servers, discovers tools, proxies calls
         ├── sandbox.rs       # Landlock filesystem sandboxing (Linux): read/write path policies, process restriction
@@ -53,7 +54,7 @@ src/
             ├── mod.rs       # Tui struct: terminal init/restore, panic hook, render+event loop
             ├── app.rs       # App state machine, event dispatch, askHuman/approval modes
             ├── event.rs     # AppEvent enum, EventBus (mpsc wrapper), crossterm adapter, askHuman monitor
-            ├── widgets.rs   # StatusBar, LogPanel, ActionPanel, InputPanel, ApprovalPanel rendering
+            ├── widgets.rs   # StatusBar, LogPanel, ActionPanel, InputPanel, ApprovalPanel, FollowUpPanel, InspectOverlay rendering
             ├── layout.rs    # Panel sizing with constraints, responsive to terminal size
             └── theme.rs     # Color/style constants (Catppuccin Mocha-inspired)
 SysPrompt.md                 # Default system prompt (direct mode, text-based JSON extraction)
@@ -90,6 +91,8 @@ Running the CLI (requires `.env` with API key):
 ./target/release/intendant --vision "screenshot test"      # Launch with Xvfb virtual display
 ./target/release/intendant --json "echo hello"             # JSONL output to stdout (implies --no-tui)
 ./target/release/intendant --sandbox "run tests"           # Enable Landlock filesystem sandboxing
+./target/release/intendant --direct "complex task"         # Force single-agent mode (skip orchestrator)
+./target/release/intendant --control-socket "task"         # Enable Unix control socket
 echo "task" | ./target/release/intendant                   # Auto-detects non-TTY, runs headless
 ```
 
@@ -119,7 +122,7 @@ Test coverage includes:
 - **caller/error.rs**: Display formatting, type conversions (including Tui variant)
 - **caller/autonomy.rs**: Autonomy levels (display, parse, cycle), action categories, approval rules, needs_approval logic, command classification (exec, destructive, network, file write, askHuman, browse), batch classification
 - **caller/control.rs**: Socket path, outbound event serialization, broadcast, server lifecycle
-- **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses), event dispatch (all AppEvent variants including OrchestratorProgress, ModelResponseDelta), bottom panel heights, model summary formatting (exec, edit, multiple commands, done signal, askHuman, invalid JSON), streaming buffer accumulation
+- **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses, follow-up input), event dispatch (all AppEvent variants including OrchestratorProgress, ModelResponseDelta, RoundComplete), bottom panel heights, model summary formatting (exec, edit, multiple commands, done signal, askHuman, invalid JSON), streaming buffer accumulation
 - **caller/tui/event.rs**: EventBus send/receive/clone, ControlMsg deserialization (all variants), serialization roundtrip, ApprovalResponse variants
 - **caller/tui/layout.rs**: Layout calculation (all panel combos, with/without bottom panel, hidden panels, small terminal)
 - **caller/tui/widgets.rs**: Log entry formatting (all levels, verbose/non-verbose), string truncation
@@ -128,6 +131,7 @@ Test coverage includes:
 - **caller/agent_runner.rs**: askHuman detection in JSON input, sandboxed execution
 - **caller/session_log.rs**: UUID-based session directories, session metadata (write_meta, find_latest_session, find_session_by_id), directory structure creation, JSONL event validity, turn tracking, model response file creation, agent input pretty-printing, agent output file creation (stdout/stderr split), approval log searchability, JSON extraction logging, summary file creation, multi-turn file separation, messages input logging, reasoning content logging (full and summary-only)
 - **caller/tools.rs**: Tool definitions, provider format conversion, tool count validation
+- **caller/tool_batch.rs** (tests in caller/main.rs): Batch assembly from tool calls (single exec, signal_done, manage_context, mixed tools, unknown tools, duplicate nonce detection, tool name mapping), result routing
 - **caller/frontend.rs**: UserAction enum completeness, state query types, log level parsing
 - **caller/vision.rs**: Xvfb display configuration per provider, dynamic display allocation, display accessibility probe
 - **caller/mcp.rs**: MCP state management, process_action_sync, resource definitions, tool parameter schemas, event-to-state mappings
@@ -181,10 +185,11 @@ Commands are processed sequentially. Each command blocks until completion and re
 
 When stdin is a TTY and `--no-tui` is not set, `intendant` launches a ratatui-based terminal UI:
 - **Status bar**: Provider, model, turn count, budget percentage, autonomy level
-- **Action panel**: Current phase (Thinking/RunningAgent/Orchestrating/WaitingApproval/WaitingHuman/Done) with spinner
+- **Action panel**: Current phase (Thinking/RunningAgent/Orchestrating/WaitingApproval/WaitingHuman/WaitingFollowUp/Idle/Done) with spinner
 - **Log panel**: Scrollable chronological log of all events with color-coded levels
 - **Approval panel**: Shown when an action needs user approval (y/s/a/n keys)
 - **Input panel**: Shown when askHuman is triggered (tui-textarea for response)
+- **Follow-up panel**: Shown when agent completes a round and awaits follow-up input
 - **Help overlay**: Key bindings reference (? key)
 
 The agent loop runs in a background tokio task and communicates with the TUI via an `EventBus` (unbounded mpsc channel of `AppEvent`). When `bus` is `None` (headless mode), all output goes to stdout/stderr as before.
@@ -324,6 +329,7 @@ The `XvfbGuard` kills the Xvfb process on drop, ensuring cleanup when the sessio
 | `crossterm` | Terminal input/output backend (event-stream feature) |
 | `tui-textarea` | Text input widget for askHuman responses |
 | `tokio-stream` | Stream utilities for crossterm EventStream |
+| `base64` | Encoding screenshot data to base64 for vision API calls |
 | `tempfile` (dev) | Temporary directories in tests |
 
 ## Environment Requirements
