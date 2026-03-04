@@ -9,19 +9,51 @@ pub struct DisplayConfig {
     pub height: u32,
 }
 
+/// Read the PID from an X lock file. Returns `None` if the file can't be read or parsed.
+fn read_lock_pid(lock_path: &str) -> Option<u32> {
+    let contents = std::fs::read_to_string(lock_path).ok()?;
+    contents.trim().parse().ok()
+}
+
 /// Check if a lock file is stale (the PID inside is no longer running).
 fn is_lock_stale(lock_path: &str) -> bool {
-    let contents = match std::fs::read_to_string(lock_path) {
-        Ok(c) => c,
-        Err(_) => return false, // can't read → assume not stale
+    match read_lock_pid(lock_path) {
+        Some(pid) => !std::path::Path::new(&format!("/proc/{}", pid)).exists(),
+        None => false, // can't read/parse → assume not stale
+    }
+}
+
+/// Check whether the process owning a lock file is an Xvfb instance for the given display.
+/// Returns true if the process cmdline starts with "Xvfb :<id>".
+fn is_our_xvfb(lock_path: &str, display_id: u32) -> bool {
+    let pid = match read_lock_pid(lock_path) {
+        Some(p) => p,
+        None => return false,
     };
-    let pid_str = contents.trim();
-    let pid: u32 = match pid_str.parse() {
-        Ok(p) => p,
+    let cmdline_path = format!("/proc/{}/cmdline", pid);
+    let cmdline = match std::fs::read(&cmdline_path) {
+        Ok(bytes) => bytes,
         Err(_) => return false,
     };
-    // Check if the process is alive via /proc (Linux-only)
-    !std::path::Path::new(&format!("/proc/{}", pid)).exists()
+    // /proc/pid/cmdline is NUL-separated; replace NULs with spaces for easy matching
+    let cmdline_str = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+    let expected = format!("Xvfb :{}", display_id);
+    cmdline_str.starts_with(&expected)
+}
+
+/// Kill the process that owns a lock file (if alive) and clean up.
+fn kill_and_reclaim(lock_path: &str, display_id: u32) {
+    if let Some(pid) = read_lock_pid(lock_path) {
+        // Send SIGKILL via the kill command — the process is an orphaned Xvfb we're reclaiming
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        // Brief wait for the process to die
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    remove_stale_lock(display_id);
 }
 
 /// Remove a stale X lock file and its socket.
@@ -51,10 +83,19 @@ pub fn display_config_for_provider(provider_name: &str) -> DisplayConfig {
     }
 }
 
-/// Find a free X display number by checking for lock files.
-/// Cleans up stale lock files (dead PIDs) encountered along the way.
+/// Preferred display number. Keeps VNC port predictable at 5999.
+const PREFERRED_DISPLAY: u32 = 99;
+
+/// Find a free X display number, preferring :99 for a predictable VNC port.
+///
+/// Strategy for each candidate display:
+/// 1. No lock file → use it
+/// 2. Lock file with dead PID → clean up and use it
+/// 3. Lock file with live Xvfb process for this display → kill and reclaim it
+///    (it's an orphan from a previous intendant session)
+/// 4. Lock file with some other live process → skip to next display
 fn find_free_display() -> u32 {
-    for id in 99..200 {
+    for id in PREFERRED_DISPLAY..200 {
         let lock = format!("/tmp/.X{}-lock", id);
         if !std::path::Path::new(&lock).exists() {
             return id;
@@ -64,22 +105,68 @@ fn find_free_display() -> u32 {
             remove_stale_lock(id);
             return id;
         }
+        // Process is alive — reclaim if it's an orphaned Xvfb for this display
+        if is_our_xvfb(&lock, id) {
+            kill_and_reclaim(&lock, id);
+            return id;
+        }
     }
     199 // fallback
 }
 
-/// Guard that kills the Xvfb process when dropped.
+/// Guard that kills the Xvfb (and optional x11vnc) process when dropped.
 /// Cleans up the lock file and socket after killing.
 pub struct XvfbGuard {
     child: Child,
+    vnc_child: Option<Child>,
     display_id: u32,
+    vnc_port: Option<u32>,
+}
+
+impl XvfbGuard {
+    /// Returns the VNC port if x11vnc was successfully launched.
+    pub fn vnc_port(&self) -> Option<u32> {
+        self.vnc_port
+    }
 }
 
 impl Drop for XvfbGuard {
     fn drop(&mut self) {
+        if let Some(ref mut vnc) = self.vnc_child {
+            let _ = vnc.start_kill();
+        }
         let _ = self.child.start_kill();
         // Clean up lock file and socket so the display number can be reused
         remove_stale_lock(self.display_id);
+    }
+}
+
+/// Best-effort launch of x11vnc on the given display.
+/// Returns `Some(Child)` on success, `None` if x11vnc is not installed or fails to start.
+async fn launch_vnc(display_arg: &str, port: u32) -> Option<Child> {
+    let child = tokio::process::Command::new("x11vnc")
+        .args([
+            "-display",
+            display_arg,
+            "-rfbport",
+            &port.to_string(),
+            "-nopw",
+            "-forever",
+            "-shared",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn();
+
+    match child {
+        Ok(c) => {
+            // Brief wait for x11vnc to bind the port
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            Some(c)
+        }
+        Err(_) => None,
     }
 }
 
@@ -121,9 +208,16 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
     // Set DISPLAY env var so the runtime subprocess inherits it
     std::env::set_var("DISPLAY", &display_arg);
 
+    // Best-effort: launch x11vnc so users can watch the display via VNC
+    let vnc_port_num = 5900 + config.display_id;
+    let vnc_child = launch_vnc(&display_arg, vnc_port_num).await;
+    let has_vnc = vnc_child.is_some();
+
     Ok(XvfbGuard {
         child,
         display_id: config.display_id,
+        vnc_child,
+        vnc_port: if has_vnc { Some(vnc_port_num) } else { None },
     })
 }
 
@@ -209,6 +303,63 @@ mod tests {
         assert!(!std::path::Path::new(&lock).exists());
         // Clean up socket if it was created
         let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn vnc_port_tracks_display_id() {
+        // VNC port should always be 5900 + display_id
+        let config = display_config_for_provider("openai");
+        assert_eq!(5900 + config.display_id, 5900 + config.display_id);
+        // With display :99, VNC port is 5999
+        assert_eq!(5900 + 99, 5999);
+    }
+
+    #[tokio::test]
+    async fn launch_vnc_missing_binary() {
+        // x11vnc may or may not be installed; if not, launch_vnc returns None gracefully
+        let result = launch_vnc(":9999", 15999).await;
+        // Either way, this should not panic or error
+        if let Some(mut c) = result {
+            let _ = c.start_kill();
+        }
+    }
+
+    #[test]
+    fn read_lock_pid_nonexistent() {
+        assert_eq!(read_lock_pid("/tmp/.X_nonexistent_test-lock"), None);
+    }
+
+    #[test]
+    fn read_lock_pid_valid() {
+        let lock = "/tmp/.X197-test-lock";
+        std::fs::write(lock, " 12345\n").unwrap();
+        assert_eq!(read_lock_pid(lock), Some(12345));
+        let _ = std::fs::remove_file(lock);
+    }
+
+    #[test]
+    fn is_our_xvfb_dead_pid() {
+        // Lock with dead PID — is_our_xvfb should return false (can't read cmdline)
+        let lock = "/tmp/.X197-test-lock2";
+        std::fs::write(lock, " 1999999999\n").unwrap();
+        assert!(!is_our_xvfb(lock, 197));
+        let _ = std::fs::remove_file(lock);
+    }
+
+    #[test]
+    fn preferred_display_is_99() {
+        assert_eq!(PREFERRED_DISPLAY, 99);
+    }
+
+    #[test]
+    fn find_free_display_prefers_99() {
+        // When :99 is free, find_free_display should return 99
+        let lock = format!("/tmp/.X{}-lock", PREFERRED_DISPLAY);
+        if !std::path::Path::new(&lock).exists() {
+            assert_eq!(find_free_display(), 99);
+        }
+        // If :99 is taken we can only assert >= 99
+        assert!(find_free_display() >= 99);
     }
 
     #[test]

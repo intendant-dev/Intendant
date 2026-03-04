@@ -517,6 +517,11 @@ async fn maybe_auto_launch_xvfb(
     });
     match vision::launch_display(&config).await {
         Ok(guard) => {
+            if let Some(port) = guard.vnc_port() {
+                slog(session_log, |l| {
+                    l.info(&format!("VNC server available at vnc://localhost:{}", port))
+                });
+            }
             *xvfb_guard = Some(guard);
         }
         Err(e) => {
@@ -3190,7 +3195,13 @@ async fn main() -> Result<(), CallerError> {
                 config.display_id, config.width, config.height
             ))
         });
-        Some(vision::launch_display(&config).await?)
+        let guard = vision::launch_display(&config).await?;
+        if let Some(port) = guard.vnc_port() {
+            slog(&session_log, |l| {
+                l.info(&format!("VNC server available at vnc://localhost:{}", port))
+            });
+        }
+        Some(guard)
     } else {
         None
     };
