@@ -36,6 +36,8 @@ pub enum UserAction {
     SetAutonomy { level: AutonomyLevel },
     /// Cycle verbosity (TUI: `v`, MCP: `set_verbosity` tool).
     SetVerbosity { level: Verbosity },
+    /// Submit a follow-up message after a round completes (TUI: textarea, MCP: `start_task` when waiting).
+    SubmitFollowUp { text: String },
     /// Shut down the agent (TUI: `q`/Ctrl-C, MCP: `quit` tool).
     Quit,
 }
@@ -55,6 +57,8 @@ pub struct StatusSnapshot {
     pub autonomy: String,
     pub verbosity: String,
     pub session_tokens: u64,
+    #[serde(default)]
+    pub round: usize,
 }
 
 /// A single log entry in serializable form.
@@ -196,6 +200,7 @@ mod tests {
             autonomy: "medium".to_string(),
             verbosity: "normal".to_string(),
             session_tokens: 1500,
+            round: 1,
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"provider\":\"openai\""));
@@ -246,6 +251,7 @@ mod tests {
             autonomy: "high".to_string(),
             verbosity: "verbose".to_string(),
             session_tokens: 500,
+            round: 0,
         });
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"type\":\"status\""));
@@ -337,9 +343,12 @@ mod tests {
             UserAction::SetVerbosity {
                 level: Verbosity::Normal,
             },
+            UserAction::SubmitFollowUp {
+                text: "continue".to_string(),
+            },
             UserAction::Quit,
         ];
-        assert_eq!(actions.len(), 8);
+        assert_eq!(actions.len(), 9);
     }
 
     #[test]

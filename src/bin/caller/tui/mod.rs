@@ -80,6 +80,9 @@ impl Tui {
                         let question = app.human_question.clone().unwrap_or_default();
                         widgets::render_input_panel(f, bottom_area, &question, app);
                     }
+                    app::AppMode::FollowUp => {
+                        widgets::render_follow_up_panel(f, bottom_area, app);
+                    }
                     _ => {}
                 }
             }
@@ -232,6 +235,7 @@ mod tests {
             app::Phase::RunningAgent,
             app::Phase::WaitingApproval,
             app::Phase::WaitingHuman,
+            app::Phase::WaitingFollowUp,
             app::Phase::Idle,
             app::Phase::Done,
         ];

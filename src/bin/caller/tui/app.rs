@@ -17,6 +17,7 @@ pub enum Phase {
     Orchestrating,
     WaitingApproval,
     WaitingHuman,
+    WaitingFollowUp,
     Idle,
     Done,
 }
@@ -29,6 +30,7 @@ pub enum AppMode {
     Help,
     Approval,
     Inspect,
+    FollowUp,
 }
 
 /// Log entry severity / source.
@@ -149,6 +151,11 @@ pub struct App {
 
     // Streaming buffer for incremental text deltas
     pub streaming_buffer: String,
+
+    // Multi-round follow-up
+    pub round: usize,
+    pub follow_up_textarea: Option<tui_textarea::TextArea<'static>>,
+    pub follow_up_tx: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 impl App {
@@ -182,7 +189,14 @@ impl App {
             session_tokens: 0,
             tick_count: 0,
             streaming_buffer: String::new(),
+            round: 1,
+            follow_up_textarea: None,
+            follow_up_tx: None,
         }
+    }
+
+    pub fn set_follow_up_sender(&mut self, tx: tokio::sync::mpsc::Sender<String>) {
+        self.follow_up_tx = Some(tx);
     }
 
     pub fn set_control_socket(&mut self, tx: tokio::sync::broadcast::Sender<String>) {
@@ -259,6 +273,7 @@ impl App {
                 height.clamp(6, 20)
             }
             AppMode::AskHuman => 5,
+            AppMode::FollowUp => 5,
             _ => 0,
         }
     }
@@ -279,6 +294,7 @@ impl App {
             }
             AppMode::Approval => self.handle_approval_key(key),
             AppMode::AskHuman => self.handle_human_key(key),
+            AppMode::FollowUp => self.handle_follow_up_key(key),
             AppMode::Inspect => self.handle_inspect_key(key),
             AppMode::Normal => self.handle_normal_key(key),
         }
@@ -539,6 +555,59 @@ impl App {
         }
     }
 
+    fn handle_follow_up_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('q') => {
+                // Quit: drop the sender so recv() returns None
+                self.follow_up_textarea = None;
+                self.follow_up_tx = None;
+                self.mode = AppMode::Normal;
+                self.current_phase = Phase::Done;
+                self.should_quit = true;
+                true
+            }
+            KeyCode::Esc => {
+                // Cancel follow-up, end session
+                self.follow_up_textarea = None;
+                self.follow_up_tx = None;
+                self.mode = AppMode::Normal;
+                self.current_phase = Phase::Done;
+                true
+            }
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                // Submit the follow-up
+                if let Some(ref textarea) = self.follow_up_textarea {
+                    let text = textarea.lines().join("\n");
+                    if text.trim().is_empty() {
+                        self.log(
+                            LogLevel::Warn,
+                            "Follow-up cannot be empty. Enter text or press Esc/q to quit."
+                                .to_string(),
+                        );
+                        return true;
+                    }
+
+                    if let Some(ref tx) = self.follow_up_tx {
+                        let _ = tx.try_send(text.clone());
+                    }
+                    self.log(LogLevel::Info, format!("Follow-up: {}", truncate_str(&text, 80)));
+                }
+                self.follow_up_textarea = None;
+                self.mode = AppMode::Normal;
+                self.current_phase = Phase::Thinking;
+                self.round += 1;
+                true
+            }
+            _ => {
+                // Forward to textarea
+                if let Some(ref mut textarea) = self.follow_up_textarea {
+                    textarea.input(key);
+                }
+                true
+            }
+        }
+    }
+
     fn cycle_autonomy_up(&mut self) {
         let rt = tokio::runtime::Handle::try_current();
         if let Ok(handle) = rt {
@@ -689,6 +758,18 @@ impl App {
                     LogLevel::Warn,
                     "Controller control commands are only supported in MCP mode".to_string(),
                 );
+            }
+            ControlMsg::FollowUp { text } => {
+                if self.mode == AppMode::FollowUp {
+                    if let Some(ref tx) = self.follow_up_tx {
+                        let _ = tx.try_send(text.clone());
+                    }
+                    self.follow_up_textarea = None;
+                    self.mode = AppMode::Normal;
+                    self.current_phase = Phase::Thinking;
+                    self.round += 1;
+                    self.log(LogLevel::Info, format!("Follow-up via control socket: {}", truncate_str(&text, 80)));
+                }
             }
             ControlMsg::Quit => {
                 self.should_quit = true;
@@ -874,6 +955,28 @@ impl App {
             }
             AppEvent::AutoApproved { preview } => {
                 self.log(LogLevel::Info, format!("auto-approved: {}", preview));
+            }
+            AppEvent::RoundComplete {
+                round,
+                turns_in_round,
+            } => {
+                self.round = round;
+                self.current_phase = Phase::WaitingFollowUp;
+                self.mode = AppMode::FollowUp;
+                self.broadcast_control(OutboundEvent::RoundComplete {
+                    round,
+                    turns_in_round,
+                });
+                let mut textarea = tui_textarea::TextArea::default();
+                textarea.set_cursor_line_style(ratatui::style::Style::default());
+                self.follow_up_textarea = Some(textarea);
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Round {} complete ({} turns). Enter follow-up or q to quit.",
+                        round, turns_in_round
+                    ),
+                );
             }
             AppEvent::SessionDirChanged { .. } => {
                 // Only relevant for MCP mode; TUI ignores this.

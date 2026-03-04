@@ -30,6 +30,10 @@ pub enum OutboundEvent {
     TaskComplete {
         reason: String,
     },
+    RoundComplete {
+        round: usize,
+        turns_in_round: usize,
+    },
     Status {
         turn: usize,
         phase: String,

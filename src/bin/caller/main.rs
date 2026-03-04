@@ -48,11 +48,31 @@ const SAFETY_CAP: usize = 500;
 const MIN_BUDGET_TOKENS: u64 = 4096;
 const BUDGET_WARNING_THRESHOLD: f64 = 0.85;
 
+/// Why the agent loop exited after a round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoopExitReason {
+    /// Agent sent an explicit done signal.
+    DoneSignal,
+    /// Task completed (no JSON, no commands, etc.).
+    TaskComplete,
+    /// Context budget exhausted.
+    BudgetExhausted,
+    /// Hit the safety cap of 500 turns.
+    SafetyCapReached,
+    /// User denied a command.
+    Denied,
+    /// An error occurred.
+    Error,
+}
+
 #[derive(Debug, Clone, Default)]
 struct LoopStats {
     turns: usize,
+    rounds: usize,
     usage: provider::TokenUsage,
 }
+
+type FollowUpReceiver = tokio::sync::mpsc::Receiver<String>;
 
 /// CLI flags parsed from command-line arguments.
 struct CliFlags {
@@ -659,6 +679,16 @@ fn app_event_to_json(event: &AppEvent) -> Option<(&'static str, serde_json::Valu
         AppEvent::ContextManagement { turn } => {
             Some(("context_management", serde_json::json!({ "turn": turn })))
         }
+        AppEvent::RoundComplete {
+            round,
+            turns_in_round,
+        } => Some((
+            "round_complete",
+            serde_json::json!({
+                "round": round,
+                "turns_in_round": turns_in_round,
+            }),
+        )),
         _ => None, // Skip events that don't need JSON output (Key, Resize, Tick, etc.)
     }
 }
@@ -1443,13 +1473,14 @@ async fn run_agent_loop(
     session_log: SharedSessionLog,
     log_dir: &std::path::Path,
     mcp_mgr: Option<&mcp_client::McpClientManager>,
-) -> Result<LoopStats, CallerError> {
+) -> Result<(LoopStats, LoopExitReason), CallerError> {
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
     let mut loop_stats = LoopStats::default();
     let mut seen_sub_agent_results: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut xvfb_guard: Option<vision::XvfbGuard> = None;
+    let mut exit_reason = LoopExitReason::TaskComplete;
 
     for turn in 1..=SAFETY_CAP {
         // Check budget before sending
@@ -1471,6 +1502,7 @@ async fn run_agent_loop(
                     )
                 },
             );
+            exit_reason = LoopExitReason::BudgetExhausted;
             break;
         }
 
@@ -1748,6 +1780,7 @@ async fn run_agent_loop(
                         println!("--- Task complete ---");
                     },
                 );
+                exit_reason = LoopExitReason::DoneSignal;
                 break;
             }
 
@@ -1857,7 +1890,7 @@ async fn run_agent_loop(
                         },
                         || println!("--- Denied by policy ({}) ---", cat),
                     );
-                    return Ok(loop_stats);
+                    return Ok((loop_stats, LoopExitReason::Denied));
                 }
 
                 if let Some(ref bus_ref) = bus {
@@ -1898,7 +1931,7 @@ async fn run_agent_loop(
                                 },
                                 || println!("--- Denied by user ---"),
                             );
-                            return Ok(loop_stats);
+                            return Ok((loop_stats, LoopExitReason::Denied));
                         }
                     }
                 }
@@ -1913,7 +1946,7 @@ async fn run_agent_loop(
                         },
                         || println!("--- Approval required in headless mode ({}) ---", cat),
                     );
-                    return Ok(loop_stats);
+                    return Ok((loop_stats, LoopExitReason::Denied));
                 }
             } else {
                 // Commands auto-approved — log for visibility at Normal verbosity
@@ -2000,6 +2033,7 @@ async fn run_agent_loop(
                         },
                         || println!("--- Task complete ---"),
                     );
+                    exit_reason = LoopExitReason::TaskComplete;
                     break;
                 }
             };
@@ -2043,6 +2077,7 @@ async fn run_agent_loop(
                             println!("--- Task complete ---");
                         },
                     );
+                    exit_reason = LoopExitReason::DoneSignal;
                     break;
                 }
             }
@@ -2081,6 +2116,7 @@ async fn run_agent_loop(
                             },
                             || println!("--- Task complete ---"),
                         );
+                        exit_reason = LoopExitReason::TaskComplete;
                         break;
                     }
                     slog(&session_log, |l| {
@@ -2159,7 +2195,7 @@ Proceed with explicit assumptions and continue without additional questions."
                         },
                         || println!("--- Denied by policy ({}) ---", cat),
                     );
-                    return Ok(loop_stats);
+                    return Ok((loop_stats, LoopExitReason::Denied));
                 }
 
                 if let Some(ref bus_ref) = bus {
@@ -2200,7 +2236,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                 },
                                 || println!("--- Denied by user ---"),
                             );
-                            return Ok(loop_stats);
+                            return Ok((loop_stats, LoopExitReason::Denied));
                         }
                     }
                 }
@@ -2215,7 +2251,7 @@ Proceed with explicit assumptions and continue without additional questions."
                         },
                         || println!("--- Approval required in headless mode ({}) ---", cat),
                     );
-                    return Ok(loop_stats);
+                    return Ok((loop_stats, LoopExitReason::Denied));
                 }
             } else {
                 // Commands auto-approved — log for visibility at Normal verbosity
@@ -2321,11 +2357,96 @@ Proceed with explicit assumptions and continue without additional questions."
                 || AppEvent::SafetyCapReached,
                 || println!("--- Safety cap ({}) reached ---", SAFETY_CAP),
             );
+            exit_reason = LoopExitReason::SafetyCapReached;
         }
     }
 
     slog(&session_log, |l| l.info("Agent loop finished"));
-    Ok(loop_stats)
+    Ok((loop_stats, exit_reason))
+}
+
+/// Wraps `run_agent_loop` in a multi-round loop that waits for follow-up messages
+/// between rounds. The session continues until the user closes the channel,
+/// budget is exhausted, safety cap is reached, or a non-recoverable exit occurs.
+async fn run_round_loop(
+    provider: &dyn provider::ChatProvider,
+    conversation: &mut Conversation,
+    project: &Project,
+    sub_agent_mode: Option<&(String, sub_agent::SubAgentRole)>,
+    bus: Option<EventBus>,
+    autonomy: SharedAutonomy,
+    session_log: SharedSessionLog,
+    log_dir: &std::path::Path,
+    mcp_mgr: Option<&mcp_client::McpClientManager>,
+    mut follow_up_rx: FollowUpReceiver,
+) -> Result<LoopStats, CallerError> {
+    let mut round = 1usize;
+    let mut cumulative_stats = LoopStats::default();
+
+    loop {
+        let (stats, exit_reason) = run_agent_loop(
+            provider,
+            conversation,
+            project,
+            sub_agent_mode,
+            bus.clone(),
+            autonomy.clone(),
+            session_log.clone(),
+            log_dir,
+            mcp_mgr,
+        )
+        .await?;
+
+        cumulative_stats.turns += stats.turns;
+        cumulative_stats.usage.prompt_tokens += stats.usage.prompt_tokens;
+        cumulative_stats.usage.completion_tokens += stats.usage.completion_tokens;
+        cumulative_stats.usage.total_tokens += stats.usage.total_tokens;
+        cumulative_stats.rounds = round;
+
+        // Sub-agent mode: never wait for follow-up
+        if sub_agent_mode.is_some() {
+            break;
+        }
+
+        // Only wait for follow-up on recoverable exits
+        match exit_reason {
+            LoopExitReason::DoneSignal | LoopExitReason::TaskComplete => {
+                // Emit RoundComplete event
+                let turns_in_round = stats.turns;
+                emit(
+                    &bus,
+                    || AppEvent::RoundComplete {
+                        round,
+                        turns_in_round,
+                    },
+                    || println!("--- Round {} complete ({} turns) ---", round, turns_in_round),
+                );
+
+                // Wait for follow-up message
+                match follow_up_rx.recv().await {
+                    Some(message) => {
+                        round += 1;
+                        slog(&session_log, |l| {
+                            l.info(&format!("Round {} follow-up: {}", round, &message))
+                        });
+                        conversation.add_user(message);
+                    }
+                    None => {
+                        // Channel closed — user quit or sender dropped
+                        break;
+                    }
+                }
+            }
+            LoopExitReason::BudgetExhausted
+            | LoopExitReason::SafetyCapReached
+            | LoopExitReason::Denied
+            | LoopExitReason::Error => {
+                break;
+            }
+        }
+    }
+
+    Ok(cumulative_stats)
 }
 
 fn get_task_from_flags_or_env(flags: &CliFlags) -> Result<String, CallerError> {
@@ -2450,10 +2571,13 @@ All relative paths and commands execute from this directory.",
     )
     .await;
 
+    // Map (LoopStats, LoopExitReason) → LoopStats for sub-agent callers
+    let result = result.map(|(stats, _reason)| stats);
+
     // Update session status before writing result file
     match &result {
         Ok(stats) => slog(&session_log_for_summary, |l| {
-            l.write_summary(&task, "completed", stats.turns)
+            l.write_summary_with_rounds(&task, "completed", stats.turns, Some(stats.rounds))
         }),
         Err(e) => slog(&session_log_for_summary, |l| {
             l.write_summary(&task, &format!("error: {}", e), 0)
@@ -2666,6 +2790,7 @@ async fn run_direct_mode(
     session_log: SharedSessionLog,
     log_dir: PathBuf,
     mcp_mgr: Option<mcp_client::McpClientManager>,
+    follow_up_rx: FollowUpReceiver,
 ) -> Result<LoopStats, CallerError> {
     let role = sub_agent::SubAgentRole::Custom("direct".to_string());
     let system_prompt = if provider.use_tools() {
@@ -2733,7 +2858,7 @@ async fn run_direct_mode(
         println!("---");
     }
 
-    run_agent_loop(
+    run_round_loop(
         provider.as_ref(),
         &mut conversation,
         &project,
@@ -2743,6 +2868,7 @@ async fn run_direct_mode(
         session_log,
         &log_dir,
         mcp_mgr.as_ref(),
+        follow_up_rx,
     )
     .await
 }
@@ -3139,9 +3265,17 @@ async fn main() -> Result<(), CallerError> {
                     None => !is_simple_task(&task_str), // auto: same heuristic as TUI
                 };
 
+                // Create follow-up channel for multi-round support
+                let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+                {
+                    let mut s = mcp_state.write().await;
+                    s.follow_up_tx = Some(follow_up_tx);
+                }
+
                 let bus_clone = bus.clone();
                 let task_for_summary = task_str.clone();
                 let session_log_summary = session_log.clone();
+                let mcp_state_cleanup = mcp_state.clone();
                 tokio::spawn(async move {
                     let result = if use_orchestration {
                         run_user_mode(
@@ -3163,6 +3297,7 @@ async fn main() -> Result<(), CallerError> {
                             session_log,
                             log_dir,
                             None,
+                            follow_up_rx,
                         )
                         .await
                     };
@@ -3170,7 +3305,12 @@ async fn main() -> Result<(), CallerError> {
                     match result {
                         Ok(stats) => {
                             slog(&session_log_summary, |l| {
-                                l.write_summary(&task_for_summary, "completed", stats.turns)
+                                l.write_summary_with_rounds(
+                                    &task_for_summary,
+                                    "completed",
+                                    stats.turns,
+                                    Some(stats.rounds),
+                                )
                             });
                             // Note: TaskComplete is already emitted by run_agent_loop
                             // when it breaks (done signal, no JSON, etc.)
@@ -3181,6 +3321,12 @@ async fn main() -> Result<(), CallerError> {
                             });
                             bus_clone.send(AppEvent::LoopError(e.to_string()));
                         }
+                    }
+
+                    // Clean up follow-up sender so MCP knows no task is active
+                    {
+                        let mut s = mcp_state_cleanup.write().await;
+                        s.follow_up_tx = None;
                     }
                 })
             })
@@ -3273,6 +3419,10 @@ async fn main() -> Result<(), CallerError> {
 
         app.log(tui::app::LogLevel::Info, format!("Task: {}", task));
 
+        // Create follow-up channel for multi-round support
+        let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+        app.set_follow_up_sender(follow_up_tx);
+
         // Spawn the agent loop in a background task
         let bus_clone = bus.clone();
         let autonomy_clone = autonomy.clone();
@@ -3298,6 +3448,7 @@ async fn main() -> Result<(), CallerError> {
                     session_log_clone,
                     log_dir_clone,
                     mcp_mgr,
+                    follow_up_rx,
                 )
                 .await
             } else {
@@ -3315,7 +3466,12 @@ async fn main() -> Result<(), CallerError> {
             match result {
                 Ok(stats) => {
                     slog(&session_log_summary, |l| {
-                        l.write_summary(&task_for_summary, "completed", stats.turns)
+                        l.write_summary_with_rounds(
+                            &task_for_summary,
+                            "completed",
+                            stats.turns,
+                            Some(stats.rounds),
+                        )
                     });
                     // Note: TaskComplete is already emitted by run_agent_loop
                 }
@@ -3347,6 +3503,32 @@ async fn main() -> Result<(), CallerError> {
         } else {
             None
         };
+
+        // Create follow-up channel. In JSON mode, spawn a stdin reader to enable
+        // follow-up via stdin lines. Otherwise, drop the sender immediately so
+        // recv() returns None → single-round behavior.
+        let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+        if flags.json_output {
+            // JSON mode: read follow-up lines from stdin
+            tokio::spawn(async move {
+                let stdin = tokio::io::stdin();
+                let reader = tokio::io::BufReader::new(stdin);
+                use tokio::io::AsyncBufReadExt;
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if follow_up_tx.send(line).await.is_err() {
+                        break; // receiver dropped
+                    }
+                }
+            });
+        } else {
+            drop(follow_up_tx); // single-round: recv() returns None immediately
+        }
+
         let result = if flags.direct || is_simple_task(&task) {
             run_direct_mode(
                 provider,
@@ -3357,6 +3539,7 @@ async fn main() -> Result<(), CallerError> {
                 session_log.clone(),
                 log_dir,
                 mcp_mgr,
+                follow_up_rx,
             )
             .await
         } else {
@@ -3372,7 +3555,7 @@ async fn main() -> Result<(), CallerError> {
         };
         match &result {
             Ok(stats) => slog(&session_log, |l| {
-                l.write_summary(&task, "completed", stats.turns)
+                l.write_summary_with_rounds(&task, "completed", stats.turns, Some(stats.rounds))
             }),
             Err(e) => slog(&session_log, |l| {
                 l.write_summary(&task, &format!("error: {}", e), 0)

@@ -41,6 +41,8 @@ pub struct SessionMeta {
     pub last_turn: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rounds: Option<usize>,
 }
 
 /// Comprehensive structured session logger.
@@ -133,6 +135,7 @@ impl SessionLog {
             status: Some("running".to_string()),
             last_turn: None,
             role: role.map(|r| r.to_string()),
+            rounds: None,
         };
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             if let Err(e) = fs::write(self.dir.join("session_meta.json"), json) {
@@ -578,7 +581,18 @@ impl SessionLog {
     /// Write the session summary (call at end of session).
     /// Also updates session_meta.json with completion status.
     pub fn write_summary(&mut self, task: &str, outcome: &str, total_turns: usize) {
-        let summary = serde_json::json!({
+        self.write_summary_with_rounds(task, outcome, total_turns, None);
+    }
+
+    /// Write session summary with optional round count.
+    pub fn write_summary_with_rounds(
+        &mut self,
+        task: &str,
+        outcome: &str,
+        total_turns: usize,
+        rounds: Option<usize>,
+    ) {
+        let mut summary = serde_json::json!({
             "task": task,
             "outcome": outcome,
             "total_turns": total_turns,
@@ -586,6 +600,9 @@ impl SessionLog {
             "session_dir": self.dir.to_string_lossy(),
             "ended_at": Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         });
+        if let Some(r) = rounds {
+            summary["rounds"] = serde_json::json!(r);
+        }
         let path = self.dir.join("summary.json");
         if let Ok(pretty) = serde_json::to_string_pretty(&summary) {
             if let Err(e) = fs::write(&path, &pretty) {
@@ -599,6 +616,7 @@ impl SessionLog {
             if let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
                 meta.status = Some("completed".to_string());
                 meta.last_turn = Some(total_turns);
+                meta.rounds = rounds;
                 if let Ok(json) = serde_json::to_string_pretty(&meta) {
                     if let Err(e) = fs::write(&meta_path, &json) {
                         eprintln!("session_log: failed to update session_meta.json: {}", e);
@@ -707,6 +725,7 @@ mod tests {
             status: None,
             last_turn: None,
             role: None,
+            rounds: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),
@@ -926,6 +945,7 @@ mod tests {
             status: Some("completed".to_string()),
             last_turn: Some(5),
             role: None,
+            rounds: None,
         };
         fs::write(
             s1_dir.join("session_meta.json"),
@@ -943,6 +963,7 @@ mod tests {
             status: Some("completed".to_string()),
             last_turn: Some(3),
             role: None,
+            rounds: None,
         };
         fs::write(
             s2_dir.join("session_meta.json"),

@@ -97,6 +97,12 @@ pub enum AppEvent {
         preview: String,
     },
 
+    // Round lifecycle
+    RoundComplete {
+        round: usize,
+        turns_in_round: usize,
+    },
+
     // TUI internal
     Tick,
     #[allow(dead_code)]
@@ -176,6 +182,9 @@ pub enum ControlMsg {
         mode: String,
     },
     GetControllerLoopStatus,
+    FollowUp {
+        text: String,
+    },
     Quit,
 }
 
@@ -486,6 +495,9 @@ mod tests {
                 mode: "stop".to_string(),
             },
             ControlMsg::GetControllerLoopStatus,
+            ControlMsg::FollowUp {
+                text: "continue working".to_string(),
+            },
             ControlMsg::Quit,
         ];
         for msg in msgs {
