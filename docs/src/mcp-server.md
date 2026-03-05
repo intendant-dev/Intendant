@@ -79,7 +79,8 @@ Resources provide push-based state observation via subscriptions. The server sen
 
 | URI | Description |
 |-----|-------------|
-| `intendant://status` | Provider, model, turn count, budget %, phase, autonomy level |
+| `intendant://status` | Provider, model, turn count, budget %, phase, autonomy, session ID, task |
+| `intendant://usage` | Per-model token usage: tokens used, context window, usage % (main + optional presence) |
 | `intendant://logs` | Last 100 chronological log entries (same as TUI log panel) |
 | `intendant://pending-approval` | Current pending approval request, if any |
 | `intendant://pending-input` | Current pending human question, if any |

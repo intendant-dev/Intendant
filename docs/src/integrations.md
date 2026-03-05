@@ -27,6 +27,7 @@ When `--control-socket` is enabled, a Unix domain socket is created at `/tmp/int
 {"action": "query_detail", "scope": "diff"}
 {"action": "query_detail", "scope": "file", "target": "src/main.rs"}
 {"action": "recall_memory", "keywords": ["auth", "login"], "channel": "project_state"}
+{"action": "usage"}
 {"action": "quit"}
 ```
 
@@ -38,9 +39,15 @@ When `--control-socket` is enabled, a Unix domain socket is created at `/tmp/int
 {"event": "approval_required", "id": 123, "command": "rm -rf /tmp/test"}
 {"event": "ask_human", "question": "Which database?"}
 {"event": "task_complete", "reason": "done signal"}
-{"event": "status", "turn": 3, "phase": "thinking", "autonomy": "medium"}
+{"event": "status", "turn": 3, "phase": "thinking", "autonomy": "medium", "session_id": "abc-123", "task": "fix tests"}
+{"event": "usage", "main": {"provider": "openai", "model": "gpt-5", "tokens_used": 12000, "context_window": 128000, "usage_pct": 9.4}}
+{"event": "usage_update", "main": {"provider": "openai", "model": "gpt-5", "tokens_used": 15000, "context_window": 128000, "usage_pct": 11.7}}
 {"event": "command_result", "action": "get_restart_status", "ok": true, "message": "ok", "data": {...}}
 ```
+
+- The `status` event now includes `session_id` and `task` fields.
+- The `usage` event is a response to `{"action": "usage"}`, returning per-model token usage.
+- The `usage_update` event is broadcast automatically after each agent turn, providing streaming token consumption updates. The `presence` field is included when the presence layer is active.
 
 `command_result.ok` is `false` when a control action fails (for example, `schedule_controller_restart` with `restart_after="now"` and no executable restart action configured).
 
