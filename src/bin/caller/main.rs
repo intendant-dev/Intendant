@@ -19,7 +19,7 @@ mod tools;
 mod tui;
 mod user_mode;
 mod vision;
-mod voice_gateway;
+mod live_gateway;
 mod worktree;
 
 use autonomy::{AutonomyLevel, AutonomyState, SharedAutonomy};
@@ -101,9 +101,9 @@ struct CliFlags {
     direct: bool,
     /// --no-presence: Disable the presence layer (direct agent interaction).
     no_presence: bool,
-    /// --voice-gateway [PORT]: Enable voice control WebSocket gateway.
-    voice_gateway: bool,
-    voice_gateway_port: u16,
+    /// --live [PORT]: Enable live gateway WebSocket server (implies --mcp).
+    live: bool,
+    live_port: u16,
 }
 
 fn print_help() {
@@ -128,7 +128,7 @@ fn print_help() {
     println!("    --sandbox             Enable Landlock filesystem sandboxing for the runtime");
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
-    println!("    --voice-gateway [PORT] Enable voice control WebSocket gateway (default port: 8765)");
+    println!("    --live [PORT]          Enable live gateway (audio/video/text, default port: 8765; implies --mcp)");
     println!("    --help, -h            Show this help message");
     println!();
     println!("SESSION LOGS:");
@@ -172,8 +172,8 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         sandbox: false,
         direct: false,
         no_presence: false,
-        voice_gateway: false,
-        voice_gateway_port: voice_gateway::DEFAULT_PORT,
+        live: false,
+        live_port: live_gateway::DEFAULT_PORT,
     };
 
     let mut task_parts = Vec::new();
@@ -269,11 +269,12 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                 flags.no_presence = true;
                 i += 1;
             }
-            "--voice-gateway" => {
-                flags.voice_gateway = true;
+            "--live" | "--voice-gateway" => {
+                flags.live = true;
+                flags.mcp = true; // --live implies --mcp
                 // Optional port argument (next arg if it's numeric)
                 if i + 1 < args.len() && args[i + 1].parse::<u16>().is_ok() {
-                    flags.voice_gateway_port = args[i + 1].parse().unwrap();
+                    flags.live_port = args[i + 1].parse().unwrap();
                     i += 2;
                 } else {
                     i += 1;
@@ -1045,8 +1046,8 @@ Also: {"source": "bare"}"#;
             sandbox: false,
             direct: false,
             no_presence: false,
-            voice_gateway: false,
-            voice_gateway_port: voice_gateway::DEFAULT_PORT,
+            live: false,
+            live_port: live_gateway::DEFAULT_PORT,
         };
         assert!(!flags.verbose);
         assert!(!flags.no_tui);
@@ -1057,13 +1058,13 @@ Also: {"source": "bare"}"#;
         assert!(!flags.json_output);
         assert!(!flags.direct);
         assert!(!flags.no_presence);
-        assert!(!flags.voice_gateway);
-        assert_eq!(flags.voice_gateway_port, 8765);
+        assert!(!flags.live);
+        assert_eq!(flags.live_port, 8765);
         assert_eq!(flags.autonomy, AutonomyLevel::Medium);
     }
 
     #[test]
-    fn cli_voice_gateway_flag() {
+    fn cli_live_flag() {
         let flags = CliFlags {
             task: None,
             provider: None,
@@ -1080,15 +1081,15 @@ Also: {"source": "bare"}"#;
             sandbox: false,
             direct: false,
             no_presence: false,
-            voice_gateway: true,
-            voice_gateway_port: voice_gateway::DEFAULT_PORT,
+            live: true,
+            live_port: live_gateway::DEFAULT_PORT,
         };
-        assert!(flags.voice_gateway);
-        assert_eq!(flags.voice_gateway_port, voice_gateway::DEFAULT_PORT);
+        assert!(flags.live);
+        assert_eq!(flags.live_port, live_gateway::DEFAULT_PORT);
     }
 
     #[test]
-    fn cli_voice_gateway_with_port() {
+    fn cli_live_with_port() {
         let flags = CliFlags {
             task: None,
             provider: None,
@@ -1105,11 +1106,11 @@ Also: {"source": "bare"}"#;
             sandbox: false,
             direct: false,
             no_presence: false,
-            voice_gateway: true,
-            voice_gateway_port: 9000,
+            live: true,
+            live_port: 9000,
         };
-        assert!(flags.voice_gateway);
-        assert_eq!(flags.voice_gateway_port, 9000);
+        assert!(flags.live);
+        assert_eq!(flags.live_port, 9000);
     }
 
     #[test]
@@ -2772,7 +2773,7 @@ All relative paths and commands execute from this directory.",
 /// delegates tasks to the agent loop via a channel, and narrates events.
 #[allow(clippy::too_many_arguments)]
 async fn run_with_presence(
-    task: String,
+    task: Option<String>,
     project: Project,
     bus: EventBus,
     autonomy: SharedAutonomy,
@@ -2823,13 +2824,15 @@ async fn run_with_presence(
         project.root.clone(),
     );
 
-    // 8. Send initial task to presence
-    let initial_response = presence
-        .process_user_input(&format!("The user wants: {}", task))
-        .await
-        .unwrap_or_else(|e| format!("Error: {}", e));
-    if !initial_response.is_empty() {
-        let _ = response_tx.send(initial_response).await;
+    // 8. Send initial task to presence (if provided)
+    if let Some(ref task_str) = task {
+        let initial_response = presence
+            .process_user_input(&format!("The user wants: {}", task_str))
+            .await
+            .unwrap_or_else(|e| format!("Error: {}", e));
+        if !initial_response.is_empty() {
+            let _ = response_tx.send(initial_response).await;
+        }
     }
 
     // 9. Main loop: process tasks from presence + user follow-ups
@@ -3479,28 +3482,32 @@ async fn main() -> Result<(), CallerError> {
             None
         };
 
-        // Voice gateway (WebSocket)
-        let _voice_handle = if flags.voice_gateway {
+        // Live gateway (WebSocket)
+        let _live_handle = if flags.live {
             let broadcast_tx = if let Some(ref tx) = mcp_control_tx {
                 tx.clone()
             } else {
                 let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
                 tx
             };
-            let handle = voice_gateway::spawn_voice_gateway(
-                flags.voice_gateway_port,
+            let config = live_gateway::build_config(
+                project.config.presence.audio_model.as_deref(),
+            );
+            let handle = live_gateway::spawn_live_gateway(
+                flags.live_port,
                 bus.clone(),
                 broadcast_tx,
+                config,
             );
             slog(&session_log, |l| {
                 l.info(&format!(
-                    "Voice gateway: http://0.0.0.0:{}",
-                    flags.voice_gateway_port
+                    "Live gateway: http://0.0.0.0:{}",
+                    flags.live_port
                 ))
             });
             eprintln!(
-                "Voice gateway: http://0.0.0.0:{}",
-                flags.voice_gateway_port
+                "Live gateway: http://0.0.0.0:{}",
+                flags.live_port
             );
             Some(handle)
         } else {
@@ -3741,8 +3748,8 @@ async fn main() -> Result<(), CallerError> {
             );
         }
 
-        // Voice gateway (WebSocket) — shares broadcast channel with control socket if both enabled
-        let _voice_handle = if flags.voice_gateway {
+        // Live gateway (WebSocket) — shares broadcast channel with control socket if both enabled
+        let _live_handle = if flags.live {
             let broadcast_tx = if let Some(ref tx) = app.control_tx {
                 tx.clone()
             } else {
@@ -3750,14 +3757,18 @@ async fn main() -> Result<(), CallerError> {
                 app.set_control_socket(tx.clone());
                 tx
             };
-            let handle = voice_gateway::spawn_voice_gateway(
-                flags.voice_gateway_port,
+            let config = live_gateway::build_config(
+                project.config.presence.audio_model.as_deref(),
+            );
+            let handle = live_gateway::spawn_live_gateway(
+                flags.live_port,
                 bus.clone(),
                 broadcast_tx,
+                config,
             );
             app.log(
                 tui::app::LogLevel::Info,
-                format!("Voice gateway: http://0.0.0.0:{}", flags.voice_gateway_port),
+                format!("Live gateway: http://0.0.0.0:{}", flags.live_port),
             );
             Some(handle)
         } else {
@@ -3820,7 +3831,7 @@ async fn main() -> Result<(), CallerError> {
 
             tokio::spawn(async move {
                 let result = run_with_presence(
-                    task_clone,
+                    Some(task_clone),
                     project,
                     bus_clone.clone(),
                     autonomy_clone,
@@ -3931,18 +3942,22 @@ async fn main() -> Result<(), CallerError> {
 
         // Headless mode (--no-tui or non-TTY)
 
-        // Voice gateway in headless mode needs an EventBus + broadcast channel
-        let headless_bus = if flags.voice_gateway {
+        // Live gateway in headless mode needs an EventBus + broadcast channel
+        let headless_bus = if flags.live {
             let (bus, _rx) = EventBus::new();
             let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(256);
-            let _voice_handle = voice_gateway::spawn_voice_gateway(
-                flags.voice_gateway_port,
+            let config = live_gateway::build_config(
+                project.config.presence.audio_model.as_deref(),
+            );
+            let _live_handle = live_gateway::spawn_live_gateway(
+                flags.live_port,
                 bus.clone(),
                 broadcast_tx,
+                config,
             );
             eprintln!(
-                "Voice gateway: http://0.0.0.0:{}",
-                flags.voice_gateway_port
+                "Live gateway: http://0.0.0.0:{}",
+                flags.live_port
             );
             Some(bus)
         } else {

@@ -48,7 +48,7 @@ src/
         ├── mcp_client.rs    # MCP client: connects to external MCP servers, discovers tools, proxies calls
         ├── sandbox.rs       # Landlock filesystem sandboxing (Linux): read/write path policies, process restriction
         ├── vision.rs        # Xvfb display management, x11vnc co-process, per-provider resolution, display :99 preference with orphan reclaim
-        ├── voice_gateway.rs # WebSocket gateway for voice control (serves static/voice.html, bridges EventBus)
+        ├── live_gateway.rs  # WebSocket gateway for live interaction (serves static/live.html, /config endpoint, bridges EventBus)
         ├── session_log.rs   # UUID-based session directories, structured event logging, conversation persistence
         ├── error.rs         # CallerError enum (includes Tui variant)
         └── tui/
@@ -65,7 +65,7 @@ SysPrompt_orchestrator.md    # Orchestrator agent prompt
 SysPrompt_research.md        # Research sub-agent prompt
 SysPrompt_implementation.md  # Implementation sub-agent prompt
 static/
-└── voice.html               # Self-contained voice control UI (Gemini Live API + WebSocket bridge)
+└── live.html                # Self-contained live interaction UI (Gemini Live + OpenAI Realtime APIs, provider abstraction)
 ```
 
 ## Build and Run
@@ -93,8 +93,8 @@ Running the CLI (requires `.env` with API key):
 ./target/release/intendant --mcp "task"                    # Run as MCP server on stdio
 ./target/release/intendant --json "echo hello"             # JSONL output to stdout (implies --no-tui)
 ./target/release/intendant --sandbox "run tests"           # Enable Landlock filesystem sandboxing
-./target/release/intendant --voice-gateway --mcp           # Voice control via phone browser (port 8765)
-./target/release/intendant --voice-gateway 9000 "task"     # Voice gateway on custom port
+./target/release/intendant --live                          # Live gateway (audio/video/text) on port 8765 (implies --mcp)
+./target/release/intendant --live 9000                     # Live gateway on custom port (implies --mcp)
 ./target/release/intendant --direct "complex task"         # Force single-agent mode (skip orchestrator)
 ./target/release/intendant --control-socket "task"         # Enable Unix control socket
 echo "task" | ./target/release/intendant                   # Auto-detects non-TTY, runs headless
@@ -336,7 +336,7 @@ An `x11vnc` server is launched alongside Xvfb as a best-effort co-process (port 
 | `tui-textarea` | Text input widget for askHuman responses |
 | `tokio-stream` | Stream utilities for crossterm EventStream |
 | `base64` | Encoding screenshot data to base64 for vision API calls |
-| `tokio-tungstenite` | WebSocket server/client for voice gateway |
+| `tokio-tungstenite` | WebSocket server/client for live gateway |
 | `tempfile` (dev) | Temporary directories in tests |
 
 ## Environment Requirements

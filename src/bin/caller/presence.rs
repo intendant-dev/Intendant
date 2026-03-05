@@ -22,7 +22,7 @@ pub struct PresenceConfig {
     /// Model for text mode.
     #[serde(default)]
     pub model: Option<String>,
-    /// Model for audio/video mode (voice gateway).
+    /// Model for audio/video mode (live gateway).
     #[serde(default)]
     pub audio_model: Option<String>,
     /// Context window size for the presence conversation.

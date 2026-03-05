@@ -50,49 +50,52 @@ When `--control-socket` is enabled, a Unix domain socket is created at `/tmp/int
 echo '{"action":"status"}' | socat - UNIX:/tmp/intendant-$(pgrep intendant).sock
 ```
 
-## Voice Gateway
+## Live Gateway
 
-The `--voice-gateway` flag starts a WebSocket server that enables voice control of Intendant from a phone browser via the Gemini Live API.
+The `--live` flag starts a WebSocket server that enables voice and text control of Intendant from a browser. It supports both the Gemini Live API and OpenAI Realtime API via a provider abstraction. `--live` implies `--mcp`, so no initial task is required — the agent starts idle and accepts tasks dynamically.
 
 ### How It Works
 
 ```
-Phone browser ──WebSocket──> Intendant gateway (port 8765)
-     │                              │
-     │  (audio)                     │ (ControlMsg JSON, same as control socket)
-     v                              v
-Gemini Live API            EventBus / broadcast channel
-     │                              │
-     │  (function calls)            │ (OutboundEvent JSON)
-     v                              v
-  JS bridge ──────────────> Intendant agent loop
+Browser ──WebSocket──> Intendant live gateway (port 8765)
+  │                              │
+  │  (audio / text)              │ (ControlMsg JSON, same as control socket)
+  v                              v
+Model API (Gemini/OpenAI)  EventBus / broadcast channel
+  │                              │
+  │  (function calls)            │ (OutboundEvent JSON)
+  v                              v
+JS provider bridge ──────> Intendant agent loop
 ```
 
-The phone browser connects directly to the Gemini Live API for low-latency voice I/O, and to the Intendant gateway for control messages. A JS bridge in the browser translates Gemini function calls (`submit_task`, `approve_action`, `check_status`, etc.) into Intendant `ControlMsg` JSON and injects Intendant events back into the Gemini session for voice narration.
+The browser connects directly to the model's realtime API for low-latency voice I/O, and to the Intendant gateway for control messages. A JS provider bridge translates model function calls (`submit_task`, `approve_action`, `check_status`, etc.) into Intendant `ControlMsg` JSON and injects Intendant events back into the model session for voice narration. A text input bar also allows typed messages.
+
+The live gateway serves a `/config` endpoint that returns the configured provider and model as JSON, which the frontend uses to select the correct provider adapter.
 
 ### Running
 
 ```bash
-# With MCP mode
-./target/release/intendant --mcp --voice-gateway
-
-# With TUI
-./target/release/intendant --voice-gateway "Fix the login bug"
+# Start idle, waiting for tasks via live UI
+./target/release/intendant --live
 
 # Custom port
-./target/release/intendant --voice-gateway 9000 --mcp
+./target/release/intendant --live 9000
 ```
 
-Open `http://<host>:8765/` on your phone. On first visit, enter your [Google AI Studio API key](https://aistudio.google.com/apikey) (stored in browser localStorage, never sent to Intendant).
+Open `http://<host>:8765/` on your phone or browser. On first visit, enter your API key (Gemini or OpenAI depending on configuration; stored in browser localStorage, never sent to Intendant).
+
+### Provider Configuration
+
+The live gateway auto-detects the provider from `presence.audio_model` in `intendant.toml`, or falls back to environment variable detection (`GEMINI_API_KEY` → Gemini, `OPENAI_API_KEY` → OpenAI).
 
 ### Requirements
 
 - **Microphone access requires a secure context**: Use `localhost` (via SSH tunnel: `ssh -L 8765:localhost:8765 host`), or set browser flags for insecure origins.
-- **Gemini API key**: Free tier from Google AI Studio. The key is used browser-side only.
+- **API key**: Gemini (free tier from Google AI Studio) or OpenAI. The key is used browser-side only.
 
 ### Voice Identity
 
-The voice gateway speaks in first person as Intendant — "I'm running your tests now" rather than "The agent is running tests." Event narration from the agent loop is rewritten into first-person system messages before being injected into the Gemini session.
+The live gateway speaks in first person as Intendant — "I'm running your tests now" rather than "The agent is running tests." Event narration from the agent loop is rewritten into first-person system messages before being injected into the model session.
 
 ### Supported Voice Commands
 
