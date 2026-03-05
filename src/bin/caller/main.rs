@@ -2804,6 +2804,7 @@ async fn run_with_presence(
 
     // 3. Create channels
     let (task_tx, mut task_rx) = tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
+    let fallback_task_tx = task_tx.clone(); // keep a handle for fallback if presence fails
     // The presence_event_rx is fed by the TUI via App.forward_to_presence() →
     // presence_event_tx, which was created and wired by the caller (TUI branch).
     let presence_event_rx = presence_event_rx;
@@ -2828,6 +2829,7 @@ async fn run_with_presence(
 
     // 8. Send initial task to presence (if provided), with a timeout so a
     //    slow or misconfigured presence provider doesn't freeze the TUI.
+    let mut presence_failed_task: Option<String> = None;
     if let Some(ref task_str) = task {
         let input = format!("The user wants: {}", task_str);
         match tokio::time::timeout(
@@ -2840,20 +2842,39 @@ async fn run_with_presence(
                 let _ = response_tx.send(response).await;
             }
             Ok(Err(e)) => {
-                bus.send(AppEvent::LoopError(format!(
-                    "Presence provider error: {}. Falling through to direct agent.",
-                    e
-                )));
+                bus.send(AppEvent::PresenceLog {
+                    message: format!(
+                        "Presence provider error: {}. Use --no-presence or --direct to bypass. \
+                         Submitting task directly.",
+                        e
+                    ),
+                });
+                presence_failed_task = Some(task_str.clone());
             }
             Err(_) => {
-                bus.send(AppEvent::LoopError(
-                    "Presence provider timed out (30s). Falling through to direct agent."
+                bus.send(AppEvent::PresenceLog {
+                    message: "Presence provider timed out (30s). Use --no-presence or --direct to bypass. \
+                         Submitting task directly."
                         .to_string(),
-                ));
+                });
+                presence_failed_task = Some(task_str.clone());
             }
             _ => {}
         }
     }
+
+    // If presence failed on the initial task, inject the task directly into
+    // the task channel so the agent loop still runs. The user sees the warning
+    // above and can quit or continue.
+    if let Some(failed_task) = presence_failed_task {
+        let envelope = presence::TaskEnvelope {
+            task: failed_task,
+            force_direct: true,
+            context_hints: vec![],
+        };
+        let _ = fallback_task_tx.send(envelope).await;
+    }
+    drop(fallback_task_tx);
 
     // 9. Main loop: process tasks from presence + user follow-ups
     let mut cumulative_stats = LoopStats::default();
@@ -3883,12 +3904,12 @@ async fn main() -> Result<(), CallerError> {
             let _response_forwarder = tokio::spawn(async move {
                 while let Some(response) = response_rx.recv().await {
                     if !response.is_empty() {
-                        // Use LoopError for errors, ModelResponseDelta for normal responses
                         if response.starts_with("Presence error:") || response.starts_with("Presence provider timed out") {
                             bus_for_responses.send(AppEvent::LoopError(response));
                         } else {
-                            bus_for_responses.send(AppEvent::ModelResponseDelta {
-                                text: format!("\n[Intendant] {}\n", response),
+                            // Log presence response as a visible PresenceLog entry
+                            bus_for_responses.send(AppEvent::PresenceLog {
+                                message: response,
                             });
                             // Reset to follow-up phase after presence responds
                             bus_for_responses.send(AppEvent::RoundComplete {
