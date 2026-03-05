@@ -41,7 +41,7 @@ src/
         ├── project.rs       # Project detection (git root), config parsing (intendant.toml + [approval] + [[mcp_servers]] + [sandbox])
         ├── autonomy.rs      # Autonomy levels, action categories, approval rules, command classification
         ├── control.rs       # Unix control socket server (JSON-line protocol at /tmp/intendant-<pid>.sock)
-        ├── frontend.rs      # Shared frontend contract for TUI and MCP (UserAction enum, state queries)
+        ├── frontend.rs      # Shared frontend contract for TUI and MCP (UserAction enum, state queries, StatusSnapshot, ModelUsageSnapshot)
         ├── tools.rs         # Native tool definitions (11 tools), provider format conversion, extra tool registration for MCP client
         ├── tool_batch.rs    # Tool call batch assembly/disassembly: separates runtime vs caller-handled vs MCP tool calls, maps results back to per-tool responses
         ├── mcp.rs           # MCP server implementation (rmcp-based, stdio transport, hot-reload)
@@ -125,7 +125,7 @@ Test coverage includes:
 - **caller/provider.rs**: Provider selection, token usage parsing, context window defaults, Responses API types, structured output, reasoning controls, role mapping, rate-limit retry, API key masking, SSE parsing, streaming events, shared message builders
 - **caller/error.rs**: Display formatting, type conversions (including Tui variant)
 - **caller/autonomy.rs**: Autonomy levels (display, parse, cycle), action categories, approval rules, needs_approval logic, command classification (exec, destructive, network, file write, askHuman, browse), batch classification
-- **caller/control.rs**: Socket path, outbound event serialization, broadcast, server lifecycle
+- **caller/control.rs**: Socket path, outbound event serialization (including usage/usage_update), broadcast, server lifecycle
 - **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses, follow-up input), event dispatch (all AppEvent variants including OrchestratorProgress, ModelResponseDelta, RoundComplete), bottom panel heights, model summary formatting (exec, edit, multiple commands, done signal, askHuman, invalid JSON), streaming buffer accumulation
 - **caller/tui/event.rs**: EventBus send/receive/clone, ControlMsg deserialization (all variants), serialization roundtrip, ApprovalResponse variants
 - **caller/tui/layout.rs**: Layout calculation (all panel combos, with/without bottom panel, hidden panels, small terminal)
@@ -136,7 +136,7 @@ Test coverage includes:
 - **caller/session_log.rs**: UUID-based session directories, session metadata (write_meta, find_latest_session, find_session_by_id), directory structure creation, JSONL event validity, turn tracking, model response file creation, agent input pretty-printing, agent output file creation (stdout/stderr split), approval log searchability, JSON extraction logging, summary file creation, multi-turn file separation, messages input logging, reasoning content logging (full and summary-only)
 - **caller/tools.rs**: Tool definitions, provider format conversion, tool count validation
 - **caller/tool_batch.rs** (tests in caller/main.rs): Batch assembly from tool calls (single exec, signal_done, manage_context, mixed tools, unknown tools, duplicate nonce detection, tool name mapping), result routing
-- **caller/frontend.rs**: UserAction enum completeness, state query types, log level parsing
+- **caller/frontend.rs**: UserAction enum completeness, state query types, log level parsing, StatusSnapshot/ModelUsageSnapshot/UsageSnapshot serialization
 - **caller/vision.rs**: Xvfb display configuration per provider, dynamic display allocation with :99 preference and orphan reclaim, x11vnc co-process launch, VNC port tracking, display accessibility probe
 - **caller/mcp.rs**: MCP state management, process_action_sync, resource definitions, tool parameter schemas, event-to-state mappings
 - **caller/mcp_client.rs**: Tool name parsing (`mcp__<server>_<tool>`), routing validation, connection lifecycle
@@ -210,7 +210,7 @@ Commands are classified into categories (FileRead, FileWrite, FileDelete, Comman
 
 ### Control Socket
 
-A Unix socket server at `/tmp/intendant-<pid>.sock` enables programmatic control. JSON-line protocol supports: status, approve, deny, input, set_autonomy, quit. Outbound events are broadcast to all connected clients.
+A Unix socket server at `/tmp/intendant-<pid>.sock` enables programmatic control. JSON-line protocol supports: status, usage, approve, deny, input, set_autonomy, quit. Outbound events are broadcast to all connected clients. The `status` event includes `session_id` and `task`. The `usage` command returns per-model token usage (`ModelUsageSnapshot` for main and optional presence). A `usage_update` event is broadcast after each agent turn with current token consumption.
 
 ### MCP Hot Reload
 

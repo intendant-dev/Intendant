@@ -24,6 +24,7 @@ intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
   +--> Prompt caching:  Anthropic cache_control, OpenAI/Gemini implicit caching
   +--> Auto-compaction: triggers at 90% context usage, preserves system+tail messages
   +--> Optional control socket (--control-socket): /tmp/intendant-<pid>.sock (JSON-line protocol)
+  |       status (with session_id, task), usage, usage_update events
   +--> Live gateway (--live): WebSocket + Gemini Live / OpenAI Realtime APIs for voice/text control
   +--> Token budget tracking (context-window-aware loop termination)
   +--> Sub-agent spawning via env vars (INTENDANT_ROLE, INTENDANT_ID, etc.)

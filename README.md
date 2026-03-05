@@ -5,36 +5,24 @@ A Rust runtime for autonomous AI agents with process lifecycle management. Inten
 ## Architecture
 
 ```
-stdin (JSON) --> intendant-runtime --> executes commands sequentially (blocking)
-                  |
-                  +--> in-memory process state (HashMap<nonce, ProcessInfo>)
-                  +--> $INTENDANT_LOG_DIR/  (stdout/stderr logs per nonce)
-                  |
-                  +--> stdout (result lines with exit code, stdout/stderr tail)
-
-intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
-  |
-  +--> User Mode:       spawns orchestrator subprocess, monitors progress (no API calls)
-  +--> Sub-Agent Mode:  scoped task, writes results/progress, isolated context
-  +--> Direct Mode:     single-loop execution for simple tasks
-  |
-  +--> Native tool calling (OpenAI/Anthropic/Gemini) with text extraction fallback
-  +--> Streaming output:  SSE-based token streaming for all 3 providers
-  +--> Ratatui TUI:     status bar, scrollable log, approval panel, askHuman input
-  +--> MCP Server:      --mcp flag, stdio transport, full parity with TUI (tools + resources)
-  +--> MCP Client:      connects to external MCP servers (configured in intendant.toml)
-  +--> Autonomy system: Low/Medium/High/Full + per-category rules from intendant.toml
-  +--> Landlock sandbox: filesystem restrictions on agent runtime (Linux)
-  +--> Prompt caching:  Anthropic cache_control, OpenAI/Gemini implicit caching
-  +--> Auto-compaction: triggers at 90% context usage, preserves system+tail messages
-  +--> Optional control socket (--control-socket): /tmp/intendant-<pid>.sock (JSON-line protocol)
-  +--> Live gateway (--live): WebSocket + Gemini Live / OpenAI Realtime APIs for voice/text control
-  +--> Token budget tracking (context-window-aware loop termination)
-  +--> Sub-agent spawning via env vars (INTENDANT_ROLE, INTENDANT_ID, etc.)
-  +--> Git worktree isolation for implementation agents
-  +--> Tagged knowledge store with pub/sub channels between agents
-  +--> Presence layer: conversational mediator between user and agent loop
+                          ┌─────────────────────────────┐
+                          │     intendant (caller)       │
+                          │                             │
+  TUI / MCP / Live ◄─────┤  presence ── agent loop ──┐ │
+                          │     │           │         │ │
+                          │     │      ┌────┴────┐    │ │
+                          │     │      │ sub-agents│   │ │
+                          │     │      └─────────┘    │ │
+                          └─────┼─────────────────────┼─┘
+                                │                     │
+                                v                     v
+                          Model APIs           intendant-runtime
+                     (OpenAI/Anthropic/        (sequential command
+                      Gemini + streaming)       execution, stdin/stdout)
 ```
+
+**Presence layer** mediates between the user and agent loop — handles conversation, dispatches tasks, narrates events.
+Three execution modes: *direct* (single agent), *user* (orchestrator + sub-agents), *sub-agent* (scoped child task).
 
 ## Quick Start
 
@@ -59,6 +47,9 @@ echo 'OPENAI_API_KEY=sk-...' > .env
 
 # Run as MCP server
 ./target/release/intendant --mcp "Deploy the application"
+
+# Live gateway (voice/text from browser)
+./target/release/intendant --live
 ```
 
 ## Testing
