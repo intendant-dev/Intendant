@@ -4,7 +4,7 @@ use crate::tui::event::{AppEvent, ApprovalResponse, ControlMsg};
 use crate::tui::layout::PanelConfig;
 use chrono::Local;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use tokio::sync::oneshot;
 
 const MAX_LOG_ENTRIES: usize = 10_000;
@@ -43,6 +43,48 @@ pub enum LogLevel {
     Warn,
     SubAgent,
     Debug,
+}
+
+/// Which subsystem produced a log entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSource {
+    System,
+    Agent,
+    Presence,
+}
+
+/// Which log tab is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogTab {
+    All,
+    Agent,
+    Presence,
+}
+
+impl LogTab {
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Agent,
+            Self::Agent => Self::Presence,
+            Self::Presence => Self::All,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Agent => "Agent",
+            Self::Presence => "Presence",
+        }
+    }
+
+    pub fn includes(self, source: LogSource) -> bool {
+        match self {
+            Self::All => true,
+            Self::Agent => source != LogSource::Presence,
+            Self::Presence => source != LogSource::Agent,
+        }
+    }
 }
 
 /// Log verbosity profile.
@@ -96,6 +138,8 @@ pub struct LogEntry {
     pub ts: String,
     pub level: LogLevel,
     pub content: String,
+    pub source: LogSource,
+    pub turn: Option<usize>,
 }
 
 /// Pending approval waiting for user response.
@@ -115,6 +159,9 @@ pub struct App {
     pub auto_scroll: bool,
     pub verbosity: Verbosity,
     pub inspect_index: Option<usize>,
+    pub log_tab: LogTab,
+    pub expanded_turns: HashSet<usize>,
+    pub focused_line: Option<usize>,
 
     // Status
     pub provider_name: String,
@@ -191,6 +238,9 @@ impl App {
             auto_scroll: true,
             verbosity: Verbosity::Normal,
             inspect_index: None,
+            log_tab: LogTab::All,
+            expanded_turns: HashSet::new(),
+            focused_line: None,
             provider_name,
             model_name,
             turn: 0,
@@ -328,6 +378,16 @@ impl App {
     }
 
     pub fn log(&mut self, level: LogLevel, content: String) {
+        self.log_sourced(level, content, LogSource::System, None);
+    }
+
+    pub fn log_sourced(
+        &mut self,
+        level: LogLevel,
+        content: String,
+        source: LogSource,
+        turn: Option<usize>,
+    ) {
         if self.log_entries.len() >= MAX_LOG_ENTRIES {
             self.log_entries.pop_front();
         }
@@ -335,6 +395,8 @@ impl App {
             ts: Local::now().format("%H:%M:%S").to_string(),
             level,
             content,
+            source,
+            turn,
         });
         if self.auto_scroll {
             self.scroll_to_bottom();
@@ -345,7 +407,34 @@ impl App {
         self.log_entries
             .iter()
             .enumerate()
-            .filter_map(|(idx, entry)| self.verbosity.includes(&entry.level).then_some(idx))
+            .filter_map(|(idx, entry)| {
+                if !self.verbosity.includes(&entry.level) {
+                    return None;
+                }
+                if !self.log_tab.includes(entry.source) {
+                    return None;
+                }
+                // Turn grouping: if entry belongs to a collapsed turn, hide it
+                // unless it's the first entry of that turn (the summary line).
+                if let Some(t) = entry.turn {
+                    if !self.expanded_turns.contains(&t) {
+                        // Find the first visible entry for this turn
+                        let dominated = self
+                            .log_entries
+                            .iter()
+                            .take(idx)
+                            .any(|e| {
+                                e.turn == Some(t)
+                                    && self.verbosity.includes(&e.level)
+                                    && self.log_tab.includes(e.source)
+                            });
+                        if dominated {
+                            return None;
+                        }
+                    }
+                }
+                Some(idx)
+            })
             .collect()
     }
 
@@ -398,7 +487,16 @@ impl App {
             }
             AppMode::AskHuman => 5,
             AppMode::FollowUp => 5,
-            _ => 0,
+            _ => {
+                // Show a slim reminder bar when browsing during follow-up
+                if self.current_phase == Phase::WaitingFollowUp
+                    && self.follow_up_textarea.is_some()
+                {
+                    3
+                } else {
+                    0
+                }
+            }
         }
     }
 
@@ -435,12 +533,33 @@ impl App {
                 self.clamp_view_to_filtered();
                 true
             }
-            KeyCode::Char('i') | KeyCode::Enter => {
+            KeyCode::Char('i') => {
                 if self.open_inspect_mode() {
                     true
                 } else {
                     false
                 }
+            }
+            KeyCode::Char('f') => {
+                // Re-open follow-up input if a round is waiting
+                if self.current_phase == Phase::WaitingFollowUp
+                    && self.follow_up_textarea.is_some()
+                {
+                    self.mode = AppMode::FollowUp;
+                    true
+                } else {
+                    false
+                }
+            }
+            // Enter or Right arrow: toggle turn expansion on the focused entry
+            KeyCode::Enter | KeyCode::Right => {
+                self.toggle_focused_turn_expand();
+                true
+            }
+            // Left arrow: collapse focused turn
+            KeyCode::Left => {
+                self.collapse_focused_turn();
+                true
             }
             KeyCode::Char('?') => {
                 self.mode = AppMode::Help;
@@ -452,6 +571,27 @@ impl App {
             }
             KeyCode::Char('-') => {
                 self.cycle_autonomy_down();
+                true
+            }
+            // Tab: cycle log tab
+            KeyCode::Tab => {
+                self.log_tab = self.log_tab.next();
+                self.clamp_view_to_filtered();
+                true
+            }
+            KeyCode::Char('1') => {
+                self.log_tab = LogTab::All;
+                self.clamp_view_to_filtered();
+                true
+            }
+            KeyCode::Char('2') => {
+                self.log_tab = LogTab::Agent;
+                self.clamp_view_to_filtered();
+                true
+            }
+            KeyCode::Char('3') => {
+                self.log_tab = LogTab::Presence;
+                self.clamp_view_to_filtered();
                 true
             }
             KeyCode::Up => {
@@ -480,6 +620,39 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// Toggle expand/collapse for the turn of the currently focused log entry.
+    fn toggle_focused_turn_expand(&mut self) {
+        if let Some(turn) = self.focused_turn() {
+            if self.expanded_turns.contains(&turn) {
+                self.expanded_turns.remove(&turn);
+            } else {
+                self.expanded_turns.insert(turn);
+            }
+            self.clamp_view_to_filtered();
+        }
+    }
+
+    /// Collapse the turn of the currently focused log entry.
+    fn collapse_focused_turn(&mut self) {
+        if let Some(turn) = self.focused_turn() {
+            self.expanded_turns.remove(&turn);
+            self.clamp_view_to_filtered();
+        }
+    }
+
+    /// Whether we're browsing the log but a follow-up is still pending.
+    pub fn is_follow_up_browsing(&self) -> bool {
+        self.mode != AppMode::FollowUp
+            && self.current_phase == Phase::WaitingFollowUp
+            && self.follow_up_textarea.is_some()
+    }
+
+    /// Get the turn number of the currently focused log entry.
+    fn focused_turn(&self) -> Option<usize> {
+        let idx = self.focus_index()?;
+        self.log_entries.get(idx).and_then(|e| e.turn)
     }
 
     fn handle_inspect_key(&mut self, key: KeyEvent) -> bool {
@@ -532,7 +705,7 @@ impl App {
         self.scroll_offset = self.scroll_offset.min(total.saturating_sub(1));
     }
 
-    fn focus_index(&self) -> Option<usize> {
+    pub fn focus_index(&self) -> Option<usize> {
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
             return None;
@@ -691,11 +864,10 @@ impl App {
                 true
             }
             KeyCode::Esc => {
-                // Cancel follow-up, end session
-                self.follow_up_textarea = None;
-                self.follow_up_tx = None;
+                // Temporarily leave follow-up input to browse the log.
+                // The follow-up panel hides but the session stays alive.
+                // Press 'f' in Normal mode to re-open the follow-up input.
                 self.mode = AppMode::Normal;
-                self.current_phase = Phase::Done;
                 true
             }
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -947,9 +1119,11 @@ impl App {
                 self.budget_pct = budget_pct;
                 self.current_phase = Phase::Thinking;
                 self.broadcast_control(OutboundEvent::TurnStarted { turn, budget_pct });
-                self.log(
+                self.log_sourced(
                     LogLevel::Debug,
                     format!("Turn {} started ({:.0}% budget)", turn, budget_pct),
+                    LogSource::Agent,
+                    Some(turn),
                 );
             }
             AppEvent::ModelResponse {
@@ -964,29 +1138,58 @@ impl App {
                 self.broadcast_usage_update();
                 // Show human-readable command summary at Model level (visible at Normal verbosity)
                 let summary = format_model_summary(&content);
-                self.log(LogLevel::Model, format!("T{}: {}", turn, summary));
+                self.log_sourced(
+                    LogLevel::Model,
+                    format!("T{}: {}", turn, summary),
+                    LogSource::Agent,
+                    Some(turn),
+                );
                 if let Some(ref reasoning_text) = reasoning {
-                    self.log(LogLevel::Model, format!("Reasoning: {}", reasoning_text));
+                    self.log_sourced(
+                        LogLevel::Model,
+                        format!("Reasoning: {}", reasoning_text),
+                        LogSource::Agent,
+                        Some(turn),
+                    );
                 }
-                self.log(
+                self.log_sourced(
                     LogLevel::Info,
                     format!(
                         "tokens: prompt={} completion={} total={}",
                         usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
                     ),
+                    LogSource::Agent,
+                    Some(turn),
                 );
-                self.log(LogLevel::Debug, format!("Raw model response: {}", content));
+                self.log_sourced(
+                    LogLevel::Debug,
+                    format!("Raw model response: {}", content),
+                    LogSource::Agent,
+                    Some(turn),
+                );
             }
             AppEvent::ModelResponseDelta { text } => {
                 // Accumulate streaming text; shown at Debug level to avoid noise
                 self.streaming_buffer.push_str(&text);
             }
             AppEvent::JsonExtracted { preview } => {
-                self.log(LogLevel::Debug, format!("JSON: {}", preview));
+                let t = self.turn;
+                self.log_sourced(
+                    LogLevel::Debug,
+                    format!("JSON: {}", preview),
+                    LogSource::Agent,
+                    if t > 0 { Some(t) } else { None },
+                );
             }
             AppEvent::DoneSignal { message } => {
                 if let Some(msg) = message {
-                    self.log(LogLevel::Info, msg);
+                    let t = self.turn;
+                    self.log_sourced(
+                        LogLevel::Info,
+                        msg,
+                        LogSource::Agent,
+                        if t > 0 { Some(t) } else { None },
+                    );
                 }
                 self.current_phase = Phase::Done;
             }
@@ -995,9 +1198,11 @@ impl App {
                 commands_preview,
             } => {
                 self.current_phase = Phase::RunningAgent;
-                self.log(
+                self.log_sourced(
                     LogLevel::Debug,
                     format!("Agent running (turn {}): {}", turn, commands_preview),
+                    LogSource::Agent,
+                    Some(turn),
                 );
             }
             AppEvent::AgentOutput { stdout, stderr } => {
@@ -1005,19 +1210,31 @@ impl App {
                     stdout: stdout.clone(),
                     stderr: stderr.clone(),
                 });
+                let t = self.turn;
+                let turn_opt = if t > 0 { Some(t) } else { None };
                 if !stdout.is_empty() {
                     for line in stdout.lines() {
-                        self.log(LogLevel::Agent, line.to_string());
+                        self.log_sourced(
+                            LogLevel::Agent,
+                            line.to_string(),
+                            LogSource::Agent,
+                            turn_opt,
+                        );
                     }
                 }
                 if !stderr.is_empty() {
                     for line in stderr.lines() {
-                        self.log(LogLevel::Warn, format!("stderr: {}", line));
+                        self.log_sourced(
+                            LogLevel::Warn,
+                            format!("stderr: {}", line),
+                            LogSource::Agent,
+                            turn_opt,
+                        );
                     }
                 }
             }
             AppEvent::SubAgentResult { formatted } => {
-                self.log(LogLevel::SubAgent, formatted);
+                self.log_sourced(LogLevel::SubAgent, formatted, LogSource::Agent, None);
             }
             AppEvent::OrchestratorProgress {
                 turn,
@@ -1031,12 +1248,14 @@ impl App {
                 } else {
                     format!("Orchestrator T{}: {} — {}", turn, status, last_action)
                 };
-                self.log(LogLevel::SubAgent, summary);
+                self.log_sourced(LogLevel::SubAgent, summary, LogSource::Agent, Some(turn));
             }
             AppEvent::ContextManagement { turn } => {
-                self.log(
+                self.log_sourced(
                     LogLevel::Debug,
                     format!("Context management (turn {})", turn),
+                    LogSource::Agent,
+                    Some(turn),
                 );
             }
             AppEvent::TaskComplete { reason } => {
@@ -1070,7 +1289,12 @@ impl App {
                 self.current_phase = Phase::Done;
             }
             AppEvent::PresenceLog { message } => {
-                self.log(LogLevel::Info, format!("[presence] {}", message));
+                self.log_sourced(
+                    LogLevel::Info,
+                    format!("[presence] {}", message),
+                    LogSource::Presence,
+                    None,
+                );
             }
             AppEvent::HumanQuestionDetected { question } => {
                 self.human_question = Some(question.clone());
@@ -1101,13 +1325,16 @@ impl App {
                     category: category.to_string(),
                     responder,
                 });
-                self.log(
+                let t = self.turn;
+                self.log_sourced(
                     LogLevel::Warn,
                     format!(
                         "Approval needed [{}]: {}",
                         category,
                         truncate_str(&command_preview, 80)
                     ),
+                    LogSource::Agent,
+                    if t > 0 { Some(t) } else { None },
                 );
                 self.broadcast_control(OutboundEvent::ApprovalRequired {
                     id,
@@ -1118,7 +1345,13 @@ impl App {
                 self.handle_control_command(msg);
             }
             AppEvent::AutoApproved { preview } => {
-                self.log(LogLevel::Info, format!("auto-approved: {}", preview));
+                let t = self.turn;
+                self.log_sourced(
+                    LogLevel::Info,
+                    format!("auto-approved: {}", preview),
+                    LogSource::Agent,
+                    if t > 0 { Some(t) } else { None },
+                );
             }
             AppEvent::RoundComplete {
                 round,
@@ -1137,7 +1370,7 @@ impl App {
                 self.log(
                     LogLevel::Info,
                     format!(
-                        "Round {} complete ({} turns). Enter follow-up or q to quit.",
+                        "Round {} complete ({} turns). Press f to write a follow-up, q to quit.",
                         round, turns_in_round
                     ),
                 );
@@ -1822,5 +2055,202 @@ mod tests {
             reasoning: None,
         });
         assert!(app.streaming_buffer.is_empty());
+    }
+
+    // --- LogSource and LogTab tests ---
+
+    #[test]
+    fn log_tab_cycle() {
+        assert_eq!(LogTab::All.next(), LogTab::Agent);
+        assert_eq!(LogTab::Agent.next(), LogTab::Presence);
+        assert_eq!(LogTab::Presence.next(), LogTab::All);
+    }
+
+    #[test]
+    fn log_tab_includes() {
+        assert!(LogTab::All.includes(LogSource::Agent));
+        assert!(LogTab::All.includes(LogSource::Presence));
+        assert!(LogTab::All.includes(LogSource::System));
+
+        assert!(LogTab::Agent.includes(LogSource::Agent));
+        assert!(LogTab::Agent.includes(LogSource::System));
+        assert!(!LogTab::Agent.includes(LogSource::Presence));
+
+        assert!(LogTab::Presence.includes(LogSource::Presence));
+        assert!(LogTab::Presence.includes(LogSource::System));
+        assert!(!LogTab::Presence.includes(LogSource::Agent));
+    }
+
+    #[test]
+    fn log_sourced_tags_entries() {
+        let mut app = test_app();
+        app.log_sourced(
+            LogLevel::Model,
+            "T1: exec: ls".to_string(),
+            LogSource::Agent,
+            Some(1),
+        );
+        app.log_sourced(
+            LogLevel::Info,
+            "[presence] tool call".to_string(),
+            LogSource::Presence,
+            None,
+        );
+        assert_eq!(app.log_entries[0].source, LogSource::Agent);
+        assert_eq!(app.log_entries[0].turn, Some(1));
+        assert_eq!(app.log_entries[1].source, LogSource::Presence);
+        assert_eq!(app.log_entries[1].turn, None);
+    }
+
+    #[test]
+    fn filtered_indices_respects_tab() {
+        let mut app = test_app();
+        app.log_sourced(
+            LogLevel::Model,
+            "agent msg".to_string(),
+            LogSource::Agent,
+            Some(1),
+        );
+        app.log_sourced(
+            LogLevel::Info,
+            "presence msg".to_string(),
+            LogSource::Presence,
+            None,
+        );
+        app.log_sourced(
+            LogLevel::Info,
+            "system msg".to_string(),
+            LogSource::System,
+            None,
+        );
+
+        app.log_tab = LogTab::All;
+        assert_eq!(app.filtered_indices().len(), 3);
+
+        app.log_tab = LogTab::Agent;
+        let indices = app.filtered_indices();
+        assert_eq!(indices.len(), 2); // agent + system
+        assert_eq!(app.log_entries[indices[0]].source, LogSource::Agent);
+        assert_eq!(app.log_entries[indices[1]].source, LogSource::System);
+
+        app.log_tab = LogTab::Presence;
+        let indices = app.filtered_indices();
+        assert_eq!(indices.len(), 2); // presence + system
+        assert_eq!(app.log_entries[indices[0]].source, LogSource::Presence);
+        assert_eq!(app.log_entries[indices[1]].source, LogSource::System);
+    }
+
+    #[test]
+    fn turn_collapse_hides_subsequent_entries() {
+        let mut app = test_app();
+        // Add 3 entries for turn 1 (all visible at Normal verbosity)
+        app.log_sourced(
+            LogLevel::Model,
+            "T1: exec: ls".to_string(),
+            LogSource::Agent,
+            Some(1),
+        );
+        app.log_sourced(
+            LogLevel::Info,
+            "tokens: 100".to_string(),
+            LogSource::Agent,
+            Some(1),
+        );
+        app.log_sourced(
+            LogLevel::Warn,
+            "Approval needed".to_string(),
+            LogSource::Agent,
+            Some(1),
+        );
+        // Add 1 system entry (no turn)
+        app.log(LogLevel::Info, "system msg".to_string());
+
+        // By default, turn 1 is collapsed: only first entry of turn + system
+        assert!(!app.expanded_turns.contains(&1));
+        let indices = app.filtered_indices();
+        assert_eq!(indices.len(), 2); // first turn entry + system entry
+        assert_eq!(app.log_entries[indices[0]].content, "T1: exec: ls");
+        assert_eq!(app.log_entries[indices[1]].content, "system msg");
+
+        // Expand turn 1: all entries visible
+        app.expanded_turns.insert(1);
+        let indices = app.filtered_indices();
+        assert_eq!(indices.len(), 4); // all 3 turn entries + system
+    }
+
+    #[test]
+    fn toggle_focused_turn_expand() {
+        let mut app = test_app();
+        app.log_sourced(
+            LogLevel::Model,
+            "T1: exec: ls".to_string(),
+            LogSource::Agent,
+            Some(1),
+        );
+        app.log_sourced(
+            LogLevel::Info,
+            "tokens: 100".to_string(),
+            LogSource::Agent,
+            Some(1),
+        );
+        // Focus on first entry
+        app.auto_scroll = true;
+
+        // Toggle expand
+        app.toggle_focused_turn_expand();
+        assert!(app.expanded_turns.contains(&1));
+
+        // Toggle collapse
+        app.toggle_focused_turn_expand();
+        assert!(!app.expanded_turns.contains(&1));
+    }
+
+    #[test]
+    fn tab_switch_keys() {
+        let mut app = test_app();
+        assert_eq!(app.log_tab, LogTab::All);
+
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        app.handle_key(tab);
+        assert_eq!(app.log_tab, LogTab::Agent);
+
+        let key2 = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE);
+        app.handle_key(key2);
+        assert_eq!(app.log_tab, LogTab::Presence);
+
+        let key1 = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
+        app.handle_key(key1);
+        assert_eq!(app.log_tab, LogTab::All);
+    }
+
+    #[test]
+    fn model_response_tagged_as_agent_source() {
+        let mut app = test_app();
+        app.handle_event(AppEvent::ModelResponse {
+            turn: 2,
+            content: r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}]}"#
+                .to_string(),
+            usage: crate::provider::TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                total_tokens: 120,
+            },
+            reasoning: None,
+        });
+        // All entries from ModelResponse should be Agent source with turn 2
+        for entry in &app.log_entries {
+            assert_eq!(entry.source, LogSource::Agent);
+            assert_eq!(entry.turn, Some(2));
+        }
+    }
+
+    #[test]
+    fn presence_log_tagged_as_presence_source() {
+        let mut app = test_app();
+        app.handle_event(AppEvent::PresenceLog {
+            message: "Tool call: recall_memory".to_string(),
+        });
+        assert_eq!(app.log_entries.len(), 1);
+        assert_eq!(app.log_entries[0].source, LogSource::Presence);
     }
 }
