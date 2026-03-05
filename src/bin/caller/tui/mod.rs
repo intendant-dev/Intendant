@@ -83,7 +83,11 @@ impl Tui {
                     app::AppMode::FollowUp => {
                         widgets::render_follow_up_panel(f, bottom_area, app);
                     }
-                    _ => {}
+                    _ => {
+                        if app.is_follow_up_browsing() {
+                            widgets::render_follow_up_reminder(f, bottom_area, app);
+                        }
+                    }
                 }
             }
 
@@ -303,6 +307,36 @@ mod tests {
                 if let Some(log_area) = app_layout.log_panel {
                     widgets::render_log_panel(f, log_area, &app);
                 }
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn render_follow_up_reminder_bar() {
+        let mut terminal = test_terminal();
+        let mut app = test_app();
+        app.current_phase = app::Phase::WaitingFollowUp;
+        app.mode = app::AppMode::FollowUp;
+        // Simulate RoundComplete setting up textarea
+        let textarea = tui_textarea::TextArea::default();
+        app.follow_up_textarea = Some(textarea);
+        app.round = 1;
+
+        // Press Escape to enter browsing mode
+        app.mode = app::AppMode::Normal;
+
+        assert!(app.is_follow_up_browsing());
+        assert_eq!(app.bottom_panel_height(), 3);
+
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                let bottom_height = app.bottom_panel_height();
+                let app_layout = layout::calculate_layout(area, &app.panels, bottom_height);
+                assert!(app_layout.bottom_panel.is_some());
+                let bottom_area = app_layout.bottom_panel.unwrap();
+                assert_eq!(bottom_area.height, 3);
+                widgets::render_follow_up_reminder(f, bottom_area, &app);
             })
             .unwrap();
     }

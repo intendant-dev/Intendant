@@ -1,7 +1,7 @@
-use crate::tui::app::{App, AppMode, LogEntry, LogLevel, Phase};
+use crate::tui::app::{App, AppMode, LogEntry, LogLevel, LogTab, Phase};
 use crate::tui::theme;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
@@ -182,11 +182,7 @@ pub fn render_action_panel(f: &mut Frame, area: Rect, app: &App) {
 /// Render the log panel (scrollable).
 pub fn render_log_panel(f: &mut Frame, area: Rect, app: &App) {
     let visible_height = area.height.saturating_sub(2) as usize; // minus borders
-    let filtered: Vec<&LogEntry> = app
-        .log_entries
-        .iter()
-        .filter(|entry| app.verbosity.includes(&entry.level))
-        .collect();
+    let filtered = app.filtered_indices();
     let total = filtered.len();
     let scroll_offset = if app.auto_scroll {
         total.saturating_sub(visible_height)
@@ -194,13 +190,23 @@ pub fn render_log_panel(f: &mut Frame, area: Rect, app: &App) {
         app.scroll_offset.min(total.saturating_sub(1))
     };
 
-    let lines: Vec<Line> = app
-        .log_entries
+    // Determine which filtered position is focused for highlight
+    let focus_raw = app.focus_index();
+    let focus_filtered_pos = focus_raw
+        .and_then(|raw| filtered.iter().position(|&i| i == raw));
+
+    let lines: Vec<Line> = filtered
         .iter()
-        .filter(|entry| app.verbosity.includes(&entry.level))
         .skip(scroll_offset)
         .take(visible_height)
-        .map(format_log_entry)
+        .enumerate()
+        .map(|(vis_pos, &raw_idx)| {
+            let entry = &app.log_entries[raw_idx];
+            let is_focused = focus_filtered_pos
+                .map(|fp| fp == scroll_offset + vis_pos)
+                .unwrap_or(false);
+            format_log_entry_with_turn(entry, &app.expanded_turns, is_focused)
+        })
         .collect();
 
     let scroll_info = if total > visible_height {
@@ -210,15 +216,13 @@ pub fn render_log_panel(f: &mut Frame, area: Rect, app: &App) {
         String::new()
     };
 
+    // Build tab title: " Log [All | Agent | Presence] "
+    let tab_title = build_tab_title(app.log_tab);
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::LOG_DIM_FG))
-        .title(Span::styled(
-            " Log ",
-            Style::default()
-                .fg(theme::LOG_FG)
-                .add_modifier(Modifier::BOLD),
-        ))
+        .title(tab_title)
         .title_bottom(Span::styled(
             scroll_info,
             Style::default().fg(theme::LOG_DIM_FG),
@@ -250,7 +254,66 @@ pub fn render_log_panel(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn format_log_entry(entry: &LogEntry) -> Line<'static> {
+/// Build the tab title spans for the log panel.
+fn build_tab_title(active: LogTab) -> Line<'static> {
+    use LogTab::*;
+    let tabs = [All, Agent, Presence];
+    let mut spans = vec![Span::styled(
+        " Log ",
+        Style::default()
+            .fg(theme::LOG_FG)
+            .add_modifier(Modifier::BOLD),
+    )];
+    for (i, tab) in tabs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("|", Style::default().fg(theme::LOG_DIM_FG)));
+        }
+        let label = tab.label();
+        if *tab == active {
+            spans.push(Span::styled(
+                label.to_string(),
+                Style::default()
+                    .fg(theme::HELP_KEY_FG)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                label.to_string(),
+                Style::default().fg(theme::LOG_DIM_FG),
+            ));
+        }
+    }
+    spans.push(Span::styled(" ", Style::default()));
+    Line::from(spans)
+}
+
+/// Format a log entry with turn collapse/expand indicator and optional focus highlight.
+fn format_log_entry_with_turn(
+    entry: &LogEntry,
+    expanded_turns: &std::collections::HashSet<usize>,
+    is_focused: bool,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+
+    // Turn indicator prefix
+    if let Some(t) = entry.turn {
+        let expanded = expanded_turns.contains(&t);
+        let marker = if expanded { "▾ " } else { "▸ " };
+        spans.push(Span::styled(
+            marker.to_string(),
+            Style::default().fg(theme::STATUS_TURN_FG),
+        ));
+    } else {
+        spans.push(Span::styled("  ", Style::default()));
+    }
+
+    // Timestamp
+    spans.push(Span::styled(
+        format!("{} ", entry.ts),
+        Style::default().fg(theme::LOG_DIM_FG),
+    ));
+
+    // Level indicator
     let level_span = match entry.level {
         LogLevel::Info => Span::styled("  ", Style::default().fg(theme::LOG_FG)),
         LogLevel::Model => Span::styled("M ", Style::default().fg(theme::LOG_MODEL_FG)),
@@ -260,7 +323,9 @@ fn format_log_entry(entry: &LogEntry) -> Line<'static> {
         LogLevel::SubAgent => Span::styled("S ", Style::default().fg(theme::LOG_SUBAGENT_FG)),
         LogLevel::Debug => Span::styled("D ", Style::default().fg(theme::LOG_DIM_FG)),
     };
+    spans.push(level_span);
 
+    // Content
     let content_color = match entry.level {
         LogLevel::Info => theme::LOG_FG,
         LogLevel::Model => theme::LOG_MODEL_FG,
@@ -270,15 +335,21 @@ fn format_log_entry(entry: &LogEntry) -> Line<'static> {
         LogLevel::SubAgent => theme::LOG_SUBAGENT_FG,
         LogLevel::Debug => theme::LOG_DIM_FG,
     };
+    spans.push(Span::styled(
+        entry.content.clone(),
+        Style::default().fg(content_color),
+    ));
 
-    Line::from(vec![
-        Span::styled(
-            format!("{} ", entry.ts),
-            Style::default().fg(theme::LOG_DIM_FG),
-        ),
-        level_span,
-        Span::styled(entry.content.clone(), Style::default().fg(content_color)),
-    ])
+    let mut line = Line::from(spans);
+    if is_focused {
+        // Subtle background highlight for focused entry
+        line = line.style(Style::default().bg(Color::Rgb(40, 42, 60)));
+    }
+    line
+}
+
+fn format_log_entry(entry: &LogEntry) -> Line<'static> {
+    format_log_entry_with_turn(entry, &std::collections::HashSet::new(), false)
 }
 
 /// Render inspect overlay for one focused log entry.
@@ -489,12 +560,63 @@ pub fn render_follow_up_panel(f: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+/// Render a slim reminder bar when the follow-up input is hidden but the session is still waiting.
+pub fn render_follow_up_reminder(f: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::INPUT_QUESTION_FG))
+        .style(Style::default().bg(theme::INPUT_BG));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let line = Line::from(vec![
+        Span::styled(
+            " Press ",
+            Style::default().fg(theme::LOG_DIM_FG),
+        ),
+        Span::styled(
+            "f",
+            Style::default()
+                .fg(theme::HELP_KEY_FG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" to write a follow-up (round {}), ", app.round),
+            Style::default().fg(theme::LOG_DIM_FG),
+        ),
+        Span::styled(
+            "q",
+            Style::default()
+                .fg(theme::HELP_KEY_FG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " to quit",
+            Style::default().fg(theme::LOG_DIM_FG),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().bg(theme::INPUT_BG)),
+        inner,
+    );
+}
+
 /// Render help overlay.
 pub fn render_help_overlay(f: &mut Frame, area: Rect) {
     let help_text = vec![
         ("q / Ctrl-C", "Quit"),
         ("v", "Cycle verbosity profile"),
-        ("i / Enter", "Inspect focused log entry"),
+        ("Tab/1/2/3", "Log tab: All / Agent / Presence"),
+        ("Enter/\u{2192}", "Expand turn details"),
+        ("\u{2190}", "Collapse turn details"),
+        ("i", "Inspect focused log entry"),
+        ("f", "Re-open follow-up input"),
+        ("Esc", "Browse log (hides input panel)"),
         ("Up/Down", "Scroll log"),
         ("PgUp/PgDn", "Scroll log (page)"),
         ("Home/End", "Jump to start/end"),
@@ -531,7 +653,7 @@ pub fn render_help_overlay(f: &mut Frame, area: Rect) {
         .style(Style::default().bg(theme::HELP_BG));
 
     // Center the help overlay
-    let width = 44.min(area.width);
+    let width = 50.min(area.width);
     let height = (help_text.len() as u16 + 2).min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
@@ -599,37 +721,38 @@ mod tests {
         assert_eq!(truncate("hello", 2), "he");
     }
 
+    use crate::tui::app::LogSource;
+
+    fn test_entry(level: LogLevel, content: &str) -> LogEntry {
+        LogEntry {
+            ts: "00:00:00".to_string(),
+            level,
+            content: content.to_string(),
+            source: LogSource::System,
+            turn: None,
+        }
+    }
+
     #[test]
     fn format_log_entry_info() {
-        let entry = LogEntry {
-            ts: "00:00:00".to_string(),
-            level: LogLevel::Info,
-            content: "test message".to_string(),
-        };
+        let entry = test_entry(LogLevel::Info, "test message");
         let line = format_log_entry(&entry);
-        assert_eq!(line.spans.len(), 3);
+        // 4 spans: turn indicator, timestamp, level, content
+        assert_eq!(line.spans.len(), 4);
     }
 
     #[test]
     fn format_log_entry_debug_hidden() {
-        let entry = LogEntry {
-            ts: "00:00:00".to_string(),
-            level: LogLevel::Debug,
-            content: "debug msg".to_string(),
-        };
+        let entry = test_entry(LogLevel::Debug, "debug msg");
         let line = format_log_entry(&entry);
-        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans.len(), 4);
     }
 
     #[test]
     fn format_log_entry_debug_shown() {
-        let entry = LogEntry {
-            ts: "00:00:00".to_string(),
-            level: LogLevel::Debug,
-            content: "debug msg".to_string(),
-        };
+        let entry = test_entry(LogLevel::Debug, "debug msg");
         let line = format_log_entry(&entry);
-        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans.len(), 4);
     }
 
     #[test]
@@ -644,11 +767,7 @@ mod tests {
             LogLevel::Debug,
         ];
         for level in levels {
-            let entry = LogEntry {
-                ts: "00:00:00".to_string(),
-                level,
-                content: "test".to_string(),
-            };
+            let entry = test_entry(level, "test");
             let _ = format_log_entry(&entry);
         }
     }
