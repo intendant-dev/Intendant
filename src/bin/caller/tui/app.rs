@@ -228,6 +228,8 @@ pub struct App {
     pub last_presence_phase: String,
     // Shared agent state snapshot for presence layer status queries (check_status, query_detail)
     pub presence_agent_state: Option<std::sync::Arc<std::sync::Mutex<crate::presence::AgentStateSnapshot>>>,
+    /// Shared flag to pause/resume server-side presence (voice mutual exclusion).
+    pub presence_paused: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 
     // Project paths for query_detail and recall_memory socket commands
     pub project_root: Option<std::path::PathBuf>,
@@ -284,6 +286,7 @@ impl App {
             presence_event_tx: None,
             last_presence_phase: String::new(),
             presence_agent_state: None,
+            presence_paused: None,
             project_root: None,
             knowledge_path: None,
         }
@@ -309,6 +312,10 @@ impl App {
         state: std::sync::Arc<std::sync::Mutex<crate::presence::AgentStateSnapshot>>,
     ) {
         self.presence_agent_state = Some(state);
+    }
+
+    pub fn set_presence_paused_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.presence_paused = Some(flag);
     }
 
     /// Build a usage snapshot for the main model.
@@ -1540,6 +1547,18 @@ impl App {
                         textarea.set_cursor_line_style(ratatui::style::Style::default());
                         self.follow_up_textarea = Some(textarea);
                     }
+                }
+            }
+            AppEvent::LiveConnected => {
+                self.log(LogLevel::Info, "Browser live model connected — server presence paused".to_string());
+                if let Some(ref flag) = self.presence_paused {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            AppEvent::LiveDisconnected => {
+                self.log(LogLevel::Info, "Browser live model disconnected — server presence resumed".to_string());
+                if let Some(ref flag) = self.presence_paused {
+                    flag.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             AppEvent::Tick => {

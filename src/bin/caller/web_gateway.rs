@@ -1,6 +1,9 @@
+use crate::presence::{self, AgentStateSnapshot};
 use crate::tui::event::{AppEvent, ControlMsg, EventBus};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
@@ -8,6 +11,16 @@ use tokio_tungstenite::tungstenite::Message;
 pub const DEFAULT_PORT: u16 = 8765;
 
 const WEB_HTML: &str = include_str!("../../../static/live.html");
+
+/// Context for answering presence tool queries from browser-side live models.
+/// Shared across all WebSocket connections (read-only for query tools).
+#[derive(Clone)]
+pub struct WebQueryCtx {
+    pub agent_state: Arc<Mutex<AgentStateSnapshot>>,
+    pub project_root: PathBuf,
+    pub log_dir: PathBuf,
+    pub knowledge_path: PathBuf,
+}
 
 /// Configuration sent to the web frontend via `/config`.
 #[derive(Clone, Debug, Serialize)]
@@ -41,6 +54,7 @@ pub fn spawn_web_gateway(
     bus: EventBus,
     broadcast_tx: broadcast::Sender<String>,
     config: WebGatewayConfig,
+    query_ctx: Option<WebQueryCtx>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -63,6 +77,7 @@ pub fn spawn_web_gateway(
             let bus = bus.clone();
             let broadcast_tx = broadcast_tx.clone();
             let config_json = config_json.clone();
+            let query_ctx = query_ctx.clone();
 
             tokio::spawn(async move {
                 // Peek at the first bytes to detect WebSocket upgrade.
@@ -88,12 +103,34 @@ pub fn spawn_web_gateway(
                     let (mut ws_tx, mut ws_rx) = ws_stream.split();
                     let mut outbound_rx = broadcast_tx.subscribe();
 
+                    // Direct response channel: tool_response and state_snapshot
+                    // messages for this specific connection (not broadcast).
+                    let (direct_tx, mut direct_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<String>();
+
+                    // Send bootstrap state snapshot on connect
+                    if let Some(ref ctx) = query_ctx {
+                        let state = ctx.agent_state.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        let bootstrap = serde_json::json!({
+                            "t": "state_snapshot",
+                            "state": state,
+                        });
+                        let _ = direct_tx.send(bootstrap.to_string());
+                    }
+
                     // Inbound: WebSocket → EventBus
-                    // Handles three message types:
+                    // Handles message types:
                     //   {"t":"key", "key":"Enter", ...}  → AppEvent::Key
                     //   {"t":"resize", "cols":N, "rows":N} → AppEvent::Resize
+                    //   {"t":"live_connected"}           → AppEvent::LiveConnected
+                    //   {"t":"live_disconnected"}        → AppEvent::LiveDisconnected
+                    //   {"t":"tool_request", "id":"...", "tool":"...", "args":{}} → tool_response
                     //   {"action":"status", ...}         → AppEvent::ControlCommand
                     let bus_inbound = bus.clone();
+                    let query_ctx_inbound = query_ctx.clone();
+                    let direct_tx_inbound = direct_tx.clone();
                     let inbound = tokio::spawn(async move {
                         while let Some(Ok(msg)) = ws_rx.next().await {
                             if let Message::Text(text) = msg {
@@ -114,6 +151,92 @@ pub fn spawn_web_gateway(
                                             let rows = json["rows"].as_u64().unwrap_or(24) as u16;
                                             bus_inbound.send(AppEvent::Resize(cols, rows));
                                         }
+                                        Some("live_connected") => {
+                                            bus_inbound.send(AppEvent::LiveConnected);
+                                        }
+                                        Some("live_disconnected") => {
+                                            bus_inbound.send(AppEvent::LiveDisconnected);
+                                        }
+                                        Some("tool_request") => {
+                                            let req_id = json["id"].as_str().unwrap_or("").to_string();
+                                            let tool = json["tool"].as_str().unwrap_or("").to_string();
+                                            let args = json.get("args").cloned()
+                                                .unwrap_or(serde_json::Value::Object(Default::default()));
+
+                                            // Action tools: dispatch via EventBus (fire-and-forget)
+                                            let result = match tool.as_str() {
+                                                "submit_task" => {
+                                                    let task = args["description"].as_str().unwrap_or("").to_string();
+                                                    if !task.is_empty() {
+                                                        bus_inbound.send(AppEvent::ControlCommand(
+                                                            ControlMsg::StartTask { task: task.clone(), orchestrate: None }
+                                                        ));
+                                                    }
+                                                    format!("Task submitted: {}", task)
+                                                }
+                                                "approve_action" => {
+                                                    let id = args["id"].as_u64().unwrap_or(0);
+                                                    bus_inbound.send(AppEvent::ControlCommand(
+                                                        ControlMsg::Approve { id }
+                                                    ));
+                                                    format!("Approved action {}", id)
+                                                }
+                                                "deny_action" => {
+                                                    let id = args["id"].as_u64().unwrap_or(0);
+                                                    bus_inbound.send(AppEvent::ControlCommand(
+                                                        ControlMsg::Deny { id }
+                                                    ));
+                                                    format!("Denied action {}", id)
+                                                }
+                                                "skip_action" => {
+                                                    let id = args["id"].as_u64().unwrap_or(0);
+                                                    bus_inbound.send(AppEvent::ControlCommand(
+                                                        ControlMsg::Skip { id }
+                                                    ));
+                                                    format!("Skipped action {}", id)
+                                                }
+                                                "respond_to_question" => {
+                                                    let text = args["text"].as_str().unwrap_or("").to_string();
+                                                    bus_inbound.send(AppEvent::ControlCommand(
+                                                        ControlMsg::Input { text: text.clone() }
+                                                    ));
+                                                    format!("Sent response: {}", text)
+                                                }
+                                                "set_autonomy" => {
+                                                    let level = args["level"].as_str().unwrap_or("medium").to_string();
+                                                    bus_inbound.send(AppEvent::ControlCommand(
+                                                        ControlMsg::SetAutonomy { level: level.clone() }
+                                                    ));
+                                                    format!("Autonomy set to {}", level)
+                                                }
+                                                // Query tools: need server-side data
+                                                _ => {
+                                                    if let Some(ref ctx) = query_ctx_inbound {
+                                                        if let Some(result) = presence::handle_tool_query(
+                                                            &ctx.agent_state,
+                                                            &ctx.project_root,
+                                                            &ctx.log_dir,
+                                                            &ctx.knowledge_path,
+                                                            &tool,
+                                                            &args,
+                                                        ).await {
+                                                            result
+                                                        } else {
+                                                            format!("Unknown tool: {}", tool)
+                                                        }
+                                                    } else {
+                                                        "Presence query context not available".to_string()
+                                                    }
+                                                }
+                                            };
+
+                                            let response = serde_json::json!({
+                                                "t": "tool_response",
+                                                "id": req_id,
+                                                "result": result,
+                                            });
+                                            let _ = direct_tx_inbound.send(response.to_string());
+                                        }
                                         _ => {
                                             // Fall through to ControlMsg parsing
                                             if let Ok(ctrl) = serde_json::from_value::<ControlMsg>(json) {
@@ -126,21 +249,39 @@ pub fn spawn_web_gateway(
                         }
                     });
 
-                    // Outbound: broadcast → WebSocket
+                    // Outbound: broadcast + direct responses → WebSocket
                     let outbound = tokio::spawn(async move {
                         loop {
-                            match outbound_rx.recv().await {
-                                Ok(line) => {
-                                    if ws_tx
-                                        .send(Message::Text(line.into()))
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
+                            tokio::select! {
+                                msg = outbound_rx.recv() => {
+                                    match msg {
+                                        Ok(line) => {
+                                            if ws_tx
+                                                .send(Message::Text(line.into()))
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        Err(broadcast::error::RecvError::Closed) => break,
+                                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
                                     }
                                 }
-                                Err(broadcast::error::RecvError::Closed) => break,
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                msg = direct_rx.recv() => {
+                                    match msg {
+                                        Some(line) => {
+                                            if ws_tx
+                                                .send(Message::Text(line.into()))
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        None => break,
+                                    }
+                                }
                             }
                         }
                     });
@@ -306,7 +447,7 @@ mod tests {
         let (bus, _rx) = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(0, bus, broadcast_tx, config);
+        let handle = spawn_web_gateway(0, bus, broadcast_tx, config, None);
 
         // Give it a moment to bind
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -325,7 +466,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -364,7 +505,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -415,7 +556,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Plain HTTP GET
@@ -457,7 +598,7 @@ mod tests {
             input_sample_rate: 24000,
             output_sample_rate: 24000,
         };
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // GET /config
@@ -480,6 +621,250 @@ mod tests {
         assert!(response_str.contains("200 OK"));
         assert!(response_str.contains("application/json"));
         assert!(response_str.contains("\"provider\":\"openai\""));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_live_connected_disconnected() {
+        let (bus, mut rx) = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Send live_connected
+        ws.send(Message::Text(r#"{"t":"live_connected"}"#.into()))
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            rx.recv(),
+        )
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+        assert!(matches!(event, AppEvent::LiveConnected));
+
+        // Send live_disconnected
+        ws.send(Message::Text(r#"{"t":"live_disconnected"}"#.into()))
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            rx.recv(),
+        )
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+        assert!(matches!(event, AppEvent::LiveDisconnected));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_tool_request_check_status() {
+        let (bus, _rx) = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        // Create a query context with a known agent state
+        let agent_state = Arc::new(Mutex::new(AgentStateSnapshot {
+            phase: "thinking".to_string(),
+            turn: 3,
+            budget_pct: 0.15,
+            ..Default::default()
+        }));
+        let query_ctx = Some(WebQueryCtx {
+            agent_state,
+            project_root: PathBuf::from("/tmp"),
+            log_dir: PathBuf::from("/tmp"),
+            knowledge_path: PathBuf::from("/tmp/knowledge.json"),
+        });
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let (_ws_tx_split, mut ws_rx) = ws.split();
+
+        // First message should be the bootstrap state_snapshot
+        let msg = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            ws_rx.next(),
+        )
+        .await
+        .expect("timeout")
+        .unwrap()
+        .unwrap();
+
+        if let Message::Text(text) = msg {
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["t"], "state_snapshot");
+            assert_eq!(json["state"]["phase"], "thinking");
+            assert_eq!(json["state"]["turn"], 3);
+        } else {
+            panic!("expected text message for state_snapshot");
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_tool_request_response_roundtrip() {
+        let (bus, _rx) = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let agent_state = Arc::new(Mutex::new(AgentStateSnapshot {
+            phase: "running_agent".to_string(),
+            turn: 5,
+            budget_pct: 0.42,
+            last_command_preview: "cargo test".to_string(),
+            ..Default::default()
+        }));
+        let query_ctx = Some(WebQueryCtx {
+            agent_state,
+            project_root: PathBuf::from("/tmp"),
+            log_dir: PathBuf::from("/tmp"),
+            knowledge_path: PathBuf::from("/tmp/knowledge.json"),
+        });
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Drain the bootstrap message
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            futures_util::StreamExt::next(&mut ws),
+        )
+        .await;
+
+        // Send a check_status tool request
+        ws.send(Message::Text(
+            r#"{"t":"tool_request","id":"req_1","tool":"check_status","args":{}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        // Read the tool_response
+        let msg = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            futures_util::StreamExt::next(&mut ws),
+        )
+        .await
+        .expect("timeout")
+        .unwrap()
+        .unwrap();
+
+        if let Message::Text(text) = msg {
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["t"], "tool_response");
+            assert_eq!(json["id"], "req_1");
+            let result = json["result"].as_str().unwrap();
+            assert!(result.contains("running_agent"), "result: {}", result);
+            assert!(result.contains("Turn: 5"), "result: {}", result);
+        } else {
+            panic!("expected text message for tool_response");
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_tool_request_action_dispatches_control() {
+        let (bus, mut rx) = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let agent_state = Arc::new(Mutex::new(AgentStateSnapshot::default()));
+        let query_ctx = Some(WebQueryCtx {
+            agent_state,
+            project_root: PathBuf::from("/tmp"),
+            log_dir: PathBuf::from("/tmp"),
+            knowledge_path: PathBuf::from("/tmp/knowledge.json"),
+        });
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Send an approve_action tool request
+        ws.send(Message::Text(
+            r#"{"t":"tool_request","id":"req_2","tool":"approve_action","args":{"id":42}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        // Should emit a ControlCommand(Approve) on the EventBus
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            rx.recv(),
+        )
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+        match event {
+            AppEvent::ControlCommand(ControlMsg::Approve { id }) => assert_eq!(id, 42),
+            _ => panic!("expected ControlCommand(Approve), got {:?}", event),
+        }
+
+        // Should also get a tool_response back
+        // Drain bootstrap first
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_millis(500),
+            futures_util::StreamExt::next(&mut ws),
+        )
+        .await;
+
+        let msg = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            futures_util::StreamExt::next(&mut ws),
+        )
+        .await
+        .expect("timeout")
+        .unwrap()
+        .unwrap();
+
+        if let Message::Text(text) = msg {
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["t"], "tool_response");
+            assert_eq!(json["id"], "req_2");
+            assert!(json["result"].as_str().unwrap().contains("Approved"));
+        } else {
+            panic!("expected text message");
+        }
 
         handle.abort();
     }

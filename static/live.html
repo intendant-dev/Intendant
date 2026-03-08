@@ -274,16 +274,7 @@ function connectWs() {
   ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
-      if (msg.t === 'term') {
-        // Terminal data — decode base64 and write to xterm.js
-        const bytes = atob(msg.d);
-        const arr = new Uint8Array(bytes.length);
-        for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-        term.write(arr);
-      } else if (msg.event) {
-        // Intendant event — forward to voice model for narration
-        handleIntendantEvent(msg);
-      }
+      handleServerMessage(msg);
     } catch(_) {}
   };
 
@@ -546,33 +537,99 @@ function createProvider(name, callbacks) {
   return new GeminiProvider(callbacks);
 }
 
-// --- Voice system prompt & tools ---
-// The voice model only handles approvals and questions — the TUI shows everything else.
-const VOICE_PROMPT = `You are Intendant, a software engineering AI agent. You speak to the user via voice. Be concise (1-3 sentences). Speak in first person — you ARE the agent.
+// --- Presence system prompt & tools ---
+// Full presence prompt: the live model IS the presence layer when connected.
+const VOICE_PROMPT = `You are Intendant, an autonomous AI agent runtime. You speak to the user via voice. Be concise (1-3 sentences). Speak in first person — you ARE the agent.
 
-When the system tells you an approval is needed, ask the user naturally: "I want to run X, is that ok?"
-When the system tells you a question was asked, relay it naturally in your own voice.
-When the system tells you work is done, tell the user briefly what happened.
+## Identity
+You ARE Intendant. Never reference "the system", "the agent", or "the backend" — those are your internals. When the user asks you to do something, you do it. When workers complete tasks, you report the results as your own work.
 
-Do NOT narrate status changes. The user can see the TUI for that.`;
+## Capabilities
+You have tools to handle user requests:
+- Status queries: "What are you working on?" → use check_status
+- Detail queries: "Show me the diff" → use query_detail
+- Memory recall: "What did we do last time?" → use recall_memory
+- Coding tasks: "Implement feature X" → use submit_task
+- Autonomy changes: "Run everything automatically" → use set_autonomy
+
+## Approval Gates
+When the system tells you approval is needed, ask the user naturally: "I want to run X, is that ok?"
+Use approve_action, deny_action, or skip_action based on user input.
+
+## Human Questions
+When the system tells you a question was asked, relay it to the user naturally. Pass the answer back with respond_to_question.
+
+## Event Narration
+You receive events about task progress. Narrate concisely:
+- Phase changes: "Starting analysis..." / "Running your code now..."
+- Task complete: Summarize what was accomplished
+- Errors: Explain what went wrong simply
+- Budget warnings: Mention if context is getting tight
+Keep narration brief — one sentence per event unless the user asks for details.
+
+## Style
+- Be conversational but efficient
+- For ANY request involving code, commands, files, or work — always use submit_task
+- Match the user's tone and energy level`;
 
 const VOICE_TOOLS = [
-  { name: 'submit_task', description: 'Start a new coding task',
-    parameters: { type: 'object', properties: { description: { type: 'string' } }, required: ['description'] } },
-  { name: 'approve_action', description: 'Approve a pending command',
+  { name: 'submit_task', description: 'Submit a coding task for workers to execute',
+    parameters: { type: 'object', properties: {
+      description: { type: 'string', description: 'The task description' },
+      force_direct: { type: 'boolean', description: 'Force single-agent mode. Default false.' },
+    }, required: ['description'] } },
+  { name: 'check_status', description: 'Check current agent status: phase, turn, budget, last command, workers',
+    parameters: { type: 'object', properties: {}, required: [] } },
+  { name: 'query_detail', description: 'Query detailed info. Scopes: current_turn, last_output, worker, diff, logs, file',
+    parameters: { type: 'object', properties: {
+      scope: { type: 'string', enum: ['current_turn','last_output','worker','diff','logs','file'] },
+      target: { type: 'string', description: 'Target path (required for file scope)' },
+    }, required: ['scope'] } },
+  { name: 'recall_memory', description: 'Search knowledge store and session logs for past context',
+    parameters: { type: 'object', properties: {
+      keywords: { type: 'array', items: { type: 'string' } },
+      tags: { type: 'array', items: { type: 'string' } },
+      channel: { type: 'string' },
+    }, required: [] } },
+  { name: 'approve_action', description: 'Approve a pending action that requires user consent',
     parameters: { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] } },
-  { name: 'deny_action', description: 'Deny a pending command',
+  { name: 'deny_action', description: 'Deny a pending action, stopping the current command',
     parameters: { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] } },
-  { name: 'respond_to_question', description: 'Answer a question from the agent',
+  { name: 'skip_action', description: 'Skip a pending action, continuing with the next command',
+    parameters: { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] } },
+  { name: 'respond_to_question', description: 'Respond to a question from the worker (askHuman)',
     parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
-  { name: 'set_autonomy', description: 'Change autonomy level',
-    parameters: { type: 'object', properties: { level: { type: 'string', enum: ['low','medium','high','full'] } }, required: ['level'] } },
+  { name: 'set_autonomy', description: 'Set autonomy level: low/medium/high/full',
+    parameters: { type: 'object', properties: {
+      level: { type: 'string', enum: ['low','medium','high','full'] }
+    }, required: ['level'] } },
 ];
 
-// --- Handle events from Intendant for voice narration ---
+// --- Agent state (updated from server bootstrap + events) ---
+let agentState = { phase: '', turn: 0, budget_pct: 0, last_command_preview: '', last_output_summary: '', active_workers: [] };
+
+// --- Pending tool requests (id → {call, resolve}) ---
+const pendingToolRequests = new Map();
+let toolRequestCounter = 0;
+
+// --- Handle events from Intendant ---
 function handleIntendantEvent(evt) {
   const eventType = evt.event;
-  // Only narrate actionable events via voice — the TUI shows everything
+
+  // Update local agent state from events
+  if (eventType === 'turn_started') {
+    agentState.turn = evt.turn || agentState.turn;
+    agentState.budget_pct = evt.budget_pct || agentState.budget_pct;
+    agentState.phase = 'thinking';
+  } else if (eventType === 'status') {
+    agentState.phase = evt.phase || agentState.phase;
+  } else if (eventType === 'agent_output') {
+    agentState.last_output_summary = (evt.stdout || '').slice(0, 500);
+  } else if (eventType === 'round_complete') {
+    agentState.phase = 'idle';
+  }
+
+  // Forward actionable events to the live model for narration
   if (modelProvider && modelProvider.connected) {
     if (eventType === 'approval_required') {
       modelProvider.sendText(`[System: approval needed] You want to run: "${evt.command}" (id: ${evt.id}). Ask the user.`);
@@ -580,35 +637,73 @@ function handleIntendantEvent(evt) {
       modelProvider.sendText(`[System: question] "${evt.question}". Ask the user naturally.`);
     } else if (eventType === 'task_complete') {
       modelProvider.sendText(`[System: done] ${evt.reason}. Tell the user briefly.`);
+    } else if (eventType === 'status' && evt.phase) {
+      // Only narrate significant phase changes
+      if (evt.phase === 'running_agent' || evt.phase === 'thinking') {
+        modelProvider.sendText(`[System: phase] Now ${evt.phase === 'running_agent' ? 'running commands' : 'thinking'}.`);
+      }
     }
-    // Status changes, agent output, etc. are NOT narrated — user sees the TUI
   }
 }
 
-// --- Voice tool call handling ---
+// --- Handle WebSocket messages including tool_response and state_snapshot ---
+function handleServerMessage(msg) {
+  if (msg.t === 'term') {
+    const bytes = atob(msg.d);
+    const arr = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+    term.write(arr);
+  } else if (msg.t === 'state_snapshot') {
+    // Bootstrap or reconnect: full agent state
+    if (msg.state) {
+      agentState = { ...agentState, ...msg.state };
+    }
+  } else if (msg.t === 'tool_response') {
+    // Response to a tool_request
+    const pending = pendingToolRequests.get(msg.id);
+    if (pending) {
+      pending.resolve(msg.result);
+      pendingToolRequests.delete(msg.id);
+    }
+  } else if (msg.event) {
+    // Intendant event — forward to live model for narration
+    handleIntendantEvent(msg);
+  }
+}
+
+// --- Send a tool request to the server and wait for the response ---
+function sendToolRequest(toolName, args) {
+  return new Promise((resolve) => {
+    const id = `req_${++toolRequestCounter}`;
+    pendingToolRequests.set(id, { resolve });
+    if (ws && wsConnected) {
+      ws.send(JSON.stringify({ t: 'tool_request', id, tool: toolName, args }));
+    } else {
+      resolve('Server not connected');
+      pendingToolRequests.delete(id);
+    }
+    // Timeout: don't wait forever
+    setTimeout(() => {
+      if (pendingToolRequests.has(id)) {
+        pendingToolRequests.get(id).resolve('Request timed out');
+        pendingToolRequests.delete(id);
+      }
+    }, 10000);
+  });
+}
+
+// --- Tool call handling: routes through server for all tools ---
 function handleToolCall(call) {
   const name = call.name;
   const args = call.args || {};
-  let controlMsg = null;
-  switch (name) {
-    case 'submit_task':
-      controlMsg = { action: 'start_task', task: args.description || '' }; break;
-    case 'approve_action':
-      controlMsg = { action: 'approve', id: args.id }; break;
-    case 'deny_action':
-      controlMsg = { action: 'deny', id: args.id }; break;
-    case 'respond_to_question':
-      controlMsg = { action: 'input', text: args.text || '' }; break;
-    case 'set_autonomy':
-      controlMsg = { action: 'set_autonomy', level: args.level || 'medium' }; break;
-    default:
-      if (modelProvider) modelProvider.sendToolResponse(call, { error: 'unknown' });
-      return;
-  }
-  if (ws && wsConnected) {
-    ws.send(JSON.stringify(controlMsg));
-  }
-  if (modelProvider) modelProvider.sendToolResponse(call, { ok: true });
+
+  // All tools go through the server's tool_request protocol.
+  // The server handles both action dispatch and query resolution.
+  sendToolRequest(name, args).then((result) => {
+    if (modelProvider) {
+      modelProvider.sendToolResponse(call, typeof result === 'string' ? { result } : result);
+    }
+  });
 }
 
 // ============================================================
@@ -800,15 +895,20 @@ async function init() {
       voiceLabel.textContent = providerName.charAt(0).toUpperCase() + providerName.slice(1);
       showVoiceStatus('Voice ready');
       setTimeout(hideVoiceStatus, 3000);
+      // Notify server to pause server-side presence (mutual exclusion)
+      if (ws && wsConnected) ws.send(JSON.stringify({ t: 'live_connected' }));
     },
     onAudio: (b64) => { playAudioChunk(b64); },
     onText: (text) => { showVoiceStatus(text); setTimeout(hideVoiceStatus, 5000); },
     onToolCall: (call) => { handleToolCall(call); },
     onInterrupted: () => {},
     onError: (msg) => {
+      const wasConnected = modelConnected;
       modelConnected = false;
       voiceDot.className = 'conn-dot err';
       showVoiceStatus(msg, true);
+      // Notify server to resume server-side presence (mutual exclusion)
+      if (wasConnected && ws && wsConnected) ws.send(JSON.stringify({ t: 'live_disconnected' }));
     }
   });
 

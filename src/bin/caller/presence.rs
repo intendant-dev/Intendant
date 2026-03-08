@@ -6,6 +6,7 @@ use crate::session_log;
 use crate::tui::event::{AppEvent, ControlMsg, EventBus};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -55,6 +56,9 @@ pub struct PresenceLayer {
     turn: usize,
     /// Timestamp of the last phase-change narration (for debounce).
     last_narration_at: std::time::Instant,
+    /// When true, the presence layer is paused (browser live model is active).
+    /// Events are silently dropped; user input is still forwarded as tasks.
+    paused: Arc<AtomicBool>,
 }
 
 impl PresenceLayer {
@@ -70,6 +74,7 @@ impl PresenceLayer {
         knowledge_path: PathBuf,
         log_dir: PathBuf,
         project_root: PathBuf,
+        paused: Arc<AtomicBool>,
     ) -> Self {
         let conversation = Conversation::new(system_prompt, context_window);
         Self {
@@ -84,7 +89,18 @@ impl PresenceLayer {
             project_root,
             turn: 0,
             last_narration_at: std::time::Instant::now() - NARRATION_DEBOUNCE,
+            paused,
         }
+    }
+
+    /// Return a shared handle to the paused flag for external pause/resume control.
+    pub fn paused_flag(&self) -> Arc<AtomicBool> {
+        self.paused.clone()
+    }
+
+    /// Check if the presence layer is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
     }
 
     /// Process text input from the user, returning the model's response.
@@ -129,6 +145,10 @@ impl PresenceLayer {
 
     /// Inject a PresenceEvent into the conversation and let the model narrate.
     pub async fn handle_event(&mut self, event: PresenceEvent) -> Result<Option<String>, CallerError> {
+        // When paused (browser voice model active), skip narration
+        if self.is_paused() {
+            return Ok(None);
+        }
         // Debounce phase-change narrations
         if matches!(event, PresenceEvent::PhaseChanged { .. }) {
             let now = std::time::Instant::now();
@@ -288,132 +308,11 @@ impl PresenceLayer {
     }
 
     async fn handle_query_detail(&self, args: &Value) -> String {
-        let scope = args["scope"].as_str().unwrap_or("current_turn");
-        let target = args["target"].as_str();
-
-        match scope {
-            "current_turn" => {
-                let state = self.agent_state.lock().unwrap_or_else(|e| e.into_inner());
-                format!(
-                    "Turn: {}\nPhase: {}\nBudget: {:.0}%",
-                    state.turn, state.phase, state.budget_pct * 100.0
-                )
-            }
-            "last_output" => {
-                let state = self.agent_state.lock().unwrap_or_else(|e| e.into_inner());
-                if state.last_output_summary.is_empty() {
-                    "No output yet.".to_string()
-                } else {
-                    state.last_output_summary.clone()
-                }
-            }
-            "worker" => {
-                let state = self.agent_state.lock().unwrap_or_else(|e| e.into_inner());
-                if state.active_workers.is_empty() {
-                    "No active workers.".to_string()
-                } else {
-                    state
-                        .active_workers
-                        .iter()
-                        .enumerate()
-                        .map(|(i, w)| format!("{}. {}", i + 1, w))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
-            }
-            "diff" => {
-                let output = tokio::process::Command::new("git")
-                    .args(["diff", "--stat"])
-                    .current_dir(&self.project_root)
-                    .output()
-                    .await;
-                match output {
-                    Ok(o) => {
-                        let stdout = String::from_utf8_lossy(&o.stdout);
-                        if stdout.trim().is_empty() {
-                            "No changes.".to_string()
-                        } else {
-                            stdout.to_string()
-                        }
-                    }
-                    Err(e) => format!("Failed to run git diff: {}", e),
-                }
-            }
-            "logs" => {
-                let entries = session_log::recent_entries(&self.log_dir, 20);
-                if entries.is_empty() {
-                    "No log entries yet.".to_string()
-                } else {
-                    entries.join("\n")
-                }
-            }
-            "file" => {
-                let path = match target {
-                    Some(p) => p,
-                    None => return "Error: target file path is required".to_string(),
-                };
-                match tokio::fs::read_to_string(path).await {
-                    Ok(content) => {
-                        let lines: Vec<&str> = content.lines().take(200).collect();
-                        lines.join("\n")
-                    }
-                    Err(e) => format!("Failed to read file: {}", e),
-                }
-            }
-            _ => format!("Unknown scope: {}", scope),
-        }
+        query_detail(&self.agent_state, &self.project_root, &self.log_dir, args).await
     }
 
     fn handle_recall_memory(&self, args: &Value) -> String {
-        let keywords = args["keywords"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
-        let tags = args["tags"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
-        let channel = args["channel"].as_str().map(String::from);
-
-        let query = KnowledgeQuery {
-            keywords,
-            tags,
-            channel,
-            ..Default::default()
-        };
-
-        match knowledge::load(&self.knowledge_path) {
-            Ok(store) => {
-                let results = knowledge::query(&store, &query);
-                if results.is_empty() {
-                    // Fall back to session log search
-                    let entries = session_log::recent_entries(&self.log_dir, 100);
-                    if let Some(ref kws) = query.keywords {
-                        let matched: Vec<&String> = entries
-                            .iter()
-                            .filter(|e| {
-                                let lower = e.to_lowercase();
-                                kws.iter().any(|kw| lower.contains(&kw.to_lowercase()))
-                            })
-                            .take(10)
-                            .collect();
-                        if matched.is_empty() {
-                            "No memories found.".to_string()
-                        } else {
-                            matched.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n")
-                        }
-                    } else {
-                        "No memories found.".to_string()
-                    }
-                } else {
-                    results
-                        .iter()
-                        .take(10)
-                        .map(|e| format!("[{}] {}: {}", e.channel, e.key, e.summary))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
-            }
-            Err(e) => format!("Failed to load knowledge: {}", e),
-        }
+        recall_memory(&self.knowledge_path, &self.log_dir, args)
     }
 
     /// Main run loop: listen for events and user input, process both.
@@ -448,6 +347,180 @@ impl PresenceLayer {
                 else => break,
             }
         }
+    }
+}
+
+// ── Standalone query functions (shared by PresenceLayer and WebSocket gateway) ──
+
+/// Handle a `query_detail` tool call: returns agent state, git diff, logs, or file content.
+pub async fn query_detail(
+    agent_state: &Arc<Mutex<AgentStateSnapshot>>,
+    project_root: &std::path::Path,
+    log_dir: &std::path::Path,
+    args: &Value,
+) -> String {
+    let scope = args["scope"].as_str().unwrap_or("current_turn");
+    let target = args["target"].as_str();
+
+    match scope {
+        "current_turn" => {
+            let state = agent_state.lock().unwrap_or_else(|e| e.into_inner());
+            format!(
+                "Turn: {}\nPhase: {}\nBudget: {:.0}%",
+                state.turn, state.phase, state.budget_pct * 100.0
+            )
+        }
+        "last_output" => {
+            let state = agent_state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.last_output_summary.is_empty() {
+                "No output yet.".to_string()
+            } else {
+                state.last_output_summary.clone()
+            }
+        }
+        "worker" => {
+            let state = agent_state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.active_workers.is_empty() {
+                "No active workers.".to_string()
+            } else {
+                state
+                    .active_workers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, w)| format!("{}. {}", i + 1, w))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+        "diff" => {
+            let output = tokio::process::Command::new("git")
+                .args(["diff", "--stat"])
+                .current_dir(project_root)
+                .output()
+                .await;
+            match output {
+                Ok(o) => {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    if stdout.trim().is_empty() {
+                        "No changes.".to_string()
+                    } else {
+                        stdout.to_string()
+                    }
+                }
+                Err(e) => format!("Failed to run git diff: {}", e),
+            }
+        }
+        "logs" => {
+            let entries = session_log::recent_entries(log_dir, 20);
+            if entries.is_empty() {
+                "No log entries yet.".to_string()
+            } else {
+                entries.join("\n")
+            }
+        }
+        "file" => {
+            let path = match target {
+                Some(p) => p,
+                None => return "Error: target file path is required".to_string(),
+            };
+            match tokio::fs::read_to_string(path).await {
+                Ok(content) => {
+                    let lines: Vec<&str> = content.lines().take(200).collect();
+                    lines.join("\n")
+                }
+                Err(e) => format!("Failed to read file: {}", e),
+            }
+        }
+        _ => format!("Unknown scope: {}", scope),
+    }
+}
+
+/// Handle a `recall_memory` tool call: query knowledge store with optional fallback to session logs.
+pub fn recall_memory(
+    knowledge_path: &std::path::Path,
+    log_dir: &std::path::Path,
+    args: &Value,
+) -> String {
+    let keywords = args["keywords"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+    let tags = args["tags"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+    let channel = args["channel"].as_str().map(String::from);
+
+    let query = KnowledgeQuery {
+        keywords,
+        tags,
+        channel,
+        ..Default::default()
+    };
+
+    match knowledge::load(knowledge_path) {
+        Ok(store) => {
+            let results = knowledge::query(&store, &query);
+            if results.is_empty() {
+                // Fall back to session log search
+                let entries = session_log::recent_entries(log_dir, 100);
+                if let Some(ref kws) = query.keywords {
+                    let matched: Vec<&String> = entries
+                        .iter()
+                        .filter(|e| {
+                            let lower = e.to_lowercase();
+                            kws.iter().any(|kw| lower.contains(&kw.to_lowercase()))
+                        })
+                        .take(10)
+                        .collect();
+                    if matched.is_empty() {
+                        "No memories found.".to_string()
+                    } else {
+                        matched.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n")
+                    }
+                } else {
+                    "No memories found.".to_string()
+                }
+            } else {
+                results
+                    .iter()
+                    .take(10)
+                    .map(|e| format!("[{}] {}: {}", e.channel, e.key, e.summary))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+        Err(e) => format!("Failed to load knowledge: {}", e),
+    }
+}
+
+/// Handle a tool query by name. Used by both the server-side PresenceLayer and
+/// the WebSocket gateway for browser-side live model tool requests.
+///
+/// For action tools (approve, deny, submit_task, etc.), the caller must handle
+/// dispatch separately — this function only handles read-only query tools.
+pub async fn handle_tool_query(
+    agent_state: &Arc<Mutex<AgentStateSnapshot>>,
+    project_root: &std::path::Path,
+    log_dir: &std::path::Path,
+    knowledge_path: &std::path::Path,
+    tool_name: &str,
+    args: &Value,
+) -> Option<String> {
+    match tool_name {
+        "check_status" => {
+            let state = agent_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let action = dispatch_tool_call("check_status", args, &state);
+            match action {
+                PresenceAction::TextResult(text) => Some(text),
+                _ => None,
+            }
+        }
+        "query_detail" => {
+            Some(query_detail(agent_state, project_root, log_dir, args).await)
+        }
+        "recall_memory" => {
+            Some(recall_memory(knowledge_path, log_dir, args))
+        }
+        _ => None,
     }
 }
 
@@ -544,6 +617,8 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::PresenceUsageUpdate { .. }
         | AppEvent::PresenceLog { .. }
         | AppEvent::PresenceReady
+        | AppEvent::LiveConnected
+        | AppEvent::LiveDisconnected
         | AppEvent::ControlCommand(_)
         | AppEvent::Key(_)
         | AppEvent::Resize(_, _)
@@ -830,6 +905,13 @@ mod tests {
             message: "oops".to_string(),
         });
         assert!(s.contains("oops"));
+    }
+
+    #[test]
+    fn filter_event_live_connected_is_pull_only() {
+        let mut last_phase = String::new();
+        assert!(filter_event(&AppEvent::LiveConnected, &mut last_phase).is_none());
+        assert!(filter_event(&AppEvent::LiveDisconnected, &mut last_phase).is_none());
     }
 
     #[test]

@@ -133,6 +133,11 @@ pub enum AppEvent {
     /// presence narration so the user can type a follow-up.
     PresenceReady,
 
+    /// Browser-side live model connected — server-side presence should pause.
+    LiveConnected,
+    /// Browser-side live model disconnected — server-side presence should resume.
+    LiveDisconnected,
+
     // TUI internal
     Tick,
     #[allow(dead_code)]
