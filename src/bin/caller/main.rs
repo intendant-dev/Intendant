@@ -2787,6 +2787,7 @@ async fn run_with_presence(
     presence_event_rx: tokio::sync::mpsc::Receiver<presence::PresenceEvent>,
     agent_state: Arc<Mutex<presence::AgentStateSnapshot>>,
     force_direct: bool,
+    presence_paused: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<LoopStats, CallerError> {
     // 1. Create presence provider (small/fast model)
     let presence_provider = provider::select_presence_provider(
@@ -2821,6 +2822,7 @@ async fn run_with_presence(
         project.memory_path(),
         log_dir.clone(),
         project.root.clone(),
+        presence_paused,
     );
 
     // 6. Send initial task to presence (if provided), with a timeout so a
@@ -3540,6 +3542,7 @@ async fn main() -> Result<(), CallerError> {
                 bus.clone(),
                 broadcast_tx,
                 config,
+                None, // MCP mode: no presence query context
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -3802,30 +3805,18 @@ async fn main() -> Result<(), CallerError> {
             );
         }
 
-        // Web gateway (WebSocket) — shares broadcast channel with control socket if both enabled
-        let _web_handle = if flags.web {
-            let broadcast_tx = if let Some(ref tx) = app.control_tx {
+        // Web gateway broadcast channel — shares with control socket if both enabled.
+        // The actual web gateway spawn is deferred until after presence setup so we
+        // can pass the WebQueryCtx (agent state, project root, etc.) for tool requests.
+        let web_broadcast_tx = if flags.web {
+            let tx = if let Some(ref tx) = app.control_tx {
                 tx.clone()
             } else {
                 let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
                 app.set_control_socket(tx.clone());
                 tx
             };
-            let config = web_gateway::build_config(
-                project.config.presence.live_provider.as_deref(),
-                project.config.presence.live_model.as_deref(),
-            );
-            let handle = web_gateway::spawn_web_gateway(
-                flags.web_port,
-                bus.clone(),
-                broadcast_tx,
-                config,
-            );
-            app.log(
-                tui::app::LogLevel::Info,
-                format!("Web TUI: http://0.0.0.0:{}", flags.web_port),
-            );
-            Some(handle)
+            Some(tx)
         } else {
             None
         };
@@ -3887,6 +3878,36 @@ async fn main() -> Result<(), CallerError> {
             (None, None, None)
         };
 
+        // Deferred web gateway spawn — now we have the agent state for tool queries
+        let _web_handle = if let Some(broadcast_tx) = web_broadcast_tx {
+            let query_ctx = presence_agent_state.as_ref().map(|state| {
+                web_gateway::WebQueryCtx {
+                    agent_state: state.clone(),
+                    project_root: project.root.clone(),
+                    log_dir: log_dir.clone(),
+                    knowledge_path: project.memory_path(),
+                }
+            });
+            let config = web_gateway::build_config(
+                project.config.presence.live_provider.as_deref(),
+                project.config.presence.live_model.as_deref(),
+            );
+            let handle = web_gateway::spawn_web_gateway(
+                flags.web_port,
+                bus.clone(),
+                broadcast_tx,
+                config,
+                query_ctx,
+            );
+            app.log(
+                tui::app::LogLevel::Info,
+                format!("Web TUI: http://0.0.0.0:{}", flags.web_port),
+            );
+            Some(handle)
+        } else {
+            None
+        };
+
         // Spawn the agent loop in a background task
         let bus_clone = bus.clone();
         let autonomy_clone = autonomy.clone();
@@ -3906,6 +3927,10 @@ async fn main() -> Result<(), CallerError> {
             let agent_state = presence_agent_state.unwrap();
             let (response_tx, mut response_rx) =
                 tokio::sync::mpsc::channel::<String>(8);
+
+            // Shared paused flag: toggled by LiveConnected/LiveDisconnected events
+            let presence_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            app.set_presence_paused_flag(presence_paused.clone());
 
             // Forward presence responses to TUI as log entries + reset phase
             let bus_for_responses = bus_clone.clone();
@@ -3941,6 +3966,7 @@ async fn main() -> Result<(), CallerError> {
                     presence_event_rx,
                     agent_state,
                     force_direct,
+                    presence_paused,
                 )
                 .await;
 
@@ -4092,6 +4118,7 @@ async fn main() -> Result<(), CallerError> {
                 bus.clone(),
                 broadcast_tx,
                 config,
+                None, // Headless mode: no presence query context
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",

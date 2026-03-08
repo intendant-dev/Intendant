@@ -1941,6 +1941,12 @@ pub fn spawn_event_listener(
                             s.set_phase(Phase::WaitingFollowUp);
                         }
                     }
+                    AppEvent::LiveConnected => {
+                        s.push_log(LogLevel::Info, "Browser live model connected — server presence paused".to_string());
+                    }
+                    AppEvent::LiveDisconnected => {
+                        s.push_log(LogLevel::Info, "Browser live model disconnected — server presence resumed".to_string());
+                    }
                 }
             }
 
