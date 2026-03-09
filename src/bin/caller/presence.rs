@@ -19,6 +19,44 @@ pub use presence_core::{
     PresenceAction, dispatch_tool_call,
 };
 
+/// Convert a `PresenceAction` to a `(ControlMsg, confirmation_text)` pair.
+/// Returns `None` for `TextResult` and `NeedsIO` which need separate handling.
+pub fn action_to_control_msg(action: &PresenceAction) -> Option<(ControlMsg, String)> {
+    match action {
+        PresenceAction::SubmitTask(envelope) => {
+            let orchestrate = if envelope.force_direct { Some(false) } else { None };
+            Some((
+                ControlMsg::StartTask {
+                    task: envelope.task.clone(),
+                    orchestrate,
+                },
+                format!("Task submitted: {}", envelope.task),
+            ))
+        }
+        PresenceAction::Approve { id } => Some((
+            ControlMsg::Approve { id: *id },
+            format!("Approved action {}", id),
+        )),
+        PresenceAction::Deny { id } => Some((
+            ControlMsg::Deny { id: *id },
+            format!("Denied action {}", id),
+        )),
+        PresenceAction::Skip { id } => Some((
+            ControlMsg::Skip { id: *id },
+            format!("Skipped action {}", id),
+        )),
+        PresenceAction::Respond { text } => Some((
+            ControlMsg::Input { text: text.clone() },
+            format!("Sent response: {}", text),
+        )),
+        PresenceAction::SetAutonomy { level } => Some((
+            ControlMsg::SetAutonomy { level: level.clone() },
+            format!("Autonomy set to {}", level),
+        )),
+        PresenceAction::TextResult(_) | PresenceAction::NeedsIO { .. } => None,
+    }
+}
+
 // Re-export presence_tools with conversion to the main crate's ToolDefinition.
 pub fn presence_tools() -> Vec<crate::tools::ToolDefinition> {
     presence_core::presence_tools()
@@ -261,42 +299,28 @@ impl PresenceLayer {
 
         let action = dispatch_tool_call(name, &args, &state_snapshot);
 
+        // SubmitTask is special: it uses the dedicated task channel (preserves
+        // the full TaskEnvelope including force_direct and context_hints).
+        if let PresenceAction::SubmitTask(envelope) = action {
+            let task = envelope.task.clone();
+            return match self.task_tx.send(envelope).await {
+                Ok(()) => {
+                    self.plog(format!("Dispatched task: {}", task), None);
+                    format!("Task submitted: {}", task)
+                }
+                Err(_) => "Error: task channel closed".to_string(),
+            };
+        }
+
+        // Action variants → ControlMsg via canonical helper.
+        if let Some((ctrl, msg)) = action_to_control_msg(&action) {
+            self.bus.send(AppEvent::ControlCommand(ctrl));
+            return msg;
+        }
+
+        // Remaining: TextResult, NeedsIO.
         match action {
             PresenceAction::TextResult(text) => text,
-            PresenceAction::SubmitTask(envelope) => {
-                let task = envelope.task.clone();
-                match self.task_tx.send(envelope).await {
-                    Ok(()) => {
-                        self.plog(format!("Dispatched task: {}", task), None);
-                        format!("Task submitted: {}", task)
-                    }
-                    Err(_) => "Error: task channel closed".to_string(),
-                }
-            }
-            PresenceAction::Approve { id } => {
-                self.bus.send(AppEvent::ControlCommand(ControlMsg::Approve { id }));
-                format!("Approved action {}", id)
-            }
-            PresenceAction::Deny { id } => {
-                self.bus.send(AppEvent::ControlCommand(ControlMsg::Deny { id }));
-                format!("Denied action {}", id)
-            }
-            PresenceAction::Skip { id } => {
-                self.bus.send(AppEvent::ControlCommand(ControlMsg::Skip { id }));
-                format!("Skipped action {}", id)
-            }
-            PresenceAction::Respond { text } => {
-                self.bus.send(AppEvent::ControlCommand(ControlMsg::Input {
-                    text: text.clone(),
-                }));
-                format!("Sent response: {}", text)
-            }
-            PresenceAction::SetAutonomy { level } => {
-                self.bus.send(AppEvent::ControlCommand(ControlMsg::SetAutonomy {
-                    level: level.clone(),
-                }));
-                format!("Autonomy set to {}", level)
-            }
             PresenceAction::NeedsIO { tool_name, args } => {
                 match tool_name.as_str() {
                     "query_detail" => self.handle_query_detail(&args).await,
@@ -304,6 +328,7 @@ impl PresenceLayer {
                     _ => format!("Unknown IO tool: {}", tool_name),
                 }
             }
+            _ => unreachable!(), // SubmitTask and action variants handled above
         }
     }
 

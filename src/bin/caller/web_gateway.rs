@@ -173,70 +173,38 @@ pub fn spawn_web_gateway(
                                             let args = json.get("args").cloned()
                                                 .unwrap_or(serde_json::Value::Object(Default::default()));
 
-                                            // Action tools: dispatch via EventBus (fire-and-forget)
-                                            let result = match tool.as_str() {
-                                                "submit_task" => {
-                                                    let task = args["description"].as_str().unwrap_or("").to_string();
-                                                    if !task.is_empty() {
-                                                        bus_inbound.send(AppEvent::ControlCommand(
-                                                            ControlMsg::StartTask { task: task.clone(), orchestrate: None }
-                                                        ));
-                                                    }
-                                                    format!("Task submitted: {}", task)
-                                                }
-                                                "approve_action" => {
-                                                    let id = args["id"].as_u64().unwrap_or(0);
-                                                    bus_inbound.send(AppEvent::ControlCommand(
-                                                        ControlMsg::Approve { id }
-                                                    ));
-                                                    format!("Approved action {}", id)
-                                                }
-                                                "deny_action" => {
-                                                    let id = args["id"].as_u64().unwrap_or(0);
-                                                    bus_inbound.send(AppEvent::ControlCommand(
-                                                        ControlMsg::Deny { id }
-                                                    ));
-                                                    format!("Denied action {}", id)
-                                                }
-                                                "skip_action" => {
-                                                    let id = args["id"].as_u64().unwrap_or(0);
-                                                    bus_inbound.send(AppEvent::ControlCommand(
-                                                        ControlMsg::Skip { id }
-                                                    ));
-                                                    format!("Skipped action {}", id)
-                                                }
-                                                "respond_to_question" => {
-                                                    let text = args["text"].as_str().unwrap_or("").to_string();
-                                                    bus_inbound.send(AppEvent::ControlCommand(
-                                                        ControlMsg::Input { text: text.clone() }
-                                                    ));
-                                                    format!("Sent response: {}", text)
-                                                }
-                                                "set_autonomy" => {
-                                                    let level = args["level"].as_str().unwrap_or("medium").to_string();
-                                                    bus_inbound.send(AppEvent::ControlCommand(
-                                                        ControlMsg::SetAutonomy { level: level.clone() }
-                                                    ));
-                                                    format!("Autonomy set to {}", level)
-                                                }
-                                                // Query tools: need server-side data
-                                                _ => {
-                                                    if let Some(ref ctx) = query_ctx_inbound {
-                                                        if let Some(result) = presence::handle_tool_query(
-                                                            &ctx.agent_state,
-                                                            &ctx.project_root,
-                                                            &ctx.log_dir,
-                                                            &ctx.knowledge_path,
-                                                            &tool,
-                                                            &args,
-                                                        ).await {
-                                                            result
+                                            // Dispatch through presence-core (single canonical layer)
+                                            let state = query_ctx_inbound.as_ref()
+                                                .map(|ctx| ctx.agent_state.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                                                .unwrap_or_default();
+                                            let action = presence::dispatch_tool_call(&tool, &args, &state);
+
+                                            let result = if let Some((ctrl, msg)) = presence::action_to_control_msg(&action) {
+                                                // Action tools: dispatch via EventBus
+                                                bus_inbound.send(AppEvent::ControlCommand(ctrl));
+                                                msg
+                                            } else {
+                                                match action {
+                                                    presence::PresenceAction::TextResult(text) => text,
+                                                    presence::PresenceAction::NeedsIO { tool_name, args: io_args } => {
+                                                        if let Some(ref ctx) = query_ctx_inbound {
+                                                            if let Some(result) = presence::handle_tool_query(
+                                                                &ctx.agent_state,
+                                                                &ctx.project_root,
+                                                                &ctx.log_dir,
+                                                                &ctx.knowledge_path,
+                                                                &tool_name,
+                                                                &io_args,
+                                                            ).await {
+                                                                result
+                                                            } else {
+                                                                format!("Unknown tool: {}", tool)
+                                                            }
                                                         } else {
-                                                            format!("Unknown tool: {}", tool)
+                                                            "Presence query context not available".to_string()
                                                         }
-                                                    } else {
-                                                        "Presence query context not available".to_string()
                                                     }
+                                                    _ => unreachable!(),
                                                 }
                                             };
 
