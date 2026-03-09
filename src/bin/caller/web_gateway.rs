@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn test_live_gateway_config_default() {
+    fn test_web_gateway_config_default() {
         let config = WebGatewayConfig::default();
         assert_eq!(config.provider, "gemini");
         assert_eq!(config.input_sample_rate, 16000);
@@ -442,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn test_live_gateway_config_serialize() {
+    fn test_web_gateway_config_serialize() {
         let config = WebGatewayConfig::default();
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"provider\":\"gemini\""));
