@@ -157,7 +157,7 @@ Test coverage includes:
 - **caller/mcp.rs**: MCP state management, process_action_sync, resource definitions, tool parameter schemas, event-to-state mappings
 - **caller/mcp_client.rs**: Tool name parsing (`mcp__<server>_<tool>`), routing validation, connection lifecycle
 - **caller/sandbox.rs**: Default config construction, disabled config skip, write path setup
-- **caller/web_gateway.rs**: Default port, HTML embedding, config serialization, config building (gemini/openai/explicit provider), WebSocket lifecycle, WebSocket echo (control message roundtrip), broadcast-to-WebSocket, HTTP serves HTML, HTTP serves config, live_connected/live_disconnected events, tool_request bootstrap (state_snapshot on connect), tool_request/tool_response roundtrip (check_status), tool_request action dispatch (approve → ControlCommand)
+- **caller/web_gateway.rs**: Default port, HTML embedding, config serialization, config building (gemini/openai/explicit provider), WebSocket lifecycle, WebSocket echo (control message roundtrip), broadcast-to-WebSocket, HTTP serves HTML, HTTP serves config, live_connected/live_disconnected events, tool_request bootstrap (state_snapshot on connect), tool_request/tool_response roundtrip (check_status), tool_request action dispatch (approve → ControlCommand), auto-LiveDisconnected on WebSocket drop (with and without prior live_connected)
 - **caller/conversation.rs** (additional): Auto-compaction threshold, compaction preserves system+tail, too-few-messages guard
 
 ## Architecture Details

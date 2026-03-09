@@ -3,7 +3,8 @@ use serde_json::Value;
 
 /// Actions produced by tool call dispatch.
 /// The platform layer (native or WASM) interprets and executes these.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", content = "data")]
 pub enum PresenceAction {
     /// Tool produced a text result directly (no I/O needed).
     TextResult(String),
@@ -89,6 +90,12 @@ fn handle_check_status(state: &AgentStateSnapshot) -> String {
     if !state.active_workers.is_empty() {
         parts.push(format!("Workers: {}", state.active_workers.join(", ")));
     }
+    if let Some(ref pa) = state.pending_approval {
+        parts.push(format!(
+            "PENDING APPROVAL: {} (id: {}, category: {})",
+            pa.command_preview, pa.id, pa.category
+        ));
+    }
     parts.join("\n")
 }
 
@@ -139,6 +146,32 @@ mod tests {
                 assert!(text.contains("Phase: thinking"));
                 assert!(text.contains("Turn: 3"));
                 assert!(text.contains("Budget: 15%"));
+            }
+            _ => panic!("expected TextResult"),
+        }
+    }
+
+    #[test]
+    fn dispatch_check_status_with_pending_approval() {
+        use crate::types::PendingApprovalSnapshot;
+        let state = AgentStateSnapshot {
+            phase: "waiting_approval".to_string(),
+            turn: 1,
+            budget_pct: 0.0,
+            pending_approval: Some(PendingApprovalSnapshot {
+                id: 1,
+                command_preview: "exec: ls -la /tmp".to_string(),
+                category: "CommandExec".to_string(),
+            }),
+            ..Default::default()
+        };
+        let action = dispatch_tool_call("check_status", &json!({}), &state);
+        match action {
+            PresenceAction::TextResult(text) => {
+                assert!(text.contains("PENDING APPROVAL"));
+                assert!(text.contains("exec: ls -la /tmp"));
+                assert!(text.contains("id: 1"));
+                assert!(text.contains("CommandExec"));
             }
             _ => panic!("expected TextResult"),
         }

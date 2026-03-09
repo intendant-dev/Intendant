@@ -11,6 +11,8 @@ use tokio_tungstenite::tungstenite::Message;
 pub const DEFAULT_PORT: u16 = 8765;
 
 const WEB_HTML: &str = include_str!("../../../static/live.html");
+const WASM_JS: &str = include_str!("../../../static/wasm/presence_core.js");
+const WASM_BIN: &[u8] = include_bytes!("../../../static/wasm/presence_core_bg.wasm");
 
 /// Context for answering presence tool queries from browser-side live models.
 /// Shared across all WebSocket connections (read-only for query tools).
@@ -132,6 +134,12 @@ pub fn spawn_web_gateway(
                     let query_ctx_inbound = query_ctx.clone();
                     let direct_tx_inbound = direct_tx.clone();
                     let inbound = tokio::spawn(async move {
+                        // Track whether this connection has an active live model,
+                        // so we can auto-send LiveDisconnected if the WebSocket drops
+                        // without a clean live_disconnected message (e.g. tab close
+                        // before beforeunload fires, network failure).
+                        let mut is_live_connected = false;
+
                         while let Some(Ok(msg)) = ws_rx.next().await {
                             if let Message::Text(text) = msg {
                                 let trimmed = text.trim();
@@ -152,9 +160,11 @@ pub fn spawn_web_gateway(
                                             bus_inbound.send(AppEvent::Resize(cols, rows));
                                         }
                                         Some("live_connected") => {
+                                            is_live_connected = true;
                                             bus_inbound.send(AppEvent::LiveConnected);
                                         }
                                         Some("live_disconnected") => {
+                                            is_live_connected = false;
                                             bus_inbound.send(AppEvent::LiveDisconnected);
                                         }
                                         Some("tool_request") => {
@@ -247,6 +257,13 @@ pub fn spawn_web_gateway(
                                 }
                             }
                         }
+
+                        // WebSocket closed — auto-resume server presence if this
+                        // client had an active live model (covers tab close without
+                        // beforeunload, network drops, etc.)
+                        if is_live_connected {
+                            bus_inbound.send(AppEvent::LiveDisconnected);
+                        }
                     });
 
                     // Outbound: broadcast + direct responses → WebSocket
@@ -294,30 +311,44 @@ pub fn spawn_web_gateway(
                     let _ = stream.read_exact(&mut discard).await;
 
                     // Route by request path
-                    let is_config = header_text
-                        .lines()
-                        .next()
-                        .map(|l| l.contains("/config"))
-                        .unwrap_or(false);
+                    let request_line = header_text.lines().next().unwrap_or("");
 
-                    let (content_type, body) = if is_config {
-                        ("application/json", config_json.as_str())
+                    if request_line.contains("/wasm/presence_core_bg.wasm") {
+                        // Serve WASM binary
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/wasm\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: public, max-age=86400\r\n\
+                             Connection: close\r\n\
+                             \r\n",
+                            WASM_BIN.len()
+                        );
+                        let _ = stream.try_write(header.as_bytes());
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(WASM_BIN).await;
                     } else {
-                        ("text/html; charset=utf-8", WEB_HTML)
-                    };
+                        let (content_type, body) = if request_line.contains("/wasm/presence_core.js") {
+                            ("application/javascript", WASM_JS)
+                        } else if request_line.contains("/config") {
+                            ("application/json", config_json.as_str())
+                        } else {
+                            ("text/html; charset=utf-8", WEB_HTML)
+                        };
 
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\n\
-                         Content-Type: {}\r\n\
-                         Content-Length: {}\r\n\
-                         Connection: close\r\n\
-                         \r\n\
-                         {}",
-                        content_type,
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.try_write(response.as_bytes());
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: {}\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            content_type,
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.try_write(response.as_bytes());
+                    }
                     // Give the client time to receive before dropping.
                     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                 }
@@ -865,6 +896,103 @@ mod tests {
         } else {
             panic!("expected text message");
         }
+
+        handle.abort();
+    }
+
+    /// When a WebSocket client that sent `live_connected` drops without
+    /// sending `live_disconnected`, the server should auto-emit
+    /// `LiveDisconnected` to resume server-side presence.
+    #[tokio::test]
+    async fn test_ws_drop_auto_sends_live_disconnected() {
+        let (bus, mut rx) = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Send live_connected
+        ws.send(Message::Text(r#"{"t":"live_connected"}"#.into()))
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            rx.recv(),
+        )
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+        assert!(matches!(event, AppEvent::LiveConnected));
+
+        // Drop the WebSocket WITHOUT sending live_disconnected
+        ws.close(None).await.unwrap();
+
+        // Server should auto-send LiveDisconnected
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            rx.recv(),
+        )
+        .await
+        .expect("timeout waiting for auto LiveDisconnected")
+        .expect("channel closed");
+
+        assert!(matches!(event, AppEvent::LiveDisconnected));
+
+        handle.abort();
+    }
+
+    /// When a client that never sent `live_connected` drops, no
+    /// `LiveDisconnected` should be emitted.
+    #[tokio::test]
+    async fn test_ws_drop_no_auto_disconnect_without_live() {
+        let (bus, mut rx) = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Send a resize (not live_connected), then drop
+        ws.send(Message::Text(r#"{"t":"resize","cols":80,"rows":24}"#.into()))
+            .await
+            .unwrap();
+
+        // Drain the Resize event
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            rx.recv(),
+        )
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+        assert!(matches!(event, AppEvent::Resize(80, 24)));
+
+        // Drop the WebSocket
+        ws.close(None).await.unwrap();
+
+        // Should NOT receive LiveDisconnected — only a timeout
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(500),
+            rx.recv(),
+        )
+        .await;
+        assert!(result.is_err(), "expected timeout, got {:?}", result);
 
         handle.abort();
     }

@@ -645,6 +645,7 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
         } => {
             s.phase = "running_agent".to_string();
             s.last_command_preview = commands_preview.clone();
+            s.pending_approval = None;
         }
         AppEvent::AgentOutput { stdout, stderr } => {
             // Keep a truncated summary
@@ -661,8 +662,18 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
         AppEvent::RoundComplete { .. } => {
             s.phase = "waiting_followup".to_string();
         }
-        AppEvent::ApprovalRequired { .. } => {
+        AppEvent::ApprovalRequired {
+            id,
+            command_preview,
+            category,
+            ..
+        } => {
             s.phase = "waiting_approval".to_string();
+            s.pending_approval = Some(presence_core::PendingApprovalSnapshot {
+                id: *id,
+                command_preview: command_preview.clone(),
+                category: format!("{:?}", category),
+            });
         }
         AppEvent::HumanQuestionDetected { .. } => {
             s.phase = "waiting_human".to_string();
