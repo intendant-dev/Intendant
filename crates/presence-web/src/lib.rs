@@ -31,7 +31,7 @@ pub struct PresenceWeb {
     server: RefCell<server::ServerConnection>,
     gemini: RefCell<Option<gemini::GeminiProvider>>,
     openai: Rc<RefCell<Option<openai::OpenAIProvider>>>,
-    presence: RefCell<WasmPresence>,
+    presence: Rc<RefCell<WasmPresence>>,
     active_provider: RefCell<String>, // "gemini" or "openai" or ""
     pending_tool_requests:
         Rc<RefCell<std::collections::HashMap<String, js_sys::Function>>>,
@@ -43,7 +43,7 @@ impl PresenceWeb {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
         let callbacks = Rc::new(Callbacks::default());
-        let presence = RefCell::new(WasmPresence::new());
+        let presence = Rc::new(RefCell::new(WasmPresence::new()));
         let pending = Rc::new(RefCell::new(std::collections::HashMap::new()));
 
         let mut server = server::ServerConnection::new(callbacks.clone());
@@ -111,16 +111,28 @@ impl PresenceWeb {
         *self.callbacks.on_error.borrow_mut() = Some(f);
     }
 
+    #[wasm_bindgen]
+    pub fn set_on_state_snapshot(&self, f: Function) {
+        *self.callbacks.on_state_snapshot.borrow_mut() = Some(f);
+    }
+
+    #[wasm_bindgen]
+    pub fn set_on_server_event(&self, f: Function) {
+        *self.callbacks.on_server_event.borrow_mut() = Some(f);
+    }
+
     // --- Server connection ---
 
     #[wasm_bindgen]
     pub fn connect_server(&self, url: &str) {
         let pending = self.pending_tool_requests.clone();
+        let presence = self.presence.clone();
 
         // Create the message handler
         let handler: Rc<RefCell<Box<dyn FnMut(serde_json::Value)>>> = Rc::new(RefCell::new({
             let cb = self.callbacks.clone();
             let pending = pending;
+            let presence = presence;
             Box::new(move |msg: serde_json::Value| {
                 // Route by message type
                 let t = msg.get("t").and_then(|v| v.as_str());
@@ -132,14 +144,16 @@ impl PresenceWeb {
                         }
                     }
                     Some("state_snapshot") => {
-                        // State snapshot is handled via a separate callback
-                        // since we need to update the WasmPresence instance
-                        if let Some(ref f) = *cb.on_server_state.borrow() {
-                            // Signal "snapshot" by sending a special message
-                            let snapshot_js =
-                                serde_wasm_bindgen::to_value(&msg).unwrap_or(JsValue::NULL);
-                            let _ = f.call1(&JsValue::NULL, &snapshot_js);
+                        // Update presence state from bootstrap/reconnect
+                        if let Some(state) = msg.get("state") {
+                            let state_js =
+                                serde_wasm_bindgen::to_value(state).unwrap_or(JsValue::NULL);
+                            presence.borrow_mut().set_state(state_js);
                         }
+                        // Notify JS for voice model narration
+                        let snapshot_js =
+                            serde_wasm_bindgen::to_value(&msg).unwrap_or(JsValue::NULL);
+                        cb.invoke_state_snapshot(&snapshot_js);
                     }
                     Some("tool_response") => {
                         if let Some(id) = msg["id"].as_str() {
@@ -158,10 +172,10 @@ impl PresenceWeb {
                         if msg.get("event").is_some() {
                             let event_js =
                                 serde_wasm_bindgen::to_value(&msg).unwrap_or(JsValue::NULL);
-                            // Forward to on_server_state as an event
-                            if let Some(ref f) = *cb.on_server_state.borrow() {
-                                let _ = f.call1(&JsValue::NULL, &event_js);
-                            }
+                            // Update presence state (drop borrow before callback)
+                            presence.borrow_mut().update_from_event(event_js.clone());
+                            // Notify JS for voice model narration
+                            cb.invoke_server_event(&event_js);
                         }
                     }
                 }

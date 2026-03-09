@@ -39,7 +39,9 @@ export class PresenceWeb {
     send_tool_request(tool: string, args: any, on_result: Function): void;
     send_voice_tool_response(call: any, result: any): void;
     set_on_error(f: Function): void;
+    set_on_server_event(f: Function): void;
     set_on_server_state(f: Function): void;
+    set_on_state_snapshot(f: Function): void;
     set_on_term(f: Function): void;
     set_on_voice_audio(f: Function): void;
     set_on_voice_interrupted(f: Function): void;
@@ -141,7 +143,9 @@ export interface InitOutput {
     readonly presenceweb_send_tool_request: (a: number, b: number, c: number, d: any, e: any) => void;
     readonly presenceweb_send_voice_tool_response: (a: number, b: any, c: any) => void;
     readonly presenceweb_set_on_error: (a: number, b: any) => void;
+    readonly presenceweb_set_on_server_event: (a: number, b: any) => void;
     readonly presenceweb_set_on_server_state: (a: number, b: any) => void;
+    readonly presenceweb_set_on_state_snapshot: (a: number, b: any) => void;
     readonly presenceweb_set_on_term: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_audio: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_interrupted: (a: number, b: any) => void;
