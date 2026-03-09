@@ -4,6 +4,9 @@ pub mod dispatch;
 pub mod format;
 pub mod prompt;
 
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
+
 // Re-exports for convenience
 pub use types::*;
 pub use dispatch::{PresenceAction, dispatch_tool_call};

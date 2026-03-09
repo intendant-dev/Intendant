@@ -269,6 +269,11 @@ function connectWs() {
     intLabel.textContent = 'Server';
     // Send initial resize so the server knows our terminal size
     sendResize();
+    // Re-assert live model status after reconnect so server resumes
+    // mutual exclusion (server auto-sent LiveDisconnected on WS drop)
+    if (modelConnected) {
+      ws.send(JSON.stringify({ t: 'live_connected' }));
+    }
   };
 
   ws.onmessage = (e) => {
@@ -537,100 +542,40 @@ function createProvider(name, callbacks) {
   return new GeminiProvider(callbacks);
 }
 
-// --- Presence system prompt & tools ---
-// Full presence prompt: the live model IS the presence layer when connected.
-const VOICE_PROMPT = `You are Intendant, an autonomous AI agent runtime. You speak to the user via voice. Be concise (1-3 sentences). Speak in first person — you ARE the agent.
+// --- Presence (powered by presence-core WASM module) ---
+// Tool definitions, system prompt, state tracking, and tool dispatch all
+// come from the same Rust crate used server-side. Single source of truth.
+let wasmPresence = null;
+let VOICE_TOOLS = [];
+let VOICE_PROMPT = '';
 
-## Identity
-You ARE Intendant. Never reference "the system", "the agent", or "the backend" — those are your internals. When the user asks you to do something, you do it. When workers complete tasks, you report the results as your own work.
+const wasmReady = (async () => {
+  try {
+    const wasm = await import('/wasm/presence_core.js');
+    await wasm.default('/wasm/presence_core_bg.wasm');
+    wasmPresence = new wasm.WasmPresence();
+    VOICE_TOOLS = wasm.get_presence_tools();
+    VOICE_PROMPT = wasm.get_presence_prompt();
+    console.log('[presence-core] WASM loaded: %d tools', VOICE_TOOLS.length);
+  } catch (e) {
+    console.warn('[presence-core] WASM not available:', e);
+  }
+})();
 
-## Capabilities
-You have tools to handle user requests:
-- Status queries: "What are you working on?" → use check_status
-- Detail queries: "Show me the diff" → use query_detail
-- Memory recall: "What did we do last time?" → use recall_memory
-- Coding tasks: "Implement feature X" → use submit_task
-- Autonomy changes: "Run everything automatically" → use set_autonomy
-
-## Approval Gates
-When the system tells you approval is needed, ask the user naturally: "I want to run X, is that ok?"
-Use approve_action, deny_action, or skip_action based on user input.
-
-## Human Questions
-When the system tells you a question was asked, relay it to the user naturally. Pass the answer back with respond_to_question.
-
-## Event Narration
-You receive events about task progress. Narrate concisely:
-- Phase changes: "Starting analysis..." / "Running your code now..."
-- Task complete: Summarize what was accomplished
-- Errors: Explain what went wrong simply
-- Budget warnings: Mention if context is getting tight
-Keep narration brief — one sentence per event unless the user asks for details.
-
-## Style
-- Be conversational but efficient
-- For ANY request involving code, commands, files, or work — always use submit_task
-- Match the user's tone and energy level`;
-
-const VOICE_TOOLS = [
-  { name: 'submit_task', description: 'Submit a coding task for workers to execute',
-    parameters: { type: 'object', properties: {
-      description: { type: 'string', description: 'The task description' },
-      force_direct: { type: 'boolean', description: 'Force single-agent mode. Default false.' },
-    }, required: ['description'] } },
-  { name: 'check_status', description: 'Check current agent status: phase, turn, budget, last command, workers',
-    parameters: { type: 'object', properties: {}, required: [] } },
-  { name: 'query_detail', description: 'Query detailed info. Scopes: current_turn, last_output, worker, diff, logs, file',
-    parameters: { type: 'object', properties: {
-      scope: { type: 'string', enum: ['current_turn','last_output','worker','diff','logs','file'] },
-      target: { type: 'string', description: 'Target path (required for file scope)' },
-    }, required: ['scope'] } },
-  { name: 'recall_memory', description: 'Search knowledge store and session logs for past context',
-    parameters: { type: 'object', properties: {
-      keywords: { type: 'array', items: { type: 'string' } },
-      tags: { type: 'array', items: { type: 'string' } },
-      channel: { type: 'string' },
-    }, required: [] } },
-  { name: 'approve_action', description: 'Approve a pending action that requires user consent',
-    parameters: { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] } },
-  { name: 'deny_action', description: 'Deny a pending action, stopping the current command',
-    parameters: { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] } },
-  { name: 'skip_action', description: 'Skip a pending action, continuing with the next command',
-    parameters: { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] } },
-  { name: 'respond_to_question', description: 'Respond to a question from the worker (askHuman)',
-    parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
-  { name: 'set_autonomy', description: 'Set autonomy level: low/medium/high/full',
-    parameters: { type: 'object', properties: {
-      level: { type: 'string', enum: ['low','medium','high','full'] }
-    }, required: ['level'] } },
-];
-
-// --- Agent state (updated from server bootstrap + events) ---
-let agentState = { phase: '', turn: 0, budget_pct: 0, last_command_preview: '', last_output_summary: '', active_workers: [] };
-
-// --- Pending tool requests (id → {call, resolve}) ---
+// --- Pending tool requests for NeedsIO (server round-trips) ---
 const pendingToolRequests = new Map();
 let toolRequestCounter = 0;
 
 // --- Handle events from Intendant ---
 function handleIntendantEvent(evt) {
-  const eventType = evt.event;
-
-  // Update local agent state from events
-  if (eventType === 'turn_started') {
-    agentState.turn = evt.turn || agentState.turn;
-    agentState.budget_pct = evt.budget_pct || agentState.budget_pct;
-    agentState.phase = 'thinking';
-  } else if (eventType === 'status') {
-    agentState.phase = evt.phase || agentState.phase;
-  } else if (eventType === 'agent_output') {
-    agentState.last_output_summary = (evt.stdout || '').slice(0, 500);
-  } else if (eventType === 'round_complete') {
-    agentState.phase = 'idle';
+  // Update agent state via WASM (also returns narration if applicable)
+  if (wasmPresence) {
+    wasmPresence.update_from_event(evt);
   }
 
   // Forward actionable events to the live model for narration
   if (modelProvider && modelProvider.connected) {
+    const eventType = evt.event;
     if (eventType === 'approval_required') {
       modelProvider.sendText(`[System: approval needed] You want to run: "${evt.command}" (id: ${evt.id}). Ask the user.`);
     } else if (eventType === 'ask_human') {
@@ -638,7 +583,6 @@ function handleIntendantEvent(evt) {
     } else if (eventType === 'task_complete') {
       modelProvider.sendText(`[System: done] ${evt.reason}. Tell the user briefly.`);
     } else if (eventType === 'status' && evt.phase) {
-      // Only narrate significant phase changes
       if (evt.phase === 'running_agent' || evt.phase === 'thinking') {
         modelProvider.sendText(`[System: phase] Now ${evt.phase === 'running_agent' ? 'running commands' : 'thinking'}.`);
       }
@@ -654,24 +598,34 @@ function handleServerMessage(msg) {
     for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
     term.write(arr);
   } else if (msg.t === 'state_snapshot') {
-    // Bootstrap or reconnect: full agent state
-    if (msg.state) {
-      agentState = { ...agentState, ...msg.state };
+    // Bootstrap or reconnect: full agent state in WASM
+    if (msg.state && wasmPresence) {
+      wasmPresence.set_state(msg.state);
+    }
+    // If the live model is connected and there's a pending approval,
+    // feed the context so it can relay to the user immediately.
+    if (modelProvider && modelProvider.connected && wasmPresence && wasmPresence.has_pending_approval()) {
+      const state = wasmPresence.get_state();
+      const pa = state.pending_approval;
+      if (pa) {
+        modelProvider.sendText(
+          `[System: approval needed] You want to run: "${pa.command_preview}" (id: ${pa.id}, category: ${pa.category}). Ask the user if this is okay.`
+        );
+      }
     }
   } else if (msg.t === 'tool_response') {
-    // Response to a tool_request
+    // Response to a NeedsIO tool_request
     const pending = pendingToolRequests.get(msg.id);
     if (pending) {
       pending.resolve(msg.result);
       pendingToolRequests.delete(msg.id);
     }
   } else if (msg.event) {
-    // Intendant event — forward to live model for narration
     handleIntendantEvent(msg);
   }
 }
 
-// --- Send a tool request to the server and wait for the response ---
+// --- Send a tool request to the server (only for NeedsIO tools) ---
 function sendToolRequest(toolName, args) {
   return new Promise((resolve) => {
     const id = `req_${++toolRequestCounter}`;
@@ -682,7 +636,6 @@ function sendToolRequest(toolName, args) {
       resolve('Server not connected');
       pendingToolRequests.delete(id);
     }
-    // Timeout: don't wait forever
     setTimeout(() => {
       if (pendingToolRequests.has(id)) {
         pendingToolRequests.get(id).resolve('Request timed out');
@@ -692,18 +645,84 @@ function sendToolRequest(toolName, args) {
   });
 }
 
-// --- Tool call handling: routes through server for all tools ---
+// --- Convert PresenceAction to server ControlMsg and send ---
+function sendPresenceAction(action) {
+  if (!ws || !wsConnected) return;
+  let msg = null;
+  switch (action.type) {
+    case 'SubmitTask':
+      msg = { action: 'start_task', task: action.data.task };
+      break;
+    case 'Approve':
+      msg = { action: 'approve', id: action.data.id };
+      break;
+    case 'Deny':
+      msg = { action: 'deny', id: action.data.id };
+      break;
+    case 'Skip':
+      msg = { action: 'skip', id: action.data.id };
+      break;
+    case 'Respond':
+      msg = { action: 'input', text: action.data.text };
+      break;
+    case 'SetAutonomy':
+      msg = { action: 'set_autonomy', level: action.data.level };
+      break;
+  }
+  if (msg) ws.send(JSON.stringify(msg));
+}
+
+// --- Human-readable confirmation for a dispatched action ---
+function actionConfirmation(action) {
+  switch (action.type) {
+    case 'SubmitTask': return `Task submitted: ${action.data.task}`;
+    case 'Approve': return `Approved action ${action.data.id}`;
+    case 'Deny': return `Denied action ${action.data.id}`;
+    case 'Skip': return `Skipped action ${action.data.id}`;
+    case 'Respond': return `Sent response: ${action.data.text}`;
+    case 'SetAutonomy': return `Autonomy set to ${action.data.level}`;
+    default: return 'Action dispatched';
+  }
+}
+
+// --- Tool call handling: WASM local dispatch + server routing ---
 function handleToolCall(call) {
   const name = call.name;
   const args = call.args || {};
 
-  // All tools go through the server's tool_request protocol.
-  // The server handles both action dispatch and query resolution.
-  sendToolRequest(name, args).then((result) => {
+  if (!wasmPresence) {
+    // Fallback: send everything to server (WASM not loaded)
+    sendToolRequest(name, args).then((result) => {
+      if (modelProvider) {
+        modelProvider.sendToolResponse(call, typeof result === 'string' ? { result } : result);
+      }
+    });
+    return;
+  }
+
+  // Dispatch locally via WASM
+  const action = wasmPresence.dispatch(name, args);
+
+  if (action.type === 'TextResult') {
+    // Resolved entirely client-side (e.g. check_status) — zero latency
     if (modelProvider) {
-      modelProvider.sendToolResponse(call, typeof result === 'string' ? { result } : result);
+      modelProvider.sendToolResponse(call, { result: action.data });
     }
-  });
+  } else if (action.type === 'NeedsIO') {
+    // Server round-trip needed (query_detail, recall_memory)
+    sendToolRequest(action.data.tool_name, action.data.args).then((result) => {
+      if (modelProvider) {
+        modelProvider.sendToolResponse(call, typeof result === 'string' ? { result } : result);
+      }
+    });
+  } else {
+    // Action types: SubmitTask, Approve, Deny, Skip, Respond, SetAutonomy
+    // Execute on server, respond to model immediately
+    sendPresenceAction(action);
+    if (modelProvider) {
+      modelProvider.sendToolResponse(call, { result: actionConfirmation(action) });
+    }
+  }
 }
 
 // ============================================================
@@ -876,6 +895,9 @@ function connectVoice() {
 }
 
 async function init() {
+  // 0. Wait for WASM presence module
+  await wasmReady;
+
   // 1. Connect to Intendant (TUI over WebSocket)
   connectWs();
 
@@ -897,6 +919,16 @@ async function init() {
       setTimeout(hideVoiceStatus, 3000);
       // Notify server to pause server-side presence (mutual exclusion)
       if (ws && wsConnected) ws.send(JSON.stringify({ t: 'live_connected' }));
+      // If there's a pending approval from the bootstrap snapshot, relay it
+      if (wasmPresence && wasmPresence.has_pending_approval()) {
+        const state = wasmPresence.get_state();
+        const pa = state.pending_approval;
+        if (pa) {
+          modelProvider.sendText(
+            `[System: approval needed] You want to run: "${pa.command_preview}" (id: ${pa.id}, category: ${pa.category}). Ask the user if this is okay.`
+          );
+        }
+      }
     },
     onAudio: (b64) => { playAudioChunk(b64); },
     onText: (text) => { showVoiceStatus(text); setTimeout(hideVoiceStatus, 5000); },
@@ -920,6 +952,13 @@ async function init() {
   // Don't show first-run dialog by default — voice is optional.
   // User can click the settings gear to set up voice.
 }
+
+// Send live_disconnected on tab close so server resumes presence
+window.addEventListener('beforeunload', () => {
+  if (modelConnected && ws && wsConnected) {
+    ws.send(JSON.stringify({ t: 'live_disconnected' }));
+  }
+});
 
 window.addEventListener('load', init);
 </script>

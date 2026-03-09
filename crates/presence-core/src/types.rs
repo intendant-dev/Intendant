@@ -106,6 +106,104 @@ pub struct AgentStateSnapshot {
     pub last_output_summary: String,
     pub last_command_preview: String,
     pub active_workers: Vec<String>,
+    /// Pending approval details (set when phase is "waiting_approval").
+    /// Cleared when the approval is resolved (agent starts running).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_approval: Option<PendingApprovalSnapshot>,
+}
+
+/// Serializable snapshot of a pending approval for the live model bootstrap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingApprovalSnapshot {
+    pub id: u64,
+    pub command_preview: String,
+    pub category: String,
+}
+
+impl AgentStateSnapshot {
+    /// Update state from a server-sent event (OutboundEvent JSON).
+    /// Returns an optional `PresenceEvent` if this event is worth narrating.
+    pub fn update_from_server_event(&mut self, event: &serde_json::Value) -> Option<PresenceEvent> {
+        let event_type = event.get("event")?.as_str()?;
+        match event_type {
+            "turn_started" => {
+                if let Some(t) = event["turn"].as_u64() {
+                    self.turn = t as usize;
+                }
+                if let Some(b) = event["budget_pct"].as_f64() {
+                    self.budget_pct = b;
+                }
+                self.phase = "thinking".to_string();
+                Some(PresenceEvent::PhaseChanged {
+                    phase: "thinking".to_string(),
+                })
+            }
+            "status" => {
+                if let Some(p) = event["phase"].as_str() {
+                    self.phase = p.to_string();
+                    Some(PresenceEvent::PhaseChanged {
+                        phase: p.to_string(),
+                    })
+                } else {
+                    None
+                }
+            }
+            "agent_output" => {
+                let stdout = event["stdout"].as_str().unwrap_or("");
+                self.last_output_summary = crate::truncate(stdout, 500);
+                None // agent_output is not narrated by default
+            }
+            "approval_required" => {
+                let id = event["id"].as_u64().unwrap_or(0);
+                let command = event["command"].as_str().unwrap_or("").to_string();
+                let category = event["category"].as_str().unwrap_or("").to_string();
+                self.phase = "waiting_approval".to_string();
+                self.pending_approval = Some(PendingApprovalSnapshot {
+                    id,
+                    command_preview: command.clone(),
+                    category: category.clone(),
+                });
+                Some(PresenceEvent::ApprovalNeeded {
+                    id,
+                    preview: command,
+                    category,
+                })
+            }
+            "ask_human" => {
+                let question = event["question"].as_str().unwrap_or("").to_string();
+                self.phase = "waiting_human".to_string();
+                Some(PresenceEvent::HumanQuestion { question })
+            }
+            "task_complete" => {
+                let reason = event["reason"].as_str().unwrap_or("done").to_string();
+                self.phase = "idle".to_string();
+                self.pending_approval = None;
+                Some(PresenceEvent::TaskComplete { reason })
+            }
+            "round_complete" => {
+                self.phase = "idle".to_string();
+                self.pending_approval = None;
+                let round = event["round"].as_u64().unwrap_or(0) as usize;
+                let turns = event["turns_in_round"].as_u64().unwrap_or(0) as usize;
+                Some(PresenceEvent::RoundComplete {
+                    round,
+                    turns_in_round: turns,
+                })
+            }
+            "error" => {
+                let message = event["message"].as_str().unwrap_or("unknown error").to_string();
+                Some(PresenceEvent::Error { message })
+            }
+            _ => None,
+        }
+    }
+
+    /// Update state when agent starts running (clears pending approval).
+    pub fn on_agent_started(&mut self, commands_preview: &str) {
+        self.phase = "running_agent".to_string();
+        self.last_command_preview = commands_preview.to_string();
+        self.pending_approval = None;
+    }
 }
 
 /// Minimum interval between phase-change narrations (in milliseconds).
@@ -188,5 +286,115 @@ mod tests {
         assert!(s.last_output_summary.is_empty());
         assert!(s.last_command_preview.is_empty());
         assert!(s.active_workers.is_empty());
+        assert!(s.pending_approval.is_none());
+    }
+
+    #[test]
+    fn agent_state_snapshot_with_pending_approval() {
+        let s = AgentStateSnapshot {
+            phase: "waiting_approval".to_string(),
+            pending_approval: Some(PendingApprovalSnapshot {
+                id: 1,
+                command_preview: "exec: ls -la /tmp".to_string(),
+                category: "CommandExec".to_string(),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("pending_approval"));
+        assert!(json.contains("exec: ls -la /tmp"));
+        let back: AgentStateSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(back.pending_approval.is_some());
+        let pa = back.pending_approval.unwrap();
+        assert_eq!(pa.id, 1);
+        assert_eq!(pa.command_preview, "exec: ls -la /tmp");
+    }
+
+    #[test]
+    fn agent_state_snapshot_without_approval_omits_field() {
+        let s = AgentStateSnapshot::default();
+        let json = serde_json::to_string(&s).unwrap();
+        // skip_serializing_if = "Option::is_none" should omit the field
+        assert!(!json.contains("pending_approval"));
+    }
+
+    #[test]
+    fn update_from_server_event_turn_started() {
+        let mut s = AgentStateSnapshot::default();
+        let event = serde_json::json!({"event": "turn_started", "turn": 5, "budget_pct": 0.3});
+        let narration = s.update_from_server_event(&event);
+        assert_eq!(s.turn, 5);
+        assert!((s.budget_pct - 0.3).abs() < f64::EPSILON);
+        assert_eq!(s.phase, "thinking");
+        assert!(narration.is_some());
+    }
+
+    #[test]
+    fn update_from_server_event_approval_required() {
+        let mut s = AgentStateSnapshot::default();
+        let event = serde_json::json!({
+            "event": "approval_required",
+            "id": 42,
+            "command": "rm -rf /tmp",
+            "category": "Destructive"
+        });
+        let narration = s.update_from_server_event(&event);
+        assert_eq!(s.phase, "waiting_approval");
+        assert!(s.pending_approval.is_some());
+        let pa = s.pending_approval.as_ref().unwrap();
+        assert_eq!(pa.id, 42);
+        assert_eq!(pa.command_preview, "rm -rf /tmp");
+        assert!(narration.is_some());
+    }
+
+    #[test]
+    fn update_from_server_event_task_complete_clears_approval() {
+        let mut s = AgentStateSnapshot {
+            phase: "waiting_approval".to_string(),
+            pending_approval: Some(PendingApprovalSnapshot {
+                id: 1,
+                command_preview: "test".to_string(),
+                category: "exec".to_string(),
+            }),
+            ..Default::default()
+        };
+        let event = serde_json::json!({"event": "task_complete", "reason": "all done"});
+        let narration = s.update_from_server_event(&event);
+        assert_eq!(s.phase, "idle");
+        assert!(s.pending_approval.is_none());
+        assert!(narration.is_some());
+    }
+
+    #[test]
+    fn update_from_server_event_agent_output_not_narrated() {
+        let mut s = AgentStateSnapshot::default();
+        let event = serde_json::json!({"event": "agent_output", "stdout": "hello world"});
+        let narration = s.update_from_server_event(&event);
+        assert!(narration.is_none());
+        assert_eq!(s.last_output_summary, "hello world");
+    }
+
+    #[test]
+    fn update_from_server_event_unknown_ignored() {
+        let mut s = AgentStateSnapshot::default();
+        let event = serde_json::json!({"event": "usage_update", "tokens": 1000});
+        let narration = s.update_from_server_event(&event);
+        assert!(narration.is_none());
+    }
+
+    #[test]
+    fn on_agent_started_clears_approval() {
+        let mut s = AgentStateSnapshot {
+            pending_approval: Some(PendingApprovalSnapshot {
+                id: 1,
+                command_preview: "test".to_string(),
+                category: "exec".to_string(),
+            }),
+            ..Default::default()
+        };
+        s.on_agent_started("cargo test");
+        assert_eq!(s.phase, "running_agent");
+        assert_eq!(s.last_command_preview, "cargo test");
+        assert!(s.pending_approval.is_none());
     }
 }
