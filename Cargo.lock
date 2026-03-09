@@ -1329,6 +1329,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "presence-web"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "presence-core",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
