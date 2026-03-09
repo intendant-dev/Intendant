@@ -237,442 +237,60 @@ const fitAddon = new FitAddon.FitAddon();
 term.loadAddon(fitAddon);
 term.open(document.getElementById('terminal-container'));
 fitAddon.fit();
-
-// Resize terminal when window resizes
 window.addEventListener('resize', () => {
   fitAddon.fit();
-  sendResize();
+  if (pw) pw.send_resize(term.cols, term.rows);
 });
 
 // ============================================================
-// WebSocket — connects to the Intendant live gateway
+// State & DOM refs
 // ============================================================
-let ws = null;
-let wsConnected = false;
+let pw = null;           // PresenceWeb WASM instance (manages all WebSockets)
+let gatewayConfig = null;
+let micActive = false;
+let modelConnected = false;
+let audioCtx = null;
+let mediaStream = null;
+let scriptNode = null;
+
 const intDot = document.getElementById('intDot');
 const intLabel = document.getElementById('intLabel');
+const voiceDot = document.getElementById('voiceDot');
+const voiceLabel = document.getElementById('voiceLabel');
+const voiceStatus = document.getElementById('voiceStatus');
+const micBtn = document.getElementById('micBtn');
 
+// ============================================================
+// Helpers
+// ============================================================
 function getServerUrl() {
   const saved = localStorage.getItem('intendant_server_url');
   if (saved) return saved;
   return `ws://${location.hostname || 'localhost'}:${location.port || '8765'}`;
 }
 
-function connectWs() {
-  if (ws) try { ws.close(); } catch(_) {}
-  const url = getServerUrl();
-  try { ws = new WebSocket(url); } catch(e) { return; }
-
-  ws.onopen = () => {
-    wsConnected = true;
-    intDot.className = 'conn-dot ok';
-    intLabel.textContent = 'Server';
-    // Send initial resize so the server knows our terminal size
-    sendResize();
-    // Re-assert live model status after reconnect so server resumes
-    // mutual exclusion (server auto-sent LiveDisconnected on WS drop)
-    if (modelConnected) {
-      ws.send(JSON.stringify({ t: 'live_connected' }));
-    }
-  };
-
-  ws.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      handleServerMessage(msg);
-    } catch(_) {}
-  };
-
-  ws.onclose = () => {
-    wsConnected = false;
-    intDot.className = 'conn-dot err';
-    // Attempt reconnect after 3 seconds
-    setTimeout(connectWs, 3000);
-  };
-
-  ws.onerror = () => {
-    intDot.className = 'conn-dot err';
-  };
+function getStorageKey() {
+  return (gatewayConfig && gatewayConfig.provider === 'openai')
+    ? 'intendant_openai_key' : 'intendant_gemini_key';
 }
 
-function sendResize() {
-  if (ws && wsConnected) {
-    ws.send(JSON.stringify({ t: 'resize', cols: term.cols, rows: term.rows }));
-  }
+function getApiKeyName() {
+  return (gatewayConfig && gatewayConfig.provider === 'openai')
+    ? 'OpenAI API Key' : 'Gemini API Key';
 }
 
-// Forward keyboard input from xterm.js to the server
-term.onKey(({ domEvent }) => {
-  if (!ws || !wsConnected) return;
-  ws.send(JSON.stringify({
-    t: 'key',
-    key: domEvent.key,
-    ctrl: domEvent.ctrlKey,
-    alt: domEvent.altKey,
-    shift: domEvent.shiftKey,
-  }));
-});
-
-// ============================================================
-// Voice Model — direct browser-to-API connection (low latency)
-// ============================================================
-let gatewayConfig = null;
-let modelProvider = null;
-let micActive = false;
-let modelConnected = false;
-let audioCtx = null;
-let mediaStream = null;
-let scriptNode = null;
-let analyserNode = null;
-const voiceDot = document.getElementById('voiceDot');
-const voiceLabel = document.getElementById('voiceLabel');
-const voiceStatus = document.getElementById('voiceStatus');
-const micBtn = document.getElementById('micBtn');
-
-// --- Provider Abstraction ---
-class LiveProvider {
-  constructor(callbacks) {
-    this.cb = callbacks;
-    this.ws = null;
-    this.connected = false;
-  }
-  connect(config) {}
-  sendSetup(systemPrompt, tools) {}
-  sendAudio(base64pcm) {}
-  sendText(text) {}
-  sendToolResponse(call, result) {}
-  disconnect() {
-    if (this.ws) { try { this.ws.close(); } catch(_) {} }
-    this.connected = false;
-  }
-  getApiKeyName() { return 'API Key'; }
-  getStorageKey() { return 'intendant_api_key'; }
-}
-
-class GeminiProvider extends LiveProvider {
-  constructor(callbacks) {
-    super(callbacks);
-    this.model = 'gemini-2.5-flash-native-audio-preview-12-2025';
-    this.inputSampleRate = 16000;
-  }
-
-  connect(config) {
-    if (config && config.model) this.model = config.model;
-    if (config && config.input_sample_rate) this.inputSampleRate = config.input_sample_rate;
-    const key = this.getApiKey();
-    if (!key) { this.cb.onError('No Gemini API key'); return; }
-    this.disconnect();
-    const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${key}`;
-    try { this.ws = new WebSocket(url); } catch(e) { this.cb.onError(`${e}`); return; }
-    this.ws.onopen = () => { this.connected = true; this.sendSetup(VOICE_PROMPT, VOICE_TOOLS); };
-    this.ws.onmessage = async (e) => {
-      try {
-        const text = typeof e.data === 'string' ? e.data : await e.data.text();
-        this.handleMessage(JSON.parse(text));
-      } catch(err) { this.cb.onError(`${err}`); }
-    };
-    this.ws.onclose = (e) => { this.connected = false; this.cb.onError(`Disconnected (${e.code})`); };
-    this.ws.onerror = () => { this.cb.onError('WebSocket error'); };
-  }
-
-  sendSetup(systemPrompt, tools) {
-    if (!this.ws || !this.connected) return;
-    this.ws.send(JSON.stringify({
-      setup: {
-        model: `models/${this.model}`,
-        generation_config: {
-          response_modalities: ['AUDIO'],
-          speech_config: { voice_config: { prebuilt_voice_config: { voice_name: 'Aoede' } } }
-        },
-        system_instruction: { parts: [{ text: systemPrompt }] },
-        tools: [{ function_declarations: tools }]
-      }
-    }));
-  }
-
-  sendAudio(base64pcm) {
-    if (!this.ws || !this.connected) return;
-    this.ws.send(JSON.stringify({
-      realtime_input: {
-        media_chunks: [{ mime_type: `audio/pcm;rate=${this.inputSampleRate}`, data: base64pcm }]
-      }
-    }));
-  }
-
-  sendText(text) {
-    if (!this.ws || !this.connected) return;
-    this.ws.send(JSON.stringify({
-      client_content: { turns: [{ role: 'user', parts: [{ text }] }], turn_complete: true }
-    }));
-  }
-
-  sendToolResponse(call, result) {
-    if (!this.ws || !this.connected) return;
-    this.ws.send(JSON.stringify({
-      tool_response: {
-        function_responses: [{ name: call.name, id: call.id || call.name, response: result }]
-      }
-    }));
-  }
-
-  handleMessage(msg) {
-    if (msg.setupComplete) { this.cb.onReady(); return; }
-    if (msg.toolCall && msg.toolCall.functionCalls) {
-      for (const fc of msg.toolCall.functionCalls) this.cb.onToolCall(fc);
-      return;
-    }
-    if (msg.toolCallCancellation) return;
-    const response = msg.serverContent;
-    if (!response) return;
-    if (response.turnComplete) return;
-    if (response.interrupted) { this.cb.onInterrupted(); return; }
-    if (response.modelTurn && response.modelTurn.parts) {
-      for (const part of response.modelTurn.parts) {
-        if (part.inlineData && part.inlineData.mimeType && part.inlineData.mimeType.startsWith('audio/'))
-          this.cb.onAudio(part.inlineData.data);
-        if (part.text) this.cb.onText(part.text);
-        if (part.functionCall) this.cb.onToolCall(part.functionCall);
-      }
-    }
-  }
-
-  getApiKey() { return localStorage.getItem(this.getStorageKey()) || ''; }
-  getApiKeyName() { return 'Gemini API Key'; }
-  getStorageKey() { return 'intendant_gemini_key'; }
-}
-
-class OpenAIProvider extends LiveProvider {
-  constructor(callbacks) {
-    super(callbacks);
-    this.model = 'gpt-4o-realtime-preview';
-    this.inputSampleRate = 24000;
-  }
-
-  async connect(config) {
-    if (config && config.model) this.model = config.model;
-    if (config && config.input_sample_rate) this.inputSampleRate = config.input_sample_rate;
-    const key = this.getApiKey();
-    if (!key) { this.cb.onError('No OpenAI API key'); return; }
-    this.disconnect();
-    let ephemeralKey;
-    try {
-      const resp = await fetch('https://api.openai.com/v1/realtime/sessions', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: this.model, modalities: ['audio', 'text'], voice: 'alloy' }),
-      });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const data = await resp.json();
-      ephemeralKey = data.client_secret?.value;
-      if (!ephemeralKey) throw new Error('No client_secret');
-    } catch(e) { this.cb.onError(`Session: ${e.message}`); return; }
-
-    const url = `wss://api.openai.com/v1/realtime?model=${this.model}`;
-    try {
-      this.ws = new WebSocket(url, ['realtime', `openai-insecure-api-key.${ephemeralKey}`, 'openai-beta.realtime-v1']);
-    } catch(e) { this.cb.onError(`${e}`); return; }
-    this.ws.onopen = () => { this.connected = true; this.sendSetup(VOICE_PROMPT, VOICE_TOOLS); };
-    this.ws.onmessage = (e) => { try { this.handleMessage(JSON.parse(e.data)); } catch(err) { this.cb.onError(`${err}`); } };
-    this.ws.onclose = (e) => { this.connected = false; this.cb.onError(`Disconnected (${e.code})`); };
-    this.ws.onerror = () => { this.cb.onError('WebSocket error'); };
-  }
-
-  sendSetup(systemPrompt, tools) {
-    if (!this.ws || !this.connected) return;
-    this.ws.send(JSON.stringify({
-      type: 'session.update',
-      session: {
-        modalities: ['audio', 'text'],
-        instructions: systemPrompt,
-        voice: 'alloy',
-        input_audio_format: 'pcm16',
-        output_audio_format: 'pcm16',
-        tools: tools.map(t => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters })),
-      }
-    }));
-  }
-
-  sendAudio(base64pcm) {
-    if (!this.ws || !this.connected) return;
-    this.ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: base64pcm }));
-  }
-
-  sendText(text) {
-    if (!this.ws || !this.connected) return;
-    this.ws.send(JSON.stringify({
-      type: 'conversation.item.create',
-      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] }
-    }));
-    this.ws.send(JSON.stringify({ type: 'response.create' }));
-  }
-
-  sendToolResponse(call, result) {
-    if (!this.ws || !this.connected) return;
-    this.ws.send(JSON.stringify({
-      type: 'conversation.item.create',
-      item: { type: 'function_call_output', call_id: call.call_id || call.id || call.name, output: JSON.stringify(result) }
-    }));
-    this.ws.send(JSON.stringify({ type: 'response.create' }));
-  }
-
-  handleMessage(msg) {
-    switch (msg.type) {
-      case 'session.created':
-      case 'session.updated':
-        this.cb.onReady(); break;
-      case 'response.audio.delta':
-        if (msg.delta) this.cb.onAudio(msg.delta); break;
-      case 'response.text.delta':
-        if (msg.delta) this.cb.onText(msg.delta); break;
-      case 'response.function_call_arguments.done':
-        this.cb.onToolCall({ name: msg.name, args: JSON.parse(msg.arguments || '{}'), id: msg.item_id, call_id: msg.call_id });
-        break;
-      case 'input_audio_buffer.speech_started':
-        this.cb.onInterrupted(); break;
-    }
-  }
-
-  getApiKey() { return localStorage.getItem(this.getStorageKey()) || ''; }
-  getApiKeyName() { return 'OpenAI API Key'; }
-  getStorageKey() { return 'intendant_openai_key'; }
-}
-
-function createProvider(name, callbacks) {
-  if (name === 'openai') return new OpenAIProvider(callbacks);
-  return new GeminiProvider(callbacks);
-}
-
-// --- Presence (powered by presence-core WASM module) ---
-// Tool definitions, system prompt, state tracking, and tool dispatch all
-// come from the same Rust crate used server-side. Single source of truth.
-let wasmPresence = null;
-let VOICE_TOOLS = [];
-let VOICE_PROMPT = '';
-
-const wasmReady = (async () => {
-  try {
-    const wasm = await import('/wasm/presence_core.js');
-    await wasm.default('/wasm/presence_core_bg.wasm');
-    wasmPresence = new wasm.WasmPresence();
-    VOICE_TOOLS = wasm.get_presence_tools();
-    VOICE_PROMPT = wasm.get_presence_prompt();
-    console.log('[presence-core] WASM loaded: %d tools', VOICE_TOOLS.length);
-  } catch (e) {
-    console.warn('[presence-core] WASM not available:', e);
-  }
-})();
-
-// --- Pending tool requests for NeedsIO (server round-trips) ---
-const pendingToolRequests = new Map();
-let toolRequestCounter = 0;
-
-// --- Handle events from Intendant ---
-function handleIntendantEvent(evt) {
-  // Update agent state via WASM (also returns narration if applicable)
-  if (wasmPresence) {
-    wasmPresence.update_from_event(evt);
-  }
-
-  // Forward actionable events to the live model for narration
-  if (modelProvider && modelProvider.connected) {
-    const eventType = evt.event;
-    if (eventType === 'approval_required') {
-      modelProvider.sendText(`[System: approval needed] You want to run: "${evt.command}" (id: ${evt.id}). Ask the user.`);
-    } else if (eventType === 'ask_human') {
-      modelProvider.sendText(`[System: question] "${evt.question}". Ask the user naturally.`);
-    } else if (eventType === 'task_complete') {
-      modelProvider.sendText(`[System: done] ${evt.reason}. Tell the user briefly.`);
-    } else if (eventType === 'status' && evt.phase) {
-      if (evt.phase === 'running_agent' || evt.phase === 'thinking') {
-        modelProvider.sendText(`[System: phase] Now ${evt.phase === 'running_agent' ? 'running commands' : 'thinking'}.`);
-      }
-    }
-  }
-}
-
-// --- Handle WebSocket messages including tool_response and state_snapshot ---
-function handleServerMessage(msg) {
-  if (msg.t === 'term') {
-    const bytes = atob(msg.d);
-    const arr = new Uint8Array(bytes.length);
-    for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-    term.write(arr);
-  } else if (msg.t === 'state_snapshot') {
-    // Bootstrap or reconnect: full agent state in WASM
-    if (msg.state && wasmPresence) {
-      wasmPresence.set_state(msg.state);
-    }
-    // If the live model is connected and there's a pending approval,
-    // feed the context so it can relay to the user immediately.
-    if (modelProvider && modelProvider.connected && wasmPresence && wasmPresence.has_pending_approval()) {
-      const state = wasmPresence.get_state();
-      const pa = state.pending_approval;
-      if (pa) {
-        modelProvider.sendText(
-          `[System: approval needed] You want to run: "${pa.command_preview}" (id: ${pa.id}, category: ${pa.category}). Ask the user if this is okay.`
-        );
-      }
-    }
-  } else if (msg.t === 'tool_response') {
-    // Response to a NeedsIO tool_request
-    const pending = pendingToolRequests.get(msg.id);
-    if (pending) {
-      pending.resolve(msg.result);
-      pendingToolRequests.delete(msg.id);
-    }
-  } else if (msg.event) {
-    handleIntendantEvent(msg);
-  }
-}
-
-// --- Send a tool request to the server (only for NeedsIO tools) ---
-function sendToolRequest(toolName, args) {
-  return new Promise((resolve) => {
-    const id = `req_${++toolRequestCounter}`;
-    pendingToolRequests.set(id, { resolve });
-    if (ws && wsConnected) {
-      ws.send(JSON.stringify({ t: 'tool_request', id, tool: toolName, args }));
-    } else {
-      resolve('Server not connected');
-      pendingToolRequests.delete(id);
-    }
-    setTimeout(() => {
-      if (pendingToolRequests.has(id)) {
-        pendingToolRequests.get(id).resolve('Request timed out');
-        pendingToolRequests.delete(id);
-      }
-    }, 10000);
-  });
-}
-
-// --- Convert PresenceAction to server ControlMsg and send ---
-function sendPresenceAction(action) {
-  if (!ws || !wsConnected) return;
-  let msg = null;
+function presenceActionToControlMsg(action) {
   switch (action.type) {
-    case 'SubmitTask':
-      msg = { action: 'start_task', task: action.data.task };
-      break;
-    case 'Approve':
-      msg = { action: 'approve', id: action.data.id };
-      break;
-    case 'Deny':
-      msg = { action: 'deny', id: action.data.id };
-      break;
-    case 'Skip':
-      msg = { action: 'skip', id: action.data.id };
-      break;
-    case 'Respond':
-      msg = { action: 'input', text: action.data.text };
-      break;
-    case 'SetAutonomy':
-      msg = { action: 'set_autonomy', level: action.data.level };
-      break;
+    case 'SubmitTask': return { action: 'start_task', task: action.data.task };
+    case 'Approve': return { action: 'approve', id: action.data.id };
+    case 'Deny': return { action: 'deny', id: action.data.id };
+    case 'Skip': return { action: 'skip', id: action.data.id };
+    case 'Respond': return { action: 'input', text: action.data.text };
+    case 'SetAutonomy': return { action: 'set_autonomy', level: action.data.level };
+    default: return null;
   }
-  if (msg) ws.send(JSON.stringify(msg));
 }
 
-// --- Human-readable confirmation for a dispatched action ---
 function actionConfirmation(action) {
   switch (action.type) {
     case 'SubmitTask': return `Task submitted: ${action.data.task}`;
@@ -685,44 +303,15 @@ function actionConfirmation(action) {
   }
 }
 
-// --- Tool call handling: WASM local dispatch + server routing ---
-function handleToolCall(call) {
-  const name = call.name;
-  const args = call.args || {};
-
-  if (!wasmPresence) {
-    // Fallback: send everything to server (WASM not loaded)
-    sendToolRequest(name, args).then((result) => {
-      if (modelProvider) {
-        modelProvider.sendToolResponse(call, typeof result === 'string' ? { result } : result);
-      }
-    });
-    return;
-  }
-
-  // Dispatch locally via WASM
-  const action = wasmPresence.dispatch(name, args);
-
-  if (action.type === 'TextResult') {
-    // Resolved entirely client-side (e.g. check_status) — zero latency
-    if (modelProvider) {
-      modelProvider.sendToolResponse(call, { result: action.data });
-    }
-  } else if (action.type === 'NeedsIO') {
-    // Server round-trip needed (query_detail, recall_memory)
-    sendToolRequest(action.data.tool_name, action.data.args).then((result) => {
-      if (modelProvider) {
-        modelProvider.sendToolResponse(call, typeof result === 'string' ? { result } : result);
-      }
-    });
-  } else {
-    // Action types: SubmitTask, Approve, Deny, Skip, Respond, SetAutonomy
-    // Execute on server, respond to model immediately
-    sendPresenceAction(action);
-    if (modelProvider) {
-      modelProvider.sendToolResponse(call, { result: actionConfirmation(action) });
-    }
-  }
+// ============================================================
+// Voice Status
+// ============================================================
+function showVoiceStatus(text, isError) {
+  voiceStatus.textContent = text;
+  voiceStatus.className = 'voice-status' + (isError ? ' error' : '');
+}
+function hideVoiceStatus() {
+  voiceStatus.className = 'voice-status hidden';
 }
 
 // ============================================================
@@ -759,7 +348,6 @@ async function startMic() {
   }
   if (!audioCtx) audioCtx = new AudioContext();
   if (audioCtx.state === 'suspended') await audioCtx.resume();
-
   if (!mediaStream) {
     try {
       mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true } });
@@ -775,17 +363,17 @@ async function startMic() {
   const nativeSR = audioCtx.sampleRate;
   scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
   scriptNode.onaudioprocess = (e) => {
-    if (!micActive || !modelProvider || !modelProvider.connected) return;
+    if (!micActive || !modelConnected || !pw) return;
     const float32 = e.inputBuffer.getChannelData(0);
     const resampled = downsample(float32, nativeSR, targetSR);
     const pcm16 = new Int16Array(resampled.length);
     for (let i = 0; i < resampled.length; i++)
       pcm16[i] = Math.max(-32768, Math.min(32767, Math.floor(resampled[i] * 32768)));
-    modelProvider.sendAudio(arrayBufferToBase64(pcm16.buffer));
+    pw.send_audio(arrayBufferToBase64(pcm16.buffer));
   };
   source.connect(scriptNode);
   scriptNode.connect(audioCtx.destination);
-  showVoiceStatus('Mic active — speak now');
+  showVoiceStatus('Mic active \u2014 speak now');
 }
 
 function stopMic() {
@@ -793,7 +381,6 @@ function stopMic() {
   hideVoiceStatus();
 }
 
-// --- Audio playback ---
 const audioQueue = [];
 let isPlaying = false;
 
@@ -824,27 +411,12 @@ function playNext() {
 }
 
 // ============================================================
-// Voice Status
-// ============================================================
-function showVoiceStatus(text, isError) {
-  voiceStatus.textContent = text;
-  voiceStatus.className = 'voice-status' + (isError ? ' error' : '');
-}
-function hideVoiceStatus() {
-  voiceStatus.className = 'voice-status hidden';
-}
-
-// ============================================================
 // Mic Button
 // ============================================================
 micBtn.addEventListener('click', async () => {
   micActive = !micActive;
   micBtn.classList.toggle('active', micActive);
-  if (micActive) {
-    await startMic();
-  } else {
-    stopMic();
-  }
+  if (micActive) await startMic(); else stopMic();
 });
 
 // ============================================================
@@ -862,102 +434,173 @@ const firstRunSkip = document.getElementById('firstRunSkip');
 const firstRunKeyInput = document.getElementById('firstRunKeyInput');
 
 settingsBtn.addEventListener('click', () => {
-  if (modelProvider) {
-    apiKeyInput.value = localStorage.getItem(modelProvider.getStorageKey()) || '';
-    apiKeyLabel.textContent = modelProvider.getApiKeyName();
-  }
+  apiKeyInput.value = localStorage.getItem(getStorageKey()) || '';
+  apiKeyLabel.textContent = getApiKeyName();
   settingsDialog.classList.remove('hidden');
 });
 settingsCancel.addEventListener('click', () => settingsDialog.classList.add('hidden'));
 settingsSave.addEventListener('click', () => {
-  if (modelProvider) localStorage.setItem(modelProvider.getStorageKey(), apiKeyInput.value.trim());
+  localStorage.setItem(getStorageKey(), apiKeyInput.value.trim());
   settingsDialog.classList.add('hidden');
   connectVoice();
 });
 firstRunSave.addEventListener('click', () => {
   const key = firstRunKeyInput.value.trim();
-  if (key && modelProvider) localStorage.setItem(modelProvider.getStorageKey(), key);
+  if (key) localStorage.setItem(getStorageKey(), key);
   firstRunDialog.classList.add('hidden');
   if (key) connectVoice();
 });
-firstRunSkip.addEventListener('click', () => {
-  firstRunDialog.classList.add('hidden');
-});
+firstRunSkip.addEventListener('click', () => firstRunDialog.classList.add('hidden'));
 
 // ============================================================
-// Init
+// Voice connection — delegates to PresenceWeb WASM
 // ============================================================
 function connectVoice() {
-  if (!modelProvider) return;
-  const key = localStorage.getItem(modelProvider.getStorageKey());
+  if (!pw) return;
+  const key = localStorage.getItem(getStorageKey());
   if (!key) return;
-  modelProvider.connect(gatewayConfig);
+  const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
+  const model = (gatewayConfig && gatewayConfig.model) || null;
+  const inputRate = (gatewayConfig && gatewayConfig.input_sample_rate) || null;
+  pw.connect_voice(provider, key, model, inputRate);
 }
 
+// ============================================================
+// Init — loads presence-web WASM and wires everything up
+// ============================================================
 async function init() {
-  // 0. Wait for WASM presence module
-  await wasmReady;
+  // 1. Load presence-web WASM (includes presence-core + all WebSocket protocols)
+  try {
+    const wasm = await import('/wasm-web/presence_web.js');
+    await wasm.default('/wasm-web/presence_web_bg.wasm');
+    pw = new wasm.PresenceWeb();
+    window.__presenceWeb = pw;
+    console.log('[presence-web] WASM loaded (%d tools)', pw.get_tools().length);
+  } catch (e) {
+    console.error('[presence-web] WASM load failed:', e);
+    term.write('\r\n\x1b[31mError: Failed to load presence-web WASM module.\x1b[0m\r\n');
+    return;
+  }
 
-  // 1. Connect to Intendant (TUI over WebSocket)
-  connectWs();
+  // 2. Set up WASM -> JS callbacks
 
-  // 2. Fetch config for voice model
+  // Terminal data (base64-encoded ANSI frames)
+  pw.set_on_term((b64) => {
+    const bytes = atob(b64);
+    const arr = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+    term.write(arr);
+  });
+
+  // Server connection state
+  pw.set_on_server_state((connected) => {
+    intDot.className = 'conn-dot ' + (connected ? 'ok' : 'err');
+    intLabel.textContent = 'Server';
+    if (connected) pw.send_resize(term.cols, term.rows);
+  });
+
+  // Bootstrap state snapshot (presence state already updated in WASM)
+  pw.set_on_state_snapshot(() => {
+    if (modelConnected && pw.has_pending_approval()) {
+      const state = pw.get_state();
+      const pa = state.pending_approval;
+      if (pa) {
+        pw.send_text(
+          `[System: approval needed] You want to run: "${pa.command_preview}" (id: ${pa.id}, category: ${pa.category}). Ask the user if this is okay.`
+        );
+      }
+    }
+  });
+
+  // Server events (presence state already updated in WASM)
+  pw.set_on_server_event((evt) => {
+    if (!modelConnected) return;
+    const eventType = evt.event;
+    if (eventType === 'approval_required') {
+      pw.send_text(`[System: approval needed] You want to run: "${evt.command}" (id: ${evt.id}). Ask the user.`);
+    } else if (eventType === 'ask_human') {
+      pw.send_text(`[System: question] "${evt.question}". Ask the user naturally.`);
+    } else if (eventType === 'task_complete') {
+      pw.send_text(`[System: done] ${evt.reason}. Tell the user briefly.`);
+    } else if (eventType === 'status' && evt.phase) {
+      if (evt.phase === 'running_agent' || evt.phase === 'thinking') {
+        pw.send_text(`[System: phase] Now ${evt.phase === 'running_agent' ? 'running commands' : 'thinking'}.`);
+      }
+    }
+  });
+
+  // Voice model ready
+  pw.set_on_voice_ready(() => {
+    modelConnected = true;
+    voiceDot.className = 'conn-dot ok';
+    const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
+    voiceLabel.textContent = provider.charAt(0).toUpperCase() + provider.slice(1);
+    showVoiceStatus('Voice ready');
+    setTimeout(hideVoiceStatus, 3000);
+    if (pw.has_pending_approval()) {
+      const state = pw.get_state();
+      const pa = state.pending_approval;
+      if (pa) {
+        pw.send_text(
+          `[System: approval needed] You want to run: "${pa.command_preview}" (id: ${pa.id}, category: ${pa.category}). Ask the user if this is okay.`
+        );
+      }
+    }
+  });
+
+  // Voice audio and text
+  pw.set_on_voice_audio((b64) => playAudioChunk(b64));
+  pw.set_on_voice_text((text) => {
+    showVoiceStatus(text);
+    setTimeout(hideVoiceStatus, 5000);
+  });
+
+  // Voice tool calls — dispatch via WASM, route by action type
+  pw.set_on_voice_tool_call((call) => {
+    const action = pw.dispatch_tool(call.name, call.args || {});
+
+    if (action.type === 'TextResult') {
+      pw.send_voice_tool_response(call, { result: action.data });
+    } else if (action.type === 'NeedsIO') {
+      pw.send_tool_request(action.data.tool_name, action.data.args, (result) => {
+        pw.send_voice_tool_response(call, typeof result === 'string' ? { result } : result);
+      });
+    } else {
+      const msg = presenceActionToControlMsg(action);
+      if (msg) pw.send_server_action(msg);
+      pw.send_voice_tool_response(call, { result: actionConfirmation(action) });
+    }
+  });
+
+  pw.set_on_voice_interrupted(() => {});
+  pw.set_on_error((msg) => {
+    modelConnected = false;
+    voiceDot.className = 'conn-dot err';
+    showVoiceStatus(msg, true);
+  });
+
+  // Forward keyboard input via WASM
+  term.onKey(({ domEvent }) => {
+    if (pw) pw.send_key(domEvent.key, domEvent.ctrlKey, domEvent.altKey, domEvent.shiftKey);
+  });
+
+  // 3. Connect to server (WebSocket managed by WASM)
+  pw.connect_server(getServerUrl());
+
+  // 4. Fetch voice config
   try {
     const resp = await fetch('/config');
     if (resp.ok) gatewayConfig = await resp.json();
   } catch(_) {}
 
-  const providerName = gatewayConfig ? gatewayConfig.provider : 'gemini';
-
-  // 3. Create voice provider
-  modelProvider = createProvider(providerName, {
-    onReady: () => {
-      modelConnected = true;
-      voiceDot.className = 'conn-dot ok';
-      voiceLabel.textContent = providerName.charAt(0).toUpperCase() + providerName.slice(1);
-      showVoiceStatus('Voice ready');
-      setTimeout(hideVoiceStatus, 3000);
-      // Notify server to pause server-side presence (mutual exclusion)
-      if (ws && wsConnected) ws.send(JSON.stringify({ t: 'live_connected' }));
-      // If there's a pending approval from the bootstrap snapshot, relay it
-      if (wasmPresence && wasmPresence.has_pending_approval()) {
-        const state = wasmPresence.get_state();
-        const pa = state.pending_approval;
-        if (pa) {
-          modelProvider.sendText(
-            `[System: approval needed] You want to run: "${pa.command_preview}" (id: ${pa.id}, category: ${pa.category}). Ask the user if this is okay.`
-          );
-        }
-      }
-    },
-    onAudio: (b64) => { playAudioChunk(b64); },
-    onText: (text) => { showVoiceStatus(text); setTimeout(hideVoiceStatus, 5000); },
-    onToolCall: (call) => { handleToolCall(call); },
-    onInterrupted: () => {},
-    onError: (msg) => {
-      const wasConnected = modelConnected;
-      modelConnected = false;
-      voiceDot.className = 'conn-dot err';
-      showVoiceStatus(msg, true);
-      // Notify server to resume server-side presence (mutual exclusion)
-      if (wasConnected && ws && wsConnected) ws.send(JSON.stringify({ t: 'live_disconnected' }));
-    }
-  });
-
-  // 4. Check for existing API key
-  const existingKey = localStorage.getItem(modelProvider.getStorageKey());
-  if (existingKey) {
-    connectVoice();
-  }
-  // Don't show first-run dialog by default — voice is optional.
-  // User can click the settings gear to set up voice.
+  // 5. Connect voice if API key exists
+  const existingKey = localStorage.getItem(getStorageKey());
+  if (existingKey) connectVoice();
 }
 
-// Send live_disconnected on tab close so server resumes presence
+// Clean disconnect on tab close
 window.addEventListener('beforeunload', () => {
-  if (modelConnected && ws && wsConnected) {
-    ws.send(JSON.stringify({ t: 'live_disconnected' }));
-  }
+  if (modelConnected && pw) pw.disconnect_voice();
 });
 
 window.addEventListener('load', init);

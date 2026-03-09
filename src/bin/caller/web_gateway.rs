@@ -13,6 +13,8 @@ pub const DEFAULT_PORT: u16 = 8765;
 const WEB_HTML: &str = include_str!("../../../static/live.html");
 const WASM_JS: &str = include_str!("../../../static/wasm/presence_core.js");
 const WASM_BIN: &[u8] = include_bytes!("../../../static/wasm/presence_core_bg.wasm");
+const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
+const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
 
 /// Context for answering presence tool queries from browser-side live models.
 /// Shared across all WebSocket connections (read-only for query tools).
@@ -313,8 +315,16 @@ pub fn spawn_web_gateway(
                     // Route by request path
                     let request_line = header_text.lines().next().unwrap_or("");
 
-                    if request_line.contains("/wasm/presence_core_bg.wasm") {
-                        // Serve WASM binary
+                    // Route WASM binaries (need async write_all for large payloads)
+                    let wasm_binary = if request_line.contains("/wasm/presence_core_bg.wasm") {
+                        Some(WASM_BIN)
+                    } else if request_line.contains("/wasm-web/presence_web_bg.wasm") {
+                        Some(WASM_WEB_BIN)
+                    } else {
+                        None
+                    };
+
+                    if let Some(wasm_data) = wasm_binary {
                         let header = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/wasm\r\n\
@@ -322,14 +332,16 @@ pub fn spawn_web_gateway(
                              Cache-Control: public, max-age=86400\r\n\
                              Connection: close\r\n\
                              \r\n",
-                            WASM_BIN.len()
+                            wasm_data.len()
                         );
                         let _ = stream.try_write(header.as_bytes());
                         use tokio::io::AsyncWriteExt;
-                        let _ = stream.write_all(WASM_BIN).await;
+                        let _ = stream.write_all(wasm_data).await;
                     } else {
                         let (content_type, body) = if request_line.contains("/wasm/presence_core.js") {
                             ("application/javascript", WASM_JS)
+                        } else if request_line.contains("/wasm-web/presence_web.js") {
+                            ("application/javascript", WASM_WEB_JS)
                         } else if request_line.contains("/config") {
                             ("application/json", config_json.as_str())
                         } else {

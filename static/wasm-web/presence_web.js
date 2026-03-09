@@ -189,8 +189,20 @@ export class PresenceWeb {
     /**
      * @param {Function} f
      */
+    set_on_server_event(f) {
+        wasm.presenceweb_set_on_server_event(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
     set_on_server_state(f) {
         wasm.presenceweb_set_on_server_state(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_state_snapshot(f) {
+        wasm.presenceweb_set_on_state_snapshot(this.__wbg_ptr, f);
     }
     /**
      * @param {Function} f

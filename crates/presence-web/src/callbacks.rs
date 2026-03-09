@@ -13,8 +13,12 @@ use wasm_bindgen::prelude::*;
 pub struct Callbacks {
     /// Terminal ANSI data from server (base64-encoded).
     pub on_term: RefCell<Option<Function>>,
-    /// Server connection state changed.
+    /// Server connection state changed (boolean: connected/disconnected).
     pub on_server_state: RefCell<Option<Function>>,
+    /// Bootstrap state_snapshot from server (JsValue with state object).
+    pub on_state_snapshot: RefCell<Option<Function>>,
+    /// Intendant event from server (JsValue with event object).
+    pub on_server_event: RefCell<Option<Function>>,
     /// Voice model ready (connected + setup complete).
     pub on_voice_ready: RefCell<Option<Function>>,
     /// Voice audio chunk (base64 PCM).
@@ -39,6 +43,18 @@ impl Callbacks {
     pub fn invoke_server_state(&self, connected: bool) {
         if let Some(ref f) = *self.on_server_state.borrow() {
             let _ = f.call1(&JsValue::NULL, &JsValue::from_bool(connected));
+        }
+    }
+
+    pub fn invoke_state_snapshot(&self, state: &JsValue) {
+        if let Some(ref f) = *self.on_state_snapshot.borrow() {
+            let _ = f.call1(&JsValue::NULL, state);
+        }
+    }
+
+    pub fn invoke_server_event(&self, event: &JsValue) {
+        if let Some(ref f) = *self.on_server_event.borrow() {
+            let _ = f.call1(&JsValue::NULL, event);
         }
     }
 
