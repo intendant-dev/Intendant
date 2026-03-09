@@ -281,7 +281,11 @@ function getApiKeyName() {
 
 function presenceActionToControlMsg(action) {
   switch (action.type) {
-    case 'SubmitTask': return { action: 'start_task', task: action.data.task };
+    case 'SubmitTask': {
+      const msg = { action: 'start_task', task: action.data.task };
+      if (action.data.force_direct) msg.orchestrate = false;
+      return msg;
+    }
     case 'Approve': return { action: 'approve', id: action.data.id };
     case 'Deny': return { action: 'deny', id: action.data.id };
     case 'Skip': return { action: 'skip', id: action.data.id };
