@@ -33,6 +33,8 @@ pub struct Callbacks {
     pub on_error: RefCell<Option<Function>>,
     /// Diagnostic event (kind, detail) — for debug logging.
     pub on_diagnostic: RefCell<Option<Function>>,
+    /// Inject system text into the active voice model (for async query results).
+    pub on_inject_voice_text: RefCell<Option<Function>>,
 }
 
 impl Callbacks {
@@ -103,6 +105,12 @@ impl Callbacks {
                 &JsValue::from_str(kind),
                 &JsValue::from_str(detail),
             );
+        }
+    }
+
+    pub fn invoke_inject_voice_text(&self, text: &str) {
+        if let Some(ref f) = *self.on_inject_voice_text.borrow() {
+            let _ = f.call1(&JsValue::NULL, &JsValue::from_str(text));
         }
     }
 }

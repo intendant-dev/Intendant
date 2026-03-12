@@ -32,12 +32,12 @@ export class PresenceWeb {
     /**
      * Handle a voice model tool call end-to-end.
      *
-     * - Dispatches the tool via presence-core
-     * - Sends voice log to server
-     * - For `TextResult` and action types: sends voice tool response, dispatches
-     *   server action if needed, returns `JsValue::NULL`
-     * - For `NeedsIO`: returns `{ needs_io: true, tool_name, args }` so JS can
-     *   do the async server roundtrip and call `send_voice_tool_response` itself
+     * ALL tools respond instantly — no server roundtrip blocks the voice model.
+     *
+     * - `TextResult` (check_status): answered from cached state, immediate response
+     * - Action tools (approve, deny, submit_task, etc.): immediate "ok", fire-and-forget to server
+     * - `NeedsIO` (query_detail, recall_memory): immediate "querying..." response,
+     *   async query to server, result injected as text when it arrives
      */
     handle_voice_tool_call(call: any): any;
     has_pending_approval(): boolean;
@@ -73,6 +73,7 @@ export class PresenceWeb {
     send_voice_tool_response(call: any, result: any): void;
     set_on_diagnostic(f: Function): void;
     set_on_error(f: Function): void;
+    set_on_inject_voice_text(f: Function): void;
     set_on_server_event(f: Function): void;
     set_on_server_state(f: Function): void;
     set_on_state_snapshot(f: Function): void;
@@ -184,6 +185,7 @@ export interface InitOutput {
     readonly presenceweb_send_voice_tool_response: (a: number, b: any, c: any) => void;
     readonly presenceweb_set_on_diagnostic: (a: number, b: any) => void;
     readonly presenceweb_set_on_error: (a: number, b: any) => void;
+    readonly presenceweb_set_on_inject_voice_text: (a: number, b: any) => void;
     readonly presenceweb_set_on_server_event: (a: number, b: any) => void;
     readonly presenceweb_set_on_server_state: (a: number, b: any) => void;
     readonly presenceweb_set_on_state_snapshot: (a: number, b: any) => void;

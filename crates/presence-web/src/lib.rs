@@ -125,6 +125,11 @@ impl PresenceWeb {
     }
 
     #[wasm_bindgen]
+    pub fn set_on_inject_voice_text(&self, f: Function) {
+        *self.callbacks.on_inject_voice_text.borrow_mut() = Some(f);
+    }
+
+    #[wasm_bindgen]
     pub fn set_on_state_snapshot(&self, f: Function) {
         *self.callbacks.on_state_snapshot.borrow_mut() = Some(f);
     }
@@ -204,6 +209,18 @@ impl PresenceWeb {
                                 let _ = f.call1(&JsValue::NULL, &result_js);
                             }
                         }
+                    }
+                    Some("async_query_result") => {
+                        // Async query result from server — inject into voice model as system text
+                        let tool = msg["tool"].as_str().unwrap_or("query");
+                        let result_text = msg["result"].as_str().unwrap_or("");
+                        let truncated = if result_text.len() > 2000 {
+                            format!("{}...(truncated)", &result_text[..2000])
+                        } else {
+                            result_text.to_string()
+                        };
+                        let text = format!("[System: {} result] {}", tool, truncated);
+                        cb.invoke_inject_voice_text(&text);
                     }
                     _ => {
                         // Event messages (have "event" field)
@@ -453,12 +470,12 @@ impl PresenceWeb {
 
     /// Handle a voice model tool call end-to-end.
     ///
-    /// - Dispatches the tool via presence-core
-    /// - Sends voice log to server
-    /// - For `TextResult` and action types: sends voice tool response, dispatches
-    ///   server action if needed, returns `JsValue::NULL`
-    /// - For `NeedsIO`: returns `{ needs_io: true, tool_name, args }` so JS can
-    ///   do the async server roundtrip and call `send_voice_tool_response` itself
+    /// ALL tools respond instantly — no server roundtrip blocks the voice model.
+    ///
+    /// - `TextResult` (check_status): answered from cached state, immediate response
+    /// - Action tools (approve, deny, submit_task, etc.): immediate "ok", fire-and-forget to server
+    /// - `NeedsIO` (query_detail, recall_memory): immediate "querying..." response,
+    ///   async query to server, result injected as text when it arrives
     #[wasm_bindgen]
     pub fn handle_voice_tool_call(&self, call: JsValue) -> JsValue {
         let call_val: serde_json::Value =
@@ -477,24 +494,31 @@ impl PresenceWeb {
         // Log
         let args_str = serde_json::to_string(&args_val).unwrap_or_default();
         let log_text = format!("[tool] {}({})", name, args_str);
-        self.send_voice_log(&log_text, Some(name));
+        self.send_voice_log(&log_text, Some(name.clone()));
 
         match &action {
             PresenceAction::TextResult(text) => {
                 let result = serde_json::json!({"result": text});
                 self.send_voice_tool_response(call, to_js(&result));
-                JsValue::NULL
             }
             PresenceAction::NeedsIO { tool_name, args } => {
-                let ret = serde_json::json!({
-                    "needs_io": true,
-                    "tool_name": tool_name,
-                    "args": args,
+                // Respond immediately with placeholder — don't block voice model
+                let result = serde_json::json!({
+                    "result": format!("Querying {}... result will follow shortly.", tool_name)
                 });
-                to_js(&ret)
+                self.send_voice_tool_response(call, to_js(&result));
+
+                // Fire async query to server — result arrives as async_query_result
+                let mut counter = self.tool_request_counter.borrow_mut();
+                *counter += 1;
+                let id = format!("aq_{}", *counter);
+                drop(counter);
+
+                self.server.borrow().send_async_query(&id, tool_name, args);
             }
             _ => {
                 // Action type (Approve, Deny, Skip, SubmitTask, etc.)
+                // Respond immediately, dispatch to server fire-and-forget
                 let confirmation = presence_core::action_confirmation(&action);
                 let msg = self.action_to_server_msg(&action);
                 if !msg.is_null() {
@@ -502,9 +526,9 @@ impl PresenceWeb {
                 }
                 let result = serde_json::json!({"result": confirmation});
                 self.send_voice_tool_response(call, to_js(&result));
-                JsValue::NULL
             }
         }
+        JsValue::NULL
     }
 
     /// Convert a PresenceAction to a server control message (JSON).
