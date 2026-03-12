@@ -510,6 +510,57 @@ pub fn spawn_web_gateway(
                                             });
                                             let _ = direct_tx_inbound.send(response.to_string());
                                         }
+                                        Some("async_query") => {
+                                            // Async query from browser — same dispatch as tool_request
+                                            // but result goes back as async_query_result (injected into
+                                            // voice session as text, not as a tool response).
+                                            let req_id = json["id"].as_str().unwrap_or("").to_string();
+                                            let tool = json["tool"].as_str().unwrap_or("").to_string();
+                                            let args = json.get("args").cloned()
+                                                .unwrap_or(serde_json::Value::Object(Default::default()));
+
+                                            bus_inbound.send(AppEvent::PresenceLog {
+                                                message: format!("[async_query] {}", tool),
+                                                level: Some(LogLevel::Debug),
+                                                turn: None,
+                                            });
+
+                                            let result = if let Some(ref ctx) = query_ctx_inbound {
+                                                if let Some(result) = presence::handle_tool_query(
+                                                    &ctx.agent_state,
+                                                    &ctx.project_root,
+                                                    &ctx.log_dir,
+                                                    &ctx.knowledge_path,
+                                                    &tool,
+                                                    &args,
+                                                ).await {
+                                                    result
+                                                } else {
+                                                    format!("Unknown query tool: {}", tool)
+                                                }
+                                            } else {
+                                                "Presence query context not available".to_string()
+                                            };
+
+                                            let result_preview = if result.len() > 200 {
+                                                format!("{}...", &result[..200])
+                                            } else {
+                                                result.clone()
+                                            };
+                                            bus_inbound.send(AppEvent::PresenceLog {
+                                                message: format!("[async_query_result] {} → {}", tool, result_preview),
+                                                level: Some(LogLevel::Debug),
+                                                turn: None,
+                                            });
+
+                                            let response = serde_json::json!({
+                                                "t": "async_query_result",
+                                                "id": req_id,
+                                                "tool": tool,
+                                                "result": result,
+                                            });
+                                            let _ = direct_tx_inbound.send(response.to_string());
+                                        }
                                         _ => {
                                             // Fall through to ControlMsg parsing
                                             if let Ok(ctrl) = serde_json::from_value::<ControlMsg>(json) {

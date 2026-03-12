@@ -99,12 +99,12 @@ export class PresenceWeb {
     /**
      * Handle a voice model tool call end-to-end.
      *
-     * - Dispatches the tool via presence-core
-     * - Sends voice log to server
-     * - For `TextResult` and action types: sends voice tool response, dispatches
-     *   server action if needed, returns `JsValue::NULL`
-     * - For `NeedsIO`: returns `{ needs_io: true, tool_name, args }` so JS can
-     *   do the async server roundtrip and call `send_voice_tool_response` itself
+     * ALL tools respond instantly — no server roundtrip blocks the voice model.
+     *
+     * - `TextResult` (check_status): answered from cached state, immediate response
+     * - Action tools (approve, deny, submit_task, etc.): immediate "ok", fire-and-forget to server
+     * - `NeedsIO` (query_detail, recall_memory): immediate "querying..." response,
+     *   async query to server, result injected as text when it arrives
      * @param {any} call
      * @returns {any}
      */
@@ -259,6 +259,12 @@ export class PresenceWeb {
      */
     set_on_error(f) {
         wasm.presenceweb_set_on_error(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_inject_voice_text(f) {
+        wasm.presenceweb_set_on_inject_voice_text(this.__wbg_ptr, f);
     }
     /**
      * @param {Function} f

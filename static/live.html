@@ -578,12 +578,10 @@ async function init() {
   });
 
   pw.set_on_voice_tool_call((call) => {
-    const result = pw.handle_voice_tool_call(call);
-    if (result && result.needs_io) {
-      pw.send_tool_request(result.tool_name, result.args, (response) => {
-        pw.send_voice_tool_response(call, typeof response === 'string' ? { result: response } : response);
-      });
-    }
+    // All tools respond instantly from WASM — no server roundtrip blocks the voice model.
+    // check_status: answered from cached state. Action tools: fire-and-forget to server.
+    // query_detail/recall_memory: placeholder response, async query result injected later.
+    pw.handle_voice_tool_call(call);
   });
 
   pw.set_on_voice_interrupted(() => {
@@ -601,6 +599,10 @@ async function init() {
   });
   pw.set_on_diagnostic((kind, detail) => {
     try { pw.send_voice_diagnostic(kind, detail); } catch(_) {}
+  });
+  pw.set_on_inject_voice_text((text) => {
+    // Async query results from server — inject into voice model as system text
+    pw.send_text(text);
   });
 
   term.onKey(({ domEvent }) => {

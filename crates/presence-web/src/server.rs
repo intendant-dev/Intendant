@@ -321,6 +321,18 @@ impl ServerConnection {
         self.send_json(&msg);
     }
 
+    /// Send an async_query to the server (fire-and-forget for NeedsIO tools).
+    /// Result arrives later as an `async_query_result` message.
+    pub fn send_async_query(&self, id: &str, tool: &str, args: &serde_json::Value) {
+        let msg = serde_json::json!({
+            "t": "async_query",
+            "id": id,
+            "tool": tool,
+            "args": args,
+        });
+        self.send_json(&msg);
+    }
+
     /// Send a ControlMsg action to the server.
     pub fn send_action(&self, action: &serde_json::Value) {
         self.send_json(action);
