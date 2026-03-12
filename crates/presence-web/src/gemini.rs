@@ -306,13 +306,10 @@ impl GeminiProvider {
             });
             let _ = ws.send_with_str(&msg.to_string());
             self.audio_send_count += 1;
-            // Log every 100th audio chunk so we can verify audio is flowing
-            if self.audio_send_count % 100 == 1 {
-                self.callbacks.invoke_diagnostic(
-                    "audio_send",
-                    &format!("chunk #{} ({}B)", self.audio_send_count, base64_pcm.len()),
-                );
-            }
+            self.callbacks.invoke_diagnostic(
+                "audio_send",
+                &format!("chunk #{} ({}B)", self.audio_send_count, base64_pcm.len()),
+            );
         } else {
             self.callbacks.invoke_diagnostic("audio_send", "DROPPED — no WebSocket");
         }
