@@ -573,8 +573,7 @@ async function init() {
   pw.set_on_voice_audio((b64) => playAudioChunk(b64));
 
   pw.set_on_voice_text((text) => {
-    showVoiceStatus(text);
-    setTimeout(hideVoiceStatus, 5000);
+    // Voice text goes to TUI log panel via server, not as browser overlay
     pw.send_voice_log(text, undefined);
   });
 
