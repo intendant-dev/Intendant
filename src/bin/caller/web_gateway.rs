@@ -562,7 +562,7 @@ pub fn spawn_web_gateway(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/wasm\r\n\
                              Content-Length: {}\r\n\
-                             Cache-Control: public, max-age=86400\r\n\
+                             Cache-Control: public, max-age=60\r\n\
                              Connection: close\r\n\
                              \r\n",
                             wasm_data.len()
