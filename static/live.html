@@ -84,18 +84,15 @@ body {
 .voice-status.error { border-color: var(--red); color: var(--red); }
 .voice-status.hidden { display: none; }
 
-/* Connection status bar */
+/* Connection status bar — inline header, not overlapping terminal */
 .conn-bar {
-  position: fixed;
-  top: 0;
-  right: 0;
   display: flex;
   gap: 8px;
   align-items: center;
-  padding: 6px 12px;
-  z-index: 50;
-  background: rgba(24,24,37,0.85);
-  border-bottom-left-radius: 8px;
+  justify-content: flex-end;
+  padding: 4px 12px;
+  flex-shrink: 0;
+  background: var(--crust);
   font-size: 12px;
 }
 .conn-dot {
@@ -109,21 +106,18 @@ body {
 
 /* Settings button */
 .settings-btn {
-  position: fixed;
-  top: 6px;
-  right: 180px;
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   border-radius: 6px;
   border: 1px solid var(--surface1);
   background: transparent;
   color: var(--subtext0);
-  font-size: 16px;
+  font-size: 14px;
   cursor: pointer;
-  z-index: 50;
   display: flex;
   align-items: center;
   justify-content: center;
+  margin-left: auto;
 }
 .settings-btn:hover { color: var(--text); border-color: var(--blue); }
 
@@ -177,18 +171,16 @@ body {
 </head>
 <body>
 
-<div id="terminal-container"></div>
-
-<!-- Connection status -->
+<!-- Connection status — top bar (in flow, never overlaps terminal) -->
 <div class="conn-bar">
+  <button class="settings-btn" id="settingsBtn" title="Settings">&#9881;</button>
   <div class="conn-dot" id="intDot"></div>
   <span class="conn-label" id="intLabel">Server</span>
   <div class="conn-dot" id="voiceDot"></div>
   <span class="conn-label" id="voiceLabel">Voice</span>
 </div>
 
-<!-- Settings button -->
-<button class="settings-btn" id="settingsBtn" title="Settings">&#9881;</button>
+<div id="terminal-container"></div>
 
 <!-- Voice overlay -->
 <div class="voice-overlay">
