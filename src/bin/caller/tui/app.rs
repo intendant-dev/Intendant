@@ -1641,9 +1641,10 @@ fn format_model_summary(content: &str) -> String {
     let parsed: serde_json::Value = match serde_json::from_str(content) {
         Ok(v) => v,
         Err(_) => {
-            // Not valid JSON; just show a truncated preview
-            let preview = truncate_str(content, 200);
-            return preview.to_string();
+            // Not valid JSON — return the full text for multi-line rendering.
+            // The rendering layer handles showing one line (collapsed turn) vs
+            // all lines (expanded turn) with continuation indentation.
+            return content.to_string();
         }
     };
 
@@ -2099,6 +2100,14 @@ mod tests {
         let text = "This is not JSON";
         let summary = format_model_summary(text);
         assert_eq!(summary, "This is not JSON");
+    }
+
+    #[test]
+    fn format_model_summary_text_preserves_newlines() {
+        let text = "Here are the files:\nfoo.rs\nbar.rs\nbaz.rs";
+        let summary = format_model_summary(text);
+        // Non-JSON text is returned as-is (newlines preserved for multi-line rendering)
+        assert_eq!(summary, text);
     }
 
     #[test]

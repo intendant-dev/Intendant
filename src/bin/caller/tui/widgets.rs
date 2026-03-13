@@ -196,22 +196,27 @@ pub fn render_log_panel(f: &mut Frame, area: Rect, app: &App) {
     let focus_filtered_pos = focus_raw
         .and_then(|raw| filtered.iter().position(|&i| i == raw));
 
-    let lines: Vec<Line> = filtered
-        .iter()
-        .skip(scroll_offset)
-        .take(visible_height)
-        .enumerate()
-        .map(|(vis_pos, &raw_idx)| {
-            let entry = &app.log_entries[raw_idx];
-            let is_focused = focus_filtered_pos
-                .map(|fp| fp == scroll_offset + vis_pos)
-                .unwrap_or(false);
-            format_log_entry_with_turn(entry, &app.expanded_turns, is_focused)
-        })
-        .collect();
+    // Accumulate rendered lines from entries.  Each entry may produce multiple
+    // terminal lines when its content contains newlines (multi-line rendering).
+    let mut lines: Vec<Line> = Vec::with_capacity(visible_height);
+    let mut entries_shown: usize = 0;
+    for (vis_pos, &raw_idx) in filtered.iter().skip(scroll_offset).enumerate() {
+        if lines.len() >= visible_height {
+            break;
+        }
+        let entry = &app.log_entries[raw_idx];
+        let is_focused = focus_filtered_pos
+            .map(|fp| fp == scroll_offset + vis_pos)
+            .unwrap_or(false);
+        let entry_lines =
+            format_log_entry_with_turn(entry, &app.expanded_turns, is_focused);
+        lines.extend(entry_lines);
+        entries_shown += 1;
+    }
+    lines.truncate(visible_height);
 
     let scroll_info = if total > visible_height {
-        let pos = scroll_offset + visible_height.min(total - scroll_offset);
+        let pos = scroll_offset + entries_shown.min(total - scroll_offset);
         format!(" {}/{} ", pos, total)
     } else {
         String::new()
@@ -288,28 +293,48 @@ fn build_tab_title(active: LogTab) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Width of the prefix area: marker(2) + timestamp(9) + level(2) = 13 display columns.
+const LOG_PREFIX_WIDTH: usize = 13;
+
 /// Format a log entry with turn collapse/expand indicator and optional focus highlight.
+///
+/// Returns multiple `Line`s when the entry content contains newlines.  The first
+/// line carries the full prefix (marker + timestamp + level); continuation lines
+/// are indented to align with the content column, producing a clean multi-line
+/// block in the log panel.
+///
+/// For entries belonging to a **collapsed** turn, only the first line is returned
+/// regardless of how many newlines the content contains — the turn expand/collapse
+/// toggle controls whether the full text is visible.
 fn format_log_entry_with_turn(
     entry: &LogEntry,
     expanded_turns: &std::collections::HashSet<usize>,
     is_focused: bool,
-) -> Line<'static> {
-    let mut spans = Vec::new();
+) -> Vec<Line<'static>> {
+    // Determine if this entry's turn is collapsed (only first entry shown by filter)
+    let turn_collapsed = entry
+        .turn
+        .map(|t| !expanded_turns.contains(&t))
+        .unwrap_or(false);
 
-    // Turn indicator prefix
+    // --- build prefix spans (shared for the first rendered line) ---
+
+    let mut prefix = Vec::new();
+
+    // Turn indicator
     if let Some(t) = entry.turn {
         let expanded = expanded_turns.contains(&t);
         let marker = if expanded { "▾ " } else { "▸ " };
-        spans.push(Span::styled(
+        prefix.push(Span::styled(
             marker.to_string(),
             Style::default().fg(theme::STATUS_TURN_FG),
         ));
     } else {
-        spans.push(Span::styled("  ", Style::default()));
+        prefix.push(Span::styled("  ", Style::default()));
     }
 
     // Timestamp
-    spans.push(Span::styled(
+    prefix.push(Span::styled(
         format!("{} ", entry.ts),
         Style::default().fg(theme::LOG_DIM_FG),
     ));
@@ -325,9 +350,9 @@ fn format_log_entry_with_turn(
         LogLevel::Detail => Span::styled("· ", Style::default().fg(theme::LOG_DETAIL_FG)),
         LogLevel::Debug => Span::styled("D ", Style::default().fg(theme::LOG_DIM_FG)),
     };
-    spans.push(level_span);
+    prefix.push(level_span);
 
-    // Content
+    // Content styling
     let content_color = match entry.level {
         LogLevel::Info => theme::LOG_FG,
         LogLevel::Model => theme::LOG_MODEL_FG,
@@ -338,20 +363,53 @@ fn format_log_entry_with_turn(
         LogLevel::Detail => theme::LOG_DETAIL_FG,
         LogLevel::Debug => theme::LOG_DIM_FG,
     };
-    spans.push(Span::styled(
-        entry.content.clone(),
-        Style::default().fg(content_color),
-    ));
+    let content_style = Style::default().fg(content_color);
+    let focus_style = if is_focused {
+        Some(Style::default().bg(Color::Rgb(40, 42, 60)))
+    } else {
+        None
+    };
 
-    let mut line = Line::from(spans);
-    if is_focused {
-        // Subtle background highlight for focused entry
-        line = line.style(Style::default().bg(Color::Rgb(40, 42, 60)));
+    // --- split content into lines ---
+
+    let content_lines: Vec<&str> = entry.content.split('\n').collect();
+
+    // First line: full prefix + first content line
+    let mut first_spans = prefix;
+    first_spans.push(Span::styled(
+        content_lines[0].to_string(),
+        content_style,
+    ));
+    let mut first_line = Line::from(first_spans);
+    if let Some(fs) = focus_style {
+        first_line = first_line.style(fs);
     }
-    line
+
+    // For collapsed turns or single-line content, return just the first line
+    if turn_collapsed || content_lines.len() <= 1 {
+        return vec![first_line];
+    }
+
+    // Expanded multi-line: continuation lines indented to the content column
+    let indent = " ".repeat(LOG_PREFIX_WIDTH);
+    let mut result = Vec::with_capacity(content_lines.len());
+    result.push(first_line);
+
+    for text in &content_lines[1..] {
+        let mut cont_line = Line::from(vec![
+            Span::styled(indent.clone(), Style::default()),
+            Span::styled(text.to_string(), content_style),
+        ]);
+        if let Some(fs) = focus_style {
+            cont_line = cont_line.style(fs);
+        }
+        result.push(cont_line);
+    }
+
+    result
 }
 
-fn format_log_entry(entry: &LogEntry) -> Line<'static> {
+fn format_log_entry(entry: &LogEntry) -> Vec<Line<'static>> {
     format_log_entry_with_turn(entry, &std::collections::HashSet::new(), false)
 }
 
@@ -387,7 +445,7 @@ pub fn render_inspect_overlay(f: &mut Frame, area: Rect, app: &App) {
 
     f.render_widget(ratatui::widgets::Clear, centered);
 
-    let body = vec![
+    let mut body = vec![
         Line::from(vec![Span::styled(
             format!(" [{}] entry #{} ", level_text, selected_index),
             Style::default()
@@ -395,13 +453,16 @@ pub fn render_inspect_overlay(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::default(),
-        Line::from(entry.content.clone()),
-        Line::default(),
-        Line::from(vec![Span::styled(
-            " Up/Down=next entry  PgUp/PgDn=jump  Enter/Esc/i=close ",
-            Style::default().fg(theme::LOG_DIM_FG),
-        )]),
     ];
+    // Split content by newlines so multi-line entries render properly
+    for content_line in entry.content.split('\n') {
+        body.push(Line::from(content_line.to_string()));
+    }
+    body.push(Line::default());
+    body.push(Line::from(vec![Span::styled(
+        " Up/Down=next entry  PgUp/PgDn=jump  Enter/Esc/i=close ",
+        Style::default().fg(theme::LOG_DIM_FG),
+    )]));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -740,23 +801,26 @@ mod tests {
     #[test]
     fn format_log_entry_info() {
         let entry = test_entry(LogLevel::Info, "test message");
-        let line = format_log_entry(&entry);
+        let lines = format_log_entry(&entry);
+        assert_eq!(lines.len(), 1);
         // 4 spans: turn indicator, timestamp, level, content
-        assert_eq!(line.spans.len(), 4);
+        assert_eq!(lines[0].spans.len(), 4);
     }
 
     #[test]
     fn format_log_entry_debug_hidden() {
         let entry = test_entry(LogLevel::Debug, "debug msg");
-        let line = format_log_entry(&entry);
-        assert_eq!(line.spans.len(), 4);
+        let lines = format_log_entry(&entry);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans.len(), 4);
     }
 
     #[test]
     fn format_log_entry_debug_shown() {
         let entry = test_entry(LogLevel::Debug, "debug msg");
-        let line = format_log_entry(&entry);
-        assert_eq!(line.spans.len(), 4);
+        let lines = format_log_entry(&entry);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans.len(), 4);
     }
 
     #[test]
@@ -775,6 +839,50 @@ mod tests {
             let entry = test_entry(level, "test");
             let _ = format_log_entry(&entry);
         }
+    }
+
+    #[test]
+    fn format_log_entry_multiline() {
+        let entry = test_entry(LogLevel::Model, "line one\nline two\nline three");
+        let lines = format_log_entry(&entry);
+        // No turn → never collapsed → all 3 lines rendered
+        assert_eq!(lines.len(), 3);
+        // First line: full prefix (4 spans)
+        assert_eq!(lines[0].spans.len(), 4);
+        // Continuation lines: indent + content (2 spans)
+        assert_eq!(lines[1].spans.len(), 2);
+        assert_eq!(lines[2].spans.len(), 2);
+    }
+
+    #[test]
+    fn format_log_entry_multiline_collapsed_turn() {
+        let entry = LogEntry {
+            ts: "00:00:00".to_string(),
+            level: LogLevel::Model,
+            content: "first line\nsecond line\nthird line".to_string(),
+            source: LogSource::System,
+            turn: Some(1),
+        };
+        // Turn 1 not in expanded set → collapsed → single line
+        let expanded = std::collections::HashSet::new();
+        let lines = format_log_entry_with_turn(&entry, &expanded, false);
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn format_log_entry_multiline_expanded_turn() {
+        let entry = LogEntry {
+            ts: "00:00:00".to_string(),
+            level: LogLevel::Model,
+            content: "first line\nsecond line\nthird line".to_string(),
+            source: LogSource::System,
+            turn: Some(1),
+        };
+        // Turn 1 expanded → all lines
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert(1);
+        let lines = format_log_entry_with_turn(&entry, &expanded, false);
+        assert_eq!(lines.len(), 3);
     }
 
     #[test]
