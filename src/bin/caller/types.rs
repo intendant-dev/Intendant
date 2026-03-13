@@ -76,6 +76,7 @@ impl Verbosity {
                 level,
                 LogLevel::Info
                     | LogLevel::Model
+                    | LogLevel::Agent
                     | LogLevel::Warn
                     | LogLevel::Error
                     | LogLevel::SubAgent
