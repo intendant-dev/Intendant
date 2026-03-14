@@ -19,11 +19,15 @@ pub struct ServerConnection {
     url: String,
     connected: bool,
     /// Whether the voice model is live (for re-sending presence_connect on reconnect).
-    voice_live: bool,
+    /// Shared via Rc so the onopen closure sees updates from set_voice_live() even
+    /// when called after connect() but before the WebSocket opens.
+    voice_live: Rc<RefCell<bool>>,
     /// Active voice provider name (e.g. "gemini", "openai") — sent in presence_connect.
-    active_provider: String,
+    /// Shared via Rc so the onopen closure sees updates from set_active_voice().
+    active_provider: Rc<RefCell<String>>,
     /// Active voice model name — sent in presence_connect.
-    active_model: String,
+    /// Shared via Rc so the onopen closure sees updates from set_active_voice().
+    active_model: Rc<RefCell<String>>,
     callbacks: Rc<Callbacks>,
     /// Closures must be stored to prevent drop while WebSocket holds references.
     _onopen: Option<Closure<dyn FnMut()>>,
@@ -47,9 +51,9 @@ impl ServerConnection {
             ws: None,
             url: String::new(),
             connected: false,
-            voice_live: false,
-            active_provider: String::new(),
-            active_model: String::new(),
+            voice_live: Rc::new(RefCell::new(false)),
+            active_provider: Rc::new(RefCell::new(String::new())),
+            active_model: Rc::new(RefCell::new(String::new())),
             callbacks,
             _onopen: None,
             _onmessage: None,
@@ -67,13 +71,13 @@ impl ServerConnection {
     }
 
     pub fn set_voice_live(&mut self, live: bool) {
-        self.voice_live = live;
+        *self.voice_live.borrow_mut() = live;
     }
 
     /// Set the active voice provider and model (sent in presence_connect messages).
     pub fn set_active_voice(&mut self, provider: &str, model: &str) {
-        self.active_provider = provider.to_string();
-        self.active_model = model.to_string();
+        *self.active_provider.borrow_mut() = provider.to_string();
+        *self.active_model.borrow_mut() = model.to_string();
     }
 
     /// Set a handler for parsed server messages.
@@ -108,19 +112,16 @@ impl ServerConnection {
         // We need shared mutable state for the connection flag and voice_live.
         // Since WASM is single-threaded, Rc<RefCell<>> is safe.
         let connected_flag = Rc::new(RefCell::new(false));
-        let voice_live_flag = Rc::new(RefCell::new(self.voice_live));
         let ws_clone = ws.clone();
 
         let connected_open = connected_flag.clone();
-        let voice_open = voice_live_flag.clone();
-        let session_id_ref = Rc::new(RefCell::new(self.server_session_id.clone()));
-        let last_seq_ref = Rc::new(RefCell::new(self.last_event_seq));
-        let provider_ref = Rc::new(RefCell::new(self.active_provider.clone()));
-        let model_ref = Rc::new(RefCell::new(self.active_model.clone()));
-        let session_id_open = session_id_ref.clone();
-        let last_seq_open = last_seq_ref.clone();
-        let provider_open = provider_ref.clone();
-        let model_open = model_ref.clone();
+        // Clone the shared Rcs — not snapshots, so set_voice_live/set_active_voice
+        // changes are visible to the onopen closure even if called after connect().
+        let voice_open = self.voice_live.clone();
+        let session_id_open = Rc::new(RefCell::new(self.server_session_id.clone()));
+        let last_seq_open = Rc::new(RefCell::new(self.last_event_seq));
+        let provider_open = self.active_provider.clone();
+        let model_open = self.active_model.clone();
         let onopen = Closure::wrap(Box::new(move || {
             *connected_open.borrow_mut() = true;
             callbacks_open.invoke_server_state(true);
@@ -244,11 +245,13 @@ impl ServerConnection {
             "server_session_id": self.server_session_id,
             "last_event_seq": self.last_event_seq,
         });
-        if !self.active_provider.is_empty() {
-            msg["provider"] = serde_json::Value::String(self.active_provider.clone());
+        let p = self.active_provider.borrow();
+        if !p.is_empty() {
+            msg["provider"] = serde_json::Value::String(p.clone());
         }
-        if !self.active_model.is_empty() {
-            msg["model"] = serde_json::Value::String(self.active_model.clone());
+        let m = self.active_model.borrow();
+        if !m.is_empty() {
+            msg["model"] = serde_json::Value::String(m.clone());
         }
         self.send_json(&msg);
     }
