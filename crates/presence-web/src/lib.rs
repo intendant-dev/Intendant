@@ -589,20 +589,15 @@ impl PresenceWeb {
             "task_complete" => {
                 let reason = evt_val["reason"].as_str().unwrap_or("");
                 Some(format!(
-                    "[System: done] {}. Tell the user briefly.",
+                    "[System: done] {}. Tell the user briefly and ask if they need anything else. \
+                     If they give you a new task, use submit_task.",
                     reason
                 ))
             }
-            "round_complete" => {
-                let round = evt_val["round"].as_u64().unwrap_or(0);
-                let turns = evt_val["turns_in_round"].as_u64().unwrap_or(0);
-                Some(format!(
-                    "[System: round {} complete ({} turns)] The task finished. \
-                     Summarize what was done and ask the user if they need anything else. \
-                     If they give you a new task, use submit_task.",
-                    round, turns
-                ))
-            }
+            // round_complete is intentionally NOT injected — task_complete already
+            // notifies the voice model.  Injecting both causes the model to process
+            // two prompts in rapid succession, delaying responsiveness to user speech.
+            "round_complete" => None,
             "status" => {
                 let phase = evt_val["phase"].as_str().unwrap_or("");
                 match phase {
