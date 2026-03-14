@@ -2,8 +2,9 @@
 name: tui-e2e
 description: >
   E2E test the intendant TUI on a virtual display. Launches Xvfb, runs the
-  TUI in xterm, takes screenshots, and controls it via the Unix socket.
-compatibility: Requires Xvfb, xterm, ImageMagick (import), socat, x11vnc
+  TUI in xterm, and controls/asserts via the Unix control socket JSON protocol.
+  Human monitors via VNC on port 5950.
+compatibility: Requires Xvfb, xterm, socat, x11vnc
 allowed-tools: Bash Read
 disable-model-invocation: true
 ---
@@ -38,14 +39,6 @@ DISPLAY=:50 xterm -geometry 100x30 -fa Monospace -fs 12 \
     "your task" 2>/tmp/intendant-tui-stderr.log; sleep 120' &
 ```
 
-## Screenshot
-
-Always use `DISPLAY=:50`:
-
-```bash
-DISPLAY=:50 import -window root /tmp/tui-screenshot.png
-```
-
 ## Control socket
 
 Path: `/tmp/intendant-<PID>.sock` (find PID with `pgrep -a intendant`).
@@ -73,6 +66,92 @@ Actions:
 | `query_detail` | `scope`, `target`? | Query detail about a scope |
 | `recall_memory` | `keywords`?, `tags`?, `channel`? | Recall stored knowledge |
 | `quit` | — | End session |
+
+## Asserting on State (instead of screenshots)
+
+Use the control socket to verify behavior programmatically. Every assertion
+reads structured JSON — no vision model needed.
+
+### Check phase and status
+```bash
+SOCK=/tmp/intendant-$(pgrep -f 'intendant.*control-socket' | head -1).sock
+
+# Get current state
+RESULT=$(echo '{"action":"status"}' | socat - UNIX-CONNECT:$SOCK 2>/dev/null)
+echo "$RESULT" | python3 -m json.tool
+
+# Assert phase
+echo "$RESULT" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+phase = d.get('phase', '')
+print(f'Phase: {phase}')
+assert phase in ('Thinking', 'RunningAgent', 'WaitingApproval', 'Idle', 'Done'), f'Unexpected phase: {phase}'
+"
+```
+
+### Wait for a specific phase
+```bash
+# Poll until approval is pending (up to 30s)
+for i in $(seq 1 30); do
+  RESULT=$(echo '{"action":"status"}' | socat - UNIX-CONNECT:$SOCK 2>/dev/null)
+  PHASE=$(echo "$RESULT" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('phase',''))" 2>/dev/null)
+  [ "$PHASE" = "WaitingApproval" ] && break
+  sleep 1
+done
+echo "Phase reached: $PHASE"
+```
+
+### Approve and verify execution
+```bash
+# Get the turn number from status
+TURN=$(echo '{"action":"status"}' | socat - UNIX-CONNECT:$SOCK 2>/dev/null | \
+  python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('turn',0))")
+
+# Approve
+echo "{\"action\":\"approve\",\"id\":$TURN}" | socat - UNIX-CONNECT:$SOCK
+
+# Wait for phase to leave WaitingApproval
+sleep 2
+RESULT=$(echo '{"action":"status"}' | socat - UNIX-CONNECT:$SOCK 2>/dev/null)
+echo "$RESULT" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+assert d.get('phase') != 'WaitingApproval', 'Still waiting for approval after approve sent'
+print(f'Approved — now in phase: {d.get(\"phase\")}')
+"
+```
+
+### Check token usage
+```bash
+USAGE=$(echo '{"action":"usage"}' | socat - UNIX-CONNECT:$SOCK 2>/dev/null)
+echo "$USAGE" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+main = d.get('main', {})
+print(f'Provider: {main.get(\"provider\")}, Model: {main.get(\"model\")}')
+print(f'Tokens: {main.get(\"tokens_used\")}/{main.get(\"context_window\")} ({main.get(\"usage_pct\",0):.1f}%)')
+"
+```
+
+### Listen for events (streaming)
+```bash
+# Open a persistent connection and read events as they arrive
+socat - UNIX-CONNECT:$SOCK &
+SOCAT_PID=$!
+# Events stream as JSON lines: {"event":"approval_required","id":2,...}
+# Kill with: kill $SOCAT_PID
+```
+
+## Screenshot (optional — for human VNC verification only)
+
+If you want a visual snapshot for the VNC viewer:
+
+```bash
+DISPLAY=:50 import -window root /tmp/tui-screenshot.png
+```
+
+This is **not needed for assertions** — use the control socket instead.
 
 ## Cleanup
 
