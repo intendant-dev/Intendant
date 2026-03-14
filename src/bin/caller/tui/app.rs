@@ -1050,6 +1050,7 @@ impl App {
                 // live model (or control socket / MCP) already made.
                 if self.current_phase == Phase::WaitingFollowUp
                     || self.current_phase == Phase::Done
+                    || self.current_phase == Phase::Idle
                 {
                     let dispatched = if let Some(ref tx) = self.task_tx {
                         let envelope = presence_core::TaskEnvelope {
@@ -1069,12 +1070,12 @@ impl App {
                         self.current_phase = Phase::Thinking;
                         self.round += 1;
                         self.log(LogLevel::Info, format!("Task dispatched: {}", truncate_str(&task, 80)));
+                    } else if self.current_phase == Phase::Idle {
+                        self.log(
+                            LogLevel::Warn,
+                            "start_task: task channel not ready yet — try again shortly".to_string(),
+                        );
                     }
-                } else if self.current_phase == Phase::Idle {
-                    self.log(
-                        LogLevel::Warn,
-                        "start_task: no active session to send task to".to_string(),
-                    );
                 } else {
                     self.log(
                         LogLevel::Warn,
