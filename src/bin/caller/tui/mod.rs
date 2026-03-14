@@ -1,6 +1,7 @@
 pub mod app;
 pub mod event;
 pub mod layout;
+pub mod markdown;
 pub mod theme;
 pub mod web;
 pub mod widgets;

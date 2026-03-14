@@ -787,6 +787,9 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
         AppEvent::OrchestratorProgress { status, .. } => {
             s.phase = format!("orchestrating: {}", status);
         }
+        AppEvent::SubAgentResult { formatted } => {
+            s.last_output_summary = truncate(formatted, 500);
+        }
         AppEvent::LoopError(msg) => {
             s.phase = format!("error: {}", msg);
         }
@@ -975,6 +978,20 @@ mod tests {
         {
             let s = state.lock().unwrap();
             assert_eq!(s.last_output_summary, "hello world");
+        }
+
+        update_agent_state(
+            &AppEvent::SubAgentResult {
+                formatted: "Orchestrator completed: analyzed project structure".to_string(),
+            },
+            &state,
+        );
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                s.last_output_summary,
+                "Orchestrator completed: analyzed project structure"
+            );
         }
 
         update_agent_state(
