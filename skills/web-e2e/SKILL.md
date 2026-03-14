@@ -2,9 +2,9 @@
 name: web-e2e
 description: >
   E2E test the --web live mode. Launches Xvfb, runs intendant --web as a
-  background process (no xterm needed), opens Firefox on the web TUI,
-  and takes screenshots. User monitors via VNC.
-compatibility: Requires Xvfb, Firefox, ImageMagick (import), x11vnc, xdotool
+  background process, opens Firefox on the web TUI, and asserts via /debug
+  endpoint and WebSocket JSON. Human monitors via VNC on port 5950.
+compatibility: Requires Xvfb, Firefox, x11vnc, xdotool, curl
 allowed-tools: Bash Read
 disable-model-invocation: true
 ---
@@ -46,7 +46,7 @@ sleep 0.5
 
 # 3. Launch intendant --web as background process (no xterm needed)
 > /tmp/intendant-web-stderr.log
-cd /home/user/projects/intendant-codex-fork && source .env && \
+cd /home/user/projects/intendant && source .env && \
   nohup ./target/release/intendant --direct --autonomy low --web \
   "your task here" > /dev/null 2>/tmp/intendant-web-stderr.log &
 
@@ -58,72 +58,77 @@ cat /tmp/intendant-web-stderr.log  # Should show "Web TUI: http://0.0.0.0:8765"
 DISPLAY=:50 nohup firefox --new-window http://localhost:8765 > /dev/null 2>&1 &
 ```
 
-## Debugging
+## Asserting on State (primary method — no screenshots)
 
-**Use `curl` and the `/debug` endpoint for all debugging — no screenshots needed.**
+### /debug endpoint
+
+The `/debug` endpoint returns the full agent state as JSON. Use it for all assertions.
 
 ```bash
-# Server state: agent phase, pending approvals, voice connection, voice logs
+# Full state dump
 curl -s http://localhost:8765/debug | python3 -m json.tool
 
+# Assert on specific fields
+curl -s http://localhost:8765/debug | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+state = d.get('agent_state', d)
+print(f'Phase: {state.get(\"phase\")}')
+print(f'Turn: {state.get(\"turn\")}')
+print(f'Pending approval: {state.get(\"pending_approval\")}')
+voice = d.get('voice', {})
+print(f'Voice connected: {voice.get(\"connected\", False)}')
+print(f'Voice logs: {voice.get(\"voice_log_count\", 0)}')
+"
+```
+
+### Wait for a specific state
+```bash
+# Poll until approval is pending (up to 30s)
+for i in $(seq 1 30); do
+  PENDING=$(curl -s http://localhost:8765/debug | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+pa = d.get('agent_state', d).get('pending_approval')
+print('yes' if pa and pa != 'null' else 'no')
+" 2>/dev/null)
+  [ "$PENDING" = "yes" ] && break
+  sleep 1
+done
+echo "Approval pending: $PENDING"
+```
+
+### Wait for task completion
+```bash
+for i in $(seq 1 60); do
+  PHASE=$(curl -s http://localhost:8765/debug | python3 -c "
+import sys, json; print(json.load(sys.stdin).get('agent_state', {}).get('phase', ''))" 2>/dev/null)
+  [ "$PHASE" = "Done" ] || [ "$PHASE" = "Idle" ] && break
+  sleep 1
+done
+echo "Final phase: $PHASE"
+```
+
+### Check voice connection
+```bash
+curl -s http://localhost:8765/debug | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+v = d.get('voice', {})
+assert v.get('connected') == True, f'Voice not connected: {v}'
+print('Voice connected OK')
+print(f'Last voice log: {v.get(\"last_voice_log\", \"(none)\")}')
+"
+```
+
+### Other endpoints
+```bash
 # Config: provider, model, sample rates (no secrets)
 curl -s http://localhost:8765/config
 
 # Session: mint ephemeral token (called by browser on mic click)
 curl -s -X POST http://localhost:8765/session
 ```
-
-The `/debug` endpoint returns:
-- `agent_state`: phase, turn, budget, pending_approval, last_command
-- `voice.connected`: whether browser voice model is connected
-- `voice.voice_log_count`: number of voice text/tool logs received
-- `voice.last_voice_log`: most recent voice model text response
-
-**Test Gemini WebSocket from terminal** (requires `pip3 install websockets`):
-```bash
-# With API key (non-constrained, supports tool calls):
-source .env && python3 - "$GEMINI_API_KEY" << 'PYEOF'
-import asyncio, json, websockets, sys
-KEY = sys.argv[1]
-MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
-async def test():
-    url = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key={KEY}"
-    async with websockets.connect(url) as ws:
-        print("Connected to BidiGenerateContent")
-        setup = {"setup": {"model": f"models/{MODEL}", "generation_config": {"response_modalities": ["AUDIO"]}, "system_instruction": {"parts": [{"text": "You are a helpful assistant."}]}, "tools": [{"function_declarations": [{"name": "check_status", "description": "Check status", "parameters": {"type": "object", "properties": {}}}]}]}}
-        await ws.send(json.dumps(setup))
-        msg = await asyncio.wait_for(ws.recv(), timeout=10)
-        print(f"Setup: {json.loads(msg)}")
-        await ws.send(json.dumps({"client_content": {"turns": [{"role": "user", "parts": [{"text": "Call check_status"}]}], "turn_complete": True}}))
-        for _ in range(15):
-            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
-            if "toolCall" in msg:
-                print(f"TOOL CALL: {msg['toolCall']}")
-                break
-            if msg.get("serverContent", {}).get("turnComplete"):
-                print("Turn complete (no tool call)")
-                break
-asyncio.run(test())
-PYEOF
-```
-
-**For browser-side JS debugging** (only needed for WASM/JS errors):
-
-Firefox `--start-debugger-server` requires `devtools.debugger.remote-enabled=true`
-in the Firefox profile's `user.js`. Set up once per environment:
-```bash
-PROFILE=$(ls -d ~/.mozilla/firefox/*.default* | head -1)
-cat >> "$PROFILE/user.js" << 'EOF'
-user_pref("devtools.debugger.remote-enabled", true);
-user_pref("devtools.chrome.enabled", true);
-user_pref("devtools.debugger.prompt-connection", false);
-user_pref("devtools.debugger.force-local", false);
-EOF
-```
-Then launch Firefox with `--start-debugger-server 6000` and use `/tmp/ff-eval.py`
-(a zero-dependency raw socket script) for JS evaluation — no pip packages needed.
-If `/tmp/ff-eval.py` doesn't exist, create it from the project's prior test artifacts
-or write a fresh one using the Firefox remote debug protocol (`length:json` framing).
 
 ## Simulating Voice Input
 
@@ -153,7 +158,7 @@ DISPLAY=:50 xdotool type --clearmodifiers 'pw.send_text("Hello, what are you wor
 DISPLAY=:50 xdotool key Return
 ```
 
-Then check `curl -s http://localhost:8765/debug` to see voice logs.
+Then verify with `curl -s http://localhost:8765/debug` to see voice logs.
 
 ## Keyboard Input via xdotool
 
@@ -168,11 +173,13 @@ DISPLAY=:50 xdotool key y   # approve
 **Gotcha**: If the follow-up text input panel is active, keyboard shortcuts
 go into the text input. Press Escape first to dismiss it.
 
-## Screenshot
+## Screenshot (optional — for human VNC verification only)
 
 ```bash
 DISPLAY=:50 import -window root /tmp/web-e2e-screenshot.png
 ```
+
+This is **not needed for assertions** — use `/debug` instead.
 
 ## Known Gotchas
 
@@ -206,6 +213,24 @@ DISPLAY=:50 import -window root /tmp/web-e2e-screenshot.png
 - **Follow-up panel** captures keystrokes — Escape first before sending shortcuts.
 - **Firefox profile lock**: If Firefox won't start, remove lock files:
   `rm -f ~/.mozilla/firefox/*/.parentlock ~/.mozilla/firefox/*/lock`
+
+**For browser-side JS debugging** (only needed for WASM/JS errors):
+
+Firefox `--start-debugger-server` requires `devtools.debugger.remote-enabled=true`
+in the Firefox profile's `user.js`. Set up once per environment:
+```bash
+PROFILE=$(ls -d ~/.mozilla/firefox/*.default* | head -1)
+cat >> "$PROFILE/user.js" << 'EOF'
+user_pref("devtools.debugger.remote-enabled", true);
+user_pref("devtools.chrome.enabled", true);
+user_pref("devtools.debugger.prompt-connection", false);
+user_pref("devtools.debugger.force-local", false);
+EOF
+```
+Then launch Firefox with `--start-debugger-server 6000` and use `/tmp/ff-eval.py`
+(a zero-dependency raw socket script) for JS evaluation — no pip packages needed.
+If `/tmp/ff-eval.py` doesn't exist, create it from the project's prior test artifacts
+or write a fresh one using the Firefox remote debug protocol (`length:json` framing).
 
 ## Cleanup
 
