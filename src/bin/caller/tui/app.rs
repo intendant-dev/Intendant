@@ -1580,8 +1580,13 @@ impl App {
                 } else {
                     format!("[voice #{seq} ({})] {text}", ctx)
                 };
-                // Tool calls at Detail, voice text at Info (visible at Normal)
-                let lvl = if ctx.is_empty() { LogLevel::Info } else { LogLevel::Detail };
+                // Transcripts and plain voice text at Info (visible at Normal);
+                // tool calls and thinking at Detail (visible at Verbose).
+                let lvl = if ctx.is_empty() || ctx == "transcript" {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Detail
+                };
                 let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
                 self.log_sourced(lvl, msg, LogSource::Presence, vt);
                 // Persist to session log
