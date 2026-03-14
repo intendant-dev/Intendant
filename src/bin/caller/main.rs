@@ -83,6 +83,8 @@ struct LoopStats {
     turns: usize,
     rounds: usize,
     usage: provider::TokenUsage,
+    /// Last model response content (for sub-agent result summaries).
+    last_response: Option<String>,
 }
 
 type FollowUpReceiver = tokio::sync::mpsc::Receiver<String>;
@@ -1801,6 +1803,9 @@ async fn run_agent_loop(
         loop_stats.usage.prompt_tokens += response.usage.prompt_tokens;
         loop_stats.usage.completion_tokens += response.usage.completion_tokens;
         loop_stats.usage.total_tokens += response.usage.total_tokens;
+        if !response.content.is_empty() {
+            loop_stats.last_response = Some(response.content.clone());
+        }
 
         // Store assistant message — with or without tool calls
         let has_tool_calls = !response.tool_calls.is_empty();
@@ -2917,7 +2922,10 @@ All relative paths and commands execute from this directory.",
         let (status, summary, usage) = match &result {
             Ok(stats) => (
                 sub_agent::SubAgentStatus::Completed,
-                "Task completed successfully".to_string(),
+                stats
+                    .last_response
+                    .clone()
+                    .unwrap_or_else(|| "Task completed successfully".to_string()),
                 stats.usage.clone(),
             ),
             Err(e) => (
@@ -3185,9 +3193,9 @@ async fn run_user_mode(
         .spawn()
         .map_err(|e| CallerError::SubAgent(format!("Failed to spawn orchestrator: {}", e)))?;
 
-    // Capture stderr in a background task
+    // Capture stderr in a background task (log only, not emitted as AgentOutput
+    // to avoid orchestrator diagnostic lines clobbering last_output_summary)
     let stderr = child.stderr.take();
-    let bus_stderr = bus.clone();
     let session_log_stderr = session_log.clone();
     let stderr_handle = tokio::spawn(async move {
         if let Some(stderr) = stderr {
@@ -3198,14 +3206,7 @@ async fn run_user_mode(
                 slog(&session_log_stderr, |l| {
                     l.debug(&format!("orchestrator stderr: {}", line));
                 });
-                emit(
-                    &bus_stderr,
-                    || AppEvent::AgentOutput {
-                        stdout: String::new(),
-                        stderr: line.clone(),
-                    },
-                    || eprintln!("orchestrator: {}", line),
-                );
+                eprintln!("orchestrator: {}", line);
             }
         }
     });

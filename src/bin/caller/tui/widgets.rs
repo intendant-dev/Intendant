@@ -1,4 +1,5 @@
 use crate::tui::app::{App, AppMode, LogEntry, LogTab};
+use crate::tui::markdown;
 use crate::types::{LogLevel, Phase};
 use crate::tui::theme;
 use ratatui::layout::Rect;
@@ -394,7 +395,13 @@ fn format_log_entry_with_turn(
 
     let content_lines: Vec<&str> = entry.content.split('\n').collect();
 
-    // First line: full prefix + first content line
+    // Use markdown rendering for entry types that contain LLM output
+    let use_markdown = matches!(
+        entry.level,
+        LogLevel::SubAgent | LogLevel::Model
+    ) && content_lines.len() > 1;
+
+    // First line: full prefix + first content line (always plain — it's the summary)
     let mut first_spans = prefix;
     first_spans.push(Span::styled(
         content_lines[0].to_string(),
@@ -428,15 +435,30 @@ fn format_log_entry_with_turn(
     let mut result = Vec::with_capacity(content_lines.len());
     result.push(first_line);
 
-    for text in &content_lines[1..] {
-        let mut cont_line = Line::from(vec![
-            Span::styled(indent.clone(), Style::default()),
-            Span::styled(text.to_string(), content_style),
-        ]);
-        if let Some(fs) = focus_style {
-            cont_line = cont_line.style(fs);
+    if use_markdown {
+        // Render remaining lines as markdown
+        let remaining = content_lines[1..].join("\n");
+        let md_lines = markdown::render_markdown(&remaining, content_style);
+        for md_line in md_lines {
+            let mut spans = vec![Span::styled(indent.clone(), Style::default())];
+            spans.extend(md_line.spans);
+            let mut cont_line = Line::from(spans);
+            if let Some(fs) = focus_style {
+                cont_line = cont_line.style(fs);
+            }
+            result.push(cont_line);
         }
-        result.push(cont_line);
+    } else {
+        for text in &content_lines[1..] {
+            let mut cont_line = Line::from(vec![
+                Span::styled(indent.clone(), Style::default()),
+                Span::styled(text.to_string(), content_style),
+            ]);
+            if let Some(fs) = focus_style {
+                cont_line = cont_line.style(fs);
+            }
+            result.push(cont_line);
+        }
     }
 
     result
@@ -487,9 +509,14 @@ pub fn render_inspect_overlay(f: &mut Frame, area: Rect, app: &App) {
         )]),
         Line::default(),
     ];
-    // Split content by newlines so multi-line entries render properly
-    for content_line in entry.content.split('\n') {
-        body.push(Line::from(content_line.to_string()));
+    // Render content — use markdown for SubAgent/Model entries
+    if matches!(entry.level, LogLevel::SubAgent | LogLevel::Model) {
+        let base = Style::default().fg(theme::LOG_FG);
+        body.extend(markdown::render_markdown(&entry.content, base));
+    } else {
+        for content_line in entry.content.split('\n') {
+            body.push(Line::from(content_line.to_string()));
+        }
     }
     body.push(Line::default());
     body.push(Line::from(vec![Span::styled(

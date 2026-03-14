@@ -1338,7 +1338,8 @@ impl App {
                 }
             }
             AppEvent::SubAgentResult { formatted } => {
-                self.log_sourced(LogLevel::SubAgent, formatted, LogSource::Agent, None);
+                self.turn += 1;
+                self.log_sourced(LogLevel::SubAgent, formatted, LogSource::Agent, Some(self.turn));
             }
             AppEvent::OrchestratorProgress {
                 turn,
