@@ -58,6 +58,11 @@ pub enum AppEvent {
         status: String,
         last_action: String,
     },
+    /// Detailed log entry from the orchestrator's session log (tailed by parent).
+    OrchestratorLog {
+        message: String,
+        level: crate::types::LogLevel,
+    },
     ContextManagement {
         turn: usize,
     },
