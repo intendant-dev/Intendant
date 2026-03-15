@@ -31,7 +31,7 @@ use event::{AppEvent, EventBus};
 use project::Project;
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tool_batch::{assemble_batch_from_tool_calls, map_results_to_tool_responses};
@@ -3292,6 +3292,117 @@ async fn run_with_presence(
     Ok(cumulative_stats)
 }
 
+/// Tail the orchestrator's session JSONL from `offset`, emitting new entries
+/// to the TUI as orchestrator log entries. Returns the new offset.
+fn tail_orchestrator_log(
+    log_path: &Path,
+    offset: u64,
+    bus: &Option<EventBus>,
+    session_log: &SharedSessionLog,
+) -> u64 {
+    use std::io::{BufRead, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(log_path) else {
+        return offset;
+    };
+    let meta = file.metadata().ok();
+    let file_len = meta.map(|m| m.len()).unwrap_or(0);
+    if file_len <= offset {
+        return offset;
+    }
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return offset;
+    }
+    let reader = std::io::BufReader::new(&file);
+    let mut new_offset = offset;
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        new_offset += line.len() as u64 + 1; // +1 for newline
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let event = entry["event"].as_str().unwrap_or("");
+        let level = entry["level"].as_str().unwrap_or("info");
+        let message = entry["message"].as_str().unwrap_or("");
+        let turn = entry["turn"].as_u64().map(|t| t as usize);
+
+        // Skip noisy/redundant events
+        match event {
+            "session_start" | "session_end" | "messages_input" => continue,
+            _ => {}
+        }
+
+        // Map orchestrator log level to TUI LogLevel
+        let tui_level = match level {
+            "debug" => crate::types::LogLevel::Debug,
+            "warn" => crate::types::LogLevel::Warn,
+            "error" => crate::types::LogLevel::Error,
+            _ => crate::types::LogLevel::Detail,
+        };
+
+        // Format the log line with orchestrator context
+        let content = match event {
+            "turn_start" => {
+                let budget = entry["data"]["budget_pct"].as_f64().unwrap_or(0.0);
+                format!("Turn {} — budget {:.0}%", turn.unwrap_or(0), budget * 100.0)
+            }
+            "model_response" => {
+                let data = &entry["data"];
+                let tokens = data["tokens"]["total"].as_u64().unwrap_or(0);
+                let content_len = data["content_length"].as_u64().unwrap_or(0);
+                if content_len > 0 {
+                    let preview: String = message.chars().take(200).collect();
+                    format!("Model ({} tokens): {}", tokens, preview)
+                } else {
+                    format!("Model ({} tokens, tool calls)", tokens)
+                }
+            }
+            "reasoning" => {
+                if message.is_empty() { continue; }
+                format!("Reasoning: {}", message)
+            }
+            "agent_input" => {
+                let funcs = entry["data"]["functions"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                format!("Agent: {}", funcs)
+            }
+            "agent_output" => {
+                let preview: String = message.chars().take(300).collect();
+                if preview.is_empty() {
+                    continue;
+                }
+                format!("Output: {}", preview)
+            }
+            "info" | "debug" | "warn" | "error" => {
+                if message.is_empty() { continue; }
+                message.to_string()
+            }
+            _ => {
+                if message.is_empty() { continue; }
+                format!("{}: {}", event, message)
+            }
+        };
+
+        let prefixed = format!("[orch] {}", content);
+
+        slog(session_log, |l| {
+            l.debug(&prefixed);
+        });
+
+        emit(bus, || AppEvent::OrchestratorLog {
+            message: prefixed.clone(),
+            level: tui_level,
+        }, || {});
+    }
+    new_offset
+}
+
 async fn run_user_mode(
     _provider: Box<dyn provider::ChatProvider>,
     task: String,
@@ -3338,16 +3449,23 @@ async fn run_user_mode(
         .spawn()
         .map_err(|e| CallerError::SubAgent(format!("Failed to spawn orchestrator: {}", e)))?;
 
-    // Capture stderr in a background task (log only, not emitted as AgentOutput
-    // to avoid orchestrator diagnostic lines clobbering last_output_summary)
+    // Capture stderr in a background task — extract orchestrator session log path
     let stderr = child.stderr.take();
     let session_log_stderr = session_log.clone();
+    let orch_session_log_path: Arc<std::sync::Mutex<Option<PathBuf>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let orch_log_path_writer = orch_session_log_path.clone();
     let stderr_handle = tokio::spawn(async move {
         if let Some(stderr) = stderr {
             use tokio::io::AsyncBufReadExt;
             let reader = tokio::io::BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                // Extract session log path from "Session log: <path>"
+                if line.starts_with("Session log: ") {
+                    let path = PathBuf::from(line.trim_start_matches("Session log: ").trim());
+                    *orch_log_path_writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+                }
                 slog(&session_log_stderr, |l| {
                     l.debug(&format!("orchestrator stderr: {}", line));
                 });
@@ -3356,8 +3474,10 @@ async fn run_user_mode(
         }
     });
 
-    // Monitor loop: poll progress file and wait for process exit
+    // Monitor loop: poll progress file + tail orchestrator session log
     let mut last_progress_turn: usize = 0;
+    let mut orch_log_offset: u64 = 0;
+    let mut orch_log_file: Option<PathBuf> = None;
     let poll_interval = tokio::time::Duration::from_millis(500);
     let mut poll_timer = tokio::time::interval(poll_interval);
     poll_timer.tick().await; // consume the immediate first tick
@@ -3387,9 +3507,27 @@ async fn run_user_mode(
                         );
                     }
                 }
+
+                // Tail orchestrator session log for detailed events
+                if orch_log_file.is_none() {
+                    orch_log_file = orch_session_log_path
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                }
+                if let Some(ref log_path) = orch_log_file {
+                    orch_log_offset = tail_orchestrator_log(
+                        log_path, orch_log_offset, &bus, &session_log,
+                    );
+                }
             }
         }
     };
+
+    // Final tail to catch any remaining log entries written before exit
+    if let Some(ref log_path) = orch_log_file {
+        tail_orchestrator_log(log_path, orch_log_offset, &bus, &session_log);
+    }
 
     // Wait for stderr task to finish
     let _ = stderr_handle.await;

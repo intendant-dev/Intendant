@@ -1365,6 +1365,9 @@ impl App {
                 };
                 self.log_sourced(LogLevel::SubAgent, summary, LogSource::Agent, Some(turn));
             }
+            AppEvent::OrchestratorLog { message, level } => {
+                self.log_sourced(level, message, LogSource::Agent, Some(self.turn));
+            }
             AppEvent::ContextManagement { turn } => {
                 self.log_sourced(
                     LogLevel::Detail,

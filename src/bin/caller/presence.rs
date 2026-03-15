@@ -645,6 +645,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::JsonExtracted { .. }
         | AppEvent::DoneSignal { .. }
         | AppEvent::OrchestratorProgress { .. }
+        | AppEvent::OrchestratorLog { .. }
         | AppEvent::AutoApproved { .. }
         | AppEvent::ContextManagement { .. }
         | AppEvent::SubAgentResult { .. }
