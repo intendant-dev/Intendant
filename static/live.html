@@ -286,7 +286,8 @@ const firstRunKeyLabel = document.getElementById('firstRunKeyLabel');
 function getServerUrl() {
   const saved = localStorage.getItem('intendant_server_url');
   if (saved) return saved;
-  return `ws://${location.hostname || 'localhost'}:${location.port || '8765'}`;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${location.hostname || 'localhost'}:${location.port || '8765'}`;
 }
 
 function getStorageKey() {
