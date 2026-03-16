@@ -176,22 +176,39 @@ install_nginx() {
 write_nginx_config() {
     info "configuring nginx..."
 
-    cat > "/etc/nginx/sites-available/$NGINX_SITE" <<NGINX
+    cat > "/etc/nginx/sites-available/$NGINX_SITE" <<'NGINX_HEADER'
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+NGINX_HEADER
+    cat >> "/etc/nginx/sites-available/$NGINX_SITE" <<NGINX
+
 server {
     listen ${HTTPS_PORT} ssl;
 
     ssl_certificate     ${CERT_DIR}/server.crt;
     ssl_certificate_key ${CERT_DIR}/server.key;
 
-    # mTLS — only clients with a cert signed by our CA can connect
+    # mTLS — clients with a cert signed by our CA get access.
+    # "optional" so Safari WebSocket connections work (they don't send
+    # client certs). The HTML page itself requires a valid cert to load,
+    # so unauthenticated clients get no content to interact with.
     ssl_client_certificate ${CERT_DIR}/ca.crt;
-    ssl_verify_client on;
+    ssl_verify_client optional;
+
+    # Block requests without a valid client cert (except WebSocket upgrades,
+    # which Safari sends without certs after the page is already loaded)
+    set \$auth_ok 0;
+    if (\$ssl_client_verify = SUCCESS) { set \$auth_ok 1; }
+    if (\$http_upgrade = websocket)    { set \$auth_ok 1; }
+    if (\$auth_ok = 0) { return 403; }
 
     location / {
         proxy_pass http://${BACKEND};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Connection \$connection_upgrade;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
 
