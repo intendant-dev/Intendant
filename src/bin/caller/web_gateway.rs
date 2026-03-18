@@ -613,6 +613,20 @@ pub fn spawn_web_gateway(
                                                         // Drain at ~3s of audio (16kHz * 2 bytes/sample * 1 channel * 3s = 96000)
                                                         let threshold = (audio_sample_rate as usize) * 2 * 3;
                                                         if audio_buf.len() >= threshold {
+                                                            // Skip silent buffers — compute RMS energy of PCM16 samples.
+                                                            // Whisper hallucinates on silence (outputs "you", ".", etc).
+                                                            let rms = {
+                                                                let samples = audio_buf.chunks_exact(2)
+                                                                    .map(|c| i16::from_le_bytes([c[0], c[1]]) as f64);
+                                                                let sum_sq: f64 = samples.map(|s| s * s).sum();
+                                                                let n = audio_buf.len() / 2;
+                                                                if n > 0 { (sum_sq / n as f64).sqrt() } else { 0.0 }
+                                                            };
+                                                            if rms < 200.0 {
+                                                                // Near-silence — skip transcription
+                                                                audio_buf.clear();
+                                                                continue;
+                                                            }
                                                             let wav = crate::transcription::encode_wav(
                                                                 &audio_buf,
                                                                 audio_sample_rate,
