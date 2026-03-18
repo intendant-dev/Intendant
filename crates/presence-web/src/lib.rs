@@ -488,6 +488,12 @@ impl PresenceWeb {
         self.server.borrow().send_presence_checkpoint(summary);
     }
 
+    /// Send raw PCM16 audio (base64-encoded) to the server for transcription.
+    #[wasm_bindgen]
+    pub fn send_user_audio(&self, base64_pcm: &str) {
+        self.server.borrow().send_user_audio(base64_pcm);
+    }
+
     /// Send a voice diagnostic to the server (errors, silence, disconnects).
     #[wasm_bindgen]
     pub fn send_voice_diagnostic(&self, kind: &str, detail: &str) {

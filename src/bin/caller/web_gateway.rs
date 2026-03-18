@@ -131,6 +131,9 @@ pub struct WebGatewayConfig {
     pub model: String,
     pub input_sample_rate: u32,
     pub output_sample_rate: u32,
+    /// Whether server-side transcription is enabled (browser should send user_audio).
+    #[serde(default)]
+    pub transcription_enabled: bool,
 }
 
 impl Default for WebGatewayConfig {
@@ -140,6 +143,7 @@ impl Default for WebGatewayConfig {
             model: "gemini-2.5-flash-native-audio-preview-12-2025".to_string(),
             input_sample_rate: 16000,
             output_sample_rate: 24000,
+            transcription_enabled: false,
         }
     }
 }
@@ -168,6 +172,7 @@ pub fn spawn_web_gateway(
     broadcast_tx: broadcast::Sender<String>,
     config: WebGatewayConfig,
     query_ctx: Option<WebQueryCtx>,
+    transcriber: Option<Arc<dyn crate::transcription::Transcriber>>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -212,6 +217,7 @@ pub fn spawn_web_gateway(
             let session_provider = session_provider.clone();
             let session_model = session_model.clone();
             let web_html = web_html.clone();
+            let transcriber = transcriber.clone();
 
             tokio::spawn(async move {
                 // Peek at the first bytes to detect WebSocket upgrade.
@@ -271,12 +277,20 @@ pub fn spawn_web_gateway(
                     let voice_debug_inbound = voice_debug.clone();
                     let live_provider = session_provider.clone();
                     let live_model = session_model.clone();
+                    let transcriber_inbound = transcriber.clone();
                     let inbound = tokio::spawn(async move {
                         // Track whether this connection has an active presence model,
                         // so we can auto-send PresenceDisconnected if the WebSocket drops
                         // without a clean presence_disconnect message (e.g. tab close
                         // before beforeunload fires, network failure).
                         let mut is_presence_connected = false;
+
+                        // Per-connection audio transcription buffer.
+                        // PCM16 bytes are accumulated and drained every ~3s.
+                        let mut audio_buf: Vec<u8> = Vec::new();
+                        let mut audio_seq: u64 = 0;
+                        // Input sample rate (known from config, default 16kHz)
+                        let audio_sample_rate: u32 = 16000;
 
                         while let Some(Ok(msg)) = ws_rx.next().await {
                             if let Message::Text(text) = msg {
@@ -438,6 +452,46 @@ pub fn spawn_web_gateway(
                                                 kind,
                                                 detail,
                                             });
+                                        }
+                                        Some("user_audio") => {
+                                            // Browser sends base64-encoded PCM16 audio for server-side transcription.
+                                            if let Some(ref transcriber) = transcriber_inbound {
+                                                if let Some(data_b64) = json["data"].as_str() {
+                                                    use base64::Engine;
+                                                    if let Ok(pcm_bytes) = base64::engine::general_purpose::STANDARD
+                                                        .decode(data_b64)
+                                                    {
+                                                        audio_buf.extend_from_slice(&pcm_bytes);
+                                                        // Drain at ~3s of audio (16kHz * 2 bytes/sample * 1 channel * 3s = 96000)
+                                                        let threshold = (audio_sample_rate as usize) * 2 * 3;
+                                                        if audio_buf.len() >= threshold {
+                                                            let wav = crate::transcription::encode_wav(
+                                                                &audio_buf,
+                                                                audio_sample_rate,
+                                                                1,
+                                                            );
+                                                            audio_buf.clear();
+                                                            audio_seq += 1;
+                                                            let seq = audio_seq;
+                                                            let t = transcriber.clone();
+                                                            let bus_tx = bus_inbound.clone();
+                                                            tokio::spawn(async move {
+                                                                match t.transcribe(&wav).await {
+                                                                    Ok(segment) => {
+                                                                        let text = segment.text.trim().to_string();
+                                                                        if !text.is_empty() {
+                                                                            bus_tx.send(AppEvent::UserTranscript { text, seq });
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        eprintln!("transcription failed: {}", e);
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                         Some("tool_request") => {
                                             let req_id = json["id"].as_str().unwrap_or("").to_string();
@@ -738,7 +792,11 @@ pub fn spawn_web_gateway(
 
 /// Build a `WebGatewayConfig` from the presence config's live fields,
 /// falling back to environment variable detection.
-pub fn build_config(live_provider: Option<&str>, live_model: Option<&str>) -> WebGatewayConfig {
+pub fn build_config(
+    live_provider: Option<&str>,
+    live_model: Option<&str>,
+    transcription_enabled: bool,
+) -> WebGatewayConfig {
     // If an explicit provider is given, use it directly.
     if let Some(provider) = live_provider {
         let model = live_model.unwrap_or_else(|| match provider {
@@ -755,6 +813,7 @@ pub fn build_config(live_provider: Option<&str>, live_model: Option<&str>) -> We
             model: model.to_string(),
             input_sample_rate: input_rate,
             output_sample_rate: output_rate,
+            transcription_enabled,
         };
     }
 
@@ -766,6 +825,7 @@ pub fn build_config(live_provider: Option<&str>, live_model: Option<&str>) -> We
                 model: model.to_string(),
                 input_sample_rate: 24000,
                 output_sample_rate: 24000,
+                transcription_enabled,
             };
         }
         return WebGatewayConfig {
@@ -773,6 +833,7 @@ pub fn build_config(live_provider: Option<&str>, live_model: Option<&str>) -> We
             model: model.to_string(),
             input_sample_rate: 16000,
             output_sample_rate: 24000,
+            transcription_enabled,
         };
     }
 
@@ -783,9 +844,12 @@ pub fn build_config(live_provider: Option<&str>, live_model: Option<&str>) -> We
             model: "gpt-4o-realtime-preview".to_string(),
             input_sample_rate: 24000,
             output_sample_rate: 24000,
+            transcription_enabled,
         }
     } else {
-        WebGatewayConfig::default()
+        let mut cfg = WebGatewayConfig::default();
+        cfg.transcription_enabled = transcription_enabled;
+        cfg
     }
 }
 
@@ -824,21 +888,21 @@ mod tests {
 
     #[test]
     fn test_build_config_gemini_model() {
-        let config = build_config(None, Some("gemini-2.5-flash-native-audio-preview-12-2025"));
+        let config = build_config(None, Some("gemini-2.5-flash-native-audio-preview-12-2025"), false);
         assert_eq!(config.provider, "gemini");
         assert_eq!(config.input_sample_rate, 16000);
     }
 
     #[test]
     fn test_build_config_openai_model() {
-        let config = build_config(None, Some("gpt-4o-realtime-preview"));
+        let config = build_config(None, Some("gpt-4o-realtime-preview"), false);
         assert_eq!(config.provider, "openai");
         assert_eq!(config.input_sample_rate, 24000);
     }
 
     #[test]
     fn test_build_config_explicit_provider() {
-        let config = build_config(Some("openai"), None);
+        let config = build_config(Some("openai"), None, false);
         assert_eq!(config.provider, "openai");
         assert_eq!(config.model, "gpt-4o-realtime-preview");
     }
@@ -847,7 +911,7 @@ mod tests {
     fn test_build_config_no_model() {
         // With no model and no env vars set in a predictable way,
         // this should default to gemini
-        let config = build_config(None, None);
+        let config = build_config(None, None, false);
         // Either gemini or openai depending on env, but it shouldn't panic
         assert!(!config.provider.is_empty());
     }
@@ -857,7 +921,7 @@ mod tests {
         let (bus, _rx) = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(0, bus, broadcast_tx, config, None);
+        let handle = spawn_web_gateway(0, bus, broadcast_tx, config, None, None);
 
         // Give it a moment to bind
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -876,7 +940,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -920,7 +984,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -971,7 +1035,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Plain HTTP GET
@@ -1012,8 +1076,9 @@ mod tests {
             model: "gpt-4o-realtime-preview".to_string(),
             input_sample_rate: 24000,
             output_sample_rate: 24000,
+            transcription_enabled: false,
         };
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // GET /config
@@ -1050,7 +1115,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1105,7 +1170,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1160,7 +1225,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1215,7 +1280,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1269,7 +1334,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1332,7 +1397,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1406,7 +1471,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1455,7 +1520,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1501,7 +1566,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // POST /session without any API key env var set
@@ -1537,7 +1602,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))

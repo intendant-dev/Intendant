@@ -171,6 +171,12 @@ pub enum AppEvent {
         detail: String,
     },
 
+    /// Server-side transcription of user speech (from Whisper API).
+    UserTranscript {
+        text: String,
+        seq: u64,
+    },
+
     // TUI internal
     Tick,
     #[allow(dead_code)]

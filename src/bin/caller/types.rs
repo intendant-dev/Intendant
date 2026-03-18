@@ -158,4 +158,8 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         data: Option<serde_json::Value>,
     },
+    UserTranscript {
+        text: String,
+        seq: u64,
+    },
 }

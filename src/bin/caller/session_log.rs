@@ -341,6 +341,20 @@ impl SessionLog {
         });
     }
 
+    /// Log a server-side user speech transcript (from Whisper API).
+    pub fn user_transcript(&mut self, text: &str, seq: u64) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "user_transcript".to_string(),
+            level: Some("info".to_string()),
+            message: Some(text.to_string()),
+            data: Some(serde_json::json!({ "seq": seq })),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log a presence checkpoint (context summary from browser model).
     pub fn presence_checkpoint(&mut self, summary: &str, last_event_seq: u64) {
         self.emit(LogEvent {
@@ -1321,6 +1335,21 @@ mod tests {
         assert_eq!(last["event"], "voice_log");
         assert_eq!(last["message"], "hi");
         assert!(last["data"]["tool_context"].is_null());
+    }
+
+    #[test]
+    fn user_transcript_writes_jsonl_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.user_transcript("Hello, run the tests please", 3);
+
+        let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["event"], "user_transcript");
+        assert_eq!(last["message"], "Hello, run the tests please");
+        assert_eq!(last["data"]["seq"], 3);
     }
 
     #[test]

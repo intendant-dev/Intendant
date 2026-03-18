@@ -17,6 +17,7 @@ mod session_log;
 mod sub_agent;
 mod tool_batch;
 mod tools;
+mod transcription;
 mod tui;
 mod types;
 mod user_mode;
@@ -3999,9 +4000,22 @@ async fn main() -> Result<(), CallerError> {
                 let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
                 tx
             };
+            let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
+                if project.config.transcription.enabled {
+                    match transcription::WhisperTranscriber::new(&project.config.transcription) {
+                        Ok(t) => Some(std::sync::Arc::new(t)),
+                        Err(e) => {
+                            eprintln!("Transcription init failed: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
             let config = web_gateway::build_config(
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
+                project.config.transcription.enabled,
             );
             let handle = web_gateway::spawn_web_gateway(
                 flags.web_port,
@@ -4009,6 +4023,7 @@ async fn main() -> Result<(), CallerError> {
                 broadcast_tx,
                 config,
                 None, // MCP mode: no presence query context
+                transcriber,
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -4366,9 +4381,22 @@ async fn main() -> Result<(), CallerError> {
                     presence_session: Some(presence_session.clone()),
                 }
             });
+            let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
+                if project.config.transcription.enabled {
+                    match transcription::WhisperTranscriber::new(&project.config.transcription) {
+                        Ok(t) => Some(std::sync::Arc::new(t)),
+                        Err(e) => {
+                            app.log(types::LogLevel::Warn, format!("Transcription init failed: {}", e));
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
             let config = web_gateway::build_config(
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
+                project.config.transcription.enabled,
             );
             let handle = web_gateway::spawn_web_gateway(
                 flags.web_port,
@@ -4376,6 +4404,7 @@ async fn main() -> Result<(), CallerError> {
                 broadcast_tx,
                 config,
                 query_ctx,
+                transcriber,
             );
             app.log(
                 types::LogLevel::Info,
@@ -4596,9 +4625,22 @@ async fn main() -> Result<(), CallerError> {
         let headless_bus = if flags.web {
             let (bus, _rx) = EventBus::new();
             let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(256);
+            let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
+                if project.config.transcription.enabled {
+                    match transcription::WhisperTranscriber::new(&project.config.transcription) {
+                        Ok(t) => Some(std::sync::Arc::new(t)),
+                        Err(e) => {
+                            eprintln!("Transcription init failed: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
             let config = web_gateway::build_config(
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
+                project.config.transcription.enabled,
             );
             let _web_handle = web_gateway::spawn_web_gateway(
                 flags.web_port,
@@ -4606,6 +4648,7 @@ async fn main() -> Result<(), CallerError> {
                 broadcast_tx,
                 config,
                 None, // Headless mode: no presence query context
+                transcriber,
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",

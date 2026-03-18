@@ -63,6 +63,8 @@ pub struct ProjectConfig {
     pub sandbox: SandboxProjectConfig,
     #[serde(default)]
     pub presence: crate::presence::PresenceConfig,
+    #[serde(default)]
+    pub transcription: crate::transcription::TranscriptionConfig,
 }
 
 /// Sandbox configuration in intendant.toml.
@@ -359,6 +361,37 @@ args = ["mcp-server-sqlite", "--db-path", "/tmp/test.db"]
         assert!(config.presence.live_model.is_none());
         assert_eq!(config.presence.context_window, 1_048_576);
         assert_eq!(config.presence.live_context_window, 32_768);
+    }
+
+    #[test]
+    fn parse_transcription_config_defaults() {
+        let config: ProjectConfig = toml::from_str("").unwrap();
+        assert!(!config.transcription.enabled);
+        assert_eq!(config.transcription.provider, "openai");
+        assert_eq!(config.transcription.model, "whisper-1");
+        assert!(config.transcription.endpoint.is_none());
+        assert!(config.transcription.language.is_none());
+    }
+
+    #[test]
+    fn parse_transcription_config_full() {
+        let toml_str = r#"
+[transcription]
+enabled = true
+provider = "openai"
+model = "whisper-1"
+endpoint = "http://localhost:8080/v1/audio/transcriptions"
+language = "en"
+buffer_secs = 5.0
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.transcription.enabled);
+        assert_eq!(config.transcription.model, "whisper-1");
+        assert_eq!(
+            config.transcription.endpoint.as_deref(),
+            Some("http://localhost:8080/v1/audio/transcriptions")
+        );
+        assert_eq!(config.transcription.language.as_deref(), Some("en"));
     }
 
     #[test]

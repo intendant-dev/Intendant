@@ -661,6 +661,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::VoiceLog { .. }
         | AppEvent::PresenceCheckpointReceived { .. }
         | AppEvent::VoiceDiagnostic { .. }
+        | AppEvent::UserTranscript { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::Key(_)
         | AppEvent::Resize(_, _)
