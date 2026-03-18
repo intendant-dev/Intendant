@@ -303,6 +303,15 @@ impl ServerConnection {
         self.send_json(&msg);
     }
 
+    /// Send raw PCM16 audio (base64-encoded) to the server for transcription.
+    pub fn send_user_audio(&self, base64_pcm: &str) {
+        let msg = serde_json::json!({
+            "t": "user_audio",
+            "data": base64_pcm,
+        });
+        self.send_json(&msg);
+    }
+
     /// Send a voice diagnostic to the server (errors, silence, disconnects).
     pub fn send_voice_diagnostic(&self, kind: &str, detail: &str) {
         let msg = serde_json::json!({

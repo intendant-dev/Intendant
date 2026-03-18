@@ -1912,7 +1912,7 @@ pub fn resolve_use_tools() -> bool {
 }
 
 /// Mask API keys in error messages to prevent accidental leakage.
-fn mask_api_keys(s: &str) -> String {
+pub(crate) fn mask_api_keys(s: &str) -> String {
     static API_KEY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         // Match sk- (OpenAI), key- (Anthropic), AIza (Google) prefixed keys
         // Capture first 14 chars (prefix + 10) then mask the rest

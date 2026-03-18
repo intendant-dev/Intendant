@@ -1684,6 +1684,22 @@ impl App {
                 let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
                 self.log_sourced(lvl, msg, LogSource::Presence, vt);
             }
+            AppEvent::UserTranscript { ref text, seq } => {
+                // Persist to session log
+                if let Some(ref sl) = self.session_log {
+                    if let Ok(mut log) = sl.lock() {
+                        log.user_transcript(text, seq);
+                    }
+                }
+                // Log at Info level
+                let msg = format!("[transcript] {}", text);
+                self.log(LogLevel::Info, msg);
+                // Broadcast as outbound event
+                self.broadcast_control(OutboundEvent::UserTranscript {
+                    text: text.clone(),
+                    seq,
+                });
+            }
             AppEvent::Tick => {
                 self.tick_count += 1;
                 // Update autonomy display

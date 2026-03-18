@@ -1962,6 +1962,9 @@ pub fn spawn_event_listener(
                     AppEvent::VoiceDiagnostic { kind, detail } => {
                         s.push_log(LogLevel::Warn, format!("[voice:{}] {}", kind, detail));
                     }
+                    AppEvent::UserTranscript { ref text, seq } => {
+                        s.push_log(LogLevel::Info, format!("[transcript #{}] {}", seq, text));
+                    }
                 }
             }
 

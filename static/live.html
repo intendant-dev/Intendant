@@ -393,6 +393,10 @@ async function startMic() {
     for (let i = 0; i < resampled.length; i++)
       pcm16[i] = Math.max(-32768, Math.min(32767, Math.floor(resampled[i] * 32768)));
     pw.send_audio(arrayBufferToBase64(pcm16.buffer));
+    // Fork audio to server for transcription if enabled
+    if (gatewayConfig && gatewayConfig.transcription_enabled) {
+      pw.send_user_audio(arrayBufferToBase64(pcm16.buffer));
+    }
   };
   source.connect(workletNode);
   workletNode.connect(audioCtx.destination);
