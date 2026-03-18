@@ -180,6 +180,7 @@ pub fn spawn_web_gateway(
     config: WebGatewayConfig,
     query_ctx: Option<WebQueryCtx>,
     transcriber: Option<Arc<dyn crate::transcription::Transcriber>>,
+    web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -227,6 +228,7 @@ pub fn spawn_web_gateway(
             let web_html = web_html.clone();
             let transcriber = transcriber.clone();
             let active_presence = active_presence.clone();
+            let web_tui_tx = web_tui_tx.clone();
 
             tokio::spawn(async move {
                 // Peek at the first bytes to detect WebSocket upgrade.
@@ -259,6 +261,16 @@ pub fn spawn_web_gateway(
                     // messages for this specific connection (not broadcast).
                     let (direct_tx, mut direct_rx) =
                         mpsc::unbounded_channel::<String>();
+
+                    // Register connection with WebTui for per-connection rendering
+                    if let Some(ref tx) = web_tui_tx {
+                        let _ = tx.send(crate::tui::web::WebTuiCommand::AddConnection {
+                            id: connection_id.clone(),
+                            direct_tx: direct_tx.clone(),
+                            cols: 120,
+                            rows: 40,
+                        });
+                    }
 
                     // Send bootstrap state snapshot on connect (with connection_id)
                     if let Some(ref ctx) = query_ctx {
@@ -293,6 +305,7 @@ pub fn spawn_web_gateway(
                     let transcriber_inbound = transcriber.clone();
                     let active_presence_inbound = active_presence.clone();
                     let connection_id_inbound = connection_id.clone();
+                    let web_tui_tx_inbound = web_tui_tx.clone();
                     let inbound = tokio::spawn(async move {
                         // Track whether this connection has an active presence model,
                         // so we can auto-send PresenceDisconnected if the WebSocket drops
@@ -319,14 +332,33 @@ pub fn spawn_web_gateway(
                                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
                                     match json.get("t").and_then(|v| v.as_str()) {
                                         Some("key") => {
+                                            // Route key events to this connection's
+                                            // ViewState via WebTuiCommand (not EventBus).
                                             if let Some(key_event) = crate::tui::web::parse_web_key(&json) {
-                                                bus_inbound.send(AppEvent::Key(key_event));
+                                                if let Some(ref tx) = web_tui_tx {
+                                                    let _ = tx.send(crate::tui::web::WebTuiCommand::Key {
+                                                        id: connection_id_inbound.clone(),
+                                                        key: key_event,
+                                                    });
+                                                } else if is_active {
+                                                    // Fallback: no WebTui (headless web mode)
+                                                    bus_inbound.send(AppEvent::Key(key_event));
+                                                }
                                             }
                                         }
                                         Some("resize") => {
+                                            // Route resize to this connection's terminal
                                             let cols = json["cols"].as_u64().unwrap_or(80) as u16;
                                             let rows = json["rows"].as_u64().unwrap_or(24) as u16;
-                                            bus_inbound.send(AppEvent::Resize(cols, rows));
+                                            if let Some(ref tx) = web_tui_tx {
+                                                let _ = tx.send(crate::tui::web::WebTuiCommand::Resize {
+                                                    id: connection_id_inbound.clone(),
+                                                    cols,
+                                                    rows,
+                                                });
+                                            } else if is_active {
+                                                bus_inbound.send(AppEvent::Resize(cols, rows));
+                                            }
                                         }
                                         // Legacy: keep accepting live_connected/live_disconnected
                                         // for older clients, mapping to the new protocol
@@ -825,6 +857,12 @@ pub fn spawn_web_gateway(
                         if is_presence_connected && is_active {
                             bus_inbound.send(AppEvent::PresenceDisconnected);
                         }
+                        // Unregister from WebTui
+                        if let Some(ref tx) = web_tui_tx_inbound {
+                            let _ = tx.send(crate::tui::web::WebTuiCommand::RemoveConnection {
+                                id: connection_id_inbound.clone(),
+                            });
+                        }
                     });
 
                     // Outbound: broadcast + direct responses → WebSocket
@@ -1096,7 +1134,7 @@ mod tests {
         let (bus, _rx) = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(0, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(0, bus, broadcast_tx, config, None, None, None);
 
         // Give it a moment to bind
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1115,7 +1153,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -1159,7 +1197,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -1210,7 +1248,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Plain HTTP GET
@@ -1253,7 +1291,7 @@ mod tests {
             output_sample_rate: 24000,
             transcription_enabled: false,
         };
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // GET /config
@@ -1290,7 +1328,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1345,7 +1383,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1400,7 +1438,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1455,7 +1493,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1509,7 +1547,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1572,7 +1610,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1646,7 +1684,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1695,26 +1733,34 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
-        // Send a resize (not live_connected), then drop
-        ws.send(Message::Text(r#"{"t":"resize","cols":80,"rows":24}"#.into()))
+        // Send a control action (routes through EventBus regardless of active state)
+        ws.send(Message::Text(r#"{"action":"status"}"#.into()))
             .await
             .unwrap();
 
-        // Drain the Resize event
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            rx.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
-        assert!(matches!(event, AppEvent::Resize(80, 24)));
+        // Drain events until we see the Status control event
+        // (may be preceded by PresenceLog debug events)
+        let mut found = false;
+        for _ in 0..5 {
+            let event = tokio::time::timeout(
+                tokio::time::Duration::from_secs(2),
+                rx.recv(),
+            )
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+            if matches!(event, AppEvent::ControlCommand(ControlMsg::Status)) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "expected ControlCommand(Status)");
 
         // Drop the WebSocket
         ws.close(None).await.unwrap();
@@ -1741,7 +1787,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // POST /session without any API key env var set
@@ -1777,7 +1823,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
@@ -1814,7 +1860,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1869,7 +1915,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1938,7 +1984,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2035,7 +2081,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);

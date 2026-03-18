@@ -87,10 +87,13 @@ pub struct PendingApproval {
     pub responder: oneshot::Sender<ApprovalResponse>,
 }
 
-/// The main application state.
-pub struct App {
-    // Display
-    pub log_entries: VecDeque<LogEntry>,
+/// Per-connection view state: scroll position, verbosity, inspect mode, etc.
+/// Each browser tab / TUI terminal gets its own `ViewState`.
+///
+/// `App::mode` tracks the shared interactive mode (Approval, AskHuman,
+/// FollowUp).  `ViewState` adds per-connection overlays: Help and Inspect.
+#[derive(Debug, Clone)]
+pub struct ViewState {
     pub scroll_offset: usize,
     pub auto_scroll: bool,
     pub verbosity: Verbosity,
@@ -99,6 +102,350 @@ pub struct App {
     pub log_tab: LogTab,
     pub expanded_turns: HashSet<usize>,
     pub focused_line: Option<usize>,
+    /// Per-connection overlays on top of the shared `App::mode`.
+    pub show_help: bool,
+    pub show_inspect: bool,
+}
+
+impl Default for ViewState {
+    fn default() -> Self {
+        Self {
+            scroll_offset: 0,
+            auto_scroll: true,
+            verbosity: Verbosity::Normal,
+            inspect_index: None,
+            inspect_scroll: 0,
+            log_tab: LogTab::All,
+            expanded_turns: HashSet::new(),
+            focused_line: None,
+            show_help: false,
+            show_inspect: false,
+        }
+    }
+}
+
+impl ViewState {
+    /// Return indices into `app.log_entries` that pass the current view filters.
+    pub fn filtered_indices(&self, app: &App) -> Vec<usize> {
+        app.log_entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| {
+                if !self.verbosity.includes(&entry.level) {
+                    return None;
+                }
+                if !self.log_tab.includes(entry.source) {
+                    return None;
+                }
+                // Turn grouping: if entry belongs to a collapsed turn, hide it
+                // unless it's the first entry of that turn (the summary line).
+                if let Some(t) = entry.turn {
+                    if !self.expanded_turns.contains(&t) {
+                        let dominated = app
+                            .log_entries
+                            .iter()
+                            .take(idx)
+                            .any(|e| {
+                                e.turn == Some(t)
+                                    && self.verbosity.includes(&e.level)
+                                    && self.log_tab.includes(e.source)
+                            });
+                        if dominated {
+                            return None;
+                        }
+                    }
+                }
+                Some(idx)
+            })
+            .collect()
+    }
+
+    pub fn scroll_to_bottom(&mut self, app: &App) {
+        let total = self.filtered_indices(app).len();
+        self.scroll_offset = total.saturating_sub(1);
+    }
+
+    pub fn scroll_up(&mut self, n: usize) {
+        self.auto_scroll = false;
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+    }
+
+    pub fn scroll_down(&mut self, n: usize, app: &App) {
+        self.auto_scroll = false;
+        let total = self.filtered_indices(app).len();
+        self.scroll_offset = (self.scroll_offset + n).min(total.saturating_sub(1));
+    }
+
+    pub fn scroll_page_up(&mut self, page_size: usize) {
+        self.scroll_up(page_size);
+    }
+
+    pub fn scroll_page_down(&mut self, page_size: usize, app: &App) {
+        self.scroll_down(page_size, app);
+    }
+
+    pub fn scroll_home(&mut self) {
+        self.auto_scroll = false;
+        self.scroll_offset = 0;
+    }
+
+    pub fn scroll_end(&mut self, app: &App) {
+        self.auto_scroll = true;
+        self.scroll_to_bottom(app);
+    }
+
+    pub fn focus_index(&self, app: &App) -> Option<usize> {
+        let filtered = self.filtered_indices(app);
+        if filtered.is_empty() {
+            return None;
+        }
+        if self.auto_scroll {
+            return filtered.last().copied();
+        }
+        filtered.get(self.scroll_offset).copied()
+    }
+
+    fn clamp_view_to_filtered(&mut self, app: &App) {
+        let total = self.filtered_indices(app).len();
+        if total == 0 {
+            self.scroll_offset = 0;
+            self.inspect_index = None;
+            return;
+        }
+        self.scroll_offset = self.scroll_offset.min(total.saturating_sub(1));
+    }
+
+    fn open_inspect_mode(&mut self, app: &App) -> bool {
+        self.inspect_index = self.focus_index(app);
+        if self.inspect_index.is_some() {
+            self.inspect_scroll = 0;
+            self.show_inspect = true;
+            return true;
+        }
+        false
+    }
+
+    fn ensure_inspect_index(&mut self, app: &App) {
+        let filtered = self.filtered_indices(app);
+        if filtered.is_empty() {
+            self.inspect_index = None;
+            return;
+        }
+        if let Some(current) = self.inspect_index {
+            if filtered.contains(&current) {
+                return;
+            }
+        }
+        self.inspect_index = filtered.last().copied();
+    }
+
+    fn move_inspect(&mut self, delta: isize, app: &App) {
+        let filtered = self.filtered_indices(app);
+        if filtered.is_empty() {
+            self.inspect_index = None;
+            return;
+        }
+
+        let current_pos = self
+            .inspect_index
+            .and_then(|idx| filtered.iter().position(|&i| i == idx))
+            .unwrap_or(filtered.len().saturating_sub(1));
+
+        let next_pos = (current_pos as isize + delta)
+            .clamp(0, filtered.len().saturating_sub(1) as isize) as usize;
+        self.inspect_index = Some(filtered[next_pos]);
+        self.auto_scroll = false;
+        self.scroll_offset = next_pos.saturating_sub(2);
+    }
+
+    fn jump_inspect_to_edge(&mut self, start: bool, app: &App) {
+        let filtered = self.filtered_indices(app);
+        if filtered.is_empty() {
+            self.inspect_index = None;
+            return;
+        }
+
+        let pos = if start {
+            0
+        } else {
+            filtered.len().saturating_sub(1)
+        };
+        self.inspect_index = Some(filtered[pos]);
+        self.auto_scroll = !start;
+        self.scroll_offset = if start { 0 } else { pos.saturating_sub(2) };
+    }
+
+    /// Get the turn number of the currently focused log entry.
+    fn focused_turn(&self, app: &App) -> Option<usize> {
+        let idx = self.focus_index(app)?;
+        app.log_entries.get(idx).and_then(|e| e.turn)
+    }
+
+    /// Toggle expand/collapse for the turn of the currently focused log entry.
+    fn toggle_focused_turn_expand(&mut self, app: &App) {
+        if let Some(turn) = self.focused_turn(app) {
+            if self.expanded_turns.contains(&turn) {
+                self.expanded_turns.remove(&turn);
+            } else {
+                self.expanded_turns.insert(turn);
+            }
+            self.clamp_view_to_filtered(app);
+        }
+    }
+
+    /// Collapse the turn of the currently focused log entry.
+    fn collapse_focused_turn(&mut self, app: &App) {
+        if let Some(turn) = self.focused_turn(app) {
+            self.expanded_turns.remove(&turn);
+            self.clamp_view_to_filtered(app);
+        }
+    }
+
+    /// Handle a key event that only affects view state.
+    /// Returns true if the event was consumed (view-only key).
+    /// Returns false if the key should be handled by App (shared state key).
+    pub fn handle_key(&mut self, key: KeyEvent, app: &App) -> bool {
+        if self.show_help {
+            // Any key closes help
+            self.show_help = false;
+            return true;
+        }
+        if self.show_inspect {
+            return self.handle_inspect_key(key, app);
+        }
+        // In shared-mode states (Approval, AskHuman, FollowUp), let App handle keys
+        match app.mode {
+            AppMode::Approval | AppMode::AskHuman | AppMode::FollowUp => false,
+            AppMode::Normal | AppMode::Help | AppMode::Inspect => {
+                self.handle_normal_view_key(key, app)
+            }
+        }
+    }
+
+    fn handle_normal_view_key(&mut self, key: KeyEvent, app: &App) -> bool {
+        match key.code {
+            KeyCode::Char('v') => {
+                self.verbosity = self.verbosity.next();
+                self.clamp_view_to_filtered(app);
+                true
+            }
+            KeyCode::Char('i') => {
+                self.open_inspect_mode(app)
+            }
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                true
+            }
+            // Enter or Right arrow: toggle turn expansion on the focused entry
+            KeyCode::Enter | KeyCode::Right => {
+                self.toggle_focused_turn_expand(app);
+                true
+            }
+            // Left arrow: collapse focused turn
+            KeyCode::Left => {
+                self.collapse_focused_turn(app);
+                true
+            }
+            // Tab: cycle log tab
+            KeyCode::Tab => {
+                self.log_tab = self.log_tab.next();
+                self.clamp_view_to_filtered(app);
+                true
+            }
+            KeyCode::Char('1') => {
+                self.log_tab = LogTab::All;
+                self.clamp_view_to_filtered(app);
+                true
+            }
+            KeyCode::Char('2') => {
+                self.log_tab = LogTab::Agent;
+                self.clamp_view_to_filtered(app);
+                true
+            }
+            KeyCode::Char('3') => {
+                self.log_tab = LogTab::Presence;
+                self.clamp_view_to_filtered(app);
+                true
+            }
+            KeyCode::Up => {
+                self.scroll_up(1);
+                true
+            }
+            KeyCode::Down => {
+                self.scroll_down(1, app);
+                true
+            }
+            KeyCode::PageUp => {
+                self.scroll_page_up(20);
+                true
+            }
+            KeyCode::PageDown => {
+                self.scroll_page_down(20, app);
+                true
+            }
+            KeyCode::Home => {
+                self.scroll_home();
+                true
+            }
+            KeyCode::End => {
+                self.scroll_end(app);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_inspect_key(&mut self, key: KeyEvent, app: &App) -> bool {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('i') | KeyCode::Enter => {
+                self.show_inspect = false;
+                true
+            }
+            // Up/Down scroll within the current entry
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.inspect_scroll = self.inspect_scroll.saturating_sub(1);
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.inspect_scroll = self.inspect_scroll.saturating_add(1);
+                true
+            }
+            // Left/Right navigate between entries
+            KeyCode::Left | KeyCode::PageUp => {
+                self.move_inspect(-1, app);
+                self.inspect_scroll = 0;
+                true
+            }
+            KeyCode::Right | KeyCode::PageDown => {
+                self.move_inspect(1, app);
+                self.inspect_scroll = 0;
+                true
+            }
+            KeyCode::Home => {
+                self.jump_inspect_to_edge(true, app);
+                self.inspect_scroll = 0;
+                true
+            }
+            KeyCode::End => {
+                self.jump_inspect_to_edge(false, app);
+                self.inspect_scroll = 0;
+                true
+            }
+            KeyCode::Char('v') => {
+                self.verbosity = self.verbosity.next();
+                self.clamp_view_to_filtered(app);
+                self.ensure_inspect_index(app);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The main application state.
+pub struct App {
+    // Display
+    pub log_entries: VecDeque<LogEntry>,
 
     // Status
     pub provider_name: String,
@@ -110,6 +457,8 @@ pub struct App {
 
     // Panels
     pub panels: PanelConfig,
+    /// Shared interactive mode (Approval, AskHuman, FollowUp, Normal).
+    /// Per-connection overlays (Help, Inspect) are in `ViewState`.
     pub mode: AppMode,
     pub should_quit: bool,
 
@@ -135,8 +484,12 @@ pub struct App {
     pub session_id: String,
     pub task_description: String,
 
-    // Animation
+    // Animation (kept in App for server-side idle tick tracking)
     pub tick_count: usize,
+
+    /// Verbosity override — consumed by the TUI event loop and applied to all
+    /// connections' ViewStates. Set by --verbose flag at startup or by control socket.
+    pub pending_verbosity: Option<Verbosity>,
 
     // Streaming buffer for incremental text deltas
     pub streaming_buffer: String,
@@ -200,14 +553,6 @@ impl App {
     ) -> Self {
         Self {
             log_entries: VecDeque::new(),
-            scroll_offset: 0,
-            auto_scroll: true,
-            verbosity: Verbosity::Normal,
-            inspect_index: None,
-            inspect_scroll: 0,
-            log_tab: LogTab::All,
-            expanded_turns: HashSet::new(),
-            focused_line: None,
             provider_name,
             model_name,
             turn: 0,
@@ -228,6 +573,7 @@ impl App {
             session_id: String::new(),
             task_description: String::new(),
             tick_count: 0,
+            pending_verbosity: None,
             streaming_buffer: String::new(),
             round: 1,
             follow_up_textarea: None,
@@ -368,9 +714,8 @@ impl App {
             source,
             turn,
         });
-        if self.auto_scroll {
-            self.scroll_to_bottom();
-        }
+        // Note: auto_scroll is now per-connection in ViewState.
+        // Each connection's render loop handles its own scroll position.
     }
 
     /// Flush accumulated voice transcript fragments into a single Info log entry.
@@ -384,75 +729,6 @@ impl App {
             self.voice_transcript_buffer.clear();
             self.voice_transcript_idle_ticks = 0;
         }
-    }
-
-    pub fn filtered_indices(&self) -> Vec<usize> {
-        self.log_entries
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, entry)| {
-                if !self.verbosity.includes(&entry.level) {
-                    return None;
-                }
-                if !self.log_tab.includes(entry.source) {
-                    return None;
-                }
-                // Turn grouping: if entry belongs to a collapsed turn, hide it
-                // unless it's the first entry of that turn (the summary line).
-                if let Some(t) = entry.turn {
-                    if !self.expanded_turns.contains(&t) {
-                        // Find the first visible entry for this turn
-                        let dominated = self
-                            .log_entries
-                            .iter()
-                            .take(idx)
-                            .any(|e| {
-                                e.turn == Some(t)
-                                    && self.verbosity.includes(&e.level)
-                                    && self.log_tab.includes(e.source)
-                            });
-                        if dominated {
-                            return None;
-                        }
-                    }
-                }
-                Some(idx)
-            })
-            .collect()
-    }
-
-    pub fn scroll_to_bottom(&mut self) {
-        let total = self.filtered_indices().len();
-        self.scroll_offset = total.saturating_sub(1);
-    }
-
-    pub fn scroll_up(&mut self, n: usize) {
-        self.auto_scroll = false;
-        self.scroll_offset = self.scroll_offset.saturating_sub(n);
-    }
-
-    pub fn scroll_down(&mut self, n: usize) {
-        self.auto_scroll = false;
-        let total = self.filtered_indices().len();
-        self.scroll_offset = (self.scroll_offset + n).min(total.saturating_sub(1));
-    }
-
-    pub fn scroll_page_up(&mut self, page_size: usize) {
-        self.scroll_up(page_size);
-    }
-
-    pub fn scroll_page_down(&mut self, page_size: usize) {
-        self.scroll_down(page_size);
-    }
-
-    pub fn scroll_home(&mut self) {
-        self.auto_scroll = false;
-        self.scroll_offset = 0;
-    }
-
-    pub fn scroll_end(&mut self) {
-        self.auto_scroll = true;
-        self.scroll_to_bottom();
     }
 
     /// Get the height available for the bottom panel (0 if none active).
@@ -472,9 +748,7 @@ impl App {
             AppMode::FollowUp => 5,
             _ => {
                 // Show a slim reminder bar when browsing during follow-up or after task done
-                if (self.current_phase == Phase::WaitingFollowUp
-                    || self.current_phase == Phase::Done)
-                    && self.follow_up_textarea.is_some()
+                if self.is_follow_up_browsing()
                 {
                     3
                 } else {
@@ -484,7 +758,8 @@ impl App {
         }
     }
 
-    /// Handle a key event. Returns true if the event was consumed.
+    /// Handle a key event that modifies shared App state.
+    /// Returns true if the event was consumed.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         // Global quit
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -493,137 +768,39 @@ impl App {
         }
 
         match self.mode {
-            AppMode::Help => {
-                // Any key closes help
-                self.mode = AppMode::Normal;
-                true
-            }
             AppMode::Approval => self.handle_approval_key(key),
             AppMode::AskHuman => self.handle_human_key(key),
             AppMode::FollowUp => self.handle_follow_up_key(key),
-            AppMode::Inspect => self.handle_inspect_key(key),
-            AppMode::Normal => self.handle_normal_key(key),
-        }
-    }
-
-    fn handle_normal_key(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Char('q') => {
-                self.should_quit = true;
-                true
-            }
-            KeyCode::Char('v') => {
-                self.verbosity = self.verbosity.next();
-                self.clamp_view_to_filtered();
-                true
-            }
-            KeyCode::Char('i') => {
-                if self.open_inspect_mode() {
-                    true
-                } else {
-                    false
+            AppMode::Normal | AppMode::Help | AppMode::Inspect => {
+                // Shared-state keys in Normal mode
+                match key.code {
+                    KeyCode::Char('q') => {
+                        self.should_quit = true;
+                        true
+                    }
+                    KeyCode::Char('f') => {
+                        // Re-open follow-up input if a round is waiting or task is done
+                        if (self.current_phase == Phase::WaitingFollowUp
+                            || self.current_phase == Phase::Done)
+                            && self.follow_up_textarea.is_some()
+                        {
+                            self.mode = AppMode::FollowUp;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                        self.cycle_autonomy_up();
+                        true
+                    }
+                    KeyCode::Char('-') => {
+                        self.cycle_autonomy_down();
+                        true
+                    }
+                    _ => false,
                 }
             }
-            KeyCode::Char('f') => {
-                // Re-open follow-up input if a round is waiting or task is done
-                if (self.current_phase == Phase::WaitingFollowUp
-                    || self.current_phase == Phase::Done)
-                    && self.follow_up_textarea.is_some()
-                {
-                    self.mode = AppMode::FollowUp;
-                    true
-                } else {
-                    false
-                }
-            }
-            // Enter or Right arrow: toggle turn expansion on the focused entry
-            KeyCode::Enter | KeyCode::Right => {
-                self.toggle_focused_turn_expand();
-                true
-            }
-            // Left arrow: collapse focused turn
-            KeyCode::Left => {
-                self.collapse_focused_turn();
-                true
-            }
-            KeyCode::Char('?') => {
-                self.mode = AppMode::Help;
-                true
-            }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                self.cycle_autonomy_up();
-                true
-            }
-            KeyCode::Char('-') => {
-                self.cycle_autonomy_down();
-                true
-            }
-            // Tab: cycle log tab
-            KeyCode::Tab => {
-                self.log_tab = self.log_tab.next();
-                self.clamp_view_to_filtered();
-                true
-            }
-            KeyCode::Char('1') => {
-                self.log_tab = LogTab::All;
-                self.clamp_view_to_filtered();
-                true
-            }
-            KeyCode::Char('2') => {
-                self.log_tab = LogTab::Agent;
-                self.clamp_view_to_filtered();
-                true
-            }
-            KeyCode::Char('3') => {
-                self.log_tab = LogTab::Presence;
-                self.clamp_view_to_filtered();
-                true
-            }
-            KeyCode::Up => {
-                self.scroll_up(1);
-                true
-            }
-            KeyCode::Down => {
-                self.scroll_down(1);
-                true
-            }
-            KeyCode::PageUp => {
-                self.scroll_page_up(20);
-                true
-            }
-            KeyCode::PageDown => {
-                self.scroll_page_down(20);
-                true
-            }
-            KeyCode::Home => {
-                self.scroll_home();
-                true
-            }
-            KeyCode::End => {
-                self.scroll_end();
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Toggle expand/collapse for the turn of the currently focused log entry.
-    fn toggle_focused_turn_expand(&mut self) {
-        if let Some(turn) = self.focused_turn() {
-            if self.expanded_turns.contains(&turn) {
-                self.expanded_turns.remove(&turn);
-            } else {
-                self.expanded_turns.insert(turn);
-            }
-            self.clamp_view_to_filtered();
-        }
-    }
-
-    /// Collapse the turn of the currently focused log entry.
-    fn collapse_focused_turn(&mut self) {
-        if let Some(turn) = self.focused_turn() {
-            self.expanded_turns.remove(&turn);
-            self.clamp_view_to_filtered();
         }
     }
 
@@ -633,139 +810,6 @@ impl App {
             && (self.current_phase == Phase::WaitingFollowUp
                 || self.current_phase == Phase::Done)
             && self.follow_up_textarea.is_some()
-    }
-
-    /// Get the turn number of the currently focused log entry.
-    fn focused_turn(&self) -> Option<usize> {
-        let idx = self.focus_index()?;
-        self.log_entries.get(idx).and_then(|e| e.turn)
-    }
-
-    fn handle_inspect_key(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('i') | KeyCode::Enter => {
-                self.mode = AppMode::Normal;
-                true
-            }
-            // Up/Down scroll within the current entry
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.inspect_scroll = self.inspect_scroll.saturating_sub(1);
-                true
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.inspect_scroll = self.inspect_scroll.saturating_add(1);
-                true
-            }
-            // Left/Right navigate between entries
-            KeyCode::Left | KeyCode::PageUp => {
-                self.move_inspect(-1);
-                self.inspect_scroll = 0;
-                true
-            }
-            KeyCode::Right | KeyCode::PageDown => {
-                self.move_inspect(1);
-                self.inspect_scroll = 0;
-                true
-            }
-            KeyCode::Home => {
-                self.jump_inspect_to_edge(true);
-                self.inspect_scroll = 0;
-                true
-            }
-            KeyCode::End => {
-                self.jump_inspect_to_edge(false);
-                self.inspect_scroll = 0;
-                true
-            }
-            KeyCode::Char('v') => {
-                self.verbosity = self.verbosity.next();
-                self.clamp_view_to_filtered();
-                self.ensure_inspect_index();
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn clamp_view_to_filtered(&mut self) {
-        let total = self.filtered_indices().len();
-        if total == 0 {
-            self.scroll_offset = 0;
-            self.inspect_index = None;
-            return;
-        }
-        self.scroll_offset = self.scroll_offset.min(total.saturating_sub(1));
-    }
-
-    pub fn focus_index(&self) -> Option<usize> {
-        let filtered = self.filtered_indices();
-        if filtered.is_empty() {
-            return None;
-        }
-        if self.auto_scroll {
-            return filtered.last().copied();
-        }
-        filtered.get(self.scroll_offset).copied()
-    }
-
-    fn open_inspect_mode(&mut self) -> bool {
-        self.inspect_index = self.focus_index();
-        if self.inspect_index.is_some() {
-            self.inspect_scroll = 0;
-            self.mode = AppMode::Inspect;
-            return true;
-        }
-        false
-    }
-
-    fn ensure_inspect_index(&mut self) {
-        let filtered = self.filtered_indices();
-        if filtered.is_empty() {
-            self.inspect_index = None;
-            return;
-        }
-        if let Some(current) = self.inspect_index {
-            if filtered.contains(&current) {
-                return;
-            }
-        }
-        self.inspect_index = filtered.last().copied();
-    }
-
-    fn move_inspect(&mut self, delta: isize) {
-        let filtered = self.filtered_indices();
-        if filtered.is_empty() {
-            self.inspect_index = None;
-            return;
-        }
-
-        let current_pos = self
-            .inspect_index
-            .and_then(|idx| filtered.iter().position(|&i| i == idx))
-            .unwrap_or(filtered.len().saturating_sub(1));
-
-        let next_pos = (current_pos as isize + delta)
-            .clamp(0, filtered.len().saturating_sub(1) as isize) as usize;
-        self.inspect_index = Some(filtered[next_pos]);
-        self.auto_scroll = false;
-        self.scroll_offset = next_pos.saturating_sub(2);
-    }
-
-    fn jump_inspect_to_edge(&mut self, start: bool) {
-        let filtered = self.filtered_indices();
-        if filtered.is_empty() {
-            self.inspect_index = None;
-            return;
-        }
-
-        let pos = if start {
-            0
-        } else {
-            filtered.len().saturating_sub(1)
-        };
-        self.inspect_index = Some(filtered[pos]);
-        self.auto_scroll = !start;
-        self.scroll_offset = if start { 0 } else { pos.saturating_sub(2) };
     }
 
     fn handle_approval_key(&mut self, key: KeyEvent) -> bool {
@@ -1027,24 +1071,25 @@ impl App {
             }
             ControlMsg::SetVerbosity { level } => {
                 let new_verbosity = match level.to_lowercase().as_str() {
-                    "quiet" => Verbosity::Quiet,
-                    "normal" => Verbosity::Normal,
-                    "verbose" => Verbosity::Verbose,
-                    "debug" => Verbosity::Debug,
+                    "quiet" => Some(Verbosity::Quiet),
+                    "normal" => Some(Verbosity::Normal),
+                    "verbose" => Some(Verbosity::Verbose),
+                    "debug" => Some(Verbosity::Debug),
                     _ => {
                         self.log(
                             LogLevel::Warn,
                             format!("Unknown verbosity level: {}", level),
                         );
-                        return;
+                        None
                     }
                 };
-                self.verbosity = new_verbosity;
-                self.clamp_view_to_filtered();
-                self.log(
-                    LogLevel::Info,
-                    format!("Verbosity set to {} via control socket", new_verbosity.label()),
-                );
+                if let Some(v) = new_verbosity {
+                    self.pending_verbosity = Some(v);
+                    self.log(
+                        LogLevel::Info,
+                        format!("Verbosity set to {} via control socket", v.label()),
+                    );
+                }
             }
             ControlMsg::StartTask { task, orchestrate } => {
                 // StartTask is an explicit command — bypass server-side presence
@@ -1856,14 +1901,15 @@ mod tests {
     #[test]
     fn app_new_defaults() {
         let app = test_app();
+        let view = ViewState::default();
         assert_eq!(app.turn, 0);
         assert_eq!(app.budget_pct, 0.0);
         assert_eq!(app.session_tokens, 0);
         assert_eq!(app.current_phase, Phase::Idle);
         assert_eq!(app.mode, AppMode::Normal);
         assert!(!app.should_quit);
-        assert_eq!(app.verbosity, Verbosity::Normal);
-        assert!(app.auto_scroll);
+        assert_eq!(view.verbosity, Verbosity::Normal);
+        assert!(view.auto_scroll);
         assert!(app.log_entries.is_empty());
     }
 
@@ -1894,22 +1940,25 @@ mod tests {
         for i in 0..50 {
             app.log(LogLevel::Info, format!("line {}", i));
         }
-        app.scroll_offset = 30;
-        app.auto_scroll = false;
+        let mut view = ViewState::default();
+        view.scroll_offset = 30;
+        view.auto_scroll = false;
 
-        app.scroll_up(5);
-        assert_eq!(app.scroll_offset, 25);
+        view.scroll_up(5);
+        assert_eq!(view.scroll_offset, 25);
 
-        app.scroll_down(10);
-        assert_eq!(app.scroll_offset, 35);
+        view.scroll_down(10, &app);
+        assert_eq!(view.scroll_offset, 35);
     }
 
     #[test]
     fn scroll_up_clamps_to_zero() {
-        let mut app = test_app();
-        app.scroll_offset = 3;
-        app.scroll_up(10);
-        assert_eq!(app.scroll_offset, 0);
+        let app = test_app();
+        let mut view = ViewState::default();
+        view.scroll_offset = 3;
+        view.scroll_up(10);
+        assert_eq!(view.scroll_offset, 0);
+        let _ = app; // suppress unused warning
     }
 
     #[test]
@@ -1918,12 +1967,13 @@ mod tests {
         for i in 0..50 {
             app.log(LogLevel::Info, format!("line {}", i));
         }
-        app.scroll_home();
-        assert_eq!(app.scroll_offset, 0);
-        assert!(!app.auto_scroll);
+        let mut view = ViewState::default();
+        view.scroll_home();
+        assert_eq!(view.scroll_offset, 0);
+        assert!(!view.auto_scroll);
 
-        app.scroll_end();
-        assert!(app.auto_scroll);
+        view.scroll_end(&app);
+        assert!(view.auto_scroll);
     }
 
     #[test]
@@ -1944,28 +1994,30 @@ mod tests {
 
     #[test]
     fn handle_key_verbosity_cycle() {
-        let mut app = test_app();
-        assert_eq!(app.verbosity, Verbosity::Normal);
+        let app = test_app();
+        let mut view = ViewState::default();
+        assert_eq!(view.verbosity, Verbosity::Normal);
         let key = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
-        app.handle_key(key);
-        assert_eq!(app.verbosity, Verbosity::Verbose);
-        app.handle_key(key);
-        assert_eq!(app.verbosity, Verbosity::Debug);
-        app.handle_key(key);
-        assert_eq!(app.verbosity, Verbosity::Quiet);
+        view.handle_key(key, &app);
+        assert_eq!(view.verbosity, Verbosity::Verbose);
+        view.handle_key(key, &app);
+        assert_eq!(view.verbosity, Verbosity::Debug);
+        view.handle_key(key, &app);
+        assert_eq!(view.verbosity, Verbosity::Quiet);
     }
 
     #[test]
     fn handle_key_help_toggle() {
-        let mut app = test_app();
+        let app = test_app();
+        let mut view = ViewState::default();
         let key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
-        app.handle_key(key);
-        assert_eq!(app.mode, AppMode::Help);
+        view.handle_key(key, &app);
+        assert!(view.show_help);
 
         // Any key closes help
         let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
-        app.handle_key(key);
-        assert_eq!(app.mode, AppMode::Normal);
+        view.handle_key(key, &app);
+        assert!(!view.show_help);
     }
 
     #[test]
@@ -1974,16 +2026,17 @@ mod tests {
         for i in 0..50 {
             app.log(LogLevel::Info, format!("line {}", i));
         }
-        app.scroll_offset = 25;
-        app.auto_scroll = false;
+        let mut view = ViewState::default();
+        view.scroll_offset = 25;
+        view.auto_scroll = false;
 
         let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
-        app.handle_key(up);
-        assert_eq!(app.scroll_offset, 24);
+        view.handle_key(up, &app);
+        assert_eq!(view.scroll_offset, 24);
 
         let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
-        app.handle_key(down);
-        assert_eq!(app.scroll_offset, 25);
+        view.handle_key(down, &app);
+        assert_eq!(view.scroll_offset, 25);
     }
 
     #[test]
@@ -2445,17 +2498,18 @@ mod tests {
             None,
         );
 
-        app.log_tab = LogTab::All;
-        assert_eq!(app.filtered_indices().len(), 3);
+        let mut view = ViewState::default();
+        view.log_tab = LogTab::All;
+        assert_eq!(view.filtered_indices(&app).len(), 3);
 
-        app.log_tab = LogTab::Agent;
-        let indices = app.filtered_indices();
+        view.log_tab = LogTab::Agent;
+        let indices = view.filtered_indices(&app);
         assert_eq!(indices.len(), 2); // agent + system
         assert_eq!(app.log_entries[indices[0]].source, LogSource::Agent);
         assert_eq!(app.log_entries[indices[1]].source, LogSource::System);
 
-        app.log_tab = LogTab::Presence;
-        let indices = app.filtered_indices();
+        view.log_tab = LogTab::Presence;
+        let indices = view.filtered_indices(&app);
         assert_eq!(indices.len(), 2); // presence + system
         assert_eq!(app.log_entries[indices[0]].source, LogSource::Presence);
         assert_eq!(app.log_entries[indices[1]].source, LogSource::System);
@@ -2486,16 +2540,17 @@ mod tests {
         // Add 1 system entry (no turn)
         app.log(LogLevel::Info, "system msg".to_string());
 
+        let mut view = ViewState::default();
         // By default, turn 1 is collapsed: only first entry of turn + system
-        assert!(!app.expanded_turns.contains(&1));
-        let indices = app.filtered_indices();
+        assert!(!view.expanded_turns.contains(&1));
+        let indices = view.filtered_indices(&app);
         assert_eq!(indices.len(), 2); // first turn entry + system entry
         assert_eq!(app.log_entries[indices[0]].content, "T1: exec: ls");
         assert_eq!(app.log_entries[indices[1]].content, "system msg");
 
         // Expand turn 1: all entries visible
-        app.expanded_turns.insert(1);
-        let indices = app.filtered_indices();
+        view.expanded_turns.insert(1);
+        let indices = view.filtered_indices(&app);
         assert_eq!(indices.len(), 4); // all 3 turn entries + system
     }
 
@@ -2514,34 +2569,36 @@ mod tests {
             LogSource::Agent,
             Some(1),
         );
-        // Focus on first entry
-        app.auto_scroll = true;
+        // Focus on first entry (auto_scroll=true means last filtered entry is focused)
+        let mut view = ViewState::default();
+        view.auto_scroll = true;
 
         // Toggle expand
-        app.toggle_focused_turn_expand();
-        assert!(app.expanded_turns.contains(&1));
+        view.toggle_focused_turn_expand(&app);
+        assert!(view.expanded_turns.contains(&1));
 
         // Toggle collapse
-        app.toggle_focused_turn_expand();
-        assert!(!app.expanded_turns.contains(&1));
+        view.toggle_focused_turn_expand(&app);
+        assert!(!view.expanded_turns.contains(&1));
     }
 
     #[test]
     fn tab_switch_keys() {
-        let mut app = test_app();
-        assert_eq!(app.log_tab, LogTab::All);
+        let app = test_app();
+        let mut view = ViewState::default();
+        assert_eq!(view.log_tab, LogTab::All);
 
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
-        app.handle_key(tab);
-        assert_eq!(app.log_tab, LogTab::Agent);
+        view.handle_key(tab, &app);
+        assert_eq!(view.log_tab, LogTab::Agent);
 
         let key2 = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE);
-        app.handle_key(key2);
-        assert_eq!(app.log_tab, LogTab::Presence);
+        view.handle_key(key2, &app);
+        assert_eq!(view.log_tab, LogTab::Presence);
 
         let key1 = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
-        app.handle_key(key1);
-        assert_eq!(app.log_tab, LogTab::All);
+        view.handle_key(key1, &app);
+        assert_eq!(view.log_tab, LogTab::All);
     }
 
     #[test]

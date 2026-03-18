@@ -2,13 +2,14 @@
 //! output over WebSocket via a broadcast channel.  Key events and resize
 //! messages arrive from the browser and are injected as `AppEvent`s.
 
-use super::app::App;
+use super::app::{App, ViewState};
 use crate::event::AppEvent;
 use crossterm::execute;
 use crossterm::terminal::EnterAlternateScreen;
 use ratatui::prelude::*;
 use ratatui::{TerminalOptions, Viewport};
 use serde_json::json;
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
@@ -50,23 +51,48 @@ impl Write for SharedWriter {
 }
 
 // ---------------------------------------------------------------------------
-// WebTui — ratatui terminal that broadcasts ANSI to WebSocket clients
+// WebTuiCommand — channel for per-connection events from the web gateway
 // ---------------------------------------------------------------------------
 
-/// Web TUI: renders the ratatui interface into a buffer and broadcasts
-/// ANSI escape sequences over a broadcast channel for xterm.js clients.
-pub struct WebTui {
-    terminal: Terminal<CrosstermBackend<SharedWriter>>,
-    writer: SharedWriter,
-    broadcast_tx: broadcast::Sender<String>,
-}
-
-impl WebTui {
-    /// Create a new web TUI with the given initial terminal dimensions.
-    pub fn new(
+/// Commands from the web gateway to the WebTui event loop.
+/// Key/resize events are routed per-connection instead of through EventBus.
+pub enum WebTuiCommand {
+    AddConnection {
+        id: String,
+        direct_tx: mpsc::UnboundedSender<String>,
         cols: u16,
         rows: u16,
-        broadcast_tx: broadcast::Sender<String>,
+    },
+    RemoveConnection {
+        id: String,
+    },
+    Resize {
+        id: String,
+        cols: u16,
+        rows: u16,
+    },
+    Key {
+        id: String,
+        key: crossterm::event::KeyEvent,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// WebConnection — per-connection terminal + view state
+// ---------------------------------------------------------------------------
+
+struct WebConnection {
+    terminal: Terminal<CrosstermBackend<SharedWriter>>,
+    writer: SharedWriter,
+    view: ViewState,
+    direct_tx: mpsc::UnboundedSender<String>,
+}
+
+impl WebConnection {
+    fn new(
+        cols: u16,
+        rows: u16,
+        direct_tx: mpsc::UnboundedSender<String>,
     ) -> io::Result<Self> {
         let writer = SharedWriter::new();
         let backend = CrosstermBackend::new(writer.clone());
@@ -77,48 +103,74 @@ impl WebTui {
             },
         )?;
 
-        // Write the initial alternate-screen enter sequence so xterm.js
-        // switches to the alternate buffer.
+        // Send alternate-screen enter sequence to this connection
         let mut init_writer = writer.clone();
         execute!(init_writer, EnterAlternateScreen)?;
         let init_data = writer.take();
         if !init_data.is_empty() {
-            Self::broadcast_term(&broadcast_tx, &init_data);
+            let b64 = encode_term(&init_data);
+            let _ = direct_tx.send(b64);
         }
 
         Ok(Self {
             terminal,
             writer,
-            broadcast_tx,
+            view: ViewState::default(),
+            direct_tx,
         })
     }
 
-    /// Render one frame and broadcast the ANSI diff to connected clients.
-    pub fn draw(&mut self, app: &mut App) -> io::Result<()> {
-        self.terminal.draw(|f| {
-            super::render_frame(f, app);
-        })?;
-
-        // Capture the ANSI output written during draw and broadcast it
-        let data = self.writer.take();
-        if !data.is_empty() {
-            Self::broadcast_term(&self.broadcast_tx, &data);
-        }
-
-        Ok(())
-    }
-
-    /// Resize the virtual terminal and force a full redraw.
-    pub fn resize(&mut self, cols: u16, rows: u16) {
-        let _ = self
-            .terminal
-            .resize(Rect::new(0, 0, cols, rows));
-        // Force a full redraw by clearing the internal diff buffer
+    fn resize(&mut self, cols: u16, rows: u16) {
+        let _ = self.terminal.resize(Rect::new(0, 0, cols, rows));
         let _ = self.terminal.clear();
         let data = self.writer.take();
         if !data.is_empty() {
-            Self::broadcast_term(&self.broadcast_tx, &data);
+            let _ = self.direct_tx.send(encode_term(&data));
         }
+    }
+
+    fn draw(&mut self, app: &mut App) -> io::Result<()> {
+        let view = &self.view;
+        self.terminal.draw(|f| {
+            super::render_frame(f, app, view);
+        })?;
+        let data = self.writer.take();
+        if !data.is_empty() {
+            let _ = self.direct_tx.send(encode_term(&data));
+        }
+        Ok(())
+    }
+}
+
+fn encode_term(data: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+    json!({"t": "term", "d": b64}).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// WebTui — manages N per-connection terminals with independent view state
+// ---------------------------------------------------------------------------
+
+/// Web TUI: renders the ratatui interface per-connection, each with its own
+/// terminal buffer and view state (scroll, verbosity, expanded turns).
+pub struct WebTui {
+    connections: HashMap<String, WebConnection>,
+    /// Broadcast channel for non-term events (OutboundEvents).
+    broadcast_tx: broadcast::Sender<String>,
+}
+
+impl WebTui {
+    /// Create a new web TUI (no initial connections — they register via WebTuiCommand).
+    pub fn new(
+        _cols: u16,
+        _rows: u16,
+        broadcast_tx: broadcast::Sender<String>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            connections: HashMap::new(),
+            broadcast_tx,
+        })
     }
 
     fn broadcast_term(tx: &broadcast::Sender<String>, data: &[u8]) {
@@ -133,23 +185,73 @@ impl WebTui {
         &mut self,
         app: &mut App,
         mut event_rx: mpsc::UnboundedReceiver<AppEvent>,
+        mut cmd_rx: mpsc::UnboundedReceiver<WebTuiCommand>,
     ) -> io::Result<()> {
         loop {
-            self.draw(app)?;
+            // Apply any pending verbosity override from control socket
+            if let Some(v) = app.pending_verbosity.take() {
+                for conn in self.connections.values_mut() {
+                    conn.view.verbosity = v;
+                }
+            }
 
-            if let Some(event) = event_rx.recv().await {
-                // Handle resize events from the browser
-                if let AppEvent::Resize(w, h) = &event {
-                    if *w > 0 && *h > 0 {
-                        self.resize(*w, *h);
+            // Render each connection independently
+            for conn in self.connections.values_mut() {
+                let _ = conn.draw(app);
+            }
+
+            // Wait for next event (AppEvent or WebTuiCommand)
+            tokio::select! {
+                event = event_rx.recv() => {
+                    match event {
+                        Some(AppEvent::Key(_)) | Some(AppEvent::Resize(_, _)) => {
+                            // Key/Resize from EventBus (e.g. crossterm native terminal)
+                            // are ignored in web mode — per-connection keys come via
+                            // WebTuiCommand. But still forward to App for shared state.
+                            if let Some(ev) = event {
+                                app.handle_event(ev);
+                            }
+                        }
+                        Some(ev) => {
+                            app.handle_event(ev);
+                        }
+                        None => break,
+                    }
+                    if app.should_quit {
+                        break;
                     }
                 }
-                app.handle_event(event);
-                if app.should_quit {
-                    break;
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(WebTuiCommand::AddConnection { id, direct_tx, cols, rows }) => {
+                            match WebConnection::new(cols, rows, direct_tx) {
+                                Ok(conn) => { self.connections.insert(id, conn); }
+                                Err(e) => eprintln!("WebTui: failed to create connection: {}", e),
+                            }
+                        }
+                        Some(WebTuiCommand::RemoveConnection { id }) => {
+                            self.connections.remove(&id);
+                        }
+                        Some(WebTuiCommand::Resize { id, cols, rows }) => {
+                            if let Some(conn) = self.connections.get_mut(&id) {
+                                conn.resize(cols, rows);
+                            }
+                        }
+                        Some(WebTuiCommand::Key { id, key }) => {
+                            if let Some(conn) = self.connections.get_mut(&id) {
+                                // Try view-only key handling first
+                                if !conn.view.handle_key(key, app) {
+                                    // Fall through to shared state
+                                    app.handle_key(key);
+                                }
+                            }
+                        }
+                        None => break,
+                    }
+                    if app.should_quit {
+                        break;
+                    }
                 }
-            } else {
-                break;
             }
         }
 

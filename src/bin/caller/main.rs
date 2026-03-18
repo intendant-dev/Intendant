@@ -4026,6 +4026,7 @@ async fn main() -> Result<(), CallerError> {
                 config,
                 None, // MCP mode: no presence query context
                 transcriber,
+                None, // MCP mode: no WebTui
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -4275,11 +4276,9 @@ async fn main() -> Result<(), CallerError> {
         app.task_description = task.clone().unwrap_or_default();
         app.project_root = Some(project.root.clone());
         app.knowledge_path = Some(project.memory_path());
-        app.verbosity = if flags.verbose {
-            types::Verbosity::Debug
-        } else {
-            types::Verbosity::Normal
-        };
+        if flags.verbose {
+            app.pending_verbosity = Some(types::Verbosity::Debug);
+        }
         if flags.control_socket {
             let (_control_handle, control_tx) = control::spawn_control_server(bus.clone());
             app.set_control_socket(control_tx);
@@ -4288,6 +4287,14 @@ async fn main() -> Result<(), CallerError> {
                 format!("Control socket: {}", control::socket_path().display()),
             );
         }
+
+        // Per-connection WebTui command channel (only for --web mode).
+        let (web_tui_tx, web_tui_rx) = if flags.web {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<tui::web::WebTuiCommand>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
 
         // Web gateway broadcast channel — shares with control socket if both enabled.
         // The actual web gateway spawn is deferred until after presence setup so we
@@ -4407,6 +4414,7 @@ async fn main() -> Result<(), CallerError> {
                 config,
                 query_ctx,
                 transcriber,
+                web_tui_tx.clone(),
             );
             app.log(
                 types::LogLevel::Info,
@@ -4599,7 +4607,8 @@ async fn main() -> Result<(), CallerError> {
             eprintln!("Web TUI: http://0.0.0.0:{}", flags.web_port);
             let mut web_tui = tui::web::WebTui::new(120, 40, broadcast_tx)
                 .map_err(|e| CallerError::Tui(format!("Failed to initialize Web TUI: {}", e)))?;
-            let _ = web_tui.run(&mut app, event_rx).await;
+            let cmd_rx = web_tui_rx.expect("web_tui_rx must exist in --web mode");
+            let _ = web_tui.run(&mut app, event_rx, cmd_rx).await;
         } else {
             let mut terminal = tui::Tui::new()
                 .map_err(|e| CallerError::Tui(format!("Failed to initialize TUI: {}", e)))?;
@@ -4652,6 +4661,7 @@ async fn main() -> Result<(), CallerError> {
                 config,
                 None, // Headless mode: no presence query context
                 transcriber,
+                None, // Headless mode: no WebTui
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",

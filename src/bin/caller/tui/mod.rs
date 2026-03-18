@@ -48,9 +48,9 @@ impl Tui {
     }
 
     /// Render one frame of the TUI.
-    pub fn draw(&mut self, app: &mut App) -> io::Result<()> {
+    pub fn draw(&mut self, app: &mut App, view: &app::ViewState) -> io::Result<()> {
         self.terminal.draw(|f| {
-            render_frame(f, app);
+            render_frame(f, app, view);
         })?;
         Ok(())
     }
@@ -61,11 +61,24 @@ impl Tui {
         app: &mut App,
         mut event_rx: mpsc::UnboundedReceiver<AppEvent>,
     ) -> io::Result<()> {
+        let mut view = app::ViewState::default();
         loop {
-            self.draw(app)?;
+            // Apply any pending verbosity override from control socket
+            if let Some(v) = app.pending_verbosity.take() {
+                view.verbosity = v;
+            }
+            self.draw(app, &view)?;
 
             if let Some(event) = event_rx.recv().await {
-                app.handle_event(event);
+                if let AppEvent::Key(key) = &event {
+                    // Try view-only key handling first
+                    if !view.handle_key(*key, app) {
+                        // Fall through to shared state handling
+                        app.handle_event(event);
+                    }
+                } else {
+                    app.handle_event(event);
+                }
                 if app.should_quit {
                     break;
                 }
@@ -79,13 +92,13 @@ impl Tui {
 }
 
 /// Shared render function used by both `Tui` (terminal) and `WebTui` (browser).
-pub fn render_frame(f: &mut ratatui::Frame, app: &mut App) {
+pub fn render_frame(f: &mut ratatui::Frame, app: &mut App, view: &app::ViewState) {
     let area = f.area();
     let bottom_height = app.bottom_panel_height();
     let app_layout = layout::calculate_layout(area, &app.panels, bottom_height);
 
     if let Some(status_area) = app_layout.status_bar {
-        widgets::render_status_bar(f, status_area, app);
+        widgets::render_status_bar(f, status_area, app, view);
     }
 
     if let Some(action_area) = app_layout.action_panel {
@@ -93,7 +106,7 @@ pub fn render_frame(f: &mut ratatui::Frame, app: &mut App) {
     }
 
     if let Some(log_area) = app_layout.log_panel {
-        widgets::render_log_panel(f, log_area, app);
+        widgets::render_log_panel(f, log_area, app, view);
     }
 
     if let Some(bottom_area) = app_layout.bottom_panel {
@@ -123,12 +136,12 @@ pub fn render_frame(f: &mut ratatui::Frame, app: &mut App) {
         }
     }
 
-    // Help overlay on top
-    if app.mode == app::AppMode::Help {
+    // Per-connection overlays
+    if view.show_help {
         widgets::render_help_overlay(f, area);
     }
-    if app.mode == app::AppMode::Inspect {
-        widgets::render_inspect_overlay(f, area, app);
+    if view.show_inspect {
+        widgets::render_inspect_overlay(f, area, app, view);
     }
 }
 
@@ -163,6 +176,7 @@ mod tests {
     fn render_default_state() {
         let mut terminal = test_terminal();
         let app = test_app();
+        let view = app::ViewState::default();
 
         terminal
             .draw(|f| {
@@ -170,13 +184,13 @@ mod tests {
                 let app_layout = layout::calculate_layout(area, &app.panels, 0);
 
                 if let Some(status_area) = app_layout.status_bar {
-                    widgets::render_status_bar(f, status_area, &app);
+                    widgets::render_status_bar(f, status_area, &app, &view);
                 }
                 if let Some(action_area) = app_layout.action_panel {
                     widgets::render_action_panel(f, action_area, &app);
                 }
                 if let Some(log_area) = app_layout.log_panel {
-                    widgets::render_log_panel(f, log_area, &app);
+                    widgets::render_log_panel(f, log_area, &app, &view);
                 }
             })
             .unwrap();
@@ -190,13 +204,14 @@ mod tests {
         app.log(app::LogLevel::Model, "Model response".to_string());
         app.log(app::LogLevel::Agent, "Agent output".to_string());
         app.log(app::LogLevel::Error, "Error message".to_string());
+        let view = app::ViewState::default();
 
         terminal
             .draw(|f| {
                 let area = f.area();
                 let app_layout = layout::calculate_layout(area, &app.panels, 0);
                 if let Some(log_area) = app_layout.log_panel {
-                    widgets::render_log_panel(f, log_area, &app);
+                    widgets::render_log_panel(f, log_area, &app, &view);
                 }
             })
             .unwrap();
@@ -273,25 +288,26 @@ mod tests {
         app.log(app::LogLevel::Info, "always visible".to_string());
 
         // Normal verbosity (debug hidden)
-        app.verbosity = app::Verbosity::Normal;
+        let mut view = app::ViewState::default();
+        view.verbosity = app::Verbosity::Normal;
         terminal
             .draw(|f| {
                 let area = f.area();
                 let app_layout = layout::calculate_layout(area, &app.panels, 0);
                 if let Some(log_area) = app_layout.log_panel {
-                    widgets::render_log_panel(f, log_area, &app);
+                    widgets::render_log_panel(f, log_area, &app, &view);
                 }
             })
             .unwrap();
 
         // Debug verbosity (debug shown)
-        app.verbosity = app::Verbosity::Debug;
+        view.verbosity = app::Verbosity::Debug;
         terminal
             .draw(|f| {
                 let area = f.area();
                 let app_layout = layout::calculate_layout(area, &app.panels, 0);
                 if let Some(log_area) = app_layout.log_panel {
-                    widgets::render_log_panel(f, log_area, &app);
+                    widgets::render_log_panel(f, log_area, &app, &view);
                 }
             })
             .unwrap();
@@ -303,16 +319,17 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = test_app();
         app.log(app::LogLevel::Info, "test".to_string());
+        let view = app::ViewState::default();
 
         terminal
             .draw(|f| {
                 let area = f.area();
                 let app_layout = layout::calculate_layout(area, &app.panels, 0);
                 if let Some(status_area) = app_layout.status_bar {
-                    widgets::render_status_bar(f, status_area, &app);
+                    widgets::render_status_bar(f, status_area, &app, &view);
                 }
                 if let Some(log_area) = app_layout.log_panel {
-                    widgets::render_log_panel(f, log_area, &app);
+                    widgets::render_log_panel(f, log_area, &app, &view);
                 }
             })
             .unwrap();
