@@ -819,8 +819,11 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             };
             s.last_output_summary = truncate(&combined, 500);
         }
-        AppEvent::TaskComplete { reason, .. } => {
+        AppEvent::TaskComplete { reason, summary } => {
             s.phase = format!("done: {}", reason);
+            if let Some(text) = summary {
+                s.last_task_result = Some(text.clone());
+            }
         }
         AppEvent::RoundComplete { .. } => {
             s.phase = "waiting_followup".to_string();
