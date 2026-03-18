@@ -166,7 +166,7 @@ pub struct App {
     // Shared agent state snapshot for presence layer status queries (check_status, query_detail)
     pub presence_agent_state: Option<std::sync::Arc<std::sync::Mutex<crate::presence::AgentStateSnapshot>>>,
     /// Shared flag to pause/resume server-side presence (voice mutual exclusion).
-    pub presence_paused: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub presence_paused: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 
     // Project paths for query_detail and recall_memory socket commands
     pub project_root: Option<std::path::PathBuf>,
@@ -277,7 +277,7 @@ impl App {
         self.presence_agent_state = Some(state);
     }
 
-    pub fn set_presence_paused_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    pub fn set_presence_paused_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         self.presence_paused = Some(flag);
     }
 
@@ -1579,12 +1579,17 @@ impl App {
                 self.voice_turn += 1;
                 let p_display = live_provider.as_deref().unwrap_or("unknown");
                 let m_display = live_model.as_deref().unwrap_or("unknown");
-                self.log_sourced(LogLevel::Detail, format!(
-                    "Browser presence connected ({}:{}) — server presence paused",
-                    p_display, m_display
-                ), LogSource::Presence, Some(self.voice_turn));
                 if let Some(ref flag) = self.presence_paused {
-                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let count = flag.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    self.log_sourced(LogLevel::Detail, format!(
+                        "Browser presence connected ({}:{}) — server presence paused ({})",
+                        p_display, m_display, count
+                    ), LogSource::Presence, Some(self.voice_turn));
+                } else {
+                    self.log_sourced(LogLevel::Detail, format!(
+                        "Browser presence connected ({}:{})",
+                        p_display, m_display
+                    ), LogSource::Presence, Some(self.voice_turn));
                 }
                 // Update displayed model/provider to the live model
                 if let Some(ref provider) = live_provider {
@@ -1606,9 +1611,20 @@ impl App {
             AppEvent::PresenceDisconnected => {
                 self.flush_voice_transcript();
                 let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
-                self.log_sourced(LogLevel::Detail, "Browser presence disconnected — server presence resumed".to_string(), LogSource::Presence, vt);
                 if let Some(ref flag) = self.presence_paused {
-                    flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    let _ = flag.fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |v| Some(v.saturating_sub(1)),
+                    );
+                    let count = flag.load(std::sync::atomic::Ordering::Relaxed);
+                    if count == 0 {
+                        self.log_sourced(LogLevel::Detail, "Browser presence disconnected — server presence resumed".to_string(), LogSource::Presence, vt);
+                    } else {
+                        self.log_sourced(LogLevel::Detail, format!("Browser presence disconnected ({} still connected)", count), LogSource::Presence, vt);
+                    }
+                } else {
+                    self.log_sourced(LogLevel::Detail, "Browser presence disconnected".to_string(), LogSource::Presence, vt);
                 }
                 // Persist to session log
                 if let Some(ref sl) = self.session_log {

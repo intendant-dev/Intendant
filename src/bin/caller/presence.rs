@@ -6,7 +6,7 @@ use crate::session_log;
 use crate::event::{AppEvent, ControlMsg, EventBus};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -93,10 +93,10 @@ pub struct PresenceLayer {
     turn: usize,
     /// Timestamp of the last phase-change narration (for debounce).
     last_narration_at: std::time::Instant,
-    /// When true, the presence layer is paused (browser live model is active).
+    /// When > 0, the presence layer is paused (one or more browser live models active).
     /// All events and user input are silently dropped — the browser live model
     /// IS the presence and dispatches tasks directly via task_tx.
-    paused: Arc<AtomicBool>,
+    paused: Arc<AtomicUsize>,
 }
 
 impl PresenceLayer {
@@ -112,7 +112,7 @@ impl PresenceLayer {
         knowledge_path: PathBuf,
         log_dir: PathBuf,
         project_root: PathBuf,
-        paused: Arc<AtomicBool>,
+        paused: Arc<AtomicUsize>,
     ) -> Self {
         let conversation = Conversation::new(system_prompt, context_window);
         Self {
@@ -132,13 +132,13 @@ impl PresenceLayer {
     }
 
     /// Return a shared handle to the paused flag for external pause/resume control.
-    pub fn paused_flag(&self) -> Arc<AtomicBool> {
+    pub fn paused_flag(&self) -> Arc<AtomicUsize> {
         self.paused.clone()
     }
 
-    /// Check if the presence layer is currently paused.
+    /// Check if the presence layer is currently paused (any browser has active voice).
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
+        self.paused.load(Ordering::Relaxed) > 0
     }
 
     /// Process text input from the user, returning the model's response.
@@ -685,7 +685,7 @@ pub struct PresenceSession {
     session_id: String,
     event_window: PresenceEventWindow,
     last_checkpoint: Option<CheckpointState>,
-    connected: bool,
+    connected_count: usize,
 }
 
 impl PresenceSession {
@@ -695,7 +695,7 @@ impl PresenceSession {
             session_id,
             event_window: PresenceEventWindow::default(),
             last_checkpoint: None,
-            connected: false,
+            connected_count: 0,
         }
     }
 
@@ -731,11 +731,15 @@ impl PresenceSession {
     }
 
     pub fn set_connected(&mut self, connected: bool) {
-        self.connected = connected;
+        if connected {
+            self.connected_count += 1;
+        } else {
+            self.connected_count = self.connected_count.saturating_sub(1);
+        }
     }
 
     pub fn is_connected(&self) -> bool {
-        self.connected
+        self.connected_count > 0
     }
 
     pub fn session_id(&self) -> &str {
@@ -1167,5 +1171,26 @@ mod tests {
         assert!(session.is_connected());
         session.set_connected(false);
         assert!(!session.is_connected());
+    }
+
+    #[test]
+    fn presence_session_multi_connect() {
+        let mut session = PresenceSession::new("sess-1".to_string());
+        session.set_connected(true); // browser A
+        session.set_connected(true); // browser B
+        assert!(session.is_connected());
+        session.set_connected(false); // browser A disconnects
+        assert!(session.is_connected()); // B still connected
+        session.set_connected(false); // browser B disconnects
+        assert!(!session.is_connected()); // now fully disconnected
+    }
+
+    #[test]
+    fn presence_session_disconnect_underflow() {
+        let mut session = PresenceSession::new("sess-1".to_string());
+        session.set_connected(false); // spurious disconnect
+        assert!(!session.is_connected()); // doesn't underflow
+        session.set_connected(true);
+        assert!(session.is_connected());
     }
 }

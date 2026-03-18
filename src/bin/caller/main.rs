@@ -3113,7 +3113,7 @@ async fn run_with_presence(
     presence_event_rx: tokio::sync::mpsc::Receiver<presence::PresenceEvent>,
     agent_state: Arc<Mutex<presence::AgentStateSnapshot>>,
     force_direct: bool,
-    presence_paused: Arc<std::sync::atomic::AtomicBool>,
+    presence_paused: Arc<std::sync::atomic::AtomicUsize>,
     task_tx: tokio::sync::mpsc::Sender<presence::TaskEnvelope>,
     mut task_rx: tokio::sync::mpsc::Receiver<presence::TaskEnvelope>,
 ) -> Result<LoopStats, CallerError> {
@@ -4435,8 +4435,9 @@ async fn main() -> Result<(), CallerError> {
             let (response_tx, mut response_rx) =
                 tokio::sync::mpsc::channel::<String>(8);
 
-            // Shared paused flag: toggled by PresenceConnected/PresenceDisconnected events
-            let presence_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // Shared paused ref-count: incremented by PresenceConnected, decremented by PresenceDisconnected.
+            // Server-side presence is paused when count > 0 (any browser has active voice).
+            let presence_paused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             app.set_presence_paused_flag(presence_paused.clone());
 
             // Task dispatch channel: StartTask from browser/control/MCP goes
