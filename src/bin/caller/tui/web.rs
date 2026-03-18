@@ -225,7 +225,11 @@ impl WebTui {
                     match cmd {
                         Some(WebTuiCommand::AddConnection { id, direct_tx, cols, rows }) => {
                             match WebConnection::new(cols, rows, direct_tx) {
-                                Ok(conn) => { self.connections.insert(id, conn); }
+                                Ok(mut conn) => {
+                                    // Immediately render so the browser doesn't see a blank screen
+                                    let _ = conn.draw(app);
+                                    self.connections.insert(id, conn);
+                                }
                                 Err(e) => eprintln!("WebTui: failed to create connection: {}", e),
                             }
                         }
@@ -235,6 +239,7 @@ impl WebTui {
                         Some(WebTuiCommand::Resize { id, cols, rows }) => {
                             if let Some(conn) = self.connections.get_mut(&id) {
                                 conn.resize(cols, rows);
+                                let _ = conn.draw(app);
                             }
                         }
                         Some(WebTuiCommand::Key { id, key }) => {
