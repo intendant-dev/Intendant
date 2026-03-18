@@ -376,7 +376,7 @@ impl App {
             let text = self.voice_transcript_buffer.trim().to_string();
             if !text.is_empty() {
                 let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
-                self.log_sourced(LogLevel::Info, text, LogSource::Presence, vt);
+                self.log_sourced(LogLevel::Info, format!("[Presence] {}", text), LogSource::Presence, vt);
             }
             self.voice_transcript_buffer.clear();
             self.voice_transcript_idle_ticks = 0;
@@ -2636,7 +2636,7 @@ mod tests {
         // Buffer flushed as single entry, then thinking logged
         assert_eq!(app.log_entries.len(), 3);
         assert_eq!(app.log_entries[1].level, LogLevel::Info);
-        assert_eq!(app.log_entries[1].content, "Hello world.");
+        assert_eq!(app.log_entries[1].content, "[Presence] Hello world.");
         assert_eq!(app.log_entries[1].turn, Some(2)); // belongs to previous turn
         assert_eq!(app.log_entries[2].level, LogLevel::Detail);
         assert_eq!(app.log_entries[2].turn, Some(3));
@@ -2668,7 +2668,7 @@ mod tests {
             tool_context: Some("submit_task".to_string()),
         });
         assert_eq!(app.log_entries.len(), 2);
-        assert_eq!(app.log_entries[0].content, "Sure, doing it.");
+        assert_eq!(app.log_entries[0].content, "[Presence] Sure, doing it.");
         assert_eq!(app.log_entries[0].level, LogLevel::Info);
         assert_eq!(app.log_entries[1].level, LogLevel::Detail);
     }
@@ -2694,6 +2694,6 @@ mod tests {
         // 5th tick — flush
         app.handle_event(AppEvent::Tick);
         assert_eq!(app.log_entries.len(), 1);
-        assert_eq!(app.log_entries[0].content, "Done.");
+        assert_eq!(app.log_entries[0].content, "[Presence] Done.");
     }
 }
