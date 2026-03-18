@@ -30,6 +30,7 @@ pub const LOG_ERROR_FG: Color = Color::Rgb(243, 139, 168);
 pub const LOG_WARN_FG: Color = Color::Rgb(249, 226, 175);
 pub const LOG_SUBAGENT_FG: Color = Color::Rgb(203, 166, 247);
 pub const LOG_DETAIL_FG: Color = Color::Rgb(162, 168, 190);
+pub const LOG_PRESENCE_FG: Color = Color::Rgb(166, 227, 161); // green — live voice presence
 
 // Approval panel
 pub const APPROVAL_BG: Color = Color::Rgb(49, 50, 68);

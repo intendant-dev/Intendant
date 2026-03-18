@@ -2411,11 +2411,12 @@ async fn run_agent_loop(
                     slog(&session_log, |l| {
                         l.info("No JSON found in response — task complete")
                     });
+                    let brief: String = response.content.chars().take(500).collect();
                     emit(
                         &bus,
                         || AppEvent::TaskComplete {
                             reason: "Task complete".to_string(),
-                            summary: None,
+                            summary: if brief.is_empty() { None } else { Some(brief.clone()) },
                         },
                         || println!("--- Task complete ---"),
                     );
@@ -2495,11 +2496,12 @@ async fn run_agent_loop(
                         slog(&session_log, |l| {
                             l.info("No commands across consecutive turns — task complete")
                         });
+                        let brief: String = response.content.chars().take(500).collect();
                         emit(
                             &bus,
                             || AppEvent::TaskComplete {
                                 reason: "Task complete".to_string(),
-                                summary: None,
+                                summary: if brief.is_empty() { None } else { Some(brief.clone()) },
                             },
                             || println!("--- Task complete ---"),
                         );

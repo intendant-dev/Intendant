@@ -1,4 +1,4 @@
-use crate::tui::app::{App, AppMode, LogEntry, LogTab};
+use crate::tui::app::{App, AppMode, LogEntry, LogSource, LogTab};
 use crate::tui::markdown;
 use crate::types::{LogLevel, Phase};
 use crate::tui::theme;
@@ -360,16 +360,29 @@ fn format_log_entry_with_turn(
         Style::default().fg(theme::LOG_DIM_FG),
     ));
 
-    // Level indicator
-    let level_span = match entry.level {
-        LogLevel::Info => Span::styled("  ", Style::default().fg(theme::LOG_FG)),
-        LogLevel::Model => Span::styled("M ", Style::default().fg(theme::LOG_MODEL_FG)),
-        LogLevel::Agent => Span::styled("A ", Style::default().fg(theme::LOG_AGENT_FG)),
-        LogLevel::Error => Span::styled("E ", Style::default().fg(theme::LOG_ERROR_FG)),
-        LogLevel::Warn => Span::styled("W ", Style::default().fg(theme::LOG_WARN_FG)),
-        LogLevel::SubAgent => Span::styled("S ", Style::default().fg(theme::LOG_SUBAGENT_FG)),
-        LogLevel::Detail => Span::styled("· ", Style::default().fg(theme::LOG_DETAIL_FG)),
-        LogLevel::Debug => Span::styled("D ", Style::default().fg(theme::LOG_DIM_FG)),
+    // Level/source indicator: combine LogLevel with LogSource for clarity.
+    // Presence entries (voice model) get "P" prefix; worker model gets "W".
+    let level_span = match (&entry.level, &entry.source) {
+        (LogLevel::Info, LogSource::Presence) =>
+            Span::styled("P ", Style::default().fg(theme::LOG_PRESENCE_FG)),
+        (LogLevel::Detail, LogSource::Presence) =>
+            Span::styled("P ", Style::default().fg(theme::LOG_DETAIL_FG)),
+        (LogLevel::Info, _) =>
+            Span::styled("  ", Style::default().fg(theme::LOG_FG)),
+        (LogLevel::Model, _) =>
+            Span::styled("W ", Style::default().fg(theme::LOG_MODEL_FG)),
+        (LogLevel::Agent, _) =>
+            Span::styled("A ", Style::default().fg(theme::LOG_AGENT_FG)),
+        (LogLevel::Error, _) =>
+            Span::styled("E ", Style::default().fg(theme::LOG_ERROR_FG)),
+        (LogLevel::Warn, _) =>
+            Span::styled("! ", Style::default().fg(theme::LOG_WARN_FG)),
+        (LogLevel::SubAgent, _) =>
+            Span::styled("S ", Style::default().fg(theme::LOG_SUBAGENT_FG)),
+        (LogLevel::Detail, _) =>
+            Span::styled("· ", Style::default().fg(theme::LOG_DETAIL_FG)),
+        (LogLevel::Debug, _) =>
+            Span::styled("D ", Style::default().fg(theme::LOG_DIM_FG)),
     };
     prefix.push(level_span);
 
