@@ -168,7 +168,7 @@ impl PresenceLayer {
 
     fn plog(&self, message: String, level: Option<crate::types::LogLevel>) {
         self.bus.send(AppEvent::PresenceLog {
-            message,
+            message: format!("[model] {}", message),
             level,
             turn: Some(PRESENCE_TURN_OFFSET + self.turn),
         });

@@ -4458,7 +4458,7 @@ async fn main() -> Result<(), CallerError> {
                         } else {
                             // Log presence response as a visible PresenceLog entry
                             bus_for_responses.send(AppEvent::PresenceLog {
-                                message: response,
+                                message: format!("[presence] {}", response),
                                 level: None,
                                 turn: None,
                             });
