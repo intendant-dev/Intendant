@@ -1,4 +1,4 @@
-use crate::tui::app::{App, AppMode, LogEntry, LogSource, LogTab};
+use crate::tui::app::{App, LogEntry, LogSource, LogTab, ViewState};
 use crate::tui::markdown;
 use crate::types::{LogLevel, Phase};
 use crate::tui::theme;
@@ -11,7 +11,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 /// Render the status bar (1 line).
-pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
+pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App, view: &ViewState) {
     let autonomy_str = app.autonomy_display.clone();
     let autonomy_color = theme::autonomy_color(&autonomy_str);
 
@@ -81,7 +81,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
                 .bg(theme::STATUS_BAR_BG),
         ),
         Span::styled(
-            app.verbosity.label().to_string(),
+            view.verbosity.label().to_string(),
             Style::default()
                 .fg(theme::LOG_DIM_FG)
                 .bg(theme::STATUS_BAR_BG),
@@ -182,18 +182,18 @@ pub fn render_action_panel(f: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Render the log panel (scrollable).
-pub fn render_log_panel(f: &mut Frame, area: Rect, app: &App) {
+pub fn render_log_panel(f: &mut Frame, area: Rect, app: &App, view: &ViewState) {
     let visible_height = area.height.saturating_sub(2) as usize; // minus borders
-    let filtered = app.filtered_indices();
+    let filtered = view.filtered_indices(app);
     let total = filtered.len();
-    let scroll_offset = if app.auto_scroll {
+    let scroll_offset = if view.auto_scroll {
         total.saturating_sub(visible_height)
     } else {
-        app.scroll_offset.min(total.saturating_sub(1))
+        view.scroll_offset.min(total.saturating_sub(1))
     };
 
     // Determine which filtered position is focused for highlight
-    let focus_raw = app.focus_index();
+    let focus_raw = view.focus_index(app);
     let focus_filtered_pos = focus_raw
         .and_then(|raw| filtered.iter().position(|&i| i == raw));
 
@@ -203,9 +203,9 @@ pub fn render_log_panel(f: &mut Frame, area: Rect, app: &App) {
         std::collections::HashMap::new();
     for entry in &app.log_entries {
         if let Some(t) = entry.turn {
-            if !app.expanded_turns.contains(&t)
-                && app.verbosity.includes(&entry.level)
-                && app.log_tab.includes(entry.source)
+            if !view.expanded_turns.contains(&t)
+                && view.verbosity.includes(&entry.level)
+                && view.log_tab.includes(entry.source)
             {
                 *turn_counts.entry(t).or_insert(0) += 1;
             }
@@ -229,7 +229,7 @@ pub fn render_log_panel(f: &mut Frame, area: Rect, app: &App) {
             .and_then(|t| turn_counts.get(&t).map(|&c| c.saturating_sub(1)))
             .unwrap_or(0);
         let entry_lines =
-            format_log_entry_with_turn(entry, &app.expanded_turns, is_focused, hidden_count);
+            format_log_entry_with_turn(entry, &view.expanded_turns, is_focused, hidden_count);
         lines.extend(entry_lines);
         entries_shown += 1;
     }
@@ -243,7 +243,7 @@ pub fn render_log_panel(f: &mut Frame, area: Rect, app: &App) {
     };
 
     // Build tab title: " Log [All | Agent | Presence] "
-    let tab_title = build_tab_title(app.log_tab);
+    let tab_title = build_tab_title(view.log_tab);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -485,12 +485,12 @@ fn format_log_entry(entry: &LogEntry) -> Vec<Line<'static>> {
 }
 
 /// Render inspect overlay for one focused log entry.
-pub fn render_inspect_overlay(f: &mut Frame, area: Rect, app: &App) {
-    if app.mode != AppMode::Inspect {
+pub fn render_inspect_overlay(f: &mut Frame, area: Rect, app: &App, view: &ViewState) {
+    if !view.show_inspect {
         return;
     }
 
-    let Some(selected_index) = app.inspect_index else {
+    let Some(selected_index) = view.inspect_index else {
         return;
     };
     let Some(entry) = app.log_entries.get(selected_index) else {
@@ -554,7 +554,7 @@ pub fn render_inspect_overlay(f: &mut Frame, area: Rect, app: &App) {
     let widget = Paragraph::new(body)
         .block(block)
         .wrap(Wrap { trim: false })
-        .scroll((app.inspect_scroll, 0));
+        .scroll((view.inspect_scroll, 0));
     f.render_widget(widget, centered);
 }
 
