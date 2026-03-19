@@ -210,6 +210,18 @@ pub enum OutboundEvent {
     },
     HumanResponseSent,
     SafetyCapReached,
+    PresenceLog {
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        level: Option<String>,
+    },
+    PresenceUsageUpdate {
+        total_tokens: u64,
+        context_window: u64,
+        usage_pct: f64,
+        provider: String,
+        model: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
