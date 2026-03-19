@@ -171,11 +171,37 @@ impl GeminiProvider {
         self._onerror = Some(onerror);
     }
 
+    /// Deserialize tools JsValue to serde_json::Value, logging the result.
+    fn deserialize_tools(callbacks: &Callbacks, tools: &JsValue) -> serde_json::Value {
+        match serde_wasm_bindgen::from_value::<serde_json::Value>(tools.clone()) {
+            Ok(val) => {
+                let count = val.as_array().map(|a| a.len()).unwrap_or(0);
+                callbacks.invoke_diagnostic(
+                    "gemini_setup",
+                    &format!("tools deserialized: {} function declarations", count),
+                );
+                if count == 0 {
+                    callbacks.invoke_diagnostic(
+                        "gemini_setup",
+                        "WARNING: zero tools — model will not be able to call functions",
+                    );
+                }
+                val
+            }
+            Err(e) => {
+                callbacks.invoke_diagnostic(
+                    "gemini_setup",
+                    &format!("ERROR: tools deserialization failed: {:?} — sending empty tools", e),
+                );
+                serde_json::Value::Array(vec![])
+            }
+        }
+    }
+
     /// Setup message for BidiGenerateContentConstrained (ephemeral tokens).
     /// Model + generation_config are baked into the token; only send tools + system prompt.
     fn build_setup_message(&self, system_prompt: &str, tools: &JsValue) -> String {
-        let tools_val: serde_json::Value =
-            serde_wasm_bindgen::from_value(tools.clone()).unwrap_or(serde_json::Value::Array(vec![]));
+        let tools_val = Self::deserialize_tools(&self.callbacks, tools);
 
         let setup = serde_json::json!({
             "setup": {
@@ -193,8 +219,7 @@ impl GeminiProvider {
     /// Full setup message for BidiGenerateContent (API key auth).
     /// Includes model, generation_config, tools, and system prompt.
     fn build_full_setup_message(&self, system_prompt: &str, tools: &JsValue) -> String {
-        let tools_val: serde_json::Value =
-            serde_wasm_bindgen::from_value(tools.clone()).unwrap_or(serde_json::Value::Array(vec![]));
+        let tools_val = Self::deserialize_tools(&self.callbacks, tools);
 
         let setup = serde_json::json!({
             "setup": {
