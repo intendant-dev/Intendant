@@ -1111,6 +1111,25 @@ function handleEvent(msg) {
       addLogEntry(msg.ok ? 'detail' : 'error', `[${msg.action}] ${msg.message}`, undefined, SOURCE_LABELS.system);
       break;
 
+    case 'presence_log':
+      addLogEntry(msg.level === 'detail' ? 'detail' : 'info', msg.message, undefined, SOURCE_LABELS.server);
+      break;
+
+    case 'presence_usage_update':
+      // Update presence usage data for the Usage tab
+      usageData.presence = {
+        provider: msg.provider,
+        model: msg.model,
+        tokens_used: msg.total_tokens,
+        context_window: msg.context_window,
+        usage_pct: msg.usage_pct,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        cached_tokens: 0,
+      };
+      renderUsageTab();
+      break;
+
     case 'user_transcript':
       addLogEntry('presence', msg.text, undefined, SOURCE_LABELS.live);
       break;

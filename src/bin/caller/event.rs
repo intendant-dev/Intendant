@@ -418,6 +418,25 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             text: text.clone(),
             seq: *seq,
         }),
+        AppEvent::PresenceLog {
+            message, level, ..
+        } => Some(OutboundEvent::PresenceLog {
+            message: message.clone(),
+            level: level.as_ref().map(|l| crate::frontend::log_level_to_str(l).to_string()),
+        }),
+        AppEvent::PresenceUsageUpdate {
+            total_tokens,
+            context_window,
+            usage_pct,
+            provider,
+            model,
+        } => Some(OutboundEvent::PresenceUsageUpdate {
+            total_tokens: *total_tokens,
+            context_window: *context_window,
+            usage_pct: *usage_pct,
+            provider: provider.clone(),
+            model: model.clone(),
+        }),
         // Terminal-only / internal events — not broadcast to external consumers
         AppEvent::Key(_)
         | AppEvent::Resize(_, _)
@@ -427,8 +446,6 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         | AppEvent::OrchestratorLog { .. }
         | AppEvent::SessionDirChanged { .. }
         | AppEvent::ControlCommand(_)
-        | AppEvent::PresenceLog { .. }
-        | AppEvent::PresenceUsageUpdate { .. }
         | AppEvent::PresenceReady
         | AppEvent::PresenceConnected { .. }
         | AppEvent::PresenceDisconnected
