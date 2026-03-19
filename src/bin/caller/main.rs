@@ -2752,6 +2752,7 @@ async fn run_with_presence(
     presence_paused: Arc<std::sync::atomic::AtomicUsize>,
     task_tx: tokio::sync::mpsc::Sender<presence::TaskEnvelope>,
     mut task_rx: tokio::sync::mpsc::Receiver<presence::TaskEnvelope>,
+    approval_registry: event::ApprovalRegistry,
 ) -> Result<LoopStats, CallerError> {
     // 1. Create presence provider (small/fast model)
     let presence_provider = provider::select_presence_provider(
@@ -2894,7 +2895,7 @@ async fn run_with_presence(
                 None,
                 follow_up_rx,
                 None, // no JSON approval in TUI/presence mode
-                event::ApprovalRegistry::default(),
+                approval_registry.clone(),
                 false, // not headless — presence has interactive UI
             )
             .await
@@ -4150,6 +4151,7 @@ async fn main() -> Result<(), CallerError> {
                     presence_paused,
                     task_tx,
                     task_rx,
+                    approval_registry_clone,
                 )
                 .await;
 
