@@ -140,14 +140,14 @@ by sending text directly to the live model via the Firefox debugger or
 
 **Via Firefox debugger** (if `--start-debugger-server 6000` is active):
 ```bash
-python3 /tmp/ff-eval.py "pw.send_text('Hello, what is happening?')"
+python3 scripts/ff-eval.py "pw.send_text('Hello, what is happening?')"
 ```
 
 **Setting API key in localStorage** (required for tool calling):
 ```bash
-source .env && python3 /tmp/ff-eval.py "localStorage.setItem('gemini_api_key', '$GEMINI_API_KEY'); 'stored'"
+source .env && python3 scripts/ff-eval.py "localStorage.setItem('gemini_api_key', '$GEMINI_API_KEY'); 'stored'"
 # Then reload the page:
-python3 /tmp/ff-eval.py "location.reload(); 'reloading'"
+python3 scripts/ff-eval.py "location.reload(); 'reloading'"
 ```
 
 **Via xdotool** (open DevTools F12 → Console tab → type):
@@ -229,9 +229,9 @@ user_pref("devtools.debugger.prompt-connection", false);
 user_pref("devtools.debugger.force-local", false);
 EOF
 ```
-Then launch Firefox with `--start-debugger-server 6000` and use `/tmp/ff-eval.py`
+Then launch Firefox with `--start-debugger-server 6000` and use `scripts/ff-eval.py`
 (a zero-dependency raw socket script) for JS evaluation — no pip packages needed.
-If `/tmp/ff-eval.py` doesn't exist, create it from the project's prior test artifacts
+If `scripts/ff-eval.py` doesn't exist, create it from the project's prior test artifacts
 or write a fresh one using the Firefox remote debug protocol (`length:json` framing).
 
 ## Cleanup

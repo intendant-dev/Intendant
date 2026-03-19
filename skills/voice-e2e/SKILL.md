@@ -163,17 +163,17 @@ sleep 5
 
 For Gemini Live with tool calling, an API key must be in localStorage:
 ```bash
-source .env && python3 /tmp/ff-eval.py \
+source .env && python3 scripts/ff-eval.py \
   "localStorage.setItem('gemini_api_key', '$GEMINI_API_KEY'); 'stored'"
-python3 /tmp/ff-eval.py "location.reload(); 'reloading'"
+python3 scripts/ff-eval.py "location.reload(); 'reloading'"
 sleep 3
 ```
 
 For OpenAI Realtime, set:
 ```bash
-source .env && python3 /tmp/ff-eval.py \
+source .env && python3 scripts/ff-eval.py \
   "localStorage.setItem('openai_api_key', '$OPENAI_API_KEY'); 'stored'"
-python3 /tmp/ff-eval.py "location.reload(); 'reloading'"
+python3 scripts/ff-eval.py "location.reload(); 'reloading'"
 sleep 3
 ```
 
@@ -232,7 +232,7 @@ sleep 1
 Or programmatically:
 ```bash
 # Gemini Live
-python3 /tmp/ff-eval.py "document.querySelector('#mic-btn')?.click(); 'clicked'"
+python3 scripts/ff-eval.py "document.querySelector('#mic-btn')?.click(); 'clicked'"
 sleep 3
 ```
 
@@ -341,7 +341,7 @@ print(\"Pending approval:\", d.get(\"agent_state\", {}).get(\"pending_approval\"
 
 ```bash
 # 1. Connect voice
-python3 /tmp/ff-eval.py "document.querySelector('#mic-btn')?.click(); 'clicked'"
+python3 scripts/ff-eval.py "document.querySelector('#mic-btn')?.click(); 'clicked'"
 sleep 3
 
 # 2. Verify connected
@@ -438,7 +438,7 @@ This is **not needed for assertions** — use `/debug` instead.
 
 5. **Check audio drops**: Use the diagnostic callback:
    ```bash
-   python3 /tmp/ff-eval.py "pw?.get_diagnostics?.() || 'no diagnostics method'"
+   python3 scripts/ff-eval.py "pw?.get_diagnostics?.() || 'no diagnostics method'"
    ```
 
 ### Voice model not responding to speech
@@ -455,7 +455,7 @@ This is **not needed for assertions** — use `/debug` instead.
   approach above is the most reliable fix.
 - Alternatively, use `about:config` via the debugger:
   ```bash
-  python3 /tmp/ff-eval.py "void(0)"  # verify debugger works first
+  python3 scripts/ff-eval.py "void(0)"  # verify debugger works first
   ```
 
 ### PulseAudio not running
