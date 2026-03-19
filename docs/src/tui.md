@@ -51,6 +51,19 @@
 
 When a model is generating a response, text deltas are forwarded to the TUI in real-time via `AppEvent::ModelResponseDelta` and accumulated in a streaming buffer. The buffer is cleared when the full response arrives. This gives immediate feedback during long model responses.
 
+### Markdown Rendering
+
+Model responses and log entries that contain markdown are rendered with syntax-aware styling via a lightweight markdown renderer (`tui/markdown.rs`). Supported syntax:
+
+- **Headers** (`#` through `####`) — styled in blue with increasing indentation
+- **Bold** (`**text**`) and **italic** (`*text*`)
+- **Inline code** (`` `code` ``) — green on dark background
+- **Fenced code blocks** (`` ``` ``) — green text, indented
+- **Unordered lists** (`- ` and `* `) — with yellow bullets
+- **Horizontal rules** (`---`)
+
+Colors follow the Catppuccin Mocha palette used throughout the TUI.
+
 ### Theme
 
 The TUI uses a Catppuccin Mocha-inspired color scheme with budget-aware color thresholds (green → yellow → red as context fills up).

@@ -111,6 +111,22 @@ GITHUB_TOKEN = "ghp_..."
 
 When sandboxing is enabled (via `--sandbox` or `[sandbox].enabled = true`), runtime command execution is restricted to read-only filesystem access plus writes to project root, `/tmp`, session log directory, `~/.intendant`, and `extra_write_paths`. On kernels without Landlock support, sandboxing is silently skipped.
 
+### Transcription
+
+Audio transcription is disabled by default. Enable it for voice-to-text input in the web interface:
+
+```toml
+[transcription]
+enabled = true                # default: false
+provider = "openai"           # transcription backend (default: "openai")
+model = "whisper-1"           # model name (default: "whisper-1")
+# endpoint = "http://localhost:8080/v1/audio/transcriptions"  # custom endpoint for self-hosted whisper.cpp
+# language = "en"             # language hint for improved accuracy
+# buffer_secs = 3             # audio buffer duration before sending
+```
+
+The `Transcriber` async trait abstracts backends. The built-in `WhisperTranscriber` uses the OpenAI Whisper API (multipart audio upload). Set a custom `endpoint` to use self-hosted whisper.cpp or other compatible APIs.
+
 ## INTENDANT.md Project Instructions
 
 Place an `INTENDANT.md` file in your project root or at `~/.config/intendant/INTENDANT.md` for global instructions. These are injected into the conversation at session start, before knowledge/memory. Both files are loaded if present (global first, project-local second).

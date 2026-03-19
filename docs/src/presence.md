@@ -122,6 +122,18 @@ The `crates/presence-core/` workspace crate contains the WASM-compatible core lo
 
 Minimal dependencies (serde + serde_json only, no tokio/reqwest). Compiles to both native and `wasm32-unknown-unknown`. The main crate re-exports its types and converts `ToolDefinition` to the provider-specific format.
 
+## presence-web Crate
+
+The `crates/presence-web/` workspace crate provides the browser-side WASM implementation for live presence. It compiles to `wasm32-unknown-unknown` and runs directly in the browser:
+
+- **`lib.rs`** — Main WASM runtime: manages the live presence session lifecycle in the browser
+- **`server.rs`** — Server-side support: session token minting for vendor APIs (OpenAI Realtime, Gemini auth_tokens)
+- **`callbacks.rs`** — Callback handlers for bridging WASM events to JavaScript
+- **`openai.rs`** — OpenAI Realtime API integration (WebSocket-based voice I/O)
+- **`gemini.rs`** — Gemini Live API integration (WebSocket-based voice I/O)
+
+Compiled WASM artifacts are served from `static/wasm-web/` by the web gateway. The browser loads `presence_web.js` which initializes the WASM module for live voice interaction.
+
 ## Tool Dispatch Flow
 
 Tool dispatch uses `presence_core::dispatch_tool_call()` which returns a `PresenceAction` enum:

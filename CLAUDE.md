@@ -42,6 +42,8 @@ src/
         ├── autonomy.rs      # Autonomy levels, action categories, approval rules, command classification
         ├── control.rs       # Unix control socket server (JSON-line protocol at /tmp/intendant-<pid>.sock)
         ├── frontend.rs      # Shared frontend contract for TUI and MCP (UserAction enum, state queries, StatusSnapshot, ModelUsageSnapshot)
+        ├── types.rs         # Shared type definitions: Phase, LogLevel, Verbosity, OutboundEvent
+        ├── event.rs         # AppEvent enum (25+ variants), EventBus (mpsc wrapper), ControlMsg, ApprovalResponse
         ├── tools.rs         # Native tool definitions (11 tools), provider format conversion, extra tool registration for MCP client
         ├── tool_batch.rs    # Tool call batch assembly/disassembly: separates runtime vs caller-handled vs MCP tool calls, maps results back to per-tool responses
         ├── presence.rs      # Presence layer: server-side PresenceLayer, tool dispatch, standalone query functions, event filtering, agent state tracking
@@ -51,15 +53,17 @@ src/
         ├── vision.rs        # Xvfb display management, x11vnc co-process, per-provider resolution, display :99 preference with orphan reclaim
         ├── web_gateway.rs   # WebSocket gateway: serves web TUI (xterm.js), streams TUI ANSI, bridges EventBus + key/resize input, tool request/response protocol
         ├── session_log.rs   # UUID-based session directories, structured event logging, conversation persistence
+        ├── transcription.rs # Audio transcription via Whisper API (or compatible), configurable provider/model/endpoint
         ├── error.rs         # CallerError enum (includes Tui variant)
         └── tui/
             ├── mod.rs       # Tui struct: terminal init/restore, render_frame(), render+event loop
             ├── app.rs       # App state machine, event dispatch, askHuman/approval modes, presence pause/resume
-            ├── event.rs     # AppEvent enum (including LiveConnected/LiveDisconnected), EventBus (mpsc wrapper), crossterm adapter, askHuman monitor
+            ├── event.rs     # Crossterm terminal input reader (spawn_crossterm_reader)
             ├── web.rs       # WebTui: buffer-backed ratatui backend, ANSI→WebSocket broadcast, web key parsing
             ├── widgets.rs   # StatusBar, LogPanel, ActionPanel, InputPanel, ApprovalPanel, FollowUpPanel, InspectOverlay rendering
             ├── layout.rs    # Panel sizing with constraints, responsive to terminal size
-            └── theme.rs     # Color/style constants (Catppuccin Mocha-inspired)
+            ├── theme.rs     # Color/style constants (Catppuccin Mocha-inspired)
+            └── markdown.rs  # Lightweight markdown-to-ratatui renderer (headers, bold, italic, code, lists)
 crates/
 └── presence-core/           # WASM-compatible workspace crate for presence logic
     ├── Cargo.toml           # Minimal deps: serde + serde_json only (no tokio/reqwest)
@@ -69,30 +73,43 @@ crates/
     │   ├── dispatch.rs      # PresenceAction enum, dispatch_tool_call() — pure logic dispatch
     │   ├── format.rs        # format_event(), truncate() (unicode-safe)
     │   ├── tools.rs         # 9 presence tool definitions (provider-agnostic)
-    │   └── prompt.rs        # DEFAULT_PRESENCE_PROMPT via include_str!
+    │   ├── prompt.rs        # DEFAULT_PRESENCE_PROMPT via include_str!
+    │   └── wasm.rs          # WASM bindings for browser-side presence
     └── prompts/
         └── SysPrompt_presence.md  # Presence system prompt
+└── presence-web/            # Browser/live presence WASM crate
+    ├── Cargo.toml
+    └── src/
+        ├── lib.rs           # Main library: WASM presence runtime for browser
+        ├── server.rs        # Server-side support
+        ├── callbacks.rs     # Callback handlers
+        ├── openai.rs        # OpenAI Realtime integration
+        └── gemini.rs        # Gemini Live integration
 SysPrompt.md                 # Default system prompt (direct mode, text-based JSON extraction)
 SysPrompt_tools.md           # Condensed prompt for native tool calling mode
 SysPrompt_user.md            # User-facing mode prompt
 SysPrompt_orchestrator.md    # Orchestrator agent prompt
 SysPrompt_research.md        # Research sub-agent prompt
 SysPrompt_implementation.md  # Implementation sub-agent prompt
+SysPrompt_presence.md        # Presence layer system prompt
 static/
-└── live.html                # Web TUI (xterm.js terminal + live model presence via Gemini Live / OpenAI Realtime)
-tests/
-└── e2e/
-    ├── main.rs              # Integration test entry point
-    ├── harness.rs           # IntendantProcess, ControlSocketClient, WsClient, voice helpers
-    ├── test_basic.rs        # Tier 1: exec, approval, follow-up (--json mode, no display)
-    ├── test_control_socket.rs # Tier 2: status, usage, autonomy (control socket, needs display)
-    ├── test_web.rs          # Tier 3: WebSocket state_snapshot, tool_request, ANSI frames
-    └── test_voice.rs        # Tier 3: voice connection, submit+approve (needs browser + audio)
+├── live.html                # Web TUI (xterm.js terminal + live model presence via Gemini Live / OpenAI Realtime)
+├── app.html                 # App wrapper page for web interface
+├── audio-processor.js       # Audio processing worklet for voice input
+└── wasm-web/                # Compiled WASM artifacts for browser presence (presence_web.js, .wasm)
+docs/
+├── book.toml                # mdBook configuration
+└── src/                     # mdBook documentation chapters
+    ├── SUMMARY.md, getting-started.md, architecture.md, configuration.md,
+    ├── runtime-protocol.md, tui.md, multi-agent.md, presence.md,
+    ├── mcp-server.md, integrations.md, session-logging.md
+scripts/                     # Utility scripts (eval loops, LAN setup)
 skills/
-├── e2e/SKILL.md             # Automated integration test guide
 ├── tui-e2e/SKILL.md         # Interactive TUI testing guide (screenshot-based)
 ├── web-e2e/SKILL.md         # Interactive web/voice testing guide
 └── voice-e2e/SKILL.md       # Full audio pipeline testing guide
+.github/
+└── workflows/docs.yml       # GitHub Actions workflow for mdBook deployment
 ```
 
 ## Build and Run
@@ -138,26 +155,6 @@ cargo test -- --list      # List all test names
 
 All unit tests are inline `#[cfg(test)]` modules in the same files as the code they test. Async tests use `#[tokio::test]`. The `tempfile` crate provides isolated temporary directories for tests that touch the filesystem. These tests are deterministic, fast, and require no external services.
 
-### Integration Tests (`tests/e2e/`)
-
-Integration tests in `tests/e2e/` spawn a real intendant binary and exercise the full stack. **Every test makes real API calls** to an LLM provider, so they cost tokens and are non-deterministic. They are NOT suitable for CI/CD — run them manually or on a schedule.
-
-```bash
-cargo build --release                                    # Build binary first
-cargo test --test e2e test_basic -- --nocapture           # Tier 1: no display needed
-cargo test --test e2e test_control_socket -- --nocapture  # Tier 2: needs Xvfb
-cargo test --test e2e test_web -- --nocapture             # Tier 3: needs Xvfb
-cargo test --test e2e test_voice -- --nocapture           # Tier 3: needs Xvfb + Firefox + PulseAudio
-```
-
-**Tier 1 (JSON mode)**: Spawns `intendant --json --direct`, reads JSONL events from stdout, sends JSON commands (`{"action":"approve","id":N}`) and follow-up text on stdin. No display required.
-
-**Tier 2 (Control socket)**: Spawns `intendant --control-socket --direct` in TUI mode, connects to `/tmp/intendant-<pid>.sock`. Requires `DISPLAY` for TUI rendering.
-
-**Tier 3 (Web/Voice)**: Spawns `intendant --json --direct --web <port>`, connects via WebSocket and HTTP `/debug`. Voice tests additionally require Firefox, PulseAudio, and espeak-ng.
-
-VNC monitoring: Tier 2/3 tests use Xvfb on `:50` with x11vnc on port 5950. Connect with any VNC viewer to watch tests run graphically.
-
 Test coverage includes:
 - **agent.rs**: Process info operations, blocking command execution, path inspection, nonce reference replacement, process mapping, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters
 - **models.rs**: Serialization roundtrips, deserialization of minimal/full commands, repr(C) layout
@@ -177,7 +174,8 @@ Test coverage includes:
 - **caller/control.rs**: Socket path, outbound event serialization (including usage/usage_update), broadcast, server lifecycle
 - **caller/presence.rs**: Event filtering (push-worthy vs pull-only, phase dedup, LiveConnected/LiveDisconnected), agent state updates, standalone query functions
 - **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses, follow-up input), event dispatch (all AppEvent variants including OrchestratorProgress, ModelResponseDelta, RoundComplete, LiveConnected/LiveDisconnected), bottom panel heights, model summary formatting (exec, edit, multiple commands, done signal, askHuman, invalid JSON), streaming buffer accumulation
-- **caller/tui/event.rs**: EventBus send/receive/clone, ControlMsg deserialization (all variants), serialization roundtrip, ApprovalResponse variants
+- **caller/event.rs**: EventBus send/receive/clone, ControlMsg deserialization (all variants), serialization roundtrip, ApprovalResponse variants
+- **caller/types.rs**: Phase display, LogLevel ordering, Verbosity cycling/includes, OutboundEvent serialization
 - **caller/tui/layout.rs**: Layout calculation (all panel combos, with/without bottom panel, hidden panels, small terminal)
 - **caller/tui/widgets.rs**: Log entry formatting (all levels, verbose/non-verbose), string truncation
 - **caller/tui/theme.rs**: Budget color thresholds, spinner frames, action style variants, autonomy color variants
@@ -193,13 +191,8 @@ Test coverage includes:
 - **caller/mcp_client.rs**: Tool name parsing (`mcp__<server>_<tool>`), routing validation, connection lifecycle
 - **caller/sandbox.rs**: Default config construction, disabled config skip, write path setup
 - **caller/web_gateway.rs**: Default port, HTML embedding, config serialization, config building (gemini/openai/explicit provider), WebSocket lifecycle, WebSocket echo (control message roundtrip), broadcast-to-WebSocket, HTTP serves HTML, HTTP serves config, live_connected/live_disconnected events, tool_request bootstrap (state_snapshot on connect), tool_request/tool_response roundtrip (check_status), tool_request action dispatch (approve → ControlCommand), auto-LiveDisconnected on WebSocket drop (with and without prior live_connected)
+- **caller/tui/markdown.rs**: Header parsing (h1–h4), inline formatting (bold, italic, code), list items, code blocks, horizontal rules
 - **caller/conversation.rs** (additional): Auto-compaction threshold, compaction preserves system+tail, too-few-messages guard
-
-Integration test coverage (requires API key, not run in CI):
-- **tests/e2e/test_basic.rs**: Full-stack exec via --json mode, approval approve/deny via stdin, multi-round follow-up
-- **tests/e2e/test_control_socket.rs**: Status/usage queries, autonomy change, approve via Unix control socket
-- **tests/e2e/test_web.rs**: WebSocket state_snapshot on connect, tool_request/response, ANSI term frames, /debug endpoint
-- **tests/e2e/test_voice.rs**: Voice connection via /debug polling, voice task submit and approval via espeak-ng
 
 ## Architecture Details
 
@@ -383,6 +376,19 @@ Tool dispatch uses `presence_core::dispatch_tool_call()` which returns a `Presen
 
 **presence-core** (`crates/presence-core/`): WASM-compatible workspace crate containing types, tool definitions, dispatch logic, event formatting, and the presence system prompt. No tokio/reqwest dependencies. Compiles to both native and `wasm32-unknown-unknown`. The main crate re-exports its types and converts `ToolDefinition` to the provider-specific format.
 
+**presence-web** (`crates/presence-web/`): Browser-side WASM crate that runs live presence directly in the browser. Contains provider-specific integrations for OpenAI Realtime (`openai.rs`) and Gemini Live (`gemini.rs`), plus a server module for token minting and callback handlers. Compiled WASM artifacts are served from `static/wasm-web/`.
+
+### Transcription
+
+Audio transcription is available via `transcription.rs`, disabled by default. Enable with `[transcription] enabled = true` in `intendant.toml`. Configuration options:
+- `provider`: Transcription backend (default: `"openai"`)
+- `model`: Model name (default: `"whisper-1"`)
+- `endpoint`: Custom API endpoint (for self-hosted whisper.cpp)
+- `language`: Language hint for improved accuracy
+- `buffer_secs`: Audio buffer duration before sending
+
+The `Transcriber` async trait abstracts backends; `WhisperTranscriber` implements the OpenAI Whisper API (multipart audio upload). Audio input is processed via `static/audio-processor.js` in the web interface.
+
 ### Web Gateway
 
 `--web` (default port 8765) serves the web TUI and bridges WebSocket connections to the EventBus. The gateway handles:
@@ -424,7 +430,7 @@ The gateway uses a dual-channel outbound architecture: a `broadcast::Receiver` f
 | `chrono` | Timestamp formatting for log directories |
 | `env_logger` | Logging |
 | `regex` | $NONCE[id] pattern matching, ANSI escape stripping |
-| `reqwest` (rustls-tls, stream) | HTTP client for API calls, SSE streaming |
+| `reqwest` (rustls-tls, stream, multipart) | HTTP client for API calls, SSE streaming, audio upload |
 | `html2text` | HTML to plain text conversion for browse |
 | `portable-pty` | PTY session management for execPty |
 | `dotenvy` | .env file loading |
@@ -443,6 +449,7 @@ The gateway uses a dual-channel outbound architecture: a `broadcast::Receiver` f
 | `base64` | Encoding screenshot data to base64 for vision API calls |
 | `tokio-tungstenite` | WebSocket server/client for web gateway |
 | `presence-core` (workspace) | WASM-compatible presence logic (types, tools, dispatch, format, prompt) |
+| `presence-web` (workspace) | Browser-side WASM presence (OpenAI Realtime, Gemini Live) |
 | `tempfile` (dev) | Temporary directories in tests |
 
 ## Environment Requirements
@@ -454,4 +461,4 @@ The gateway uses a dual-channel outbound architecture: a `broadcast::Receiver` f
 
 ## CI/CD
 
-No CI/CD is currently configured. Run `cargo test --bins` and `cargo clippy` locally before committing. Unit tests (`cargo test --bins`) are fast and deterministic — safe for CI. Integration tests (`cargo test --test e2e`) make real API calls to LLM providers — run them manually, not in CI.
+A GitHub Actions workflow (`.github/workflows/docs.yml`) is configured for automated mdBook documentation deployment. Run `cargo test --bins` and `cargo clippy` locally before committing. Unit tests (`cargo test --bins`) are fast and deterministic — safe for CI.
