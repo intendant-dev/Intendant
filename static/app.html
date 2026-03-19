@@ -897,9 +897,9 @@ function connectWs() {
   ws.onopen = () => {
     connected = true;
     document.getElementById('sb-conn').className = 'conn-dot ok';
-    // Request current state so late-connecting browsers get populated
-    sendJson({ action: 'usage' });
-    sendJson({ action: 'status' });
+    // state_snapshot arrives automatically on connect (bootstrap).
+    // Usage data arrives via usage_update events during agent runs.
+    // Do NOT send ControlMsg here — it pollutes the event log.
   };
 
   ws.onclose = () => {
@@ -1111,9 +1111,12 @@ function handleEvent(msg) {
       addLogEntry(msg.ok ? 'detail' : 'error', `[${msg.action}] ${msg.message}`, undefined, SOURCE_LABELS.system);
       break;
 
-    case 'presence_log':
-      addLogEntry(msg.level === 'detail' ? 'detail' : 'info', msg.message, undefined, SOURCE_LABELS.server);
+    case 'presence_log': {
+      // Respect the level from the presence layer (debug/detail/info)
+      const presenceLevel = msg.level || 'info';
+      addLogEntry(presenceLevel, msg.message, undefined, SOURCE_LABELS.server);
       break;
+    }
 
     case 'presence_usage_update':
       // Update presence usage data for the Usage tab
