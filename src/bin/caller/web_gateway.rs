@@ -201,6 +201,31 @@ pub fn spawn_web_gateway(
     let voice_debug = Arc::new(Mutex::new(VoiceDebugState::default()));
     let active_presence: Arc<Mutex<Option<ActivePresence>>> = Arc::new(Mutex::new(None));
 
+    // Cache the latest usage_update JSON so late-connecting browsers get it
+    // without sending ControlMsg (which would pollute the event log).
+    let last_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    {
+        let cache = last_usage_json.clone();
+        let mut usage_rx = broadcast_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match usage_rx.recv().await {
+                    Ok(line) => {
+                        if line.contains("\"event\":\"usage_update\"")
+                            || line.contains("\"event\":\"usage\"")
+                        {
+                            if let Ok(mut guard) = cache.lock() {
+                                *guard = Some(line);
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     let web_html = Arc::new(web_html);
     let app_html = Arc::new(APP_HTML.to_string());
 
@@ -231,6 +256,7 @@ pub fn spawn_web_gateway(
             let app_html = app_html.clone();
             let transcriber = transcriber.clone();
             let active_presence = active_presence.clone();
+            let last_usage_json = last_usage_json.clone();
             let web_tui_tx = web_tui_tx.clone();
 
             tokio::spawn(async move {
@@ -286,6 +312,14 @@ pub fn spawn_web_gateway(
                             "connection_id": connection_id,
                         });
                         let _ = direct_tx.send(bootstrap.to_string());
+                    }
+
+                    // Send cached usage data so late-connecting browsers
+                    // populate the Usage tab without sending ControlMsg.
+                    if let Ok(guard) = last_usage_json.lock() {
+                        if let Some(ref usage_json) = *guard {
+                            let _ = direct_tx.send(usage_json.clone());
+                        }
                     }
 
                     // Inbound: WebSocket → EventBus
