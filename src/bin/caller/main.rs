@@ -1472,7 +1472,8 @@ Also: {"source": "bare"}"#;
 
     #[test]
     fn emit_with_bus() {
-        let (bus, mut rx) = EventBus::new();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
         let bus_opt = Some(bus);
         emit(
             &bus_opt,
@@ -4000,7 +4001,8 @@ async fn main() -> Result<(), CallerError> {
     if flags.mcp {
         // MCP mode — speaks Model Context Protocol on stdio.
         // This is architecturally a peer of the TUI: same EventBus, same UserAction contract.
-        let (bus, event_rx) = EventBus::new();
+        let bus = EventBus::new();
+        let event_rx = bus.subscribe();
         let human_question_path = event::shared_question_path(log_dir.join("human_question"));
         let _human_monitor =
             event::spawn_human_question_monitor(bus.clone(), human_question_path.clone());
@@ -4272,7 +4274,8 @@ async fn main() -> Result<(), CallerError> {
         // TUI mode — task may be None (user provides it via follow-up input)
 
         // TUI mode
-        let (bus, event_rx) = EventBus::new();
+        let bus = EventBus::new();
+        let event_rx = bus.subscribe();
 
         // Spawn background tasks.
         // In web mode (--web), key events come from WebSocket, not the terminal.
@@ -4663,7 +4666,7 @@ async fn main() -> Result<(), CallerError> {
 
         // Web gateway in headless mode needs an EventBus + broadcast channel
         let headless_bus = if flags.web {
-            let (bus, _rx) = EventBus::new();
+            let bus = EventBus::new();
             let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(256);
             let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
                 if project.config.transcription.enabled {

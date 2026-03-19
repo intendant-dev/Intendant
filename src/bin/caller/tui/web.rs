@@ -184,7 +184,7 @@ impl WebTui {
     pub async fn run(
         &mut self,
         app: &mut App,
-        mut event_rx: mpsc::UnboundedReceiver<AppEvent>,
+        mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
         mut cmd_rx: mpsc::UnboundedReceiver<WebTuiCommand>,
     ) -> io::Result<()> {
         loop {
@@ -202,20 +202,19 @@ impl WebTui {
 
             // Wait for next event (AppEvent or WebTuiCommand)
             tokio::select! {
-                event = event_rx.recv() => {
-                    match event {
-                        Some(AppEvent::Key(_)) | Some(AppEvent::Resize(_, _)) => {
+                result = event_rx.recv() => {
+                    match result {
+                        Ok(ev @ AppEvent::Key(_)) | Ok(ev @ AppEvent::Resize(_, _)) => {
                             // Key/Resize from EventBus (e.g. crossterm native terminal)
                             // are ignored in web mode — per-connection keys come via
                             // WebTuiCommand. But still forward to App for shared state.
-                            if let Some(ev) = event {
-                                app.handle_event(ev);
-                            }
-                        }
-                        Some(ev) => {
                             app.handle_event(ev);
                         }
-                        None => break,
+                        Ok(ev) => {
+                            app.handle_event(ev);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                     if app.should_quit {
                         break;

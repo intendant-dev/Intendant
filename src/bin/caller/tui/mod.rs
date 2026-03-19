@@ -59,7 +59,7 @@ impl Tui {
     pub async fn run(
         &mut self,
         app: &mut App,
-        mut event_rx: mpsc::UnboundedReceiver<AppEvent>,
+        mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
     ) -> io::Result<()> {
         let mut view = app::ViewState::default();
         loop {
@@ -69,21 +69,23 @@ impl Tui {
             }
             self.draw(app, &view)?;
 
-            if let Some(event) = event_rx.recv().await {
-                if let AppEvent::Key(key) = &event {
-                    // Try view-only key handling first
-                    if !view.handle_key(*key, app) {
-                        // Fall through to shared state handling
+            match event_rx.recv().await {
+                Ok(event) => {
+                    if let AppEvent::Key(key) = &event {
+                        // Try view-only key handling first
+                        if !view.handle_key(*key, app) {
+                            // Fall through to shared state handling
+                            app.handle_event(event);
+                        }
+                    } else {
                         app.handle_event(event);
                     }
-                } else {
-                    app.handle_event(event);
+                    if app.should_quit {
+                        break;
+                    }
                 }
-                if app.should_quit {
-                    break;
-                }
-            } else {
-                break;
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
 

@@ -1653,14 +1653,19 @@ fn parse_verbosity(s: &str) -> Option<Verbosity> {
 /// Returns a handle for cleanup.
 pub fn spawn_event_listener(
     state: SharedMcpState,
-    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
     peer: Arc<Mutex<Option<rmcp::Peer<RoleServer>>>>,
     bus: EventBus,
     human_question_path: Option<crate::event::SharedQuestionPath>,
     control_tx: Option<broadcast::Sender<String>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
+        loop {
+            let event = match event_rx.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             let mut resource_changed: Option<&str> = None;
             let mut deferred_control_msg: Option<ControlMsg> = None;
 
@@ -3218,7 +3223,7 @@ pub const RELOAD_EXIT_CODE: i32 = 42;
 pub async fn run_mcp_server(
     state: SharedMcpState,
     bus: EventBus,
-    event_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
     reloaded: bool,
     human_question_path: Option<crate::event::SharedQuestionPath>,
     control_tx: Option<broadcast::Sender<String>>,
@@ -3740,7 +3745,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let (bus, _rx) = EventBus::new();
+            let bus = EventBus::new();
             let server = IntendantServer::new(state, bus);
             let info = server.get_info();
             assert_eq!(info.server_info.name, "intendant");
@@ -3836,7 +3841,7 @@ mod tests {
     async fn schedule_restart_rejects_missing_actions() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state, bus);
 
         let output = server
@@ -3865,7 +3870,7 @@ mod tests {
     async fn schedule_restart_normalizes_string_fields() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state.clone(), bus);
 
         let output = server
@@ -3899,7 +3904,7 @@ mod tests {
     async fn schedule_restart_now_reports_completed_phase() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state, bus);
 
         let output = server
@@ -3924,7 +3929,7 @@ mod tests {
     async fn schedule_restart_now_reports_failed_phase() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state, bus);
 
         let output = server
@@ -3952,7 +3957,7 @@ mod tests {
     async fn control_schedule_restart_rejects_missing_actions() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (control_tx, mut control_rx) = broadcast::channel::<String>(8);
 
         let resource = handle_control_command_mcp(
@@ -4000,7 +4005,7 @@ mod tests {
     async fn control_schedule_restart_now_reports_completed_phase() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (control_tx, mut control_rx) = broadcast::channel::<String>(8);
 
         let resource = handle_control_command_mcp(
@@ -4047,7 +4052,7 @@ mod tests {
     async fn control_get_restart_status_redacts_turn_complete_token() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (control_tx, mut control_rx) = broadcast::channel::<String>(8);
 
         let resource = handle_control_command_mcp(
@@ -4118,7 +4123,7 @@ mod tests {
     async fn control_controller_turn_complete_returns_structured_data_payload() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (control_tx, mut control_rx) = broadcast::channel::<String>(8);
 
         let resource = handle_control_command_mcp(
@@ -4205,7 +4210,7 @@ mod tests {
     async fn control_cancel_controller_restart_returns_structured_data_payloads() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (control_tx, mut control_rx) = broadcast::channel::<String>(8);
 
         let resource = handle_control_command_mcp(
@@ -4315,7 +4320,7 @@ mod tests {
     async fn schedule_restart_rejects_invalid_restart_after() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state, bus);
 
         let output = server
@@ -4344,7 +4349,7 @@ mod tests {
     async fn control_schedule_restart_rejects_zero_max_attempts() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (control_tx, mut control_rx) = broadcast::channel::<String>(8);
 
         let resource = handle_control_command_mcp(
@@ -4390,7 +4395,7 @@ mod tests {
     async fn schedule_restart_rejects_empty_restart_command() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state, bus);
 
         let output = server
@@ -4419,7 +4424,7 @@ mod tests {
     async fn schedule_restart_rejects_when_active_with_json_payload() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state, bus);
 
         let first = server
@@ -4482,7 +4487,7 @@ mod tests {
     async fn controller_turn_complete_returns_json_success_payload() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state.clone(), bus);
 
         let scheduled = server
@@ -4524,7 +4529,7 @@ mod tests {
     async fn get_restart_status_redacts_turn_complete_token() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state, bus);
 
         let scheduled = server
@@ -4561,7 +4566,7 @@ mod tests {
     async fn controller_turn_complete_marks_restart_failed_when_auto_start_task_fails() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state.clone(), bus);
 
         let scheduled = server
@@ -4624,7 +4629,7 @@ mod tests {
     async fn controller_turn_complete_returns_json_error_payload() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state, bus);
 
         let scheduled = server
@@ -4665,7 +4670,7 @@ mod tests {
     async fn controller_turn_complete_rejects_ready_phase() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state.clone(), bus);
 
         let scheduled = server
@@ -4719,7 +4724,7 @@ mod tests {
     async fn controller_turn_complete_normalizes_ids_and_optional_fields() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state.clone(), bus);
 
         let scheduled = server
@@ -4765,7 +4770,7 @@ mod tests {
     async fn cancel_controller_restart_returns_json_success_payload() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state, bus);
 
         let scheduled = server
@@ -4799,7 +4804,7 @@ mod tests {
     async fn cancel_controller_restart_returns_json_error_payload() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state, bus);
 
         let output = server
@@ -4821,7 +4826,7 @@ mod tests {
     async fn cancel_controller_restart_treats_whitespace_guard_as_none() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let server = IntendantServer::new(state, bus);
 
         let scheduled = server

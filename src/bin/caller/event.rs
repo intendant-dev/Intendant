@@ -292,24 +292,27 @@ pub enum ControlMsg {
 }
 
 /// The event bus sender. Cloneable for use in multiple tasks.
+///
+/// Backed by a `broadcast::channel` so multiple consumers can subscribe
+/// independently. Each subscriber gets its own copy of every event.
 #[derive(Clone)]
 pub struct EventBus {
-    tx: mpsc::UnboundedSender<AppEvent>,
+    tx: tokio::sync::broadcast::Sender<AppEvent>,
 }
 
 impl EventBus {
-    pub fn new() -> (Self, mpsc::UnboundedReceiver<AppEvent>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (Self { tx }, rx)
+    pub fn new() -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(4096);
+        Self { tx }
     }
 
     pub fn send(&self, event: AppEvent) {
         let _ = self.tx.send(event);
     }
 
-    #[allow(dead_code)]
-    pub fn sender(&self) -> &mpsc::UnboundedSender<AppEvent> {
-        &self.tx
+    /// Create a new subscriber that receives all future events.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AppEvent> {
+        self.tx.subscribe()
     }
 }
 
@@ -378,7 +381,8 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let (bus, mut rx) = EventBus::new();
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
             bus.send(AppEvent::Tick);
             bus.send(AppEvent::Quit);
 
@@ -400,7 +404,8 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let (bus, mut rx) = EventBus::new();
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
             let bus2 = bus.clone();
             bus.send(AppEvent::Tick);
             bus2.send(AppEvent::Quit);

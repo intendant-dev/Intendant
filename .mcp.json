@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "intendant": {
+      "command": "/home/user/projects/intendant-codex-fork/target/release/intendant",
+      "args": ["--mcp"]
+    }
+  }
+}

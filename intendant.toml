@@ -1,0 +1,5 @@
+[transcription]
+enabled = true
+provider = "openai"
+model = "whisper-1"
+language = "en"
