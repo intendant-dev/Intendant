@@ -1153,7 +1153,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_web_gateway_lifecycle() {
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let config = WebGatewayConfig::default();
         let handle = spawn_web_gateway(0, bus, broadcast_tx, config, None, None, None);
@@ -1166,7 +1166,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_websocket_echo() {
-        let (bus, mut rx) = EventBus::new();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         // Bind to port 0 for a random free port
@@ -1211,7 +1212,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_broadcast_to_websocket() {
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1262,7 +1263,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_serves_html() {
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1299,7 +1300,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_serves_config() {
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1342,7 +1343,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_presence_connect_disconnect() {
-        let (bus, mut rx) = EventBus::new();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1397,7 +1399,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_legacy_live_connected_maps_to_presence() {
-        let (bus, mut rx) = EventBus::new();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1452,7 +1455,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_voice_log_forwarding() {
-        let (bus, mut rx) = EventBus::new();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1492,7 +1496,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_request_check_status() {
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1546,7 +1550,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_request_response_roundtrip() {
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1615,7 +1619,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_request_action_dispatches_control() {
-        let (bus, mut rx) = EventBus::new();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1698,7 +1703,8 @@ mod tests {
     /// `PresenceDisconnected` to resume server-side presence.
     #[tokio::test]
     async fn test_ws_drop_auto_sends_presence_disconnected() {
-        let (bus, mut rx) = EventBus::new();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1747,7 +1753,8 @@ mod tests {
     /// `PresenceDisconnected` should be emitted.
     #[tokio::test]
     async fn test_ws_drop_no_auto_disconnect_without_presence() {
-        let (bus, mut rx) = EventBus::new();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1801,7 +1808,7 @@ mod tests {
     /// POST /session returns 502 when no API key is configured.
     #[tokio::test]
     async fn test_post_session_no_api_key() {
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1837,7 +1844,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_serves_audio_processor_js() {
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1874,7 +1881,8 @@ mod tests {
     /// First browser to send presence_connect should become active.
     #[tokio::test]
     async fn test_first_browser_becomes_active() {
-        let (bus, mut rx) = EventBus::new();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1929,7 +1937,8 @@ mod tests {
     /// Second browser to send presence_connect should be passive (no PresenceConnected emitted).
     #[tokio::test]
     async fn test_second_browser_is_passive() {
-        let (bus, mut rx) = EventBus::new();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1998,7 +2007,8 @@ mod tests {
     /// When second browser sends make_active, the first should receive force_disconnect_voice.
     #[tokio::test]
     async fn test_make_active_handover() {
-        let (bus, mut rx) = EventBus::new();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2080,7 +2090,7 @@ mod tests {
         let mut found_connected = false;
         for _ in 0..5 {
             match tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv()).await {
-                Ok(Some(AppEvent::PresenceConnected { .. })) => {
+                Ok(Ok(AppEvent::PresenceConnected { .. })) => {
                     found_connected = true;
                     break;
                 }
@@ -2095,7 +2105,8 @@ mod tests {
     /// When the active browser drops, the next browser to connect should get active.
     #[tokio::test]
     async fn test_active_drop_clears_slot() {
-        let (bus, mut rx) = EventBus::new();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

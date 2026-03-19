@@ -253,7 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn control_server_lifecycle() {
-        let (bus, _rx) = EventBus::new();
+        let bus = EventBus::new();
         let (handle, _tx) = spawn_control_server(bus);
 
         // In restricted sandboxes Unix socket bind can be blocked.
