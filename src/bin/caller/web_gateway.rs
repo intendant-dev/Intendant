@@ -414,15 +414,18 @@ pub fn spawn_web_gateway(
     let last_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache the latest VNC port from display_ready events for the /vnc proxy.
     let last_vnc_port: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    // Cache the last display_ready JSON for late-connecting browsers.
+    let last_display_ready_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     {
         let usage_cache = last_usage_json.clone();
         let vnc_cache = last_vnc_port.clone();
+        let display_cache = last_display_ready_json.clone();
         let mut usage_rx = broadcast_tx.subscribe();
         tokio::spawn(async move {
             loop {
                 match usage_rx.recv().await {
                     Ok(line) => {
-                        // Cache VNC port from display_ready events
+                        // Cache VNC port and full event from display_ready events
                         if line.contains("\"event\":\"display_ready\"") {
                             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
                                 if let Some(port) = parsed.get("vnc_port").and_then(|v| v.as_u64()) {
@@ -430,6 +433,9 @@ pub fn spawn_web_gateway(
                                         *guard = Some(port as u32);
                                     }
                                 }
+                            }
+                            if let Ok(mut guard) = display_cache.lock() {
+                                *guard = Some(line.clone());
                             }
                         }
                         if line.contains("\"event\":\"usage_update\"")
@@ -479,6 +485,7 @@ pub fn spawn_web_gateway(
             let active_presence = active_presence.clone();
             let last_usage_json = last_usage_json.clone();
             let last_vnc_port = last_vnc_port.clone();
+            let last_display_ready_json = last_display_ready_json.clone();
             let web_tui_tx = web_tui_tx.clone();
 
             tokio::spawn(async move {
@@ -561,6 +568,14 @@ pub fn spawn_web_gateway(
                     if let Ok(guard) = last_usage_json.lock() {
                         if let Some(ref usage_json) = *guard {
                             let _ = direct_tx.send(usage_json.clone());
+                        }
+                    }
+
+                    // Send cached display_ready so late-connecting browsers
+                    // auto-create display slots.
+                    if let Ok(guard) = last_display_ready_json.lock() {
+                        if let Some(ref display_json) = *guard {
+                            let _ = direct_tx.send(display_json.clone());
                         }
                     }
 
