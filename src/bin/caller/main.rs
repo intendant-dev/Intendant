@@ -14,6 +14,7 @@ mod prompts;
 mod provider;
 mod sandbox;
 mod session_log;
+mod skills;
 mod sub_agent;
 mod tool_batch;
 mod tools;
@@ -1875,6 +1876,63 @@ async fn run_agent_loop(
                 }
             }
 
+            // Process invoke_skill tool calls (if any)
+            for (call_id, skill_name, arguments) in &batch.skill_invocations {
+                let discovered = skills::discover_skills(Some(&project.root));
+                match discovered
+                    .iter()
+                    .find(|s| s.config.name == *skill_name)
+                {
+                    Some(skill) => {
+                        let body = skills::load_skill_body(skill, arguments);
+                        // Apply autonomy override if specified
+                        if let Some(ref level_str) = skill.config.autonomy {
+                            let level = AutonomyLevel::from_str_loose(level_str);
+                            let mut state = autonomy.write().await;
+                            state.level = level;
+                            slog(&session_log, |l| {
+                                l.info(&format!(
+                                    "Skill '{}' set autonomy to {}",
+                                    skill_name, level_str
+                                ))
+                            });
+                        }
+                        slog(&session_log, |l| {
+                            l.info(&format!(
+                                "Invoked skill '{}' (args: {})",
+                                skill_name,
+                                if arguments.is_empty() { "(none)" } else { arguments }
+                            ))
+                        });
+                        conversation.add_tool_result(
+                            call_id,
+                            "invoke_skill",
+                            &format!(
+                                "Skill '{}' loaded. Follow these instructions:\n\n{}",
+                                skill_name, body
+                            ),
+                        );
+                    }
+                    None => {
+                        let available: Vec<&str> =
+                            discovered.iter().map(|s| s.config.name.as_str()).collect();
+                        conversation.add_tool_result(
+                            call_id,
+                            "invoke_skill",
+                            &format!(
+                                "Error: skill '{}' not found. Available: {}",
+                                skill_name,
+                                if available.is_empty() {
+                                    "(none)".to_string()
+                                } else {
+                                    available.join(", ")
+                                }
+                            ),
+                        );
+                    }
+                }
+            }
+
             if batch.agent_input_json.is_none() && !batch.precomputed_results.is_empty() {
                 continue;
             }
@@ -3372,6 +3430,14 @@ All relative paths and commands execute from this directory.",
         }
     }
 
+    // Inject skill catalog
+    let discovered_skills = skills::discover_skills(Some(&project.root));
+    if !discovered_skills.is_empty() {
+        let catalog = skills::format_skill_catalog(&discovered_skills);
+        conv.add_user(catalog);
+        conv.add_assistant("Acknowledged. I see the available skills.".to_string());
+    }
+
     // Add the task
     conv.add_user(task.to_string());
 }
@@ -3947,6 +4013,7 @@ async fn main() -> Result<(), CallerError> {
         app.task_description = task.clone().unwrap_or_default();
         app.project_root = Some(project.root.clone());
         app.knowledge_path = Some(project.memory_path());
+        app.skills = skills::discover_skills(Some(&project.root));
         if flags.verbose {
             app.pending_verbosity = Some(types::Verbosity::Debug);
         }

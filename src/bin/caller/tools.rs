@@ -59,9 +59,9 @@ pub fn tool_name_to_function(tool_name: &str) -> Option<&'static str> {
     }
 }
 
-/// Returns all 11 tool definitions.
+/// Returns all 12 tool definitions.
 pub fn all_tools() -> Vec<ToolDefinition> {
-    let mut tools = Vec::with_capacity(11);
+    let mut tools = Vec::with_capacity(12);
 
     // 1. exec_command → execAsAgent
     {
@@ -347,6 +347,27 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         }),
     });
 
+    // 12. invoke_skill (caller-handled, not sent to runtime)
+    tools.push(ToolDefinition {
+        name: "invoke_skill".to_string(),
+        description: "Invoke a named skill. The skill's instructions will be loaded and you should follow them. Use this when a task matches an available skill's description, or when the user explicitly requests a skill by name.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "skill_name": {
+                    "type": "string",
+                    "description": "Name of the skill to invoke."
+                },
+                "arguments": {
+                    "type": "string",
+                    "description": "Arguments to pass to the skill (replaces $ARGUMENTS in skill instructions)."
+                }
+            },
+            "required": ["skill_name"],
+            "additionalProperties": false
+        }),
+    });
+
     // Append any extra tools registered at runtime (MCP servers, etc.)
     if let Ok(extra) = EXTRA_TOOLS.lock() {
         tools.extend(extra.iter().cloned());
@@ -376,9 +397,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_tools_has_11_definitions() {
+    fn all_tools_has_12_definitions() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]
@@ -449,7 +470,7 @@ mod tests {
 
     #[test]
     fn caller_tools_have_no_nonce() {
-        let caller_tools = ["manage_context", "signal_done"];
+        let caller_tools = ["manage_context", "signal_done", "invoke_skill"];
         let tools = all_tools();
         for name in &caller_tools {
             let tool = tools.iter().find(|t| t.name == *name).unwrap();
@@ -478,6 +499,7 @@ mod tests {
         assert_eq!(tool_name_to_function("recall_memory"), Some("recallMemory"));
         assert_eq!(tool_name_to_function("manage_context"), None);
         assert_eq!(tool_name_to_function("signal_done"), None);
+        assert_eq!(tool_name_to_function("invoke_skill"), None);
         assert_eq!(tool_name_to_function("nonexistent"), None);
     }
 
@@ -519,19 +541,19 @@ mod tests {
         let tools = all_tools();
 
         let oai_tools: Vec<Value> = tools.iter().map(|t| t.to_openai()).collect();
-        assert_eq!(oai_tools.len(), 11);
+        assert_eq!(oai_tools.len(), 12);
         for t in &oai_tools {
             assert_eq!(t["type"].as_str(), Some("function"));
         }
 
         let ant_tools: Vec<Value> = tools.iter().map(|t| t.to_anthropic()).collect();
-        assert_eq!(ant_tools.len(), 11);
+        assert_eq!(ant_tools.len(), 12);
         for t in &ant_tools {
             assert!(t["input_schema"].is_object());
         }
 
         let gem_tools: Vec<Value> = tools.iter().map(|t| t.to_gemini()).collect();
-        assert_eq!(gem_tools.len(), 11);
+        assert_eq!(gem_tools.len(), 12);
         for t in &gem_tools {
             assert!(t["parameters"].is_object());
         }

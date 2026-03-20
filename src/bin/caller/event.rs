@@ -327,6 +327,11 @@ pub enum ControlMsg {
         #[serde(default)]
         channel: Option<String>,
     },
+    InvokeSkill {
+        skill_name: String,
+        #[serde(default)]
+        arguments: Option<String>,
+    },
     Quit,
 }
 
@@ -837,6 +842,10 @@ mod tests {
                 display_id: 99,
                 note: Some("done testing".to_string()),
             },
+            ControlMsg::InvokeSkill {
+                skill_name: "deploy".to_string(),
+                arguments: Some("staging".to_string()),
+            },
             ControlMsg::Usage,
             ControlMsg::Quit,
         ];
@@ -979,6 +988,38 @@ mod tests {
                 assert!(channel.is_none());
             }
             _ => panic!("expected RecallMemory"),
+        }
+    }
+
+    #[test]
+    fn control_msg_invoke_skill_deserialize() {
+        let json = r#"{"action":"invoke_skill","skill_name":"deploy","arguments":"staging"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::InvokeSkill {
+                skill_name,
+                arguments,
+            } => {
+                assert_eq!(skill_name, "deploy");
+                assert_eq!(arguments, Some("staging".to_string()));
+            }
+            _ => panic!("expected InvokeSkill"),
+        }
+    }
+
+    #[test]
+    fn control_msg_invoke_skill_no_args() {
+        let json = r#"{"action":"invoke_skill","skill_name":"lint"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::InvokeSkill {
+                skill_name,
+                arguments,
+            } => {
+                assert_eq!(skill_name, "lint");
+                assert!(arguments.is_none());
+            }
+            _ => panic!("expected InvokeSkill"),
         }
     }
 

@@ -3,7 +3,7 @@ use crate::control;
 use crate::event::{AppEvent, ApprovalRegistry, ApprovalResponse, ControlMsg};
 pub use crate::types::{LogLevel, Phase, Verbosity};
 use crate::types::{format_model_summary, truncate_str, OutboundEvent};
-use crate::{knowledge, session_log};
+use crate::{knowledge, session_log, skills};
 use crate::tui::layout::PanelConfig;
 use chrono::Local;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -544,6 +544,9 @@ pub struct App {
     pub project_root: Option<std::path::PathBuf>,
     pub knowledge_path: Option<std::path::PathBuf>,
 
+    // Discovered skills for InvokeSkill control messages
+    pub skills: Vec<skills::Skill>,
+
     // Shared session log for voice log persistence
     pub session_log: Option<std::sync::Arc<std::sync::Mutex<crate::session_log::SessionLog>>>,
 
@@ -616,6 +619,7 @@ impl App {
             presence_paused: None,
             project_root: None,
             knowledge_path: None,
+            skills: Vec::new(),
             session_log: None,
             presence_session: None,
             voice_turn: 0,
@@ -1321,6 +1325,24 @@ impl App {
                     display_id,
                     note,
                 });
+            }
+            ControlMsg::InvokeSkill {
+                skill_name,
+                arguments,
+            } => {
+                let args = arguments.as_deref().unwrap_or("");
+                match skills::resolve_skill_as_task(&self.skills, &skill_name, args) {
+                    Ok(task_text) => {
+                        // Dispatch as a StartTask
+                        self.handle_control_command(ControlMsg::StartTask {
+                            task: task_text,
+                            orchestrate: Some(false),
+                        });
+                    }
+                    Err(e) => {
+                        self.log(LogLevel::Warn, format!("invoke_skill: {}", e));
+                    }
+                }
             }
             ControlMsg::Quit => {
                 self.should_quit = true;

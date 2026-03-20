@@ -19,6 +19,9 @@ pub struct ToolBatchResult {
     pub mcp_calls: Vec<(String, String, String)>,
     /// Tool-level validation errors generated before runtime execution.
     pub precomputed_results: Vec<(String, String, String)>,
+    /// Skill invocations extracted from invoke_skill tool calls.
+    /// Vec of (call_id, skill_name, arguments).
+    pub skill_invocations: Vec<(String, String, String)>,
 }
 
 /// Assemble an AgentInput batch from individual tool calls.
@@ -32,6 +35,7 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
     let mut done_message = None;
     let mut mcp_calls = Vec::new();
     let mut precomputed_results = Vec::new();
+    let mut skill_invocations = Vec::new();
 
     for tc in tool_calls {
         call_id_names.push((tc.call_id.clone(), tc.name.clone()));
@@ -40,6 +44,21 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
             "manage_context" => {
                 if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                     context_directives = Some(args);
+                }
+            }
+            "invoke_skill" => {
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    let skill_name = args
+                        .get("skill_name")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let arguments = args
+                        .get("arguments")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    skill_invocations.push((tc.call_id.clone(), skill_name, arguments));
                 }
             }
             "signal_done" => {
@@ -103,6 +122,7 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
         call_id_names,
         mcp_calls,
         precomputed_results,
+        skill_invocations,
     }
 }
 
@@ -171,7 +191,7 @@ pub fn map_results_to_tool_responses(
             }
         }
 
-        if tool_name == "manage_context" || tool_name == "signal_done" {
+        if tool_name == "manage_context" || tool_name == "signal_done" || tool_name == "invoke_skill" {
             results.push((call_id.clone(), tool_name.clone(), "OK".to_string()));
             continue;
         }

@@ -1609,6 +1609,24 @@ async fn handle_control_command_mcp(
             emit_control_result(control_tx, "release_display", true, format!("Released control of :{}", display_id), None);
             Some(RESOURCE_LOGS_URI)
         }
+        ControlMsg::InvokeSkill { skill_name, arguments } => {
+            // In MCP mode, convert skill invocation to a StartTask
+            let discovered = crate::skills::discover_skills(None);
+            let args = arguments.as_deref().unwrap_or("");
+            match crate::skills::resolve_skill_as_task(&discovered, &skill_name, args) {
+                Ok(task_text) => {
+                    bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+                        task: task_text,
+                        orchestrate: Some(false),
+                    }));
+                    emit_control_result(control_tx, "invoke_skill", true, format!("Skill '{}' dispatched", skill_name), None);
+                }
+                Err(e) => {
+                    emit_control_result(control_tx, "invoke_skill", false, e, None);
+                }
+            }
+            None
+        }
         ControlMsg::Quit => {
             let action = UserAction::Quit;
             let mut s = state.write().await;
