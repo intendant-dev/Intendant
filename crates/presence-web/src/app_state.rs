@@ -815,7 +815,7 @@ impl AppState {
 
             "user_transcript" => {
                 let text = msg["text"].as_str().unwrap_or("");
-                cmds.extend(self.add_log("presence", text, None, "live"));
+                cmds.extend(self.add_log("presence", &format!("[You] {}", text), None, "live"));
             }
 
             "human_response_sent" => {
