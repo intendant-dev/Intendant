@@ -721,6 +721,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::UserTranscript { .. }
         | AppEvent::UsageSnapshot { .. }
         | AppEvent::StatusUpdate { .. }
+        | AppEvent::LogEntry { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::Key(_)
         | AppEvent::Resize(_, _)

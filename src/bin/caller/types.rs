@@ -236,6 +236,14 @@ pub enum OutboundEvent {
         #[serde(default)]
         cached_tokens: u64,
     },
+    /// App-originated log entry broadcast to external consumers.
+    LogEntry {
+        level: String,
+        source: String,
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn: Option<usize>,
+    },
 }
 
 // ---------------------------------------------------------------------------

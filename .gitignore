@@ -5,3 +5,5 @@
 !.env.example
 docs/book/
 .claude/
+.mcp.json
+intendant.toml

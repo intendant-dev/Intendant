@@ -218,6 +218,16 @@ pub enum AppEvent {
         task: String,
     },
 
+    /// Log entry emitted by the App for broadcast to external consumers.
+    /// The TUI renders these from its internal deque; external consumers
+    /// (web UI, control socket) receive them via the outbound broadcaster.
+    LogEntry {
+        level: String,
+        source: String,
+        content: String,
+        turn: Option<usize>,
+    },
+
     // TUI internal
     Tick,
     #[allow(dead_code)]
@@ -512,6 +522,17 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             autonomy: autonomy.clone(),
             session_id: session_id.clone(),
             task: task.clone(),
+        }),
+        AppEvent::LogEntry {
+            level,
+            source,
+            content,
+            turn,
+        } => Some(OutboundEvent::LogEntry {
+            level: level.clone(),
+            source: source.clone(),
+            content: content.clone(),
+            turn: *turn,
         }),
         // Terminal-only / internal events — not broadcast to external consumers
         AppEvent::Key(_)

@@ -486,6 +486,9 @@ pub struct App {
     // Context injection queue for display takeover messages
     pub context_injection: crate::event::ContextInjectionQueue,
 
+    // Derived events pending emission (populated by log(), drained by handle_event)
+    pending_derived: Vec<AppEvent>,
+
     // Token tracking
     pub session_tokens: u64,
     pub session_prompt_tokens: u64,
@@ -589,6 +592,7 @@ impl App {
             approval_registry: ApprovalRegistry::default(),
             log_dir,
             context_injection: crate::event::ContextInjectionQueue::default(),
+            pending_derived: Vec::new(),
             session_tokens: 0,
             session_prompt_tokens: 0,
             session_completion_tokens: 0,
@@ -733,6 +737,20 @@ impl App {
         if self.log_entries.len() >= MAX_LOG_ENTRIES {
             self.log_entries.pop_front();
         }
+        // Broadcast to external consumers (web UI, control socket)
+        let level_str = crate::frontend::log_level_to_str(&level).to_string();
+        let source_str = match source {
+            LogSource::System => "system",
+            LogSource::Agent => "agent",
+            LogSource::Presence => "server",
+            LogSource::Live => "live",
+        }.to_string();
+        self.pending_derived.push(AppEvent::LogEntry {
+            level: level_str,
+            source: source_str,
+            content: content.clone(),
+            turn,
+        });
         self.log_entries.push_back(LogEntry {
             ts: Local::now().format("%H:%M:%S").to_string(),
             level,
@@ -740,8 +758,6 @@ impl App {
             source,
             turn,
         });
-        // Note: auto_scroll is now per-connection in ViewState.
-        // Each connection's render loop handles its own scroll position.
     }
 
     /// Flush accumulated voice transcript fragments into a single Info log entry.
@@ -1883,7 +1899,7 @@ impl App {
             AppEvent::Key(key) => {
                 self.handle_key(key);
             }
-            AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } => {
+            AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } => {
                 // Derived events — just pass through to outbound broadcaster.
                 // App doesn't need to handle its own output.
             }
@@ -1893,6 +1909,8 @@ impl App {
             }
         }
 
+        // Drain log entries emitted during this handle_event call
+        derived.append(&mut self.pending_derived);
         derived
     }
 }
