@@ -19,6 +19,23 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use callbacks::Callbacks;
+
+/// Provider-agnostic live model usage snapshot.
+/// Both Gemini Live and OpenAI Realtime map their provider-specific
+/// usage metadata into this common structure.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LiveUsage {
+    /// Input/prompt tokens (includes cached).
+    pub input_tokens: u64,
+    /// Output/response tokens.
+    pub output_tokens: u64,
+    /// Cached input tokens (subset of input_tokens, cheaper pricing).
+    pub cached_tokens: u64,
+    /// Total tokens across all categories.
+    pub total_tokens: u64,
+    /// Thinking/reasoning tokens (model-dependent, 0 if not applicable).
+    pub thinking_tokens: u64,
+}
 use js_sys::Function;
 use presence_core::wasm::WasmPresence;
 use presence_core::PresenceAction;
@@ -167,8 +184,8 @@ impl PresenceWeb {
     }
 
     #[wasm_bindgen]
-    pub fn set_on_voice_usage(&self, f: Function) {
-        *self.callbacks.on_voice_usage.borrow_mut() = Some(f);
+    pub fn set_on_live_usage(&self, f: Function) {
+        *self.callbacks.on_live_usage.borrow_mut() = Some(f);
     }
 
     // --- Server connection ---

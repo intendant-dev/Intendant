@@ -179,6 +179,27 @@ impl OpenAIProvider {
             "input_audio_buffer.speech_started" => {
                 callbacks.invoke_voice_interrupted();
             }
+            "response.done" => {
+                // Extract usage from response.done event
+                if let Some(resp) = msg.get("response") {
+                    if let Some(usage) = resp.get("usage") {
+                        let cached = usage.get("input_token_details")
+                            .and_then(|d| d["cached_tokens"].as_u64())
+                            .unwrap_or(0);
+                        let live_usage = crate::LiveUsage {
+                            input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
+                            output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+                            cached_tokens: cached,
+                            total_tokens: usage["total_tokens"].as_u64().unwrap_or(0),
+                            thinking_tokens: 0, // OpenAI Realtime doesn't report thinking tokens
+                        };
+                        let val = serde_json::to_value(&live_usage).unwrap_or_default();
+                        callbacks.invoke_live_usage(
+                            &serde_wasm_bindgen::to_value(&val).unwrap_or(JsValue::NULL),
+                        );
+                    }
+                }
+            }
             _ => {}
         }
     }

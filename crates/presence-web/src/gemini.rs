@@ -252,9 +252,19 @@ impl GeminiProvider {
         turn_tool_calls: &Cell<u32>,
         turn_has_speech: &Cell<bool>,
     ) {
-        // usageMetadata can appear alongside any server message
+        // usageMetadata can appear alongside any server message.
+        // Normalize Gemini-specific fields into provider-agnostic LiveUsage.
         if let Some(usage) = msg.get("usageMetadata") {
-            callbacks.invoke_voice_usage(&to_js_object(usage));
+            let live_usage = crate::LiveUsage {
+                input_tokens: usage["promptTokenCount"].as_u64().unwrap_or(0),
+                output_tokens: usage["responseTokenCount"].as_u64().unwrap_or(0),
+                cached_tokens: usage["cachedContentTokenCount"].as_u64().unwrap_or(0),
+                total_tokens: usage["totalTokenCount"].as_u64().unwrap_or(0),
+                thinking_tokens: usage["thoughtsTokenCount"].as_u64().unwrap_or(0),
+            };
+            callbacks.invoke_live_usage(&to_js_object(
+                &serde_json::to_value(&live_usage).unwrap_or_default(),
+            ));
         }
 
         // setupComplete
