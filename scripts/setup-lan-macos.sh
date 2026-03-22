@@ -3,21 +3,19 @@
 # Intendant LAN Access Setup for macOS hosts with a UTM Linux guest.
 #
 # Usage:
-#   sudo ./setup-lan-macos.sh              # Interactive setup wizard
-#   sudo ./setup-lan-macos.sh --remove     # Uninstall everything
-#   sudo ./setup-lan-macos.sh --recert     # Regenerate server cert (IP changed)
+#   ./setup-lan-macos.sh              # Interactive setup wizard
+#   ./setup-lan-macos.sh --remove     # Uninstall everything
+#   ./setup-lan-macos.sh --recert     # Regenerate server cert (IP changed)
 #
 set -euo pipefail
 
-PF_ANCHOR="intendant-lan"
-PF_ANCHOR_FILE="/etc/pf.anchors/$PF_ANCHOR"
-PF_CONF="/etc/pf.conf"
-PF_CONF_BACKUP="/etc/pf.conf.intendant-backup"
+LAUNCHD_LABEL="com.intendant.tunnel"
 SETUP_SCRIPT_NAME="setup-lan.sh"
 
 REAL_USER="${SUDO_USER:-$(whoami)}"
 REAL_HOME=$(eval echo "~$REAL_USER")
 CONFIG_FILE="$REAL_HOME/.intendant-lan.conf"
+LAUNCHD_PLIST="$REAL_HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
 
 ACTION="setup"
 FORCE=false
@@ -78,7 +76,7 @@ HTTPS_PORT=$HTTPS_PORT
 NET_MODE="$NET_MODE"
 LAN_IFACE="$LAN_IFACE"
 CFG
-    chown "$REAL_USER" "$CONFIG_FILE"
+    chown "$REAL_USER" "$CONFIG_FILE" 2>/dev/null || true
 }
 
 load_config() {
@@ -123,102 +121,83 @@ copy_to_guest() {
     run_on_guest "chmod +x /tmp/$SETUP_SCRIPT_NAME"
 }
 
-# ── pfctl port forwarding ──
-
-write_pf_anchor() {
-    info "writing pfctl anchor rules..."
-    cat > "$PF_ANCHOR_FILE" <<RULES
-# Intendant LAN — forward to UTM guest at $VM_IP
-rdr pass on $LAN_IFACE inet proto tcp from any to any port $HTTPS_PORT -> $VM_IP port $HTTPS_PORT
-rdr pass on $LAN_IFACE inet proto tcp from any to any port $CERT_PORT -> $VM_IP port $CERT_PORT
-RULES
-}
-
-add_pf_conf_anchor() {
-    # Already present?
-    if grep -q "$PF_ANCHOR" "$PF_CONF" 2>/dev/null; then
-        info "pfctl anchor already in $PF_CONF"
-        return 1   # no full reload needed
+ensure_ssh_keys() {
+    if as_user ssh -o BatchMode=yes -o ConnectTimeout=3 \
+            "${VM_USER}@${VM_IP}" "true" &>/dev/null; then
+        info "SSH key auth already working"
+        return
     fi
 
-    # Backup original (once)
-    if [[ ! -f "$PF_CONF_BACKUP" ]]; then
-        cp "$PF_CONF" "$PF_CONF_BACKUP"
-        info "backed up $PF_CONF → $PF_CONF_BACKUP"
+    info "SSH key auth required for the tunnel service"
+
+    local key_file="$REAL_HOME/.ssh/id_ed25519"
+    if [[ ! -f "$key_file" ]]; then
+        info "generating SSH key..."
+        as_user ssh-keygen -t ed25519 -f "$key_file" -N "" -q
     fi
 
-    info "adding anchor to $PF_CONF..."
-
-    # Insert rdr-anchor after the last existing rdr-anchor line,
-    # and append load-anchor at the end.
-    local last_rdr
-    last_rdr=$(grep -n '^rdr-anchor' "$PF_CONF" | tail -1 | cut -d: -f1)
-
-    local tmp
-    tmp=$(mktemp)
-    local n=0
-    while IFS= read -r line; do
-        n=$((n + 1))
-        printf '%s\n' "$line" >> "$tmp"
-        if [[ "$n" -eq "$last_rdr" ]]; then
-            printf 'rdr-anchor "%s"\n' "$PF_ANCHOR" >> "$tmp"
-        fi
-    done < "$PF_CONF"
-
-    printf 'load anchor "%s" from "%s"\n' "$PF_ANCHOR" "$PF_ANCHOR_FILE" >> "$tmp"
-
-    mv "$tmp" "$PF_CONF"
+    info "copying key to VM (enter password one last time)..."
+    as_user ssh-copy-id -o StrictHostKeyChecking=accept-new "${VM_USER}@${VM_IP}"
+    info "SSH keys configured"
 }
 
-remove_pf_conf_anchor() {
-    if [[ -f "$PF_CONF_BACKUP" ]]; then
-        mv "$PF_CONF_BACKUP" "$PF_CONF"
-        info "restored original $PF_CONF"
+# ── SSH tunnel via launchd ──
+
+setup_tunnel() {
+    info "setting up SSH tunnel service..."
+
+    as_user mkdir -p "$REAL_HOME/Library/LaunchAgents"
+
+    # Unload existing if present
+    as_user launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
+
+    cat > "$LAUNCHD_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LAUNCHD_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/ssh</string>
+        <string>-N</string>
+        <string>-o</string>
+        <string>ExitOnForwardFailure=yes</string>
+        <string>-o</string>
+        <string>ServerAliveInterval=15</string>
+        <string>-o</string>
+        <string>ServerAliveCountMax=3</string>
+        <string>-L</string>
+        <string>0.0.0.0:${HTTPS_PORT}:localhost:${HTTPS_PORT}</string>
+        <string>-L</string>
+        <string>0.0.0.0:${CERT_PORT}:localhost:${CERT_PORT}</string>
+        <string>${VM_USER}@${VM_IP}</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>${REAL_HOME}/.intendant-tunnel.log</string>
+</dict>
+</plist>
+PLIST
+    chown "$REAL_USER" "$LAUNCHD_PLIST" 2>/dev/null || true
+
+    as_user launchctl load "$LAUNCHD_PLIST"
+    info "tunnel service started — forwarding 0.0.0.0:{$HTTPS_PORT,$CERT_PORT} → VM"
+}
+
+remove_tunnel() {
+    if [[ -f "$LAUNCHD_PLIST" ]]; then
+        as_user launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
+        rm -f "$LAUNCHD_PLIST"
+        info "tunnel service removed"
     else
-        local tmp
-        tmp=$(mktemp)
-        grep -v "$PF_ANCHOR" "$PF_CONF" > "$tmp" || true
-        mv "$tmp" "$PF_CONF"
-        info "removed anchor from $PF_CONF"
+        info "no tunnel service found"
     fi
-}
-
-setup_port_forwarding() {
-    write_pf_anchor
-
-    local need_full_reload=false
-    add_pf_conf_anchor && need_full_reload=true
-
-    info "enabling IP forwarding..."
-    sysctl -w net.inet.ip.forwarding=1 >/dev/null
-
-    info "loading pfctl rules..."
-    if $need_full_reload; then
-        # First time: anchor was just added to pf.conf, need full reload to register it
-        pfctl -f "$PF_CONF" 2>/dev/null
-    else
-        # Subsequent runs: just reload our anchor rules without disrupting NAT state
-        pfctl -a "$PF_ANCHOR" -f "$PF_ANCHOR_FILE" 2>/dev/null
-    fi
-    pfctl -e 2>/dev/null || true   # may already be enabled
-    info "pfctl active — forwarding $LAN_IFACE:{$HTTPS_PORT,$CERT_PORT} → $VM_IP"
-}
-
-remove_port_forwarding() {
-    # Flush our anchor
-    pfctl -a "$PF_ANCHOR" -F all 2>/dev/null || true
-
-    # Remove anchor from pf.conf
-    remove_pf_conf_anchor
-    rm -f "$PF_ANCHOR_FILE"
-
-    # Reload pf without our rules
-    pfctl -f "$PF_CONF" 2>/dev/null || true
-
-    # Disable IP forwarding
-    sysctl -w net.inet.ip.forwarding=0 >/dev/null 2>&1 || true
-
-    info "port forwarding removed"
+    rm -f "$REAL_HOME/.intendant-tunnel.log"
 }
 
 # ── Interactive wizard ──
@@ -303,25 +282,28 @@ run_wizard() {
     fi
     info "SSH connection OK"
 
-    # Suggest SSH keys if password auth was used
-    if ! as_user ssh -o BatchMode=yes -o ConnectTimeout=3 \
-            "${VM_USER}@${VM_IP}" "true" &>/dev/null; then
-        echo ""
-        echo "  Tip: set up SSH keys to avoid repeated password prompts:"
-        echo "    ssh-copy-id ${VM_USER}@${VM_IP}"
-        echo ""
-        local setup_keys
-        setup_keys=$(ask "Set up SSH keys now? (y/n)" "y")
-        if [[ "$setup_keys" == "y" ]]; then
-            # Generate key if none exists
-            local key_file="$REAL_HOME/.ssh/id_ed25519"
-            if [[ ! -f "$key_file" ]]; then
-                info "generating SSH key..."
-                as_user ssh-keygen -t ed25519 -f "$key_file" -N "" -q
+    # SSH keys — required for shared (tunnel service), optional for bridged
+    if [[ "$NET_MODE" == "shared" ]]; then
+        ensure_ssh_keys
+    else
+        if ! as_user ssh -o BatchMode=yes -o ConnectTimeout=3 \
+                "${VM_USER}@${VM_IP}" "true" &>/dev/null; then
+            echo ""
+            echo "  Tip: set up SSH keys to avoid repeated password prompts:"
+            echo "    ssh-copy-id ${VM_USER}@${VM_IP}"
+            echo ""
+            local setup_keys
+            setup_keys=$(ask "Set up SSH keys now? (y/n)" "y")
+            if [[ "$setup_keys" == "y" ]]; then
+                local key_file="$REAL_HOME/.ssh/id_ed25519"
+                if [[ ! -f "$key_file" ]]; then
+                    info "generating SSH key..."
+                    as_user ssh-keygen -t ed25519 -f "$key_file" -N "" -q
+                fi
+                info "copying key to VM (enter password one last time)..."
+                as_user ssh-copy-id -o StrictHostKeyChecking=accept-new "${VM_USER}@${VM_IP}"
+                info "SSH keys configured — no more password prompts"
             fi
-            info "copying key to VM (enter password one last time)..."
-            as_user ssh-copy-id -o StrictHostKeyChecking=accept-new "${VM_USER}@${VM_IP}"
-            info "SSH keys configured — no more password prompts"
         fi
     fi
 
@@ -344,7 +326,7 @@ run_wizard() {
     echo "  Host LAN IP:   $LAN_IP"
     echo "  HTTPS port:    $HTTPS_PORT"
     if [[ "$NET_MODE" == "shared" ]]; then
-        echo "  Port forward:  ${LAN_IFACE}:{$HTTPS_PORT,$CERT_PORT} → $VM_IP (pfctl)"
+        echo "  SSH tunnel:    0.0.0.0:{$HTTPS_PORT,$CERT_PORT} → VM (launchd)"
     fi
     echo "  Phone URL:     https://${LAN_IP}:${HTTPS_PORT}"
     echo ""
@@ -356,11 +338,9 @@ run_wizard() {
     # Step 7: Execute
     echo ""
 
-    # Port forwarding first — the cert-serving HTTP server on the guest
-    # needs to be reachable from the phone via the Mac's LAN IP
+    # SSH tunnel for shared networking (before guest setup so cert port is reachable)
     if [[ "$NET_MODE" == "shared" ]]; then
-        info "setting up macOS port forwarding..."
-        setup_port_forwarding
+        setup_tunnel
     fi
 
     # UTM shared networking often lacks IPv6 routing — tell apt to use IPv4
@@ -386,8 +366,8 @@ run_wizard() {
     echo "  Phone connects to: https://${LAN_IP}:${HTTPS_PORT}"
     echo ""
     if [[ "$NET_MODE" == "shared" ]]; then
-        warn "pfctl rules do not survive reboot. After restarting your Mac, re-run:"
-        warn "  sudo ./setup-lan-macos.sh --recert"
+        info "SSH tunnel survives reboot (launchd service)"
+        info "  Logs: ~/.intendant-tunnel.log"
     fi
 }
 
@@ -400,12 +380,8 @@ run_recert() {
     detect_lan_ip
 
     if [[ "$NET_MODE" == "shared" ]]; then
-        info "updating port forwarding to $VM_IP..."
-        write_pf_anchor
-        sysctl -w net.inet.ip.forwarding=1 >/dev/null
-        pfctl -a "$PF_ANCHOR" -f "$PF_ANCHOR_FILE" 2>/dev/null
-        pfctl -e 2>/dev/null || true
-        info "pfctl rules reloaded"
+        info "restarting SSH tunnel..."
+        setup_tunnel
     fi
 
     local recert_args="--recert"
@@ -428,8 +404,7 @@ run_remove() {
     info "removing intendant LAN setup..."
 
     if [[ "$NET_MODE" == "shared" ]]; then
-        detect_lan_iface
-        remove_port_forwarding
+        remove_tunnel
     fi
 
     info "removing VM-side config..."
@@ -445,8 +420,6 @@ run_remove() {
 main() {
     parse_args "$@"
     check_macos
-
-    [[ $(id -u) -eq 0 ]] || die "run with sudo"
 
     case "$ACTION" in
         setup)  run_wizard ;;
