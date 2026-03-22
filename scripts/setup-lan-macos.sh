@@ -105,12 +105,12 @@ detect_lan_ip() {
 # ── SSH helpers ──
 
 test_ssh() {
-    as_user ssh -o BatchMode=yes -o ConnectTimeout=5 \
-        "${VM_USER}@${VM_IP}" "echo ok" &>/dev/null
+    as_user ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+        "${VM_USER}@${VM_IP}" "echo ok" >/dev/null
 }
 
 run_on_guest() {
-    as_user ssh "${VM_USER}@${VM_IP}" "$1"
+    as_user ssh -o StrictHostKeyChecking=accept-new "${VM_USER}@${VM_IP}" "$1"
 }
 
 copy_to_guest() {
@@ -119,7 +119,7 @@ copy_to_guest() {
     local script_path="$script_dir/$SETUP_SCRIPT_NAME"
     [[ -f "$script_path" ]] || die "$SETUP_SCRIPT_NAME not found in $script_dir"
 
-    as_user scp "$script_path" "${VM_USER}@${VM_IP}:/tmp/$SETUP_SCRIPT_NAME"
+    as_user scp -o StrictHostKeyChecking=accept-new "$script_path" "${VM_USER}@${VM_IP}:/tmp/$SETUP_SCRIPT_NAME"
     run_on_guest "chmod +x /tmp/$SETUP_SCRIPT_NAME"
 }
 
@@ -280,6 +280,10 @@ run_wizard() {
         echo "    - The VM is running"
         echo "    - SSH server is installed: sudo apt install openssh-server"
         echo "    - You can SSH manually: ssh ${VM_USER}@${VM_IP}"
+        echo ""
+        echo "  If you were prompted for a password above and it was rejected,"
+        echo "  consider setting up SSH keys:"
+        echo "    ssh-copy-id ${VM_USER}@${VM_IP}"
         echo ""
         local retry
         retry=$(ask "Try again after fixing? (y/n)" "y")
