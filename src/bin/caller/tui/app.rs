@@ -1683,7 +1683,7 @@ impl App {
                 );
                 self.log(LogLevel::Warn, msg.clone());
                 if let Ok(mut q) = self.context_injection.lock() {
-                    q.push(msg);
+                    q.push(crate::event::ContextInjection::text(msg));
                 }
             }
             AppEvent::DisplayReleased { display_id, note } => {
@@ -1700,7 +1700,7 @@ impl App {
                 };
                 self.log(LogLevel::Info, msg.clone());
                 if let Ok(mut q) = self.context_injection.lock() {
-                    q.push(msg);
+                    q.push(crate::event::ContextInjection::text(msg));
                 }
             }
             AppEvent::SessionDirChanged { .. } => {
