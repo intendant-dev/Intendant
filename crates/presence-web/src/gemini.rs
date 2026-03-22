@@ -375,6 +375,27 @@ impl GeminiProvider {
         }
     }
 
+    /// Send a video frame to Gemini Live as a media_chunk (image/jpeg).
+    /// The frame_id is included as a text annotation so the model can reference it.
+    pub fn send_frame(&self, base64_jpeg: &str, frame_id: &str) {
+        if let Some(ref ws) = self.ws {
+            // Send the image as a media chunk (same mechanism as audio)
+            let msg = serde_json::json!({
+                "realtime_input": {
+                    "media_chunks": [{
+                        "mime_type": "image/jpeg",
+                        "data": base64_jpeg
+                    }]
+                }
+            });
+            let _ = ws.send_with_str(&msg.to_string());
+            self.callbacks.invoke_diagnostic(
+                "video_send",
+                &format!("frame {} ({}B)", frame_id, base64_jpeg.len()),
+            );
+        }
+    }
+
     pub fn send_audio(&self, base64_pcm: &str) {
         if let Some(ref ws) = self.ws {
             let msg = serde_json::json!({

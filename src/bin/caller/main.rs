@@ -4,6 +4,7 @@ mod control;
 mod conversation;
 mod error;
 mod event;
+mod frames;
 mod frontend;
 mod knowledge;
 mod mcp;
@@ -3603,6 +3604,10 @@ async fn main() -> Result<(), CallerError> {
         }
     };
 
+    // Create shared frame registry for video frame storage.
+    let frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>> =
+        Arc::new(tokio::sync::RwLock::new(frames::FrameRegistry::new(&log_dir)));
+
     configure_sandbox_env(&flags, &project, &log_dir);
 
     // CLI --transcription flag overrides config file setting
@@ -3759,6 +3764,7 @@ async fn main() -> Result<(), CallerError> {
                 None, // MCP mode: no presence query context
                 transcriber,
                 None, // MCP mode: no WebTui
+                Some(frame_registry.clone()),
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -4161,6 +4167,7 @@ async fn main() -> Result<(), CallerError> {
                 query_ctx,
                 transcriber,
                 web_tui_tx.clone(),
+                Some(frame_registry.clone()),
             );
             app.log(
                 types::LogLevel::Info,
@@ -4436,6 +4443,7 @@ async fn main() -> Result<(), CallerError> {
                 None, // Headless mode: no presence query context
                 transcriber,
                 None, // Headless mode: no WebTui
+                Some(frame_registry.clone()),
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",

@@ -60,6 +60,14 @@ pub fn dispatch_tool_call(
             tool_name: "recall_memory".to_string(),
             args: args.clone(),
         },
+        "inspect_frame" => PresenceAction::NeedsIO {
+            tool_name: "inspect_frame".to_string(),
+            args: args.clone(),
+        },
+        "inspect_frames" => PresenceAction::NeedsIO {
+            tool_name: "inspect_frames".to_string(),
+            args: args.clone(),
+        },
         "approve_action" => handle_approve(args),
         "deny_action" => handle_deny(args),
         "skip_action" => handle_skip(args),
@@ -295,6 +303,53 @@ mod tests {
         match action {
             PresenceAction::NeedsIO { tool_name, .. } => {
                 assert_eq!(tool_name, "recall_memory");
+            }
+            _ => panic!("expected NeedsIO"),
+        }
+    }
+
+    #[test]
+    fn dispatch_inspect_frame_needs_io() {
+        let state = AgentStateSnapshot::default();
+        let action = dispatch_tool_call(
+            "inspect_frame",
+            &json!({"frame_id": "cam0-f00047"}),
+            &state,
+        );
+        match action {
+            PresenceAction::NeedsIO { tool_name, args } => {
+                assert_eq!(tool_name, "inspect_frame");
+                assert_eq!(args["frame_id"].as_str(), Some("cam0-f00047"));
+            }
+            _ => panic!("expected NeedsIO"),
+        }
+    }
+
+    #[test]
+    fn dispatch_inspect_frame_no_id() {
+        let state = AgentStateSnapshot::default();
+        let action = dispatch_tool_call("inspect_frame", &json!({}), &state);
+        match action {
+            PresenceAction::NeedsIO { tool_name, .. } => {
+                assert_eq!(tool_name, "inspect_frame");
+            }
+            _ => panic!("expected NeedsIO"),
+        }
+    }
+
+    #[test]
+    fn dispatch_inspect_frames_needs_io() {
+        let state = AgentStateSnapshot::default();
+        let action = dispatch_tool_call(
+            "inspect_frames",
+            &json!({"query": "last 30s", "count": 5}),
+            &state,
+        );
+        match action {
+            PresenceAction::NeedsIO { tool_name, args } => {
+                assert_eq!(tool_name, "inspect_frames");
+                assert_eq!(args["query"].as_str(), Some("last 30s"));
+                assert_eq!(args["count"].as_u64(), Some(5));
             }
             _ => panic!("expected NeedsIO"),
         }

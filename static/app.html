@@ -786,6 +786,47 @@ html, body {
 .mic-btn:hover { border-color: var(--blue); background: var(--surface1); }
 .mic-btn.active { border-color: var(--red); background: var(--red); color: var(--crust); }
 .mic-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.video-btn {
+  width: 48px; height: 48px;
+  border-radius: 50%;
+  border: 2px solid var(--surface1);
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 20px;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.video-btn:hover { border-color: var(--sapphire); background: var(--surface1); }
+.video-btn.active { border-color: var(--sapphire); background: var(--sapphire); color: var(--crust); }
+.video-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.video-preview-wrap {
+  position: fixed;
+  bottom: 80px;
+  right: 16px;
+  z-index: 99;
+  display: none;
+}
+.video-preview-wrap.visible { display: block; }
+.video-preview {
+  width: 160px;
+  height: 120px;
+  border-radius: 8px;
+  border: 2px solid var(--surface1);
+  background: var(--crust);
+  object-fit: cover;
+}
+.video-preview-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 2px 4px;
+  font-size: 10px;
+  color: var(--overlay0);
+}
+.video-preview-info .frame-id { color: var(--sapphire); }
 .voice-status {
   padding: 4px 10px;
   background: var(--surface0);
@@ -866,6 +907,9 @@ html, body {
   .usage-cards { flex-direction: column; }
   .budget-bar .bar-track { width: 40px; }
   .mic-btn { width: 40px; height: 40px; font-size: 16px; }
+  .video-btn { width: 40px; height: 40px; font-size: 16px; }
+  .video-preview { width: 120px; height: 90px; }
+  .video-preview-wrap { bottom: 70px; right: 8px; }
 }
 </style>
 </head>
@@ -1008,10 +1052,21 @@ html, body {
   </div>
 </div>
 
+<!-- Video Preview -->
+<div class="video-preview-wrap" id="videoPreviewWrap">
+  <video id="videoPreviewEl" class="video-preview" autoplay muted playsinline></video>
+  <canvas id="videoCanvas" style="display:none;"></canvas>
+  <div class="video-preview-info">
+    <span class="frame-id" id="videoFrameId">--</span>
+    <span id="videoFps">0 fps</span>
+  </div>
+</div>
+
 <!-- Voice Overlay -->
 <div class="voice-overlay">
   <div class="voice-status hidden" id="voiceStatus"></div>
   <button class="make-active-btn hidden" id="makeActiveBtn">Make Active</button>
+  <button class="video-btn" id="videoBtn" title="Toggle video" disabled>&#128249;</button>
   <button class="mic-btn" id="micBtn" title="Toggle voice">&#127908;</button>
 </div>
 
@@ -1105,6 +1160,15 @@ let audioDropLogCount = 0;
 const audioQueue = [];
 let isPlaying = false;
 
+// Video / Frame capture
+let videoActive = false;
+let videoStream = null;
+let videoIntervalId = null;
+let frameCounter = 0;
+const FRAME_STREAM = 'cam0';
+const LIVE_RES = 768;  // 768x768 for live model
+const VIDEO_FPS = 1;
+
 // ── Audio Helpers ──
 function downsample(buffer, fromRate, toRate) {
   if (fromRate === toRate) return buffer;
@@ -1147,10 +1211,13 @@ function hideVoiceStatus() {
 function updateActivePassiveUI() {
   const micBtn = document.getElementById('micBtn');
   const makeActiveBtn = document.getElementById('makeActiveBtn');
+  const videoBtn = document.getElementById('videoBtn');
   micBtn.disabled = !isActiveBrowser;
+  videoBtn.disabled = !isActiveBrowser || !modelConnected;
   makeActiveBtn.classList.toggle('hidden', isActiveBrowser);
   if (!isActiveBrowser) {
     document.getElementById('sb-voice-label').textContent = 'Passive';
+    if (videoActive) stopVideo();
   }
 }
 
@@ -1239,6 +1306,86 @@ function stopMic() {
   hideVoiceStatus();
 }
 
+// ── Video Capture ──
+function makeFrameId() {
+  frameCounter++;
+  return FRAME_STREAM + '-f' + String(frameCounter).padStart(5, '0');
+}
+
+async function startVideo() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showVoiceStatus('Camera requires HTTPS or localhost', true);
+    return;
+  }
+  try {
+    videoStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
+    });
+  } catch (e) {
+    showVoiceStatus('Camera denied: ' + e.message, true);
+    return;
+  }
+  const videoEl = document.getElementById('videoPreviewEl');
+  videoEl.srcObject = videoStream;
+  document.getElementById('videoPreviewWrap').classList.add('visible');
+
+  const canvas = document.getElementById('videoCanvas');
+  const ctx = canvas.getContext('2d');
+
+  // Capture loop at VIDEO_FPS
+  videoIntervalId = setInterval(() => {
+    if (!videoActive || !app || !modelConnected) return;
+    const vw = videoEl.videoWidth;
+    const vh = videoEl.videoHeight;
+    if (!vw || !vh) return;
+
+    const frameId = makeFrameId();
+
+    // Live-res: square crop (center) and scale to LIVE_RES x LIVE_RES
+    const side = Math.min(vw, vh);
+    const sx = (vw - side) / 2;
+    const sy = (vh - side) / 2;
+    canvas.width = LIVE_RES;
+    canvas.height = LIVE_RES;
+    ctx.drawImage(videoEl, sx, sy, side, side, 0, 0, LIVE_RES, LIVE_RES);
+    const liveJpeg = canvas.toDataURL('image/jpeg', 0.8);
+    const liveB64 = liveJpeg.split(',')[1];
+
+    // Send live-res frame to voice model + frame ID annotation
+    app.send_frame(liveB64, frameId);
+    app.send_frame_context(frameId);
+
+    // Send HQ frame (full resolution) to server for archival
+    canvas.width = vw;
+    canvas.height = vh;
+    ctx.drawImage(videoEl, 0, 0);
+    const hqJpeg = canvas.toDataURL('image/jpeg', 0.92);
+    const hqB64 = hqJpeg.split(',')[1];
+    app.send_video_frame_to_server(hqB64, frameId, FRAME_STREAM);
+
+    // Update preview UI
+    document.getElementById('videoFrameId').textContent = frameId;
+  }, 1000 / VIDEO_FPS);
+
+  videoActive = true;
+  document.getElementById('videoBtn').classList.add('active');
+  showVoiceStatus('Video active — ' + LIVE_RES + 'x' + LIVE_RES + ' @ ' + VIDEO_FPS + ' fps');
+  setTimeout(hideVoiceStatus, 3000);
+}
+
+function stopVideo() {
+  videoActive = false;
+  if (videoIntervalId) { clearInterval(videoIntervalId); videoIntervalId = null; }
+  if (videoStream) {
+    videoStream.getTracks().forEach(t => t.stop());
+    videoStream = null;
+  }
+  document.getElementById('videoPreviewEl').srcObject = null;
+  document.getElementById('videoPreviewWrap').classList.remove('visible');
+  document.getElementById('videoBtn').classList.remove('active');
+  document.getElementById('videoFrameId').textContent = '--';
+}
+
 // ── Voice Connection ──
 function connectVoice() {
   if (!app || voiceConnecting || !isActiveBrowser) return;
@@ -1290,6 +1437,7 @@ async function main() {
   app.set_on_voice_ready(() => {
     modelConnected = true;
     document.getElementById('sb-voice').className = 'voice-dot ok';
+    document.getElementById('videoBtn').disabled = false;
     const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
     document.getElementById('sb-voice-label').textContent = provider.charAt(0).toUpperCase() + provider.slice(1);
     showVoiceStatus('Voice ready');
@@ -1339,6 +1487,8 @@ async function main() {
     if (!msg.startsWith('Server')) {
       modelConnected = false;
       document.getElementById('sb-voice').className = 'voice-dot err';
+      if (videoActive) stopVideo();
+      document.getElementById('videoBtn').disabled = true;
     }
     showVoiceStatus(msg, true);
     try { app.send_voice_diagnostic('error', msg); } catch(_) {}
@@ -1350,9 +1500,11 @@ async function main() {
 
   app.set_on_session_changed(() => {
     if (modelConnected) {
+      if (videoActive) stopVideo();
       app.disconnect_voice();
       modelConnected = false;
       document.getElementById('sb-voice').className = 'voice-dot err';
+      document.getElementById('videoBtn').disabled = true;
       connectVoice();
     }
   });
@@ -1376,10 +1528,12 @@ async function main() {
 
   app.set_on_force_disconnect((reason) => {
     if (modelConnected) {
+      if (videoActive) stopVideo();
       app.disconnect_voice();
       modelConnected = false;
       micActive = false;
       document.getElementById('micBtn').classList.remove('active');
+      document.getElementById('videoBtn').disabled = true;
       stopMic();
     }
     isActiveBrowser = false;
@@ -1440,6 +1594,17 @@ async function main() {
     micActive = !micActive;
     document.getElementById('micBtn').classList.toggle('active', micActive);
     if (micActive) await startMic(); else stopMic();
+  });
+
+  // ── Video Button ──
+  // Video requires voice to be active first — enable/disable accordingly.
+  document.getElementById('videoBtn').addEventListener('click', async () => {
+    if (!isActiveBrowser || !modelConnected) return;
+    if (videoActive) {
+      stopVideo();
+    } else {
+      await startVideo();
+    }
   });
 
   // Long-press mic button opens settings

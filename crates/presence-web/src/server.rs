@@ -380,4 +380,15 @@ impl ServerConnection {
     pub fn send_make_active(&self) {
         self.send_json(&serde_json::json!({"t": "make_active"}));
     }
+
+    /// Send a video frame to the server for HQ archival and frame registry.
+    pub fn send_video_frame(&self, base64_jpeg: &str, frame_id: &str, stream: &str) {
+        let msg = serde_json::json!({
+            "t": "video_frame",
+            "frame_id": frame_id,
+            "stream": stream,
+            "data": base64_jpeg,
+        });
+        self.send_json(&msg);
+    }
 }

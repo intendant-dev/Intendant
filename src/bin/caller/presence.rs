@@ -347,6 +347,9 @@ impl PresenceLayer {
                 match tool_name.as_str() {
                     "query_detail" => self.handle_query_detail(&args).await,
                     "recall_memory" => self.handle_recall_memory(&args),
+                    "inspect_frame" | "inspect_frames" => {
+                        "Frame inspection is only available in live video mode (browser).".to_string()
+                    }
                     _ => format!("Unknown IO tool: {}", tool_name),
                 }
             }
@@ -596,6 +599,7 @@ pub async fn handle_tool_query(
     knowledge_path: &std::path::Path,
     tool_name: &str,
     args: &Value,
+    frame_registry: Option<&Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
 ) -> Option<String> {
     match tool_name {
         "check_status" => {
@@ -611,6 +615,44 @@ pub async fn handle_tool_query(
         }
         "recall_memory" => {
             Some(recall_memory(knowledge_path, log_dir, args))
+        }
+        "inspect_frame" => {
+            let reg = frame_registry?;
+            let reg = reg.read().await;
+            let frame_id = args["frame_id"].as_str();
+            let fid = match frame_id {
+                Some(id) => id.to_string(),
+                None => reg.latest(None)?.to_string(),
+            };
+            if let Some(meta) = reg.get(&fid) {
+                // Return metadata text. The HQ image will be injected separately
+                // (as a media chunk in the live model or as an image part in the agent conversation).
+                Some(format!(
+                    "Frame {} | stream={} | ts={} | hq_resolution={} | HQ image attached below.",
+                    meta.frame_id,
+                    meta.stream,
+                    meta.timestamp,
+                    meta.hq_resolution.as_deref().unwrap_or("unknown"),
+                ))
+            } else {
+                Some(format!("Frame {} not found in registry.", fid))
+            }
+        }
+        "inspect_frames" => {
+            let reg = frame_registry?;
+            let reg = reg.read().await;
+            let query = args["query"].as_str().unwrap_or("");
+            let count = args["count"].as_u64().unwrap_or(10) as usize;
+
+            // Parse query: if it matches a stream name, filter by stream; otherwise return recent frames.
+            let stream_filter = if query.starts_with("cam") || query.starts_with("display:") || query.starts_with("d") {
+                Some(query)
+            } else {
+                None
+            };
+
+            let frames = reg.query(stream_filter, count);
+            Some(crate::frames::FrameRegistry::format_frame_list(&frames))
         }
         _ => None,
     }

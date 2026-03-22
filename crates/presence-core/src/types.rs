@@ -228,6 +228,43 @@ pub const NARRATION_DEBOUNCE_MS: u64 = 500;
 /// Presence turn offset to avoid collisions with agent turns in TUI collapse logic.
 pub const PRESENCE_TURN_OFFSET: usize = 100_000;
 
+// ── Video / frame types ──
+
+/// A unique frame identifier, assigned client-side.
+/// Format: `{stream_prefix}-f{monotonic_counter}`, e.g. `cam0-f00047`.
+pub type FrameId = String;
+
+/// Metadata for a single captured frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameMeta {
+    /// Unique frame identifier.
+    pub frame_id: FrameId,
+    /// Source stream (e.g. "cam0", "display:99").
+    pub stream: String,
+    /// UTC timestamp when the frame was captured.
+    pub timestamp: String,
+    /// Whether this frame was sent to the live model.
+    pub sent_to_live: bool,
+    /// Resolution of the live-res version sent to the model (e.g. "768x768").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_resolution: Option<String>,
+    /// Resolution of the HQ version stored server-side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hq_resolution: Option<String>,
+}
+
+/// Summary of active video streams for the presence model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VideoState {
+    /// Currently active video streams.
+    pub active_streams: Vec<String>,
+    /// Most recent frame ID across all streams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_frame_id: Option<FrameId>,
+    /// Total frames captured this session.
+    pub total_frames: u64,
+}
+
 // ── Presence session protocol types ──
 
 /// Browser → server: initiate presence handshake.
@@ -712,5 +749,58 @@ mod tests {
         let w = PresenceEventWindow::default();
         assert_eq!(w.capacity, 200);
         assert_eq!(w.current_seq(), 0);
+    }
+
+    // ── Video / frame type tests ──
+
+    #[test]
+    fn frame_meta_roundtrip() {
+        let meta = FrameMeta {
+            frame_id: "cam0-f00047".to_string(),
+            stream: "cam0".to_string(),
+            timestamp: "2026-03-21T10:15:32Z".to_string(),
+            sent_to_live: true,
+            live_resolution: Some("768x768".to_string()),
+            hq_resolution: Some("1920x1080".to_string()),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: FrameMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.frame_id, "cam0-f00047");
+        assert_eq!(back.stream, "cam0");
+        assert!(back.sent_to_live);
+        assert_eq!(back.live_resolution.as_deref(), Some("768x768"));
+        assert_eq!(back.hq_resolution.as_deref(), Some("1920x1080"));
+    }
+
+    #[test]
+    fn frame_meta_minimal() {
+        let json = r#"{"frame_id":"d99-f00001","stream":"display:99","timestamp":"2026-03-21T10:00:00Z","sent_to_live":false}"#;
+        let meta: FrameMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.frame_id, "d99-f00001");
+        assert!(!meta.sent_to_live);
+        assert!(meta.live_resolution.is_none());
+        assert!(meta.hq_resolution.is_none());
+    }
+
+    #[test]
+    fn video_state_defaults() {
+        let vs = VideoState::default();
+        assert!(vs.active_streams.is_empty());
+        assert!(vs.current_frame_id.is_none());
+        assert_eq!(vs.total_frames, 0);
+    }
+
+    #[test]
+    fn video_state_roundtrip() {
+        let vs = VideoState {
+            active_streams: vec!["cam0".to_string()],
+            current_frame_id: Some("cam0-f00100".to_string()),
+            total_frames: 100,
+        };
+        let json = serde_json::to_string(&vs).unwrap();
+        let back: VideoState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.active_streams, vec!["cam0"]);
+        assert_eq!(back.current_frame_id.as_deref(), Some("cam0-f00100"));
+        assert_eq!(back.total_frames, 100);
     }
 }

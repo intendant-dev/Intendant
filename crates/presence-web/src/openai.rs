@@ -204,6 +204,30 @@ impl OpenAIProvider {
         }
     }
 
+    /// Send a video frame to OpenAI Realtime as an image content part.
+    /// Uses conversation.item.create with input_image type.
+    pub fn send_frame(&self, base64_jpeg: &str, frame_id: &str) {
+        if let Some(ref ws) = self.ws {
+            // Inject as a user message with image content
+            let msg = serde_json::json!({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_image",
+                        "image": format!("data:image/jpeg;base64,{}", base64_jpeg)
+                    }]
+                }
+            });
+            let _ = ws.send_with_str(&msg.to_string());
+            self.callbacks.invoke_diagnostic(
+                "video_send",
+                &format!("frame {} ({}B) via OpenAI", frame_id, base64_jpeg.len()),
+            );
+        }
+    }
+
     pub fn send_audio(&self, base64_pcm: &str) {
         if let Some(ref ws) = self.ws {
             let msg = serde_json::json!({

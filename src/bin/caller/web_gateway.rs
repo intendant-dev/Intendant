@@ -503,6 +503,7 @@ pub fn spawn_web_gateway(
     query_ctx: Option<WebQueryCtx>,
     transcriber: Option<Arc<dyn crate::transcription::Transcriber>>,
     web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
+    frame_registry: Option<Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -762,6 +763,7 @@ pub fn spawn_web_gateway(
                     let active_presence_inbound = active_presence.clone();
                     let connection_id_inbound = connection_id.clone();
                     let web_tui_tx_inbound = web_tui_tx.clone();
+                    let frame_registry_inbound = frame_registry.clone();
                     let inbound = tokio::spawn(async move {
                         // Track whether this connection has an active presence model,
                         // so we can auto-send PresenceDisconnected if the WebSocket drops
@@ -1151,6 +1153,30 @@ pub fn spawn_web_gateway(
                                                 }
                                             }
                                         }
+                                        Some("video_frame") => {
+                                            // Browser sends a video frame for HQ archival in the frame registry.
+                                            if let Some(ref registry) = frame_registry_inbound {
+                                                let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
+                                                let stream = json["stream"].as_str().unwrap_or("cam0").to_string();
+                                                if let Some(data_b64) = json["data"].as_str() {
+                                                    use base64::Engine;
+                                                    if let Ok(jpeg_bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                                                        let meta = presence_core::FrameMeta {
+                                                            frame_id: frame_id.clone(),
+                                                            stream,
+                                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                                            sent_to_live: true,
+                                                            live_resolution: Some("768x768".to_string()),
+                                                            hq_resolution: None, // Could be extracted from image headers
+                                                        };
+                                                        let mut reg = registry.write().await;
+                                                        if let Err(e) = reg.register(meta, &jpeg_bytes) {
+                                                            eprintln!("frame registry write failed: {}", e);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         Some("tool_request") => {
                                             let req_id = json["id"].as_str().unwrap_or("").to_string();
                                             let tool = json["tool"].as_str().unwrap_or("").to_string();
@@ -1190,6 +1216,7 @@ pub fn spawn_web_gateway(
                                                                 &ctx.knowledge_path,
                                                                 &tool_name,
                                                                 &io_args,
+                                                                frame_registry_inbound.as_ref(),
                                                             ).await {
                                                                 result
                                                             } else {
@@ -1245,6 +1272,7 @@ pub fn spawn_web_gateway(
                                                     &ctx.knowledge_path,
                                                     &tool,
                                                     &args,
+                                                    frame_registry_inbound.as_ref(),
                                                 ).await {
                                                     result
                                                 } else {
@@ -1390,6 +1418,46 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(header.as_bytes()).await;
                         let _ = stream.write_all(wasm_data).await;
+                    } else if request_line.contains("/frames/") {
+                        // Serve HQ frame images from the frame registry.
+                        // URL format: /frames/<frame_id>
+                        use tokio::io::AsyncWriteExt;
+                        let frame_id = request_line
+                            .split("/frames/")
+                            .nth(1)
+                            .and_then(|s| s.split_whitespace().next())
+                            .unwrap_or("");
+                        let data = if let Some(ref reg) = frame_registry {
+                            let reg = reg.read().await;
+                            reg.read_hq(frame_id).ok()
+                        } else {
+                            None
+                        };
+                        if let Some(jpeg_data) = data {
+                            let header = format!(
+                                "HTTP/1.1 200 OK\r\n\
+                                 Content-Type: image/jpeg\r\n\
+                                 Content-Length: {}\r\n\
+                                 Cache-Control: public, max-age=31536000, immutable\r\n\
+                                 Connection: close\r\n\
+                                 \r\n",
+                                jpeg_data.len()
+                            );
+                            let _ = stream.write_all(header.as_bytes()).await;
+                            let _ = stream.write_all(&jpeg_data).await;
+                        } else {
+                            let body = "Frame not found";
+                            let response = format!(
+                                "HTTP/1.1 404 Not Found\r\n\
+                                 Content-Type: text/plain\r\n\
+                                 Content-Length: {}\r\n\
+                                 Connection: close\r\n\
+                                 \r\n\
+                                 {}",
+                                body.len(), body
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        }
                     } else if request_line.starts_with("POST") && request_line.contains("/session") {
                         let result = mint_session_token(&session_provider, &session_model).await;
                         let (status, body) = match result {

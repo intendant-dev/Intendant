@@ -14,7 +14,7 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
-/// Return the 9 presence tool definitions for native tool calling.
+/// Return the presence tool definitions for native tool calling.
 pub fn presence_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -166,6 +166,39 @@ pub fn presence_tools() -> Vec<ToolDefinition> {
                 "required": ["level"]
             }),
         },
+        // ── Video / frame tools ──
+        ToolDefinition {
+            name: "inspect_frame".to_string(),
+            description: "Retrieve the high-resolution version of a video frame. If frame_id is omitted, returns the latest frame. The HQ image will be injected into your context after the tool response.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "frame_id": {
+                        "type": "string",
+                        "description": "The frame ID to inspect (e.g. 'cam0-f00047'). Omit for the latest frame."
+                    }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "inspect_frames".to_string(),
+            description: "Search for past video frames by time range or description. Returns frame metadata (IDs, timestamps, streams) without images — use inspect_frame on specific results to see them.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query: a time range like 'last 30s', a stream name like 'cam0', or a description."
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return. Default 10."
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
     ]
 }
 
@@ -176,7 +209,7 @@ mod tests {
     #[test]
     fn presence_tools_count_and_names() {
         let tools = presence_tools();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 11);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"submit_task"));
         assert!(names.contains(&"check_status"));
@@ -187,5 +220,7 @@ mod tests {
         assert!(names.contains(&"skip_action"));
         assert!(names.contains(&"respond_to_question"));
         assert!(names.contains(&"set_autonomy"));
+        assert!(names.contains(&"inspect_frame"));
+        assert!(names.contains(&"inspect_frames"));
     }
 }

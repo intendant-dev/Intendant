@@ -423,6 +423,43 @@ impl PresenceWeb {
         }
     }
 
+    /// Send a video frame to the active live provider.
+    /// `base64_jpeg` is the 768x768 live-resolution frame.
+    /// `frame_id` is the client-assigned ID (e.g. "cam0-f00047").
+    #[wasm_bindgen]
+    pub fn send_frame(&self, base64_jpeg: &str, frame_id: &str) {
+        match self.active_provider.borrow().as_str() {
+            "gemini" => {
+                if let Some(ref g) = *self.gemini.borrow() {
+                    g.send_frame(base64_jpeg, frame_id);
+                }
+            }
+            "openai" => {
+                if let Some(ref o) = *self.openai.borrow() {
+                    o.send_frame(base64_jpeg, frame_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Send a frame ID context annotation to the live provider as system text.
+    /// Called alongside send_frame so the model knows the ID of the image it just received.
+    #[wasm_bindgen]
+    pub fn send_frame_context(&self, frame_id: &str) {
+        let text = format!("[frame:{}]", frame_id);
+        self.send_text(&text);
+    }
+
+    /// Send a video frame to the server for HQ archival.
+    /// `base64_jpeg` is the original resolution frame.
+    /// `frame_id` is the client-assigned ID.
+    /// `stream` is the source stream name (e.g. "cam0").
+    #[wasm_bindgen]
+    pub fn send_video_frame_to_server(&self, base64_jpeg: &str, frame_id: &str, stream: &str) {
+        self.server.borrow().send_video_frame(base64_jpeg, frame_id, stream);
+    }
+
     #[wasm_bindgen]
     pub fn send_text(&self, text: &str) {
         match self.active_provider.borrow().as_str() {
