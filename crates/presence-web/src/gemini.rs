@@ -252,20 +252,16 @@ impl GeminiProvider {
         turn_tool_calls: &Cell<u32>,
         turn_has_speech: &Cell<bool>,
     ) {
-        // Log top-level keys for debugging (helps identify when usageMetadata is/isn't sent).
-        if let Some(obj) = msg.as_object() {
-            let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
-            callbacks.invoke_diagnostic("gemini_keys", &keys.join(","));
-        }
-
         // usageMetadata can appear alongside any server message.
         // Normalize Gemini-specific fields into provider-agnostic LiveUsage.
         if let Some(usage) = msg.get("usageMetadata") {
+            let total = usage["totalTokenCount"].as_u64().unwrap_or(0);
             callbacks.invoke_diagnostic("gemini_usage", &format!(
-                "usageMetadata: total={} prompt={} response={}",
-                usage["totalTokenCount"].as_u64().unwrap_or(0),
+                "tokens: total={} prompt={} response={} thinking={}",
+                total,
                 usage["promptTokenCount"].as_u64().unwrap_or(0),
                 usage["responseTokenCount"].as_u64().unwrap_or(0),
+                usage["thoughtsTokenCount"].as_u64().unwrap_or(0),
             ));
             let live_usage = crate::LiveUsage {
                 input_tokens: usage["promptTokenCount"].as_u64().unwrap_or(0),

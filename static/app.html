@@ -1469,11 +1469,26 @@ async function main() {
   });
 
   app.set_on_live_usage((usage) => {
-    // Route live usage through WASM AppState for proper rendering + cost calculation,
-    // and send to server for caching/broadcast.
-    if (usage && typeof app.handle_live_usage === 'function') {
+    if (!usage) return;
+    // Preferred path: route through WASM AppState for rendering + cost + server broadcast.
+    if (typeof app.handle_live_usage === 'function') {
       const cmds = app.handle_live_usage(usage);
       if (cmds) processCommands(cmds);
+    } else {
+      // Fallback for WASM without handle_live_usage: send to server via
+      // send_server_action (which calls send_json on the WebSocket).
+      // The server handles "t":"live_usage_update" and broadcasts it back,
+      // which AppState picks up via handle_server_message.
+      try {
+        app.send_server_action({
+          t: 'live_usage_update',
+          input_tokens: usage.input_tokens || 0,
+          output_tokens: usage.output_tokens || 0,
+          cached_tokens: usage.cached_tokens || 0,
+          total_tokens: usage.total_tokens || 0,
+          thinking_tokens: usage.thinking_tokens || 0,
+        });
+      } catch(_) {}
     }
   });
 
