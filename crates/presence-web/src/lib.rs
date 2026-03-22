@@ -602,6 +602,21 @@ impl PresenceWeb {
         self.server.borrow().send_voice_diagnostic(kind, detail);
     }
 
+    /// Send live model usage to the server for tracking/broadcast.
+    pub fn send_live_usage(&self, input: u64, output: u64, cached: u64, total: u64, thinking: u64) {
+        self.server.borrow().send_live_usage(input, output, cached, total, thinking);
+    }
+
+    /// Get the active voice provider name (e.g. "gemini", "openai", or "").
+    pub fn active_voice_provider(&self) -> String {
+        self.active_provider.borrow().clone()
+    }
+
+    /// Get the active voice model name from the server connection.
+    pub fn active_voice_model(&self) -> String {
+        self.server.borrow().active_model()
+    }
+
     // --- High-level handlers (consolidate JS logic into WASM) ---
 
     /// Handle a voice model tool call end-to-end.
@@ -795,6 +810,32 @@ impl PresenceWeb {
     }
 
     // --- Dashboard state (log/usage/approval UI) ---
+
+    /// Handle live model usage from Gemini Live / OpenAI Realtime.
+    /// Updates dashboard state, sends to server, returns `UiCommand[]`.
+    #[wasm_bindgen]
+    pub fn handle_live_usage(&self, usage: JsValue) -> JsValue {
+        let Ok(val) = serde_wasm_bindgen::from_value::<serde_json::Value>(usage) else {
+            return JsValue::NULL;
+        };
+        let provider = self.active_voice_provider();
+        let model = self.active_voice_model();
+        let input_tokens = val["input_tokens"].as_u64().unwrap_or(0);
+        let output_tokens = val["output_tokens"].as_u64().unwrap_or(0);
+        let cached_tokens = val["cached_tokens"].as_u64().unwrap_or(0);
+        let total_tokens = val["total_tokens"].as_u64().unwrap_or(0);
+        let thinking_tokens = val["thinking_tokens"].as_u64().unwrap_or(0);
+
+        // Update WASM state for immediate rendering
+        let cmds = self.dashboard.borrow_mut().update_live_usage(
+            &provider, &model,
+            input_tokens, output_tokens, cached_tokens, total_tokens, thinking_tokens,
+        );
+        // Notify server for caching/broadcast to other connections
+        self.send_live_usage(input_tokens, output_tokens, cached_tokens, total_tokens, thinking_tokens);
+
+        to_js(&cmds)
+    }
 
     /// Route a raw server message through the dashboard state machine.
     /// Returns `UiCommand[]` as a JS array for the rendering layer.
