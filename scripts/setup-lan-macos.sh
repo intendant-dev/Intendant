@@ -129,6 +129,10 @@ write_pf_anchor() {
     info "writing pfctl anchor rules..."
     cat > "$PF_ANCHOR_FILE" <<RULES
 # Intendant LAN — forward to UTM guest at $VM_IP
+# NAT masquerade: ensure VM outbound traffic gets source-NATted when
+# IP forwarding is enabled, otherwise packets leave with the VM's private
+# IP and responses never come back (breaks guest internet).
+nat on $LAN_IFACE from $VM_IP to any -> ($LAN_IFACE)
 rdr pass on $LAN_IFACE inet proto tcp from any to any port $HTTPS_PORT -> $VM_IP port $HTTPS_PORT
 rdr pass on $LAN_IFACE inet proto tcp from any to any port $CERT_PORT -> $VM_IP port $CERT_PORT
 RULES
@@ -149,10 +153,12 @@ add_pf_conf_anchor() {
 
     info "adding anchor to $PF_CONF..."
 
-    # Insert rdr-anchor after the last existing rdr-anchor line,
+    # Insert nat-anchor after the last existing nat-anchor line,
+    # rdr-anchor after the last existing rdr-anchor line,
     # and append load-anchor at the end.
-    local last_rdr
-    last_rdr=$(grep -n '^rdr-anchor' "$PF_CONF" | tail -1 | cut -d: -f1)
+    local last_nat last_rdr
+    last_nat=$(grep -n '^nat-anchor' "$PF_CONF" | tail -1 | cut -d: -f1 || true)
+    last_rdr=$(grep -n '^rdr-anchor' "$PF_CONF" | tail -1 | cut -d: -f1 || true)
 
     local tmp
     tmp=$(mktemp)
@@ -160,7 +166,10 @@ add_pf_conf_anchor() {
     while IFS= read -r line; do
         n=$((n + 1))
         printf '%s\n' "$line" >> "$tmp"
-        if [[ "$n" -eq "$last_rdr" ]]; then
+        if [[ -n "$last_nat" && "$n" -eq "$last_nat" ]]; then
+            printf 'nat-anchor "%s"\n' "$PF_ANCHOR" >> "$tmp"
+        fi
+        if [[ -n "$last_rdr" && "$n" -eq "$last_rdr" ]]; then
             printf 'rdr-anchor "%s"\n' "$PF_ANCHOR" >> "$tmp"
         fi
     done < "$PF_CONF"
