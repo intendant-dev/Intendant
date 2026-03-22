@@ -255,6 +255,14 @@ impl GeminiProvider {
         // usageMetadata can appear alongside any server message.
         // Normalize Gemini-specific fields into provider-agnostic LiveUsage.
         if let Some(usage) = msg.get("usageMetadata") {
+            let total = usage["totalTokenCount"].as_u64().unwrap_or(0);
+            callbacks.invoke_diagnostic("gemini_usage", &format!(
+                "tokens: total={} prompt={} response={} thinking={}",
+                total,
+                usage["promptTokenCount"].as_u64().unwrap_or(0),
+                usage["responseTokenCount"].as_u64().unwrap_or(0),
+                usage["thoughtsTokenCount"].as_u64().unwrap_or(0),
+            ));
             let live_usage = crate::LiveUsage {
                 input_tokens: usage["promptTokenCount"].as_u64().unwrap_or(0),
                 output_tokens: usage["responseTokenCount"].as_u64().unwrap_or(0),

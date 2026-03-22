@@ -1469,12 +1469,9 @@ async function main() {
   });
 
   app.set_on_live_usage((usage) => {
-    // Route live usage through WASM AppState for proper rendering + cost calculation,
-    // and send to server for caching/broadcast.
-    if (usage && typeof app.handle_live_usage === 'function') {
-      const cmds = app.handle_live_usage(usage);
-      if (cmds) processCommands(cmds);
-    }
+    if (!usage) return;
+    const cmds = app.handle_live_usage(usage);
+    if (cmds) processCommands(cmds);
   });
 
   app.set_on_error((msg) => {

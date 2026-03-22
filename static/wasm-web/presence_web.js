@@ -19,6 +19,38 @@ export class PresenceWeb {
         wasm.__wbg_presenceweb_free(ptr, 0);
     }
     /**
+     * Get the active voice model name from the server connection.
+     * @returns {string}
+     */
+    active_voice_model() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.presenceweb_active_voice_model(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Get the active voice provider name (e.g. "gemini", "openai", or "").
+     * @returns {string}
+     */
+    active_voice_provider() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.presenceweb_active_voice_provider(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
      * @param {string} url
      */
     connect_server(url) {
@@ -84,6 +116,16 @@ export class PresenceWeb {
      */
     get_tools() {
         const ret = wasm.presenceweb_get_tools(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Handle live model usage from Gemini Live / OpenAI Realtime.
+     * Updates dashboard state, sends to server, returns `UiCommand[]`.
+     * @param {any} usage
+     * @returns {any}
+     */
+    handle_live_usage(usage) {
+        const ret = wasm.presenceweb_handle_live_usage(this.__wbg_ptr, usage);
         return ret;
     }
     /**
@@ -261,6 +303,17 @@ export class PresenceWeb {
         const ptr0 = passStringToWasm0(key, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         wasm.presenceweb_send_key(this.__wbg_ptr, ptr0, len0, ctrl, alt, shift);
+    }
+    /**
+     * Send live model usage to the server for tracking/broadcast.
+     * @param {bigint} input
+     * @param {bigint} output
+     * @param {bigint} cached
+     * @param {bigint} total
+     * @param {bigint} thinking
+     */
+    send_live_usage(input, output, cached, total, thinking) {
+        wasm.presenceweb_send_live_usage(this.__wbg_ptr, input, output, cached, total, thinking);
     }
     /**
      * Request to become the active voice owner (triggers handover from current active).
