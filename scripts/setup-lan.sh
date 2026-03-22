@@ -138,7 +138,7 @@ generate_certs() {
     openssl req -x509 -new -nodes \
         -key "$CERT_DIR/ca.key" \
         -days 3650 -out "$CERT_DIR/ca.crt" \
-        -subj "/CN=Intendant CA" 2>/dev/null
+        -subj "/CN=Intendant CA ($LAN_IP)" 2>/dev/null
 
     # Server cert (SAN required by modern iOS/browsers)
     generate_server_cert
@@ -148,7 +148,7 @@ generate_certs() {
     openssl req -new \
         -key "$CERT_DIR/client.key" \
         -out "$CERT_DIR/client.csr" \
-        -subj "/CN=Intendant Client" 2>/dev/null
+        -subj "/CN=Intendant Client ($LAN_IP)" 2>/dev/null
     openssl x509 -req \
         -in "$CERT_DIR/client.csr" \
         -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" -CAcreateserial \
