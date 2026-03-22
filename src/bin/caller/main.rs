@@ -3765,6 +3765,7 @@ async fn main() -> Result<(), CallerError> {
                 transcriber,
                 None, // MCP mode: no WebTui
                 Some(frame_registry.clone()),
+                Some(session_log.clone()),
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -4168,6 +4169,7 @@ async fn main() -> Result<(), CallerError> {
                 transcriber,
                 web_tui_tx.clone(),
                 Some(frame_registry.clone()),
+                Some(session_log.clone()),
             );
             app.log(
                 types::LogLevel::Info,
@@ -4444,6 +4446,7 @@ async fn main() -> Result<(), CallerError> {
                 transcriber,
                 None, // Headless mode: no WebTui
                 Some(frame_registry.clone()),
+                Some(session_log.clone()),
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",
