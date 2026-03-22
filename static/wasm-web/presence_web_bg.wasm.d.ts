@@ -2,6 +2,8 @@
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
 export const __wbg_presenceweb_free: (a: number, b: number) => void;
+export const presenceweb_active_voice_model: (a: number) => [number, number];
+export const presenceweb_active_voice_provider: (a: number) => [number, number];
 export const presenceweb_connect_server: (a: number, b: number, c: number) => void;
 export const presenceweb_connect_voice: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const presenceweb_disconnect_voice: (a: number) => void;
@@ -9,6 +11,7 @@ export const presenceweb_dispatch_tool: (a: number, b: number, c: number, d: any
 export const presenceweb_get_prompt: (a: number) => [number, number];
 export const presenceweb_get_state: (a: number) => any;
 export const presenceweb_get_tools: (a: number) => any;
+export const presenceweb_handle_live_usage: (a: number, b: any) => any;
 export const presenceweb_handle_server_event: (a: number, b: any) => number;
 export const presenceweb_handle_server_message: (a: number, b: any) => any;
 export const presenceweb_handle_voice_tool_call: (a: number, b: any) => any;
@@ -26,6 +29,7 @@ export const presenceweb_send_frame: (a: number, b: number, c: number, d: number
 export const presenceweb_send_frame_context: (a: number, b: number, c: number) => void;
 export const presenceweb_send_human_response: (a: number, b: number, c: number) => any;
 export const presenceweb_send_key: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+export const presenceweb_send_live_usage: (a: number, b: bigint, c: bigint, d: bigint, e: bigint, f: bigint) => void;
 export const presenceweb_send_make_active: (a: number) => void;
 export const presenceweb_send_presence_checkpoint: (a: number, b: number, c: number) => void;
 export const presenceweb_send_resize: (a: number, b: number, c: number) => void;

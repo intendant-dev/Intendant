@@ -11,6 +11,14 @@
 export class PresenceWeb {
     free(): void;
     [Symbol.dispose](): void;
+    /**
+     * Get the active voice model name from the server connection.
+     */
+    active_voice_model(): string;
+    /**
+     * Get the active voice provider name (e.g. "gemini", "openai", or "").
+     */
+    active_voice_provider(): string;
     connect_server(url: string): void;
     connect_voice(provider: string, token: string, model?: string | null, input_sample_rate?: number | null): void;
     disconnect_voice(): void;
@@ -24,6 +32,11 @@ export class PresenceWeb {
      * Get presence tools as JS array (from presence-core).
      */
     get_tools(): any;
+    /**
+     * Handle live model usage from Gemini Live / OpenAI Realtime.
+     * Updates dashboard state, sends to server, returns `UiCommand[]`.
+     */
+    handle_live_usage(usage: any): any;
     /**
      * Handle a server event by injecting system text into the voice model.
      * Returns true if a message was sent to the voice model.
@@ -88,6 +101,10 @@ export class PresenceWeb {
      */
     send_human_response(text: string): any;
     send_key(key: string, ctrl: boolean, alt: boolean, shift: boolean): void;
+    /**
+     * Send live model usage to the server for tracking/broadcast.
+     */
+    send_live_usage(input: bigint, output: bigint, cached: bigint, total: bigint, thinking: bigint): void;
     /**
      * Request to become the active voice owner (triggers handover from current active).
      */
@@ -234,6 +251,8 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_presenceweb_free: (a: number, b: number) => void;
+    readonly presenceweb_active_voice_model: (a: number) => [number, number];
+    readonly presenceweb_active_voice_provider: (a: number) => [number, number];
     readonly presenceweb_connect_server: (a: number, b: number, c: number) => void;
     readonly presenceweb_connect_voice: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly presenceweb_disconnect_voice: (a: number) => void;
@@ -241,6 +260,7 @@ export interface InitOutput {
     readonly presenceweb_get_prompt: (a: number) => [number, number];
     readonly presenceweb_get_state: (a: number) => any;
     readonly presenceweb_get_tools: (a: number) => any;
+    readonly presenceweb_handle_live_usage: (a: number, b: any) => any;
     readonly presenceweb_handle_server_event: (a: number, b: any) => number;
     readonly presenceweb_handle_server_message: (a: number, b: any) => any;
     readonly presenceweb_handle_voice_tool_call: (a: number, b: any) => any;
@@ -258,6 +278,7 @@ export interface InitOutput {
     readonly presenceweb_send_frame_context: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_human_response: (a: number, b: number, c: number) => any;
     readonly presenceweb_send_key: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly presenceweb_send_live_usage: (a: number, b: bigint, c: bigint, d: bigint, e: bigint, f: bigint) => void;
     readonly presenceweb_send_make_active: (a: number) => void;
     readonly presenceweb_send_presence_checkpoint: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_resize: (a: number, b: number, c: number) => void;
