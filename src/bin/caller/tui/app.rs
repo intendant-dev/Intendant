@@ -1761,13 +1761,10 @@ impl App {
                         p_display, m_display
                     ), LogSource::Live, Some(self.voice_turn));
                 }
-                // Update displayed model/provider to the live model
-                if let Some(ref provider) = live_provider {
-                    self.presence_provider_name = Some(provider.clone());
-                }
-                if let Some(ref model) = live_model {
-                    self.presence_model_name = Some(model.clone());
-                }
+                // Note: we no longer overwrite presence_model_name with the live model.
+                // The live model now has its own dedicated card in the Usage tab
+                // via LiveUsageUpdate events. The presence card should continue
+                // showing the server-side presence model (if it was ever active).
             }
             AppEvent::PresenceDisconnected => {
                 self.flush_voice_transcript();
