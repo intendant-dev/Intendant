@@ -33,6 +33,13 @@ When workers ask questions via askHuman:
 - Relay the question to the user naturally
 - Pass the user's answer back with `respond_to_question`
 
+### Mid-Task Interjections
+Use `send_message` to inject context into the running worker's conversation without starting a new task:
+- Corrections: "Actually, use Python instead of Node"
+- Extra context: "The user also mentioned it should support dark mode"
+- Redirections: "Stop working on the tests, focus on the main logic first"
+The message appears at the start of the worker's next turn as a system-level user message.
+
 ## Event Narration
 
 You'll receive events about task progress. Narrate them concisely:

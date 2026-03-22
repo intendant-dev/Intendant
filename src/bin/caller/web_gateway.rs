@@ -121,6 +121,8 @@ pub struct WebQueryCtx {
     pub knowledge_path: PathBuf,
     /// Server-authoritative presence session (event window + checkpoint state).
     pub presence_session: Option<Arc<Mutex<crate::presence::PresenceSession>>>,
+    /// Shared context injection queue for mid-task interjections.
+    pub context_injection: Option<crate::event::ContextInjectionQueue>,
 }
 
 /// Debug state for the voice model, tracked server-side from WebSocket messages.
@@ -1223,6 +1225,7 @@ pub fn spawn_web_gateway(
                                                                 &tool_name,
                                                                 &io_args,
                                                                 frame_registry_inbound.as_ref(),
+                                                                ctx.context_injection.as_ref(),
                                                             ).await {
                                                                 result
                                                             } else {
@@ -1279,6 +1282,7 @@ pub fn spawn_web_gateway(
                                                     &tool,
                                                     &args,
                                                     frame_registry_inbound.as_ref(),
+                                                    ctx.context_injection.as_ref(),
                                                 ).await {
                                                     result
                                                 } else {
@@ -1980,6 +1984,7 @@ mod tests {
             log_dir: PathBuf::from("/tmp"),
             knowledge_path: PathBuf::from("/tmp/knowledge.json"),
             presence_session: None,
+            context_injection: None,
         });
 
         let config = WebGatewayConfig::default();
@@ -2034,6 +2039,7 @@ mod tests {
             log_dir: PathBuf::from("/tmp"),
             knowledge_path: PathBuf::from("/tmp/knowledge.json"),
             presence_session: None,
+            context_injection: None,
         });
 
         let config = WebGatewayConfig::default();
@@ -2098,6 +2104,7 @@ mod tests {
             log_dir: PathBuf::from("/tmp"),
             knowledge_path: PathBuf::from("/tmp/knowledge.json"),
             presence_session: None,
+            context_injection: None,
         });
 
         let config = WebGatewayConfig::default();

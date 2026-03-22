@@ -166,6 +166,21 @@ pub fn presence_tools() -> Vec<ToolDefinition> {
                 "required": ["level"]
             }),
         },
+        // ── Interjection tool ──
+        ToolDefinition {
+            name: "send_message".to_string(),
+            description: "Send a message to the running worker agent as a mid-task interjection. The message will be injected into the agent's conversation at the start of its next turn. Use this for corrections, additional context, or redirections — NOT for new tasks (use submit_task for those).".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The message to inject into the agent's conversation."
+                    }
+                },
+                "required": ["message"]
+            }),
+        },
         // ── Video / frame tools ──
         ToolDefinition {
             name: "inspect_frame".to_string(),
@@ -209,7 +224,7 @@ mod tests {
     #[test]
     fn presence_tools_count_and_names() {
         let tools = presence_tools();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"submit_task"));
         assert!(names.contains(&"check_status"));
@@ -220,6 +235,7 @@ mod tests {
         assert!(names.contains(&"skip_action"));
         assert!(names.contains(&"respond_to_question"));
         assert!(names.contains(&"set_autonomy"));
+        assert!(names.contains(&"send_message"));
         assert!(names.contains(&"inspect_frame"));
         assert!(names.contains(&"inspect_frames"));
     }

@@ -2873,6 +2873,7 @@ async fn run_with_presence(
         log_dir.clone(),
         project.root.clone(),
         presence_paused,
+        context_injection.clone(),
     );
 
     // 6. Send initial task to presence (if provided), with a timeout so a
@@ -4237,6 +4238,7 @@ async fn main() -> Result<(), CallerError> {
                     log_dir: log_dir.clone(),
                     knowledge_path: project.memory_path(),
                     presence_session: Some(presence_session.clone()),
+                    context_injection: Some(app.context_injection.clone()),
                 }
             });
             let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
