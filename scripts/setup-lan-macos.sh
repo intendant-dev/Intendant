@@ -295,6 +295,28 @@ run_wizard() {
     fi
     info "SSH connection OK"
 
+    # Suggest SSH keys if password auth was used
+    if ! as_user ssh -o BatchMode=yes -o ConnectTimeout=3 \
+            "${VM_USER}@${VM_IP}" "true" &>/dev/null; then
+        echo ""
+        echo "  Tip: set up SSH keys to avoid repeated password prompts:"
+        echo "    ssh-copy-id ${VM_USER}@${VM_IP}"
+        echo ""
+        local setup_keys
+        setup_keys=$(ask "Set up SSH keys now? (y/n)" "y")
+        if [[ "$setup_keys" == "y" ]]; then
+            # Generate key if none exists
+            local key_file="$REAL_HOME/.ssh/id_ed25519"
+            if [[ ! -f "$key_file" ]]; then
+                info "generating SSH key..."
+                as_user ssh-keygen -t ed25519 -f "$key_file" -N "" -q
+            fi
+            info "copying key to VM (enter password one last time)..."
+            as_user ssh-copy-id -o StrictHostKeyChecking=accept-new "${VM_USER}@${VM_IP}"
+            info "SSH keys configured — no more password prompts"
+        fi
+    fi
+
     # Step 4: Port
     echo ""
     HTTPS_PORT=$(ask "HTTPS port for phone access" "8443")
@@ -333,10 +355,16 @@ run_wizard() {
         setup_port_forwarding
     fi
 
+    # UTM shared networking often lacks IPv6 routing — tell apt to use IPv4
+    if [[ "$NET_MODE" == "shared" ]]; then
+        info "configuring apt to prefer IPv4 on VM..."
+        run_on_guest "echo 'Acquire::ForceIPv4 \"true\";' | sudo tee /etc/apt/apt.conf.d/99force-ipv4 >/dev/null"
+    fi
+
     info "copying setup script to VM..."
     copy_to_guest
 
-    info "running setup on VM (follow the prompts there)..."
+    info "running setup on VM..."
     run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME --port $HTTPS_PORT"
 
     save_config
