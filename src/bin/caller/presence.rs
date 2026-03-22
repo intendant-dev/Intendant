@@ -97,6 +97,8 @@ pub struct PresenceLayer {
     /// All events and user input are silently dropped — the browser live model
     /// IS the presence and dispatches tasks directly via task_tx.
     paused: Arc<AtomicUsize>,
+    /// Shared context injection queue for mid-task interjections into the agent loop.
+    context_injection: crate::event::ContextInjectionQueue,
     /// Cumulative prompt/completion/cached tokens across all presence turns.
     cumulative_prompt: u64,
     cumulative_completion: u64,
@@ -117,6 +119,7 @@ impl PresenceLayer {
         log_dir: PathBuf,
         project_root: PathBuf,
         paused: Arc<AtomicUsize>,
+        context_injection: crate::event::ContextInjectionQueue,
     ) -> Self {
         let conversation = Conversation::new(system_prompt, context_window);
         Self {
@@ -132,6 +135,7 @@ impl PresenceLayer {
             turn: 0,
             last_narration_at: std::time::Instant::now() - NARRATION_DEBOUNCE,
             paused,
+            context_injection,
             cumulative_prompt: 0,
             cumulative_completion: 0,
             cumulative_cached: 0,
@@ -347,6 +351,19 @@ impl PresenceLayer {
                 match tool_name.as_str() {
                     "query_detail" => self.handle_query_detail(&args).await,
                     "recall_memory" => self.handle_recall_memory(&args),
+                    "send_message" => {
+                        let msg = args["message"].as_str().unwrap_or("").to_string();
+                        if msg.is_empty() {
+                            "Error: message is required".to_string()
+                        } else {
+                            if let Ok(mut q) = self.context_injection.lock() {
+                                q.push(crate::event::ContextInjection::text(
+                                    format!("[Presence] {}", msg),
+                                ));
+                            }
+                            format!("Message injected: {}", msg)
+                        }
+                    }
                     "inspect_frame" | "inspect_frames" => {
                         "Frame inspection is only available in live video mode (browser).".to_string()
                     }
@@ -600,6 +617,7 @@ pub async fn handle_tool_query(
     tool_name: &str,
     args: &Value,
     frame_registry: Option<&Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
+    context_injection: Option<&crate::event::ContextInjectionQueue>,
 ) -> Option<String> {
     match tool_name {
         "check_status" => {
@@ -615,6 +633,20 @@ pub async fn handle_tool_query(
         }
         "recall_memory" => {
             Some(recall_memory(knowledge_path, log_dir, args))
+        }
+        "send_message" => {
+            let msg = args["message"].as_str().unwrap_or("").to_string();
+            if msg.is_empty() {
+                return Some("Error: message is required".to_string());
+            }
+            if let Some(q) = context_injection {
+                if let Ok(mut q) = q.lock() {
+                    q.push(crate::event::ContextInjection::text(
+                        format!("[Presence] {}", msg),
+                    ));
+                }
+            }
+            Some(format!("Message injected: {}", msg))
         }
         "inspect_frame" => {
             let reg = frame_registry?;
@@ -1137,7 +1169,7 @@ mod tests {
     #[test]
     fn presence_tools_count_and_names() {
         let tools = presence_tools();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"submit_task"));
@@ -1149,6 +1181,7 @@ mod tests {
         assert!(names.contains(&"skip_action"));
         assert!(names.contains(&"respond_to_question"));
         assert!(names.contains(&"set_autonomy"));
+        assert!(names.contains(&"send_message"));
         assert!(names.contains(&"inspect_frame"));
         assert!(names.contains(&"inspect_frames"));
     }

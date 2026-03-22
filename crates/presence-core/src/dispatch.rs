@@ -60,6 +60,10 @@ pub fn dispatch_tool_call(
             tool_name: "recall_memory".to_string(),
             args: args.clone(),
         },
+        "send_message" => PresenceAction::NeedsIO {
+            tool_name: "send_message".to_string(),
+            args: args.clone(),
+        },
         "inspect_frame" => PresenceAction::NeedsIO {
             tool_name: "inspect_frame".to_string(),
             args: args.clone(),
