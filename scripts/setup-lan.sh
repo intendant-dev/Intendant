@@ -44,6 +44,7 @@ parse_args() {
             --backend)  BACKEND="$2"; shift 2 ;;
             --tunnel)   TUNNEL_TARGET="$2"; shift 2 ;;
             --port)     HTTPS_PORT="$2"; shift 2 ;;
+            --lan-ip)   LAN_IP="$2"; shift 2 ;;
             --recert)   ACTION="recert"; shift ;;
             --force)    FORCE=true; shift ;;
             --remove)   ACTION="remove"; shift ;;
@@ -54,6 +55,10 @@ parse_args() {
 }
 
 detect_lan_ip() {
+    if [[ -n "$LAN_IP" ]]; then
+        info "LAN IP: $LAN_IP (override)"
+        return
+    fi
     LAN_IP=$(hostname -I | awk '{print $1}')
     [[ -n "$LAN_IP" ]] || die "could not detect LAN IP"
     info "LAN IP: $LAN_IP"
@@ -133,7 +138,7 @@ generate_certs() {
     openssl req -x509 -new -nodes \
         -key "$CERT_DIR/ca.key" \
         -days 3650 -out "$CERT_DIR/ca.crt" \
-        -subj "/CN=Intendant CA" 2>/dev/null
+        -subj "/CN=Intendant CA ($LAN_IP)" 2>/dev/null
 
     # Server cert (SAN required by modern iOS/browsers)
     generate_server_cert
@@ -143,7 +148,7 @@ generate_certs() {
     openssl req -new \
         -key "$CERT_DIR/client.key" \
         -out "$CERT_DIR/client.csr" \
-        -subj "/CN=Intendant Client" 2>/dev/null
+        -subj "/CN=Intendant Client ($LAN_IP)" 2>/dev/null
     openssl x509 -req \
         -in "$CERT_DIR/client.csr" \
         -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" -CAcreateserial \
