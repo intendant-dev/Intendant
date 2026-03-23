@@ -1917,6 +1917,7 @@ pub fn spawn_event_listener(
                     AppEvent::DisplayReady {
                         display_id,
                         vnc_port,
+                        ..
                     } => {
                         let info = if let Some(port) = vnc_port {
                             format!("Display :{}, VNC port {}", display_id, port)
@@ -2030,6 +2031,15 @@ pub fn spawn_event_listener(
                     }
                     AppEvent::LiveUsageUpdate { .. } => {
                         // Broadcast-only — handled by outbound event converter.
+                    }
+                    AppEvent::RecordingStarted { ref stream_name } => {
+                        s.push_log(LogLevel::Detail, format!("Recording started: {}", stream_name));
+                    }
+                    AppEvent::RecordingStopped { ref stream_name } => {
+                        s.push_log(LogLevel::Detail, format!("Recording stopped: {}", stream_name));
+                    }
+                    AppEvent::RecordingError { ref stream_name, ref message } => {
+                        s.push_log(LogLevel::Warn, format!("Recording error ({}): {}", stream_name, message));
                     }
                 }
             }

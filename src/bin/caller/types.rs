@@ -133,6 +133,8 @@ pub enum OutboundEvent {
     DisplayReady {
         display_id: u32,
         vnc_port: Option<u32>,
+        width: u32,
+        height: u32,
     },
     DisplayTaken {
         display_id: u32,
@@ -141,6 +143,16 @@ pub enum OutboundEvent {
         display_id: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+    },
+    RecordingStarted {
+        stream_name: String,
+    },
+    RecordingStopped {
+        stream_name: String,
+    },
+    RecordingError {
+        stream_name: String,
+        message: String,
     },
     Status {
         turn: usize,

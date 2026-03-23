@@ -127,6 +127,8 @@ pub enum AppEvent {
     DisplayReady {
         display_id: u32,
         vnc_port: Option<u32>,
+        width: u32,
+        height: u32,
     },
 
     // Display takeover
@@ -136,6 +138,18 @@ pub enum AppEvent {
     DisplayReleased {
         display_id: u32,
         note: Option<String>,
+    },
+
+    // Recording lifecycle
+    RecordingStarted {
+        stream_name: String,
+    },
+    RecordingStopped {
+        stream_name: String,
+    },
+    RecordingError {
+        stream_name: String,
+        message: String,
     },
 
     // Session directory changed (MCP per-task isolation)
@@ -468,9 +482,13 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::DisplayReady {
             display_id,
             vnc_port,
+            width,
+            height,
         } => Some(OutboundEvent::DisplayReady {
             display_id: *display_id,
             vnc_port: *vnc_port,
+            width: *width,
+            height: *height,
         }),
         AppEvent::DisplayTaken { display_id } => Some(OutboundEvent::DisplayTaken {
             display_id: *display_id,
@@ -576,6 +594,19 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             source: source.clone(),
             content: content.clone(),
             turn: *turn,
+        }),
+        AppEvent::RecordingStarted { stream_name } => Some(OutboundEvent::RecordingStarted {
+            stream_name: stream_name.clone(),
+        }),
+        AppEvent::RecordingStopped { stream_name } => Some(OutboundEvent::RecordingStopped {
+            stream_name: stream_name.clone(),
+        }),
+        AppEvent::RecordingError {
+            stream_name,
+            message,
+        } => Some(OutboundEvent::RecordingError {
+            stream_name: stream_name.clone(),
+            message: message.clone(),
         }),
         // Terminal-only / internal events — not broadcast to external consumers
         AppEvent::Key(_)

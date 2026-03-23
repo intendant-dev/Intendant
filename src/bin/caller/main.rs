@@ -11,6 +11,7 @@ mod mcp;
 mod mcp_client;
 mod presence;
 mod project;
+mod recording;
 mod prompts;
 mod provider;
 mod sandbox;
@@ -655,6 +656,8 @@ async fn maybe_auto_launch_xvfb(
             bus.send(AppEvent::DisplayReady {
                 display_id,
                 vnc_port,
+                width: config.width,
+                height: config.height,
             });
             *xvfb_guard = Some(guard);
         }
@@ -3705,6 +3708,13 @@ async fn main() -> Result<(), CallerError> {
     let frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>> =
         Arc::new(tokio::sync::RwLock::new(frames::FrameRegistry::new(&log_dir)));
 
+    // Create recording registry (listener spawned after bus creation in each mode).
+    let recording_registry: Arc<tokio::sync::RwLock<recording::RecordingRegistry>> =
+        Arc::new(tokio::sync::RwLock::new(recording::RecordingRegistry::new(
+            &log_dir,
+            project.config.recording.clone(),
+        )));
+
     configure_sandbox_env(&flags, &project, &log_dir);
 
     // CLI --transcription flag overrides config file setting
@@ -3798,6 +3808,9 @@ async fn main() -> Result<(), CallerError> {
         let _human_monitor =
             event::spawn_human_question_monitor(bus.clone(), human_question_path.clone());
         let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
+        let _recording_listener = recording::spawn_recording_listener(
+            bus.subscribe(), recording_registry.clone(), bus.clone(),
+        );
         let mcp_control_tx = if flags.control_socket {
             let (_control_handle, control_tx) = control::spawn_control_server(bus.clone());
             slog(&session_log, |l| {
@@ -3863,6 +3876,7 @@ async fn main() -> Result<(), CallerError> {
                 None, // MCP mode: no WebTui
                 Some(frame_registry.clone()),
                 Some(session_log.clone()),
+                Some(recording_registry.clone()),
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -4101,6 +4115,9 @@ async fn main() -> Result<(), CallerError> {
             bus.clone(),
             event::shared_question_path(log_dir.join("human_question")),
         );
+        let _recording_listener = recording::spawn_recording_listener(
+            bus.subscribe(), recording_registry.clone(), bus.clone(),
+        );
 
         // TUI is created later — just before run() — so that web mode
         // (--web) can use WebTui instead of the real terminal backend.
@@ -4268,6 +4285,7 @@ async fn main() -> Result<(), CallerError> {
                 web_tui_tx.clone(),
                 Some(frame_registry.clone()),
                 Some(session_log.clone()),
+                Some(recording_registry.clone()),
             );
             app.log(
                 types::LogLevel::Info,
@@ -4494,6 +4512,9 @@ async fn main() -> Result<(), CallerError> {
 
         // Headless mode (--no-tui or non-TTY)
         let bus = EventBus::new();
+        let _recording_listener = recording::spawn_recording_listener(
+            bus.subscribe(), recording_registry.clone(), bus.clone(),
+        );
 
         // Outbound broadcast channel — shared by web gateway and JSON stdout subscriber
         let (outbound_tx, _) = tokio::sync::broadcast::channel::<String>(256);
@@ -4547,6 +4568,7 @@ async fn main() -> Result<(), CallerError> {
                 None, // Headless mode: no WebTui
                 Some(frame_registry.clone()),
                 Some(session_log.clone()),
+                Some(recording_registry.clone()),
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",

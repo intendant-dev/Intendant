@@ -506,6 +506,7 @@ pub fn spawn_web_gateway(
     web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
     frame_registry: Option<Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
     session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
+    recording_registry: Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -622,6 +623,7 @@ pub fn spawn_web_gateway(
             let web_tui_tx = web_tui_tx.clone();
             let frame_registry = frame_registry.clone();
             let session_log = session_log.clone();
+            let recording_registry = recording_registry.clone();
 
             tokio::spawn(async move {
                 // Peek at the first bytes to detect WebSocket upgrade.
@@ -773,6 +775,7 @@ pub fn spawn_web_gateway(
                     let connection_id_inbound = connection_id.clone();
                     let web_tui_tx_inbound = web_tui_tx.clone();
                     let frame_registry_inbound = frame_registry.clone();
+                    let recording_registry_inbound = recording_registry.clone();
                     let session_log_inbound = session_log.clone();
                     let inbound = tokio::spawn(async move {
                         // Track whether this connection has an active presence model,
@@ -1163,23 +1166,42 @@ pub fn spawn_web_gateway(
                                         }
                                         Some("video_frame") => {
                                             // Browser sends a video frame for HQ archival in the frame registry.
-                                            if let Some(ref registry) = frame_registry_inbound {
-                                                let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
-                                                let stream = json["stream"].as_str().unwrap_or("cam0").to_string();
-                                                if let Some(data_b64) = json["data"].as_str() {
-                                                    use base64::Engine;
-                                                    if let Ok(jpeg_bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                                            let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
+                                            let stream = json["stream"].as_str().unwrap_or("cam0").to_string();
+                                            if let Some(data_b64) = json["data"].as_str() {
+                                                use base64::Engine;
+                                                if let Ok(jpeg_bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                                                    // Register in frame registry
+                                                    if let Some(ref registry) = frame_registry_inbound {
                                                         let meta = presence_core::FrameMeta {
                                                             frame_id: frame_id.clone(),
-                                                            stream,
+                                                            stream: stream.clone(),
                                                             timestamp: chrono::Utc::now().to_rfc3339(),
                                                             sent_to_live: true,
                                                             live_resolution: Some("768x768".to_string()),
-                                                            hq_resolution: None, // Could be extracted from image headers
+                                                            hq_resolution: None,
                                                         };
                                                         let mut reg = registry.write().await;
                                                         if let Err(e) = reg.register(meta, &jpeg_bytes) {
                                                             eprintln!("frame registry write failed: {}", e);
+                                                        }
+                                                    }
+                                                    // Feed into recording pipeline (auto-starts on first frame)
+                                                    if let Some(ref rec_reg) = recording_registry_inbound {
+                                                        let mut rreg = rec_reg.write().await;
+                                                        if rreg.is_enabled() {
+                                                            if !rreg.is_recording(&stream) {
+                                                                if crate::recording::is_ffmpeg_available() {
+                                                                    if let Err(e) = rreg.start_stream(&stream).await {
+                                                                        eprintln!("camera recording start failed: {}", e);
+                                                                    } else {
+                                                                        bus_inbound.send(AppEvent::RecordingStarted {
+                                                                            stream_name: stream.clone(),
+                                                                        });
+                                                                    }
+                                                                }
+                                                            }
+                                                            let _ = rreg.feed_frame(&stream, &jpeg_bytes).await;
                                                         }
                                                     }
                                                 }
@@ -1700,7 +1722,7 @@ mod tests {
         let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(0, bus, broadcast_tx, config, None, None, None, None, None);
+        let handle = spawn_web_gateway(0, bus, broadcast_tx, config, None, None, None, None, None, None);
 
         // Give it a moment to bind
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1720,7 +1742,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -1764,7 +1786,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -1815,7 +1837,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Plain HTTP GET
@@ -1858,7 +1880,7 @@ mod tests {
             output_sample_rate: 24000,
             transcription_enabled: false,
         };
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // GET /config
@@ -1896,7 +1918,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1952,7 +1974,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2008,7 +2030,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2063,7 +2085,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2128,7 +2150,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2203,7 +2225,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2253,7 +2275,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2307,7 +2329,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // POST /session without any API key env var set
@@ -2343,7 +2365,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
@@ -2381,7 +2403,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2437,7 +2459,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2507,7 +2529,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2605,7 +2627,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);

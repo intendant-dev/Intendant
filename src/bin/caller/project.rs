@@ -65,6 +65,56 @@ pub struct ProjectConfig {
     pub presence: crate::presence::PresenceConfig,
     #[serde(default)]
     pub transcription: crate::transcription::TranscriptionConfig,
+    #[serde(default)]
+    pub recording: RecordingConfig,
+}
+
+/// Recording configuration in intendant.toml.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_framerate")]
+    pub framerate: u32,
+    #[serde(default = "default_segment_duration")]
+    pub segment_duration_secs: u32,
+    #[serde(default = "default_quality")]
+    pub quality: String,
+    #[serde(default)]
+    pub max_retention_hours: Option<u32>,
+}
+
+fn default_framerate() -> u32 {
+    30
+}
+fn default_segment_duration() -> u32 {
+    60
+}
+fn default_quality() -> String {
+    "medium".to_string()
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            framerate: default_framerate(),
+            segment_duration_secs: default_segment_duration(),
+            quality: default_quality(),
+            max_retention_hours: None,
+        }
+    }
+}
+
+impl RecordingConfig {
+    /// Map quality name to ffmpeg CRF value (lower = higher quality).
+    pub fn crf(&self) -> u32 {
+        match self.quality.as_str() {
+            "low" => 35,
+            "high" => 20,
+            _ => 28, // medium
+        }
+    }
 }
 
 /// Sandbox configuration in intendant.toml.
@@ -417,5 +467,34 @@ live_context_window = 65536
             Some("gpt-4o-realtime-preview")
         );
         assert_eq!(config.presence.live_context_window, 65_536);
+    }
+
+    #[test]
+    fn parse_recording_config_defaults() {
+        let config: ProjectConfig = toml::from_str("").unwrap();
+        assert!(!config.recording.enabled);
+        assert_eq!(config.recording.framerate, 30);
+        assert_eq!(config.recording.segment_duration_secs, 60);
+        assert_eq!(config.recording.quality, "medium");
+        assert!(config.recording.max_retention_hours.is_none());
+    }
+
+    #[test]
+    fn parse_recording_config_full() {
+        let toml_str = r#"
+[recording]
+enabled = true
+framerate = 15
+segment_duration_secs = 120
+quality = "high"
+max_retention_hours = 48
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.recording.enabled);
+        assert_eq!(config.recording.framerate, 15);
+        assert_eq!(config.recording.segment_duration_secs, 120);
+        assert_eq!(config.recording.quality, "high");
+        assert_eq!(config.recording.max_retention_hours, Some(48));
+        assert_eq!(config.recording.crf(), 20);
     }
 }

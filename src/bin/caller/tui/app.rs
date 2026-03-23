@@ -1662,6 +1662,7 @@ impl App {
             AppEvent::DisplayReady {
                 display_id,
                 vnc_port,
+                ..
             } => {
                 let info = if let Some(port) = vnc_port {
                     format!(":{}  VNC:{}", display_id, port)
@@ -1869,6 +1870,15 @@ impl App {
             AppEvent::Resize(_, _) => {}
             AppEvent::Quit => {
                 self.should_quit = true;
+            }
+            AppEvent::RecordingStarted { ref stream_name } => {
+                self.log(LogLevel::Detail, format!("Recording started: {}", stream_name));
+            }
+            AppEvent::RecordingStopped { ref stream_name } => {
+                self.log(LogLevel::Detail, format!("Recording stopped: {}", stream_name));
+            }
+            AppEvent::RecordingError { ref stream_name, ref message } => {
+                self.log(LogLevel::Warn, format!("Recording error ({}): {}", stream_name, message));
             }
         }
 

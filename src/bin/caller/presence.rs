@@ -842,7 +842,10 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::Key(_)
         | AppEvent::Resize(_, _)
         | AppEvent::Tick
-        | AppEvent::Quit => None,
+        | AppEvent::Quit
+        | AppEvent::RecordingStarted { .. }
+        | AppEvent::RecordingStopped { .. }
+        | AppEvent::RecordingError { .. } => None,
     }
 }
 
