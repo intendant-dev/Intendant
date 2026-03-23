@@ -2404,11 +2404,25 @@ function renderSessionsAggregate(sessions, el) {
 
   el.innerHTML = '';
 
+  const totalCost = sessions.reduce((sum, s) => sum + (s.estimated_cost || 0), 0);
+
+  // Daily/weekly breakdown
+  const now = new Date();
+  const oneDayAgo = new Date(now - 24*60*60*1000);
+  const oneWeekAgo = new Date(now - 7*24*60*60*1000);
+  let todayTokens = 0, todayCost = 0, weekTokens = 0, weekCost = 0;
+  for (const s of sessions) {
+    const ts = s.created_at ? new Date(s.created_at) : null;
+    if (!ts) continue;
+    if (ts >= oneDayAgo) { todayTokens += s.total_tokens || 0; todayCost += s.estimated_cost || 0; }
+    if (ts >= oneWeekAgo) { weekTokens += s.total_tokens || 0; weekCost += s.estimated_cost || 0; }
+  }
+
   const cards = [
     { label: 'Sessions', value: totalSessions.toLocaleString() + (activeSessions > 0 ? ` (${activeSessions} active)` : '') },
-    { label: 'Total Tokens', value: totalTokens.toLocaleString() },
-    { label: 'Input', value: totalInput.toLocaleString() },
-    { label: 'Output', value: totalOutput.toLocaleString() },
+    { label: 'Total Cost', value: '$' + totalCost.toFixed(2) },
+    { label: 'Today', value: todayTokens.toLocaleString() + ' tok / $' + todayCost.toFixed(2) },
+    { label: 'This Week', value: weekTokens.toLocaleString() + ' tok / $' + weekCost.toFixed(2) },
   ];
 
   for (const c of cards) {
@@ -2548,6 +2562,20 @@ function renderSessionsList(sessions, el) {
       tok.appendChild(tokLabel);
       tok.appendChild(tokVal);
       meta.appendChild(tok);
+    }
+
+    if (s.estimated_cost > 0) {
+      const cost = document.createElement('span');
+      const costLabel = document.createElement('span');
+      costLabel.className = 'label';
+      costLabel.textContent = 'cost';
+      const costVal = document.createElement('span');
+      costVal.className = 'value';
+      costVal.style.color = 'var(--green)';
+      costVal.textContent = '$' + s.estimated_cost.toFixed(4);
+      cost.appendChild(costLabel);
+      cost.appendChild(costVal);
+      meta.appendChild(cost);
     }
 
     card.appendChild(meta);

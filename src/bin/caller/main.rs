@@ -24,6 +24,7 @@ mod tui;
 mod types;
 mod user_mode;
 mod vision;
+mod app_state_pricing;
 mod web_gateway;
 mod worktree;
 

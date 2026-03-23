@@ -635,6 +635,11 @@ fn list_sessions() -> String {
             }
         }
 
+        // Estimate cost using the model's pricing (blended rate without cache info)
+        let estimated_cost = model.as_deref()
+            .and_then(|m| crate::app_state_pricing::estimate_session_cost(m, prompt_tokens, completion_tokens))
+            .unwrap_or(0.0);
+
         sessions.push(serde_json::json!({
             "session_id": session_id,
             "created_at": created_at.unwrap_or_default(),
@@ -646,6 +651,7 @@ fn list_sessions() -> String {
             "total_tokens": total_tokens,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
+            "estimated_cost": estimated_cost,
             "role": role,
         }));
     }
