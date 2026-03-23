@@ -1931,7 +1931,7 @@ fn build_gemini_request_parts(
 
 fn default_context_window(model: &str) -> u64 {
     match model {
-        m if m.starts_with("gpt-5") => 400_000,
+        m if m.starts_with("gpt-5") => 1_000_000,
         m if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") => 200_000,
         m if m.contains("claude") => 200_000,
         m if m.starts_with("gemini") => 1_048_576,
@@ -2498,8 +2498,8 @@ mod tests {
 
     #[test]
     fn default_context_window_known_models() {
-        assert_eq!(default_context_window("gpt-5.2-codex"), 400_000);
-        assert_eq!(default_context_window("gpt-5"), 400_000);
+        assert_eq!(default_context_window("gpt-5.2-codex"), 1_000_000);
+        assert_eq!(default_context_window("gpt-5"), 1_000_000);
         assert_eq!(
             default_context_window("claude-sonnet-4-5-20250929"),
             200_000

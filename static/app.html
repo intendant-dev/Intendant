@@ -556,6 +556,180 @@ html, body {
 }
 .history-bar:hover { opacity: 1; }
 
+/* ── Sessions Tab ── */
+.sessions-container {
+  padding: 16px;
+  overflow-y: auto;
+  flex: 1;
+}
+.sessions-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+.sessions-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.sessions-refresh {
+  padding: 4px 12px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  color: var(--subtext0);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.sessions-refresh:hover {
+  background: var(--surface1);
+  color: var(--text);
+}
+.sessions-aggregate {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+.sessions-aggregate .agg-card {
+  flex: 1;
+  min-width: 140px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 8px;
+  padding: 12px 16px;
+}
+.sessions-aggregate .agg-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--overlay1);
+  margin-bottom: 4px;
+}
+.sessions-aggregate .agg-value {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+}
+.sessions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.session-detail { flex: 1; display: flex; flex-direction: column; }
+.session-detail-header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 0; border-bottom: 1px solid var(--surface0); margin-bottom: 8px;
+}
+.session-back-btn {
+  background: var(--surface0); border: 1px solid var(--surface1);
+  border-radius: 4px; padding: 4px 12px; color: var(--text);
+  font-family: inherit; font-size: 12px; cursor: pointer;
+}
+.session-back-btn:hover { background: var(--surface1); }
+.session-detail-title { color: var(--text); font-size: 13px; }
+.session-detail-logs {
+  flex: 1; overflow-y: auto; padding: 4px 0;
+}
+.session-detail-logs .log-entry { display: flex; padding: 2px 0; line-height: 1.5; font-size: 13px; }
+.session-detail-logs .log-entry:hover { background: var(--mantle); }
+.session-detail-logs .log-ts { color: var(--overlay1); width: 70px; flex-shrink: 0; font-size: 11px; }
+.session-detail-logs .log-level { width: 52px; flex-shrink: 0; font-weight: 600; font-size: 11px; text-transform: uppercase; }
+.session-detail-logs .log-content { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; }
+.session-detail-logs .log-turn-sep { padding: 6px 0 2px; font-size: 11px; color: var(--overlay0); border-top: 1px solid var(--surface0); margin-top: 4px; }
+.session-card {
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 8px;
+  padding: 12px 16px;
+  cursor: default;
+  transition: border-color 0.15s;
+}
+.session-card:hover {
+  border-color: var(--overlay0);
+}
+.session-card.current {
+  border-color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 8%, var(--surface0));
+}
+.session-card .sc-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.session-card .sc-id {
+  font-size: 12px;
+  color: var(--overlay1);
+  font-family: inherit;
+}
+.session-card .sc-status {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-weight: 600;
+}
+.session-card .sc-status.completed {
+  background: color-mix(in srgb, var(--green) 15%, transparent);
+  color: var(--green);
+}
+.session-card .sc-status.in_progress {
+  background: color-mix(in srgb, var(--yellow) 15%, transparent);
+  color: var(--yellow);
+}
+.session-card .sc-role {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--mauve) 15%, transparent);
+  color: var(--mauve);
+}
+.session-card .sc-current-badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--blue) 20%, transparent);
+  color: var(--blue);
+  font-weight: 600;
+  margin-left: auto;
+}
+.session-card .sc-task {
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 8px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.session-card .sc-meta {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--overlay1);
+}
+.session-card .sc-meta span {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.session-card .sc-meta .label { color: var(--overlay0); }
+.session-card .sc-meta .value { color: var(--subtext0); }
+.session-card .sc-meta .provider-val { color: var(--blue); }
+.session-card .sc-meta .model-val { color: var(--green); }
+
 /* ── Terminal Tab ── */
 .terminal-container {
   flex: 1;
@@ -1047,6 +1221,9 @@ html, body {
   .log-entry .log-level { width: 44px; font-size: 10px; }
   .usage-card { min-width: unset; }
   .usage-cards { flex-direction: column; }
+  .sessions-aggregate { flex-direction: column; }
+  .sessions-aggregate .agg-card { min-width: unset; }
+  .session-card .sc-meta { gap: 8px; }
   .budget-bar .bar-track { width: 40px; }
   .mic-btn { width: 40px; height: 40px; font-size: 16px; }
   .video-btn { width: 40px; height: 40px; font-size: 16px; }
@@ -1088,6 +1265,7 @@ html, body {
     <button class="tab-btn" data-tab="usage">Usage</button>
     <button class="tab-btn" data-tab="terminal">Terminal</button>
     <button class="tab-btn" data-tab="displays">Displays</button>
+    <button class="tab-btn" data-tab="sessions">Sessions</button>
   </nav>
 
   <!-- Tab Content -->
@@ -1172,6 +1350,10 @@ html, body {
           <div class="history-title">Tokens per Turn</div>
           <div class="history-chart" id="history-chart"></div>
         </div>
+        <div class="cost-section" id="all-sessions-usage" style="display:none">
+          <div class="cost-title">All Sessions</div>
+          <div class="cost-grid" id="all-sessions-grid"></div>
+        </div>
       </div>
     </div>
 
@@ -1213,6 +1395,27 @@ html, body {
             <option value="2">2x</option>
             <option value="4">4x</option>
           </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- Sessions Tab -->
+    <div id="tab-sessions" class="tab-pane">
+      <div class="sessions-container">
+        <div class="sessions-header">
+          <span class="sessions-title">Recent Sessions</span>
+          <button class="sessions-refresh" onclick="loadSessions()">Refresh</button>
+        </div>
+        <div class="sessions-aggregate" id="sessions-aggregate"></div>
+        <div class="sessions-list" id="sessions-list">
+          <div class="empty-state">Loading sessions...</div>
+        </div>
+        <div class="session-detail" id="session-detail" style="display:none">
+          <div class="session-detail-header">
+            <button class="session-back-btn" onclick="closeSessionDetail()">&larr; Back</button>
+            <span class="session-detail-title" id="session-detail-title"></span>
+          </div>
+          <div class="session-detail-logs" id="session-detail-logs"></div>
         </div>
       </div>
     </div>
@@ -2632,6 +2835,430 @@ function switchTab(tabId) {
   if (tabId === 'terminal' && term) requestAnimationFrame(() => fitAddon && fitAddon.fit());
   if (tabId === 'activity' || tabId === 'displays') {
     relocateDisplays(tabId);
+  }
+  if (tabId === 'sessions' && !sessionsLoaded) {
+    loadSessions();
+  }
+  if (tabId === 'usage' && !allSessionsUsageLoaded) {
+    loadAllSessionsUsage();
+  }
+}
+
+// ── All Sessions Usage (in Usage tab) ──
+let allSessionsUsageLoaded = false;
+
+function loadAllSessionsUsage() {
+  fetch('/api/sessions')
+    .then(r => r.json())
+    .then(sessions => {
+      allSessionsUsageLoaded = true;
+      renderAllSessionsUsage(sessions);
+    })
+    .catch(() => {});
+}
+
+function renderAllSessionsUsage(sessions) {
+  const el = document.getElementById('all-sessions-usage');
+  const grid = document.getElementById('all-sessions-grid');
+  if (!el || !grid) return;
+
+  const now = new Date();
+  const oneDayAgo = new Date(now - 24*60*60*1000);
+  const oneWeekAgo = new Date(now - 7*24*60*60*1000);
+
+  let allInput = 0, allOutput = 0, allCached = 0, allCost = 0;
+  let todayInput = 0, todayOutput = 0, todayCached = 0, todayCost = 0;
+  let weekInput = 0, weekOutput = 0, weekCached = 0, weekCost = 0;
+
+  for (const s of sessions) {
+    const input = s.prompt_tokens || 0;
+    const output = s.completion_tokens || 0;
+    const cached = s.cached_tokens || 0;
+    const cost = s.estimated_cost || 0;
+    allInput += input;
+    allOutput += output;
+    allCached += cached;
+    allCost += cost;
+
+    const ts = s.created_at ? new Date(s.created_at) : null;
+    if (!ts) continue;
+    if (ts >= oneDayAgo) { todayInput += input; todayOutput += output; todayCached += cached; todayCost += cost; }
+    if (ts >= oneWeekAgo) { weekInput += input; weekOutput += output; weekCached += cached; weekCost += cost; }
+  }
+
+  el.style.display = 'block';
+  grid.innerHTML = '';
+
+  const rows = [
+    ['Today', todayInput, todayCached, todayOutput, todayCost],
+    ['This Week', weekInput, weekCached, weekOutput, weekCost],
+    ['All Time', allInput, allCached, allOutput, allCost],
+  ];
+
+  // Header
+  grid.innerHTML = `
+    <span class="label" style="font-weight:600"></span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Input</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Cached</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Output</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Est. Cost</span>
+  `;
+  grid.style.gridTemplateColumns = 'auto 1fr 1fr 1fr 1fr';
+
+  for (const [label, input, cached, output, cost] of rows) {
+    grid.innerHTML += `
+      <span class="label">${label}</span>
+      <span class="value">${input.toLocaleString()}</span>
+      <span class="value" style="color:var(--green)">${cached.toLocaleString()}</span>
+      <span class="value">${output.toLocaleString()}</span>
+      <span class="value" style="color:var(--green)">$${cost.toFixed(2)}</span>
+    `;
+  }
+}
+
+// ── Sessions Tab ──
+let sessionsLoaded = false;
+
+function loadSessions() {
+  const listEl = document.getElementById('sessions-list');
+  const aggEl = document.getElementById('sessions-aggregate');
+  listEl.innerHTML = '<div class="empty-state">Loading sessions...</div>';
+
+  fetch('/api/sessions')
+    .then(r => r.json())
+    .then(sessions => {
+      sessionsLoaded = true;
+      renderSessionsAggregate(sessions, aggEl);
+      renderSessionsList(sessions, listEl);
+    })
+    .catch(() => {
+      listEl.innerHTML = '<div class="empty-state">Failed to load sessions</div>';
+    });
+}
+
+function renderSessionsAggregate(sessions, el) {
+  const totalSessions = sessions.length;
+  const totalTokens = sessions.reduce((sum, s) => sum + (s.total_tokens || 0), 0);
+  const totalInput = sessions.reduce((sum, s) => sum + (s.prompt_tokens || 0), 0);
+  const totalOutput = sessions.reduce((sum, s) => sum + (s.completion_tokens || 0), 0);
+  const totalCached = sessions.reduce((sum, s) => sum + (s.cached_tokens || 0), 0);
+  const activeSessions = sessions.filter(s => s.status === 'running' || s.status === 'in_progress').length;
+
+  el.innerHTML = '';
+
+  const cards = [
+    { label: 'Sessions', value: totalSessions.toLocaleString() + (activeSessions > 0 ? ` (${activeSessions} active)` : '') },
+    { label: 'Total Tokens', value: totalTokens.toLocaleString() },
+    { label: 'Input', value: totalInput.toLocaleString() },
+    { label: 'Cached', value: totalCached.toLocaleString() },
+    { label: 'Output', value: totalOutput.toLocaleString() },
+  ];
+
+  for (const c of cards) {
+    const card = document.createElement('div');
+    card.className = 'agg-card';
+    const labelEl = document.createElement('div');
+    labelEl.className = 'agg-label';
+    labelEl.textContent = c.label;
+    const valueEl = document.createElement('div');
+    valueEl.className = 'agg-value';
+    valueEl.textContent = c.value;
+    card.appendChild(labelEl);
+    card.appendChild(valueEl);
+    el.appendChild(card);
+  }
+}
+
+function renderSessionsList(sessions, el) {
+  el.innerHTML = '';
+
+  if (sessions.length === 0) {
+    el.innerHTML = '<div class="empty-state">No sessions found</div>';
+    return;
+  }
+
+  const currentSessionId = (document.getElementById('sb-session').textContent || '').trim();
+
+  for (const s of sessions) {
+    const card = document.createElement('div');
+    card.className = 'session-card';
+    const shortId = (s.session_id || '').substring(0, 8);
+    const isCurrent = currentSessionId && s.session_id && s.session_id.startsWith(currentSessionId);
+    if (isCurrent) card.classList.add('current');
+
+    // Top row: ID + status badges
+    const top = document.createElement('div');
+    top.className = 'sc-top';
+
+    const idEl = document.createElement('span');
+    idEl.className = 'sc-id';
+    idEl.textContent = shortId;
+    top.appendChild(idEl);
+
+    const statusEl = document.createElement('span');
+    statusEl.className = 'sc-status ' + (s.status || 'in_progress');
+    statusEl.textContent = (s.status || 'in_progress').replace('_', ' ');
+    top.appendChild(statusEl);
+
+    if (s.role) {
+      const roleEl = document.createElement('span');
+      roleEl.className = 'sc-role';
+      roleEl.textContent = s.role;
+      top.appendChild(roleEl);
+    }
+
+    if (isCurrent) {
+      const badge = document.createElement('span');
+      badge.className = 'sc-current-badge';
+      badge.textContent = 'current';
+      top.appendChild(badge);
+    }
+
+    card.appendChild(top);
+
+    // Task
+    if (s.task) {
+      const taskEl = document.createElement('div');
+      taskEl.className = 'sc-task';
+      taskEl.textContent = s.task;
+      card.appendChild(taskEl);
+    }
+
+    // Meta row
+    const meta = document.createElement('div');
+    meta.className = 'sc-meta';
+
+    if (s.created_at) {
+      const ts = document.createElement('span');
+      const tsLabel = document.createElement('span');
+      tsLabel.className = 'label';
+      tsLabel.textContent = 'created';
+      const tsVal = document.createElement('span');
+      tsVal.className = 'value';
+      tsVal.textContent = s.created_at;
+      ts.appendChild(tsLabel);
+      ts.appendChild(tsVal);
+      meta.appendChild(ts);
+    }
+
+    if (s.provider) {
+      const prov = document.createElement('span');
+      const provLabel = document.createElement('span');
+      provLabel.className = 'label';
+      provLabel.textContent = 'provider';
+      const provVal = document.createElement('span');
+      provVal.className = 'value provider-val';
+      provVal.textContent = s.provider;
+      prov.appendChild(provLabel);
+      prov.appendChild(provVal);
+      meta.appendChild(prov);
+    }
+
+    if (s.model) {
+      const mod = document.createElement('span');
+      const modLabel = document.createElement('span');
+      modLabel.className = 'label';
+      modLabel.textContent = 'model';
+      const modVal = document.createElement('span');
+      modVal.className = 'value model-val';
+      modVal.textContent = s.model;
+      mod.appendChild(modLabel);
+      mod.appendChild(modVal);
+      meta.appendChild(mod);
+    }
+
+    if (s.turns > 0) {
+      const turns = document.createElement('span');
+      const turnsLabel = document.createElement('span');
+      turnsLabel.className = 'label';
+      turnsLabel.textContent = 'turns';
+      const turnsVal = document.createElement('span');
+      turnsVal.className = 'value';
+      turnsVal.textContent = s.turns;
+      turns.appendChild(turnsLabel);
+      turns.appendChild(turnsVal);
+      meta.appendChild(turns);
+    }
+
+    if (s.total_tokens > 0) {
+      const addTokField = (label, value, color) => {
+        const span = document.createElement('span');
+        const l = document.createElement('span');
+        l.className = 'label';
+        l.textContent = label;
+        const v = document.createElement('span');
+        v.className = 'value';
+        v.textContent = value.toLocaleString();
+        if (color) v.style.color = color;
+        span.appendChild(l);
+        span.appendChild(v);
+        meta.appendChild(span);
+      };
+      addTokField('in', s.prompt_tokens || 0);
+      if (s.cached_tokens > 0) addTokField('cached', s.cached_tokens, 'var(--green)');
+      addTokField('out', s.completion_tokens || 0);
+    }
+
+    if (s.estimated_cost > 0) {
+      const cost = document.createElement('span');
+      const costLabel = document.createElement('span');
+      costLabel.className = 'label';
+      costLabel.textContent = 'cost';
+      const costVal = document.createElement('span');
+      costVal.className = 'value';
+      costVal.style.color = 'var(--green)';
+      costVal.textContent = '$' + s.estimated_cost.toFixed(4);
+      cost.appendChild(costLabel);
+      cost.appendChild(costVal);
+      meta.appendChild(cost);
+    }
+
+    card.appendChild(meta);
+    card.addEventListener('click', () => openSessionDetail(s.session_id, s.task || '(no task)'));
+    el.appendChild(card);
+  }
+}
+
+function openSessionDetail(sessionId, task) {
+  const listEl = document.getElementById('sessions-list');
+  const aggEl = document.getElementById('sessions-aggregate');
+  const headerEl = document.querySelector('.sessions-header');
+  const detailEl = document.getElementById('session-detail');
+  const titleEl = document.getElementById('session-detail-title');
+  const logsEl = document.getElementById('session-detail-logs');
+
+  listEl.style.display = 'none';
+  aggEl.style.display = 'none';
+  headerEl.style.display = 'none';
+  detailEl.style.display = 'flex';
+  titleEl.textContent = task + ' (' + sessionId.substring(0, 8) + ')';
+  logsEl.innerHTML = '<div class="empty-state">Loading...</div>';
+
+  fetch('/api/session/' + sessionId)
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) {
+        logsEl.innerHTML = '<div class="empty-state">' + data.error + '</div>';
+        return;
+      }
+      renderSessionDetailLogs(data.entries || [], logsEl);
+    })
+    .catch(e => {
+      logsEl.innerHTML = '<div class="empty-state">Failed to load</div>';
+    });
+}
+
+function closeSessionDetail() {
+  document.getElementById('sessions-list').style.display = '';
+  document.getElementById('sessions-aggregate').style.display = '';
+  document.querySelector('.sessions-header').style.display = '';
+  document.getElementById('session-detail').style.display = 'none';
+}
+window.closeSessionDetail = closeSessionDetail;
+window.loadSessions = loadSessions;
+
+let detailVerbosity = 'normal';
+
+function renderSessionDetailLogs(entries, el) {
+  el.innerHTML = '';
+
+  // Verbosity toggle
+  const toolbar = document.createElement('div');
+  toolbar.style.cssText = 'display:flex;justify-content:flex-end;padding:4px 0;';
+  const select = document.createElement('select');
+  select.className = 'verbosity-select';
+  select.innerHTML = '<option value="normal">Normal</option><option value="verbose">Verbose</option><option value="debug">Debug</option>';
+  select.value = detailVerbosity;
+  select.addEventListener('change', () => {
+    detailVerbosity = select.value;
+    renderSessionDetailEntries(entries, logsContainer);
+  });
+  toolbar.appendChild(select);
+  el.appendChild(toolbar);
+
+  const logsContainer = document.createElement('div');
+  logsContainer.style.cssText = 'flex:1;overflow-y:auto;';
+  el.appendChild(logsContainer);
+
+  renderSessionDetailEntries(entries, logsContainer);
+}
+
+function renderSessionDetailEntries(entries, el) {
+  el.innerHTML = '';
+  let lastTurn = null;
+
+  const levelColors = {
+    model: 'var(--blue)', agent: 'var(--teal)', error: 'var(--red)',
+    warn: 'var(--yellow)', subagent: 'var(--mauve)', presence: 'var(--green)',
+    detail: '#a2a8be', debug: 'var(--overlay1)',
+  };
+  const sourceLabels = {
+    system: '\u2139', worker: 'Workr', agent: 'Agent',
+    server: 'Servr', live: 'Live', sub: 'Sub', orch: 'Orch',
+  };
+  const normalLevels = ['info', 'model', 'agent', 'error', 'warn', 'subagent', 'presence'];
+  const verboseLevels = [...normalLevels, 'detail'];
+  const debugLevels = [...verboseLevels, 'debug'];
+  const visibleLevels = detailVerbosity === 'debug' ? debugLevels :
+                        detailVerbosity === 'verbose' ? verboseLevels : normalLevels;
+
+  for (const e of entries) {
+    const level = e.level || 'info';
+    if (!visibleLevels.includes(level)) continue;
+
+    if (e.turn && e.turn !== lastTurn) {
+      lastTurn = e.turn;
+      const sep = document.createElement('div');
+      sep.className = 'log-turn-sep';
+      sep.textContent = '\u2500\u2500 Turn ' + e.turn + ' \u2500\u2500';
+      el.appendChild(sep);
+    }
+
+    const entry = document.createElement('div');
+    entry.className = 'log-entry';
+
+    const ts = document.createElement('span');
+    ts.className = 'log-ts';
+    ts.textContent = (e.ts || '').substring(0, 8);
+
+    const lvl = document.createElement('span');
+    lvl.className = 'log-level';
+    lvl.textContent = sourceLabels[e.source] || e.source || '\u2139';
+    lvl.style.color = levelColors[level] || 'var(--text)';
+
+    const cnt = document.createElement('span');
+    cnt.className = 'log-content';
+    cnt.textContent = e.content || '';
+    if (levelColors[level]) cnt.style.color = levelColors[level];
+
+    entry.appendChild(ts);
+    entry.appendChild(lvl);
+    entry.appendChild(cnt);
+
+    // Collapsible for long entries
+    const content = e.content || '';
+    if (content.split('\n').length > 3 || content.length > 300) {
+      cnt.style.maxHeight = '1.5em';
+      cnt.style.overflow = 'hidden';
+      cnt.style.cursor = 'pointer';
+      const toggle = document.createElement('span');
+      toggle.className = 'collapse-toggle';
+      toggle.innerHTML = '<span class="arrow">\u25B8 more</span><span class="arrow-up" style="display:none">\u25BE less</span>';
+      toggle.style.cssText = 'color:var(--blue);font-size:11px;flex-shrink:0;padding:2px 6px;cursor:pointer;';
+      entry.appendChild(toggle);
+      entry.addEventListener('click', () => {
+        const expanded = cnt.style.maxHeight === 'none';
+        cnt.style.maxHeight = expanded ? '1.5em' : 'none';
+        toggle.querySelector('.arrow').style.display = expanded ? '' : 'none';
+        toggle.querySelector('.arrow-up').style.display = expanded ? 'none' : '';
+      });
+    }
+
+    el.appendChild(entry);
+  }
+
+  if (el.children.length === 0) {
+    el.innerHTML = '<div class="empty-state">No log entries at this verbosity</div>';
   }
 }
 
