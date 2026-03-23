@@ -120,6 +120,8 @@ struct CliFlags {
     web_port: u16,
     /// --transcription: Enable user speech transcription.
     transcription: bool,
+    /// --record-display <ID>: Record an existing X11 display (repeatable).
+    record_displays: Vec<u32>,
 }
 
 fn print_help() {
@@ -146,6 +148,7 @@ fn print_help() {
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]           Serve TUI via web (xterm.js + optional voice, default port: 8765)");
     println!("    --transcription       Enable user speech transcription");
+    println!("    --record-display <ID> Record an existing X11 display (e.g. 50 for :50, repeatable)");
     println!("    --help, -h            Show this help message");
     println!();
     println!("SESSION LOGS:");
@@ -192,6 +195,7 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         web: false,
         web_port: web_gateway::DEFAULT_PORT,
         transcription: false,
+        record_displays: Vec::new(),
     };
 
     let mut task_parts = Vec::new();
@@ -302,6 +306,22 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
             "--transcription" => {
                 flags.transcription = true;
                 i += 1;
+            }
+            "--record-display" => {
+                if i + 1 >= args.len() {
+                    return Err(CallerError::Config(
+                        "--record-display requires a display ID (e.g. 50 for :50)".to_string(),
+                    ));
+                }
+                let raw = args[i + 1].trim_start_matches(':');
+                let id: u32 = raw.parse().map_err(|_| {
+                    CallerError::Config(format!(
+                        "--record-display: '{}' is not a valid display ID",
+                        args[i + 1]
+                    ))
+                })?;
+                flags.record_displays.push(id);
+                i += 2;
             }
             other => {
                 if other.starts_with('-') {
@@ -667,6 +687,51 @@ async fn maybe_auto_launch_xvfb(
                 l.warn(&format!("Failed to auto-launch Xvfb: {}", e))
             });
         }
+    }
+}
+
+/// Query the resolution of an existing X11 display via xdpyinfo.
+/// Returns (width, height) or a default of (1280, 720) if detection fails.
+fn query_display_resolution(display_id: u32) -> (u32, u32) {
+    let output = std::process::Command::new("xdpyinfo")
+        .arg("-display")
+        .arg(format!(":{}", display_id))
+        .output();
+    if let Ok(out) = output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("dimensions:") {
+                // "dimensions:    1280x720 pixels (338x190 millimeters)"
+                if let Some(dims) = trimmed.split_whitespace().nth(1) {
+                    let parts: Vec<&str> = dims.split('x').collect();
+                    if parts.len() == 2 {
+                        if let (Ok(w), Ok(h)) = (parts[0].parse(), parts[1].parse()) {
+                            return (w, h);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (1280, 720)
+}
+
+/// Emit synthetic DisplayReady events for --record-display displays.
+/// The recording listener will pick these up and start ffmpeg on each.
+fn emit_record_display_events(displays: &[u32], bus: &EventBus) {
+    for &id in displays {
+        let (width, height) = query_display_resolution(id);
+        eprintln!(
+            "Recording external display :{} ({}x{})",
+            id, width, height
+        );
+        bus.send(AppEvent::DisplayReady {
+            display_id: id,
+            vnc_port: None,
+            width,
+            height,
+        });
     }
 }
 
@@ -1082,6 +1147,7 @@ Also: {"source": "bare"}"#;
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
             transcription: false,
+            record_displays: Vec::new(),
         };
         assert!(!flags.verbose);
         assert!(!flags.no_tui);
@@ -1119,6 +1185,7 @@ Also: {"source": "bare"}"#;
             web: true,
             web_port: web_gateway::DEFAULT_PORT,
             transcription: false,
+            record_displays: Vec::new(),
         };
         assert!(flags.web);
         assert_eq!(flags.web_port, web_gateway::DEFAULT_PORT);
@@ -1145,6 +1212,7 @@ Also: {"source": "bare"}"#;
             web: true,
             web_port: 9000,
             transcription: false,
+            record_displays: Vec::new(),
         };
         assert!(flags.web);
         assert_eq!(flags.web_port, 9000);
@@ -3818,6 +3886,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
+        emit_record_display_events(&flags.record_displays, &bus);
         let mcp_control_tx = if flags.control_socket {
             let (_control_handle, control_tx) = control::spawn_control_server(bus.clone());
             slog(&session_log, |l| {
@@ -4125,6 +4194,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
+        emit_record_display_events(&flags.record_displays, &bus);
 
         // TUI is created later — just before run() — so that web mode
         // (--web) can use WebTui instead of the real terminal backend.
@@ -4522,6 +4592,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
+        emit_record_display_events(&flags.record_displays, &bus);
 
         // Outbound broadcast channel — shared by web gateway and JSON stdout subscriber
         let (outbound_tx, _) = tokio::sync::broadcast::channel::<String>(256);
