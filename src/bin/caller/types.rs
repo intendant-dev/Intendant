@@ -139,6 +139,13 @@ pub enum OutboundEvent {
         round: usize,
         turns_in_round: usize,
     },
+    DebugScreenReady {
+        display_id: u32,
+        vnc_port: u32,
+    },
+    DebugScreenTornDown {
+        display_id: u32,
+    },
     DisplayReady {
         display_id: u32,
         vnc_port: Option<u32>,
