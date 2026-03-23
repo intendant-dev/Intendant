@@ -2361,7 +2361,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, None, None, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, ActiveSessionState::empty(), None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client

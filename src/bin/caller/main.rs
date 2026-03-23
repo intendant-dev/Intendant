@@ -4402,6 +4402,9 @@ async fn main() -> Result<(), CallerError> {
             None
         };
 
+        // Save for daemon loop (project is moved into the agent loop closure)
+        let project_root = project.root.clone();
+
         // Spawn the agent loop in a background task
         let bus_clone = bus.clone();
         let autonomy_clone = autonomy.clone();
@@ -4618,9 +4621,68 @@ async fn main() -> Result<(), CallerError> {
                 reason: "completed".to_string(),
             });
             // Daemon mode: keep web gateway alive after TUI quits.
-            eprintln!("TUI exited. Web gateway still running on port {}. Press Ctrl+C to exit.", flags.web_port);
-            tokio::signal::ctrl_c().await.ok();
-            eprintln!("Shutting down.");
+            // Fall through to a headless daemon loop (TUI is not re-created).
+            eprintln!("TUI exited. Web gateway still running on port {}. Waiting for new tasks...", flags.web_port);
+            let mut event_rx = bus.subscribe();
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        eprintln!("Shutting down.");
+                        break;
+                    }
+                    event = event_rx.recv() => {
+                        match event {
+                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate })) => {
+                                eprintln!("New session: {}", &new_task[..new_task.len().min(80)]);
+                                // Create fresh session resources
+                                let new_log_dir = session_log::SessionLog::resolve_path(None);
+                                let new_session_log = match session_log::SessionLog::open(new_log_dir.clone()) {
+                                    Ok(l) => Arc::new(Mutex::new(l)),
+                                    Err(e) => { bus.send(AppEvent::LoopError(format!("Session create failed: {}", e))); continue; }
+                                };
+                                let new_provider = match provider::select_provider() {
+                                    Ok(p) => p,
+                                    Err(e) => { bus.send(AppEvent::LoopError(format!("Provider failed: {}", e))); continue; }
+                                };
+                                let new_project = match Project::from_root(project_root.clone()) {
+                                    Ok(p) => p,
+                                    Err(e) => { bus.send(AppEvent::LoopError(format!("Project load failed: {}", e))); continue; }
+                                };
+                                let new_session_id = new_log_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+                                bus.send(AppEvent::SessionStarted { session_id: new_session_id.clone(), task: Some(new_task.clone()) });
+                                let bus_spawn = bus.clone();
+                                let autonomy_spawn = autonomy.clone();
+                                let session_log_spawn = new_session_log.clone();
+                                let use_direct = orchestrate.map(|o| !o).unwrap_or_else(|| flags.direct || is_simple_task(&new_task));
+                                tokio::spawn(async move {
+                                    let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+                                    let result = if use_direct {
+                                        run_direct_mode(
+                                            new_provider, new_task.clone(), new_project,
+                                            bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
+                                            new_log_dir, None, follow_up_rx, None,
+                                            event::ApprovalRegistry::default(), event::ContextInjectionQueue::default(), true,
+                                        ).await
+                                    } else {
+                                        run_user_mode(
+                                            new_provider, new_task.clone(), new_project,
+                                            bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
+                                        ).await
+                                    };
+                                    let reason = match &result {
+                                        Ok(stats) => { slog(&session_log_spawn, |l| l.write_summary_with_rounds(&new_task, "completed", stats.turns, Some(stats.rounds))); "completed".to_string() }
+                                        Err(e) => { slog(&session_log_spawn, |l| l.write_summary(&new_task, &format!("error: {}", e), 0)); format!("error: {}", e) }
+                                    };
+                                    bus_spawn.send(AppEvent::SessionEnded { session_id: new_session_id, reason });
+                                });
+                            }
+                            Ok(_) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
         }
 
         control::cleanup();
@@ -4659,7 +4721,7 @@ async fn main() -> Result<(), CallerError> {
         }
 
         // Web gateway in headless mode
-        if flags.web {
+        let headless_shared_session: Option<web_gateway::SharedActiveSession> = if flags.web {
             let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
                 if project.config.transcription.enabled {
                     match transcription::WhisperTranscriber::new(&project.config.transcription) {
@@ -4698,7 +4760,10 @@ async fn main() -> Result<(), CallerError> {
                 "Web TUI: http://0.0.0.0:{}",
                 flags.web_port
             );
-        }
+            Some(shared_session)
+        } else {
+            None
+        };
 
         let mcp_mgr = if !project.config.mcp_servers.is_empty() {
             Some(mcp_client::McpClientManager::connect_all(&project.config.mcp_servers).await)
@@ -4796,6 +4861,10 @@ async fn main() -> Result<(), CallerError> {
             task: Some(task.clone()),
         });
 
+        // Save for daemon loop (project and autonomy are moved into the agent loop)
+        let project_root = project.root.clone();
+        let autonomy_for_daemon = autonomy.clone();
+
         let result = if flags.direct || is_simple_task(&task) {
             run_direct_mode(
                 provider,
@@ -4846,14 +4915,132 @@ async fn main() -> Result<(), CallerError> {
         });
 
         if flags.web {
-            // Daemon mode: keep web gateway alive after session ends.
-            // Wait indefinitely — the web gateway continues serving recordings,
-            // sessions, and annotations. Process exits on SIGINT/SIGTERM.
-            eprintln!("Session ended ({}). Web gateway still running on port {}. Press Ctrl+C to exit.", reason, flags.web_port);
-            // Hold the EventBus and broadcast channel alive by parking.
-            // The web gateway task continues accepting connections.
-            tokio::signal::ctrl_c().await.ok();
-            eprintln!("Shutting down.");
+            // Daemon mode: keep web gateway alive, listen for new tasks from web UI.
+            if let Some(ref shared_session) = headless_shared_session {
+                // Clear session-specific state so new connections see "no active session"
+                {
+                    let mut ss = shared_session.write().await;
+                    ss.query_ctx = None;
+                    ss.session_log = None;
+                    // Keep frame_registry and recording_registry alive
+                }
+            }
+            eprintln!("Session ended ({}). Web gateway running on port {}. Waiting for new tasks...", reason, flags.web_port);
+
+            // Daemon loop: wait for StartTask from web UI or Ctrl+C
+            let mut event_rx = bus.subscribe();
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        eprintln!("Shutting down.");
+                        break;
+                    }
+                    event = event_rx.recv() => {
+                        match event {
+                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate })) => {
+                                eprintln!("New session: {}", &new_task[..new_task.len().min(80)]);
+
+                                // Create fresh session resources
+                                let new_log_dir = session_log::SessionLog::resolve_path(None);
+                                let new_session_log = match session_log::SessionLog::open(new_log_dir.clone()) {
+                                    Ok(l) => Arc::new(Mutex::new(l)),
+                                    Err(e) => {
+                                        bus.send(AppEvent::LoopError(format!("Failed to create session: {}", e)));
+                                        continue;
+                                    }
+                                };
+                                let new_provider = match provider::select_provider() {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        bus.send(AppEvent::LoopError(format!("Failed to create provider: {}", e)));
+                                        continue;
+                                    }
+                                };
+                                let new_project = match Project::from_root(project_root.clone()) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        bus.send(AppEvent::LoopError(format!("Failed to load project: {}", e)));
+                                        continue;
+                                    }
+                                };
+
+                                // Update shared session state
+                                if let Some(ref shared_session) = headless_shared_session {
+                                    let mut ss = shared_session.write().await;
+                                    ss.session_log = Some(new_session_log.clone());
+                                }
+
+                                let new_session_id = new_log_dir
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+
+                                bus.send(AppEvent::SessionStarted {
+                                    session_id: new_session_id.clone(),
+                                    task: Some(new_task.clone()),
+                                });
+
+                                // Spawn new agent loop
+                                let bus_spawn = bus.clone();
+                                let autonomy_spawn = autonomy_for_daemon.clone();
+                                let session_log_spawn = new_session_log.clone();
+                                let shared_cleanup = headless_shared_session.clone();
+                                let use_direct = orchestrate.map(|o| !o).unwrap_or_else(|| flags.direct || is_simple_task(&new_task));
+
+                                tokio::spawn(async move {
+                                    let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+                                    let result = if use_direct {
+                                        run_direct_mode(
+                                            new_provider, new_task.clone(), new_project,
+                                            bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
+                                            new_log_dir, None, follow_up_rx, None,
+                                            event::ApprovalRegistry::default(),
+                                            event::ContextInjectionQueue::default(),
+                                            true,
+                                        ).await
+                                    } else {
+                                        run_user_mode(
+                                            new_provider, new_task.clone(), new_project,
+                                            bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
+                                        ).await
+                                    };
+
+                                    let reason = match &result {
+                                        Ok(stats) => {
+                                            slog(&session_log_spawn, |l| {
+                                                l.write_summary_with_rounds(&new_task, "completed", stats.turns, Some(stats.rounds))
+                                            });
+                                            "completed".to_string()
+                                        }
+                                        Err(e) => {
+                                            slog(&session_log_spawn, |l| {
+                                                l.write_summary(&new_task, &format!("error: {}", e), 0)
+                                            });
+                                            format!("error: {}", e)
+                                        }
+                                    };
+
+                                    bus_spawn.send(AppEvent::SessionEnded {
+                                        session_id: new_session_id,
+                                        reason,
+                                    });
+
+                                    // Clear session state
+                                    if let Some(ref ss) = shared_cleanup {
+                                        let mut state = ss.write().await;
+                                        state.session_log = None;
+                                        state.query_ctx = None;
+                                    }
+                                });
+                            }
+                            Ok(_) => {} // Ignore other events
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
         } else {
             result?;
         }
