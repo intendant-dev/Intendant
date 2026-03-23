@@ -1192,6 +1192,20 @@ pub fn spawn_web_gateway(
                                             // Request to become the active voice owner
                                             let mut slot = active_presence_inbound.lock()
                                                 .unwrap_or_else(|e| e.into_inner());
+                                            let previous_active = slot.as_ref()
+                                                .map(|active| active.connection_id.clone());
+                                            if let Some(ref sl) = session_log_inbound {
+                                                if let Ok(mut l) = sl.lock() {
+                                                    l.voice_diagnostic(
+                                                        "make_active_received_gateway",
+                                                        &format!(
+                                                            "request from connection={} previous_active={}",
+                                                            connection_id_inbound,
+                                                            previous_active.as_deref().unwrap_or("none"),
+                                                        ),
+                                                    );
+                                                }
+                                            }
 
                                             // Tell old active to disconnect voice
                                             if let Some(ref old) = *slot {
@@ -1201,6 +1215,27 @@ pub fn spawn_web_gateway(
                                                         "reason": "handover",
                                                     });
                                                     let _ = old.direct_tx.send(force_msg.to_string());
+                                                    if let Some(ref sl) = session_log_inbound {
+                                                        if let Ok(mut l) = sl.lock() {
+                                                            l.voice_diagnostic(
+                                                                "make_active_force_disconnect_gateway",
+                                                                &format!(
+                                                                    "old_active={} new_active={}",
+                                                                    old.connection_id, connection_id_inbound,
+                                                                ),
+                                                            );
+                                                        }
+                                                    }
+                                                } else if let Some(ref sl) = session_log_inbound {
+                                                    if let Ok(mut l) = sl.lock() {
+                                                        l.voice_diagnostic(
+                                                            "make_active_noop_gateway",
+                                                            &format!(
+                                                                "request from already-active connection={}",
+                                                                connection_id_inbound,
+                                                            ),
+                                                        );
+                                                    }
                                                 }
                                             }
 
@@ -1227,6 +1262,10 @@ pub fn spawn_web_gateway(
                                             // Build conversation context from recent voice transcripts
                                             let conversation_ctx = query_ctx_inbound.as_ref()
                                                 .and_then(|ctx| presence::build_conversation_context(&ctx.log_dir, 20));
+                                            let has_handover_context = !handover_context.is_empty();
+                                            let has_conversation_context = conversation_ctx.as_deref()
+                                                .map(|s| !s.is_empty())
+                                                .unwrap_or(false);
 
                                             // Send active_granted to this connection
                                             let granted_msg = serde_json::json!({
@@ -1236,6 +1275,19 @@ pub fn spawn_web_gateway(
                                                 "conversation_context": conversation_ctx,
                                             });
                                             let _ = direct_tx_inbound.send(granted_msg.to_string());
+                                            if let Some(ref sl) = session_log_inbound {
+                                                if let Ok(mut l) = sl.lock() {
+                                                    l.voice_diagnostic(
+                                                        "make_active_granted_gateway",
+                                                        &format!(
+                                                            "connection={} handover_context={} conversation_context={}",
+                                                            connection_id_inbound,
+                                                            if has_handover_context { "yes" } else { "no" },
+                                                            if has_conversation_context { "yes" } else { "no" },
+                                                        ),
+                                                    );
+                                                }
+                                            }
 
                                             // Emit PresenceConnected for the new active browser
                                             if let Some(ref sl) = session_log_inbound {

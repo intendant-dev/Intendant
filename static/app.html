@@ -1897,6 +1897,7 @@ async function main() {
   });
 
   app.set_on_force_disconnect((reason) => {
+    try { app.send_voice_diagnostic('make_active_force_disconnect_client', 'reason=' + reason); } catch(_) {}
     if (modelConnected) {
       if (videoActive) stopVideo();
       app.disconnect_voice();
@@ -1915,6 +1916,12 @@ async function main() {
   });
 
   app.set_on_active_granted((handoverContext, conversationContext) => {
+    try {
+      app.send_voice_diagnostic(
+        'make_active_granted_client',
+        'handover=' + (handoverContext ? 'yes' : 'no') + ', conversation=' + (conversationContext ? 'yes' : 'no'),
+      );
+    } catch(_) {}
     isActiveBrowser = true;
     document.getElementById('makeActiveBtn').disabled = false;
     updateActivePassiveUI();
@@ -1990,9 +1997,19 @@ async function main() {
   // Make Active button
   document.getElementById('makeActiveBtn').addEventListener('click', () => {
     if (app && !isActiveBrowser) {
-      app.send_make_active();
-      document.getElementById('makeActiveBtn').disabled = true;
-      showVoiceStatus('Requesting active...');
+      const sent = app.send_make_active();
+      try {
+        app.send_voice_diagnostic(
+          'make_active_request_client',
+          sent ? 'request sent to server' : 'request NOT sent (server socket not open)',
+        );
+      } catch(_) {}
+      if (sent) {
+        document.getElementById('makeActiveBtn').disabled = true;
+        showVoiceStatus('Requesting active...');
+      } else {
+        showVoiceStatus('Takeover request failed', true);
+      }
     }
   });
 

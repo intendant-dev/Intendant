@@ -128,6 +128,10 @@ sleep 0.5
 
 ### 4. Launch intendant --web
 
+Prefer running `intendant --web` in a long-lived session/PTY. In this environment,
+short-lived shell wrappers around `nohup ... &` let the web server disappear
+between steps.
+
 ```bash
 > /tmp/intendant-web-stderr.log
 cd /home/user/projects/intendant && source .env && \
@@ -173,11 +177,21 @@ sleep 5
 
 For Gemini Live with tool calling, an API key must be in localStorage:
 ```bash
-source .env && python3 scripts/ff-eval.py \
-  "localStorage.setItem('gemini_api_key', '$GEMINI_API_KEY'); 'stored'"
+set -a && source .env && set +a
+JS=$(python3 - <<'PY'
+import json, os
+print("localStorage.setItem('gemini_api_key', %s); 'stored'" % json.dumps(os.environ['GEMINI_API_KEY']))
+PY
+)
+python3 scripts/ff-eval.py "$JS"
+python3 scripts/ff-eval.py "!!localStorage.getItem('gemini_api_key')"
 python3 scripts/ff-eval.py "location.reload(); 'reloading'"
 sleep 3
 ```
+
+**Important**: if the first-run voice dialog is already open, storing the key in
+`localStorage` does not dismiss it. Reload after storing, or click the mic button
+again once the key exists.
 
 For OpenAI Realtime, set:
 ```bash
@@ -247,6 +261,9 @@ sleep 1
 
 Then verify connection via `/debug` (see Assertions below).
 
+**Important**: `voice.connected=true` only proves the live model connection is up.
+It does **not** prove Firefox is actively capturing microphone audio. Verify both.
+
 ## Asserting on State (primary method — no screenshots)
 
 ### Verify live connection
@@ -272,6 +289,26 @@ done
 echo "Live connected: $CONNECTED"
 ```
 
+### Verify Firefox is actively capturing from the virtual mic
+After activating the mic, verify Firefox has a recording stream:
+
+```bash
+pactl list short source-outputs
+```
+
+Expected: at least one `source-output` owned by Firefox. If empty, the browser is
+connected to live mode but is not currently capturing audio.
+
+If the mic button state looks wrong after earlier setup failures, force a fresh
+`getUserMedia` start by clicking the visible mic button directly:
+
+```bash
+# Example coordinates from a 1280x720 Xvfb display; adjust via VNC if needed
+DISPLAY=:50 xdotool mousemove --sync 1112 608 click 1
+sleep 2
+pactl list short source-outputs
+```
+
 ### Check live activity after speaking
 ```bash
 say "What is the current status?" 130
@@ -286,6 +323,16 @@ print(f'Last voice log: {v.get(\"last_voice_log\", \"(none)\")}')
 assert v.get('voice_log_count', 0) > 0, 'No voice logs — model may not have received audio'
 "
 ```
+
+### Verify browser audio is being sent to the live model
+If `/debug` stays quiet, inspect the session log for `voice:audio_send` diagnostics:
+
+```bash
+tail -n 200 ~/.intendant/logs/*/session.jsonl | grep 'voice:audio_send'
+```
+
+This confirms the path up to the browser send loop is active:
+`virtual mic -> Firefox -> getUserMedia -> AudioWorklet/WASM -> live audio send`.
 
 ### Verify task was submitted via live
 ```bash
@@ -384,6 +431,8 @@ print('Approved OK')
 
 1. **Check virtual mic exists**: `pactl list short sources | grep virtual_mic`
 2. **Check default source**: `pactl get-default-source` — should be `virtual_mic.monitor`
+3. **Check Firefox is actually recording**: `pactl list short source-outputs`
+   - If empty, live may be connected but `getUserMedia` is not active.
 3. **Test audio flow**: Play a tone and check PulseAudio levels:
    ```bash
    ffmpeg -f lavfi -i "sine=frequency=440:duration=2" -f s16le -ar 48000 -ac 1 pipe:1 2>/dev/null | \
@@ -447,3 +496,10 @@ for p in $(pgrep -x firefox -x firefox-esr 2>/dev/null); do kill -9 "$p" 2>/dev/
 for p in $(pgrep -x Xvfb 2>/dev/null); do kill "$p" 2>/dev/null; done
 for p in $(pgrep -x x11vnc 2>/dev/null); do kill "$p" 2>/dev/null; done
 ```
+
+## Notes from verified runs
+
+- On this environment, verify VNC with `ss -ltnp | grep 5950` after startup.
+  `x11vnc` can appear to start and then exit.
+- A stable VNC launch here was one that remained attached to the live `Xvfb :50`
+  display and was verified by checking the actual listener.

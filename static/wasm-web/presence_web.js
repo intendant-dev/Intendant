@@ -317,9 +317,11 @@ export class PresenceWeb {
     }
     /**
      * Request to become the active voice owner (triggers handover from current active).
+     * @returns {boolean}
      */
     send_make_active() {
-        wasm.presenceweb_send_make_active(this.__wbg_ptr);
+        const ret = wasm.presenceweb_send_make_active(this.__wbg_ptr);
+        return ret !== 0;
     }
     /**
      * Send a presence checkpoint to the server.

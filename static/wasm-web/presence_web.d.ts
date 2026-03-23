@@ -108,7 +108,7 @@ export class PresenceWeb {
     /**
      * Request to become the active voice owner (triggers handover from current active).
      */
-    send_make_active(): void;
+    send_make_active(): boolean;
     /**
      * Send a presence checkpoint to the server.
      */
@@ -280,7 +280,7 @@ export interface InitOutput {
     readonly presenceweb_send_human_response: (a: number, b: number, c: number) => any;
     readonly presenceweb_send_key: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly presenceweb_send_live_usage: (a: number, b: bigint, c: bigint, d: bigint, e: bigint, f: bigint) => void;
-    readonly presenceweb_send_make_active: (a: number) => void;
+    readonly presenceweb_send_make_active: (a: number) => number;
     readonly presenceweb_send_presence_checkpoint: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_resize: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_server_action: (a: number, b: any) => void;

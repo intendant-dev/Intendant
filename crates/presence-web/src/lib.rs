@@ -333,8 +333,8 @@ impl PresenceWeb {
 
     /// Request to become the active voice owner (triggers handover from current active).
     #[wasm_bindgen]
-    pub fn send_make_active(&self) {
-        self.server.borrow().send_make_active();
+    pub fn send_make_active(&self) -> bool {
+        self.server.borrow().send_make_active()
     }
 
     #[wasm_bindgen]

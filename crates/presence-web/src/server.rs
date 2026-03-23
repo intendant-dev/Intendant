@@ -388,8 +388,8 @@ impl ServerConnection {
     }
 
     /// Request to become the active voice owner (triggers handover from current active).
-    pub fn send_make_active(&self) {
-        self.send_json(&serde_json::json!({"t": "make_active"}));
+    pub fn send_make_active(&self) -> bool {
+        self.send_json(&serde_json::json!({"t": "make_active"}))
     }
 
     /// Send a video frame to the server for HQ archival and frame registry.
