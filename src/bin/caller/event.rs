@@ -108,6 +108,13 @@ pub enum AppEvent {
         session_id: String,
         reason: String,
     },
+    DebugScreenReady {
+        display_id: u32,
+        vnc_port: u32,
+    },
+    DebugScreenTornDown {
+        display_id: u32,
+    },
     BudgetWarning {
         pct: f64,
         remaining: u64,
@@ -391,6 +398,10 @@ pub enum ControlMsg {
         arguments: Option<String>,
     },
     Quit,
+    SetupDebugScreen,
+    TeardownDebugScreen,
+    StartDebugRecording,
+    StopDebugRecording,
 }
 
 /// The event bus sender. Cloneable for use in multiple tasks.
@@ -475,6 +486,17 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             Some(OutboundEvent::SessionEnded {
                 session_id: session_id.clone(),
                 reason: reason.clone(),
+            })
+        }
+        AppEvent::DebugScreenReady { display_id, vnc_port } => {
+            Some(OutboundEvent::DebugScreenReady {
+                display_id: *display_id,
+                vnc_port: *vnc_port,
+            })
+        }
+        AppEvent::DebugScreenTornDown { display_id } => {
+            Some(OutboundEvent::DebugScreenTornDown {
+                display_id: *display_id,
             })
         }
         AppEvent::ApprovalRequired {

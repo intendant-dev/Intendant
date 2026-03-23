@@ -1363,6 +1363,11 @@ impl App {
             ControlMsg::Quit => {
                 self.should_quit = true;
             }
+            // Debug screen commands handled by dedicated handler task
+            ControlMsg::SetupDebugScreen
+            | ControlMsg::TeardownDebugScreen
+            | ControlMsg::StartDebugRecording
+            | ControlMsg::StopDebugRecording => {}
         }
     }
 
@@ -1885,6 +1890,12 @@ impl App {
             }
             AppEvent::SessionEnded { ref session_id, ref reason } => {
                 self.log(LogLevel::Info, format!("Session ended: {} — {}", session_id, reason));
+            }
+            AppEvent::DebugScreenReady { display_id, vnc_port } => {
+                self.log(LogLevel::Info, format!("Debug screen ready on :{}, VNC port {}", display_id, vnc_port));
+            }
+            AppEvent::DebugScreenTornDown { display_id } => {
+                self.log(LogLevel::Info, format!("Debug screen :{} torn down", display_id));
             }
         }
 

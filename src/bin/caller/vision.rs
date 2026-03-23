@@ -10,13 +10,13 @@ pub struct DisplayConfig {
 }
 
 /// Read the PID from an X lock file. Returns `None` if the file can't be read or parsed.
-fn read_lock_pid(lock_path: &str) -> Option<u32> {
+pub(crate) fn read_lock_pid(lock_path: &str) -> Option<u32> {
     let contents = std::fs::read_to_string(lock_path).ok()?;
     contents.trim().parse().ok()
 }
 
 /// Check if a lock file is stale (the PID inside is no longer running).
-fn is_lock_stale(lock_path: &str) -> bool {
+pub(crate) fn is_lock_stale(lock_path: &str) -> bool {
     match read_lock_pid(lock_path) {
         Some(pid) => !std::path::Path::new(&format!("/proc/{}", pid)).exists(),
         None => false, // can't read/parse → assume not stale
@@ -25,7 +25,7 @@ fn is_lock_stale(lock_path: &str) -> bool {
 
 /// Check whether the process owning a lock file is an Xvfb instance for the given display.
 /// Returns true if the process cmdline starts with "Xvfb :<id>".
-fn is_our_xvfb(lock_path: &str, display_id: u32) -> bool {
+pub(crate) fn is_our_xvfb(lock_path: &str, display_id: u32) -> bool {
     let pid = match read_lock_pid(lock_path) {
         Some(p) => p,
         None => return false,
@@ -42,7 +42,7 @@ fn is_our_xvfb(lock_path: &str, display_id: u32) -> bool {
 }
 
 /// Kill the process that owns a lock file (if alive) and clean up.
-fn kill_and_reclaim(lock_path: &str, display_id: u32) {
+pub(crate) fn kill_and_reclaim(lock_path: &str, display_id: u32) {
     if let Some(pid) = read_lock_pid(lock_path) {
         // Send SIGKILL via the kill command — the process is an orphaned Xvfb we're reclaiming
         let _ = std::process::Command::new("kill")
@@ -57,7 +57,7 @@ fn kill_and_reclaim(lock_path: &str, display_id: u32) {
 }
 
 /// Remove a stale X lock file and its socket.
-fn remove_stale_lock(id: u32) {
+pub(crate) fn remove_stale_lock(id: u32) {
     let lock = format!("/tmp/.X{}-lock", id);
     let socket = format!("/tmp/.X11-unix/X{}", id);
     let _ = std::fs::remove_file(&lock);
