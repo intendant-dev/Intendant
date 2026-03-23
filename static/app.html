@@ -3589,7 +3589,7 @@ function startNewSession() {
   if (!task) return;
   input.value = '';
   if (app) {
-    app.send_server_action({ action: 'start_task', text: task });
+    app.send_server_action({ action: 'start_task', task: task });
   }
 }
 
