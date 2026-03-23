@@ -496,6 +496,147 @@ impl tokio_tungstenite::tungstenite::handshake::server::Callback for VncWsCallba
     }
 }
 
+/// List session directories from `~/.intendant/logs/`, returning JSON metadata
+/// for each session (newest first, capped at 100).
+fn list_sessions() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let logs_dir = PathBuf::from(format!("{}/.intendant/logs", home));
+    if !logs_dir.is_dir() {
+        return "[]".to_string();
+    }
+
+    let mut sessions: Vec<serde_json::Value> = Vec::new();
+
+    let entries = match std::fs::read_dir(&logs_dir) {
+        Ok(e) => e,
+        Err(_) => return "[]".to_string(),
+    };
+
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let session_id = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Try to read session_meta.json first (fast path)
+        let meta_path = dir.join("session_meta.json");
+        let mut task: Option<String> = None;
+        let mut created_at: Option<String> = None;
+        let mut provider: Option<String> = None;
+        let mut model: Option<String> = None;
+        let mut status = "in_progress".to_string();
+        let mut turns: u64 = 0;
+        let mut total_tokens: u64 = 0;
+        let mut role: Option<String> = None;
+
+        if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+                task = meta.get("task").and_then(|v| v.as_str()).map(|s| s.to_string());
+                created_at = meta.get("created_at").and_then(|v| v.as_str()).map(|s| s.to_string());
+                if let Some(s) = meta.get("status").and_then(|v| v.as_str()) {
+                    status = s.to_string();
+                }
+                if let Some(t) = meta.get("last_turn").and_then(|v| v.as_u64()) {
+                    turns = t;
+                }
+                role = meta.get("role").and_then(|v| v.as_str()).map(|s| s.to_string());
+            }
+        }
+
+        // Parse session.jsonl for provider, model, token totals, and any missing fields
+        let jsonl_path = dir.join("session.jsonl");
+        if let Ok(contents) = std::fs::read_to_string(&jsonl_path) {
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let event = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
+
+                match event {
+                    "session_start" => {
+                        if created_at.is_none() {
+                            created_at = obj.get("ts").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        }
+                    }
+                    "info" => {
+                        if message.starts_with("Provider: ") && provider.is_none() {
+                            provider = Some(message.trim_start_matches("Provider: ").to_string());
+                        } else if message.starts_with("Model: ") && model.is_none() {
+                            model = Some(message.trim_start_matches("Model: ").to_string());
+                        } else if message.starts_with("Task: ") && task.is_none() {
+                            task = Some(message.trim_start_matches("Task: ").to_string());
+                        }
+                    }
+                    "turn_start" => {
+                        if let Some(t) = obj.get("turn").and_then(|v| v.as_u64()) {
+                            if t > turns {
+                                turns = t;
+                            }
+                        }
+                    }
+                    "model_response" => {
+                        if let Some(tokens) = obj
+                            .get("data")
+                            .and_then(|d| d.get("tokens"))
+                            .and_then(|t| t.get("total"))
+                            .and_then(|v| v.as_u64())
+                        {
+                            total_tokens += tokens;
+                        }
+                    }
+                    "task_complete" | "session_end" | "round_complete" => {
+                        status = "completed".to_string();
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Fall back to directory mtime for created_at
+        if created_at.is_none() {
+            if let Ok(metadata) = std::fs::metadata(&dir) {
+                if let Ok(modified) = metadata.modified() {
+                    let dt: chrono::DateTime<chrono::Local> = modified.into();
+                    created_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                }
+            }
+        }
+
+        sessions.push(serde_json::json!({
+            "session_id": session_id,
+            "created_at": created_at.unwrap_or_default(),
+            "task": task,
+            "provider": provider,
+            "model": model,
+            "turns": turns,
+            "status": status,
+            "total_tokens": total_tokens,
+            "role": role,
+        }));
+    }
+
+    // Sort newest first by created_at
+    sessions.sort_by(|a, b| {
+        let a_ts = a.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let b_ts = b.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        b_ts.cmp(a_ts)
+    });
+
+    // Cap at 100
+    sessions.truncate(100);
+
+    serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".to_string())
+}
+
 pub fn spawn_web_gateway(
     port: u16,
     bus: EventBus,
@@ -1502,6 +1643,21 @@ pub fn spawn_web_gateway(
                              \r\n\
                              {}",
                             status, body.len(), body
+                        );
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.contains("/api/sessions") {
+                        // Session listing endpoint
+                        let body = list_sessions();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(), body
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
