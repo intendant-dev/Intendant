@@ -1187,6 +1187,10 @@ html, body {
           <div class="history-title">Tokens per Turn</div>
           <div class="history-chart" id="history-chart"></div>
         </div>
+        <div class="cost-section" id="all-sessions-usage" style="display:none">
+          <div class="cost-title">All Sessions</div>
+          <div class="cost-grid" id="all-sessions-grid"></div>
+        </div>
       </div>
     </div>
 
@@ -2373,6 +2377,77 @@ function switchTab(tabId) {
   if (tabId === 'sessions' && !sessionsLoaded) {
     loadSessions();
   }
+  if (tabId === 'usage' && !allSessionsUsageLoaded) {
+    loadAllSessionsUsage();
+  }
+}
+
+// ── All Sessions Usage (in Usage tab) ──
+let allSessionsUsageLoaded = false;
+
+function loadAllSessionsUsage() {
+  fetch('/api/sessions')
+    .then(r => r.json())
+    .then(sessions => {
+      allSessionsUsageLoaded = true;
+      renderAllSessionsUsage(sessions);
+    })
+    .catch(() => {});
+}
+
+function renderAllSessionsUsage(sessions) {
+  const el = document.getElementById('all-sessions-usage');
+  const grid = document.getElementById('all-sessions-grid');
+  if (!el || !grid) return;
+
+  const now = new Date();
+  const oneDayAgo = new Date(now - 24*60*60*1000);
+  const oneWeekAgo = new Date(now - 7*24*60*60*1000);
+
+  let allInput = 0, allOutput = 0, allCached = 0, allCost = 0;
+  let todayInput = 0, todayOutput = 0, todayCost = 0;
+  let weekInput = 0, weekOutput = 0, weekCost = 0;
+
+  for (const s of sessions) {
+    const input = s.prompt_tokens || 0;
+    const output = s.completion_tokens || 0;
+    const cost = s.estimated_cost || 0;
+    allInput += input;
+    allOutput += output;
+    allCost += cost;
+
+    const ts = s.created_at ? new Date(s.created_at) : null;
+    if (!ts) continue;
+    if (ts >= oneDayAgo) { todayInput += input; todayOutput += output; todayCost += cost; }
+    if (ts >= oneWeekAgo) { weekInput += input; weekOutput += output; weekCost += cost; }
+  }
+
+  el.style.display = 'block';
+  grid.innerHTML = '';
+
+  const rows = [
+    ['Today', todayInput, todayOutput, todayCost],
+    ['This Week', weekInput, weekOutput, weekCost],
+    ['All Time', allInput, allOutput, allCost],
+  ];
+
+  // Header
+  grid.innerHTML = `
+    <span class="label" style="font-weight:600"></span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Input</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Output</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Est. Cost</span>
+  `;
+  grid.style.gridTemplateColumns = 'auto 1fr 1fr 1fr';
+
+  for (const [label, input, output, cost] of rows) {
+    grid.innerHTML += `
+      <span class="label">${label}</span>
+      <span class="value">${input.toLocaleString()}</span>
+      <span class="value">${output.toLocaleString()}</span>
+      <span class="value" style="color:var(--green)">$${cost.toFixed(2)}</span>
+    `;
+  }
 }
 
 // ── Sessions Tab ──
@@ -2404,25 +2479,11 @@ function renderSessionsAggregate(sessions, el) {
 
   el.innerHTML = '';
 
-  const totalCost = sessions.reduce((sum, s) => sum + (s.estimated_cost || 0), 0);
-
-  // Daily/weekly breakdown
-  const now = new Date();
-  const oneDayAgo = new Date(now - 24*60*60*1000);
-  const oneWeekAgo = new Date(now - 7*24*60*60*1000);
-  let todayTokens = 0, todayCost = 0, weekTokens = 0, weekCost = 0;
-  for (const s of sessions) {
-    const ts = s.created_at ? new Date(s.created_at) : null;
-    if (!ts) continue;
-    if (ts >= oneDayAgo) { todayTokens += s.total_tokens || 0; todayCost += s.estimated_cost || 0; }
-    if (ts >= oneWeekAgo) { weekTokens += s.total_tokens || 0; weekCost += s.estimated_cost || 0; }
-  }
-
   const cards = [
     { label: 'Sessions', value: totalSessions.toLocaleString() + (activeSessions > 0 ? ` (${activeSessions} active)` : '') },
-    { label: 'Total Cost', value: '$' + totalCost.toFixed(2) },
-    { label: 'Today', value: todayTokens.toLocaleString() + ' tok / $' + todayCost.toFixed(2) },
-    { label: 'This Week', value: weekTokens.toLocaleString() + ' tok / $' + weekCost.toFixed(2) },
+    { label: 'Total Tokens', value: totalTokens.toLocaleString() },
+    { label: 'Input', value: totalInput.toLocaleString() },
+    { label: 'Output', value: totalOutput.toLocaleString() },
   ];
 
   for (const c of cards) {
