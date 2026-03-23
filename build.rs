@@ -5,7 +5,6 @@
 //! via `wasm-pack build`. If `wasm-pack` is not installed, emits a warning.
 
 use std::path::Path;
-use std::process::Command;
 
 fn main() {
     // Re-run if any presence-web source file changes.
@@ -36,36 +35,7 @@ fn main() {
     }
 
     println!("cargo:warning=WASM is stale: presence-web source is newer than static/wasm-web/presence_web_bg.wasm");
-
-    // Try to rebuild automatically
-    let wasm_pack = Command::new("wasm-pack")
-        .args([
-            "build", "--target", "web",
-            "--out-dir", "../../static/wasm-web",
-            "--out-name", "presence_web",
-        ])
-        .current_dir("crates/presence-web")
-        .status();
-
-    match wasm_pack {
-        Ok(status) if status.success() => {
-            println!("cargo:warning=WASM rebuilt successfully via wasm-pack");
-        }
-        Ok(status) => {
-            println!(
-                "cargo:warning=wasm-pack build failed (exit {}). Run manually: cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web",
-                status
-            );
-        }
-        Err(_) => {
-            println!(
-                "cargo:warning=wasm-pack not found. Install with: cargo install wasm-pack"
-            );
-            println!(
-                "cargo:warning=Then rebuild WASM: cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web"
-            );
-        }
-    }
+    println!("cargo:warning=Rebuild WASM: cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web");
 }
 
 /// Find the newest modification time among all files in a directory (recursive).
