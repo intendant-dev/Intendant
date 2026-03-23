@@ -26,10 +26,22 @@ def main():
     s.connect(("127.0.0.1", 6000))
     recv_msg(s)  # hello
 
-    # List tabs
+    # List tabs — skip zombie tabs, prefer the selected one
     send_msg(s, {"to": "root", "type": "listTabs"})
     resp = recv_msg(s)
-    tab_actor = resp["tabs"][0]["actor"]
+    tab = None
+    for t in resp["tabs"]:
+        if not t.get("isZombieTab") and t.get("selected"):
+            tab = t
+            break
+    if not tab:
+        for t in resp["tabs"]:
+            if not t.get("isZombieTab"):
+                tab = t
+                break
+    if not tab:
+        tab = resp["tabs"][0]
+    tab_actor = tab["actor"]
 
     # Get target — drain until frame response
     send_msg(s, {"to": tab_actor, "type": "getTarget"})

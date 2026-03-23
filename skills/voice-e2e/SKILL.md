@@ -67,10 +67,18 @@ WASM callbacks -> browser UI -> WebSocket -> intendant agent
 
 ```bash
 # Install if missing
-sudo apt-get install -y espeak-ng ffmpeg pulseaudio pulseaudio-utils
+sudo apt-get install -y espeak-ng ffmpeg pulseaudio pulseaudio-utils pipewire-alsa
 ```
 
-PulseAudio must be running (`pactl info` should succeed).
+**`pipewire-alsa` is critical** — Firefox-ESR uses ALSA for audio. Without the
+PipeWire-ALSA bridge, Firefox cannot see PipeWire virtual audio devices at all
+(`enumerateDevices()` returns 0 devices, `getUserMedia` fails with NotFoundError).
+
+PulseAudio/PipeWire must be running (`pactl info` should succeed).
+
+**Only one browser can be active.** If you have `/app` open on another device
+(e.g. your host browser), close it or disconnect its voice first — otherwise
+the VM Firefox is passive and its audio is ignored by the presence layer.
 
 ## Setup
 
