@@ -596,9 +596,23 @@ fn list_sessions() -> String {
                     "task_complete" | "session_end" | "round_complete" => {
                         status = "completed".to_string();
                     }
+                    "interrupted" => {
+                        status = "interrupted".to_string();
+                    }
                     _ => {}
                 }
             }
+        }
+
+        // Check for summary.json (written on clean exit)
+        if status != "completed" && dir.join("summary.json").exists() {
+            status = "completed".to_string();
+        }
+
+        // Sessions with 0 turns and no task are abandoned (e.g., MCP probes,
+        // brief connections that never started work)
+        if status != "completed" && status != "interrupted" && turns == 0 && task.is_none() {
+            status = "abandoned".to_string();
         }
 
         // Fall back to directory mtime for created_at
