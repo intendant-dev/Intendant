@@ -3711,6 +3711,11 @@ async fn main() -> Result<(), CallerError> {
         Arc::new(tokio::sync::RwLock::new(frames::FrameRegistry::new(&log_dir)));
 
     // Create recording registry (listener spawned after bus creation in each mode).
+    if project.config.recording.enabled && !recording::is_ffmpeg_available() {
+        slog(&session_log, |l| {
+            l.warn("Recording enabled in intendant.toml but ffmpeg is not installed — recording will be disabled. Install with: sudo apt-get install ffmpeg")
+        });
+    }
     let recording_registry: Arc<tokio::sync::RwLock<recording::RecordingRegistry>> =
         Arc::new(tokio::sync::RwLock::new(recording::RecordingRegistry::new(
             &log_dir,
