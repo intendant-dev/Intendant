@@ -97,6 +97,8 @@ pub async fn start_display_recording(
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap_or_default())
         .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
+    // Force keyframes at segment boundaries so segments split reliably.
+    let keyframe_expr = format!("expr:gte(t,n_forced*{})", config.segment_duration_secs);
     let child = tokio::process::Command::new("ffmpeg")
         .args([
             "-f", "x11grab",
@@ -107,6 +109,7 @@ pub async fn start_display_recording(
             "-preset", "ultrafast",
             "-crf", &crf_arg,
             "-pix_fmt", "yuv420p",
+            "-force_key_frames", &keyframe_expr,
             "-f", "segment",
             "-segment_time", &seg_time_arg,
             "-segment_format", "mp4",
@@ -159,6 +162,7 @@ pub async fn start_frame_recording(
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap_or_default())
         .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
+    let keyframe_expr = format!("expr:gte(t,n_forced*{})", config.segment_duration_secs);
     let mut child = tokio::process::Command::new("ffmpeg")
         .args([
             "-f", "image2pipe",
@@ -169,6 +173,7 @@ pub async fn start_frame_recording(
             "-preset", "ultrafast",
             "-crf", &crf_arg,
             "-pix_fmt", "yuv420p",
+            "-force_key_frames", &keyframe_expr,
             "-f", "segment",
             "-segment_time", &seg_time_arg,
             "-segment_format", "mp4",
