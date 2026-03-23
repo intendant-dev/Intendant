@@ -498,6 +498,61 @@ impl tokio_tungstenite::tungstenite::handshake::server::Callback for VncWsCallba
 
 /// List session directories from `~/.intendant/logs/`, returning JSON metadata
 /// for each session (newest first, capped at 100).
+/// Return session detail: replayed log entries + metadata for a single session.
+fn get_session_detail(session_id: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let logs_dir = PathBuf::from(format!("{}/.intendant/logs", home));
+
+    // Find session by exact ID or prefix match
+    let session_dir = if logs_dir.join(session_id).is_dir() {
+        logs_dir.join(session_id)
+    } else {
+        // Prefix match
+        let mut found = None;
+        if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(session_id) {
+                    found = Some(entry.path());
+                    break;
+                }
+            }
+        }
+        match found {
+            Some(p) => p,
+            None => return serde_json::json!({"error": "session not found"}).to_string(),
+        }
+    };
+
+    let jsonl_path = session_dir.join("session.jsonl");
+    let entries = if let Ok(contents) = std::fs::read_to_string(&jsonl_path) {
+        replay_session_log(&contents)
+    } else {
+        Vec::new()
+    };
+
+    // Check for screenshot frames
+    let frames_dir = session_dir.join("frames");
+    let mut frames: Vec<String> = Vec::new();
+    if frames_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&frames_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".png") || name.ends_with(".jpg") {
+                    frames.push(name);
+                }
+            }
+        }
+        frames.sort();
+    }
+
+    serde_json::json!({
+        "session_id": session_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+        "entries": entries,
+        "frames": frames,
+    }).to_string()
+}
+
 fn list_sessions() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let logs_dir = PathBuf::from(format!("{}/.intendant/logs", home));
@@ -1675,6 +1730,30 @@ pub fn spawn_web_gateway(
                              \r\n\
                              {}",
                             status, body.len(), body
+                        );
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.contains("/api/session/") {
+                        // Single session detail: GET /api/session/<id>
+                        let body = if let Some(id) = request_line
+                            .split("/api/session/")
+                            .nth(1)
+                            .and_then(|rest| rest.split_whitespace().next())
+                            .and_then(|id| id.split('?').next())
+                        {
+                            get_session_detail(id)
+                        } else {
+                            r#"{"error":"missing session id"}"#.to_string()
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(), body
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
