@@ -535,6 +535,7 @@ impl SessionLog {
         prompt_tokens: u64,
         completion_tokens: u64,
         total_tokens: u64,
+        cached_tokens: u64,
     ) {
         let file = self.write_turn_file("model.txt", content);
         let preview: String = content.chars().take(200).collect();
@@ -549,6 +550,7 @@ impl SessionLog {
                     "prompt": prompt_tokens,
                     "completion": completion_tokens,
                     "total": total_tokens,
+                    "cached": cached_tokens,
                 },
                 "content_length": content.len(),
             })),
@@ -1045,7 +1047,7 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(1, 0.0, 200_000);
-        log.model_response("Hello, I will help you.\nHere is my plan.", 100, 50, 150);
+        log.model_response("Hello, I will help you.\nHere is my plan.", 100, 50, 150, 0);
         drop(log);
 
         let model_file = log_dir.join("turns/turn_001_model.txt");
@@ -1249,12 +1251,12 @@ mod tests {
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
 
         log.turn_start(1, 0.0, 200_000);
-        log.model_response("Response 1", 100, 50, 150);
+        log.model_response("Response 1", 100, 50, 150, 0);
         log.agent_input(r#"{"commands":[{"function":"execAsAgent","nonce":1}]}"#);
         log.agent_output("out1", "");
 
         log.turn_start(2, 5.0, 190_000);
-        log.model_response("Response 2", 200, 100, 300);
+        log.model_response("Response 2", 200, 100, 300, 0);
         log.agent_input(r#"{"commands":[{"function":"writeFile","nonce":2}]}"#);
         log.agent_output("out2", "err2");
 

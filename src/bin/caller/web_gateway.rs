@@ -533,6 +533,7 @@ fn list_sessions() -> String {
         let mut total_tokens: u64 = 0;
         let mut prompt_tokens: u64 = 0;
         let mut completion_tokens: u64 = 0;
+        let mut cached_tokens: u64 = 0;
         let mut role: Option<String> = None;
 
         if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
@@ -590,16 +591,14 @@ fn list_sessions() -> String {
                             if let Some(t) = tok.get("total").and_then(|v| v.as_u64()) {
                                 total_tokens += t;
                             }
-                            if let Some(p) = tok.get("prompt").and_then(|v| v.as_u64())
-                                .or_else(|| tok.get("completion").and_then(|v| v.as_u64()).map(|c| {
-                                    // If only completion is available, derive prompt from total - completion
-                                    total_tokens.saturating_sub(c)
-                                }))
-                            {
+                            if let Some(p) = tok.get("prompt").and_then(|v| v.as_u64()) {
                                 prompt_tokens += p;
                             }
                             if let Some(c) = tok.get("completion").and_then(|v| v.as_u64()) {
                                 completion_tokens += c;
+                            }
+                            if let Some(cached) = tok.get("cached").and_then(|v| v.as_u64()) {
+                                cached_tokens += cached;
                             }
                         }
                     }
@@ -651,6 +650,7 @@ fn list_sessions() -> String {
             "total_tokens": total_tokens,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
+            "cached_tokens": cached_tokens,
             "estimated_cost": estimated_cost,
             "role": role,
         }));

@@ -1750,6 +1750,7 @@ async fn run_agent_loop(
                 response.usage.prompt_tokens,
                 response.usage.completion_tokens,
                 response.usage.total_tokens,
+                response.usage.cached_tokens,
             )
         });
 

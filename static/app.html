@@ -2405,45 +2405,49 @@ function renderAllSessionsUsage(sessions) {
   const oneWeekAgo = new Date(now - 7*24*60*60*1000);
 
   let allInput = 0, allOutput = 0, allCached = 0, allCost = 0;
-  let todayInput = 0, todayOutput = 0, todayCost = 0;
-  let weekInput = 0, weekOutput = 0, weekCost = 0;
+  let todayInput = 0, todayOutput = 0, todayCached = 0, todayCost = 0;
+  let weekInput = 0, weekOutput = 0, weekCached = 0, weekCost = 0;
 
   for (const s of sessions) {
     const input = s.prompt_tokens || 0;
     const output = s.completion_tokens || 0;
+    const cached = s.cached_tokens || 0;
     const cost = s.estimated_cost || 0;
     allInput += input;
     allOutput += output;
+    allCached += cached;
     allCost += cost;
 
     const ts = s.created_at ? new Date(s.created_at) : null;
     if (!ts) continue;
-    if (ts >= oneDayAgo) { todayInput += input; todayOutput += output; todayCost += cost; }
-    if (ts >= oneWeekAgo) { weekInput += input; weekOutput += output; weekCost += cost; }
+    if (ts >= oneDayAgo) { todayInput += input; todayOutput += output; todayCached += cached; todayCost += cost; }
+    if (ts >= oneWeekAgo) { weekInput += input; weekOutput += output; weekCached += cached; weekCost += cost; }
   }
 
   el.style.display = 'block';
   grid.innerHTML = '';
 
   const rows = [
-    ['Today', todayInput, todayOutput, todayCost],
-    ['This Week', weekInput, weekOutput, weekCost],
-    ['All Time', allInput, allOutput, allCost],
+    ['Today', todayInput, todayCached, todayOutput, todayCost],
+    ['This Week', weekInput, weekCached, weekOutput, weekCost],
+    ['All Time', allInput, allCached, allOutput, allCost],
   ];
 
   // Header
   grid.innerHTML = `
     <span class="label" style="font-weight:600"></span>
     <span class="value" style="font-size:10px;color:var(--overlay1)">Input</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Cached</span>
     <span class="value" style="font-size:10px;color:var(--overlay1)">Output</span>
     <span class="value" style="font-size:10px;color:var(--overlay1)">Est. Cost</span>
   `;
-  grid.style.gridTemplateColumns = 'auto 1fr 1fr 1fr';
+  grid.style.gridTemplateColumns = 'auto 1fr 1fr 1fr 1fr';
 
-  for (const [label, input, output, cost] of rows) {
+  for (const [label, input, cached, output, cost] of rows) {
     grid.innerHTML += `
       <span class="label">${label}</span>
       <span class="value">${input.toLocaleString()}</span>
+      <span class="value" style="color:var(--green)">${cached.toLocaleString()}</span>
       <span class="value">${output.toLocaleString()}</span>
       <span class="value" style="color:var(--green)">$${cost.toFixed(2)}</span>
     `;
