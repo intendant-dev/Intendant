@@ -392,6 +392,10 @@ impl RecordingRegistry {
 }
 
 /// Parse ffmpeg's segment list CSV (filename,start_time,end_time).
+pub fn parse_segment_csv_pub(csv_path: &Path, segments_dir: &Path) -> Vec<SegmentInfo> {
+    parse_segment_csv(csv_path, segments_dir)
+}
+
 fn parse_segment_csv(csv_path: &Path, segments_dir: &Path) -> Vec<SegmentInfo> {
     let content = match std::fs::read_to_string(csv_path) {
         Ok(c) => c,

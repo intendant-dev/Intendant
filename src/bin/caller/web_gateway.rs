@@ -1896,9 +1896,18 @@ pub fn spawn_web_gateway(
                             let reg = rec_reg.read().await;
 
                             if parts.len() == 2 && parts[1] == "segments" {
-                                // GET /recordings/{stream}/segments
+                                // GET /recordings/{stream}/segments — check session then daemon dir
                                 let stream_name = parts[0];
-                                let segments = reg.segments(stream_name);
+                                let mut segments = reg.segments(stream_name);
+                                if segments.is_empty() {
+                                    // Fallback to daemon recordings dir
+                                    let daemon_dir = crate::debug::daemon_recordings_dir();
+                                    let stream_dir = daemon_dir.join(stream_name);
+                                    segments = crate::recording::parse_segment_csv_pub(
+                                        &stream_dir.join("segments.csv"),
+                                        &stream_dir,
+                                    );
+                                }
                                 let json: Vec<serde_json::Value> = segments.iter().map(|s| {
                                     serde_json::json!({
                                         "filename": s.filename,
@@ -1928,10 +1937,19 @@ pub fn spawn_web_gateway(
                                     && filename.len() < 30
                                     && !filename.contains("..");
                                 if valid {
-                                    let seg_path = reg.session_dir()
+                                    // Check session dir first, then daemon dir
+                                    let session_path = reg.session_dir()
                                         .join("recordings")
                                         .join(stream_name)
                                         .join(filename);
+                                    let daemon_path = crate::debug::daemon_recordings_dir()
+                                        .join(stream_name)
+                                        .join(filename);
+                                    let seg_path = if session_path.exists() {
+                                        session_path
+                                    } else {
+                                        daemon_path
+                                    };
                                     match tokio::fs::read(&seg_path).await {
                                         Ok(data) => {
                                             let header = format!(
@@ -2001,12 +2019,55 @@ pub fn spawn_web_gateway(
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
                     } else if request_line.contains("/recordings") {
-                        // GET /recordings — list all streams with manifest + segments
+                        // GET /recordings — list all streams (session + daemon-scoped)
                         use tokio::io::AsyncWriteExt;
-                        let body = if let Some(ref rec_reg) = recording_registry {
+
+                        // Helper to list streams from a recordings directory
+                        fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<serde_json::Value> {
+                            let mut entries = Vec::new();
+                            if let Ok(dirs) = std::fs::read_dir(recordings_dir) {
+                                for entry in dirs.flatten() {
+                                    if !entry.path().is_dir() { continue; }
+                                    let name = entry.file_name().to_string_lossy().to_string();
+                                    let stream_dir = entry.path();
+                                    // Read manifest
+                                    let manifest = std::fs::read_to_string(stream_dir.join("manifest.json"))
+                                        .ok()
+                                        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                                        .unwrap_or(serde_json::json!({}));
+                                    // Read segments CSV
+                                    let segments = crate::recording::parse_segment_csv_pub(
+                                        &stream_dir.join("segments.csv"),
+                                        &stream_dir,
+                                    );
+                                    let total_duration = segments.last().map(|s| s.end_secs).unwrap_or(0.0);
+                                    let seg_json: Vec<serde_json::Value> = segments.iter().map(|s| {
+                                        serde_json::json!({
+                                            "filename": s.filename,
+                                            "start_secs": s.start_secs,
+                                            "end_secs": s.end_secs,
+                                        })
+                                    }).collect();
+                                    let mut e = manifest;
+                                    e["stream_name"] = serde_json::json!(name);
+                                    e["segments"] = serde_json::Value::Array(seg_json);
+                                    e["total_duration_secs"] = serde_json::json!(total_duration);
+                                    entries.push(e);
+                                }
+                            }
+                            entries.sort_by(|a, b| {
+                                a["stream_name"].as_str().cmp(&b["stream_name"].as_str())
+                            });
+                            entries
+                        }
+
+                        let mut all_entries = Vec::new();
+
+                        // Session-scoped recordings (from RecordingRegistry)
+                        if let Some(ref rec_reg) = recording_registry {
                             let reg = rec_reg.read().await;
                             let streams = reg.all_streams();
-                            let entries: Vec<serde_json::Value> = streams.iter().map(|name| {
+                            for name in &streams {
                                 let manifest = reg.manifest(name).unwrap_or(serde_json::json!({}));
                                 let segments = reg.segments(name);
                                 let total_duration = segments.last()
@@ -2022,12 +2083,21 @@ pub fn spawn_web_gateway(
                                 let mut entry = manifest;
                                 entry["segments"] = serde_json::Value::Array(seg_json);
                                 entry["total_duration_secs"] = serde_json::json!(total_duration);
-                                entry
-                            }).collect();
-                            serde_json::to_string(&entries).unwrap_or("[]".to_string())
-                        } else {
-                            "[]".to_string()
-                        };
+                                all_entries.push(entry);
+                            }
+                        }
+
+                        // Daemon-scoped recordings (from ~/.intendant/recordings/)
+                        let daemon_dir = crate::debug::daemon_recordings_dir();
+                        let mut daemon_streams: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        for entry in list_recording_streams(&daemon_dir) {
+                            if let Some(name) = entry["stream_name"].as_str() {
+                                daemon_streams.insert(name.to_string());
+                            }
+                            all_entries.push(entry);
+                        }
+
+                        let body = serde_json::to_string(&all_entries).unwrap_or("[]".to_string());
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
