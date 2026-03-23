@@ -1584,7 +1584,11 @@ html, body {
       <div class="sessions-container">
         <div class="sessions-header">
           <span class="sessions-title">Recent Sessions</span>
-          <button class="sessions-refresh" onclick="loadSessions()">Refresh</button>
+          <div style="display:flex;gap:4px;align-items:center;margin-left:auto">
+            <input id="new-session-input" placeholder="New task..." style="padding:4px 8px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);font-size:12px;width:200px" />
+            <button onclick="startNewSession()" style="padding:4px 12px;border:1px solid var(--green);border-radius:4px;background:var(--green);color:var(--base);font-size:12px;font-weight:600;cursor:pointer">Start</button>
+          </div>
+          <button class="sessions-refresh" onclick="loadSessions()" style="margin-left:8px">Refresh</button>
         </div>
         <div class="sessions-aggregate" id="sessions-aggregate"></div>
         <div class="sessions-list" id="sessions-list">
@@ -2254,6 +2258,8 @@ function processCommands(cmds) {
       case 'add_recording': addRecordingStream(c.stream_name); break;
       case 'remove_recording': removeRecordingStream(c.stream_name); break;
       case 'recording_error': /* logged via add_log_entry */ break;
+      case 'session_started': onSessionStarted(c.session_id, c.task); break;
+      case 'session_ended': onSessionEnded(c.session_id, c.reason); break;
       case 'show_badge': showBadge(c.tab, c.text); break;
       case 'hide_badge': hideBadge(c.tab); break;
       case 'term_data': handleTermData(c.base64); break;
@@ -3491,6 +3497,30 @@ function renderAllSessionsUsage(sessions) {
       <span class="value">${output.toLocaleString()}</span>
       <span class="value" style="color:var(--green)">$${cost.toFixed(2)}</span>
     `;
+  }
+}
+
+// ── Session Lifecycle ──
+function onSessionStarted(sessionId, task) {
+  document.getElementById('sb-session').textContent = sessionId ? sessionId.slice(0, 8) : '';
+  switchTab('activity');
+}
+
+function onSessionEnded(sessionId, reason) {
+  // Refresh sessions list if already loaded
+  if (sessionsLoaded) loadSessions();
+  // Switch to sessions tab so user sees past sessions + new session input
+  switchTab('sessions');
+}
+
+function startNewSession() {
+  const input = document.getElementById('new-session-input');
+  if (!input) return;
+  const task = input.value.trim();
+  if (!task) return;
+  input.value = '';
+  if (app) {
+    app.send_server_action({ action: 'start_task', text: task });
   }
 }
 
