@@ -78,6 +78,15 @@ pub enum UiCommand {
         stream_name: String,
         message: String,
     },
+    SessionStarted {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+    },
+    SessionEnded {
+        session_id: String,
+        reason: String,
+    },
     ShowBadge {
         tab: String,
         text: String,
@@ -838,6 +847,20 @@ impl AppState {
                 let message = msg["message"].as_str().unwrap_or("").to_string();
                 cmds.extend(self.add_log("warn", &format!("Recording error ({}): {}", stream, message), None, "system"));
                 cmds.push(UiCommand::RecordingError { stream_name: stream, message });
+            }
+
+            "session_started" => {
+                let session_id = msg["session_id"].as_str().unwrap_or("").to_string();
+                let task = msg["task"].as_str().map(|s| s.to_string());
+                cmds.extend(self.add_log("info", &format!("Session started: {}", session_id), None, "system"));
+                cmds.push(UiCommand::SessionStarted { session_id, task });
+            }
+
+            "session_ended" => {
+                let session_id = msg["session_id"].as_str().unwrap_or("").to_string();
+                let reason = msg["reason"].as_str().unwrap_or("").to_string();
+                cmds.extend(self.add_log("info", &format!("Session ended: {} — {}", session_id, reason), None, "system"));
+                cmds.push(UiCommand::SessionEnded { session_id, reason });
             }
 
             "command_result" => {

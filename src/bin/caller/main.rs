@@ -120,6 +120,8 @@ struct CliFlags {
     web_port: u16,
     /// --transcription: Enable user speech transcription.
     transcription: bool,
+    /// --record-display <ID>: Record an existing X11 display (repeatable).
+    record_displays: Vec<u32>,
 }
 
 fn print_help() {
@@ -146,6 +148,7 @@ fn print_help() {
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]           Serve TUI via web (xterm.js + optional voice, default port: 8765)");
     println!("    --transcription       Enable user speech transcription");
+    println!("    --record-display <ID> Record an existing X11 display (e.g. 50 for :50, repeatable)");
     println!("    --help, -h            Show this help message");
     println!();
     println!("SESSION LOGS:");
@@ -192,6 +195,7 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         web: false,
         web_port: web_gateway::DEFAULT_PORT,
         transcription: false,
+        record_displays: Vec::new(),
     };
 
     let mut task_parts = Vec::new();
@@ -302,6 +306,22 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
             "--transcription" => {
                 flags.transcription = true;
                 i += 1;
+            }
+            "--record-display" => {
+                if i + 1 >= args.len() {
+                    return Err(CallerError::Config(
+                        "--record-display requires a display ID (e.g. 50 for :50)".to_string(),
+                    ));
+                }
+                let raw = args[i + 1].trim_start_matches(':');
+                let id: u32 = raw.parse().map_err(|_| {
+                    CallerError::Config(format!(
+                        "--record-display: '{}' is not a valid display ID",
+                        args[i + 1]
+                    ))
+                })?;
+                flags.record_displays.push(id);
+                i += 2;
             }
             other => {
                 if other.starts_with('-') {
@@ -666,6 +686,70 @@ async fn maybe_auto_launch_xvfb(
             slog(session_log, |l| {
                 l.warn(&format!("Failed to auto-launch Xvfb: {}", e))
             });
+        }
+    }
+}
+
+/// Query the resolution of an existing X11 display via xdpyinfo.
+/// Returns (width, height) or a default of (1280, 720) if detection fails.
+fn query_display_resolution(display_id: u32) -> (u32, u32) {
+    let output = std::process::Command::new("xdpyinfo")
+        .arg("-display")
+        .arg(format!(":{}", display_id))
+        .output();
+    if let Ok(out) = output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("dimensions:") {
+                // "dimensions:    1280x720 pixels (338x190 millimeters)"
+                if let Some(dims) = trimmed.split_whitespace().nth(1) {
+                    let parts: Vec<&str> = dims.split('x').collect();
+                    if parts.len() == 2 {
+                        if let (Ok(w), Ok(h)) = (parts[0].parse(), parts[1].parse()) {
+                            return (w, h);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (1280, 720)
+}
+
+/// Start recording external displays (--record-display) directly on the registry.
+/// Also emits DisplayReady so the web UI shows the display slot.
+async fn start_external_display_recordings(
+    displays: &[u32],
+    registry: &std::sync::Arc<tokio::sync::RwLock<recording::RecordingRegistry>>,
+    bus: &EventBus,
+) {
+    for &id in displays {
+        let (width, height) = query_display_resolution(id);
+        eprintln!(
+            "Recording external display :{} ({}x{})",
+            id, width, height
+        );
+        let mut reg = registry.write().await;
+        if !reg.is_enabled() {
+            eprintln!("Recording not enabled in config — skipping :{}",id);
+            continue;
+        }
+        if !recording::is_ffmpeg_available() {
+            eprintln!("ffmpeg not available — skipping :{}", id);
+            continue;
+        }
+        match reg.start_external_display(id, width, height).await {
+            Ok(stream_name) => {
+                bus.send(AppEvent::DisplayReady {
+                    display_id: id,
+                    vnc_port: None,
+                    width,
+                    height,
+                });
+                bus.send(AppEvent::RecordingStarted { stream_name });
+            }
+            Err(e) => eprintln!("Failed to start recording for :{}: {}", id, e),
         }
     }
 }
@@ -1082,6 +1166,7 @@ Also: {"source": "bare"}"#;
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
             transcription: false,
+            record_displays: Vec::new(),
         };
         assert!(!flags.verbose);
         assert!(!flags.no_tui);
@@ -1119,6 +1204,7 @@ Also: {"source": "bare"}"#;
             web: true,
             web_port: web_gateway::DEFAULT_PORT,
             transcription: false,
+            record_displays: Vec::new(),
         };
         assert!(flags.web);
         assert_eq!(flags.web_port, web_gateway::DEFAULT_PORT);
@@ -1145,6 +1231,7 @@ Also: {"source": "bare"}"#;
             web: true,
             web_port: 9000,
             transcription: false,
+            record_displays: Vec::new(),
         };
         assert!(flags.web);
         assert_eq!(flags.web_port, 9000);
@@ -3818,6 +3905,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
+        start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let mcp_control_tx = if flags.control_socket {
             let (_control_handle, control_tx) = control::spawn_control_server(bus.clone());
             slog(&session_log, |l| {
@@ -4125,6 +4213,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
+        start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
 
         // TUI is created later — just before run() — so that web mode
         // (--web) can use WebTui instead of the real terminal backend.
@@ -4503,6 +4592,7 @@ async fn main() -> Result<(), CallerError> {
 
         // Drop the App (and its follow_up_tx) so the round loop's recv()
         // returns None and exits gracefully, allowing write_summary to run.
+        let session_id = app.session_id.clone();
         drop(app);
 
         // Give the agent task a moment to finish writing the session summary.
@@ -4510,6 +4600,17 @@ async fn main() -> Result<(), CallerError> {
         match tokio::time::timeout(std::time::Duration::from_secs(5), &mut loop_handle).await {
             Ok(_) => {} // task finished naturally
             Err(_) => loop_handle.abort(), // timed out — force stop
+        }
+
+        if flags.web && !session_id.is_empty() {
+            bus.send(AppEvent::SessionEnded {
+                session_id,
+                reason: "completed".to_string(),
+            });
+            // Daemon mode: keep web gateway alive after TUI quits.
+            eprintln!("TUI exited. Web gateway still running on port {}. Press Ctrl+C to exit.", flags.web_port);
+            tokio::signal::ctrl_c().await.ok();
+            eprintln!("Shutting down.");
         }
 
         control::cleanup();
@@ -4522,6 +4623,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
+        start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
 
         // Outbound broadcast channel — shared by web gateway and JSON stdout subscriber
         let (outbound_tx, _) = tokio::sync::broadcast::channel::<String>(256);
@@ -4668,12 +4770,23 @@ async fn main() -> Result<(), CallerError> {
             drop(follow_up_tx); // single-round: recv() returns None immediately
         }
 
+        let session_id = log_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        bus.send(AppEvent::SessionStarted {
+            session_id: session_id.clone(),
+            task: Some(task.clone()),
+        });
+
         let result = if flags.direct || is_simple_task(&task) {
             run_direct_mode(
                 provider,
                 task.clone(),
                 project,
-                bus,
+                bus.clone(),
                 autonomy,
                 session_log.clone(),
                 log_dir,
@@ -4696,15 +4809,39 @@ async fn main() -> Result<(), CallerError> {
             )
             .await
         };
-        match &result {
-            Ok(stats) => slog(&session_log, |l| {
-                l.write_summary_with_rounds(&task, "completed", stats.turns, Some(stats.rounds))
-            }),
-            Err(e) => slog(&session_log, |l| {
-                l.write_summary(&task, &format!("error: {}", e), 0)
-            }),
+
+        let reason = match &result {
+            Ok(stats) => {
+                slog(&session_log, |l| {
+                    l.write_summary_with_rounds(&task, "completed", stats.turns, Some(stats.rounds))
+                });
+                "completed".to_string()
+            }
+            Err(e) => {
+                slog(&session_log, |l| {
+                    l.write_summary(&task, &format!("error: {}", e), 0)
+                });
+                format!("error: {}", e)
+            }
+        };
+
+        bus.send(AppEvent::SessionEnded {
+            session_id,
+            reason: reason.clone(),
+        });
+
+        if flags.web {
+            // Daemon mode: keep web gateway alive after session ends.
+            // Wait indefinitely — the web gateway continues serving recordings,
+            // sessions, and annotations. Process exits on SIGINT/SIGTERM.
+            eprintln!("Session ended ({}). Web gateway still running on port {}. Press Ctrl+C to exit.", reason, flags.web_port);
+            // Hold the EventBus and broadcast channel alive by parking.
+            // The web gateway task continues accepting connections.
+            tokio::signal::ctrl_c().await.ok();
+            eprintln!("Shutting down.");
+        } else {
+            result?;
         }
-        result?;
     }
 
     Ok(())
