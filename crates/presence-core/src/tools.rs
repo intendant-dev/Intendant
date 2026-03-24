@@ -35,6 +35,11 @@ pub fn presence_tools() -> Vec<ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Optional hints to inject into the worker's context."
+                    },
+                    "reference_frame_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Frame IDs the user was looking at when they made this request. Include these so the agent knows what the user was referring to, even if the screen has since changed."
                     }
                 },
                 "required": ["task"]

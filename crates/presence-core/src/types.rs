@@ -73,6 +73,10 @@ pub struct TaskEnvelope {
     pub force_direct: bool,
     #[serde(default)]
     pub context_hints: Vec<String>,
+    /// Frame IDs the user was looking at when they issued this task.
+    /// Used to give the CU agent temporal context about what the user was referring to.
+    #[serde(default)]
+    pub reference_frame_ids: Vec<String>,
 }
 
 /// Filtered events pushed to the presence layer from the agent loop.
@@ -413,12 +417,14 @@ mod tests {
             task: "fix the bug".to_string(),
             force_direct: true,
             context_hints: vec!["src/main.rs".to_string()],
+            reference_frame_ids: vec!["display:99-f00012".to_string()],
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let back: TaskEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(back.task, "fix the bug");
         assert!(back.force_direct);
         assert_eq!(back.context_hints.len(), 1);
+        assert_eq!(back.reference_frame_ids.len(), 1);
     }
 
     #[test]

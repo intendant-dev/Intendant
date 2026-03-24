@@ -95,11 +95,20 @@ fn handle_submit_task(args: &Value) -> PresenceAction {
                 .collect()
         })
         .unwrap_or_default();
+    let reference_frame_ids = args["reference_frame_ids"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
 
     PresenceAction::SubmitTask(TaskEnvelope {
         task,
         force_direct,
         context_hints,
+        reference_frame_ids,
     })
 }
 
@@ -378,6 +387,7 @@ mod tests {
                 task: "fix bug".to_string(),
                 force_direct: false,
                 context_hints: vec![],
+                reference_frame_ids: vec![],
             })),
             "Task submitted: fix bug"
         );

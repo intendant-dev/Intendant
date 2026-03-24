@@ -1159,6 +1159,7 @@ impl App {
                             task: task.clone(),
                             force_direct: orchestrate == Some(false),
                             context_hints: vec![],
+                            reference_frame_ids: vec![],
                         };
                         tx.try_send(envelope).is_ok()
                     } else if let Some(ref tx) = self.follow_up_tx {

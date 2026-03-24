@@ -3016,6 +3016,7 @@ async fn run_with_presence(
             task: failed_task,
             force_direct: true,
             context_hints: vec![],
+            reference_frame_ids: vec![],
         };
         let _ = fallback_task_tx.send(envelope).await;
     }
@@ -3048,6 +3049,11 @@ async fn run_with_presence(
         // Resolve frame context_hints → images
         let frame_images = resolve_frame_hints(
             &envelope.context_hints, &frame_registry
+        ).await;
+
+        // Resolve reference frames (what the user was looking at when they spoke)
+        let reference_images = resolve_frame_ids(
+            &envelope.reference_frame_ids, &frame_registry
         ).await;
 
         if persistent_conv.is_none() {
@@ -3102,6 +3108,18 @@ async fn run_with_presence(
             ));
             conv.add_assistant("Understood.".to_string());
 
+            // Inject reference frames: what the user was looking at when they spoke
+            if !reference_images.is_empty() {
+                conv.add_user_with_images(
+                    "[Reference] The user was looking at the following screen when they \
+                     made their request. Use this to understand what they are referring to, \
+                     even if the screen has since changed. Take a fresh screenshot with \
+                     capture_screen to see the current state.".to_string(),
+                    reference_images,
+                );
+                conv.add_assistant("Understood — I'll use these reference frames to understand the user's intent and capture a fresh screenshot for the current state.".to_string());
+            }
+
             // Add task with optional frame images
             if frame_images.is_empty() {
                 conv.add_user(envelope.task);
@@ -3115,6 +3133,19 @@ async fn run_with_presence(
         } else {
             // ── Subsequent task: inject into existing conversation ──
             let conv = persistent_conv.as_mut().unwrap();
+
+            // Inject reference frames for temporal context
+            if !reference_images.is_empty() {
+                conv.add_user_with_images(
+                    "[Reference] The user was looking at the following screen when they \
+                     made their request. Use this to understand what they are referring to, \
+                     even if the screen has since changed. Take a fresh screenshot with \
+                     capture_screen to see the current state.".to_string(),
+                    reference_images,
+                );
+                conv.add_assistant("Understood.".to_string());
+            }
+
             if frame_images.is_empty() {
                 conv.add_user(format!("[New Task] {}", envelope.task));
             } else {
@@ -3627,6 +3658,33 @@ async fn resolve_frame_hints(
                         // Frame not found — skip silently
                     }
                 }
+            }
+        }
+    }
+    images
+}
+
+/// Resolve explicit frame IDs into HQ images from the frame registry.
+async fn resolve_frame_ids(
+    frame_ids: &[String],
+    registry: &Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
+) -> Vec<conversation::ImageData> {
+    if frame_ids.is_empty() {
+        return Vec::new();
+    }
+    let mut images = Vec::new();
+    let reg = registry.read().await;
+    for fid in frame_ids {
+        match reg.read_hq(fid) {
+            Ok(data) => {
+                use base64::Engine;
+                images.push(conversation::ImageData {
+                    media_type: "image/jpeg".to_string(),
+                    data: base64::engine::general_purpose::STANDARD.encode(&data),
+                });
+            }
+            Err(_) => {
+                // Frame not found — skip silently
             }
         }
     }

@@ -1050,12 +1050,14 @@ mod tests {
             task: "fix the tests".to_string(),
             force_direct: true,
             context_hints: vec!["check src/main.rs".to_string()],
+            reference_frame_ids: vec!["cam0-f00005".to_string()],
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let parsed: TaskEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.task, "fix the tests");
         assert!(parsed.force_direct);
         assert_eq!(parsed.context_hints.len(), 1);
+        assert_eq!(parsed.reference_frame_ids.len(), 1);
     }
 
     #[test]
