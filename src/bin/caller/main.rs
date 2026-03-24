@@ -1,5 +1,6 @@
 mod agent_runner;
 mod autonomy;
+mod computer_use;
 mod control;
 mod conversation;
 mod debug;

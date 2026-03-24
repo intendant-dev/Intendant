@@ -99,6 +99,8 @@ pub struct ChatResponse {
     pub reasoning_summary: Option<String>,
     pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// Native computer-use tool calls (parsed from provider-specific format).
+    pub cu_calls: Vec<super::computer_use::CuToolCall>,
     /// Raw output items from the Responses API (reasoning + function_call items).
     /// Echoed back verbatim in subsequent requests per the API contract.
     pub raw_output: Option<Vec<serde_json::Value>>,
@@ -134,6 +136,16 @@ pub trait ChatProvider: Send + Sync {
     /// Whether this provider instance has native tool calling enabled.
     fn use_tools(&self) -> bool {
         false
+    }
+
+    /// Whether this provider instance has native computer-use enabled.
+    fn cu_enabled(&self) -> bool {
+        false
+    }
+
+    /// Display dimensions for CU (width, height), if CU is enabled.
+    fn cu_display(&self) -> Option<(u32, u32)> {
+        None
     }
 
     /// Return tool definitions when native tool calling is enabled.
@@ -279,6 +291,10 @@ pub struct OpenAIProvider {
     reasoning: Option<ReasoningConfig>,
     use_tools: bool,
     custom_tools: Option<Vec<ToolDefinition>>,
+    /// When true, include native computer-use tool in API requests.
+    pub cu_enabled: bool,
+    /// Display dimensions for CU (width, height).
+    pub cu_display: Option<(u32, u32)>,
 }
 
 impl OpenAIProvider {
@@ -302,6 +318,8 @@ impl OpenAIProvider {
             reasoning,
             use_tools,
             custom_tools: None,
+            cu_enabled: false,
+            cu_display: None,
         }
     }
 
@@ -321,6 +339,8 @@ impl OpenAIProvider {
             reasoning: None,
             use_tools: false,
             custom_tools: None,
+            cu_enabled: false,
+            cu_display: None,
         }
     }
 
@@ -341,6 +361,8 @@ impl OpenAIProvider {
             reasoning: None,
             use_tools: true,
             custom_tools: Some(tools),
+            cu_enabled: false,
+            cu_display: None,
         }
     }
 }
@@ -511,6 +533,7 @@ impl ChatProvider for OpenAIProvider {
             reasoning_summary,
             reasoning_content,
             tool_calls,
+            cu_calls: vec![],
             raw_output,
         })
     }
@@ -533,6 +556,14 @@ impl ChatProvider for OpenAIProvider {
 
     fn use_tools(&self) -> bool {
         self.use_tools
+    }
+
+    fn cu_enabled(&self) -> bool {
+        self.cu_enabled
+    }
+
+    fn cu_display(&self) -> Option<(u32, u32)> {
+        self.cu_display
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {
@@ -773,6 +804,7 @@ impl ChatProvider for OpenAIProvider {
             reasoning_summary,
             reasoning_content,
             tool_calls,
+            cu_calls: vec![],
             raw_output,
         };
         on_event(StreamEvent::Complete(response.clone()));
@@ -954,6 +986,10 @@ pub struct AnthropicProvider {
     max_output_tokens: u64,
     use_tools: bool,
     custom_tools: Option<Vec<ToolDefinition>>,
+    /// When true, include native computer-use tool in API requests.
+    pub cu_enabled: bool,
+    /// Display dimensions for CU (width, height).
+    pub cu_display: Option<(u32, u32)>,
 }
 
 impl AnthropicProvider {
@@ -972,6 +1008,8 @@ impl AnthropicProvider {
             max_output_tokens,
             use_tools,
             custom_tools: None,
+            cu_enabled: false,
+            cu_display: None,
         }
     }
 
@@ -989,6 +1027,8 @@ impl AnthropicProvider {
             max_output_tokens,
             use_tools: false,
             custom_tools: None,
+            cu_enabled: false,
+            cu_display: None,
         }
     }
 
@@ -1007,6 +1047,8 @@ impl AnthropicProvider {
             max_output_tokens,
             use_tools: true,
             custom_tools: Some(tools),
+            cu_enabled: false,
+            cu_display: None,
         }
     }
 }
@@ -1112,6 +1154,7 @@ impl ChatProvider for AnthropicProvider {
             reasoning_summary: None,
             reasoning_content: None,
             tool_calls,
+            cu_calls: vec![],
             raw_output: None,
         })
     }
@@ -1134,6 +1177,14 @@ impl ChatProvider for AnthropicProvider {
 
     fn use_tools(&self) -> bool {
         self.use_tools
+    }
+
+    fn cu_enabled(&self) -> bool {
+        self.cu_enabled
+    }
+
+    fn cu_display(&self) -> Option<(u32, u32)> {
+        self.cu_display
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {
@@ -1316,6 +1367,7 @@ impl ChatProvider for AnthropicProvider {
             reasoning_summary: None,
             reasoning_content: None,
             tool_calls,
+            cu_calls: vec![],
             raw_output: None,
         };
         on_event(StreamEvent::Complete(response.clone()));
@@ -1444,6 +1496,10 @@ pub struct GeminiProvider {
     use_tools: bool,
     custom_tools: Option<Vec<ToolDefinition>>,
     endpoint: String,
+    /// When true, include native computer-use tool in API requests.
+    pub cu_enabled: bool,
+    /// Display dimensions for CU (width, height).
+    pub cu_display: Option<(u32, u32)>,
 }
 
 impl GeminiProvider {
@@ -1465,6 +1521,8 @@ impl GeminiProvider {
             use_tools,
             custom_tools: None,
             endpoint,
+            cu_enabled: false,
+            cu_display: None,
         }
     }
 
@@ -1486,6 +1544,8 @@ impl GeminiProvider {
             use_tools: false,
             custom_tools: None,
             endpoint,
+            cu_enabled: false,
+            cu_display: None,
         }
     }
 
@@ -1507,6 +1567,8 @@ impl GeminiProvider {
             use_tools: true,
             custom_tools: Some(tools),
             endpoint,
+            cu_enabled: false,
+            cu_display: None,
         }
     }
 }
@@ -1636,6 +1698,7 @@ impl ChatProvider for GeminiProvider {
             reasoning_summary: None,
             reasoning_content: None,
             tool_calls,
+            cu_calls: vec![],
             raw_output: None,
         })
     }
@@ -1658,6 +1721,14 @@ impl ChatProvider for GeminiProvider {
 
     fn use_tools(&self) -> bool {
         self.use_tools
+    }
+
+    fn cu_enabled(&self) -> bool {
+        self.cu_enabled
+    }
+
+    fn cu_display(&self) -> Option<(u32, u32)> {
+        self.cu_display
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {
@@ -1804,6 +1875,7 @@ impl ChatProvider for GeminiProvider {
             reasoning_summary: None,
             reasoning_content: None,
             tool_calls,
+            cu_calls: vec![],
             raw_output: None,
         };
         on_event(StreamEvent::Complete(response.clone()));
@@ -2935,6 +3007,7 @@ mod tests {
             reasoning_summary: None,
             reasoning_content: None,
             tool_calls: vec![],
+            cu_calls: vec![],
             raw_output: None,
         };
         assert!(resp.tool_calls.is_empty());
@@ -3240,6 +3313,7 @@ mod tests {
             reasoning_summary: None,
             reasoning_content: None,
             tool_calls: vec![],
+            cu_calls: vec![],
             raw_output: None,
         };
         let event = StreamEvent::Complete(resp);
