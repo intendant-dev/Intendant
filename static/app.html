@@ -812,7 +812,8 @@ html, body {
 .display-status.connected { color: var(--green); }
 .display-status.error { color: var(--red); }
 .display-toolbar .take-control-btn,
-.display-toolbar .release-control-btn {
+.display-toolbar .release-control-btn,
+.display-toolbar .stream-btn {
   padding: 3px 10px;
   border: 1px solid var(--surface1);
   border-radius: 4px;
@@ -820,7 +821,19 @@ html, body {
   color: var(--text);
   cursor: pointer;
   font-size: 12px;
+}
+.display-toolbar .take-control-btn {
   margin-left: auto;
+}
+.display-toolbar .stream-btn:hover {
+  background: var(--green);
+  color: var(--base);
+  border-color: var(--green);
+}
+.display-toolbar .stream-btn.active {
+  background: var(--green);
+  color: var(--base);
+  border-color: var(--green);
 }
 .display-toolbar .take-control-btn:hover {
   background: var(--blue);
@@ -2712,6 +2725,10 @@ class DisplaySlot {
     this.rfb = null;
     this.interactive = false;
     this.connected = false;
+    this.streaming = false;
+    this._streamIntervalId = null;
+    this._streamFrameCounter = 0;
+    this._streamCanvas = document.createElement('canvas');
     this.el = document.createElement('div');
     this.el.className = 'display-slot';
     this.el.innerHTML = `
@@ -2719,6 +2736,7 @@ class DisplaySlot {
         <span class="display-label">:${displayId}</span>
         <span class="display-status" id="ds-status-${displayId}">Connecting...</span>
         <input class="release-note" id="ds-note-${displayId}" placeholder="Note (optional)" style="display:none">
+        <button class="stream-btn" id="ds-stream-${displayId}" title="Stream display to model">&#x1F441; Stream</button>
         <button class="take-control-btn" id="ds-take-${displayId}">Take Control</button>
         <button class="release-control-btn" id="ds-release-${displayId}" style="display:none">Release</button>
       </div>
@@ -2727,9 +2745,11 @@ class DisplaySlot {
     this.noteInput = this.el.querySelector(`#ds-note-${displayId}`);
     this.takeBtn = this.el.querySelector(`#ds-take-${displayId}`);
     this.releaseBtn = this.el.querySelector(`#ds-release-${displayId}`);
+    this.streamBtn = this.el.querySelector(`#ds-stream-${displayId}`);
     this.canvasEl = this.el.querySelector(`#display-canvas-${displayId}`);
     this.takeBtn.addEventListener('click', () => this.takeControl());
     this.releaseBtn.addEventListener('click', () => this.releaseControl());
+    this.streamBtn.addEventListener('click', () => this.toggleStreaming());
   }
   connectPassive() { loadNoVNC(() => this._connectVNC()); }
   _connectVNC() {
@@ -2772,7 +2792,54 @@ class DisplaySlot {
     this.statusEl.textContent = this.connected ? 'Connected (view-only)' : 'Disconnected';
     if (app) app.release_display(this.displayId, note);
   }
-  disconnect() { if (this.rfb) { this.rfb.disconnect(); this.rfb = null; } this.connected = false; }
+  toggleStreaming() {
+    if (this.streaming) { this.stopStreaming(); } else { this.startStreaming(); }
+  }
+  startStreaming() {
+    if (this.streaming || !this.connected) return;
+    this.streaming = true;
+    this.streamBtn.classList.add('active');
+    this.streamBtn.innerHTML = '&#x1F441; Streaming';
+    const streamName = 'display_' + this.displayId;
+    const ctx = this._streamCanvas.getContext('2d');
+    this._streamIntervalId = setInterval(() => {
+      if (!this.streaming || !this.connected || !app) return;
+      const srcCanvas = this.canvasEl.querySelector('canvas');
+      if (!srcCanvas || !srcCanvas.width || !srcCanvas.height) return;
+      const sw = srcCanvas.width;
+      const sh = srcCanvas.height;
+      this._streamFrameCounter++;
+      const frameId = streamName + '-f' + String(this._streamFrameCounter).padStart(5, '0');
+      // Live-res: scale to LIVE_RES maintaining aspect ratio within a square
+      const scale = Math.min(LIVE_RES / sw, LIVE_RES / sh);
+      const lw = Math.round(sw * scale);
+      const lh = Math.round(sh * scale);
+      this._streamCanvas.width = lw;
+      this._streamCanvas.height = lh;
+      ctx.drawImage(srcCanvas, 0, 0, lw, lh);
+      const liveJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.8);
+      const liveB64 = liveJpeg.split(',')[1];
+      app.send_frame(liveB64, frameId);
+      // HQ: full VNC resolution
+      this._streamCanvas.width = sw;
+      this._streamCanvas.height = sh;
+      ctx.drawImage(srcCanvas, 0, 0);
+      const hqJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.92);
+      const hqB64 = hqJpeg.split(',')[1];
+      app.send_video_frame_to_server(hqB64, frameId, streamName);
+    }, 1000);
+  }
+  stopStreaming() {
+    this.streaming = false;
+    if (this._streamIntervalId) { clearInterval(this._streamIntervalId); this._streamIntervalId = null; }
+    this.streamBtn.classList.remove('active');
+    this.streamBtn.innerHTML = '&#x1F441; Stream';
+  }
+  disconnect() {
+    this.stopStreaming();
+    if (this.rfb) { this.rfb.disconnect(); this.rfb = null; }
+    this.connected = false;
+  }
 }
 
 function addDisplaySlot(displayId, vncPort) {

@@ -1,5 +1,6 @@
 mod agent_runner;
 mod autonomy;
+mod computer_use;
 mod control;
 mod conversation;
 mod debug;
@@ -1690,6 +1691,7 @@ async fn run_agent_loop(
 ) -> Result<(LoopStats, LoopExitReason), CallerError> {
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
+    let mut cu_action_counter = 0u64;
     let mut loop_stats = LoopStats::default();
     let mut seen_sub_agent_results: std::collections::HashSet<String> =
         std::collections::HashSet::new();
@@ -1819,7 +1821,8 @@ async fn run_agent_loop(
 
         // Store assistant message — with or without tool calls
         let has_tool_calls = !response.tool_calls.is_empty();
-        if has_tool_calls {
+        let has_cu_calls = !response.cu_calls.is_empty();
+        if has_tool_calls || has_cu_calls {
             let refs: Vec<conversation::ToolCallRef> = response
                 .tool_calls
                 .iter()
@@ -2281,6 +2284,28 @@ async fn run_agent_loop(
                 }
                 conversation.add_tool_result(call_id, tool_name, &text);
             }
+
+            // Process CU calls alongside function tool calls
+            if has_cu_calls {
+                execute_cu_calls(
+                    &response.cu_calls,
+                    conversation,
+                    provider.cu_display(),
+                    log_dir,
+                    &mut cu_action_counter,
+                    &session_log,
+                ).await;
+            }
+        } else if has_cu_calls {
+            // CU-only turn (no function tool calls)
+            execute_cu_calls(
+                &response.cu_calls,
+                conversation,
+                provider.cu_display(),
+                log_dir,
+                &mut cu_action_counter,
+                &session_log,
+            ).await;
         } else {
             // --- Legacy text extraction path ---
 
@@ -3063,6 +3088,72 @@ async fn run_with_presence(
 
         let has_reference_frames = !reference_images.is_empty();
 
+        // ── Ephemeral CU task: lightweight, short-lived, no project context ──
+        if has_reference_frames {
+            let proj = match Project::from_root(project_root.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    bus.send(AppEvent::PresenceLog {
+                        message: format!("Project error: {}", e),
+                        level: Some(types::LogLevel::Error),
+                        turn: None,
+                    });
+                    continue;
+                }
+            };
+            let cu_provider = match provider::select_cu_provider(&proj.config.computer_use) {
+                Ok(p) => p,
+                Err(e) => {
+                    bus.send(AppEvent::PresenceLog {
+                        message: format!("CU provider error: {}", e),
+                        level: Some(types::LogLevel::Error),
+                        turn: None,
+                    });
+                    continue;
+                }
+            };
+
+            slog(&session_log, |l| {
+                l.info(&format!(
+                    "CU task: {} (provider: {}, model: {})",
+                    envelope.task, cu_provider.name(), cu_provider.model()
+                ))
+            });
+            bus.send(AppEvent::PresenceLog {
+                message: format!("Starting CU task: {}", envelope.task),
+                level: None,
+                turn: None,
+            });
+
+            match run_cu_task(
+                cu_provider.as_ref(),
+                &envelope.task,
+                reference_images,
+                frame_images,
+                &session_log,
+                &log_dir,
+                &bus,
+                &proj.config.computer_use,
+            ).await {
+                Ok(stats) => {
+                    cumulative_stats.turns += stats.turns;
+                    bus.send(AppEvent::PresenceLog {
+                        message: format!("CU task complete ({} turns)", stats.turns),
+                        level: None,
+                        turn: None,
+                    });
+                }
+                Err(e) => {
+                    bus.send(AppEvent::PresenceLog {
+                        message: format!("CU task error: {}", e),
+                        level: Some(types::LogLevel::Error),
+                        turn: None,
+                    });
+                }
+            }
+            continue;
+        }
+
         if persistent_conv.is_none() {
             // ── First task: full initialization ──
             let proj = match Project::from_root(project_root.clone()) {
@@ -3077,13 +3168,9 @@ async fn run_with_presence(
                 }
             };
 
-            // Use CU-capable provider when reference frames are present
-            let task_provider = if has_reference_frames {
-                provider::select_cu_provider(&proj.config.computer_use)
-            } else {
-                provider::select_provider()
-            };
-            let task_provider = match task_provider {
+            // CU tasks are handled by the ephemeral path above; this is the
+            // persistent conversation path for regular coding tasks.
+            let task_provider = match provider::select_provider() {
                 Ok(p) => p,
                 Err(e) => {
                     bus.send(AppEvent::PresenceLog {
@@ -3122,36 +3209,6 @@ async fn run_with_presence(
             ));
             conv.add_assistant("Understood.".to_string());
 
-            // Inject reference frames + CU guidance when visual grounding is needed
-            if !reference_images.is_empty() {
-                conv.add_user_with_images(
-                    "[Reference] The user was looking at the following screen when they \
-                     made their request. Use this to understand what they are referring to, \
-                     even if the screen has since changed. Take a fresh screenshot with \
-                     capture_screen to see the current state.".to_string(),
-                    reference_images,
-                );
-                conv.add_assistant("Understood — I'll use these reference frames to understand the user's intent and capture a fresh screenshot for the current state.".to_string());
-
-                // CU workflow guidance — only injected when reference frames indicate
-                // this is a visual/desktop interaction task
-                conv.add_user(
-                    "[Computer Use Guide] This task involves interacting with the desktop GUI. Follow this workflow:\n\
-                     1. Compare the reference frame (what the user saw) with a fresh capture_screen (current state)\n\
-                     2. Identify the target element the user is referring to\n\
-                     3. Use exec_command with xdotool to interact: \
-                        xdotool mousemove X Y click 1 (click), \
-                        xdotool type 'text' (type), \
-                        xdotool key Return (keypress), \
-                        xdotool mousemove X Y click 4/5 (scroll up/down)\n\
-                     4. capture_screen again to verify the action succeeded\n\
-                     5. Repeat until the task is complete\n\n\
-                     If the target element has moved or scrolled off screen since the reference frame, \
-                     scroll or navigate to find it before interacting.".to_string(),
-                );
-                conv.add_assistant("Understood.".to_string());
-            }
-
             // Add task with optional frame images
             if frame_images.is_empty() {
                 conv.add_user(envelope.task);
@@ -3165,18 +3222,6 @@ async fn run_with_presence(
         } else {
             // ── Subsequent task: inject into existing conversation ──
             let conv = persistent_conv.as_mut().unwrap();
-
-            // Inject reference frames for temporal context
-            if !reference_images.is_empty() {
-                conv.add_user_with_images(
-                    "[Reference] The user was looking at the following screen when they \
-                     made their request. Use this to understand what they are referring to, \
-                     even if the screen has since changed. Take a fresh screenshot with \
-                     capture_screen to see the current state.".to_string(),
-                    reference_images,
-                );
-                conv.add_assistant("Understood.".to_string());
-            }
 
             if frame_images.is_empty() {
                 conv.add_user(format!("[New Task] {}", envelope.task));
@@ -3721,6 +3766,224 @@ async fn resolve_frame_ids(
         }
     }
     images
+}
+
+/// Maximum turns for an ephemeral CU task before giving up.
+const CU_TASK_MAX_TURNS: usize = 20;
+
+/// Run an ephemeral computer-use task with minimal context.
+///
+/// Creates a lightweight conversation (no project context, skills, or knowledge),
+/// runs the CU model for a few turns until the task is done, and returns.
+#[allow(clippy::too_many_arguments)]
+async fn run_cu_task(
+    provider: &dyn provider::ChatProvider,
+    task: &str,
+    reference_images: Vec<conversation::ImageData>,
+    context_images: Vec<conversation::ImageData>,
+    session_log: &SharedSessionLog,
+    log_dir: &std::path::Path,
+    bus: &event::EventBus,
+    cu_config: &project::ComputerUseConfig,
+) -> Result<LoopStats, CallerError> {
+    let mut stats = LoopStats::default();
+    let mut cu_counter = 0u64;
+    let backend = computer_use::DisplayBackend::from_config(&cu_config.backend);
+
+    let display_id = std::env::var("DISPLAY")
+        .ok()
+        .and_then(|d| d.trim_start_matches(':').parse().ok())
+        .unwrap_or(99);
+
+    // Minimal system prompt for CU tasks
+    let system_prompt = "You are a computer use agent. You interact with a desktop GUI \
+        using native computer use tools. You can see the screen via screenshots and \
+        perform actions like clicking, typing, scrolling, and dragging.\n\n\
+        When given a task:\n\
+        1. Take a screenshot to see the current screen state\n\
+        2. Identify the target elements\n\
+        3. Perform the required actions\n\
+        4. Verify the result with another screenshot\n\
+        5. When the task is complete, respond with DONE and a brief summary\n\n\
+        Be precise with coordinates. Act efficiently — minimize unnecessary actions.".to_string();
+
+    let mut conv = Conversation::new(system_prompt, provider.context_window());
+
+    // Inject reference frames
+    if !reference_images.is_empty() {
+        conv.add_user_with_images(
+            "The user was looking at this screen when they made their request:".to_string(),
+            reference_images,
+        );
+        conv.add_assistant("I can see the reference screen. I'll compare this with the current state.".to_string());
+    }
+
+    // Inject context images
+    if !context_images.is_empty() {
+        conv.add_user_with_images(
+            "Additional context:".to_string(),
+            context_images,
+        );
+        conv.add_assistant("Noted.".to_string());
+    }
+
+    // Add the task
+    conv.add_user(task.to_string());
+
+    for turn in 1..=CU_TASK_MAX_TURNS {
+        stats.turns = turn;
+
+        let response = provider.chat_stream(
+            conv.messages(),
+            &|event| {
+                if let provider::StreamEvent::Delta(ref delta) = event {
+                    bus.send(AppEvent::PresenceLog {
+                        message: format!("[CU] {}", delta),
+                        level: None,
+                        turn: Some(turn),
+                    });
+                }
+            },
+        ).await?;
+
+        conv.set_usage(response.usage.clone());
+
+        // Check for task completion
+        let content_lower = response.content.to_lowercase();
+        let is_done = content_lower.contains("done") && response.cu_calls.is_empty()
+            && response.tool_calls.is_empty();
+
+        // Store assistant message
+        if !response.cu_calls.is_empty() {
+            // CU calls: store as assistant with tool call refs
+            let refs: Vec<conversation::ToolCallRef> = response.cu_calls.iter()
+                .map(|cu| conversation::ToolCallRef {
+                    id: cu.call_id.clone(),
+                    call_id: cu.call_id.clone(),
+                    name: "computer".to_string(),
+                    arguments: String::new(),
+                })
+                .collect();
+            conv.add_assistant_tool_calls(response.content.clone(), refs, response.raw_output.clone());
+        } else {
+            conv.add_assistant(response.content.clone());
+        }
+
+        if is_done {
+            slog(session_log, |l| l.info(&format!("CU task complete at turn {}", turn)));
+            break;
+        }
+
+        // Execute CU calls
+        if !response.cu_calls.is_empty() {
+            for cu_call in &response.cu_calls {
+                slog(session_log, |l| {
+                    l.info(&format!(
+                        "CU turn {}: {} action(s)",
+                        turn, cu_call.actions.len()
+                    ))
+                });
+
+                let results = computer_use::execute_actions(
+                    &cu_call.actions,
+                    display_id,
+                    backend,
+                    log_dir,
+                    &mut cu_counter,
+                ).await;
+
+                let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
+                let output = if results.iter().all(|r| r.success) {
+                    "Actions executed successfully.".to_string()
+                } else {
+                    let errors: Vec<&str> = results.iter()
+                        .filter_map(|r| r.error.as_deref())
+                        .collect();
+                    format!("Some actions failed: {}", errors.join("; "))
+                };
+
+                if let Some(screenshot) = last_screenshot {
+                    let images = vec![conversation::ImageData {
+                        media_type: "image/png".to_string(),
+                        data: screenshot.base64_png.clone(),
+                    }];
+                    conv.add_cu_result(&cu_call.call_id, &output, images);
+                } else {
+                    conv.add_cu_result(&cu_call.call_id, &output, vec![]);
+                }
+            }
+            continue; // next turn — let model see the results
+        }
+
+        // No CU calls and not done — model may be thinking or confused
+        if turn >= CU_TASK_MAX_TURNS {
+            slog(session_log, |l| l.warn("CU task hit max turns"));
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Execute native computer-use tool calls via the xdotool executor
+/// and add results (with screenshots) to the conversation.
+#[allow(clippy::too_many_arguments)]
+async fn execute_cu_calls(
+    cu_calls: &[computer_use::CuToolCall],
+    conversation: &mut conversation::Conversation,
+    cu_display: Option<(u32, u32)>,
+    log_dir: &std::path::Path,
+    counter: &mut u64,
+    session_log: &SharedSessionLog,
+) {
+    let display_id = cu_display
+        .map(|_| {
+            // Use the display from DISPLAY env or default to 99
+            std::env::var("DISPLAY")
+                .ok()
+                .and_then(|d| d.trim_start_matches(':').parse().ok())
+                .unwrap_or(99)
+        })
+        .unwrap_or(99);
+
+    for cu_call in cu_calls {
+        slog(session_log, |l| {
+            l.info(&format!(
+                "CU: executing {} action(s) for call {}",
+                cu_call.actions.len(),
+                cu_call.call_id
+            ))
+        });
+
+        let backend = computer_use::DisplayBackend::detect();
+        let results = computer_use::execute_actions(
+            &cu_call.actions,
+            display_id,
+            backend,
+            log_dir,
+            counter,
+        ).await;
+
+        // Find the last screenshot from results
+        let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
+        let output = if results.iter().all(|r| r.success) {
+            "Actions executed successfully.".to_string()
+        } else {
+            let errors: Vec<&str> = results.iter()
+                .filter_map(|r| r.error.as_deref())
+                .collect();
+            format!("Some actions failed: {}", errors.join("; "))
+        };
+
+        if let Some(screenshot) = last_screenshot {
+            let images = vec![conversation::ImageData {
+                media_type: "image/png".to_string(),
+                data: screenshot.base64_png.clone(),
+            }];
+            conversation.add_cu_result(&cu_call.call_id, &output, images);
+        } else {
+            conversation.add_cu_result(&cu_call.call_id, &output, vec![]);
+        }
+    }
 }
 
 fn is_simple_task(task: &str) -> bool {

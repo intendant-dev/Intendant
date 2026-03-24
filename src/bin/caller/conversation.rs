@@ -2,6 +2,10 @@ use crate::provider::TokenUsage;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 
+fn is_false(v: &bool) -> bool {
+    !v
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 pub enum MessageLayer {
@@ -49,6 +53,11 @@ pub struct Message {
     /// Used by OpenAI Responses API to echo reasoning + function_call items together.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub raw_output: Option<Vec<serde_json::Value>>,
+    /// True when this tool result is from a native computer-use call.
+    /// Used by `build_*_messages` to format the result in the provider's CU-specific format
+    /// (e.g. `computer_call_output` for OpenAI, image content block for Anthropic).
+    #[serde(skip_serializing_if = "is_false", default)]
+    pub is_cu_result: bool,
     #[serde(skip)]
     pub layer: Option<MessageLayer>,
 }
@@ -164,6 +173,29 @@ impl Conversation {
             } else {
                 Some(images)
             },
+            layer: None,
+            ..Default::default()
+        });
+    }
+
+    /// Add a native computer-use tool result with a screenshot image.
+    pub fn add_cu_result(
+        &mut self,
+        call_id: &str,
+        output: &str,
+        images: Vec<ImageData>,
+    ) {
+        self.messages.push(Message {
+            role: "tool".to_string(),
+            content: output.to_string(),
+            tool_call_id: Some(call_id.to_string()),
+            tool_name: Some("computer".to_string()),
+            images: if images.is_empty() {
+                None
+            } else {
+                Some(images)
+            },
+            is_cu_result: true,
             layer: None,
             ..Default::default()
         });
