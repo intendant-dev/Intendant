@@ -384,6 +384,10 @@ pub enum ControlMsg {
         task: String,
         #[serde(default)]
         orchestrate: Option<bool>,
+        /// When present, routes to the ephemeral CU task runner instead of the
+        /// regular agent loop.
+        #[serde(default)]
+        reference_frame_ids: Vec<String>,
     },
     FollowUp {
         text: String,
@@ -981,6 +985,7 @@ mod tests {
             ControlMsg::StartTask {
                 task: "fix bug".to_string(),
                 orchestrate: None,
+                reference_frame_ids: vec![],
             },
             ControlMsg::FollowUp {
                 text: "continue working".to_string(),
@@ -1054,9 +1059,10 @@ mod tests {
         let json = r#"{"action":"start_task","task":"fix bug"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ControlMsg::StartTask { task, orchestrate } => {
+            ControlMsg::StartTask { task, orchestrate, reference_frame_ids } => {
                 assert_eq!(task, "fix bug");
                 assert!(orchestrate.is_none());
+                assert!(reference_frame_ids.is_empty());
             }
             _ => panic!("expected StartTask"),
         }
@@ -1067,13 +1073,15 @@ mod tests {
         let msg = ControlMsg::StartTask {
             task: "deploy app".to_string(),
             orchestrate: Some(true),
+            reference_frame_ids: vec!["display_99-f00001".to_string()],
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ControlMsg = serde_json::from_str(&json).unwrap();
         match parsed {
-            ControlMsg::StartTask { task, orchestrate } => {
+            ControlMsg::StartTask { task, orchestrate, reference_frame_ids } => {
                 assert_eq!(task, "deploy app");
                 assert_eq!(orchestrate, Some(true));
+                assert_eq!(reference_frame_ids.len(), 1);
             }
             _ => panic!("expected StartTask"),
         }
