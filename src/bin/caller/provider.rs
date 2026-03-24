@@ -2191,35 +2191,63 @@ fn build_gemini_request_parts(
         let role = gemini_role(&m.role);
         if m.role == "tool" {
             if let (Some(ref _call_id), Some(ref tool_name)) = (&m.tool_call_id, &m.tool_name) {
-                let response_val: serde_json::Value =
-                    serde_json::from_str(&m.content).unwrap_or(serde_json::json!({
+                if m.is_cu_result {
+                    // CU result: include url field and screenshot as inlineData in the response
+                    let response_val = serde_json::json!({
                         "output": m.content,
-                    }));
-                contents.push(serde_json::json!({
-                    "role": role,
-                    "parts": [{
+                        "url": "desktop://local",
+                    });
+                    let mut parts = vec![serde_json::json!({
                         "functionResponse": {
                             "name": tool_name,
                             "response": response_val,
                         }
-                    }]
-                }));
-                if let Some(ref images) = m.images {
-                    let mut parts = vec![serde_json::json!({
-                        "text": "Screenshot from the previous tool call:",
                     })];
-                    for img in images {
-                        parts.push(serde_json::json!({
-                            "inlineData": {
-                                "mimeType": img.media_type,
-                                "data": img.data,
-                            }
-                        }));
+                    if let Some(ref images) = m.images {
+                        for img in images {
+                            parts.push(serde_json::json!({
+                                "inlineData": {
+                                    "mimeType": img.media_type,
+                                    "data": img.data,
+                                }
+                            }));
+                        }
                     }
                     contents.push(serde_json::json!({
-                        "role": "user",
+                        "role": role,
                         "parts": parts,
                     }));
+                } else {
+                    let response_val: serde_json::Value =
+                        serde_json::from_str(&m.content).unwrap_or(serde_json::json!({
+                            "output": m.content,
+                        }));
+                    contents.push(serde_json::json!({
+                        "role": role,
+                        "parts": [{
+                            "functionResponse": {
+                                "name": tool_name,
+                                "response": response_val,
+                            }
+                        }]
+                    }));
+                    if let Some(ref images) = m.images {
+                        let mut parts = vec![serde_json::json!({
+                            "text": "Screenshot from the previous tool call:",
+                        })];
+                        for img in images {
+                            parts.push(serde_json::json!({
+                                "inlineData": {
+                                    "mimeType": img.media_type,
+                                    "data": img.data,
+                                }
+                            }));
+                        }
+                        contents.push(serde_json::json!({
+                            "role": "user",
+                            "parts": parts,
+                        }));
+                    }
                 }
                 continue;
             }
