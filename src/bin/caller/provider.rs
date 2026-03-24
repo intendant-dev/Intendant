@@ -2199,30 +2199,33 @@ fn build_gemini_request_parts(
         if m.role == "tool" {
             if let (Some(ref _call_id), Some(ref tool_name)) = (&m.tool_call_id, &m.tool_name) {
                 if m.is_cu_result {
-                    // CU result: include url field and screenshot as inlineData in the response
+                    // CU result: screenshot goes INSIDE functionResponse.parts (not as sibling)
                     let response_val = serde_json::json!({
                         "output": m.content,
                         "url": "desktop://local",
                     });
-                    let mut parts = vec![serde_json::json!({
+                    let mut fr = serde_json::json!({
                         "functionResponse": {
                             "name": tool_name,
                             "response": response_val,
                         }
-                    })];
+                    });
                     if let Some(ref images) = m.images {
-                        for img in images {
-                            parts.push(serde_json::json!({
+                        let fr_parts: Vec<serde_json::Value> = images.iter().map(|img| {
+                            serde_json::json!({
                                 "inlineData": {
                                     "mimeType": img.media_type,
                                     "data": img.data,
                                 }
-                            }));
+                            })
+                        }).collect();
+                        if !fr_parts.is_empty() {
+                            fr["functionResponse"]["parts"] = serde_json::Value::Array(fr_parts);
                         }
                     }
                     contents.push(serde_json::json!({
                         "role": role,
-                        "parts": parts,
+                        "parts": [fr],
                     }));
                 } else {
                     let response_val: serde_json::Value =
