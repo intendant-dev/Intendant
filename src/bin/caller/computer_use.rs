@@ -1,12 +1,50 @@
 //! Provider-agnostic computer use abstraction.
 //!
 //! Defines common CU action types and an executor that dispatches them via
-//! xdotool / ImageMagick on an X11 display. Provider-specific parsing and
-//! result formatting live in `provider.rs`.
+//! platform-specific backends (X11, Wayland, macOS). Provider-specific parsing
+//! and result formatting live in `provider.rs`.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
+
+// ── Display backend ──────────────────────────────────────────────────────────
+
+/// Display backend for input simulation and screenshot capture.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DisplayBackend {
+    /// X11: xdotool + ImageMagick import. Works with Xvfb and real X11 DEs.
+    X11,
+    /// Wayland: ydotool + grim. Requires /dev/uinput access. (not yet implemented)
+    #[allow(dead_code)]
+    Wayland,
+    /// macOS: cliclick + screencapture. Requires accessibility permissions. (not yet implemented)
+    #[allow(dead_code)]
+    MacOS,
+}
+
+impl DisplayBackend {
+    /// Detect the display backend from environment or config string.
+    pub fn from_config(backend: &str) -> Self {
+        match backend {
+            "x11" => DisplayBackend::X11,
+            "wayland" => DisplayBackend::Wayland,
+            "macos" => DisplayBackend::MacOS,
+            _ => Self::detect(),
+        }
+    }
+
+    /// Auto-detect the display backend from the environment.
+    pub fn detect() -> Self {
+        if cfg!(target_os = "macos") {
+            return DisplayBackend::MacOS;
+        }
+        if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            return DisplayBackend::Wayland;
+        }
+        DisplayBackend::X11
+    }
+}
 
 // ── Action types ─────────────────────────────────────────────────────────────
 
@@ -150,7 +188,7 @@ pub fn normalized_to_pixels(
 
 // ── Executor ─────────────────────────────────────────────────────────────────
 
-/// Execute a batch of CU actions on the given X11 display.
+/// Execute a batch of CU actions on the given display.
 ///
 /// Returns one result per action. A screenshot is automatically captured after
 /// the last non-Screenshot action (all providers expect a screenshot in the
@@ -158,9 +196,27 @@ pub fn normalized_to_pixels(
 pub async fn execute_actions(
     actions: &[CuAction],
     display_id: u32,
+    backend: DisplayBackend,
     screenshot_dir: &Path,
     action_counter: &mut u64,
 ) -> Vec<CuActionResult> {
+    match backend {
+        DisplayBackend::Wayland => {
+            return vec![CuActionResult {
+                success: false,
+                screenshot: None,
+                error: Some("Wayland backend not yet implemented".to_string()),
+            }];
+        }
+        DisplayBackend::MacOS => {
+            return vec![CuActionResult {
+                success: false,
+                screenshot: None,
+                error: Some("macOS backend not yet implemented".to_string()),
+            }];
+        }
+        DisplayBackend::X11 => {} // handled below
+    }
     let display = format!(":{}", display_id);
     let mut results = Vec::with_capacity(actions.len());
     let mut last_screenshot: Option<ScreenshotData> = None;

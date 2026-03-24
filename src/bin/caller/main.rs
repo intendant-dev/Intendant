@@ -3773,9 +3773,11 @@ async fn execute_cu_calls(
             ))
         });
 
+        let backend = computer_use::DisplayBackend::detect();
         let results = computer_use::execute_actions(
             &cu_call.actions,
             display_id,
+            backend,
             log_dir,
             counter,
         ).await;

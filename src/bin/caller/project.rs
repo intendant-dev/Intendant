@@ -56,6 +56,14 @@ pub struct ComputerUseConfig {
     /// Model name (e.g. "claude-haiku-4-5-20251001", "gemini-2.5-flash").
     #[serde(default)]
     pub model: Option<String>,
+    /// Display backend for input/screenshot. Default: "auto" (detect from env).
+    /// Values: "x11", "wayland", "macos", "auto".
+    #[serde(default = "default_backend")]
+    pub backend: String,
+}
+
+fn default_backend() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Deserialize, Default)]
