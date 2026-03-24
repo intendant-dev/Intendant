@@ -487,6 +487,7 @@ pub async fn start_audio_bridge(
     sample_rate: u32,
     bridge: &PulseAudioBridge,
     audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
 ) -> Result<AudioBridge, CallerError> {
     // Capture task: parec -> model
     let monitor_source = bridge.app_audio_monitor().to_string();
@@ -542,6 +543,10 @@ pub async fn start_audio_bridge(
                             "audio": b64
                         }),
                     };
+                    // Tee captured audio for Whisper transcription
+                    if let Some(ref tee) = capture_tee_tx {
+                        let _ = tee.send(buf.clone());
+                    }
                     let mut sink = capture_write.lock().await;
                     if sink.send(WsMessage::Text(msg.to_string())).await.is_err() {
                         break;
@@ -650,6 +655,88 @@ impl TranscriptLogger {
 ///
 /// This is the main entry point called from the agent loop when handling a
 /// `spawn_live_audio` tool call. It blocks until the call finishes or times out.
+/// Buffer inbound audio chunks from the capture tee, accumulate ~3 seconds,
+/// run silence detection, and send to Whisper for transcription.
+/// Results are appended to the transcript JSONL as "app" speaker entries.
+async fn whisper_inbound_loop(
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    sample_rate: u32,
+    transcript_path: &Path,
+) {
+    use crate::transcription::{self, Transcriber, TranscriptionConfig};
+
+    // Try to create a Whisper transcriber — if OPENAI_API_KEY is not set, just skip
+    let transcriber = match transcription::WhisperTranscriber::new(&TranscriptionConfig::default())
+    {
+        Ok(t) => t,
+        Err(_) => return, // No API key or config issue — silently skip
+    };
+
+    // Buffer ~3 seconds of audio before sending to Whisper
+    let threshold = (sample_rate as usize) * 2 * 3; // 3 seconds of 16-bit mono
+    let mut audio_buf: Vec<u8> = Vec::with_capacity(threshold);
+    let rms_threshold = 1000.0f64;
+
+    // Open transcript file for appending
+    let mut transcript_file = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(transcript_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    while let Some(chunk) = rx.recv().await {
+        audio_buf.extend_from_slice(&chunk);
+
+        if audio_buf.len() < threshold {
+            continue;
+        }
+
+        // RMS silence detection
+        let rms = {
+            let samples = audio_buf
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f64);
+            let n = audio_buf.len() / 2;
+            let sum_sq: f64 = samples.map(|s| s * s).sum();
+            if n > 0 {
+                (sum_sq / n as f64).sqrt()
+            } else {
+                0.0
+            }
+        };
+
+        if rms < rms_threshold {
+            audio_buf.clear();
+            continue;
+        }
+
+        // Encode as WAV and transcribe
+        let wav = transcription::encode_wav(&audio_buf, sample_rate, 1);
+        audio_buf.clear();
+
+        match transcriber.transcribe(&wav).await {
+            Ok(segment) => {
+                let text = segment.text.trim();
+                if !text.is_empty() {
+                    let entry = serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "speaker": "app",
+                        "text": text,
+                    });
+                    let mut line = serde_json::to_string(&entry).unwrap_or_default();
+                    line.push('\n');
+                    let _ = transcript_file.write_all(line.as_bytes()).await;
+                }
+            }
+            Err(_) => {} // Transcription failures are non-fatal
+        }
+    }
+}
+
 pub async fn run_session(
     spec: &LiveAudioSpec,
     api_key: &str,
@@ -699,12 +786,20 @@ pub async fn run_session(
     let (audio_out_tx, audio_out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     // Start the audio bridge
+    // Set up Whisper transcription tee for inbound audio
+    let (capture_tee_tx, capture_tee_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let whisper_transcript_path = transcript.path().to_path_buf();
+    let whisper_handle = tokio::spawn(async move {
+        whisper_inbound_loop(capture_tee_rx, 24000, &whisper_transcript_path).await;
+    });
+
     let audio_bridge = start_audio_bridge(
         session.ws_write.clone(),
         session.provider,
         session.sample_rate,
         bridge,
         audio_out_rx,
+        Some(capture_tee_tx),
     )
     .await?;
 
@@ -762,10 +857,21 @@ pub async fn run_session(
                 LiveAudioEvent::Error(e) => {
                     break LiveAudioStatus::Failed(e);
                 }
-                LiveAudioEvent::TurnComplete | LiveAudioEvent::Interrupted => {
-                    // For TurnComplete after the model has spoken, we continue
-                    // listening for more turns until timeout or disconnect
+                LiveAudioEvent::TurnComplete => {
+                    // Check if the model has output a complete JSON response
+                    if !model_text.is_empty() {
+                        if let Ok(parsed) =
+                            serde_json::from_str::<serde_json::Value>(&model_text)
+                        {
+                            if parsed.is_object() {
+                                // Model output valid JSON — treat as conversation complete
+                                break LiveAudioStatus::Completed;
+                            }
+                        }
+                    }
+                    // Otherwise continue listening for more turns
                 }
+                LiveAudioEvent::Interrupted => {}
                 LiveAudioEvent::Connected | LiveAudioEvent::SetupComplete => {}
             },
             Ok(None) => {
@@ -779,8 +885,9 @@ pub async fn run_session(
         }
     };
 
-    // Stop the audio bridge
+    // Stop the audio bridge and whisper task
     audio_bridge.stop();
+    whisper_handle.abort();
 
     // Close the WebSocket
     session.close().await;

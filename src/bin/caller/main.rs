@@ -2042,6 +2042,99 @@ async fn run_agent_loop(
                 }
             }
 
+            // Handle live audio spawn requests
+            for (call_id, session_id, args) in &batch.live_audio_spawns {
+                let spec_result =
+                    serde_json::from_value::<live_audio_types::LiveAudioSpec>(args.clone());
+                match spec_result {
+                    Ok(mut spec) => {
+                        // Build the full system prompt from playbook + schema
+                        let system_prompt = prompts::build_live_audio_prompt(
+                            &spec.playbook,
+                            &spec.response_schema,
+                            Some(&project.root),
+                        );
+                        spec.playbook = system_prompt;
+
+                        // Resolve API key for the chosen provider
+                        let api_key_var = match spec.provider {
+                            live_audio_types::LiveAudioProvider::Gemini => "GEMINI_API_KEY",
+                            live_audio_types::LiveAudioProvider::OpenAI => "OPENAI_API_KEY",
+                        };
+                        let api_key = match std::env::var(api_key_var) {
+                            Ok(k) => k,
+                            Err(_) => {
+                                conversation.add_tool_result(
+                                    call_id,
+                                    "spawn_live_audio",
+                                    &format!("Error: {} not set", api_key_var),
+                                );
+                                continue;
+                            }
+                        };
+
+                        // Create PulseAudio bridge
+                        let bridge = match pulse_audio::create_bridge(session_id).await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                conversation.add_tool_result(
+                                    call_id,
+                                    "spawn_live_audio",
+                                    &format!("Error creating PulseAudio bridge: {}", e),
+                                );
+                                continue;
+                            }
+                        };
+
+                        slog(&session_log, |l| {
+                            l.info(&format!(
+                                "Live audio session '{}' starting ({:?})",
+                                session_id, spec.provider
+                            ))
+                        });
+
+                        // Run the session (blocks until complete or timeout)
+                        let result = live_audio::run_session(
+                            &spec,
+                            &api_key,
+                            &bridge,
+                            log_dir,
+                            Some(bus),
+                        )
+                        .await;
+
+                        // Bridge is dropped here, cleaning up PulseAudio modules
+                        drop(bridge);
+
+                        match result {
+                            Ok(la_result) => {
+                                let result_json = serde_json::to_string_pretty(&la_result)
+                                    .unwrap_or_else(|_| format!("{:?}", la_result));
+                                conversation.add_tool_result(
+                                    call_id,
+                                    "spawn_live_audio",
+                                    &result_json,
+                                );
+                            }
+                            Err(e) => {
+                                conversation.add_tool_result(
+                                    call_id,
+                                    "spawn_live_audio",
+                                    &format!("Error: {}", e),
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        conversation.add_tool_result(
+                            call_id,
+                            "spawn_live_audio",
+                            &format!("Error parsing LiveAudioSpec: {}", e),
+                        );
+                    }
+                }
+            }
+
             if batch.agent_input_json.is_none() && !batch.precomputed_results.is_empty() {
                 continue;
             }
