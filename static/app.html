@@ -1451,7 +1451,7 @@ html, body {
     <span class="conn-dot err" id="sb-conn"></span>
     <span class="voice-dot" id="sb-voice" title="Voice model"></span>
     <span style="font-size:11px;color:var(--overlay0)" id="sb-voice-label"></span>
-    <span class="active-badge is-active" id="sb-active-badge" title="Click to toggle passive mode">Active</span>
+    <span class="active-badge is-active" id="sb-active-badge" title="This browser controls voice/video — click to switch to passive (observe-only) mode">Active</span>
   </div>
 
   <!-- Tab Bar -->
@@ -1688,9 +1688,9 @@ html, body {
 <div class="voice-overlay" id="voiceOverlay" draggable="false">
   <div class="voice-drag-handle" id="voiceDragHandle"></div>
   <div class="voice-status hidden" id="voiceStatus"></div>
-  <button class="make-active-btn hidden" id="makeActiveBtn">Make Active</button>
-  <button class="video-btn is-disabled" id="videoBtn" title="Toggle video">&#128249;</button>
-  <button class="mic-btn" id="micBtn" title="Toggle voice">&#127908;</button>
+  <button class="make-active-btn hidden" id="makeActiveBtn" title="Request voice control — only one browser can be active at a time">Make Active</button>
+  <button class="video-btn is-disabled" id="videoBtn" title="Send your camera feed to the voice model">&#128249;</button>
+  <button class="mic-btn" id="micBtn" title="Start or stop your microphone for voice conversation">&#127908;</button>
 </div>
 <script>
 (function() {
@@ -1923,11 +1923,11 @@ function updateActivePassiveUI() {
   if (isActiveBrowser) {
     badge.textContent = 'Active';
     badge.className = 'active-badge is-active';
-    badge.title = 'Click to enable passive (observe only) mode';
+    badge.title = 'This browser controls voice/video — click to switch to passive (observe-only) mode';
   } else {
     badge.textContent = 'Passive';
     badge.className = 'active-badge is-passive';
-    badge.title = 'Click to request active mode';
+    badge.title = 'This browser is observe-only — click to request voice/video control';
     document.getElementById('sb-voice-label').textContent = 'Passive';
     if (videoActive) stopVideo();
   }
@@ -2805,9 +2805,9 @@ class DisplaySlot {
         <span class="display-label">:${displayId}</span>
         <span class="display-status" id="ds-status-${displayId}">Connecting...</span>
         <input class="release-note" id="ds-note-${displayId}" placeholder="Note (optional)" style="display:none">
-        <button class="stream-btn" id="ds-stream-${displayId}" title="Stream display to model">&#x1F441; Stream</button>
-        <button class="take-control-btn" id="ds-take-${displayId}">Take Control</button>
-        <button class="release-control-btn" id="ds-release-${displayId}" style="display:none">Release</button>
+        <button class="stream-btn" id="ds-stream-${displayId}" title="Continuously send screenshots of this display to the AI model">&#x1F441; Stream</button>
+        <button class="take-control-btn" id="ds-take-${displayId}" title="Take interactive control of this display (keyboard and mouse)">Take Control</button>
+        <button class="release-control-btn" id="ds-release-${displayId}" style="display:none" title="Release control and return display to view-only mode">Release</button>
       </div>
       <div class="display-canvas" id="display-canvas-${displayId}"></div>`;
     this.statusEl = this.el.querySelector(`#ds-status-${displayId}`);
