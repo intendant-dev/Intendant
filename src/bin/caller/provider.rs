@@ -2673,7 +2673,8 @@ pub fn select_cu_provider(
             let display = crate::vision::display_config_for_provider("gemini");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            let mut p = GeminiProvider::new(key, model, ctx, max_out);
+            // Use new_plain() — CU tasks only use native CU tools, not function tools
+            let mut p = GeminiProvider::new_plain(key, model, ctx, max_out);
             p.cu_enabled = true;
             p.cu_display = Some((display.width, display.height));
             Ok(Box::new(p))
@@ -2689,7 +2690,8 @@ pub fn select_cu_provider(
             let display = crate::vision::display_config_for_provider("anthropic");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            let mut p = AnthropicProvider::new(key, model, ctx, max_out);
+            // Use new_plain() — CU tasks only use native CU tools, not function tools
+            let mut p = AnthropicProvider::new_plain(key, model, ctx, max_out);
             p.cu_enabled = true;
             p.cu_display = Some((display.width, display.height));
             Ok(Box::new(p))
@@ -2702,7 +2704,8 @@ pub fn select_cu_provider(
             let display = crate::vision::display_config_for_provider("openai");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            let mut p = OpenAIProvider::new(key, model, ctx, max_out);
+            // Use new_plain() — CU tasks only use native CU tools, not function tools
+            let mut p = OpenAIProvider::new_plain(key, model, ctx, max_out);
             p.cu_enabled = true;
             p.cu_display = Some((display.width, display.height));
             Ok(Box::new(p))
