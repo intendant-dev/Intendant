@@ -31,10 +31,12 @@ Always start `x11vnc` so the human can follow along via VNC on port 5950.
 
 ```bash
 # 1. Kill stale processes from prior runs (use -9 for firefox — it ignores SIGTERM)
-pkill -f 'Xvfb :50' 2>/dev/null
-pkill -f 'x11vnc.*:50' 2>/dev/null
-pkill -9 -f firefox 2>/dev/null
-pkill -f intendant 2>/dev/null
+# NEVER use pkill — Claude Code blocks it (exit 144).
+# First check what's running, then kill specific PIDs:
+pgrep -fa 'Xvfb :50|x11vnc.*:50|firefox|intendant'
+# Then kill the relevant PIDs from the output above:
+# kill <pid1> <pid2> ...
+# kill -9 <firefox_pid>  (firefox ignores SIGTERM)
 sleep 0.5
 
 # 2. Start Xvfb + x11vnc (MANDATORY — human needs VNC to observe)
@@ -240,8 +242,7 @@ Then launch Firefox with `--start-debugger-server 6000` and use `scripts/ff-eval
 ## Cleanup
 
 ```bash
-pkill -f 'intendant.*web' 2>/dev/null
-pkill -f firefox 2>/dev/null
-pkill -f 'Xvfb :50' 2>/dev/null
-pkill -f 'x11vnc.*:50' 2>/dev/null
+# NEVER use pkill. Check what's running, then kill specific PIDs:
+pgrep -fa 'intendant|firefox|Xvfb :50|x11vnc.*:50'
+# kill <pid1> <pid2> ...
 ```

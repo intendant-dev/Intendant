@@ -65,9 +65,8 @@ cd /home/user/projects/intendant && source ~/.cargo/env && \
 
 ### 2. Clean up stale processes
 
-Use `pgrep -x` (exact process name) instead of `pkill -f` (full command-line match).
-`pkill -f intendant` will match the bash shell itself if the cwd contains "intendant",
-killing the shell with exit code 144. Always verify kills with `pgrep` after.
+NEVER use `pkill` — Claude Code blocks it entirely (exit code 144), killing the whole
+command. Use `kill $(pgrep -f 'pattern')` instead. Always verify kills with `pgrep` after.
 
 ```bash
 for p in $(pgrep -x Xvfb 2>/dev/null); do kill "$p" 2>/dev/null; done

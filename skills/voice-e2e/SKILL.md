@@ -84,9 +84,8 @@ the VM Firefox is passive and its audio is ignored by the presence layer.
 
 ### 1. Clean up stale processes
 
-Use `pgrep -x` (exact process name) instead of `pkill -f` (full command-line match).
-`pkill -f intendant` will match the bash shell itself if the cwd contains "intendant",
-killing the shell with exit code 144. Always verify kills with `pgrep` after.
+NEVER use `pkill` — Claude Code blocks it entirely (exit code 144), killing the whole
+command. Use `kill $(pgrep -f 'pattern')` instead. Always verify kills with `pgrep` after.
 
 Use `-9` for Firefox (it ignores SIGTERM). Firefox may be named `firefox` or
 `firefox-esr` depending on the system — kill both.

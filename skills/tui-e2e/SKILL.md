@@ -20,10 +20,12 @@ Always start `x11vnc` so the human can follow along via VNC on port 5950.
 Both Xvfb and x11vnc MUST be started before launching xterm.
 
 ```bash
-# 1. Kill stale processes from prior runs (use -9 for firefox — it ignores SIGTERM)
-pkill -f 'Xvfb :50' 2>/dev/null
-pkill -f 'x11vnc.*:50' 2>/dev/null
-pkill -f 'intendant.*control-socket' 2>/dev/null
+# 1. Kill stale processes from prior runs
+# NEVER use pkill — Claude Code blocks it (exit 144).
+# First check what's running, then kill specific PIDs:
+pgrep -fa 'Xvfb :50|x11vnc.*:50|intendant.*control-socket'
+# Then kill the relevant PIDs from the output above:
+# kill <pid1> <pid2> ...
 sleep 0.5
 
 # 2. Start Xvfb + x11vnc (MANDATORY — human needs VNC to observe)
@@ -158,7 +160,7 @@ This is **not needed for assertions** — use the control socket instead.
 ## Cleanup
 
 ```bash
-pkill -f 'intendant.*control-socket' 2>/dev/null
-pkill -f 'Xvfb :50' 2>/dev/null
-pkill -f 'x11vnc.*:50' 2>/dev/null
+# NEVER use pkill. Check what's running, then kill specific PIDs:
+pgrep -fa 'intendant|Xvfb :50|x11vnc.*:50'
+# kill <pid1> <pid2> ...
 ```
