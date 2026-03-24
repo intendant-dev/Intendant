@@ -2092,11 +2092,18 @@ impl ChatProvider for GeminiProvider {
                         .and_then(|p| p.as_array())
                     {
                         for part in parts {
+                            // Debug: log all part keys for CU diagnosis
+                            let part_keys: Vec<&str> = part.as_object()
+                                .map(|o| o.keys().map(|k| k.as_str()).collect())
+                                .unwrap_or_default();
+                            eprintln!("[gemini-stream] part keys: {:?}", part_keys);
+
                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                 text_parts.push(text.to_string());
                                 on_event(StreamEvent::Delta(text.to_string()));
                             }
                             if let Some(fc) = part.get("functionCall") {
+                                eprintln!("[gemini-stream] functionCall detected: {}", fc);
                                 let name = fc
                                     .get("name")
                                     .and_then(|n| n.as_str())
@@ -2407,6 +2414,19 @@ fn parse_gemini_cu_action(
             let (ex, ey) = coord("destination_x", "destination_y")?;
             Some(CuAction::Drag { start_x: sx, start_y: sy, end_x: ex, end_y: ey })
         }
+        // Browser-like navigation actions — mapped to keyboard shortcuts / xdg-open
+        "navigate" => {
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
+            // Type the URL into the address bar via xdg-open (best-effort)
+            Some(CuAction::Key { key: format!("xdg-open {}", url) })
+        }
+        "open_web_browser" => {
+            // No-op screenshot — the model wants to see the screen
+            Some(CuAction::Screenshot)
+        }
+        "go_back" => Some(CuAction::Key { key: "alt+Left".to_string() }),
+        "go_forward" => Some(CuAction::Key { key: "alt+Right".to_string() }),
+        "search" => Some(CuAction::Key { key: "ctrl+l".to_string() }),
         _ => None,
     }
 }
