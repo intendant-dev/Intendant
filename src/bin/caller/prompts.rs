@@ -2,6 +2,7 @@ use crate::error::CallerError;
 use crate::sub_agent::SubAgentRole;
 use std::path::Path;
 
+const DEFAULT_LIVE_AUDIO_PROMPT: &str = include_str!("../../../SysPromptLiveAudio.md");
 const DEFAULT_PROMPT: &str = include_str!("../../../SysPrompt.md");
 const DEFAULT_PROMPT_TOOLS: &str = include_str!("../../../SysPrompt_tools.md");
 #[allow(dead_code)]
@@ -136,6 +137,31 @@ pub fn load_project_instructions(project_root: Option<&Path>) -> Option<String> 
     }
 }
 
+/// Build the system prompt for a live audio sub-agent.
+///
+/// Resolves `SysPromptLiveAudio.md` via the 3-layer cascade, then substitutes
+/// `{PLAYBOOK}` with the parent-provided playbook and `{RESPONSE_SCHEMA}` with
+/// the JSON Schema derived from the response schema definition.
+pub fn build_live_audio_prompt(
+    playbook: &str,
+    response_schema: &crate::live_audio_types::ResponseSchema,
+    project_root: Option<&Path>,
+) -> String {
+    let template = resolve_prompt(
+        "SysPromptLiveAudio.md",
+        DEFAULT_LIVE_AUDIO_PROMPT,
+        project_root,
+    );
+
+    let json_schema = crate::schema_validator::to_json_schema(response_schema);
+    let schema_str =
+        serde_json::to_string_pretty(&json_schema).unwrap_or_else(|_| "{}".to_string());
+
+    template
+        .replace("{PLAYBOOK}", playbook)
+        .replace("{RESPONSE_SCHEMA}", &schema_str)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +175,7 @@ mod tests {
         assert!(!DEFAULT_RESEARCH_PROMPT.is_empty());
         assert!(!DEFAULT_IMPLEMENTATION_PROMPT.is_empty());
         assert!(!DEFAULT_PRESENCE_PROMPT.is_empty());
+        assert!(!DEFAULT_LIVE_AUDIO_PROMPT.is_empty());
     }
 
     #[test]
@@ -311,6 +338,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("INTENDANT.md"), "  \n  ").unwrap();
         assert!(load_project_instructions(Some(dir.path())).is_none());
+    }
+
+    #[test]
+    fn build_live_audio_prompt_substitutes_placeholders() {
+        use crate::live_audio_types::*;
+
+        let schema = ResponseSchema {
+            fields: vec![
+                FieldSpec {
+                    name: "confirmed".into(),
+                    field_type: FieldType::Boolean,
+                    required: true,
+                    description: Some("Whether confirmed".into()),
+                },
+            ],
+        };
+
+        let result = build_live_audio_prompt(
+            "Call the pizza place and order a large pepperoni.",
+            &schema,
+            None,
+        );
+
+        assert!(result.contains("Call the pizza place and order a large pepperoni."));
+        assert!(result.contains("\"confirmed\""));
+        assert!(result.contains("\"boolean\""));
+        assert!(!result.contains("{PLAYBOOK}"));
+        assert!(!result.contains("{RESPONSE_SCHEMA}"));
+    }
+
+    #[test]
+    fn build_live_audio_prompt_project_override() {
+        use crate::live_audio_types::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let custom_template = "Custom template: {PLAYBOOK}\nSchema: {RESPONSE_SCHEMA}";
+        std::fs::write(dir.path().join("SysPromptLiveAudio.md"), custom_template).unwrap();
+
+        let schema = ResponseSchema { fields: vec![] };
+        let result = build_live_audio_prompt("test playbook", &schema, Some(dir.path()));
+
+        assert!(result.starts_with("Custom template: test playbook"));
+        assert!(!result.contains("{PLAYBOOK}"));
     }
 
     #[test]
