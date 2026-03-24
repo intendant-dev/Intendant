@@ -15,6 +15,7 @@ mod mcp;
 mod mcp_client;
 mod presence;
 mod project;
+mod audio_routing;
 mod pulse_audio;
 mod quarantine;
 mod recording;
@@ -2073,18 +2074,28 @@ async fn run_agent_loop(
                             }
                         };
 
-                        // Create PulseAudio bridge
-                        let bridge = match pulse_audio::create_bridge(session_id).await {
+                        // Create virtual audio bridge
+                        let mut bridge = match audio_routing::create_bridge(session_id).await {
                             Ok(b) => b,
                             Err(e) => {
                                 conversation.add_tool_result(
                                     call_id,
                                     "spawn_live_audio",
-                                    &format!("Error creating PulseAudio bridge: {}", e),
+                                    &format!("Error creating audio bridge: {}", e),
                                 );
                                 continue;
                             }
                         };
+
+                        // Set virtual devices as system defaults (global routing)
+                        if let Err(e) = audio_routing::set_as_default(&mut bridge).await {
+                            slog(&session_log, |l| {
+                                l.warn(&format!(
+                                    "Could not set audio bridge as default: {} (per-app routing may be needed)",
+                                    e
+                                ))
+                            });
+                        }
 
                         slog(&session_log, |l| {
                             l.info(&format!(

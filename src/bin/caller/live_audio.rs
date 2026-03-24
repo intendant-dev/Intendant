@@ -1,6 +1,6 @@
 use crate::error::CallerError;
 use crate::live_audio_types::*;
-use crate::pulse_audio::PulseAudioBridge;
+use crate::audio_routing::AudioBridge;
 use crate::quarantine;
 use crate::schema_validator;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -464,12 +464,12 @@ async fn openai_read_loop(
 // ---------------------------------------------------------------------------
 
 /// Bidirectional audio bridge between PulseAudio virtual devices and a live model session.
-pub struct AudioBridge {
+pub struct AudioStreamBridge {
     capture_handle: tokio::task::JoinHandle<()>,
     playback_handle: tokio::task::JoinHandle<()>,
 }
 
-impl AudioBridge {
+impl AudioStreamBridge {
     /// Stop the audio bridge tasks.
     pub fn stop(self) {
         self.capture_handle.abort();
@@ -485,25 +485,20 @@ pub async fn start_audio_bridge(
     session_write: Arc<Mutex<WsSink>>,
     provider: LiveAudioProvider,
     sample_rate: u32,
-    bridge: &PulseAudioBridge,
+    bridge: &AudioBridge,
     audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
-) -> Result<AudioBridge, CallerError> {
-    // Capture task: parec -> model
-    let monitor_source = bridge.app_audio_monitor().to_string();
+) -> Result<AudioStreamBridge, CallerError> {
+    // Capture task: platform command -> model
+    let (capture_cmd, capture_args) = bridge.capture_command(sample_rate);
     let capture_write = session_write.clone();
     let capture_rate = sample_rate;
     let capture_provider = provider;
+    let capture_cmd = capture_cmd.to_string();
 
     let capture_handle = tokio::spawn(async move {
-        let result = tokio::process::Command::new("parec")
-            .args([
-                &format!("--device={}", monitor_source),
-                "--format=s16le",
-                &format!("--rate={}", capture_rate),
-                "--channels=1",
-                "--raw",
-            ])
+        let result = tokio::process::Command::new(&capture_cmd)
+            .args(&capture_args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn();
@@ -511,7 +506,7 @@ pub async fn start_audio_bridge(
         let mut child = match result {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("live_audio: parec spawn failed: {}", e);
+                eprintln!("live_audio: {} spawn failed: {}", capture_cmd, e);
                 return;
             }
         };
@@ -559,20 +554,13 @@ pub async fn start_audio_bridge(
         let _ = child.kill().await;
     });
 
-    // Playback task: model audio -> pacat
-    let playback_sink = bridge.model_output_sink().to_string();
-    let playback_rate = sample_rate;
+    // Playback task: model audio -> platform playback command
+    let (playback_cmd, playback_args) = bridge.playback_command(sample_rate);
+    let playback_cmd = playback_cmd.to_string();
 
     let playback_handle = tokio::spawn(async move {
-        let result = tokio::process::Command::new("pacat")
-            .args([
-                "--playback",
-                &format!("--device={}", playback_sink),
-                "--format=s16le",
-                &format!("--rate={}", playback_rate),
-                "--channels=1",
-                "--raw",
-            ])
+        let result = tokio::process::Command::new(&playback_cmd)
+            .args(&playback_args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -581,7 +569,7 @@ pub async fn start_audio_bridge(
         let mut child = match result {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("live_audio: pacat spawn failed: {}", e);
+                eprintln!("live_audio: {} spawn failed: {}", playback_cmd, e);
                 return;
             }
         };
@@ -601,7 +589,7 @@ pub async fn start_audio_bridge(
         let _ = child.kill().await;
     });
 
-    Ok(AudioBridge {
+    Ok(AudioStreamBridge {
         capture_handle,
         playback_handle,
     })
@@ -740,7 +728,7 @@ async fn whisper_inbound_loop(
 pub async fn run_session(
     spec: &LiveAudioSpec,
     api_key: &str,
-    bridge: &PulseAudioBridge,
+    bridge: &AudioBridge,
     session_log_dir: &Path,
     event_bus: Option<&crate::event::EventBus>,
 ) -> Result<LiveAudioResult, CallerError> {
