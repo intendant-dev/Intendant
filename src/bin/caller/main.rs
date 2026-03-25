@@ -4,7 +4,6 @@ mod computer_use;
 mod control;
 mod conversation;
 mod debug;
-mod display_capture;
 mod error;
 mod event;
 mod frames;
@@ -4048,6 +4047,60 @@ async fn try_cu_first(
     ).await)
 }
 
+/// Spawn a listener that reacts to `UserDisplayGranted` events by launching
+/// VNC and emitting `DisplayReady`. This ensures the user display is wired into
+/// the existing display lifecycle regardless of how the grant was triggered
+/// (approval flow, TUI hotkey, MCP, control socket).
+pub fn spawn_user_display_listener(bus: EventBus) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut rx = bus.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(AppEvent::UserDisplayGranted) => {
+                    activate_user_display(&bus).await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                _ => {}
+            }
+        }
+    })
+}
+
+/// Handle user display grant: launch VNC on the user's display and emit DisplayReady.
+///
+/// This wires the user's display into the same lifecycle as virtual displays —
+/// the recording listener starts ffmpeg, the web dashboard shows a VNC slot,
+/// and the browser can stream frames via the existing pipeline.
+async fn activate_user_display(bus: &EventBus) {
+    let display_id: u32 = 0;
+    let (width, height) = query_display_resolution(display_id);
+
+    // Best-effort: launch x11vnc on the user's display
+    #[allow(unused_mut)]
+    let mut vnc_port: Option<u32> = vision::detect_vnc_port(display_id);
+
+    #[cfg(target_os = "linux")]
+    if vnc_port.is_none() {
+        let display_arg = computer_use::DisplayTarget::UserSession.display_env_string();
+        let port = 5900 + display_id;
+        if let Some(child) = vision::launch_vnc(&display_arg, port).await {
+            // Keep x11vnc alive for the session by holding the Child in a task.
+            tokio::spawn(async move {
+                let mut c = child;
+                let _ = c.wait().await;
+            });
+            vnc_port = Some(port);
+        }
+    }
+
+    bus.send(AppEvent::DisplayReady {
+        display_id,
+        vnc_port,
+        width,
+        height,
+    });
+}
+
 /// Parse a display target string from the presence model into a `DisplayTarget`.
 ///
 /// Accepts "user_session" for the user's display, or ":<N>" / "<N>" for virtual.
@@ -4672,9 +4725,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
-        let _display_capture = display_capture::spawn_user_display_capture(
-            bus.clone(), frame_registry.clone(),
-        );
+        let _user_display_listener = spawn_user_display_listener(bus.clone());
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if flags.web {
             Some(debug::spawn_debug_screen_handler(
@@ -5005,9 +5056,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
-        let _display_capture = display_capture::spawn_user_display_capture(
-            bus.clone(), frame_registry.clone(),
-        );
+        let _user_display_listener = spawn_user_display_listener(bus.clone());
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if flags.web {
             Some(debug::spawn_debug_screen_handler(
@@ -5550,9 +5599,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
-        let _display_capture = display_capture::spawn_user_display_capture(
-            bus.clone(), frame_registry.clone(),
-        );
+        let _user_display_listener = spawn_user_display_listener(bus.clone());
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if flags.web {
             Some(debug::spawn_debug_screen_handler(
