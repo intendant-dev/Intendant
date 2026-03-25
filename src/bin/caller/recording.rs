@@ -1,8 +1,8 @@
 //! Continuous video recording for display and camera streams.
 //!
-//! Uses ffmpeg to record Xvfb displays (x11grab) and browser camera frames
-//! (image2pipe) into segmented MP4 files stored in the session directory.
-//! Follows the same RAII guard pattern as `vision::XvfbGuard`.
+//! Uses ffmpeg to record displays (x11grab on Linux, avfoundation on macOS)
+//! and browser camera frames (image2pipe) into segmented MP4 files stored in
+//! the session directory. Follows the same RAII guard pattern as `vision::XvfbGuard`.
 
 use crate::event::{AppEvent, EventBus};
 use crate::project::RecordingConfig;
@@ -68,21 +68,8 @@ pub fn is_ffmpeg_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Start recording an X11 display via ffmpeg x11grab.
-/// Only available on Linux — macOS would need `-f avfoundation`.
-#[cfg(not(target_os = "linux"))]
-pub async fn start_display_recording(
-    _display_id: u32,
-    _width: u32,
-    _height: u32,
-    _config: &RecordingConfig,
-    _session_dir: &Path,
-) -> Result<RecordingGuard, String> {
-    Err("Display recording via x11grab is only available on Linux".into())
-}
-
-/// Start recording an X11 display via ffmpeg x11grab.
-#[cfg(target_os = "linux")]
+/// Start recording a display via ffmpeg.
+/// Uses x11grab on Linux, avfoundation on macOS.
 pub async fn start_display_recording(
     display_id: u32,
     width: u32,
@@ -95,13 +82,17 @@ pub async fn start_display_recording(
     std::fs::create_dir_all(&segments_dir)
         .map_err(|e| format!("Failed to create recordings dir: {}", e))?;
 
-    let display_arg = format!(":{}", display_id);
-    let size_arg = format!("{}x{}", width, height);
     let fps_arg = config.framerate.to_string();
     let crf_arg = config.crf().to_string();
     let seg_time_arg = config.segment_duration_secs.to_string();
     let output_pattern = segments_dir.join("seg_%05d.mp4");
     let segment_list = segments_dir.join("segments.csv");
+
+    let source = if cfg!(target_os = "macos") {
+        "avfoundation"
+    } else {
+        "x11grab"
+    };
 
     // Write manifest
     let manifest = serde_json::json!({
@@ -110,20 +101,41 @@ pub async fn start_display_recording(
         "framerate": config.framerate,
         "resolution": format!("{}x{}", width, height),
         "codec": "h264",
-        "source": "x11grab",
+        "source": source,
     });
     let manifest_path = segments_dir.join("manifest.json");
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap_or_default())
         .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
+    // Build platform-specific input args
+    let mut input_args: Vec<String> = Vec::new();
+    if cfg!(target_os = "macos") {
+        // avfoundation: -f avfoundation -framerate N -capture_cursor 1 -i "<screen_index>:none"
+        // Screen index 0 = main display. "none" = no audio.
+        input_args.extend([
+            "-f".into(), "avfoundation".into(),
+            "-framerate".into(), fps_arg.clone(),
+            "-capture_cursor".into(), "1".into(),
+            "-video_size".into(), format!("{}x{}", width, height),
+            "-i".into(), format!("{}:none", display_id),
+        ]);
+    } else {
+        // x11grab: -f x11grab -framerate N -video_size WxH -i :display_id
+        let display_arg = format!(":{}", display_id);
+        let size_arg = format!("{}x{}", width, height);
+        input_args.extend([
+            "-f".into(), "x11grab".into(),
+            "-framerate".into(), fps_arg.clone(),
+            "-video_size".into(), size_arg,
+            "-i".into(), display_arg,
+        ]);
+    }
+
     // Force keyframes at segment boundaries so segments split reliably.
     let keyframe_expr = format!("expr:gte(t,n_forced*{})", config.segment_duration_secs);
-    let child = tokio::process::Command::new("ffmpeg")
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.args(&input_args)
         .args([
-            "-f", "x11grab",
-            "-framerate", &fps_arg,
-            "-video_size", &size_arg,
-            "-i", &display_arg,
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-crf", &crf_arg,
@@ -140,7 +152,9 @@ pub async fn start_display_recording(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+
+    let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn ffmpeg for display recording: {}", e))?;
 

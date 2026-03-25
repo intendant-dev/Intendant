@@ -1,4 +1,7 @@
-//! Debug screen management: Xvfb + x11vnc + passive Firefox for e2e testing.
+//! Debug screen management for e2e testing.
+//!
+//! On Linux: Xvfb + x11vnc + passive Firefox.
+//! On macOS: opens a native browser window (no virtual display needed).
 //!
 //! Provides a one-click observer display that records what happens in the
 //! web dashboard. Daemon-scoped recordings persist at `~/.intendant/recordings/`.
@@ -14,10 +17,11 @@ use tokio::process::Child;
 const DEBUG_DISPLAY_MIN: u32 = 50;
 const DEBUG_DISPLAY_MAX: u32 = 59;
 
-/// RAII guard for the debug screen: Xvfb + x11vnc + Firefox.
-/// Kills Firefox on drop; XvfbGuard handles Xvfb/x11vnc.
+/// RAII guard for the debug screen.
+/// On Linux: Xvfb + x11vnc + Firefox. On macOS: just a browser window.
+/// Kills the browser on drop; XvfbGuard (if present) handles Xvfb/x11vnc.
 pub struct DebugScreen {
-    pub xvfb_guard: vision::XvfbGuard,
+    pub xvfb_guard: Option<vision::XvfbGuard>,
     pub firefox: Child,
     pub display_id: u32,
     pub vnc_port: u32,
@@ -56,11 +60,30 @@ pub fn daemon_recordings_dir() -> PathBuf {
     PathBuf::from(home).join(".intendant").join("recordings")
 }
 
-/// Set up a debug screen: Xvfb + x11vnc + passive Firefox.
-/// Only available on Linux (requires X11).
-#[cfg(not(target_os = "linux"))]
-pub async fn setup_debug_screen(_web_port: u16) -> Result<DebugScreen, String> {
-    Err("Debug screen requires X11 (Linux only)".into())
+/// Set up a debug screen.
+/// Linux: Xvfb + x11vnc + passive Firefox.
+/// macOS: opens a native browser window via `open`.
+#[cfg(target_os = "macos")]
+pub async fn setup_debug_screen(web_port: u16) -> Result<DebugScreen, String> {
+    let url = format!("http://localhost:{}/app?passive=1", web_port);
+
+    // On macOS, `open` launches the default browser — no virtual display needed.
+    let browser = tokio::process::Command::new("open")
+        .args(["-na", "Safari", "--args", &url])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Failed to open browser: {}", e))?;
+
+    // display_id 0 = main screen (used by avfoundation for recording)
+    Ok(DebugScreen {
+        xvfb_guard: None,
+        firefox: browser,
+        display_id: 0,
+        vnc_port: 0,
+    })
 }
 
 /// Set up a debug screen: Xvfb + x11vnc + passive Firefox.
@@ -119,11 +142,17 @@ user_pref("datareporting.policy.dataSubmissionEnabled", false);
         .map_err(|e| format!("Failed to launch debug Firefox: {}", e))?;
 
     Ok(DebugScreen {
-        xvfb_guard,
+        xvfb_guard: Some(xvfb_guard),
         firefox,
         display_id,
         vnc_port,
     })
+}
+
+/// Set up a debug screen — not available on non-Linux/macOS platforms.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub async fn setup_debug_screen(_web_port: u16) -> Result<DebugScreen, String> {
+    Err("Debug screen is not supported on this platform".into())
 }
 
 /// Start a daemon-scoped recording of a debug display.
