@@ -3247,6 +3247,7 @@ async fn run_with_presence(
             force_direct: true,
             context_hints: vec![],
             reference_frame_ids: vec![],
+            display_target: None,
         };
         let _ = fallback_task_tx.send(envelope).await;
     }
@@ -4042,7 +4043,53 @@ async fn try_cu_first(
         log_dir,
         bus,
         &proj.config.computer_use,
+        None, // auto-resolve display target
     ).await)
+}
+
+/// Parse a display target string from the presence model into a `DisplayTarget`.
+///
+/// Accepts "user_session" for the user's display, or ":<N>" / "<N>" for virtual.
+fn parse_display_target_str(s: &str) -> computer_use::DisplayTarget {
+    match s.trim() {
+        "user_session" | "user" | ":0" | "0" => computer_use::DisplayTarget::UserSession,
+        other => {
+            let num_str = other.trim_start_matches(':');
+            if let Ok(id) = num_str.parse::<u32>() {
+                if id == 0 {
+                    computer_use::DisplayTarget::UserSession
+                } else {
+                    computer_use::DisplayTarget::Virtual { id }
+                }
+            } else {
+                // Unrecognized — fall back to auto-resolve
+                resolve_cu_display_target()
+            }
+        }
+    }
+}
+
+/// Resolve the display target for CU actions.
+///
+/// If user display access is granted (env var set) and the current DISPLAY
+/// is `:0` (or unset, indicating no virtual display was launched), returns
+/// `UserSession`. Otherwise returns `Virtual` with the current display ID.
+fn resolve_cu_display_target() -> computer_use::DisplayTarget {
+    let display_id: Option<u32> = std::env::var("DISPLAY")
+        .ok()
+        .and_then(|d| d.trim_start_matches(':').parse().ok());
+
+    let user_granted = std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok();
+
+    match display_id {
+        // DISPLAY is :0 and user granted → target user session
+        Some(0) if user_granted => computer_use::DisplayTarget::UserSession,
+        // DISPLAY is set to a virtual display
+        Some(id) => computer_use::DisplayTarget::Virtual { id },
+        // No DISPLAY set — if user granted, target their session; else default virtual
+        None if user_granted => computer_use::DisplayTarget::UserSession,
+        None => computer_use::DisplayTarget::Virtual { id: 99 },
+    }
 }
 
 /// Maximum turns for an ephemeral CU task before giving up.
@@ -4070,18 +4117,13 @@ async fn run_cu_task(
     log_dir: &std::path::Path,
     bus: &event::EventBus,
     cu_config: &project::ComputerUseConfig,
+    target_override: Option<computer_use::DisplayTarget>,
 ) -> Result<CuTaskResult, CallerError> {
     let mut stats = LoopStats::default();
     let mut cu_counter = 0u64;
     let backend = computer_use::DisplayBackend::from_config(&cu_config.backend);
 
-    let display_target = {
-        let id: u32 = std::env::var("DISPLAY")
-            .ok()
-            .and_then(|d| d.trim_start_matches(':').parse().ok())
-            .unwrap_or(99);
-        computer_use::DisplayTarget::Virtual { id }
-    };
+    let display_target = target_override.unwrap_or_else(resolve_cu_display_target);
 
     // CU-first system prompt: handle display tasks or escalate
     let system_prompt = "You are a fast computer-use agent. You can see and interact with a desktop display.\n\n\
@@ -4305,16 +4347,11 @@ async fn execute_cu_calls(
     counter: &mut u64,
     session_log: &SharedSessionLog,
 ) {
-    let display_target = {
-        let id: u32 = cu_display
-            .map(|_| {
-                std::env::var("DISPLAY")
-                    .ok()
-                    .and_then(|d| d.trim_start_matches(':').parse().ok())
-                    .unwrap_or(99)
-            })
-            .unwrap_or(99);
-        computer_use::DisplayTarget::Virtual { id }
+    let display_target = if cu_display.is_some() {
+        resolve_cu_display_target()
+    } else {
+        // No CU display configured — default to virtual :99
+        computer_use::DisplayTarget::Virtual { id: 99 }
     };
 
     for cu_call in cu_calls {
@@ -5393,7 +5430,7 @@ async fn main() -> Result<(), CallerError> {
                     }
                     event = event_rx.recv() => {
                         match event {
-                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, reference_frame_ids })) => {
+                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, reference_frame_ids, display_target })) => {
                                 eprintln!("New session: {}", &new_task[..new_task.len().min(80)]);
                                 // Create fresh session resources
                                 let new_log_dir = session_log::SessionLog::resolve_path(None);
@@ -5422,9 +5459,11 @@ async fn main() -> Result<(), CallerError> {
                                         let session_log_cu = new_session_log.clone();
                                         let cu_config = new_project.config.computer_use.clone();
                                         tokio::spawn(async move {
+                                            let cu_target = display_target.as_deref()
+                                                .map(parse_display_target_str);
                                             match run_cu_task(
                                                 cu_provider.as_ref(), &new_task, reference_images, vec![],
-                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config,
+                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config, cu_target,
                                             ).await {
                                                 Ok(CuTaskResult::Completed(stats)) => {
                                                     bus_cu.send(AppEvent::PresenceLog {
@@ -5760,7 +5799,7 @@ async fn main() -> Result<(), CallerError> {
                     }
                     event = event_rx.recv() => {
                         match event {
-                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, reference_frame_ids })) => {
+                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, reference_frame_ids, display_target })) => {
                                 eprintln!("New session: {}", &new_task[..new_task.len().min(80)]);
 
                                 // Create fresh session resources
@@ -5796,9 +5835,11 @@ async fn main() -> Result<(), CallerError> {
                                         let session_log_cu = new_session_log.clone();
                                         let cu_config = new_project.config.computer_use.clone();
                                         tokio::spawn(async move {
+                                            let cu_target = display_target.as_deref()
+                                                .map(parse_display_target_str);
                                             match run_cu_task(
                                                 cu_provider.as_ref(), &new_task, reference_images, vec![],
-                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config,
+                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config, cu_target,
                                             ).await {
                                                 Ok(CuTaskResult::Completed(stats)) => {
                                                     bus_cu.send(AppEvent::PresenceLog {
