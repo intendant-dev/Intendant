@@ -654,10 +654,31 @@ async fn maybe_auto_launch_xvfb(
     if xvfb_guard.is_some() {
         return;
     }
-    if vision::is_display_accessible() {
+    if !has_capture_screen_command(json_str) && !has_exec_command(json_str) {
         return;
     }
-    if !has_capture_screen_command(json_str) && !has_exec_command(json_str) {
+    // If a display is already accessible (e.g. DISPLAY was set before launch),
+    // emit DisplayReady so the web UI knows about it, but skip Xvfb launch.
+    if vision::is_display_accessible() {
+        let display_id = std::env::var("DISPLAY")
+            .ok()
+            .and_then(|d| d.trim_start_matches(':').parse::<u32>().ok())
+            .unwrap_or(99);
+        let (width, height) = query_display_resolution(display_id);
+        // Check if x11vnc is already running on this display
+        let vnc_port = vision::detect_vnc_port(display_id);
+        slog(session_log, |l| {
+            l.info(&format!(
+                "Using existing display :{} ({}x{}, vnc={:?})",
+                display_id, width, height, vnc_port
+            ))
+        });
+        bus.send(AppEvent::DisplayReady {
+            display_id,
+            vnc_port,
+            width,
+            height,
+        });
         return;
     }
     let config = vision::display_config_for_provider(provider_name);
@@ -3902,13 +3923,19 @@ async fn run_cu_task(
     let system_prompt = "You are a computer use agent. You interact with a desktop GUI \
         using native computer use tools. You can see the screen via screenshots and \
         perform actions like clicking, typing, scrolling, and dragging.\n\n\
-        When given a task:\n\
+        CRITICAL RULES:\n\
+        - You are given ONE specific task. Perform ONLY that task and nothing else.\n\
+        - Once the task is complete, STOP. Respond with just the word DONE and a one-sentence summary.\n\
+        - Do NOT take additional actions after the task is finished.\n\
+        - Do NOT open browsers, navigate to websites, or perform any action not explicitly requested.\n\
+        - Do NOT \"explore\" or do anything beyond the exact scope of the task.\n\n\
+        Workflow:\n\
         1. Take a screenshot to see the current screen state\n\
         2. Identify the target elements\n\
         3. Perform the required actions\n\
-        4. Verify the result with another screenshot\n\
-        5. When the task is complete, respond with DONE and a brief summary\n\n\
-        Be precise with coordinates. Act efficiently — minimize unnecessary actions.".to_string();
+        4. Take a verification screenshot to confirm success\n\
+        5. Respond with DONE and a brief summary — no further actions\n\n\
+        Be precise with coordinates. Act efficiently.".to_string();
 
     let mut conv = Conversation::new(system_prompt, provider.context_window());
 
@@ -4943,6 +4970,8 @@ async fn main() -> Result<(), CallerError> {
 
         // Save for daemon loop (project is moved into the agent loop closure)
         let project_root = project.root.clone();
+        // Clone frame_registry for event handlers (original may be moved into spawns)
+        let frame_registry_for_events = frame_registry.clone();
 
         // Spawn the agent loop in a background task
         let bus_clone = bus.clone();
@@ -5172,7 +5201,6 @@ async fn main() -> Result<(), CallerError> {
                     event = event_rx.recv() => {
                         match event {
                             Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, reference_frame_ids })) => {
-                                let _ = &reference_frame_ids; // TODO: route to CU path when non-empty
                                 eprintln!("New session: {}", &new_task[..new_task.len().min(80)]);
                                 // Create fresh session resources
                                 let new_log_dir = session_log::SessionLog::resolve_path(None);
@@ -5180,13 +5208,52 @@ async fn main() -> Result<(), CallerError> {
                                     Ok(l) => Arc::new(Mutex::new(l)),
                                     Err(e) => { bus.send(AppEvent::LoopError(format!("Session create failed: {}", e))); continue; }
                                 };
-                                let new_provider = match provider::select_provider() {
-                                    Ok(p) => p,
-                                    Err(e) => { bus.send(AppEvent::LoopError(format!("Provider failed: {}", e))); continue; }
-                                };
                                 let new_project = match Project::from_root(project_root.clone()) {
                                     Ok(p) => p,
                                     Err(e) => { bus.send(AppEvent::LoopError(format!("Project load failed: {}", e))); continue; }
+                                };
+
+                                // CU path: when reference_frame_ids are present, run ephemeral CU task
+                                if !reference_frame_ids.is_empty() {
+                                    let reference_images = resolve_frame_ids(&reference_frame_ids, &frame_registry_for_events).await;
+                                    if !reference_images.is_empty() {
+                                        let cu_provider = match provider::select_cu_provider(&new_project.config.computer_use) {
+                                            Ok(p) => p,
+                                            Err(e) => { bus.send(AppEvent::LoopError(format!("CU provider failed: {}", e))); continue; }
+                                        };
+                                        bus.send(AppEvent::PresenceLog {
+                                            message: format!("Starting CU task: {}", new_task),
+                                            level: None, turn: None,
+                                        });
+                                        let bus_cu = bus.clone();
+                                        let session_log_cu = new_session_log.clone();
+                                        let cu_config = new_project.config.computer_use.clone();
+                                        tokio::spawn(async move {
+                                            match run_cu_task(
+                                                cu_provider.as_ref(), &new_task, reference_images, vec![],
+                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config,
+                                            ).await {
+                                                Ok(stats) => {
+                                                    bus_cu.send(AppEvent::PresenceLog {
+                                                        message: format!("CU task complete ({} turns)", stats.turns),
+                                                        level: None, turn: None,
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    bus_cu.send(AppEvent::PresenceLog {
+                                                        message: format!("CU task error: {}", e),
+                                                        level: Some(types::LogLevel::Error), turn: None,
+                                                    });
+                                                }
+                                            }
+                                        });
+                                        continue;
+                                    }
+                                }
+
+                                let new_provider = match provider::select_provider() {
+                                    Ok(p) => p,
+                                    Err(e) => { bus.send(AppEvent::LoopError(format!("Provider failed: {}", e))); continue; }
                                 };
                                 let new_session_id = new_log_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
                                 bus.send(AppEvent::SessionStarted { session_id: new_session_id.clone(), task: Some(new_task.clone()) });
@@ -5488,7 +5555,6 @@ async fn main() -> Result<(), CallerError> {
                     event = event_rx.recv() => {
                         match event {
                             Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, reference_frame_ids })) => {
-                                let _ = &reference_frame_ids; // TODO: route to CU path when non-empty
                                 eprintln!("New session: {}", &new_task[..new_task.len().min(80)]);
 
                                 // Create fresh session resources
@@ -5500,17 +5566,56 @@ async fn main() -> Result<(), CallerError> {
                                         continue;
                                     }
                                 };
-                                let new_provider = match provider::select_provider() {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        bus.send(AppEvent::LoopError(format!("Failed to create provider: {}", e)));
-                                        continue;
-                                    }
-                                };
                                 let new_project = match Project::from_root(project_root.clone()) {
                                     Ok(p) => p,
                                     Err(e) => {
                                         bus.send(AppEvent::LoopError(format!("Failed to load project: {}", e)));
+                                        continue;
+                                    }
+                                };
+
+                                // CU path: when reference_frame_ids are present, run ephemeral CU task
+                                if !reference_frame_ids.is_empty() {
+                                    let reference_images = resolve_frame_ids(&reference_frame_ids, &frame_registry).await;
+                                    if !reference_images.is_empty() {
+                                        let cu_provider = match provider::select_cu_provider(&new_project.config.computer_use) {
+                                            Ok(p) => p,
+                                            Err(e) => { bus.send(AppEvent::LoopError(format!("CU provider failed: {}", e))); continue; }
+                                        };
+                                        bus.send(AppEvent::PresenceLog {
+                                            message: format!("Starting CU task: {}", new_task),
+                                            level: None, turn: None,
+                                        });
+                                        let bus_cu = bus.clone();
+                                        let session_log_cu = new_session_log.clone();
+                                        let cu_config = new_project.config.computer_use.clone();
+                                        tokio::spawn(async move {
+                                            match run_cu_task(
+                                                cu_provider.as_ref(), &new_task, reference_images, vec![],
+                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config,
+                                            ).await {
+                                                Ok(stats) => {
+                                                    bus_cu.send(AppEvent::PresenceLog {
+                                                        message: format!("CU task complete ({} turns)", stats.turns),
+                                                        level: None, turn: None,
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    bus_cu.send(AppEvent::PresenceLog {
+                                                        message: format!("CU task error: {}", e),
+                                                        level: Some(types::LogLevel::Error), turn: None,
+                                                    });
+                                                }
+                                            }
+                                        });
+                                        continue;
+                                    }
+                                }
+
+                                let new_provider = match provider::select_provider() {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        bus.send(AppEvent::LoopError(format!("Failed to create provider: {}", e)));
                                         continue;
                                     }
                                 };

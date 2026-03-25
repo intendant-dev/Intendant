@@ -1263,7 +1263,10 @@ html, body {
   align-items: flex-end;
   gap: 8px;
   z-index: 100;
+  cursor: grab;
+  user-select: none;
 }
+.voice-overlay.dragging { cursor: grabbing; }
 .mic-btn {
   width: 48px; height: 48px;
   border-radius: 50%;
@@ -1673,12 +1676,41 @@ html, body {
 </div>
 
 <!-- Voice Overlay -->
-<div class="voice-overlay">
+<div class="voice-overlay" id="voiceOverlay">
   <div class="voice-status hidden" id="voiceStatus"></div>
   <button class="make-active-btn hidden" id="makeActiveBtn">Make Active</button>
   <button class="video-btn" id="videoBtn" title="Toggle video" disabled>&#128249;</button>
   <button class="mic-btn" id="micBtn" title="Toggle voice">&#127908;</button>
 </div>
+<script>
+(function() {
+  const el = document.getElementById('voiceOverlay');
+  let dragging = false, startX, startY, startLeft, startBottom;
+  el.addEventListener('mousedown', (e) => {
+    if (e.target.tagName === 'BUTTON') return;
+    dragging = true;
+    el.classList.add('dragging');
+    const rect = el.getBoundingClientRect();
+    startX = e.clientX; startY = e.clientY;
+    startLeft = rect.left;
+    startBottom = window.innerHeight - rect.bottom;
+    el.style.right = 'auto';
+    el.style.left = startLeft + 'px';
+    el.style.bottom = startBottom + 'px';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    el.style.left = (startLeft + e.clientX - startX) + 'px';
+    el.style.bottom = (startBottom - (e.clientY - startY)) + 'px';
+  });
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    el.classList.remove('dragging');
+  });
+})();
+</script>
 
 <!-- Voice Settings Dialog -->
 <div class="dialog-overlay hidden" id="settingsDialog">
