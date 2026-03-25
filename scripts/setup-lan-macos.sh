@@ -393,6 +393,9 @@ run_recert() {
     $FORCE && recert_args="$recert_args --force"
     [[ "$NET_MODE" == "shared" ]] && recert_args="$recert_args --lan-ip $LAN_IP"
 
+    info "copying setup script to VM..."
+    copy_to_guest
+
     info "regenerating server cert on VM..."
     run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME $recert_args"
 
