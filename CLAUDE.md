@@ -235,11 +235,24 @@ Per-connection `WebTui` instances with independent terminal dimensions. Caches l
 - Tests: inline `#[cfg(test)]` modules only
 - WASM boundary: `serde_wasm_bindgen` with `serialize_maps_as_objects(true)`
 
+### Platform Support
+
+Target platforms: macOS, Linux (Debian, X11 and Wayland).
+
+Prefer platform-agnostic code by default. When platform-specific behavior is
+unavoidable, use `cfg!(target_os = ...)` runtime checks for small branches or
+`#[cfg(target_os = "...")]` compile-time gates for entire implementations.
+Collect OS-specific helpers in dedicated modules (e.g. `platform.rs`,
+per-platform blocks in `vision.rs`, `audio_routing.rs`, `computer_use.rs`).
+
+Every feature must either work or degrade gracefully with a clear error on all
+supported platforms — never panic or silently do nothing.
+
 ## Environment Requirements
 
-- **OS**: Linux, unprivileged user with passwordless sudo
+- **OS**: macOS or Linux (Debian), unprivileged user with passwordless sudo (Linux)
 - **API keys**: `.env` with `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`. Optional: `PROVIDER`, `MODEL_NAME`, `USE_NATIVE_TOOLS`, `STRUCTURED_OUTPUT`, `REASONING_EFFORT`, `REASONING_SUMMARY`
-- **captureScreen**: ImageMagick `import` + DISPLAY (defaults to `:1`)
+- **captureScreen**: ImageMagick `import` + DISPLAY (Linux), `screencapture` (macOS)
 - **WASM build**: `wasm-pack` (`cargo install wasm-pack`)
 
 ## CI/CD
