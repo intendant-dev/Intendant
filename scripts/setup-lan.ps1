@@ -26,7 +26,7 @@ param(
 $ErrorActionPreference = "Stop"
 $FwRuleName = "Intendant LAN Access"
 
-# State — populated by wizard or loaded from config
+# State -- populated by wizard or loaded from config
 $script:Mode = ""
 $script:GuestIp = ""
 $script:VmUser = ""
@@ -62,7 +62,7 @@ function Ask-Choice($prompt, $options) {
     }
 }
 
-# ── Config persistence ──
+# -- Config persistence --
 
 function Save-Config {
     @{
@@ -85,11 +85,11 @@ function Load-Config {
     return $false
 }
 
-# ── Network helpers ──
+# -- Network helpers --
 
 function Get-WslIp {
     $ip = wsl hostname -I 2>$null
-    if (-not $ip) { Die "could not get WSL IP — is WSL running? Start it with: wsl" }
+    if (-not $ip) { Die "could not get WSL IP -- is WSL running? Start it with: wsl" }
     return ($ip.Trim() -split '\s+')[0]
 }
 
@@ -110,7 +110,7 @@ function Resolve-GuestIp {
     }
 }
 
-# ── Port forwarding & firewall ──
+# -- Port forwarding & firewall --
 
 function Add-PortForwarding {
     $ports = @($script:Port, $script:CertPort)
@@ -148,7 +148,7 @@ function Remove-FirewallRule {
     Info "firewall rule removed"
 }
 
-# ── Guest communication ──
+# -- Guest communication --
 
 function Invoke-GuestCommand($cmd) {
     if ($script:Mode -eq "wsl") {
@@ -183,13 +183,13 @@ function Test-GuestSsh {
     }
 }
 
-# ── Interactive wizard ──
+# -- Interactive wizard --
 
 function Run-Wizard {
     Write-Host ""
-    Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "========================================================" -ForegroundColor Cyan
     Write-Host "  Intendant LAN Access Setup" -ForegroundColor Cyan
-    Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "========================================================" -ForegroundColor Cyan
 
     # Step 1: Guest type
     $guestChoice = Ask-Choice "Where is intendant running?" @(
@@ -249,9 +249,9 @@ function Run-Wizard {
 
     # Step 4: Confirm
     Write-Host ""
-    Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "========================================================" -ForegroundColor Cyan
     Write-Host "  Setup Summary" -ForegroundColor Cyan
-    Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "========================================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  Guest type:    $($script:Mode)"
     Write-Host "  Guest address: $($script:GuestIp)"
@@ -266,7 +266,7 @@ function Run-Wizard {
     # Step 5: Execute
     Write-Host ""
 
-    # Set up port forwarding FIRST — setup-lan.sh will start a temporary
+    # Set up port forwarding FIRST -- setup-lan.sh will start a temporary
     # HTTP server for cert download, which needs to be reachable from the phone
     Info "setting up Windows port forwarding..."
     Add-PortForwarding
@@ -300,19 +300,19 @@ function Run-Wizard {
     }
 
     Write-Host ""
-    Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Green
+    Write-Host "========================================================" -ForegroundColor Green
     Write-Host "  Setup complete!" -ForegroundColor Green
-    Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Green
+    Write-Host "========================================================" -ForegroundColor Green
     Write-Host ""
     Write-Host "  Phone connects to: https://${hostIp}:$($script:Port)"
     Write-Host ""
 }
 
-# ── Maintenance commands ──
+# -- Maintenance commands --
 
 function Run-Remove {
     if (-not (Load-Config)) {
-        Warn "no saved config found — using defaults"
+        Warn "no saved config found -- using defaults"
         $script:Port = 8443
     }
 
@@ -339,7 +339,7 @@ function Run-Remove {
 
 function Run-Recert {
     if (-not (Load-Config)) {
-        Die "no saved config found — run the setup wizard first"
+        Die "no saved config found -- run the setup wizard first"
     }
 
     Resolve-GuestIp
@@ -358,10 +358,10 @@ function Run-Recert {
 
     $hostIp = Get-HostLanIp
     Write-Host ""
-    Info "done — phone connects to: https://${hostIp}:$($script:Port)"
+    Info "done -- phone connects to: https://${hostIp}:$($script:Port)"
 }
 
-# ── Main ──
+# -- Main --
 
 if ($Remove) {
     Run-Remove
