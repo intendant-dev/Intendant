@@ -31,13 +31,24 @@ src/
     ├── autonomy.rs      # Autonomy levels, action categories, approval rules, command classification
     ├── control.rs       # Unix control socket (/tmp/intendant-<pid>.sock), JSON-line protocol
     ├── frontend.rs      # Shared frontend contract (UserAction, StatusSnapshot, ModelUsageSnapshot)
-    ├── tools.rs         # 12 native tool definitions, provider format conversion, MCP tool registration
+    ├── tools.rs         # 13 native tool definitions, provider format conversion, MCP tool registration
     ├── tool_batch.rs    # Tool call batch assembly: runtime vs caller-handled vs MCP routing
+    ├── computer_use.rs  # CU abstraction: DisplayBackend (X11/Wayland/macOS), DisplayTarget, CuAction executor
+    ├── platform.rs      # Cross-platform helpers: process_alive(), process_cmdline(), current_uid()
     ├── presence.rs      # PresenceLayer, tool dispatch, query functions, event filtering, session protocol
-    ├── mcp.rs           # MCP server (rmcp, stdio transport, hot-reload via exec())
+    ├── mcp.rs           # MCP server (rmcp, stdio transport, hot-reload via exec()), 22 control tools
     ├── mcp_client.rs    # MCP client: connects to external servers, discovers/proxies tools
-    ├── sandbox.rs       # Landlock filesystem sandboxing (Linux 5.13+)
-    ├── vision.rs        # Xvfb/x11vnc management, display :99 preference, orphan reclaim
+    ├── sandbox.rs       # Landlock filesystem sandboxing (Linux 5.13+, no-op on macOS)
+    ├── vision.rs        # Display management: Xvfb/x11vnc (Linux), native display (macOS), orphan reclaim
+    ├── audio_routing.rs # Virtual audio bridge: PulseAudio (Linux), BlackHole (macOS)
+    ├── recording.rs     # Segmented video recording: x11grab (Linux), avfoundation (macOS)
+    ├── debug.rs         # Debug screen: Xvfb+Firefox (Linux), native browser (macOS)
+    ├── live_audio.rs    # Live audio sessions: Gemini Live / OpenAI Realtime via virtual audio bridge
+    ├── live_audio_types.rs # LiveAudioSpec, LiveAudioResult, provider enums
+    ├── frames.rs        # FrameRegistry: video frame capture, inspection for presence tools
+    ├── quarantine.rs    # Untrusted live audio content quarantine and review
+    ├── schema_validator.rs # Tool call response schema validation
+    ├── app_state_pricing.rs # Session cost estimation for web dashboard
     ├── skills.rs        # SKILL.md discovery (YAML frontmatter), catalog formatting
     ├── transcription.rs # Whisper API transcription, WAV encoding, silence detection
     ├── web_gateway.rs   # HTTP/WebSocket server, presence protocol, VNC proxy, session replay
@@ -53,16 +64,17 @@ src/
         ├── markdown.rs  # Markdown-to-ratatui renderer
         └── theme.rs     # Catppuccin Mocha color scheme
 crates/
-├── presence-core/       # WASM-compatible crate: types, tools (9), dispatch, format, prompt, session protocol
+├── presence-core/       # WASM-compatible crate: types, tools (12), dispatch, format, prompt, session protocol
 └── presence-web/        # Browser WASM: app dashboard state, Gemini Live, OpenAI Realtime, WebSocket transport
 static/
 ├── app.html             # 4-tab web dashboard (Activity, Usage, Terminal, Displays)
 ├── audio-processor.js   # AudioWorklet for mic capture (PCM16)
 └── wasm-web/            # Compiled WASM + JS glue
-SysPrompt*.md            # System prompts (direct, tools, user, orchestrator, research, implementation, presence)
+scripts/                 # Setup scripts: setup-macos.sh, setup-lan.sh, setup-lan-macos.sh, setup-lan-guest-macos.sh
+SysPrompt*.md            # System prompts (direct, tools, user, orchestrator, research, implementation, presence, live audio)
 docs/src/                # mdBook documentation
 tests/e2e/               # Integration tests (real API calls, 3 tiers)
-skills/                  # SKILL.md files (tui-e2e, web-e2e, voice-e2e)
+skills/                  # SKILL.md files (tui-e2e, web-e2e, voice-e2e, recording-e2e)
 ```
 
 ## Build and Run
@@ -91,7 +103,7 @@ cargo build --release -p intendant   # Re-embed WASM
 ./target/release/intendant --resume abc123 "continue"      # Resume by session ID
 ./target/release/intendant --mcp "task"                    # MCP server on stdio
 ./target/release/intendant --web                           # Web dashboard on port 8765
-./target/release/intendant --sandbox "task"                # Landlock sandboxing
+./target/release/intendant --sandbox "task"                # Landlock sandboxing (Linux)
 ./target/release/intendant --control-socket "task"         # Unix control socket
 ./target/release/intendant --no-presence "task"            # Disable presence layer
 echo "task" | ./target/release/intendant                   # Auto-detects non-TTY → headless
@@ -151,7 +163,7 @@ Categories: FileRead, FileWrite, FileDelete, CommandExec, NetworkRequest, Destru
 
 ### Provider Features
 
-**All providers**: streaming via `chat_stream()` (SSE parsing), rate-limit retry (exponential backoff, 5 retries for 429/5xx), prompt caching.
+**All providers**: streaming via `chat_stream()` (SSE parsing), rate-limit retry (exponential backoff, 5 retries for 429/5xx), prompt caching, computer use action parsing.
 
 **OpenAI**: structured output (JSON object mode for gpt-5+/o3/o4, `STRUCTURED_OUTPUT` env), reasoning controls (`REASONING_EFFORT`, `REASONING_SUMMARY`), done signal via `{"commands":[],"done":true}`.
 
@@ -159,15 +171,42 @@ Categories: FileRead, FileWrite, FileDelete, CommandExec, NetworkRequest, Destru
 
 **Gemini**: `streamGenerateContent?alt=sse`, implicit caching.
 
+### Computer Use
+
+Provider-agnostic CU abstraction (`computer_use.rs`). `DisplayBackend` detects X11/Wayland/macOS; `DisplayTarget` distinguishes `Virtual { id }` from `UserSession`. CU-first routing sends display tasks to a fast model before escalating to the heavy agent.
+
+On Linux: xdotool (input), ImageMagick `import` (screenshots), Xvfb (virtual display).
+On macOS: cliclick (input), `screencapture` (screenshots), native display.
+
+### Display Management
+
+**Linux**: Xvfb auto-launched lazily on first `execAsAgent`/`captureScreen` when no accessible display exists. Prefers `:99` (VNC port 5999), reclaims orphaned Xvfb processes. x11vnc co-process launched if available. Both killed on drop via `XvfbGuard`.
+
+**macOS**: Native display always accessible, no virtual display needed. `is_display_accessible()` returns true, `find_free_display()` returns 0 as sentinel.
+
+### Audio Routing
+
+Virtual audio bridge for `spawn_live_audio` (voice calls through third-party apps). Linux: PulseAudio null sinks (`pactl`/`parec`/`pacat`). macOS: BlackHole 2ch + 16ch with SwitchAudioSource + sox. Optional — browser-based voice (Gemini Live / OpenAI Realtime via WebRTC) works without it.
+
+### Live Audio
+
+`spawn_live_audio` tool connects to Gemini Live or OpenAI Realtime APIs via WebSocket, pipes audio through the virtual audio bridge. Untrusted: zero tools, zero file access. Responses validated against a `ResponseSchema`; unexpected content quarantined (`quarantine.rs`). Whisper transcription runs in parallel for app-side audio.
+
+### Recording
+
+Segmented MP4 recording via ffmpeg. Linux: `x11grab`. macOS: `avfoundation`. Frame-fed mode (`image2pipe`) for browser camera streams. `RecordingRegistry` tracks active streams, auto-starts on `DisplayReady` events, stops agent streams on task completion.
+
 ### TUI
 
 ratatui-based UI with panels: StatusBar, ActionPanel (phase + spinner), LogPanel (scrollable, markdown), ApprovalPanel, InputPanel (tui-textarea), FollowUpPanel, HelpOverlay. Agent loop communicates via `EventBus` (`mpsc` channel of `AppEvent`).
 
 ### Control Socket & JSON Mode
 
-Control socket at `/tmp/intendant-<pid>.sock`: JSON-line protocol (status, usage, approve, deny, input, set_autonomy, quit). Broadcasts events to all clients.
+Control socket at `/tmp/intendant-<pid>.sock`: JSON-line protocol. Broadcasts events to all clients. Peer UID verification on Unix.
 
-`--json` mode: JSONL to stdout, stdin accepts plain text or `ControlMsg` JSON (`{"action":"approve","id":N}`, `deny`, `skip`, `approve_all`, `input`, `follow_up`). Fully interactive without TUI.
+`ControlMsg` variants: Approve, Deny, Skip, ApproveAll, Input, SetAutonomy, Quit, StartTask (with context_hints, reference_frame_ids, display_target), FollowUp, TakeDisplay, InvokeSkill, debug screen commands.
+
+`--json` mode: JSONL to stdout, stdin accepts plain text or `ControlMsg` JSON. Fully interactive without TUI.
 
 ### Auto-Compaction
 
@@ -175,17 +214,13 @@ At 90% context usage: keeps system + first 2 context + last 4 messages, summariz
 
 ### MCP
 
-**Server**: rmcp-based, stdio transport. `reload` tool rebuilds binary and replaces process via `exec()` (`ReloadTransport` injects synthetic MCP init, `INTENDANT_MCP_RELOAD` env flag).
+**Server**: rmcp-based, stdio transport. 22 tools: agent control (approve, deny, skip, respond, quit, set_autonomy, set_verbosity), task management (start_task, get_status, get_logs, get_pending_approval, get_pending_input), controller restart management (schedule/cancel/get_restart_status, controller_turn_complete), loop intervention (request/clear halt, intervene, get_loop_status), and `reload` (rebuilds binary, replaces process via `exec()`).
 
 **Client**: configured via `[[mcp_servers]]` in intendant.toml. Tools registered as `mcp__<server>_<tool>`.
 
 ### Sandboxing
 
-Landlock (Linux 5.13+): read `/` everywhere, write limited to project root + `/tmp` + log dir + `~/.intendant`. Extra write paths via `[sandbox] extra_write_paths`. Passed to runtime via `INTENDANT_SANDBOX_WRITE_PATHS`. Silently skipped without kernel support.
-
-### Vision / Xvfb
-
-Auto-launched lazily on first `execAsAgent`/`captureScreen` when no accessible display exists. Prefers `:99` (VNC port 5999), reclaims orphaned Xvfb processes. x11vnc co-process launched if available. Both killed on drop via `XvfbGuard`.
+Landlock (Linux 5.13+): read `/` everywhere, write limited to project root + `/tmp` + log dir + `~/.intendant`. Extra write paths via `[sandbox] extra_write_paths`. Passed to runtime via `INTENDANT_SANDBOX_WRITE_PATHS`. Silently skipped on non-Linux or without kernel support.
 
 ### Skills
 
@@ -203,7 +238,7 @@ Whisper API via `[transcription]` in intendant.toml. Web gateway buffers `user_a
 
 Conversational interface between user and agent system. Only one active at a time: server-side text OR browser-side live (Gemini Live / OpenAI Realtime).
 
-**Server-side** (`presence.rs`): `PresenceLayer` wraps a fast model (e.g., gemini-2.0-flash). 9 tools from `presence-core`: action tools (submit_task, approve/deny/skip_action, respond_to_question, set_autonomy) and query tools (check_status, query_detail, recall_memory). Dispatch via `dispatch_tool_call()` → `PresenceAction` enum.
+**Server-side** (`presence.rs`): `PresenceLayer` wraps a fast model (e.g., gemini-2.0-flash). 12 tools from `presence-core`: action tools (submit_task, approve/deny/skip_action, respond_to_question, set_autonomy, send_message), query tools (check_status, query_detail, recall_memory), and video tools (inspect_frame, inspect_frames). Dispatch via `dispatch_tool_call()` → `PresenceAction` enum. Display-aware: receives DisplayReady/UserDisplayGranted/UserDisplayRevoked events for routing decisions.
 
 **Browser-side** (`crates/presence-web/`): `presence_connect` pauses server-side presence, sends `presence_welcome` with state/replay/context. Tool calls via `tool_request`/`tool_response` WebSocket protocol. `presence_disconnect` resumes server-side.
 
@@ -215,15 +250,11 @@ Conversational interface between user and agent system. Only one active at a tim
 
 ### Web Gateway
 
-`--web` (default 8765). HTTP: `/` (app.html), `/config`, `/debug`, `POST /session` (ephemeral tokens), `/wasm-web/*`, `/audio-processor.js`. WebSocket: `/` or `/ws` (events + terminal + presence), `/vnc` (VNC proxy).
+`--web` (default 8765). HTTP: `/` (app.html), `/config`, `/debug`, `POST /session` (ephemeral tokens), `/wasm-web/*`, `/audio-processor.js`, `/api/sessions`, `/api/session/{id}`, `/api/session/{id}/recordings/*`, `/recordings/*`. WebSocket: `/` or `/ws` (events + terminal + presence), `/vnc` (VNC proxy).
 
 Per-connection `WebTui` instances with independent terminal dimensions. Caches latest `usage_update`, `status`, `display_ready` for late-connecting browsers.
 
 **Web App Dashboard**: 4-tab SPA (Activity, Usage, Terminal, Displays). WASM-driven state via `AppState` returning `Vec<UiCommand>`. Catppuccin Mocha theme, mobile-responsive.
-
-### Module Extraction
-
-`AppEvent`/`EventBus`/`ControlMsg`/`ApprovalRegistry` extracted from `tui/event.rs` → `caller/event.rs`. `Phase`/`LogLevel`/`Verbosity`/`OutboundEvent` extracted → `caller/types.rs`. Non-TUI modules have zero `use crate::tui::` imports for shared types.
 
 ## Code Conventions
 
@@ -253,7 +284,9 @@ supported platforms — never panic or silently do nothing.
 - **OS**: macOS or Linux (Debian), unprivileged user with passwordless sudo (Linux)
 - **API keys**: `.env` with `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`. Optional: `PROVIDER`, `MODEL_NAME`, `USE_NATIVE_TOOLS`, `STRUCTURED_OUTPUT`, `REASONING_EFFORT`, `REASONING_SUMMARY`
 - **captureScreen**: ImageMagick `import` + DISPLAY (Linux), `screencapture` (macOS)
+- **Computer use**: xdotool (Linux), cliclick (macOS)
 - **WASM build**: `wasm-pack` (`cargo install wasm-pack`)
+- **macOS setup**: `./scripts/setup-macos.sh` installs all dependencies
 
 ## CI/CD
 
