@@ -793,6 +793,7 @@ pub fn spawn_web_gateway(
     shared_session: SharedActiveSession,
     transcriber: Option<Arc<dyn crate::transcription::Transcriber>>,
     web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
+    task_tx: Option<tokio::sync::mpsc::Sender<presence_core::TaskEnvelope>>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -907,6 +908,7 @@ pub fn spawn_web_gateway(
             let last_vnc_port = last_vnc_port.clone();
             let last_display_ready_json = last_display_ready_json.clone();
             let web_tui_tx = web_tui_tx.clone();
+            let task_tx = task_tx.clone();
 
             tokio::spawn(async move {
                 // Snapshot session state at connection time
@@ -1067,6 +1069,7 @@ pub fn spawn_web_gateway(
                     let frame_registry_inbound = frame_registry.clone();
                     let recording_registry_inbound = recording_registry.clone();
                     let session_log_inbound = session_log.clone();
+                    let task_tx_inbound = task_tx.clone();
                     let inbound = tokio::spawn(async move {
                         // Track whether this connection has an active presence model,
                         // so we can auto-send PresenceDisconnected if the WebSocket drops
@@ -1647,8 +1650,21 @@ pub fn spawn_web_gateway(
                                                 .unwrap_or_default();
                                             let action = presence::dispatch_tool_call(&tool, &args, &state);
 
-                                            let query_result = if let Some((ctrl, msg)) = presence::action_to_control_msg(&action) {
-                                                // Action tools: dispatch via EventBus
+                                            // SubmitTask: send directly to task_tx (bypasses TUI)
+                                            let query_result = if let presence::PresenceAction::SubmitTask(envelope) = action {
+                                                let msg = format!("Task submitted: {}", envelope.task);
+                                                if let Some(ref tx) = task_tx_inbound {
+                                                    let _ = tx.send(envelope).await;
+                                                } else {
+                                                    // Fallback: dispatch via EventBus if no task_tx
+                                                    let ctrl_action = presence::PresenceAction::SubmitTask(envelope);
+                                                    if let Some((ctrl, _)) = presence::action_to_control_msg(&ctrl_action) {
+                                                        bus_inbound.send(AppEvent::ControlCommand(ctrl));
+                                                    }
+                                                }
+                                                presence::ToolQueryResult::text(msg)
+                                            } else if let Some((ctrl, msg)) = presence::action_to_control_msg(&action) {
+                                                // Other action tools: dispatch via EventBus
                                                 bus_inbound.send(AppEvent::ControlCommand(ctrl));
                                                 presence::ToolQueryResult::text(msg)
                                             } else {
