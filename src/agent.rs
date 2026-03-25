@@ -211,20 +211,28 @@ impl Agent {
         }
     }
 
-    /// Return the display number to use when no explicit display is given and
-    /// the DISPLAY env var is not set/parseable.  Prefers discovered displays
-    /// >0, falling back to 1.
+    /// Return the default display number when no explicit display is given and
+    /// the DISPLAY env var is not set/parseable.
+    ///
+    /// Prefers virtual displays (>0). Display :0 (user session) is only
+    /// returned if `INTENDANT_USER_DISPLAY_GRANTED` is set in the environment.
     fn default_display(&self) -> i32 {
         // Prefer the DISPLAY env var (set by the caller when Xvfb is auto-launched)
         if let Ok(d) = std::env::var("DISPLAY") {
             if let Ok(n) = d.trim_start_matches(':').parse::<i32>() {
-                return n;
+                // Only auto-select :0 if user display is granted
+                if n > 0 || std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok() {
+                    return n;
+                }
             }
         }
+        // Prefer virtual displays (>0), allow :0 only when granted
+        let user_display_granted =
+            std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok();
         self.available_displays
             .iter()
             .copied()
-            .find(|&d| d > 0)
+            .find(|&d| d > 0 || (d == 0 && user_display_granted))
             .unwrap_or(1)
     }
 
@@ -291,6 +299,16 @@ impl Agent {
                 .and_then(|d| d.trim_start_matches(':').parse().ok())
                 .unwrap_or_else(|| self.default_display())
         });
+        // Gate user session display access
+        if display_id <= 0
+            && std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err()
+        {
+            return Err(AgentError::Process(
+                "Access to the user's session display (display :0) requires explicit grant. \
+                 Use a virtual display or request display access first."
+                    .to_string(),
+            ));
+        }
         let mut cmd_builder = Command::new("bash");
         cmd_builder
             .arg("-c")
@@ -361,6 +379,16 @@ impl Agent {
                 .and_then(|d| d.trim_start_matches(':').parse().ok())
                 .unwrap_or_else(|| self.default_display())
         });
+        // Gate user session display access
+        if display <= 0
+            && std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err()
+        {
+            return Err(AgentError::Process(
+                "Access to the user's session display (display :0) requires explicit grant. \
+                 Use a virtual display or request display access first."
+                    .to_string(),
+            ));
+        }
         let screenshot_path = self.log_dir.join(format!("screenshot_{}.png", cmd.nonce));
 
         // Use import command from ImageMagick
