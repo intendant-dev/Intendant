@@ -97,7 +97,7 @@ cargo build --release -p intendant   # Re-embed WASM
 ./target/release/intendant --no-tui "task"                 # Headless
 ./target/release/intendant --direct "task"                 # Single-agent (skip orchestrator)
 ./target/release/intendant --json "task"                   # JSONL output (implies --no-tui)
-./target/release/intendant --provider anthropic --model claude-sonnet-4-5-20250929 "task"
+./target/release/intendant --provider anthropic --model claude-sonnet-4-6-20250929 "task"
 ./target/release/intendant --autonomy low "rm /tmp/test"   # Ask before every command
 ./target/release/intendant --continue "fix that bug"       # Resume most recent session
 ./target/release/intendant --resume abc123 "continue"      # Resume by session ID
@@ -255,7 +255,7 @@ Whisper API via `[transcription]` in intendant.toml. Web gateway buffers `user_a
 
 Conversational interface between user and agent system. Only one active at a time: server-side text OR browser-side live (Gemini Live / OpenAI Realtime).
 
-**Server-side** (`presence.rs`): `PresenceLayer` wraps a fast model (e.g., gemini-2.0-flash). 12 tools from `presence-core`: action tools (submit_task, approve/deny/skip_action, respond_to_question, set_autonomy, send_message), query tools (check_status, query_detail, recall_memory), and video tools (inspect_frame, inspect_frames). Dispatch via `dispatch_tool_call()` → `PresenceAction` enum. Display state is pull-based via `check_status` → `available_displays` field (no proactive inference on display events).
+**Server-side** (`presence.rs`): `PresenceLayer` wraps a fast model (e.g., gemini-3.0-flash). 12 tools from `presence-core`: action tools (submit_task, approve/deny/skip_action, respond_to_question, set_autonomy, send_message), query tools (check_status, query_detail, recall_memory), and video tools (inspect_frame, inspect_frames). Dispatch via `dispatch_tool_call()` → `PresenceAction` enum. Display state is pull-based via `check_status` → `available_displays` field (no proactive inference on display events).
 
 **Browser-side** (`crates/presence-web/`): `presence_connect` pauses server-side presence, sends `presence_welcome` with state/replay/context. Tool calls via `tool_request`/`tool_response` WebSocket protocol. `presence_disconnect` resumes server-side.
 
