@@ -322,6 +322,12 @@ impl PresenceLayer {
     /// Execute a presence tool call using presence-core dispatch + platform I/O.
     pub async fn handle_presence_tool_call(&mut self, name: &str, args_json: &str) -> String {
         let args: Value = serde_json::from_str(args_json).unwrap_or(json!({}));
+        if name == "submit_task" {
+            self.plog(
+                format!("[debug] submit_task args: {}", &args_json[..args_json.len().min(500)]),
+                None,
+            );
+        }
         let state_snapshot = self.agent_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         let action = dispatch_tool_call(name, &args, &state_snapshot);

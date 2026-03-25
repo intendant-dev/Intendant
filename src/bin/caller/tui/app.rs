@@ -1150,6 +1150,8 @@ impl App {
                 // and dispatch directly to the worker task channel. This avoids
                 // the server-side presence re-processing decisions the browser
                 // live model (or control socket / MCP) already made.
+                eprintln!("[TUI StartTask] task={}, ref_frames={:?}, phase={:?}, task_tx={}",
+                    &task[..task.len().min(60)], reference_frame_ids, self.current_phase, self.task_tx.is_some());
                 if self.current_phase == Phase::WaitingFollowUp
                     || self.current_phase == Phase::Done
                     || self.current_phase == Phase::Idle

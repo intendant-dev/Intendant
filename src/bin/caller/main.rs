@@ -3206,9 +3206,34 @@ async fn run_with_presence(
         ).await;
 
         // Resolve reference frames (what the user was looking at when they spoke)
+        slog(&session_log, |l| {
+            l.info(&format!(
+                "Reference frame IDs from envelope: {:?} (count={})",
+                envelope.reference_frame_ids, envelope.reference_frame_ids.len()
+            ))
+        });
         let reference_images = resolve_frame_ids(
             &envelope.reference_frame_ids, &frame_registry
         ).await;
+        slog(&session_log, |l| {
+            l.info(&format!(
+                "Resolved reference images: {} (from {} frame IDs)",
+                reference_images.len(), envelope.reference_frame_ids.len()
+            ))
+        });
+        if reference_images.is_empty() && !envelope.reference_frame_ids.is_empty() {
+            // Frame IDs were provided but couldn't be resolved — log registry state
+            let reg = frame_registry.read().await;
+            let latest = reg.latest(None);
+            let total = reg.query(None, 5);
+            slog(&session_log, |l| {
+                l.warn(&format!(
+                    "Frame resolution failed! Registry latest={:?}, recent_frames={:?}",
+                    latest,
+                    total.iter().map(|f| &f.frame_id).collect::<Vec<_>>()
+                ))
+            });
+        }
 
         let has_reference_frames = !reference_images.is_empty();
 
