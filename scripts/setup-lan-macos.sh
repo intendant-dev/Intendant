@@ -349,16 +349,19 @@ run_wizard() {
         run_on_guest "echo 'Acquire::ForceIPv4 \"true\";' | sudo tee /etc/apt/apt.conf.d/99force-ipv4 >/dev/null"
     fi
 
+    # Save config early — the guest setup ends with an interactive cert server
+    # (Ctrl+C to stop), which causes a non-zero exit that would skip save_config
+    # under set -e if we waited until after run_on_guest.
+    save_config
+    info "config saved to $CONFIG_FILE"
+
     info "copying setup script to VM..."
     copy_to_guest
 
     info "running setup on VM..."
     local guest_args="--port $HTTPS_PORT"
     [[ "$NET_MODE" == "shared" ]] && guest_args="$guest_args --lan-ip $LAN_IP"
-    run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME $guest_args"
-
-    save_config
-    info "config saved to $CONFIG_FILE"
+    run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME $guest_args" || true
 
     echo ""
     echo "════════════════════════════════════════════════════════"
