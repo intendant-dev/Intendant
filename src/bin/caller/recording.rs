@@ -23,6 +23,11 @@ pub struct RecordingGuard {
 }
 
 impl RecordingGuard {
+    /// Check if the ffmpeg process is still alive.
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
     pub fn stream_name(&self) -> &str {
         &self.stream_name
     }
@@ -242,6 +247,10 @@ impl RecordingRegistry {
     }
 
     /// Start recording a display stream.
+    ///
+    /// If a previous recording exists for this display but its ffmpeg process
+    /// has died (e.g. Xvfb was killed between tasks), the stale entry is
+    /// replaced with a fresh recording.
     pub async fn start_display(
         &mut self,
         display_id: u32,
@@ -249,8 +258,12 @@ impl RecordingRegistry {
         height: u32,
     ) -> Result<String, String> {
         let stream_name = format!("display_{}", display_id);
-        if self.recordings.contains_key(&stream_name) {
-            return Err(format!("Already recording stream: {}", stream_name));
+        if let Some(existing) = self.recordings.get_mut(&stream_name) {
+            if existing.is_alive() {
+                return Err(format!("Already recording stream: {}", stream_name));
+            }
+            // ffmpeg is dead (Xvfb was restarted) — remove stale entry
+            self.recordings.remove(&stream_name);
         }
         let guard =
             start_display_recording(display_id, width, height, &self.config, &self.session_dir)
@@ -474,7 +487,12 @@ pub fn spawn_recording_listener(
                     }
                     // Don't break — keep listening for new tasks (--continue)
                 }
-                Err(_) => {
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Receiver fell behind — skip missed events and keep listening.
+                    // The next DisplayReady will restart any missing recordings.
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     // Channel closed — stop everything including external
                     let mut reg = registry.write().await;
                     let streams = reg.active_streams();
