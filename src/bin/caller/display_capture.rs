@@ -15,7 +15,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Default capture interval in milliseconds.
-const CAPTURE_INTERVAL_MS: u64 = 2000;
+/// One frame per second balances freshness with CPU/IO cost.
+/// (The recording subsystem handles continuous video at 30fps separately.)
+const CAPTURE_INTERVAL_MS: u64 = 1000;
 
 /// Stream name used in the frame registry for user session frames.
 const STREAM_NAME: &str = "display_user_session";
