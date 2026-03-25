@@ -193,7 +193,7 @@ pub fn detect_vnc_port(display_id: u32) -> Option<u32> {
 /// Best-effort launch of x11vnc on the given display.
 /// Returns `Some(Child)` on success, `None` if x11vnc is not installed or fails to start.
 #[cfg(target_os = "linux")]
-async fn launch_vnc(display_arg: &str, port: u32) -> Option<Child> {
+pub async fn launch_vnc(display_arg: &str, port: u32) -> Option<Child> {
     let child = tokio::process::Command::new("x11vnc")
         .args([
             "-display",
