@@ -1473,8 +1473,8 @@ html, body {
     <span class="field-label">autonomy</span>
     <span class="autonomy" id="sb-autonomy">Medium</span>
     <span class="sep">|</span>
-    <span class="field-label" id="sb-display-label" style="cursor:pointer" onclick="toggleUserDisplay()" title="Toggle agent access to your display">display</span>
-    <span id="sb-display-access" style="cursor:pointer;font-weight:600;color:#f38ba8" onclick="toggleUserDisplay()" title="Toggle agent access to your display">off</span>
+    <span class="field-label" id="sb-display-label" style="cursor:pointer" onclick="toggleUserDisplay()" title="Your display (d) — grant/revoke agent access to your screen for computer use tasks">your display</span>
+    <span id="sb-display-access" style="cursor:pointer;font-weight:600;color:#f38ba8" onclick="toggleUserDisplay()" title="Your display (d) — grant/revoke agent access to your screen for computer use tasks">off</span>
     <span class="sep">|</span>
     <span class="field-label">session</span>
     <span class="session" id="sb-session"></span>
@@ -1509,6 +1509,12 @@ html, body {
           <option value="verbose">Verbose</option>
           <option value="debug">Debug</option>
         </select>
+      </div>
+
+      <!-- Task Input -->
+      <div style="display:flex;gap:4px;padding:4px 8px;border-bottom:1px solid var(--surface1)">
+        <input id="activity-task-input" placeholder="Enter task..." style="flex:1;padding:4px 8px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);font-size:12px" />
+        <button onclick="submitActivityTask()" style="padding:4px 12px;border:1px solid var(--green);border-radius:4px;background:transparent;color:var(--green);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">Send</button>
       </div>
 
       <!-- Display Strip (shown when displays are active) -->
@@ -3784,6 +3790,20 @@ function onSessionEnded(sessionId, reason) {
   switchTab('sessions');
 }
 
+window.submitActivityTask = function() {
+  const input = document.getElementById('activity-task-input');
+  if (!input || !app) return;
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  // If a task is running, send as follow-up; otherwise start new task
+  if (currentPhase && currentPhase !== 'idle' && currentPhase !== 'done') {
+    processCommands(app.send_follow_up(text));
+  } else {
+    app.send_server_action({ action: 'start_task', task: text });
+  }
+};
+
 function startNewSession() {
   const input = document.getElementById('new-session-input');
   if (!input) return;
@@ -4349,6 +4369,9 @@ document.querySelectorAll('#human-input, #followup-input').forEach(ta => {
       else window.sendFollowUp();
     }
   });
+});
+document.getElementById('activity-task-input')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); submitActivityTask(); }
 });
 
 // Verbosity toggle
