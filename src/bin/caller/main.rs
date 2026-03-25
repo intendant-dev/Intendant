@@ -4069,8 +4069,10 @@ pub fn spawn_user_display_listener(bus: EventBus) -> tokio::task::JoinHandle<()>
 /// Handle user display grant: launch VNC on the user's display and emit DisplayReady.
 ///
 /// This wires the user's display into the same lifecycle as virtual displays —
-/// the recording listener starts ffmpeg, the web dashboard shows a VNC slot,
-/// and the browser can stream frames via the existing pipeline.
+/// the recording listener starts ffmpeg, the web dashboard shows a VNC/noVNC
+/// slot, and the browser captures frames from the noVNC canvas to stream to
+/// the live model (Gemini Live / OpenAI Realtime). VNC is required — without
+/// it there is no canvas to capture from and no display slot in the dashboard.
 async fn activate_user_display(bus: &EventBus) {
     let display_id: u32 = 0;
     let (width, height) = query_display_resolution(display_id);
@@ -4122,7 +4124,8 @@ async fn activate_user_display(bus: &EventBus) {
         if vnc_port.is_none() {
             eprintln!(
                 "[user_display] Screen Sharing still not detected after 30s. \
-                 Continuing without VNC — browser streaming still works."
+                 Display will not appear in the web dashboard. Enable Screen \
+                 Sharing in System Settings for VNC-based streaming."
             );
         }
     }

@@ -37,7 +37,9 @@ src/
     ├── mcp.rs           # MCP server (rmcp, stdio transport, hot-reload via exec())
     ├── mcp_client.rs    # MCP client: connects to external servers, discovers/proxies tools
     ├── sandbox.rs       # Landlock filesystem sandboxing (Linux 5.13+)
+    ├── computer_use.rs  # DisplayTarget, DisplayBackend, CU actions, xdotool/cliclick/screencapture
     ├── vision.rs        # Xvfb/x11vnc management, display :99 preference, orphan reclaim
+    ├── platform.rs      # POSIX process helpers (process_alive, process_cmdline), macOS stubs
     ├── skills.rs        # SKILL.md discovery (YAML frontmatter), catalog formatting
     ├── transcription.rs # Whisper API transcription, WAV encoding, silence detection
     ├── web_gateway.rs   # HTTP/WebSocket server, presence protocol, VNC proxy, session replay
@@ -183,9 +185,27 @@ At 90% context usage: keeps system + first 2 context + last 4 messages, summariz
 
 Landlock (Linux 5.13+): read `/` everywhere, write limited to project root + `/tmp` + log dir + `~/.intendant`. Extra write paths via `[sandbox] extra_write_paths`. Passed to runtime via `INTENDANT_SANDBOX_WRITE_PATHS`. Silently skipped without kernel support.
 
-### Vision / Xvfb
+### Displays & Vision
 
-Auto-launched lazily on first `execAsAgent`/`captureScreen` when no accessible display exists. Prefers `:99` (VNC port 5999), reclaims orphaned Xvfb processes. x11vnc co-process launched if available. Both killed on drop via `XvfbGuard`.
+**Display types**: `DisplayTarget::Virtual { id }` (Xvfb, `:99+`) and `DisplayTarget::UserSession` (user's real screen, `:0` on Linux, native on macOS). Both go through the same lifecycle — VNC is the foundation of the entire display pipeline.
+
+**Virtual displays** (Linux): Xvfb auto-launched lazily on first `execAsAgent`/`captureScreen`. Prefers `:99` (VNC port 5999), reclaims orphans. x11vnc co-launched. `XvfbGuard` RAII cleanup. On macOS, the native display is always accessible (no Xvfb needed).
+
+**User session display**: Opt-in via `DisplayControl` autonomy category (session-grant model). On grant: x11vnc launched on `:0` (Linux) or macOS Screen Sharing enabled on port 5900. `DisplayReady` emitted, wiring into the standard pipeline. Display state is pull-based in `AgentStateSnapshot.available_displays` (no proactive inference on grant).
+
+**Display pipeline** (same for all displays):
+1. VNC server runs on the display (x11vnc on Linux, Screen Sharing on macOS)
+2. `DisplayReady { display_id, vnc_port, width, height }` event fires
+3. Recording listener starts ffmpeg (x11grab / avfoundation)
+4. Web dashboard shows noVNC viewer in the Displays tab
+5. "Stream" button captures frames from the **noVNC canvas** at 1 Hz:
+   - 768×768 JPEG → sent **directly from browser WASM to live model** (Gemini Live / OpenAI Realtime)
+   - HQ JPEG → sent to server → frame registry (`<session>/frames/`) + recording pipeline
+6. Server never sees live-resolution frames; `sent_to_live` flag in `FrameMeta` tracks what the model saw
+
+**CU-first routing**: `auto_attach_display_frames()` grabs the latest frame per `display_*` stream from the registry. `submit_task` accepts `display_target` for explicit routing (`"user_session"`, `":99"`). Fallback: `resolve_cu_display_target()` heuristic.
+
+**Computer use backends** (`DisplayBackend`): X11 (xdotool + import), MacOS (cliclick + screencapture + osascript), Wayland (stub).
 
 ### Skills
 
