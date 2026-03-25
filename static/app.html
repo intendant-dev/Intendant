@@ -663,6 +663,33 @@ html, body {
 .session-detail-logs .log-level { width: 52px; flex-shrink: 0; font-weight: 600; font-size: 11px; text-transform: uppercase; }
 .session-detail-logs .log-content { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; }
 .session-detail-logs .log-turn-sep { padding: 6px 0 2px; font-size: 11px; color: var(--overlay0); border-top: 1px solid var(--surface0); margin-top: 4px; }
+#session-detail-recordings {
+  border-bottom: 1px solid var(--surface0);
+  margin-bottom: 4px;
+}
+#session-detail-recordings .recording-player-wrap {
+  max-height: 40vh;
+}
+#session-detail-recordings .session-rec-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+  font-size: 13px;
+  color: var(--subtext1);
+  font-weight: 600;
+}
+#session-detail-recordings .session-rec-header select {
+  padding: 2px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 12px;
+  font-family: monospace;
+}
 .session-card {
   background: var(--surface0);
   border: 1px solid var(--surface1);
@@ -1451,7 +1478,7 @@ html, body {
     <span class="conn-dot err" id="sb-conn"></span>
     <span class="voice-dot" id="sb-voice" title="Voice model"></span>
     <span style="font-size:11px;color:var(--overlay0)" id="sb-voice-label"></span>
-    <span class="active-badge is-active" id="sb-active-badge" title="Click to toggle passive mode">Active</span>
+    <span class="active-badge is-active" id="sb-active-badge" title="This browser controls voice/video — click to switch to passive (observe-only) mode">Active</span>
   </div>
 
   <!-- Tab Bar -->
@@ -1649,6 +1676,7 @@ html, body {
             <button class="session-back-btn" onclick="closeSessionDetail()">&larr; Back</button>
             <span class="session-detail-title" id="session-detail-title"></span>
           </div>
+          <div id="session-detail-recordings" style="display:none"></div>
           <div class="session-detail-logs" id="session-detail-logs"></div>
         </div>
       </div>
@@ -1688,9 +1716,9 @@ html, body {
 <div class="voice-overlay" id="voiceOverlay" draggable="false">
   <div class="voice-drag-handle" id="voiceDragHandle"></div>
   <div class="voice-status hidden" id="voiceStatus"></div>
-  <button class="make-active-btn hidden" id="makeActiveBtn">Make Active</button>
-  <button class="video-btn is-disabled" id="videoBtn" title="Toggle video">&#128249;</button>
-  <button class="mic-btn" id="micBtn" title="Toggle voice">&#127908;</button>
+  <button class="make-active-btn hidden" id="makeActiveBtn" title="Request voice control — only one browser can be active at a time">Make Active</button>
+  <button class="video-btn is-disabled" id="videoBtn" title="Send your camera feed to the voice model">&#128249;</button>
+  <button class="mic-btn" id="micBtn" title="Start or stop your microphone for voice conversation">&#127908;</button>
 </div>
 <script>
 (function() {
@@ -1923,11 +1951,11 @@ function updateActivePassiveUI() {
   if (isActiveBrowser) {
     badge.textContent = 'Active';
     badge.className = 'active-badge is-active';
-    badge.title = 'Click to enable passive (observe only) mode';
+    badge.title = 'This browser controls voice/video — click to switch to passive (observe-only) mode';
   } else {
     badge.textContent = 'Passive';
     badge.className = 'active-badge is-passive';
-    badge.title = 'Click to request active mode';
+    badge.title = 'This browser is observe-only — click to request voice/video control';
     document.getElementById('sb-voice-label').textContent = 'Passive';
     if (videoActive) stopVideo();
   }
@@ -2805,9 +2833,9 @@ class DisplaySlot {
         <span class="display-label">:${displayId}</span>
         <span class="display-status" id="ds-status-${displayId}">Connecting...</span>
         <input class="release-note" id="ds-note-${displayId}" placeholder="Note (optional)" style="display:none">
-        <button class="stream-btn" id="ds-stream-${displayId}" title="Stream display to model">&#x1F441; Stream</button>
-        <button class="take-control-btn" id="ds-take-${displayId}">Take Control</button>
-        <button class="release-control-btn" id="ds-release-${displayId}" style="display:none">Release</button>
+        <button class="stream-btn" id="ds-stream-${displayId}" title="Continuously send screenshots of this display to the AI model">&#x1F441; Stream</button>
+        <button class="take-control-btn" id="ds-take-${displayId}" title="Take interactive control of this display (keyboard and mouse)">Take Control</button>
+        <button class="release-control-btn" id="ds-release-${displayId}" style="display:none" title="Release control and return display to view-only mode">Release</button>
       </div>
       <div class="display-canvas" id="display-canvas-${displayId}"></div>`;
     this.statusEl = this.el.querySelector(`#ds-status-${displayId}`);
@@ -3007,10 +3035,11 @@ function toggleDisplayStrip() {
 // ── Recording Replay ──
 
 class RecordingPlayer {
-  constructor(videoEl, timelineEl, cursorEl, progressEl, timeLabel, playBtn) {
+  constructor(videoEl, timelineEl, cursorEl, progressEl, timeLabel, playBtn, baseUrl) {
     this.video = videoEl;
     this.timelineEl = timelineEl;
     this.cursorEl = cursorEl;
+    this.baseUrl = baseUrl || '/recordings';
     this.progressEl = progressEl;
     this.timeLabel = timeLabel;
     this.playBtn = playBtn;
@@ -3036,7 +3065,7 @@ class RecordingPlayer {
   async load(streamName) {
     this.streamName = streamName;
     try {
-      const resp = await fetch(`/recordings/${streamName}/segments`);
+      const resp = await fetch(`${this.baseUrl}/${streamName}/segments`);
       this.segments = await resp.json();
     } catch { this.segments = []; }
     this.totalDuration = this.segments.length > 0
@@ -3053,7 +3082,7 @@ class RecordingPlayer {
     if (!this.streamName) return;
     const oldLen = this.segments.length;
     try {
-      const resp = await fetch(`/recordings/${this.streamName}/segments`);
+      const resp = await fetch(`${this.baseUrl}/${this.streamName}/segments`);
       this.segments = await resp.json();
     } catch { return; }
     const newTotal = this.segments.length > 0
@@ -3120,7 +3149,7 @@ class RecordingPlayer {
     if (idx < 0 || idx >= this.segments.length) return;
     this.currentSegIdx = idx;
     const seg = this.segments[idx];
-    this.video.src = `/recordings/${this.streamName}/${seg.filename}`;
+    this.video.src = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
     this.video.currentTime = offsetSecs || 0;
   }
 
@@ -4024,9 +4053,18 @@ function openSessionDetail(sessionId, task) {
     .catch(e => {
       logsEl.innerHTML = '<div class="empty-state">Failed to load</div>';
     });
+
+  // Lazy-load recordings for this session
+  loadSessionRecordings(sessionId);
 }
 
 function closeSessionDetail() {
+  // Clean up session recording player
+  if (sessionRecPlayer) { sessionRecPlayer.destroy(); sessionRecPlayer = null; }
+  const recEl = document.getElementById('session-detail-recordings');
+  recEl.style.display = 'none';
+  recEl.innerHTML = '';
+
   document.getElementById('sessions-list').style.display = '';
   document.getElementById('sessions-aggregate').style.display = '';
   document.querySelector('.sessions-header').style.display = '';
@@ -4034,6 +4072,98 @@ function closeSessionDetail() {
 }
 window.closeSessionDetail = closeSessionDetail;
 window.loadSessions = loadSessions;
+
+// ── Session Recording Replay ──
+let sessionRecPlayer = null;
+
+async function loadSessionRecordings(sessionId) {
+  const container = document.getElementById('session-detail-recordings');
+  container.style.display = 'none';
+  container.innerHTML = '';
+
+  let streams;
+  try {
+    const resp = await fetch(`/api/session/${sessionId}/recordings`);
+    streams = await resp.json();
+  } catch { return; }
+  if (!Array.isArray(streams) || streams.length === 0) return;
+
+  // Build the UI
+  container.style.display = '';
+
+  // Header with stream selector
+  const header = document.createElement('div');
+  header.className = 'session-rec-header';
+  header.innerHTML = '<span>Recordings</span>';
+  const select = document.createElement('select');
+  for (const s of streams) {
+    const opt = document.createElement('option');
+    opt.value = s.stream_name;
+    opt.textContent = s.stream_name.startsWith('display_') ? ':' + s.stream_name.slice(8) : s.stream_name;
+    if (s.total_duration_secs) opt.textContent += ` (${Math.round(s.total_duration_secs)}s)`;
+    select.appendChild(opt);
+  }
+  header.appendChild(select);
+  container.appendChild(header);
+
+  // Player wrap
+  const playerWrap = document.createElement('div');
+  playerWrap.className = 'recording-player-wrap';
+  const video = document.createElement('video');
+  video.preload = 'auto';
+  playerWrap.appendChild(video);
+  container.appendChild(playerWrap);
+
+  // Timeline
+  const timeline = document.createElement('div');
+  timeline.className = 'recording-timeline';
+  const timelineBar = document.createElement('div');
+  timelineBar.className = 'timeline-bar';
+  const timelineProgress = document.createElement('div');
+  timelineProgress.className = 'timeline-progress';
+  const timelineCursor = document.createElement('div');
+  timelineCursor.className = 'timeline-cursor';
+  timeline.appendChild(timelineBar);
+  timeline.appendChild(timelineProgress);
+  timeline.appendChild(timelineCursor);
+  container.appendChild(timeline);
+
+  // Controls
+  const controls = document.createElement('div');
+  controls.className = 'recording-controls';
+  const playBtn = document.createElement('button');
+  playBtn.innerHTML = '&#x25B6;';
+  playBtn.title = 'Play/Pause';
+  const timeLabel = document.createElement('span');
+  timeLabel.className = 'rec-time';
+  timeLabel.textContent = '0:00 / 0:00';
+  const speedSelect = document.createElement('select');
+  speedSelect.title = 'Playback speed';
+  for (const sp of ['0.5', '1', '2', '4']) {
+    const o = document.createElement('option');
+    o.value = sp;
+    o.textContent = sp + 'x';
+    if (sp === '1') o.selected = true;
+    speedSelect.appendChild(o);
+  }
+  controls.appendChild(playBtn);
+  controls.appendChild(timeLabel);
+  controls.appendChild(speedSelect);
+  container.appendChild(controls);
+
+  const baseUrl = `/api/session/${sessionId}/recordings`;
+
+  function initPlayer(streamName) {
+    if (sessionRecPlayer) sessionRecPlayer.destroy();
+    sessionRecPlayer = new RecordingPlayer(video, timeline, timelineCursor, timelineProgress, timeLabel, playBtn, baseUrl);
+    speedSelect.value = '1';
+    speedSelect.onchange = () => sessionRecPlayer.setSpeed(parseFloat(speedSelect.value));
+    sessionRecPlayer.load(streamName);
+  }
+
+  select.addEventListener('change', () => { if (select.value) initPlayer(select.value); });
+  initPlayer(streams[0].stream_name);
+}
 
 let detailVerbosity = 'normal';
 

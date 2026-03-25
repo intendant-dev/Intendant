@@ -522,29 +522,67 @@ impl tokio_tungstenite::tungstenite::handshake::server::Callback for VncWsCallba
 /// List session directories from `~/.intendant/logs/`, returning JSON metadata
 /// for each session (newest first, capped at 100).
 /// Return session detail: replayed log entries + metadata for a single session.
-fn get_session_detail(session_id: &str) -> String {
+/// Resolve a session directory by exact ID or prefix match.
+fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let logs_dir = PathBuf::from(format!("{}/.intendant/logs", home));
 
-    // Find session by exact ID or prefix match
-    let session_dir = if logs_dir.join(session_id).is_dir() {
-        logs_dir.join(session_id)
-    } else {
-        // Prefix match
-        let mut found = None;
-        if let Ok(entries) = std::fs::read_dir(&logs_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(session_id) {
-                    found = Some(entry.path());
-                    break;
-                }
+    if logs_dir.join(session_id).is_dir() {
+        return Some(logs_dir.join(session_id));
+    }
+    // Prefix match
+    if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(session_id) {
+                return Some(entry.path());
             }
         }
-        match found {
-            Some(p) => p,
-            None => return serde_json::json!({"error": "session not found"}).to_string(),
+    }
+    None
+}
+
+/// List recording streams from a recordings directory on disk.
+fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let mut entries = Vec::new();
+    if let Ok(dirs) = std::fs::read_dir(recordings_dir) {
+        for entry in dirs.flatten() {
+            if !entry.path().is_dir() { continue; }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let stream_dir = entry.path();
+            let manifest = std::fs::read_to_string(stream_dir.join("manifest.json"))
+                .ok()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                .unwrap_or(serde_json::json!({}));
+            let segments = crate::recording::parse_segment_csv_pub(
+                &stream_dir.join("segments.csv"),
+                &stream_dir,
+            );
+            let total_duration = segments.last().map(|s| s.end_secs).unwrap_or(0.0);
+            let seg_json: Vec<serde_json::Value> = segments.iter().map(|s| {
+                serde_json::json!({
+                    "filename": s.filename,
+                    "start_secs": s.start_secs,
+                    "end_secs": s.end_secs,
+                })
+            }).collect();
+            let mut e = manifest;
+            e["stream_name"] = serde_json::json!(name);
+            e["segments"] = serde_json::Value::Array(seg_json);
+            e["total_duration_secs"] = serde_json::json!(total_duration);
+            entries.push(e);
         }
+    }
+    entries.sort_by(|a, b| {
+        a["stream_name"].as_str().cmp(&b["stream_name"].as_str())
+    });
+    entries
+}
+
+fn get_session_detail(session_id: &str) -> String {
+    let session_dir = match resolve_session_dir(session_id) {
+        Some(d) => d,
+        None => return serde_json::json!({"error": "session not found"}).to_string(),
     };
 
     let jsonl_path = session_dir.join("session.jsonl");
@@ -1906,7 +1944,7 @@ pub fn spawn_web_gateway(
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.contains("/recordings/") {
+                    } else if request_line.contains("/recordings/") && !request_line.contains("/api/session/") {
                         // Serve recording data: segment files and metadata.
                         use tokio::io::AsyncWriteExt;
                         let path_part = request_line
@@ -2042,48 +2080,9 @@ pub fn spawn_web_gateway(
                             use tokio::io::AsyncWriteExt;
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
-                    } else if request_line.contains("/recordings") {
+                    } else if request_line.contains("/recordings") && !request_line.contains("/api/session/") {
                         // GET /recordings — list all streams (session + daemon-scoped)
                         use tokio::io::AsyncWriteExt;
-
-                        // Helper to list streams from a recordings directory
-                        fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<serde_json::Value> {
-                            let mut entries = Vec::new();
-                            if let Ok(dirs) = std::fs::read_dir(recordings_dir) {
-                                for entry in dirs.flatten() {
-                                    if !entry.path().is_dir() { continue; }
-                                    let name = entry.file_name().to_string_lossy().to_string();
-                                    let stream_dir = entry.path();
-                                    // Read manifest
-                                    let manifest = std::fs::read_to_string(stream_dir.join("manifest.json"))
-                                        .ok()
-                                        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                                        .unwrap_or(serde_json::json!({}));
-                                    // Read segments CSV
-                                    let segments = crate::recording::parse_segment_csv_pub(
-                                        &stream_dir.join("segments.csv"),
-                                        &stream_dir,
-                                    );
-                                    let total_duration = segments.last().map(|s| s.end_secs).unwrap_or(0.0);
-                                    let seg_json: Vec<serde_json::Value> = segments.iter().map(|s| {
-                                        serde_json::json!({
-                                            "filename": s.filename,
-                                            "start_secs": s.start_secs,
-                                            "end_secs": s.end_secs,
-                                        })
-                                    }).collect();
-                                    let mut e = manifest;
-                                    e["stream_name"] = serde_json::json!(name);
-                                    e["segments"] = serde_json::Value::Array(seg_json);
-                                    e["total_duration_secs"] = serde_json::json!(total_duration);
-                                    entries.push(e);
-                                }
-                            }
-                            entries.sort_by(|a, b| {
-                                a["stream_name"].as_str().cmp(&b["stream_name"].as_str())
-                            });
-                            entries
-                        }
 
                         let mut all_entries = Vec::new();
 
@@ -2134,29 +2133,154 @@ pub fn spawn_web_gateway(
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/api/session/") {
-                        // Single session detail: GET /api/session/<id>
-                        let body = if let Some(id) = request_line
+                        use tokio::io::AsyncWriteExt;
+                        // Extract the rest after /api/session/ and split into parts
+                        let rest = request_line
                             .split("/api/session/")
                             .nth(1)
-                            .and_then(|rest| rest.split_whitespace().next())
-                            .and_then(|id| id.split('?').next())
-                        {
-                            get_session_detail(id)
+                            .and_then(|r| r.split_whitespace().next())
+                            .unwrap_or("");
+                        let rest_parts: Vec<&str> = rest.split('/').collect();
+
+                        if rest_parts.len() >= 2 && rest_parts[1] == "recordings" {
+                            // Session recording sub-routes: /api/session/{id}/recordings[/...]
+                            let session_id = rest_parts[0];
+                            let rec_rest = &rest_parts[2..]; // parts after "recordings"
+
+                            if rec_rest.len() == 2 && rec_rest[1] == "segments" {
+                                // GET /api/session/{id}/recordings/{stream}/segments
+                                let stream_name = rec_rest[0];
+                                let body = if let Some(session_dir) = resolve_session_dir(session_id) {
+                                    let stream_dir = session_dir.join("recordings").join(stream_name);
+                                    let segments = crate::recording::parse_segment_csv_pub(
+                                        &stream_dir.join("segments.csv"),
+                                        &stream_dir,
+                                    );
+                                    let seg_json: Vec<serde_json::Value> = segments.iter().map(|s| {
+                                        serde_json::json!({
+                                            "filename": s.filename,
+                                            "start_secs": s.start_secs,
+                                            "end_secs": s.end_secs,
+                                        })
+                                    }).collect();
+                                    serde_json::to_string(&seg_json).unwrap_or("[]".to_string())
+                                } else {
+                                    "[]".to_string()
+                                };
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(), body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            } else if rec_rest.len() == 2 {
+                                // GET /api/session/{id}/recordings/{stream}/{filename}
+                                let stream_name = rec_rest[0];
+                                let filename = rec_rest[1];
+                                let valid = filename.starts_with("seg_")
+                                    && filename.ends_with(".mp4")
+                                    && filename.len() < 30
+                                    && !filename.contains("..");
+                                if valid {
+                                    let seg_path = resolve_session_dir(session_id)
+                                        .map(|d| d.join("recordings").join(stream_name).join(filename));
+                                    if let Some(path) = seg_path.filter(|p| p.exists()) {
+                                        match tokio::fs::read(&path).await {
+                                            Ok(data) => {
+                                                let header = format!(
+                                                    "HTTP/1.1 200 OK\r\n\
+                                                     Content-Type: video/mp4\r\n\
+                                                     Content-Length: {}\r\n\
+                                                     Cache-Control: public, max-age=3600\r\n\
+                                                     Connection: close\r\n\
+                                                     \r\n",
+                                                    data.len()
+                                                );
+                                                let _ = stream.write_all(header.as_bytes()).await;
+                                                let _ = stream.write_all(&data).await;
+                                            }
+                                            Err(_) => {
+                                                let body = "Failed to read segment";
+                                                let response = format!(
+                                                    "HTTP/1.1 500 Internal Server Error\r\n\
+                                                     Content-Type: text/plain\r\n\
+                                                     Content-Length: {}\r\n\
+                                                     Connection: close\r\n\
+                                                     \r\n\
+                                                     {}",
+                                                    body.len(), body
+                                                );
+                                                let _ = stream.write_all(response.as_bytes()).await;
+                                            }
+                                        }
+                                    } else {
+                                        let body = "Segment not found";
+                                        let response = format!(
+                                            "HTTP/1.1 404 Not Found\r\n\
+                                             Content-Type: text/plain\r\n\
+                                             Content-Length: {}\r\n\
+                                             Connection: close\r\n\
+                                             \r\n\
+                                             {}",
+                                            body.len(), body
+                                        );
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    }
+                                } else {
+                                    let body = "Invalid filename";
+                                    let response = format!(
+                                        "HTTP/1.1 400 Bad Request\r\n\
+                                         Content-Type: text/plain\r\n\
+                                         Content-Length: {}\r\n\
+                                         Connection: close\r\n\
+                                         \r\n\
+                                         {}",
+                                        body.len(), body
+                                    );
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                }
+                            } else {
+                                // GET /api/session/{id}/recordings — list streams
+                                let body = if let Some(session_dir) = resolve_session_dir(session_id) {
+                                    let recordings_dir = session_dir.join("recordings");
+                                    let entries = list_recording_streams(&recordings_dir);
+                                    serde_json::to_string(&entries).unwrap_or("[]".to_string())
+                                } else {
+                                    "[]".to_string()
+                                };
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(), body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
                         } else {
-                            r#"{"error":"missing session id"}"#.to_string()
-                        };
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(), body
-                        );
-                        use tokio::io::AsyncWriteExt;
-                        let _ = stream.write_all(response.as_bytes()).await;
+                            // GET /api/session/{id} — session detail
+                            let session_id = rest_parts[0].split('?').next().unwrap_or(rest_parts[0]);
+                            let body = get_session_detail(session_id);
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\n\
+                                 Content-Type: application/json\r\n\
+                                 Content-Length: {}\r\n\
+                                 Cache-Control: no-cache\r\n\
+                                 Connection: close\r\n\
+                                 \r\n\
+                                 {}",
+                                body.len(), body
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        }
                     } else if request_line.contains("/api/sessions") {
                         // Session listing endpoint
                         let body = list_sessions();
