@@ -2192,6 +2192,12 @@ async function main() {
     if (storedConversationCtx) {
       app.send_text('[System: conversation so far]\n' + storedConversationCtx);
       storedConversationCtx = null;
+    } else {
+      // Send a grounding message so Gemini enters tool-calling mode.
+      // Without any client_content after setupComplete, Gemini Live in
+      // audio-only mode may narrate tool calls in speech instead of
+      // issuing them as protocol-level toolCall messages.
+      app.send_text('[System: Ready. Waiting for user.]');
     }
     app.inject_pending_approval_if_any();
     try { app.send_voice_diagnostic('connected', provider + ' voice model ready'); } catch(_) {}
