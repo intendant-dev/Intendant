@@ -3208,6 +3208,13 @@ async fn run_with_presence(
         // ── CU-first routing: all tasks go to fast CU model first ──
         let mut task_for_agent: Option<String> = None;
 
+        slog(&session_log, |l| {
+            l.info(&format!(
+                "CU-first routing: force_direct={}, task={}",
+                envelope.force_direct, &envelope.task[..envelope.task.len().min(60)]
+            ))
+        });
+
         if !envelope.force_direct {
             // Auto-attach latest display frame(s) if none were explicitly provided
             let mut reference_images = resolve_frame_ids(
@@ -3905,7 +3912,15 @@ async fn try_cu_first(
     log_dir: &std::path::Path,
     bus: &event::EventBus,
 ) -> Option<Result<CuTaskResult, CallerError>> {
+    slog(session_log, |l| {
+        l.info(&format!(
+            "try_cu_first: ref_images={}, frame_images={}, task={}",
+            reference_images.len(), frame_images.len(), &task[..task.len().min(60)]
+        ))
+    });
+
     if reference_images.is_empty() {
+        slog(session_log, |l| l.info("try_cu_first: no display images, returning None"));
         return None;
     }
 
@@ -4608,6 +4623,7 @@ async fn main() -> Result<(), CallerError> {
                 shared_session,
                 transcriber,
                 None, // MCP mode: no WebTui
+                None, // No task_tx in MCP mode
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -4994,6 +5010,11 @@ async fn main() -> Result<(), CallerError> {
         app.presence_session = Some(presence_session.clone());
         app.session_log = Some(session_log.clone());
 
+        // Task dispatch channel: browser tool calls → presence task loop (CU-first routing)
+        let (task_tx, task_rx) =
+            tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
+        app.set_task_sender(task_tx.clone());
+
         // Deferred web gateway spawn — now we have the agent state for tool queries
         let _web_handle = if let Some(broadcast_tx) = web_broadcast_tx {
             let query_ctx = presence_agent_state.as_ref().map(|state| {
@@ -5039,6 +5060,7 @@ async fn main() -> Result<(), CallerError> {
                 shared_session,
                 transcriber,
                 web_tui_tx.clone(),
+                Some(task_tx.clone()),
             );
             app.log(
                 types::LogLevel::Info,
@@ -5080,12 +5102,6 @@ async fn main() -> Result<(), CallerError> {
             // Server-side presence is paused when count > 0 (any browser has active voice).
             let presence_paused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             app.set_presence_paused_flag(presence_paused.clone());
-
-            // Task dispatch channel: StartTask from browser/control/MCP goes
-            // directly here, bypassing server-side presence.
-            let (task_tx, task_rx) =
-                tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
-            app.set_task_sender(task_tx.clone());
 
             // Forward presence responses to TUI as log entries + reset phase
             let bus_for_responses = bus_clone.clone();
@@ -5465,6 +5481,7 @@ async fn main() -> Result<(), CallerError> {
                 shared_session.clone(),
                 transcriber,
                 None, // Headless mode: no WebTui
+                None, // No task_tx in headless mode
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",
