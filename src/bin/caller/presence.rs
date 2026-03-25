@@ -784,6 +784,17 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
                 category: format!("{:?}", category),
             })
         }
+        AppEvent::ApprovalResolved { id, action } => {
+            if action == "deny" {
+                *last_phase = "done".to_string();
+            } else {
+                *last_phase = "running_agent".to_string();
+            }
+            Some(PresenceEvent::ApprovalResolved {
+                id: *id,
+                action: action.clone(),
+            })
+        }
         AppEvent::HumanQuestionDetected { question } => {
             *last_phase = "waiting_human".to_string();
             Some(PresenceEvent::HumanQuestion {
@@ -995,6 +1006,14 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
                 command_preview: command_preview.clone(),
                 category: format!("{:?}", category),
             });
+        }
+        AppEvent::ApprovalResolved { action, .. } => {
+            s.pending_approval = None;
+            if action == "deny" {
+                s.phase = "done".to_string();
+            } else {
+                s.phase = "running_agent".to_string();
+            }
         }
         AppEvent::HumanQuestionDetected { .. } => {
             s.phase = "waiting_human".to_string();

@@ -137,6 +137,10 @@ pub enum AppEvent {
         command_preview: String,
         category: ActionCategory,
     },
+    ApprovalResolved {
+        id: u64,
+        action: String,
+    },
 
     // Vision display ready
     DisplayReady {
@@ -531,6 +535,10 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::AutoApproved { preview } => Some(OutboundEvent::AutoApproved {
             preview: preview.clone(),
         }),
+        AppEvent::ApprovalResolved { id, action } => Some(OutboundEvent::ApprovalResolved {
+            id: *id,
+            action: action.clone(),
+        }),
         AppEvent::HumanQuestionDetected { question } => Some(OutboundEvent::AskHuman {
             question: question.clone(),
         }),
@@ -787,6 +795,9 @@ fn write_event_to_session_log(
         // Approval / human interaction
         AppEvent::AutoApproved { preview } => {
             log.auto_approved(preview);
+        }
+        AppEvent::ApprovalResolved { id, action } => {
+            log.approval_resolved(*id, action);
         }
         AppEvent::HumanQuestionDetected { question } => {
             log.human_question(question);

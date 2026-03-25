@@ -89,6 +89,7 @@ pub enum PresenceEvent {
         summary: Option<String>,
     },
     ApprovalNeeded { id: u64, preview: String, category: String },
+    ApprovalResolved { id: u64, action: String },
     HumanQuestion { question: String },
     BudgetWarning { pct: f64, remaining: u64 },
     RoundComplete { round: usize, turns_in_round: usize },
@@ -185,6 +186,24 @@ impl AgentStateSnapshot {
                     preview: command,
                     category,
                 })
+            }
+            "agent_started" => {
+                let preview = event["commands_preview"].as_str().unwrap_or("").to_string();
+                self.on_agent_started(&preview);
+                Some(PresenceEvent::PhaseChanged {
+                    phase: "running_agent".to_string(),
+                })
+            }
+            "approval_resolved" => {
+                let id = event["id"].as_u64().unwrap_or(0);
+                let action = event["action"].as_str().unwrap_or("").to_string();
+                self.pending_approval = None;
+                if action == "deny" {
+                    self.phase = "done".to_string();
+                } else {
+                    self.phase = "running_agent".to_string();
+                }
+                Some(PresenceEvent::ApprovalResolved { id, action })
             }
             "ask_human" => {
                 let question = event["question"].as_str().unwrap_or("").to_string();

@@ -2272,11 +2272,13 @@ async fn run_agent_loop(
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "approved")
                             });
+                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve".to_string() });
                         }
                         Ok(event::ApprovalResponse::ApproveAll) => {
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "approve-all")
                             });
+                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve_all".to_string() });
                             let mut state = autonomy.write().await;
                             state.level = AutonomyLevel::Full;
                         }
@@ -2284,12 +2286,14 @@ async fn run_agent_loop(
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "skipped")
                             });
+                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "skip".to_string() });
                             should_skip = true;
                         }
                         Ok(event::ApprovalResponse::Deny) | Err(_) => {
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "denied")
                             });
+                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "deny".to_string() });
                             bus.send(AppEvent::TaskComplete {
                                 reason: "Denied by user".to_string(),
                                 summary: None,
@@ -2612,11 +2616,13 @@ Proceed with explicit assumptions and continue without additional questions."
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "approved")
                             });
+                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve".to_string() });
                         }
                         Ok(event::ApprovalResponse::ApproveAll) => {
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "approve-all")
                             });
+                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve_all".to_string() });
                             let mut state = autonomy.write().await;
                             state.level = AutonomyLevel::Full;
                         }
@@ -2624,12 +2630,14 @@ Proceed with explicit assumptions and continue without additional questions."
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "skipped")
                             });
+                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "skip".to_string() });
                             should_skip = true;
                         }
                         Ok(event::ApprovalResponse::Deny) | Err(_) => {
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "denied")
                             });
+                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "deny".to_string() });
                             bus.send(AppEvent::TaskComplete {
                                 reason: "Denied by user".to_string(),
                                 summary: None,

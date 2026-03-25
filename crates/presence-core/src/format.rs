@@ -19,6 +19,9 @@ pub fn format_event(event: &PresenceEvent) -> String {
             "Approval needed (id={}, category={}): {}",
             id, category, preview
         ),
+        PresenceEvent::ApprovalResolved { id, action } => {
+            format!("Approval resolved (id={}): {}", id, action)
+        }
         PresenceEvent::HumanQuestion { question } => {
             format!("Worker has a question: {}", question)
         }

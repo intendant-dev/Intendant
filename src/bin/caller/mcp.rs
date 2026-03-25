@@ -992,6 +992,9 @@ async fn handle_control_command_mcp(
         ControlMsg::Approve { id } => {
             let mut s = state.write().await;
             let outcome = process_action_sync(&mut s, UserAction::Approve { id });
+            if matches!(outcome, ActionOutcome::Ok) {
+                bus.send(AppEvent::ApprovalResolved { id, action: "approve".to_string() });
+            }
             emit_control_result(
                 control_tx,
                 "approve",
@@ -1004,6 +1007,9 @@ async fn handle_control_command_mcp(
         ControlMsg::Deny { id } => {
             let mut s = state.write().await;
             let outcome = process_action_sync(&mut s, UserAction::Deny { id });
+            if matches!(outcome, ActionOutcome::Ok) {
+                bus.send(AppEvent::ApprovalResolved { id, action: "deny".to_string() });
+            }
             emit_control_result(
                 control_tx,
                 "deny",
@@ -1028,6 +1034,9 @@ async fn handle_control_command_mcp(
         ControlMsg::Skip { id } => {
             let mut s = state.write().await;
             let outcome = process_action_sync(&mut s, UserAction::Skip { id });
+            if matches!(outcome, ActionOutcome::Ok) {
+                bus.send(AppEvent::ApprovalResolved { id, action: "skip".to_string() });
+            }
             emit_control_result(
                 control_tx,
                 "skip",
@@ -1040,6 +1049,9 @@ async fn handle_control_command_mcp(
         ControlMsg::ApproveAll { id } => {
             let mut s = state.write().await;
             let outcome = process_action_sync(&mut s, UserAction::ApproveAll { id });
+            if matches!(outcome, ActionOutcome::Ok) {
+                bus.send(AppEvent::ApprovalResolved { id, action: "approve_all".to_string() });
+            }
             emit_control_result(
                 control_tx,
                 "approve_all",
@@ -1979,6 +1991,20 @@ pub fn spawn_event_listener(
                         resource_changed = Some("intendant://logs");
                     }
 
+                    AppEvent::ApprovalResolved { id, ref action } => {
+                        s.pending_approval = None;
+                        if action == "deny" {
+                            s.set_phase(Phase::Done);
+                        } else {
+                            s.set_phase(Phase::RunningAgent);
+                        }
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Approval {} (turn {})", action, id),
+                        );
+                        resource_changed = Some(RESOURCE_APPROVAL_URI);
+                    }
+
                     AppEvent::RoundComplete {
                         round,
                         turns_in_round,
@@ -2463,6 +2489,9 @@ impl IntendantServer {
         let action = UserAction::Approve { id: params.id };
         let mut s = self.state.write().await;
         let outcome = process_action_sync(&mut s, action);
+        if outcome == ActionOutcome::Ok {
+            self.bus.send(AppEvent::ApprovalResolved { id: params.id, action: "approve".to_string() });
+        }
         format_outcome(outcome)
     }
 
@@ -2473,6 +2502,9 @@ impl IntendantServer {
         let action = UserAction::Deny { id: params.id };
         let mut s = self.state.write().await;
         let outcome = process_action_sync(&mut s, action);
+        if outcome == ActionOutcome::Ok {
+            self.bus.send(AppEvent::ApprovalResolved { id: params.id, action: "deny".to_string() });
+        }
         format_outcome(outcome)
     }
 
@@ -2483,6 +2515,9 @@ impl IntendantServer {
         let action = UserAction::Skip { id: params.id };
         let mut s = self.state.write().await;
         let outcome = process_action_sync(&mut s, action);
+        if outcome == ActionOutcome::Ok {
+            self.bus.send(AppEvent::ApprovalResolved { id: params.id, action: "skip".to_string() });
+        }
         format_outcome(outcome)
     }
 
@@ -2494,6 +2529,7 @@ impl IntendantServer {
         let mut s = self.state.write().await;
         let outcome = process_action_sync(&mut s, action);
         if outcome == ActionOutcome::Ok {
+            self.bus.send(AppEvent::ApprovalResolved { id: params.id, action: "approve_all".to_string() });
             let autonomy = s.autonomy.clone();
             drop(s);
             let mut a = autonomy.write().await;

@@ -219,6 +219,10 @@ pub enum OutboundEvent {
     AutoApproved {
         preview: String,
     },
+    ApprovalResolved {
+        id: u64,
+        action: String,
+    },
     ContextManagement {
         turn: usize,
     },

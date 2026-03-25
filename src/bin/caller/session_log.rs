@@ -524,6 +524,20 @@ impl SessionLog {
         });
     }
 
+    /// Log a resolved approval decision.
+    pub fn approval_resolved(&mut self, id: u64, action: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: Some(id as usize),
+            event: "approval_resolved".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Approval {} (turn {})", action, id)),
+            data: None,
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log a human question (askHuman).
     pub fn human_question(&mut self, question: &str) {
         self.emit(LogEvent {

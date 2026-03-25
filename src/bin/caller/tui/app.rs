@@ -888,8 +888,18 @@ impl App {
         }
     }
 
-    /// Send an approval response via the shared registry.
-    fn resolve_approval(&self, id: u64, response: ApprovalResponse) {
+    /// Send an approval response via the shared registry and emit a derived event.
+    fn resolve_approval(&mut self, id: u64, response: ApprovalResponse) {
+        let action = match response {
+            ApprovalResponse::Approve => "approve",
+            ApprovalResponse::Deny => "deny",
+            ApprovalResponse::Skip => "skip",
+            ApprovalResponse::ApproveAll => "approve_all",
+        };
+        self.pending_derived.push(AppEvent::ApprovalResolved {
+            id,
+            action: action.to_string(),
+        });
         if let Ok(mut registry) = self.approval_registry.lock() {
             if let Some(responder) = registry.remove(&id) {
                 let _ = responder.send(response);
@@ -1872,7 +1882,8 @@ impl App {
             AppEvent::Key(key) => {
                 self.handle_key(key);
             }
-            AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::LiveUsageUpdate { .. } => {
+            AppEvent::ApprovalResolved { .. }
+            | AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::LiveUsageUpdate { .. } => {
                 // Derived events — just pass through to outbound broadcaster.
                 // App doesn't need to handle its own output.
             }
