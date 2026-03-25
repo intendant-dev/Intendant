@@ -4012,7 +4012,31 @@ async fn try_cu_first(
         log_dir,
         bus,
         &proj.config.computer_use,
+        None, // auto-resolve display target
     ).await)
+}
+
+/// Resolve the display target for CU actions.
+///
+/// If user display access is granted (env var set) and the current DISPLAY
+/// is `:0` (or unset, indicating no virtual display was launched), returns
+/// `UserSession`. Otherwise returns `Virtual` with the current display ID.
+fn resolve_cu_display_target() -> computer_use::DisplayTarget {
+    let display_id: Option<u32> = std::env::var("DISPLAY")
+        .ok()
+        .and_then(|d| d.trim_start_matches(':').parse().ok());
+
+    let user_granted = std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok();
+
+    match display_id {
+        // DISPLAY is :0 and user granted → target user session
+        Some(0) if user_granted => computer_use::DisplayTarget::UserSession,
+        // DISPLAY is set to a virtual display
+        Some(id) => computer_use::DisplayTarget::Virtual { id },
+        // No DISPLAY set — if user granted, target their session; else default virtual
+        None if user_granted => computer_use::DisplayTarget::UserSession,
+        None => computer_use::DisplayTarget::Virtual { id: 99 },
+    }
 }
 
 /// Maximum turns for an ephemeral CU task before giving up.
@@ -4040,18 +4064,13 @@ async fn run_cu_task(
     log_dir: &std::path::Path,
     bus: &event::EventBus,
     cu_config: &project::ComputerUseConfig,
+    target_override: Option<computer_use::DisplayTarget>,
 ) -> Result<CuTaskResult, CallerError> {
     let mut stats = LoopStats::default();
     let mut cu_counter = 0u64;
     let backend = computer_use::DisplayBackend::from_config(&cu_config.backend);
 
-    let display_target = {
-        let id: u32 = std::env::var("DISPLAY")
-            .ok()
-            .and_then(|d| d.trim_start_matches(':').parse().ok())
-            .unwrap_or(99);
-        computer_use::DisplayTarget::Virtual { id }
-    };
+    let display_target = target_override.unwrap_or_else(resolve_cu_display_target);
 
     // CU-first system prompt: handle display tasks or escalate
     let system_prompt = "You are a fast computer-use agent. You can see and interact with a desktop display.\n\n\
@@ -4275,16 +4294,11 @@ async fn execute_cu_calls(
     counter: &mut u64,
     session_log: &SharedSessionLog,
 ) {
-    let display_target = {
-        let id: u32 = cu_display
-            .map(|_| {
-                std::env::var("DISPLAY")
-                    .ok()
-                    .and_then(|d| d.trim_start_matches(':').parse().ok())
-                    .unwrap_or(99)
-            })
-            .unwrap_or(99);
-        computer_use::DisplayTarget::Virtual { id }
+    let display_target = if cu_display.is_some() {
+        resolve_cu_display_target()
+    } else {
+        // No CU display configured — default to virtual :99
+        computer_use::DisplayTarget::Virtual { id: 99 }
     };
 
     for cu_call in cu_calls {
@@ -5394,7 +5408,7 @@ async fn main() -> Result<(), CallerError> {
                                         tokio::spawn(async move {
                                             match run_cu_task(
                                                 cu_provider.as_ref(), &new_task, reference_images, vec![],
-                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config,
+                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config, None,
                                             ).await {
                                                 Ok(CuTaskResult::Completed(stats)) => {
                                                     bus_cu.send(AppEvent::PresenceLog {
@@ -5768,7 +5782,7 @@ async fn main() -> Result<(), CallerError> {
                                         tokio::spawn(async move {
                                             match run_cu_task(
                                                 cu_provider.as_ref(), &new_task, reference_images, vec![],
-                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config,
+                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config, None,
                                             ).await {
                                                 Ok(CuTaskResult::Completed(stats)) => {
                                                     bus_cu.send(AppEvent::PresenceLog {
