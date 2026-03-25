@@ -4074,6 +4074,7 @@ fn parse_display_target_str(s: &str) -> computer_use::DisplayTarget {
 /// If user display access is granted (env var set) and the current DISPLAY
 /// is `:0` (or unset, indicating no virtual display was launched), returns
 /// `UserSession`. Otherwise returns `Virtual` with the current display ID.
+/// On macOS, always returns `UserSession` when DISPLAY is unset (no Xvfb).
 fn resolve_cu_display_target() -> computer_use::DisplayTarget {
     let display_id: Option<u32> = std::env::var("DISPLAY")
         .ok()
@@ -4088,6 +4089,8 @@ fn resolve_cu_display_target() -> computer_use::DisplayTarget {
         Some(id) => computer_use::DisplayTarget::Virtual { id },
         // No DISPLAY set — if user granted, target their session; else default virtual
         None if user_granted => computer_use::DisplayTarget::UserSession,
+        // macOS has no Xvfb — native display is always the target
+        None if cfg!(target_os = "macos") => computer_use::DisplayTarget::UserSession,
         None => computer_use::DisplayTarget::Virtual { id: 99 },
     }
 }
