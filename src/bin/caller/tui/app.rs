@@ -842,7 +842,9 @@ impl App {
                     }
                     KeyCode::Char('d') => {
                         // Toggle user display access
-                        let granted = self.autonomy.blocking_read().user_display_granted;
+                        let granted = self.autonomy.try_read()
+                            .map(|s| s.user_display_granted)
+                            .unwrap_or(false);
                         if granted {
                             self.handle_control_command(ControlMsg::RevokeUserDisplay {
                                 note: None,
@@ -1369,8 +1371,13 @@ impl App {
                 });
             }
             ControlMsg::GrantUserDisplay => {
-                {
-                    let mut state = self.autonomy.blocking_write();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let autonomy = self.autonomy.clone();
+                    handle.spawn(async move {
+                        let mut state = autonomy.write().await;
+                        state.user_display_granted = true;
+                    });
+                } else if let Ok(mut state) = self.autonomy.try_write() {
                     state.user_display_granted = true;
                 }
                 std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
@@ -1378,8 +1385,13 @@ impl App {
                 self.broadcast_control(OutboundEvent::UserDisplayGranted);
             }
             ControlMsg::RevokeUserDisplay { note } => {
-                {
-                    let mut state = self.autonomy.blocking_write();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let autonomy = self.autonomy.clone();
+                    handle.spawn(async move {
+                        let mut state = autonomy.write().await;
+                        state.user_display_granted = false;
+                    });
+                } else if let Ok(mut state) = self.autonomy.try_write() {
                     state.user_display_granted = false;
                 }
                 std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
