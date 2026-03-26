@@ -329,13 +329,23 @@ run_install() {
     echo ""
     build_intendant
 
-    # Phase 5: Final status
+    # Phase 5: App bundle
+    echo ""
+    info "building macOS app bundle..."
+    if [ -f scripts/bundle-macos.sh ]; then
+        bash scripts/bundle-macos.sh
+    fi
+
+    # Phase 6: Final status
     echo ""
     echo "════════════════════════════════════════════════════════"
     echo "  Setup complete!"
     echo "════════════════════════════════════════════════════════"
     echo ""
-    echo "  Run intendant:"
+    echo "  Run intendant (recommended — proper macOS permissions):"
+    echo "    open target/Intendant.app --args --web"
+    echo ""
+    echo "  Or without app bundle:"
     echo "    ./target/release/intendant \"your task\""
     echo ""
 
