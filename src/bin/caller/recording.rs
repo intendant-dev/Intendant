@@ -368,17 +368,10 @@ impl RecordingRegistry {
         width: u32,
         height: u32,
     ) -> Result<String, String> {
-        let stream_name = format!("display_{}", display_id);
-        if let Some(existing) = self.recordings.get_mut(&stream_name) {
-            if existing.is_alive() {
-                return Err(format!("Already recording stream: {}", stream_name));
-            }
-            // ffmpeg is dead (Xvfb was restarted) — remove stale entry
-            self.recordings.remove(&stream_name);
-        }
         let guard =
             start_display_recording(display_id, width, height, &self.config, &self.session_dir)
                 .await?;
+        let stream_name = guard.stream_name().to_string();
         self.recordings.insert(stream_name.clone(), guard);
         Ok(stream_name)
     }
@@ -627,9 +620,14 @@ pub fn spawn_recording_listener(
                     crate::event::ControlMsg::StopRecording { stream_name },
                 )) => {
                     let mut reg = registry.write().await;
-                    if reg.is_recording(&stream_name) {
-                        reg.stop(&stream_name);
-                        bus.send(AppEvent::RecordingStopped { stream_name });
+                    // Find the active recording matching this name or prefix
+                    // (e.g. "display_0" matches "display_0", "display_0_2", etc.)
+                    let active = reg.active_streams().into_iter().find(|s| {
+                        *s == stream_name || s.starts_with(&format!("{}_", stream_name))
+                    });
+                    if let Some(actual) = active {
+                        reg.stop(&actual);
+                        bus.send(AppEvent::RecordingStopped { stream_name: actual });
                     }
                 }
                 Ok(AppEvent::ControlCommand(
