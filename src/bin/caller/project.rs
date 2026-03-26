@@ -532,7 +532,7 @@ live_context_window = 65536
     fn parse_recording_config_defaults() {
         let config: ProjectConfig = toml::from_str("").unwrap();
         assert!(!config.recording.enabled);
-        assert_eq!(config.recording.framerate, 30);
+        assert_eq!(config.recording.framerate, 15);
         assert_eq!(config.recording.segment_duration_secs, 60);
         assert_eq!(config.recording.quality, "medium");
         assert!(config.recording.max_retention_hours.is_none());

@@ -283,7 +283,7 @@ pub async fn start_frame_recording(
             "-segment_list_type", "csv",
             "-reset_timestamps", "1",
         ])
-        .arg(output_pattern.to_str().unwrap_or("seg_%05d.mp4"))
+        .arg(output_pattern.to_str().unwrap_or("seg_%05d.ts"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -685,7 +685,7 @@ mod tests {
     fn recording_config_defaults() {
         let config = RecordingConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.framerate, 30);
+        assert_eq!(config.framerate, 15);
         assert_eq!(config.segment_duration_secs, 60);
         assert_eq!(config.quality, "medium");
         assert!(config.max_retention_hours.is_none());
