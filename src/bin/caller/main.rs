@@ -4598,6 +4598,9 @@ async fn main() -> Result<(), CallerError> {
         }));
     }
 
+    // Ensure platform tool directories (Homebrew etc.) are in PATH.
+    platform::ensure_tool_paths();
+
     // Load .env: cwd (+ parents) first, then project root, then ~/.config/intendant/
     dotenvy::dotenv().ok();
     let mut project = Project::detect()?;
