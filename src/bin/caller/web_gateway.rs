@@ -2011,7 +2011,7 @@ pub fn spawn_web_gateway(
                                 let filename = parts[1];
                                 // Validate filename to prevent path traversal
                                 let valid = filename.starts_with("seg_")
-                                    && filename.ends_with(".mp4")
+                                    && (filename.ends_with(".mp4") || filename.ends_with(".ts"))
                                     && filename.len() < 30
                                     && !filename.contains("..");
                                 if valid {
@@ -2028,16 +2028,17 @@ pub fn spawn_web_gateway(
                                     } else {
                                         daemon_path
                                     };
+                                    let content_type = if filename.ends_with(".ts") { "video/mp2t" } else { "video/mp4" };
                                     match tokio::fs::read(&seg_path).await {
                                         Ok(data) => {
                                             let header = format!(
                                                 "HTTP/1.1 200 OK\r\n\
-                                                 Content-Type: video/mp4\r\n\
+                                                 Content-Type: {}\r\n\
                                                  Content-Length: {}\r\n\
                                                  Cache-Control: public, max-age=3600\r\n\
                                                  Connection: close\r\n\
                                                  \r\n",
-                                                data.len()
+                                                content_type, data.len()
                                             );
                                             let _ = stream.write_all(header.as_bytes()).await;
                                             let _ = stream.write_all(&data).await;
@@ -2199,10 +2200,11 @@ pub fn spawn_web_gateway(
                                 let stream_name = rec_rest[0];
                                 let filename = rec_rest[1];
                                 let valid = filename.starts_with("seg_")
-                                    && filename.ends_with(".mp4")
+                                    && (filename.ends_with(".mp4") || filename.ends_with(".ts"))
                                     && filename.len() < 30
                                     && !filename.contains("..");
                                 if valid {
+                                    let seg_ct = if filename.ends_with(".ts") { "video/mp2t" } else { "video/mp4" };
                                     let seg_path = resolve_session_dir(session_id)
                                         .map(|d| d.join("recordings").join(stream_name).join(filename));
                                     if let Some(path) = seg_path.filter(|p| p.exists()) {
@@ -2210,12 +2212,12 @@ pub fn spawn_web_gateway(
                                             Ok(data) => {
                                                 let header = format!(
                                                     "HTTP/1.1 200 OK\r\n\
-                                                     Content-Type: video/mp4\r\n\
+                                                     Content-Type: {}\r\n\
                                                      Content-Length: {}\r\n\
                                                      Cache-Control: public, max-age=3600\r\n\
                                                      Connection: close\r\n\
                                                      \r\n",
-                                                    data.len()
+                                                    seg_ct, data.len()
                                                 );
                                                 let _ = stream.write_all(header.as_bytes()).await;
                                                 let _ = stream.write_all(&data).await;
