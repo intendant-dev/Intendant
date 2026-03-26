@@ -1386,6 +1386,218 @@ html, body {
   z-index: 5;
 }
 
+/* ── Clip Toolbar ── */
+.clip-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  background: var(--mantle);
+  border-top: 1px solid var(--surface0);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+.clip-toolbar.hidden { display: none; }
+.clip-range-display {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--subtext0);
+}
+.clip-range-display a {
+  color: var(--overlay1);
+  text-decoration: none;
+  font-size: 10px;
+}
+.clip-range-display a:hover { color: var(--red); }
+.clip-toolbar select {
+  padding: 2px 6px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 12px;
+}
+.clip-toolbar label {
+  font-size: 11px;
+  color: var(--subtext0);
+}
+.clip-frame-count {
+  font-size: 11px;
+  color: var(--subtext0);
+}
+.clip-toolbar button {
+  padding: 4px 10px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+.clip-toolbar button:hover { border-color: var(--blue); }
+.clip-toolbar button.active { background: var(--blue); color: var(--base); border-color: var(--blue); }
+.clip-toolbar .clip-send-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--green);
+  background: var(--green);
+  color: var(--base);
+  font-weight: 600;
+}
+.clip-toolbar .clip-send-btn:hover { opacity: 0.85; border-color: var(--green); }
+.clip-toolbar .clip-save-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--blue);
+  background: var(--surface0);
+  color: var(--blue);
+  font-weight: 600;
+}
+.clip-toolbar .clip-save-btn:hover { background: var(--blue); color: var(--base); }
+.clip-progress {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 2px 0;
+}
+.clip-progress.hidden { display: none; }
+.clip-progress .bar-track {
+  flex: 1;
+  height: 6px;
+  background: var(--surface0);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.clip-progress .bar-fill {
+  height: 100%;
+  background: var(--green);
+  border-radius: 3px;
+  width: 0;
+  transition: width 0.15s;
+}
+.clip-progress-text {
+  font-size: 11px;
+  color: var(--subtext0);
+  white-space: nowrap;
+}
+.clip-progress .clip-cancel-btn {
+  padding: 2px 8px;
+  font-size: 10px;
+  border: 1px solid var(--surface1);
+  border-radius: 3px;
+  background: var(--surface0);
+  color: var(--overlay1);
+  cursor: pointer;
+}
+.clip-progress .clip-cancel-btn:hover { border-color: var(--red); color: var(--red); }
+.clip-status {
+  font-size: 11px;
+  color: var(--green);
+  white-space: nowrap;
+}
+
+/* ── Clip Timeline Markers ── */
+.timeline-clip-region {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  background: var(--yellow);
+  opacity: 0.15;
+  pointer-events: none;
+  z-index: 1;
+}
+.timeline-clip-marker {
+  position: absolute;
+  top: 0;
+  width: 3px;
+  height: 100%;
+  background: var(--yellow);
+  z-index: 3;
+  cursor: ew-resize;
+}
+.timeline-clip-marker::after {
+  content: attr(data-label);
+  position: absolute;
+  top: -1px;
+  left: 4px;
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--yellow);
+  pointer-events: none;
+}
+.timeline-keyframe-mark {
+  position: absolute;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  background: var(--peach);
+  transform: translate(-4px, -50%) rotate(45deg);
+  z-index: 2;
+  cursor: pointer;
+}
+.timeline-keyframe-mark:hover { background: var(--red); }
+.timeline-ann-range {
+  position: absolute;
+  bottom: 0;
+  height: 5px;
+  border-radius: 2px;
+  z-index: 2;
+  cursor: pointer;
+  opacity: 0.8;
+}
+.timeline-ann-range:hover { opacity: 1; }
+.timeline-ann-range.selected { outline: 1px solid var(--text); }
+
+/* ── Clip Preview Strip ── */
+.clip-preview-strip {
+  display: flex;
+  gap: 4px;
+  padding: 4px 12px;
+  background: var(--mantle);
+  border-top: 1px solid var(--surface0);
+  overflow-x: auto;
+  flex-shrink: 0;
+  max-height: 100px;
+}
+.clip-preview-strip.hidden { display: none; }
+.clip-preview-thumb {
+  flex-shrink: 0;
+  width: 120px;
+  cursor: pointer;
+  border: 2px solid var(--surface1);
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+}
+.clip-preview-thumb:hover { border-color: var(--blue); }
+.clip-preview-thumb.keyframe { border-color: var(--yellow); }
+.clip-preview-thumb.annotated { border-color: var(--peach); }
+.clip-preview-thumb img {
+  width: 100%;
+  display: block;
+}
+.clip-preview-thumb .thumb-time {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: rgba(0,0,0,0.7);
+  color: var(--text);
+  font-size: 9px;
+  font-family: monospace;
+  padding: 1px 4px;
+  text-align: center;
+}
+
+/* ── Clip Annotation Prompt ── */
+.clip-ann-prompt {
+  font-size: 11px;
+  color: var(--yellow);
+  font-weight: 600;
+}
+
 /* ── Usage empty state ── */
 .empty-state {
   display: flex;
@@ -1771,6 +1983,39 @@ html, body {
           <div class="timeline-progress" id="timeline-progress"></div>
           <div class="timeline-cursor" id="timeline-cursor"></div>
         </div>
+        <div class="clip-toolbar hidden" id="clip-toolbar">
+          <div class="clip-range-display" id="clip-range">
+            <span id="clip-in-label">In: --</span>
+            <span id="clip-out-label">Out: --</span>
+            <span id="clip-duration-label"></span>
+            <a href="#" id="clip-clear-range">Clear</a>
+          </div>
+          <label>FPS:</label>
+          <select id="clip-fps">
+            <option value="1">1</option>
+            <option value="2" selected>2</option>
+            <option value="5">5</option>
+            <option value="10">10</option>
+          </select>
+          <span class="clip-frame-count" id="clip-frame-count"></span>
+          <button id="clip-keyframe-btn" title="Toggle keyframe marking mode">+ Keyframe</button>
+          <button id="clip-ann-range-btn" title="Annotate a time range">Annotate Range</button>
+          <span class="clip-ann-prompt hidden" id="clip-ann-prompt"></span>
+          <div style="margin-left:auto;display:flex;gap:4px;align-items:center">
+            <button id="clip-preview-btn" title="Generate preview thumbnails">Preview</button>
+            <input class="ann-note" id="clip-note" placeholder="Clip note..." />
+            <button class="clip-save-btn" id="clip-save-btn" title="Save clip frames to registry">Save</button>
+            <button class="clip-send-btn" id="clip-send-btn" title="Save and send clip to agent">Send</button>
+            <span class="clip-status" id="clip-status"></span>
+            <button class="ann-close" id="clip-close" title="Exit clip mode (Esc)">&times;</button>
+          </div>
+          <div class="clip-progress hidden" id="clip-progress">
+            <div class="bar-track"><div class="bar-fill" id="clip-progress-fill"></div></div>
+            <span class="clip-progress-text" id="clip-progress-text"></span>
+            <button class="clip-cancel-btn" id="clip-cancel-btn">Cancel</button>
+          </div>
+        </div>
+        <div class="clip-preview-strip hidden" id="clip-preview-strip"></div>
         <div class="recording-controls">
           <button id="rec-play-btn" title="Play/Pause">&#x25B6;</button>
           <span class="rec-time" id="rec-time">0:00 / 0:00</span>
@@ -1781,6 +2026,7 @@ html, body {
             <option value="4">4x</option>
           </select>
           <button id="rec-annotate-btn" title="Annotate frame (A)">&#9998; Annotate</button>
+          <button id="rec-clip-btn" title="Send Clip (C)">&#127916; Clip</button>
         </div>
       </div>
     </div>
@@ -2297,6 +2543,16 @@ async function main() {
       const d = JSON.parse(msg);
       if (d.t === 'annotation_saved' && d.path) {
         showAnnotationResult(d.path);
+        return;
+      }
+      if (d.t === 'clip_saved') {
+        const el = document.getElementById('clip-status');
+        if (el) {
+          const verb = d.injected ? 'Sent' : 'Saved';
+          el.textContent = `${verb} ${d.frames_registered} frames`;
+          el.style.color = 'var(--green)';
+          setTimeout(() => { el.textContent = ''; el.style.color = ''; }, 5000);
+        }
         return;
       }
       // Track user display grant/revoke events
@@ -3377,6 +3633,42 @@ class RecordingPlayer {
     this._updateDisplay();
   }
 
+  /** Async seek — resolves when the frame at `secs` is ready to draw. */
+  seekToGlobalAsync(secs) {
+    return new Promise((resolve) => {
+      secs = Math.max(0, Math.min(secs, this.totalDuration));
+      const idx = this._findSegmentIndex(secs);
+      if (idx < 0) { resolve(); return; }
+      const seg = this.segments[idx];
+      const offset = secs - seg.start_secs;
+
+      const onSeeked = () => {
+        this.video.removeEventListener('seeked', onSeeked);
+        this._updateDisplay();
+        resolve();
+      };
+
+      if (idx !== this.currentSegIdx) {
+        // Cross-segment: wait for loadeddata first, then seek, then seeked
+        const onLoaded = () => {
+          this.video.removeEventListener('loadeddata', onLoaded);
+          this.video.addEventListener('seeked', onSeeked);
+          this.video.currentTime = offset;
+        };
+        this.video.addEventListener('loadeddata', onLoaded);
+        this.currentSegIdx = idx;
+        if (seg.filename.endsWith('.ts')) {
+          this.video.src = `${this.baseUrl}/${this.streamName}/playlist.m3u8`;
+        } else {
+          this.video.src = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
+        }
+      } else {
+        this.video.addEventListener('seeked', onSeeked);
+        this.video.currentTime = offset;
+      }
+    });
+  }
+
   setSpeed(rate) {
     this.video.playbackRate = rate;
   }
@@ -3614,6 +3906,51 @@ async function checkExistingRecordings() {
 }
 
 // ── Annotation Drawing ──
+/** Draw an array of annotation shapes onto a canvas context.
+ *  Optional scaleX/scaleY for rendering on a differently-sized canvas (e.g. thumbnails). */
+function drawShapes(ctx, shapes, scaleX, scaleY) {
+  scaleX = scaleX || 1;
+  scaleY = scaleY || 1;
+  for (const s of shapes) {
+    ctx.save();
+    ctx.strokeStyle = s.color || '#f38ba8';
+    ctx.fillStyle = s.color || '#f38ba8';
+    ctx.lineWidth = (s.thickness || 4) * scaleX;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    if (s.type === 'freehand' && s.points && s.points.length > 1) {
+      ctx.beginPath();
+      ctx.moveTo(s.points[0][0] * scaleX, s.points[0][1] * scaleY);
+      for (let i = 1; i < s.points.length; i++) ctx.lineTo(s.points[i][0] * scaleX, s.points[i][1] * scaleY);
+      ctx.stroke();
+    } else if (s.type === 'rect') {
+      ctx.strokeRect(s.x * scaleX, s.y * scaleY, s.w * scaleX, s.h * scaleY);
+    } else if (s.type === 'circle') {
+      ctx.beginPath();
+      ctx.arc(s.cx * scaleX, s.cy * scaleY, s.r * Math.min(scaleX, scaleY), 0, Math.PI * 2);
+      ctx.stroke();
+    } else if (s.type === 'arrow') {
+      ctx.beginPath();
+      ctx.moveTo(s.x1 * scaleX, s.y1 * scaleY);
+      ctx.lineTo(s.x2 * scaleX, s.y2 * scaleY);
+      ctx.stroke();
+      const angle = Math.atan2((s.y2 - s.y1) * scaleY, (s.x2 - s.x1) * scaleX);
+      const headLen = Math.max(12, (s.thickness || 4) * 3) * Math.min(scaleX, scaleY);
+      ctx.beginPath();
+      ctx.moveTo(s.x2 * scaleX, s.y2 * scaleY);
+      ctx.lineTo(s.x2 * scaleX - headLen * Math.cos(angle - 0.4), s.y2 * scaleY - headLen * Math.sin(angle - 0.4));
+      ctx.lineTo(s.x2 * scaleX - headLen * Math.cos(angle + 0.4), s.y2 * scaleY - headLen * Math.sin(angle + 0.4));
+      ctx.closePath();
+      ctx.fill();
+    } else if (s.type === 'text') {
+      const size = (s.size || 20) * Math.min(scaleX, scaleY);
+      ctx.font = `${size}px sans-serif`;
+      ctx.fillText(s.text, s.x * scaleX, s.y * scaleY);
+    }
+    ctx.restore();
+  }
+}
+
 class AnnotationCanvas {
   constructor(overlayCanvas, sourceElement) {
     this.canvas = overlayCanvas;
@@ -3765,46 +4102,11 @@ class AnnotationCanvas {
 
   render() {
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    for (const s of this.shapes) this._drawShape(this.ctx, s);
+    drawShapes(this.ctx, this.shapes);
   }
 
   _drawShape(ctx, s) {
-    ctx.save();
-    ctx.strokeStyle = s.color || this.color;
-    ctx.fillStyle = s.color || this.color;
-    ctx.lineWidth = s.thickness || this.thickness;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    if (s.type === 'freehand' && s.points.length > 1) {
-      ctx.beginPath();
-      ctx.moveTo(s.points[0][0], s.points[0][1]);
-      for (let i = 1; i < s.points.length; i++) ctx.lineTo(s.points[i][0], s.points[i][1]);
-      ctx.stroke();
-    } else if (s.type === 'rect') {
-      ctx.strokeRect(s.x, s.y, s.w, s.h);
-    } else if (s.type === 'circle') {
-      ctx.beginPath();
-      ctx.arc(s.cx, s.cy, s.r, 0, Math.PI * 2);
-      ctx.stroke();
-    } else if (s.type === 'arrow') {
-      ctx.beginPath();
-      ctx.moveTo(s.x1, s.y1);
-      ctx.lineTo(s.x2, s.y2);
-      ctx.stroke();
-      // Arrowhead
-      const angle = Math.atan2(s.y2 - s.y1, s.x2 - s.x1);
-      const headLen = Math.max(12, (s.thickness || 4) * 3);
-      ctx.beginPath();
-      ctx.moveTo(s.x2, s.y2);
-      ctx.lineTo(s.x2 - headLen * Math.cos(angle - 0.4), s.y2 - headLen * Math.sin(angle - 0.4));
-      ctx.lineTo(s.x2 - headLen * Math.cos(angle + 0.4), s.y2 - headLen * Math.sin(angle + 0.4));
-      ctx.closePath();
-      ctx.fill();
-    } else if (s.type === 'text') {
-      ctx.font = `${s.size || 20}px sans-serif`;
-      ctx.fillText(s.text, s.x, s.y);
-    }
-    ctx.restore();
+    drawShapes(ctx, [s]);
   }
 
   /** Composite source frame + annotations into a JPEG blob. */
@@ -3819,7 +4121,7 @@ class AnnotationCanvas {
       // Draw source (video or canvas)
       octx.drawImage(this.source, 0, 0, w, h);
       // Draw all annotations on top
-      for (const s of this.shapes) this._drawShape(octx, s);
+      drawShapes(octx, this.shapes);
       offscreen.toBlob((blob) => resolve(blob), 'image/jpeg', 0.92);
     });
   }
@@ -3995,22 +4297,44 @@ document.getElementById('ann-note').addEventListener('keydown', (e) => {
   e.stopPropagation(); // Don't let key events bubble to global handlers
 });
 
-// Keyboard shortcuts for annotation
+// Keyboard shortcuts for annotation and clip mode
 document.addEventListener('keydown', (e) => {
-  // Don't fire in input fields (except our handled ann-note)
+  // Don't fire in input fields (except our handled note fields)
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  const section = document.getElementById('recording-section');
+  const sectionVisible = section && !section.classList.contains('hidden');
+
   if (e.key === 'a' && !e.ctrlKey && !e.metaKey && !e.altKey) {
-    // Toggle annotation mode when recording section is visible
-    const section = document.getElementById('recording-section');
-    if (section && !section.classList.contains('hidden')) {
-      if (annotationMode) exitAnnotationMode();
-      else enterAnnotationMode();
+    if (sectionVisible) {
+      if (clipMode && !clipAnnotatingRange) {
+        // In clip mode, 'a' starts annotate range flow
+        startClipAnnotateRange();
+      } else if (!clipMode) {
+        if (annotationMode) exitAnnotationMode();
+        else enterAnnotationMode();
+      }
     }
     return;
   }
-  if (e.key === 'Escape' && annotationMode) {
-    exitAnnotationMode();
+  if (e.key === 'c' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (sectionVisible && !annotationMode && !clipMode) {
+      enterClipMode();
+    }
     return;
+  }
+  if (e.key === 'Escape') {
+    if (clipAnnotatingRange) {
+      cancelClipAnnotateRange();
+      return;
+    }
+    if (clipMode) {
+      exitClipMode();
+      return;
+    }
+    if (annotationMode) {
+      exitAnnotationMode();
+      return;
+    }
   }
   if (annotationMode && annotationCanvas) {
     if (e.key === 'z' && (e.ctrlKey || e.metaKey) && e.shiftKey) {
@@ -4020,6 +4344,756 @@ document.addEventListener('keydown', (e) => {
       e.preventDefault();
       annotationCanvas.undo();
     }
+  }
+  if (clipAnnotatingRange && clipAnnCanvas) {
+    if (e.key === 'z' && (e.ctrlKey || e.metaKey) && e.shiftKey) {
+      e.preventDefault();
+      clipAnnCanvas.redo();
+    } else if (e.key === 'z' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      clipAnnCanvas.undo();
+    }
+  }
+});
+
+// ── Clip Mode ──
+
+const CLIP_ANN_COLORS = ['#f38ba8', '#89b4fa', '#a6e3a1', '#f9e2af', '#cba6f7', '#fab387', '#89dceb'];
+let clipMode = false;
+let clipInSecs = null;
+let clipOutSecs = null;
+let clipKeyframes = [];
+let clipAnnotationLayers = [];
+let clipKeyframeMode = false;
+let clipAnnotatingRange = false;
+let clipAnnRangeStart = null;
+let clipAnnRangeEnd = null;
+let clipAnnCanvas = null;
+let clipAnnSettingRange = false; // true while user is clicking to set annotation sub-range
+let clipAbort = false;
+let clipCounter = 0;
+let clipSelectedLayerId = null;
+let clipLiveOverlayRaf = null;
+
+function enterClipMode() {
+  if (clipMode) return;
+  if (annotationMode) exitAnnotationMode();
+  if (!recPlayer || recPlayer.totalDuration === 0) return;
+
+  clipMode = true;
+  clipInSecs = null;
+  clipOutSecs = null;
+  clipKeyframes = [];
+  clipAnnotationLayers = [];
+  clipKeyframeMode = false;
+  clipAnnotatingRange = false;
+  clipAbort = false;
+  clipSelectedLayerId = null;
+
+  if (recPlayer.playing) recPlayer.pause();
+  document.getElementById('clip-toolbar').classList.remove('hidden');
+  document.getElementById('clip-ann-prompt').classList.add('hidden');
+  document.getElementById('clip-progress').classList.add('hidden');
+  document.getElementById('clip-preview-strip').classList.add('hidden');
+  document.getElementById('clip-status').textContent = '';
+  document.getElementById('clip-in-label').textContent = 'In: --';
+  document.getElementById('clip-out-label').textContent = 'Out: --';
+  document.getElementById('clip-duration-label').textContent = '';
+  document.getElementById('clip-frame-count').textContent = '';
+  document.getElementById('clip-keyframe-btn').classList.remove('active');
+  renderClipMarkers();
+  startClipLiveOverlay();
+}
+
+function exitClipMode() {
+  if (!clipMode) return;
+  clipMode = false;
+  clipAnnotatingRange = false;
+  clipKeyframeMode = false;
+  clipAnnSettingRange = false;
+  if (clipAnnCanvas) {
+    clipAnnCanvas.deactivate();
+    clipAnnCanvas = null;
+  }
+  document.getElementById('clip-toolbar').classList.add('hidden');
+  document.getElementById('clip-preview-strip').classList.add('hidden');
+  document.getElementById('annotation-toolbar').classList.add('hidden');
+  document.getElementById('clip-ann-prompt').classList.add('hidden');
+  clearClipMarkers();
+  stopClipLiveOverlay();
+}
+
+// ── Timeline click interception for clip mode ──
+
+// We intercept clicks on the timeline element itself.
+// The RecordingPlayer constructor already has a click listener for seeking.
+// We add a capturing listener that runs first and can prevent the seek.
+document.getElementById('recording-timeline').addEventListener('click', (e) => {
+  if (!clipMode) return;
+
+  const timeline = document.getElementById('recording-timeline');
+  const rect = timeline.getBoundingClientRect();
+  const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  const secs = pct * recPlayer.totalDuration;
+
+  // Check if click is on an annotation range bar
+  const annBar = e.target.closest('.timeline-ann-range');
+  if (annBar) {
+    const layerId = parseInt(annBar.dataset.layerId);
+    if (clipAnnotatingRange || clipAnnSettingRange) return; // ignore while annotating
+    editClipAnnotationLayer(layerId);
+    e.stopImmediatePropagation();
+    return;
+  }
+
+  // Check if click is on a keyframe mark
+  const kfMark = e.target.closest('.timeline-keyframe-mark');
+  if (kfMark && clipKeyframeMode) {
+    const kfTime = parseFloat(kfMark.dataset.time);
+    clipKeyframes = clipKeyframes.filter(t => Math.abs(t - kfTime) > 0.05);
+    renderClipMarkers();
+    updateClipFrameCount();
+    e.stopImmediatePropagation();
+    return;
+  }
+
+  // Setting annotation sub-range
+  if (clipAnnSettingRange) {
+    if (clipAnnRangeStart === null) {
+      clipAnnRangeStart = secs;
+      document.getElementById('clip-ann-prompt').textContent = 'Click timeline for annotation end';
+      renderClipMarkers();
+    } else {
+      clipAnnRangeEnd = secs;
+      if (clipAnnRangeEnd < clipAnnRangeStart) {
+        [clipAnnRangeStart, clipAnnRangeEnd] = [clipAnnRangeEnd, clipAnnRangeStart];
+      }
+      // Clamp to clip range
+      if (clipInSecs !== null) clipAnnRangeStart = Math.max(clipAnnRangeStart, clipInSecs);
+      if (clipOutSecs !== null) clipAnnRangeEnd = Math.min(clipAnnRangeEnd, clipOutSecs);
+      clipAnnSettingRange = false;
+      document.getElementById('clip-ann-prompt').classList.add('hidden');
+      beginClipAnnotationDraw();
+    }
+    e.stopImmediatePropagation();
+    return;
+  }
+
+  // Keyframe mode
+  if (clipKeyframeMode) {
+    if (clipInSecs !== null && clipOutSecs !== null && secs >= clipInSecs && secs <= clipOutSecs) {
+      // Check if near existing keyframe — remove it
+      const existing = clipKeyframes.findIndex(t => Math.abs(t - secs) < 0.05);
+      if (existing >= 0) {
+        clipKeyframes.splice(existing, 1);
+      } else {
+        clipKeyframes.push(secs);
+      }
+      renderClipMarkers();
+      updateClipFrameCount();
+    }
+    e.stopImmediatePropagation();
+    return;
+  }
+
+  // Setting in/out
+  if (clipInSecs === null) {
+    clipInSecs = secs;
+    document.getElementById('clip-in-label').textContent = 'In: ' + fmtTime(secs);
+    renderClipMarkers();
+    // Also seek to show the frame
+    recPlayer.seekToGlobal(secs);
+  } else if (clipOutSecs === null) {
+    clipOutSecs = secs;
+    if (clipOutSecs < clipInSecs) {
+      [clipInSecs, clipOutSecs] = [clipOutSecs, clipInSecs];
+      document.getElementById('clip-in-label').textContent = 'In: ' + fmtTime(clipInSecs);
+    }
+    document.getElementById('clip-out-label').textContent = 'Out: ' + fmtTime(clipOutSecs);
+    const dur = clipOutSecs - clipInSecs;
+    document.getElementById('clip-duration-label').textContent = `(${fmtTime(dur)})`;
+    renderClipMarkers();
+    updateClipFrameCount();
+  } else {
+    // Both set: move whichever is nearer
+    const distIn = Math.abs(secs - clipInSecs);
+    const distOut = Math.abs(secs - clipOutSecs);
+    if (distIn <= distOut) {
+      clipInSecs = secs;
+      if (clipInSecs > clipOutSecs) [clipInSecs, clipOutSecs] = [clipOutSecs, clipInSecs];
+    } else {
+      clipOutSecs = secs;
+      if (clipOutSecs < clipInSecs) [clipInSecs, clipOutSecs] = [clipOutSecs, clipInSecs];
+    }
+    document.getElementById('clip-in-label').textContent = 'In: ' + fmtTime(clipInSecs);
+    document.getElementById('clip-out-label').textContent = 'Out: ' + fmtTime(clipOutSecs);
+    const dur = clipOutSecs - clipInSecs;
+    document.getElementById('clip-duration-label').textContent = `(${fmtTime(dur)})`;
+    renderClipMarkers();
+    updateClipFrameCount();
+    recPlayer.seekToGlobal(secs);
+  }
+  e.stopImmediatePropagation();
+}, true); // capturing phase — runs before RecordingPlayer's click listener
+
+// ── Clip marker dragging ──
+{
+  let draggingMarker = null; // 'in' or 'out'
+  const timeline = document.getElementById('recording-timeline');
+
+  timeline.addEventListener('pointerdown', (e) => {
+    if (!clipMode) return;
+    const marker = e.target.closest('.timeline-clip-marker');
+    if (!marker) return;
+    draggingMarker = marker.dataset.label === 'I' ? 'in' : 'out';
+    e.preventDefault();
+    timeline.setPointerCapture(e.pointerId);
+  });
+
+  timeline.addEventListener('pointermove', (e) => {
+    if (!draggingMarker) return;
+    const rect = timeline.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const secs = pct * recPlayer.totalDuration;
+    if (draggingMarker === 'in') {
+      clipInSecs = Math.min(secs, clipOutSecs !== null ? clipOutSecs - 0.1 : recPlayer.totalDuration);
+      document.getElementById('clip-in-label').textContent = 'In: ' + fmtTime(clipInSecs);
+    } else {
+      clipOutSecs = Math.max(secs, clipInSecs !== null ? clipInSecs + 0.1 : 0);
+      document.getElementById('clip-out-label').textContent = 'Out: ' + fmtTime(clipOutSecs);
+    }
+    if (clipInSecs !== null && clipOutSecs !== null) {
+      document.getElementById('clip-duration-label').textContent = `(${fmtTime(clipOutSecs - clipInSecs)})`;
+    }
+    renderClipMarkers();
+    updateClipFrameCount();
+  });
+
+  timeline.addEventListener('pointerup', () => {
+    if (draggingMarker) {
+      draggingMarker = null;
+      recPlayer.seekToGlobal(draggingMarker === 'in' ? clipInSecs : clipOutSecs);
+    }
+  });
+}
+
+// ── Render clip markers on timeline ──
+
+function renderClipMarkers() {
+  const timeline = document.getElementById('recording-timeline');
+  // Remove old clip markers
+  timeline.querySelectorAll('.timeline-clip-region, .timeline-clip-marker, .timeline-keyframe-mark, .timeline-ann-range').forEach(el => el.remove());
+
+  if (!recPlayer || recPlayer.totalDuration === 0) return;
+  const total = recPlayer.totalDuration;
+
+  // In marker
+  if (clipInSecs !== null) {
+    const marker = document.createElement('div');
+    marker.className = 'timeline-clip-marker';
+    marker.dataset.label = 'I';
+    marker.style.left = (clipInSecs / total * 100) + '%';
+    timeline.appendChild(marker);
+  }
+
+  // Out marker
+  if (clipOutSecs !== null) {
+    const marker = document.createElement('div');
+    marker.className = 'timeline-clip-marker';
+    marker.dataset.label = 'O';
+    marker.style.left = (clipOutSecs / total * 100) + '%';
+    timeline.appendChild(marker);
+  }
+
+  // Highlight region
+  if (clipInSecs !== null && clipOutSecs !== null) {
+    const region = document.createElement('div');
+    region.className = 'timeline-clip-region';
+    region.style.left = (clipInSecs / total * 100) + '%';
+    region.style.width = ((clipOutSecs - clipInSecs) / total * 100) + '%';
+    timeline.appendChild(region);
+  }
+
+  // Keyframe diamonds
+  for (const kf of clipKeyframes) {
+    const mark = document.createElement('div');
+    mark.className = 'timeline-keyframe-mark';
+    mark.style.left = (kf / total * 100) + '%';
+    mark.dataset.time = kf;
+    timeline.appendChild(mark);
+  }
+
+  // Annotation range bars
+  for (const layer of clipAnnotationLayers) {
+    const bar = document.createElement('div');
+    bar.className = 'timeline-ann-range';
+    if (clipSelectedLayerId === layer.id) bar.classList.add('selected');
+    bar.style.left = (layer.startSecs / total * 100) + '%';
+    bar.style.width = ((layer.endSecs - layer.startSecs) / total * 100) + '%';
+    bar.style.background = layer.color;
+    bar.dataset.layerId = layer.id;
+    bar.title = `Annotation layer (${fmtTime(layer.startSecs)}-${fmtTime(layer.endSecs)}, ${layer.shapes.length} shapes)`;
+    timeline.appendChild(bar);
+  }
+
+  // Annotation range being set (preview)
+  if (clipAnnSettingRange && clipAnnRangeStart !== null) {
+    const mark = document.createElement('div');
+    mark.className = 'timeline-clip-marker';
+    mark.dataset.label = 'A';
+    mark.style.left = (clipAnnRangeStart / total * 100) + '%';
+    mark.style.background = 'var(--peach)';
+    timeline.appendChild(mark);
+  }
+}
+
+function clearClipMarkers() {
+  const timeline = document.getElementById('recording-timeline');
+  timeline.querySelectorAll('.timeline-clip-region, .timeline-clip-marker, .timeline-keyframe-mark, .timeline-ann-range').forEach(el => el.remove());
+}
+
+function updateClipFrameCount() {
+  if (clipInSecs === null || clipOutSecs === null) {
+    document.getElementById('clip-frame-count').textContent = '';
+    return;
+  }
+  const timestamps = computeClipTimestamps(clipInSecs, clipOutSecs,
+    parseInt(document.getElementById('clip-fps').value), clipKeyframes);
+  document.getElementById('clip-frame-count').textContent = `~${timestamps.length} frames`;
+}
+
+function computeClipTimestamps(inSecs, outSecs, fps, keyframes) {
+  const timestamps = [];
+  const interval = 1.0 / fps;
+  for (let t = inSecs; t <= outSecs + 0.001; t += interval) {
+    timestamps.push({ t: Math.min(t, outSecs), isKeyframe: false, annotated: false });
+  }
+  // Ensure the last frame (outSecs) is included
+  if (timestamps.length === 0 || Math.abs(timestamps[timestamps.length - 1].t - outSecs) > 0.05) {
+    timestamps.push({ t: outSecs, isKeyframe: false, annotated: false });
+  }
+  // Add manual keyframes
+  for (const kf of keyframes) {
+    if (kf >= inSecs && kf <= outSecs) {
+      if (!timestamps.some(ts => Math.abs(ts.t - kf) < 0.05)) {
+        timestamps.push({ t: kf, isKeyframe: true, annotated: false });
+      }
+    }
+  }
+  timestamps.sort((a, b) => a.t - b.t);
+  // Mark which timestamps have annotation layers
+  for (const ts of timestamps) {
+    ts.annotated = clipAnnotationLayers.some(l => ts.t >= l.startSecs && ts.t <= l.endSecs);
+  }
+  return timestamps;
+}
+
+// ── Annotation Layers on Clips ──
+
+let clipAnnLayerIdCounter = 0;
+
+function startClipAnnotateRange() {
+  if (clipAnnotatingRange || clipAnnSettingRange) return;
+  if (clipInSecs === null || clipOutSecs === null) return;
+  clipAnnSettingRange = true;
+  clipAnnRangeStart = null;
+  clipAnnRangeEnd = null;
+  const prompt = document.getElementById('clip-ann-prompt');
+  prompt.textContent = 'Click timeline for annotation start';
+  prompt.classList.remove('hidden');
+}
+
+function cancelClipAnnotateRange() {
+  clipAnnSettingRange = false;
+  clipAnnotatingRange = false;
+  clipAnnRangeStart = null;
+  clipAnnRangeEnd = null;
+  if (clipAnnCanvas) {
+    clipAnnCanvas.deactivate();
+    clipAnnCanvas = null;
+  }
+  document.getElementById('clip-ann-prompt').classList.add('hidden');
+  document.getElementById('annotation-toolbar').classList.add('hidden');
+  renderClipMarkers();
+}
+
+function beginClipAnnotationDraw() {
+  clipAnnotatingRange = true;
+  // Seek video to start of annotation range
+  recPlayer.seekToGlobal(clipAnnRangeStart);
+
+  const video = document.getElementById('recording-video');
+  const overlay = document.getElementById('recording-overlay');
+  if (!video.videoWidth) { cancelClipAnnotateRange(); return; }
+
+  clipAnnCanvas = new AnnotationCanvas(overlay, video);
+  clipAnnCanvas.activate();
+
+  // Show annotation toolbar (reuse existing one, but swap save/send buttons)
+  document.getElementById('annotation-toolbar').classList.remove('hidden');
+  // Replace Save/Send with Done/Cancel for clip annotation
+  document.getElementById('ann-save-btn').style.display = 'none';
+  document.getElementById('ann-submit-btn').textContent = 'Done';
+  document.getElementById('ann-submit-btn').title = 'Save annotation layer';
+
+  const prompt = document.getElementById('clip-ann-prompt');
+  prompt.textContent = `Annotating ${fmtTime(clipAnnRangeStart)}-${fmtTime(clipAnnRangeEnd)} — Draw, then click Done`;
+  prompt.classList.remove('hidden');
+
+  renderClipMarkers();
+}
+
+function finishClipAnnotationLayer() {
+  if (!clipAnnCanvas || !clipAnnotatingRange) return;
+  const shapes = [...clipAnnCanvas.shapes]; // copy
+  if (shapes.length === 0) {
+    cancelClipAnnotateRange();
+    return;
+  }
+
+  clipAnnLayerIdCounter++;
+  const colorIdx = (clipAnnotationLayers.length) % CLIP_ANN_COLORS.length;
+  clipAnnotationLayers.push({
+    id: clipAnnLayerIdCounter,
+    startSecs: clipAnnRangeStart,
+    endSecs: clipAnnRangeEnd,
+    shapes: shapes,
+    color: CLIP_ANN_COLORS[colorIdx],
+  });
+
+  clipAnnCanvas.deactivate();
+  clipAnnCanvas = null;
+  clipAnnotatingRange = false;
+  clipAnnRangeStart = null;
+  clipAnnRangeEnd = null;
+  document.getElementById('clip-ann-prompt').classList.add('hidden');
+  document.getElementById('annotation-toolbar').classList.add('hidden');
+  // Restore annotation toolbar buttons
+  document.getElementById('ann-save-btn').style.display = '';
+  document.getElementById('ann-submit-btn').textContent = 'Send';
+  document.getElementById('ann-submit-btn').title = 'Save and send to agent';
+
+  renderClipMarkers();
+  updateClipFrameCount();
+}
+
+function editClipAnnotationLayer(layerId) {
+  const layer = clipAnnotationLayers.find(l => l.id === layerId);
+  if (!layer) return;
+
+  clipSelectedLayerId = layerId;
+  clipAnnRangeStart = layer.startSecs;
+  clipAnnRangeEnd = layer.endSecs;
+  clipAnnotatingRange = true;
+
+  recPlayer.seekToGlobal(layer.startSecs);
+
+  const video = document.getElementById('recording-video');
+  const overlay = document.getElementById('recording-overlay');
+  if (!video.videoWidth) { cancelClipAnnotateRange(); return; }
+
+  clipAnnCanvas = new AnnotationCanvas(overlay, video);
+  clipAnnCanvas.activate();
+  // Restore shapes
+  clipAnnCanvas.shapes = [...layer.shapes];
+  clipAnnCanvas.render();
+
+  document.getElementById('annotation-toolbar').classList.remove('hidden');
+  document.getElementById('ann-save-btn').style.display = 'none';
+  document.getElementById('ann-submit-btn').textContent = 'Done';
+  document.getElementById('ann-submit-btn').title = 'Save annotation layer';
+
+  const prompt = document.getElementById('clip-ann-prompt');
+  prompt.textContent = `Editing layer ${fmtTime(layer.startSecs)}-${fmtTime(layer.endSecs)} — Draw, then click Done`;
+  prompt.classList.remove('hidden');
+
+  renderClipMarkers();
+}
+
+function deleteClipAnnotationLayer(layerId) {
+  clipAnnotationLayers = clipAnnotationLayers.filter(l => l.id !== layerId);
+  if (clipSelectedLayerId === layerId) clipSelectedLayerId = null;
+  renderClipMarkers();
+  updateClipFrameCount();
+}
+
+// ── Live annotation overlay during clip playback ──
+
+function startClipLiveOverlay() {
+  stopClipLiveOverlay();
+  const overlay = document.getElementById('recording-overlay');
+  const video = document.getElementById('recording-video');
+  if (!overlay || !video) return;
+
+  const ctx = overlay.getContext('2d');
+  const tick = () => {
+    if (!clipMode) { stopClipLiveOverlay(); return; }
+    // Only draw overlay when not in annotation draw mode
+    if (!clipAnnotatingRange && recPlayer && clipAnnotationLayers.length > 0) {
+      const currentTime = recPlayer.globalTime();
+      // Size overlay to match video
+      if (video.videoWidth && (overlay.width !== video.videoWidth || overlay.height !== video.videoHeight)) {
+        overlay.width = video.videoWidth;
+        overlay.height = video.videoHeight;
+      }
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+      for (const layer of clipAnnotationLayers) {
+        if (currentTime >= layer.startSecs && currentTime <= layer.endSecs) {
+          drawShapes(ctx, layer.shapes);
+        }
+      }
+    } else if (!clipAnnotatingRange) {
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+    }
+    clipLiveOverlayRaf = requestAnimationFrame(tick);
+  };
+  clipLiveOverlayRaf = requestAnimationFrame(tick);
+}
+
+function stopClipLiveOverlay() {
+  if (clipLiveOverlayRaf) {
+    cancelAnimationFrame(clipLiveOverlayRaf);
+    clipLiveOverlayRaf = null;
+  }
+  const overlay = document.getElementById('recording-overlay');
+  if (overlay) {
+    const ctx = overlay.getContext('2d');
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+  }
+}
+
+// ── Frame Extraction ──
+
+async function* extractClipFrames(player, inSecs, outSecs, fps, keyframes, annotationLayers, quality) {
+  quality = quality || 0.92;
+  const video = player.video;
+  const wasPlaying = player.playing;
+  if (wasPlaying) player.pause();
+
+  const timestamps = computeClipTimestamps(inSecs, outSecs, fps, keyframes);
+  const captureCanvas = document.createElement('canvas');
+  captureCanvas.width = video.videoWidth || 1280;
+  captureCanvas.height = video.videoHeight || 720;
+  const ctx = captureCanvas.getContext('2d');
+
+  for (let i = 0; i < timestamps.length; i++) {
+    if (clipAbort) break;
+    const { t, isKeyframe, annotated } = timestamps[i];
+
+    await player.seekToGlobalAsync(t);
+    // Small delay for frame to render
+    await new Promise(r => setTimeout(r, 50));
+
+    ctx.clearRect(0, 0, captureCanvas.width, captureCanvas.height);
+    ctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+
+    // Composite matching annotation layers
+    let hasAnnotation = false;
+    for (const layer of annotationLayers) {
+      if (t >= layer.startSecs && t <= layer.endSecs && layer.shapes.length > 0) {
+        drawShapes(ctx, layer.shapes);
+        hasAnnotation = true;
+      }
+    }
+
+    const blob = await new Promise(r => captureCanvas.toBlob(r, 'image/jpeg', quality));
+    const b64 = await new Promise(r => {
+      const reader = new FileReader();
+      reader.onload = () => r(reader.result.split(',')[1]);
+      reader.readAsDataURL(blob);
+    });
+
+    yield { index: i, total: timestamps.length, t, isKeyframe, annotated: hasAnnotation, b64, blob };
+  }
+}
+
+async function generateClipPreview() {
+  if (clipInSecs === null || clipOutSecs === null || !recPlayer) return;
+  const strip = document.getElementById('clip-preview-strip');
+  strip.innerHTML = '';
+  strip.classList.remove('hidden');
+
+  const fps = parseInt(document.getElementById('clip-fps').value);
+  const gen = extractClipFrames(recPlayer, clipInSecs, clipOutSecs, fps,
+    clipKeyframes, clipAnnotationLayers, 0.6);
+
+  for await (const frame of gen) {
+    if (clipAbort) break;
+    const thumb = document.createElement('div');
+    thumb.className = 'clip-preview-thumb';
+    if (frame.isKeyframe) thumb.classList.add('keyframe');
+    if (frame.annotated) thumb.classList.add('annotated');
+    const img = document.createElement('img');
+    img.src = URL.createObjectURL(frame.blob);
+    thumb.appendChild(img);
+    const time = document.createElement('div');
+    time.className = 'thumb-time';
+    time.textContent = fmtTime(frame.t);
+    thumb.appendChild(time);
+    thumb.addEventListener('click', () => recPlayer.seekToGlobal(frame.t));
+    strip.appendChild(thumb);
+  }
+}
+
+async function submitClip(inject) {
+  if (clipInSecs === null || clipOutSecs === null || !recPlayer) return;
+  const fps = parseInt(document.getElementById('clip-fps').value);
+  const timestamps = computeClipTimestamps(clipInSecs, clipOutSecs, fps, clipKeyframes);
+
+  if (timestamps.length > 200) {
+    if (!confirm(`This clip has ${timestamps.length} frames. Max recommended is 200. Continue?`)) return;
+  }
+
+  clipAbort = false;
+  const progress = document.getElementById('clip-progress');
+  const progressFill = document.getElementById('clip-progress-fill');
+  const progressText = document.getElementById('clip-progress-text');
+  const status = document.getElementById('clip-status');
+  progress.classList.remove('hidden');
+  status.textContent = '';
+
+  clipCounter++;
+  const clipId = `clip-${activeRecordingStream || 'rec'}-${clipCounter}`;
+  const note = document.getElementById('clip-note').value.trim();
+
+  // Send clip_start
+  if (app) {
+    app.send_server_action({
+      t: 'clip_start',
+      clip_id: clipId,
+      stream: activeRecordingStream || 'recording',
+      in_secs: clipInSecs,
+      out_secs: clipOutSecs,
+      fps: fps,
+      total_frames: timestamps.length,
+      note: note,
+      inject: !!inject,
+      annotation_layer_count: clipAnnotationLayers.length,
+    });
+  }
+
+  // Extract and send frames
+  const gen = extractClipFrames(recPlayer, clipInSecs, clipOutSecs, fps,
+    clipKeyframes, clipAnnotationLayers, 0.92);
+  let frameIndex = 0;
+
+  for await (const frame of gen) {
+    if (clipAbort) break;
+    const pct = ((frame.index + 1) / frame.total * 100);
+    progressFill.style.width = pct + '%';
+    progressText.textContent = `Extracting ${frame.index + 1}/${frame.total}...`;
+
+    const frameId = `${clipId}-f${String(frame.index).padStart(3, '0')}`;
+    if (app) {
+      app.send_server_action({
+        t: 'clip_frame',
+        clip_id: clipId,
+        frame_id: frameId,
+        frame_index: frame.index,
+        timestamp_secs: frame.t,
+        is_keyframe: frame.isKeyframe,
+        annotated: frame.annotated,
+        data: frame.b64,
+      });
+    }
+    frameIndex++;
+
+    // Yield to UI between frames
+    await new Promise(r => setTimeout(r, 10));
+  }
+
+  if (clipAbort) {
+    progress.classList.add('hidden');
+    status.textContent = 'Cancelled';
+    status.style.color = 'var(--red)';
+    setTimeout(() => { status.textContent = ''; status.style.color = ''; }, 3000);
+    return;
+  }
+
+  // Send clip_end
+  progressText.textContent = 'Finalizing...';
+  if (app) {
+    app.send_server_action({
+      t: 'clip_end',
+      clip_id: clipId,
+      frames_sent: frameIndex,
+    });
+  }
+
+  progress.classList.add('hidden');
+  document.getElementById('clip-note').value = '';
+  const verb = inject ? 'Sent' : 'Saved';
+  status.textContent = `${verb} (${frameIndex} frames)`;
+  status.style.color = 'var(--green)';
+  setTimeout(() => { status.textContent = ''; status.style.color = ''; }, 5000);
+}
+
+document.getElementById('clip-preview-btn').addEventListener('click', generateClipPreview);
+document.getElementById('clip-save-btn').addEventListener('click', () => submitClip(false));
+document.getElementById('clip-send-btn').addEventListener('click', () => submitClip(true));
+
+// ��─ Clip toolbar event wiring ──
+
+document.getElementById('rec-clip-btn').addEventListener('click', enterClipMode);
+document.getElementById('clip-close').addEventListener('click', exitClipMode);
+document.getElementById('clip-keyframe-btn').addEventListener('click', () => {
+  clipKeyframeMode = !clipKeyframeMode;
+  document.getElementById('clip-keyframe-btn').classList.toggle('active', clipKeyframeMode);
+});
+document.getElementById('clip-ann-range-btn').addEventListener('click', startClipAnnotateRange);
+document.getElementById('clip-clear-range').addEventListener('click', (e) => {
+  e.preventDefault();
+  clipInSecs = null;
+  clipOutSecs = null;
+  clipKeyframes = [];
+  clipAnnotationLayers = [];
+  clipSelectedLayerId = null;
+  document.getElementById('clip-in-label').textContent = 'In: --';
+  document.getElementById('clip-out-label').textContent = 'Out: --';
+  document.getElementById('clip-duration-label').textContent = '';
+  document.getElementById('clip-frame-count').textContent = '';
+  renderClipMarkers();
+});
+document.getElementById('clip-fps').addEventListener('change', updateClipFrameCount);
+document.getElementById('clip-cancel-btn').addEventListener('click', () => { clipAbort = true; });
+document.getElementById('clip-note').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); submitClip(true); }
+  e.stopPropagation();
+});
+
+// Intercept annotation toolbar's "Done" button in clip mode
+document.getElementById('ann-submit-btn').addEventListener('click', () => {
+  if (clipAnnotatingRange) {
+    if (clipSelectedLayerId !== null) {
+      // Editing existing layer — update it
+      const layer = clipAnnotationLayers.find(l => l.id === clipSelectedLayerId);
+      if (layer && clipAnnCanvas) {
+        layer.shapes = [...clipAnnCanvas.shapes];
+      }
+      clipAnnCanvas.deactivate();
+      clipAnnCanvas = null;
+      clipAnnotatingRange = false;
+      clipSelectedLayerId = null;
+      document.getElementById('clip-ann-prompt').classList.add('hidden');
+      document.getElementById('annotation-toolbar').classList.add('hidden');
+      document.getElementById('ann-save-btn').style.display = '';
+      document.getElementById('ann-submit-btn').textContent = 'Send';
+      document.getElementById('ann-submit-btn').title = 'Save and send to agent';
+      renderClipMarkers();
+      updateClipFrameCount();
+    } else {
+      finishClipAnnotationLayer();
+    }
+  }
+});
+
+// Right-click on annotation range bar to delete
+document.getElementById('recording-timeline').addEventListener('contextmenu', (e) => {
+  const annBar = e.target.closest('.timeline-ann-range');
+  if (annBar && clipMode) {
+    e.preventDefault();
+    const layerId = parseInt(annBar.dataset.layerId);
+    deleteClipAnnotationLayer(layerId);
   }
 });
 

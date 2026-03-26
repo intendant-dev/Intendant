@@ -1079,6 +1079,19 @@ pub fn spawn_web_gateway(
                         // Whether this connection is the active voice owner
                         let mut is_active = false;
 
+                        // Per-connection clip accumulators for batched clip_frame messages
+                        struct ClipAccumulator {
+                            stream: String,
+                            note: String,
+                            inject: bool,
+                            in_secs: f64,
+                            out_secs: f64,
+                            fps: u32,
+                            expected: usize,
+                            frames: Vec<(String, String)>, // (frame_id, base64_data)
+                        }
+                        let mut clip_accumulators: std::collections::HashMap<String, ClipAccumulator> = std::collections::HashMap::new();
+
                         // Per-connection audio transcription buffer.
                         // PCM16 bytes are accumulated and drained every ~3s.
                         let mut audio_buf: Vec<u8> = Vec::new();
@@ -1625,6 +1638,117 @@ pub fn spawn_web_gateway(
                                                         turn: None,
                                                     });
                                                 }
+                                            }
+                                        }
+                                        Some("clip_start") => {
+                                            let clip_id = json["clip_id"].as_str().unwrap_or("").to_string();
+                                            let stream = json["stream"].as_str().unwrap_or("recording").to_string();
+                                            let note = json["note"].as_str().unwrap_or("").to_string();
+                                            let inject = json["inject"].as_bool().unwrap_or(false);
+                                            let in_secs = json["in_secs"].as_f64().unwrap_or(0.0);
+                                            let out_secs = json["out_secs"].as_f64().unwrap_or(0.0);
+                                            let fps = json["fps"].as_u64().unwrap_or(2) as u32;
+                                            let total = json["total_frames"].as_u64().unwrap_or(0) as usize;
+                                            clip_accumulators.insert(clip_id.clone(), ClipAccumulator {
+                                                stream, note, inject, in_secs, out_secs, fps,
+                                                expected: total,
+                                                frames: Vec::with_capacity(total),
+                                            });
+                                            bus_inbound.send(AppEvent::PresenceLog {
+                                                message: format!("[clip] started {} ({} frames, {}fps)", clip_id, total, fps),
+                                                level: Some(LogLevel::Debug),
+                                                turn: None,
+                                            });
+                                        }
+                                        Some("clip_frame") => {
+                                            let clip_id = json["clip_id"].as_str().unwrap_or("").to_string();
+                                            let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
+                                            let timestamp_secs = json["timestamp_secs"].as_f64().unwrap_or(0.0);
+                                            if let Some(data_b64) = json["data"].as_str() {
+                                                // Register frame in frame registry
+                                                use base64::Engine;
+                                                if let Ok(jpeg_bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                                                    if let Some(ref registry) = frame_registry_inbound {
+                                                        let meta = presence_core::FrameMeta {
+                                                            frame_id: frame_id.clone(),
+                                                            stream: format!("clip:{}", clip_id),
+                                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                                            sent_to_live: false,
+                                                            live_resolution: None,
+                                                            hq_resolution: None,
+                                                        };
+                                                        let mut reg = registry.write().await;
+                                                        if let Err(e) = reg.register(meta, &jpeg_bytes) {
+                                                            eprintln!("clip frame registry write failed: {}", e);
+                                                        }
+                                                    }
+                                                }
+                                                // Accumulate for context injection
+                                                if let Some(acc) = clip_accumulators.get_mut(&clip_id) {
+                                                    acc.frames.push((frame_id, data_b64.to_string()));
+                                                }
+                                            }
+                                        }
+                                        Some("clip_end") => {
+                                            let clip_id = json["clip_id"].as_str().unwrap_or("").to_string();
+                                            let frames_sent = json["frames_sent"].as_u64().unwrap_or(0) as usize;
+                                            let mut injected = false;
+
+                                            if let Some(acc) = clip_accumulators.remove(&clip_id) {
+                                                let frames_registered = acc.frames.len();
+                                                if acc.inject {
+                                                    if let Some(ref ctx) = query_ctx_inbound {
+                                                        if let Some(ref ciq) = ctx.context_injection {
+                                                            if let Ok(mut q) = ciq.lock() {
+                                                                let label = if acc.note.is_empty() {
+                                                                    format!(
+                                                                        "[Video Clip] {} {}-{} ({} frames, {}fps)",
+                                                                        acc.stream,
+                                                                        format!("{:.1}s", acc.in_secs),
+                                                                        format!("{:.1}s", acc.out_secs),
+                                                                        frames_registered, acc.fps,
+                                                                    )
+                                                                } else {
+                                                                    format!(
+                                                                        "[Video Clip] {} {}-{} ({} frames, {}fps). {}",
+                                                                        acc.stream,
+                                                                        format!("{:.1}s", acc.in_secs),
+                                                                        format!("{:.1}s", acc.out_secs),
+                                                                        frames_registered, acc.fps, acc.note,
+                                                                    )
+                                                                };
+                                                                let images: Vec<crate::conversation::ImageData> = acc.frames.iter().map(|(_, b64)| {
+                                                                    crate::conversation::ImageData {
+                                                                        media_type: "image/jpeg".to_string(),
+                                                                        data: b64.clone(),
+                                                                    }
+                                                                }).collect();
+                                                                q.push(crate::event::ContextInjection {
+                                                                    text: label,
+                                                                    images,
+                                                                });
+                                                                injected = true;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                let _ = direct_tx_inbound.send(serde_json::json!({
+                                                    "t": "clip_saved",
+                                                    "clip_id": clip_id,
+                                                    "frames_registered": frames_registered,
+                                                    "injected": injected,
+                                                }).to_string());
+
+                                                bus_inbound.send(AppEvent::PresenceLog {
+                                                    message: format!(
+                                                        "[clip] {} — {} frames{}",
+                                                        clip_id, frames_registered,
+                                                        if injected { " (sent to agent)" } else { " (saved)" }
+                                                    ),
+                                                    level: Some(LogLevel::Info),
+                                                    turn: None,
+                                                });
                                             }
                                         }
                                         Some("tool_request") => {
