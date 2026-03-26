@@ -2918,9 +2918,10 @@ class DisplaySlot {
       <div class="display-canvas" id="display-canvas-${displayId}">
         <div class="vnc-auth-overlay" id="ds-auth-${displayId}" style="display:none">
           <div class="vnc-auth-box">
-            <div class="vnc-auth-title">VNC Password Required</div>
-            <div class="vnc-auth-label">Display :${displayId} requires authentication</div>
-            <input type="password" class="vnc-auth-input" id="ds-auth-pw-${displayId}" placeholder="VNC password" autocomplete="off">
+            <div class="vnc-auth-title">VNC Authentication</div>
+            <div class="vnc-auth-label">Display :${displayId} requires credentials</div>
+            <input type="text" class="vnc-auth-input" id="ds-auth-user-${displayId}" placeholder="Username" autocomplete="username" style="display:none">
+            <input type="password" class="vnc-auth-input" id="ds-auth-pw-${displayId}" placeholder="Password" autocomplete="off">
             <div style="display:flex;gap:8px;justify-content:flex-end">
               <button class="vnc-auth-cancel" id="ds-auth-cancel-${displayId}">Cancel</button>
               <button class="vnc-auth-submit" id="ds-auth-ok-${displayId}">Connect</button>
@@ -2935,26 +2936,33 @@ class DisplaySlot {
     this.streamBtn = this.el.querySelector(`#ds-stream-${displayId}`);
     this.canvasEl = this.el.querySelector(`#display-canvas-${displayId}`);
     this.authOverlay = this.el.querySelector(`#ds-auth-${displayId}`);
-    this.authInput = this.el.querySelector(`#ds-auth-pw-${displayId}`);
+    this.authUserInput = this.el.querySelector(`#ds-auth-user-${displayId}`);
+    this.authPwInput = this.el.querySelector(`#ds-auth-pw-${displayId}`);
+    this._authNeedsUsername = false;
     this.takeBtn.addEventListener('click', () => this.takeControl());
     this.releaseBtn.addEventListener('click', () => this.releaseControl());
     this.streamBtn.addEventListener('click', () => this.toggleStreaming());
     this.el.querySelector(`#ds-auth-ok-${displayId}`).addEventListener('click', () => this._submitAuth());
     this.el.querySelector(`#ds-auth-cancel-${displayId}`).addEventListener('click', () => this._cancelAuth());
-    this.authInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') this._submitAuth(); });
+    this.authPwInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') this._submitAuth(); });
+    this.authUserInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') this.authPwInput.focus(); });
   }
-  _showAuth() {
+  _showAuth(types) {
+    this._authNeedsUsername = types && types.includes('username');
+    this.authUserInput.style.display = this._authNeedsUsername ? '' : 'none';
+    this.authUserInput.value = '';
+    this.authPwInput.value = '';
     this.authOverlay.style.display = 'flex';
-    this.authInput.value = '';
-    this.statusEl.textContent = 'Password required';
+    this.statusEl.textContent = 'Credentials required';
     this.statusEl.className = 'display-status';
-    setTimeout(() => this.authInput.focus(), 50);
+    setTimeout(() => (this._authNeedsUsername ? this.authUserInput : this.authPwInput).focus(), 50);
   }
   _submitAuth() {
-    const pw = this.authInput.value;
+    const creds = { password: this.authPwInput.value };
+    if (this._authNeedsUsername) creds.username = this.authUserInput.value;
     this.authOverlay.style.display = 'none';
-    if (pw && this.rfb) {
-      this.rfb.sendCredentials({ password: pw });
+    if (creds.password && this.rfb) {
+      this.rfb.sendCredentials(creds);
     }
   }
   _cancelAuth() {
@@ -2981,7 +2989,7 @@ class DisplaySlot {
         this.statusEl.className = 'display-status error';
         if (!e.detail.clean) setTimeout(() => { if (!this.connected) this._connectVNC(); }, 3000);
       });
-      this.rfb.addEventListener('credentialsrequired', () => this._showAuth());
+      this.rfb.addEventListener('credentialsrequired', (e) => this._showAuth(e.detail && e.detail.types));
       this.rfb.addEventListener('securityfailure', () => {
         this.statusEl.textContent = 'Security error'; this.statusEl.className = 'display-status error';
       });
