@@ -735,13 +735,19 @@ fn query_display_resolution(_display_id: u32) -> (u32, u32) {
         .output()
     {
         let text = String::from_utf8_lossy(&out.stdout);
-        // Parse "Resolution: 2560 x 1600 Retina" or similar
+        // Parse "Resolution: 2560 x 1600 Retina" or "Resolution: 1920 x 1080"
+        // When "Retina" is present, the values are device pixels — halve to get
+        // logical resolution (which is what CU tools and mouse coordinates use).
         for line in text.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("Resolution:") {
                 let parts: Vec<&str> = trimmed.split_whitespace().collect();
                 if parts.len() >= 4 {
-                    if let (Ok(w), Ok(h)) = (parts[1].parse(), parts[3].parse()) {
+                    if let (Ok(w), Ok(h)) = (parts[1].parse::<u32>(), parts[3].parse::<u32>()) {
+                        let is_retina = trimmed.to_lowercase().contains("retina");
+                        if is_retina {
+                            return (w / 2, h / 2);
+                        }
                         return (w, h);
                     }
                 }
