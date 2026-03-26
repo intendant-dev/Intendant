@@ -159,15 +159,17 @@ check_recording() {
     $all_ok
 }
 
-# WASM build deps (optional)
+# WASM build deps (required — build.rs auto-rebuilds WASM when source changes)
 check_wasm() {
     echo ""
-    echo "WASM build dependencies (optional):"
+    echo "WASM build dependencies:"
 
     if has_cmd wasm-pack; then
         ok "wasm-pack"
     else
         miss "wasm-pack" "cargo install wasm-pack"
+        info "installing wasm-pack..."
+        cargo install wasm-pack
     fi
 }
 
