@@ -47,12 +47,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         process.environment = env
 
-        // Set working directory to the project if .env exists nearby
-        let appDir = URL(fileURLWithPath: bundle.bundlePath).deletingLastPathComponent()
-        process.currentDirectoryURL = appDir
+        // Set working directory to the directory containing the .app bundle.
+        // For ~/projects/intendant/target/Intendant.app this gives ~/projects/intendant/target/
+        // Then walk up to find the project root (directory with .env or Cargo.toml)
+        var dir = URL(fileURLWithPath: bundle.bundlePath).deletingLastPathComponent()
+        for _ in 0..<5 {
+            if FileManager.default.fileExists(atPath: dir.appendingPathComponent("Cargo.toml").path) ||
+               FileManager.default.fileExists(atPath: dir.appendingPathComponent(".env").path) {
+                break
+            }
+            let parent = dir.deletingLastPathComponent()
+            if parent.path == dir.path { break }
+            dir = parent
+        }
+        process.currentDirectoryURL = dir
+        NSLog("Working directory: \(dir.path)")
 
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        // Log backend output for debugging
+        let logDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".intendant")
+        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        let logFile = logDir.appendingPathComponent("app-backend.log")
+        FileManager.default.createFile(atPath: logFile.path, contents: nil)
+        let logHandle = FileHandle(forWritingAtPath: logFile.path)
+        process.standardOutput = logHandle ?? FileHandle.nullDevice
+        process.standardError = logHandle ?? FileHandle.nullDevice
 
         do {
             try process.run()
