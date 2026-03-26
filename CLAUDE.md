@@ -90,6 +90,7 @@ cargo check               # Type-check only
 cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web
 cargo build --release -p intendant   # Re-embed WASM
 ```
+**Important**: `cargo build` alone does NOT rebuild WASM. Any change to `crates/presence-web/` or `crates/presence-core/` requires the wasm-pack step above, then re-embed. The `static/wasm-web/` files are pre-compiled artifacts.
 
 ### CLI usage (requires `.env` with API key)
 ```bash
