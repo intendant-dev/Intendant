@@ -3000,9 +3000,15 @@ class DisplaySlot {
           const scale = Math.round(w / this._displayReadyWidth);
           if (scale >= 2 && this.rfb.sendPointerEvent) {
             const origSend = this.rfb.sendPointerEvent.bind(this.rfb);
+            let logCount = 0;
             this.rfb.sendPointerEvent = function(x, y, mask) {
-              origSend(Math.round(x / scale), Math.round(y / scale), mask);
-            };
+              const nx = Math.round(x / scale), ny = Math.round(y / scale);
+              if (mask && logCount < 5) {
+                console.log(`[VNC pointer] fb=${w}x${h} ready=${this._displayReadyWidth} scale=${scale} raw=${x},${y} → ${nx},${ny}`);
+                logCount++;
+              }
+              origSend(nx, ny, mask);
+            }.bind(this);
           }
         }
       });
