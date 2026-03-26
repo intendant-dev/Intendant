@@ -2531,7 +2531,7 @@ function processCommands(cmds) {
       case 'hide_follow_up': hidePanel('followup-panel'); break;
       case 'hide_all_panels': hideAllPanels(); break;
       case 'update_usage': renderUsageTab(c); break;
-      case 'add_display': addDisplaySlot(c.display_id, c.vnc_port, c.width, c.height); break;
+      case 'add_display': console.log('[add_display cmd]', JSON.stringify(c)); addDisplaySlot(c.display_id, c.vnc_port, c.width, c.height); break;
       case 'add_recording': addRecordingStream(c.stream_name); break;
       case 'remove_recording': removeRecordingStream(c.stream_name); break;
       case 'recording_error': /* logged via add_log_entry */ break;
