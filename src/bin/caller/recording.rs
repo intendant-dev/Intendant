@@ -127,21 +127,20 @@ pub async fn start_display_recording(
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap_or_default())
         .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
-    // Build platform-specific input args
+    // Build platform-specific input args.
+    // macOS: screencapture (Apple system binary) feeds JPEG frames to ffmpeg
+    // via image2pipe. This avoids TCC issues (ffmpeg can't get Screen Recording
+    // permission as a third-party binary) and avfoundation timestamp bugs in VMs.
+    // Linux: x11grab captures directly.
     let mut input_args: Vec<String> = Vec::new();
-    if cfg!(target_os = "macos") {
-        // avfoundation: captures at native resolution, no -video_size needed.
-        // Requires Screen Recording TCC permission — grant via the .app bundle.
+    let use_screencapture_feeder = cfg!(target_os = "macos");
+    if use_screencapture_feeder {
         input_args.extend([
-            "-f".into(), "avfoundation".into(),
+            "-f".into(), "image2pipe".into(),
             "-framerate".into(), fps_arg.clone(),
-            "-capture_cursor".into(), "1".into(),
-            "-use_wallclock_as_timestamps".into(), "1".into(),
-            "-fflags".into(), "+genpts".into(),
-            "-i".into(), format!("{}:none", display_id),
+            "-i".into(), "pipe:0".into(),
         ]);
     } else {
-        // x11grab: -f x11grab -framerate N -video_size WxH -i :display_id
         let display_arg = format!(":{}", display_id);
         let size_arg = format!("{}x{}", width, height);
         input_args.extend([
@@ -170,8 +169,12 @@ pub async fn start_display_recording(
             "-segment_list_type", "csv",
             "-reset_timestamps", "1",
         ])
-        .arg(output_pattern.to_str().unwrap_or("seg_%05d.mp4"))
-        .stdin(std::process::Stdio::null())
+        .arg(output_pattern.to_str().unwrap_or("seg_%05d.ts"))
+        .stdin(if use_screencapture_feeder {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::null())
         .stderr({
             let log_path = segments_dir.join("ffmpeg.log");
@@ -179,11 +182,49 @@ pub async fn start_display_recording(
                 .map(std::process::Stdio::from)
                 .unwrap_or_else(|_| std::process::Stdio::null())
         })
-        .kill_on_drop(true); // Fallback — ensures no zombie ffmpeg processes
+        .kill_on_drop(true);
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn ffmpeg for display recording: {}", e))?;
+
+    if use_screencapture_feeder {
+        if let Some(stdin) = child.stdin.take() {
+            let frame_interval = std::time::Duration::from_millis(
+                1000 / config.framerate.max(1) as u64,
+            );
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let mut stdin = stdin;
+                let tmp = std::env::temp_dir().join("intendant_rec_frame.jpg");
+                loop {
+                    let start = tokio::time::Instant::now();
+                    let ok = tokio::process::Command::new("screencapture")
+                        .args(["-x", "-t", "jpg", &tmp.to_string_lossy()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .await
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    if ok {
+                        if let Ok(data) = tokio::fs::read(&tmp).await {
+                            if stdin.write_all(&data).await.is_err() {
+                                break;
+                            }
+                        }
+                    } else {
+                        // screencapture failed — likely no TCC permission, stop trying
+                        break;
+                    }
+                    let elapsed = start.elapsed();
+                    if elapsed < frame_interval {
+                        tokio::time::sleep(frame_interval - elapsed).await;
+                    }
+                }
+            });
+        }
+    }
 
     Ok(RecordingGuard {
         child,
