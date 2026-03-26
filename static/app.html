@@ -3566,6 +3566,10 @@ function switchRecordingStream(streamName) {
   handle.addEventListener('mousedown', (e) => {
     dragging = true;
     handle.classList.add('dragging');
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+    // Prevent VNC canvas from capturing mouse during drag
+    displays.style.pointerEvents = 'none';
     e.preventDefault();
   });
   document.addEventListener('mousemove', (e) => {
@@ -3581,7 +3585,13 @@ function switchRecordingStream(streamName) {
     recording.style.minHeight = '0';
   });
   document.addEventListener('mouseup', () => {
-    if (dragging) { dragging = false; handle.classList.remove('dragging'); }
+    if (dragging) {
+      dragging = false;
+      handle.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      displays.style.pointerEvents = '';
+    }
   });
 }
 
