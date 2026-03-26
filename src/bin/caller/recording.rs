@@ -97,8 +97,22 @@ pub async fn start_display_recording(
     config: &RecordingConfig,
     session_dir: &Path,
 ) -> Result<RecordingGuard, String> {
-    let stream_name = format!("display_{}", display_id);
-    let segments_dir = session_dir.join("recordings").join(&stream_name);
+    // Generate unique stream name: display_0, display_0_2, display_0_3, etc.
+    let base_name = format!("display_{}", display_id);
+    let recordings_dir = session_dir.join("recordings");
+    let stream_name = if recordings_dir.join(&base_name).exists() {
+        let mut n = 2u32;
+        loop {
+            let candidate = format!("{}_{}", base_name, n);
+            if !recordings_dir.join(&candidate).exists() {
+                break candidate;
+            }
+            n += 1;
+        }
+    } else {
+        base_name
+    };
+    let segments_dir = recordings_dir.join(&stream_name);
     std::fs::create_dir_all(&segments_dir)
         .map_err(|e| format!("Failed to create recordings dir: {}", e))?;
 

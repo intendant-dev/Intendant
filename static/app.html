@@ -3452,8 +3452,13 @@ function _streamGroup(name) {
 }
 
 function _streamLabel(name) {
-  // display_99 → :99, cam0 → cam0
-  if (name.startsWith('display_')) return ':' + name.slice(8);
+  // display_0 → :0, display_0_2 → :0 #2
+  if (name.startsWith('display_')) {
+    const rest = name.slice(8);
+    const m = rest.match(/^(\d+)_(\d+)$/);
+    if (m) return ':' + m[1] + ' #' + m[2];
+    return ':' + rest;
+  }
   return name;
 }
 
