@@ -3,6 +3,29 @@
 //! Replaces Linux-specific `/proc` filesystem access with POSIX-compatible
 //! implementations that work on both Linux and macOS.
 
+/// Ensure platform tool directories are in PATH.
+///
+/// On macOS, Homebrew installs to `/opt/homebrew/bin` (Apple Silicon) or
+/// `/usr/local/bin` (Intel), but these may not be in PATH when launched
+/// from SSH, launchd, or other non-login contexts. This ensures tools
+/// like ffmpeg, cliclick, and wasm-pack are discoverable.
+pub fn ensure_tool_paths() {
+    #[cfg(target_os = "macos")]
+    {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let mut additions = Vec::new();
+        for dir in &["/opt/homebrew/bin", "/usr/local/bin"] {
+            if !path.contains(dir) && std::path::Path::new(dir).is_dir() {
+                additions.push(*dir);
+            }
+        }
+        if !additions.is_empty() {
+            let new_path = format!("{}:{}", additions.join(":"), path);
+            std::env::set_var("PATH", &new_path);
+        }
+    }
+}
+
 /// Check whether a process with the given PID is currently running.
 ///
 /// Uses POSIX `kill(pid, 0)` which checks process existence without
