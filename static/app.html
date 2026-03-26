@@ -3032,7 +3032,7 @@ class DisplaySlot {
     const w = this.rfb._fbWidth || 0, h = this.rfb._fbHeight || 0;
     this.statusEl.textContent = w > 0 ? `Interactive ${w}x${h}` : 'Interactive';
     this.statusEl.className = 'display-status connected';
-    if (app) app.take_display(this.displayId);
+    if (app) app.take_display(BigInt(this.displayId));
   }
   releaseControl() {
     if (!this.rfb) return;
@@ -3041,7 +3041,7 @@ class DisplaySlot {
     this.noteInput.value = ''; this.noteInput.style.display = 'none';
     this.takeBtn.style.display = ''; this.releaseBtn.style.display = 'none';
     this.statusEl.textContent = this.connected ? 'Connected (view-only)' : 'Disconnected';
-    if (app) app.release_display(this.displayId, note);
+    if (app) app.release_display(BigInt(this.displayId), note);
   }
   toggleStreaming() {
     if (this.streaming) { this.stopStreaming(); } else { this.startStreaming(); }
