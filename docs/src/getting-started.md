@@ -18,16 +18,22 @@ cargo install --path .
 
 Both binaries are installed to `~/.cargo/bin/`. The `intendant` binary embeds default system prompts and web assets (HTML, WASM) at compile time, so it works immediately from any directory without needing the source tree.
 
-### Building the WASM crate
+### Prerequisites
 
-If you modify `crates/presence-web/`, rebuild the WASM module:
+- **Rust** toolchain (stable)
+- **wasm-pack** — `cargo install wasm-pack`
+- **macOS**: `./scripts/setup-macos.sh` installs all platform dependencies
+- **Linux**: `sudo apt install imagemagick xdotool xvfb x11vnc ffmpeg` (all optional)
+
+### WASM auto-rebuild
+
+The `build.rs` script automatically rebuilds WASM when `crates/presence-web/` or `crates/presence-core/` source files change. This requires `wasm-pack` to be installed. If not installed, `cargo build` prints a warning and skips the WASM rebuild.
+
+To rebuild manually:
 
 ```bash
-# From crates/presence-web/
-wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web
-
-# Then rebuild intendant to re-embed the WASM
-cargo build --release -p intendant
+cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web
+cargo build --release -p intendant   # Re-embed WASM
 ```
 
 ## Setup

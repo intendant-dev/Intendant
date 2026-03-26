@@ -27,6 +27,13 @@ A Rust runtime for autonomous AI agents with process lifecycle management. Inten
 
 Three execution modes: *direct* (single agent), *user* (orchestrator + sub-agents), *sub-agent* (scoped child task).
 
+## Dependencies
+
+- **Rust** toolchain (stable)
+- **wasm-pack** — `cargo install wasm-pack` (auto-rebuilds WASM when presence-web source changes)
+- **macOS**: `./scripts/setup-macos.sh` installs all dependencies (cliclick, ffmpeg, BlackHole, etc.)
+- **Linux**: ImageMagick (`import`), xdotool, Xvfb, x11vnc, ffmpeg (all optional, degrade gracefully)
+
 ## Quick Start
 
 ```bash
