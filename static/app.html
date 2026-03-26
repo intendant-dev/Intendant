@@ -3291,6 +3291,11 @@ class RecordingPlayer {
     if (newTotal !== this.totalDuration) {
       this.totalDuration = newTotal;
       this._renderSegmentMarks();
+      this._updateDisplay();
+      // Auto-load first segment if we went from 0 to having segments
+      if (oldLen === 0 && this.segments.length > 0) {
+        this._loadSegment(0, 0);
+      }
     }
   }
 
@@ -3472,8 +3477,11 @@ function addRecordingStream(streamName) {
 function removeRecordingStream(streamName) {
   const info = recordingStreams.get(streamName);
   if (info) info.active = false;
-  document.getElementById('rec-status').textContent = '';
-  // Don't remove from UI — user can still replay stopped recordings
+  document.getElementById('rec-status').textContent = 'Stopped';
+  // Refresh segments after recording stops — the final segment is now available
+  if (recPlayer && activeRecordingStream === streamName) {
+    setTimeout(() => recPlayer.refresh(), 500);
+  }
 }
 
 function switchRecordingStream(streamName) {
