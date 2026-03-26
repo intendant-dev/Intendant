@@ -732,7 +732,7 @@ async fn maybe_auto_launch_xvfb(
 /// (e.g. 1339x837 on a Retina display, not the 2x device pixel size).
 /// Falls back to system_profiler, then a default.
 #[cfg(target_os = "macos")]
-fn query_display_resolution(_display_id: u32) -> (u32, u32) {
+pub(crate) fn query_display_resolution(_display_id: u32) -> (u32, u32) {
     // Primary method: CoreGraphics (works in VMs where system_profiler is empty)
     if let Ok(out) = std::process::Command::new("swift")
         .args(["-e", "import CoreGraphics; let d = CGMainDisplayID(); print(\"\\(CGDisplayPixelsWide(d))x\\(CGDisplayPixelsHigh(d))\")"])
@@ -774,7 +774,7 @@ fn query_display_resolution(_display_id: u32) -> (u32, u32) {
 /// Query the resolution of an existing X11 display via xdpyinfo.
 /// Returns (width, height) or a default of (1280, 720) if detection fails.
 #[cfg(not(target_os = "macos"))]
-fn query_display_resolution(display_id: u32) -> (u32, u32) {
+pub(crate) fn query_display_resolution(display_id: u32) -> (u32, u32) {
     let output = std::process::Command::new("xdpyinfo")
         .arg("-display")
         .arg(format!(":{}", display_id))

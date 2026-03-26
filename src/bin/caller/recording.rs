@@ -112,11 +112,11 @@ pub async fn start_display_recording(
     if cfg!(target_os = "macos") {
         // avfoundation: -f avfoundation -framerate N -capture_cursor 1 -i "<screen_index>:none"
         // Screen index 0 = main display. "none" = no audio.
+        // No -video_size: avfoundation captures at native resolution.
         input_args.extend([
             "-f".into(), "avfoundation".into(),
             "-framerate".into(), fps_arg.clone(),
             "-capture_cursor".into(), "1".into(),
-            "-video_size".into(), format!("{}x{}", width, height),
             "-i".into(), format!("{}:none", display_id),
         ]);
     } else {
@@ -151,7 +151,13 @@ pub async fn start_display_recording(
         .arg(output_pattern.to_str().unwrap_or("seg_%05d.mp4"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr({
+            // Log ffmpeg errors to a file for debugging
+            let log_path = segments_dir.join("ffmpeg.log");
+            std::fs::File::create(&log_path)
+                .map(std::process::Stdio::from)
+                .unwrap_or_else(|_| std::process::Stdio::null())
+        })
         .kill_on_drop(true);
 
     let child = cmd
@@ -531,7 +537,8 @@ pub fn spawn_recording_listener(
                     // Parse display_id from stream name "display_N"
                     if let Some(id_str) = stream_name.strip_prefix("display_") {
                         if let Ok(id) = id_str.parse::<u32>() {
-                            let (w, h) = (1920, 1080); // fallback; real resolution comes from DisplayReady
+                            // Query actual display resolution
+                            let (w, h) = super::query_display_resolution(id);
                             match reg.start_display(id, w, h).await {
                                 Ok(name) => bus.send(AppEvent::RecordingStarted { stream_name: name }),
                                 Err(e) => bus.send(AppEvent::RecordingError { stream_name, message: e }),
