@@ -1597,6 +1597,83 @@ html, body {
   color: var(--yellow);
   font-weight: 600;
 }
+.timeline-ann-range-preview {
+  position: absolute;
+  bottom: 0;
+  height: 5px;
+  background: var(--peach);
+  opacity: 0.3;
+  border-radius: 2px;
+  z-index: 2;
+  pointer-events: none;
+  border-top: 1px dashed var(--peach);
+}
+.timeline-ann-range-active {
+  position: absolute;
+  bottom: 0;
+  height: 5px;
+  background: var(--peach);
+  border-radius: 2px;
+  z-index: 2;
+  pointer-events: none;
+  animation: pulse-ann 1.2s ease-in-out infinite;
+}
+@keyframes pulse-ann {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.85; }
+}
+.clip-ann-banner {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 14px;
+  padding: 6px 16px;
+  background: rgba(250, 179, 135, 0.9);
+  color: var(--crust);
+  border-radius: 6px;
+  z-index: 10;
+  pointer-events: none;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* ── MSE Loading Overlay ── */
+.mse-loading-overlay {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0, 0, 0, 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+.mse-loading-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: 60%;
+  max-width: 300px;
+}
+.mse-loading-inner .bar-track {
+  width: 100%;
+  height: 6px;
+  background: var(--surface0);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.mse-loading-inner .bar-fill {
+  height: 100%;
+  background: var(--blue);
+  border-radius: 3px;
+  width: 0;
+  transition: width 0.2s;
+}
+.mse-loading-inner span {
+  font-size: 12px;
+  color: var(--subtext0);
+}
 
 /* ── Usage empty state ── */
 .empty-state {
@@ -3533,6 +3610,46 @@ function toggleDisplayStrip() {
 
 // ── Recording Replay ──
 
+/** Parse MP4 box structure from an ArrayBuffer. Returns [{type, offset, size}]. */
+function parseMp4Boxes(buffer) {
+  const view = new DataView(buffer);
+  const boxes = [];
+  let offset = 0;
+  while (offset + 8 <= buffer.byteLength) {
+    let size = view.getUint32(offset);
+    const type = String.fromCharCode(
+      view.getUint8(offset + 4), view.getUint8(offset + 5),
+      view.getUint8(offset + 6), view.getUint8(offset + 7)
+    );
+    // Handle extended size (size == 1 → 64-bit size in next 8 bytes)
+    if (size === 1 && offset + 16 <= buffer.byteLength) {
+      const hi = view.getUint32(offset + 8);
+      const lo = view.getUint32(offset + 12);
+      size = hi * 0x100000000 + lo;
+    }
+    if (size < 8) break; // Invalid box
+    boxes.push({ type, offset, size });
+    offset += size;
+  }
+  return boxes;
+}
+
+/** Extract and concatenate specific MP4 boxes by type from an ArrayBuffer. */
+function extractMp4Boxes(buffer, types) {
+  const boxes = parseMp4Boxes(buffer);
+  const matched = boxes.filter(b => types.includes(b.type));
+  if (matched.length === 0) return new ArrayBuffer(0);
+  let totalSize = 0;
+  for (const b of matched) totalSize += b.size;
+  const result = new Uint8Array(totalSize);
+  let pos = 0;
+  for (const b of matched) {
+    result.set(new Uint8Array(buffer, b.offset, b.size), pos);
+    pos += b.size;
+  }
+  return result.buffer;
+}
+
 class RecordingPlayer {
   constructor(videoEl, timelineEl, cursorEl, progressEl, timeLabel, playBtn, baseUrl) {
     this.video = videoEl;
@@ -3548,6 +3665,10 @@ class RecordingPlayer {
     this.playing = false;
     this.rafId = null;
     this.streamName = null;
+    this.useMSE = false;
+    this._msObjectUrl = null;
+    this._mediaSource = null;
+    this._mseReady = false;
 
     this.video.addEventListener('ended', () => this._onSegmentEnd());
     this.video.addEventListener('timeupdate', () => this._updateDisplay());
@@ -3563,6 +3684,8 @@ class RecordingPlayer {
 
   async load(streamName) {
     this.streamName = streamName;
+    this.useMSE = false;
+    this._mseReady = false;
     try {
       const resp = await fetch(`${this.baseUrl}/${streamName}/segments`);
       this.segments = await resp.json();
@@ -3573,7 +3696,14 @@ class RecordingPlayer {
     this._renderSegmentMarks();
     this._updateDisplay();
     if (this.segments.length > 0) {
-      this._loadSegment(0, 0);
+      // Use MSE for fMP4 segments if supported
+      const isMp4 = this.segments[0].filename && this.segments[0].filename.endsWith('.mp4');
+      const mseOk = window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"');
+      if (isMp4 && mseOk) {
+        this._loadAllMSE();
+      } else {
+        this._loadSegment(0, 0);
+      }
     }
   }
 
@@ -3588,13 +3718,56 @@ class RecordingPlayer {
       ? this.segments[this.segments.length - 1].end_secs
       : 0;
     if (newTotal !== this.totalDuration) {
+      const prevTotal = this.totalDuration;
       this.totalDuration = newTotal;
       this._renderSegmentMarks();
       this._updateDisplay();
-      // Auto-load first segment if we went from 0 to having segments
-      if (oldLen === 0 && this.segments.length > 0) {
-        this._loadSegment(0, 0);
+      if (this.useMSE && this._mseReady && this._mediaSource) {
+        // Append new segments incrementally
+        this._appendNewMSESegments(oldLen);
+      } else if (oldLen === 0 && this.segments.length > 0) {
+        // Auto-load first segment if we went from 0 to having segments
+        const isMp4 = this.segments[0].filename && this.segments[0].filename.endsWith('.mp4');
+        const mseOk = window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"');
+        if (isMp4 && mseOk) {
+          this._loadAllMSE();
+        } else {
+          this._loadSegment(0, 0);
+        }
       }
+    }
+  }
+
+  async _appendNewMSESegments(fromIdx) {
+    if (!this._mediaSource || this._mediaSource.readyState !== 'open') return;
+    const sb = this._mediaSource.sourceBuffers[0];
+    if (!sb) return;
+
+    // Re-open the stream if it was ended
+    if (this._mediaSource.readyState === 'ended') {
+      // Cannot reopen ended MediaSource — skip incremental append
+      return;
+    }
+
+    const appendAndWait = (data) => new Promise((resolve, reject) => {
+      const onEnd = () => { sb.removeEventListener('updateend', onEnd); sb.removeEventListener('error', onErr); resolve(); };
+      const onErr = () => { sb.removeEventListener('updateend', onEnd); sb.removeEventListener('error', onErr); reject(new Error('SourceBuffer error')); };
+      sb.addEventListener('updateend', onEnd);
+      sb.addEventListener('error', onErr);
+      sb.appendBuffer(data);
+    });
+
+    for (let i = fromIdx; i < this.segments.length; i++) {
+      try {
+        const seg = this.segments[i];
+        const url = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
+        const resp = await fetch(url);
+        const buf = await resp.arrayBuffer();
+        const mediaData = extractMp4Boxes(buf, ['moof', 'mdat']);
+        if (mediaData.byteLength === 0) continue;
+        sb.timestampOffset = seg.start_secs;
+        await appendAndWait(mediaData);
+      } catch { break; }
     }
   }
 
@@ -3604,7 +3777,7 @@ class RecordingPlayer {
 
   play() {
     if (this.totalDuration === 0) return;
-    if (this.currentSegIdx < 0) this._loadSegment(0, 0);
+    if (!this.useMSE && this.currentSegIdx < 0) this._loadSegment(0, 0);
     this.video.play().catch(() => {});
     this.playing = true;
     this.playBtn.textContent = '\u23F8';
@@ -3620,6 +3793,11 @@ class RecordingPlayer {
 
   seekToGlobal(secs) {
     secs = Math.max(0, Math.min(secs, this.totalDuration));
+    if (this.useMSE) {
+      this.video.currentTime = secs;
+      this._updateDisplay();
+      return;
+    }
     const idx = this._findSegmentIndex(secs);
     if (idx < 0) return;
     const seg = this.segments[idx];
@@ -3637,6 +3815,18 @@ class RecordingPlayer {
   seekToGlobalAsync(secs) {
     return new Promise((resolve) => {
       secs = Math.max(0, Math.min(secs, this.totalDuration));
+
+      if (this.useMSE) {
+        const onSeeked = () => {
+          this.video.removeEventListener('seeked', onSeeked);
+          this._updateDisplay();
+          resolve();
+        };
+        this.video.addEventListener('seeked', onSeeked);
+        this.video.currentTime = secs;
+        return;
+      }
+
       const idx = this._findSegmentIndex(secs);
       if (idx < 0) { resolve(); return; }
       const seg = this.segments[idx];
@@ -3649,7 +3839,6 @@ class RecordingPlayer {
       };
 
       if (idx !== this.currentSegIdx) {
-        // Cross-segment: wait for loadeddata first, then seek, then seeked
         const onLoaded = () => {
           this.video.removeEventListener('loadeddata', onLoaded);
           this.video.addEventListener('seeked', onSeeked);
@@ -3674,6 +3863,7 @@ class RecordingPlayer {
   }
 
   globalTime() {
+    if (this.useMSE) return this.video.currentTime || 0;
     if (this.currentSegIdx < 0 || this.currentSegIdx >= this.segments.length) return 0;
     return this.segments[this.currentSegIdx].start_secs + this.video.currentTime;
   }
@@ -3700,6 +3890,7 @@ class RecordingPlayer {
   }
 
   _onSegmentEnd() {
+    if (this.useMSE) { this.pause(); return; }
     if (this.currentSegIdx + 1 < this.segments.length) {
       this._loadSegment(this.currentSegIdx + 1, 0);
       if (this.playing) this.video.play().catch(() => {});
@@ -3749,8 +3940,101 @@ class RecordingPlayer {
   destroy() {
     this._stopAnimLoop();
     this.video.pause();
+    if (this._msObjectUrl) {
+      URL.revokeObjectURL(this._msObjectUrl);
+      this._msObjectUrl = null;
+    }
+    this._mediaSource = null;
+    this.useMSE = false;
+    this._mseReady = false;
     this.video.removeAttribute('src');
     this.video.load();
+  }
+
+  /** Load all fMP4 segments into MSE for instant seeking. */
+  async _loadAllMSE() {
+    this.useMSE = true;
+    const ms = new MediaSource();
+    this._mediaSource = ms;
+    this._msObjectUrl = URL.createObjectURL(ms);
+    this.video.src = this._msObjectUrl;
+
+    // Show loading overlay
+    const wrap = this.video.parentElement;
+    const overlay = document.createElement('div');
+    overlay.className = 'mse-loading-overlay';
+    overlay.innerHTML = '<div class="mse-loading-inner"><div class="bar-track"><div class="bar-fill" id="_mse-bar"></div></div><span id="_mse-text">Loading segments...</span></div>';
+    wrap.appendChild(overlay);
+
+    await new Promise(r => ms.addEventListener('sourceopen', r, { once: true }));
+    const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+
+    // Fetch all segments with controlled concurrency
+    const total = this.segments.length;
+    const buffers = new Array(total);
+    let loaded = 0;
+    const barEl = overlay.querySelector('#_mse-bar');
+    const textEl = overlay.querySelector('#_mse-text');
+
+    const fetchSeg = async (i) => {
+      const seg = this.segments[i];
+      const url = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
+      const resp = await fetch(url);
+      buffers[i] = await resp.arrayBuffer();
+      loaded++;
+      const pct = (loaded / total * 100);
+      barEl.style.width = pct + '%';
+      textEl.textContent = `Loading ${loaded}/${total} segments...`;
+    };
+
+    // Parallel fetch with concurrency limit of 4
+    const pool = [];
+    for (let i = 0; i < total; i++) {
+      const p = fetchSeg(i);
+      pool.push(p);
+      if (pool.length >= 4) {
+        await Promise.race(pool);
+        // Remove resolved promises
+        for (let j = pool.length - 1; j >= 0; j--) {
+          const status = await Promise.race([pool[j].then(() => 'done'), Promise.resolve('pending')]);
+          if (status === 'done') pool.splice(j, 1);
+        }
+      }
+    }
+    await Promise.all(pool);
+
+    // Helper to append to SourceBuffer and wait for completion
+    const appendAndWait = (data) => new Promise((resolve, reject) => {
+      const onEnd = () => { sb.removeEventListener('updateend', onEnd); sb.removeEventListener('error', onErr); resolve(); };
+      const onErr = () => { sb.removeEventListener('updateend', onEnd); sb.removeEventListener('error', onErr); reject(new Error('SourceBuffer error')); };
+      sb.addEventListener('updateend', onEnd);
+      sb.addEventListener('error', onErr);
+      sb.appendBuffer(data);
+    });
+
+    // Append init segment from first file (ftyp + moov boxes)
+    const initData = extractMp4Boxes(buffers[0], ['ftyp', 'moov']);
+    if (initData.byteLength > 0) {
+      await appendAndWait(initData);
+    }
+
+    // Append media data from each segment with timestamp offset
+    textEl.textContent = 'Buffering...';
+    for (let i = 0; i < total; i++) {
+      const mediaData = extractMp4Boxes(buffers[i], ['moof', 'mdat']);
+      if (mediaData.byteLength === 0) continue;
+      sb.timestampOffset = this.segments[i].start_secs;
+      await appendAndWait(mediaData);
+      barEl.style.width = ((i + 1) / total * 100) + '%';
+    }
+
+    ms.endOfStream();
+    this._mseReady = true;
+
+    // Clean up overlay
+    overlay.remove();
+    // Free ArrayBuffers
+    buffers.length = 0;
   }
 }
 
@@ -4370,6 +4654,7 @@ let clipAnnRangeStart = null;
 let clipAnnRangeEnd = null;
 let clipAnnCanvas = null;
 let clipAnnSettingRange = false; // true while user is clicking to set annotation sub-range
+let clipAnnHoverTime = null; // mouse hover time during annotation range setting
 let clipAbort = false;
 let clipCounter = 0;
 let clipSelectedLayerId = null;
@@ -4419,6 +4704,11 @@ function exitClipMode() {
   document.getElementById('clip-preview-strip').classList.add('hidden');
   document.getElementById('annotation-toolbar').classList.add('hidden');
   document.getElementById('clip-ann-prompt').classList.add('hidden');
+  _removeClipAnnBanner();
+  // Restore annotation toolbar buttons in case clip mode was exited during annotation
+  document.getElementById('ann-save-btn').style.display = '';
+  document.getElementById('ann-submit-btn').textContent = 'Send';
+  document.getElementById('ann-submit-btn').title = 'Save and send to agent';
   clearClipMarkers();
   stopClipLiveOverlay();
 }
@@ -4461,7 +4751,7 @@ document.getElementById('recording-timeline').addEventListener('click', (e) => {
   if (clipAnnSettingRange) {
     if (clipAnnRangeStart === null) {
       clipAnnRangeStart = secs;
-      document.getElementById('clip-ann-prompt').textContent = 'Click timeline for annotation end';
+      _updateClipAnnBanner('Click timeline for annotation end');
       renderClipMarkers();
     } else {
       clipAnnRangeEnd = secs;
@@ -4577,12 +4867,30 @@ document.getElementById('recording-timeline').addEventListener('click', (e) => {
   });
 }
 
+// ── Annotation range preview on mousemove ──
+{
+  const timeline = document.getElementById('recording-timeline');
+  timeline.addEventListener('mousemove', (e) => {
+    if (!clipAnnSettingRange || clipAnnRangeStart === null || !recPlayer) return;
+    const rect = timeline.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    clipAnnHoverTime = pct * recPlayer.totalDuration;
+    renderClipMarkers();
+  });
+  timeline.addEventListener('mouseleave', () => {
+    if (clipAnnSettingRange) {
+      clipAnnHoverTime = null;
+      renderClipMarkers();
+    }
+  });
+}
+
 // ── Render clip markers on timeline ──
 
 function renderClipMarkers() {
   const timeline = document.getElementById('recording-timeline');
   // Remove old clip markers
-  timeline.querySelectorAll('.timeline-clip-region, .timeline-clip-marker, .timeline-keyframe-mark, .timeline-ann-range').forEach(el => el.remove());
+  timeline.querySelectorAll('.timeline-clip-region, .timeline-clip-marker, .timeline-keyframe-mark, .timeline-ann-range, .timeline-ann-range-preview, .timeline-ann-range-active').forEach(el => el.remove());
 
   if (!recPlayer || recPlayer.totalDuration === 0) return;
   const total = recPlayer.totalDuration;
@@ -4636,20 +4944,41 @@ function renderClipMarkers() {
     timeline.appendChild(bar);
   }
 
-  // Annotation range being set (preview)
+  // Annotation range preview (growing region from start to mouse hover)
   if (clipAnnSettingRange && clipAnnRangeStart !== null) {
-    const mark = document.createElement('div');
-    mark.className = 'timeline-clip-marker';
-    mark.dataset.label = 'A';
-    mark.style.left = (clipAnnRangeStart / total * 100) + '%';
-    mark.style.background = 'var(--peach)';
-    timeline.appendChild(mark);
+    const end = clipAnnHoverTime !== null ? clipAnnHoverTime : clipAnnRangeStart;
+    const left = Math.min(clipAnnRangeStart, end);
+    const right = Math.max(clipAnnRangeStart, end);
+    if (right > left) {
+      const preview = document.createElement('div');
+      preview.className = 'timeline-ann-range-preview';
+      preview.style.left = (left / total * 100) + '%';
+      preview.style.width = ((right - left) / total * 100) + '%';
+      timeline.appendChild(preview);
+    }
+    // Start point marker (peach dot, not a clip marker)
+    const startMark = document.createElement('div');
+    startMark.className = 'timeline-clip-marker';
+    startMark.dataset.label = '';
+    startMark.style.left = (clipAnnRangeStart / total * 100) + '%';
+    startMark.style.background = 'var(--peach)';
+    startMark.style.width = '2px';
+    timeline.appendChild(startMark);
+  }
+
+  // Active annotation range (visible during drawing)
+  if (clipAnnotatingRange && clipAnnRangeStart !== null && clipAnnRangeEnd !== null) {
+    const bar = document.createElement('div');
+    bar.className = 'timeline-ann-range-active';
+    bar.style.left = (clipAnnRangeStart / total * 100) + '%';
+    bar.style.width = ((clipAnnRangeEnd - clipAnnRangeStart) / total * 100) + '%';
+    timeline.appendChild(bar);
   }
 }
 
 function clearClipMarkers() {
   const timeline = document.getElementById('recording-timeline');
-  timeline.querySelectorAll('.timeline-clip-region, .timeline-clip-marker, .timeline-keyframe-mark, .timeline-ann-range').forEach(el => el.remove());
+  timeline.querySelectorAll('.timeline-clip-region, .timeline-clip-marker, .timeline-keyframe-mark, .timeline-ann-range, .timeline-ann-range-preview, .timeline-ann-range-active').forEach(el => el.remove());
 }
 
 function updateClipFrameCount() {
@@ -4692,15 +5021,36 @@ function computeClipTimestamps(inSecs, outSecs, fps, keyframes) {
 
 let clipAnnLayerIdCounter = 0;
 
+function _showClipAnnBanner(text) {
+  _removeClipAnnBanner();
+  const wrap = document.getElementById('recording-player-wrap');
+  if (!wrap) return;
+  const banner = document.createElement('div');
+  banner.className = 'clip-ann-banner';
+  banner.id = 'clip-ann-banner';
+  banner.textContent = text;
+  wrap.appendChild(banner);
+}
+
+function _updateClipAnnBanner(text) {
+  const el = document.getElementById('clip-ann-banner');
+  if (el) el.textContent = text;
+  else _showClipAnnBanner(text);
+}
+
+function _removeClipAnnBanner() {
+  const el = document.getElementById('clip-ann-banner');
+  if (el) el.remove();
+}
+
 function startClipAnnotateRange() {
   if (clipAnnotatingRange || clipAnnSettingRange) return;
   if (clipInSecs === null || clipOutSecs === null) return;
   clipAnnSettingRange = true;
   clipAnnRangeStart = null;
   clipAnnRangeEnd = null;
-  const prompt = document.getElementById('clip-ann-prompt');
-  prompt.textContent = 'Click timeline for annotation start';
-  prompt.classList.remove('hidden');
+  clipAnnHoverTime = null;
+  _showClipAnnBanner('Click timeline for annotation start');
 }
 
 function cancelClipAnnotateRange() {
@@ -4708,10 +5058,12 @@ function cancelClipAnnotateRange() {
   clipAnnotatingRange = false;
   clipAnnRangeStart = null;
   clipAnnRangeEnd = null;
+  clipAnnHoverTime = null;
   if (clipAnnCanvas) {
     clipAnnCanvas.deactivate();
     clipAnnCanvas = null;
   }
+  _removeClipAnnBanner();
   document.getElementById('clip-ann-prompt').classList.add('hidden');
   document.getElementById('annotation-toolbar').classList.add('hidden');
   renderClipMarkers();
@@ -4719,6 +5071,7 @@ function cancelClipAnnotateRange() {
 
 function beginClipAnnotationDraw() {
   clipAnnotatingRange = true;
+  clipAnnHoverTime = null;
   // Seek video to start of annotation range
   recPlayer.seekToGlobal(clipAnnRangeStart);
 
@@ -4731,14 +5084,11 @@ function beginClipAnnotationDraw() {
 
   // Show annotation toolbar (reuse existing one, but swap save/send buttons)
   document.getElementById('annotation-toolbar').classList.remove('hidden');
-  // Replace Save/Send with Done/Cancel for clip annotation
   document.getElementById('ann-save-btn').style.display = 'none';
   document.getElementById('ann-submit-btn').textContent = 'Done';
   document.getElementById('ann-submit-btn').title = 'Save annotation layer';
 
-  const prompt = document.getElementById('clip-ann-prompt');
-  prompt.textContent = `Annotating ${fmtTime(clipAnnRangeStart)}-${fmtTime(clipAnnRangeEnd)} — Draw, then click Done`;
-  prompt.classList.remove('hidden');
+  _updateClipAnnBanner(`Annotating ${fmtTime(clipAnnRangeStart)}\u2013${fmtTime(clipAnnRangeEnd)} \u2014 Draw, then click Done`);
 
   renderClipMarkers();
 }
@@ -4766,6 +5116,7 @@ function finishClipAnnotationLayer() {
   clipAnnotatingRange = false;
   clipAnnRangeStart = null;
   clipAnnRangeEnd = null;
+  _removeClipAnnBanner();
   document.getElementById('clip-ann-prompt').classList.add('hidden');
   document.getElementById('annotation-toolbar').classList.add('hidden');
   // Restore annotation toolbar buttons
@@ -4803,9 +5154,7 @@ function editClipAnnotationLayer(layerId) {
   document.getElementById('ann-submit-btn').textContent = 'Done';
   document.getElementById('ann-submit-btn').title = 'Save annotation layer';
 
-  const prompt = document.getElementById('clip-ann-prompt');
-  prompt.textContent = `Editing layer ${fmtTime(layer.startSecs)}-${fmtTime(layer.endSecs)} — Draw, then click Done`;
-  prompt.classList.remove('hidden');
+  _updateClipAnnBanner(`Editing layer ${fmtTime(layer.startSecs)}\u2013${fmtTime(layer.endSecs)} \u2014 Draw, then click Done`);
 
   renderClipMarkers();
 }

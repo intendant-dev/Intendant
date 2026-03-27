@@ -119,7 +119,7 @@ pub async fn start_display_recording(
     let fps_arg = config.framerate.to_string();
     let crf_arg = config.crf().to_string();
     let seg_time_arg = config.segment_duration_secs.to_string();
-    let output_pattern = segments_dir.join("seg_%05d.ts");
+    let output_pattern = segments_dir.join("seg_%05d.mp4");
     let segment_list = segments_dir.join("segments.csv");
 
     let source = if cfg!(target_os = "macos") {
@@ -178,12 +178,13 @@ pub async fn start_display_recording(
             "-vsync", "cfr",
             "-f", "segment",
             "-segment_time", &seg_time_arg,
-            "-segment_format", "mpegts",
+            "-segment_format", "mp4",
+            "-segment_format_options", "movflags=+frag_keyframe+empty_moov+default_base_moff",
             "-segment_list", segment_list.to_str().unwrap_or("segments.csv"),
             "-segment_list_type", "csv",
             "-reset_timestamps", "1",
         ])
-        .arg(output_pattern.to_str().unwrap_or("seg_%05d.ts"))
+        .arg(output_pattern.to_str().unwrap_or("seg_%05d.mp4"))
         .stdin(if use_screencapture_feeder {
             std::process::Stdio::piped()
         } else {
@@ -262,7 +263,7 @@ pub async fn start_frame_recording(
     let fps_arg = config.framerate.to_string();
     let crf_arg = config.crf().to_string();
     let seg_time_arg = config.segment_duration_secs.to_string();
-    let output_pattern = segments_dir.join("seg_%05d.ts");
+    let output_pattern = segments_dir.join("seg_%05d.mp4");
     let segment_list = segments_dir.join("segments.csv");
 
     // Write manifest
@@ -292,12 +293,13 @@ pub async fn start_frame_recording(
             "-vsync", "cfr",
             "-f", "segment",
             "-segment_time", &seg_time_arg,
-            "-segment_format", "mpegts",
+            "-segment_format", "mp4",
+            "-segment_format_options", "movflags=+frag_keyframe+empty_moov+default_base_moff",
             "-segment_list", segment_list.to_str().unwrap_or("segments.csv"),
             "-segment_list_type", "csv",
             "-reset_timestamps", "1",
         ])
-        .arg(output_pattern.to_str().unwrap_or("seg_%05d.ts"))
+        .arg(output_pattern.to_str().unwrap_or("seg_%05d.mp4"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
