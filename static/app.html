@@ -3763,7 +3763,7 @@ class RecordingPlayer {
       try {
         const seg = this.segments[i];
         const url = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
-        const resp = await fetch(url);
+        const resp = await fetch(url, { cache: 'no-store' });
         const buf = await resp.arrayBuffer();
         const mediaData = extractMp4Boxes(buf, ['moof', 'mdat']);
         if (mediaData.byteLength === 0) continue;
@@ -4004,7 +4004,7 @@ class RecordingPlayer {
       const fetchSeg = async (i) => {
         const seg = this.segments[i];
         const url = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
-        const resp = await fetch(url, { signal });
+        const resp = await fetch(url, { signal, cache: 'no-store' });
         buffers[i] = await resp.arrayBuffer();
         loaded++;
         if (barEl) {
