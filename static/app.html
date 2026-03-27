@@ -5476,7 +5476,73 @@ async function submitClip(inject) {
   status.textContent = `${verb} (${frameIndex} frames)`;
   status.style.color = 'var(--green)';
   setTimeout(() => { status.textContent = ''; status.style.color = ''; }, 5000);
+
+  // Add clip reference
+  addClipRef(clipId, frameIndex, inject);
+
+  // Reset for another clip (stay in clip mode)
+  clipInSecs = null;
+  clipOutSecs = null;
+  clipKeyframes = [];
+  clipAnnotationLayers = [];
+  clipSelectedLayerId = null;
+  document.getElementById('clip-in-label').textContent = 'In: --';
+  document.getElementById('clip-out-label').textContent = 'Out: --';
+  document.getElementById('clip-duration-label').textContent = '';
+  document.getElementById('clip-frame-count').textContent = '';
+  document.getElementById('clip-preview-strip').classList.add('hidden');
+  renderClipMarkers();
 }
+
+// ── Clip References ──
+
+const savedClips = [];
+
+function addClipRef(clipId, frameCount, injected) {
+  savedClips.push({ clipId, frameCount, injected });
+  renderClipRefs();
+}
+
+function renderClipRefs() {
+  let panel = document.getElementById('clip-refs-panel');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'clip-refs-panel';
+    panel.className = 'annotation-refs-panel';
+    const section = document.getElementById('recording-section');
+    section.appendChild(panel);
+  }
+  panel.style.display = savedClips.length > 0 ? '' : 'none';
+
+  const items = savedClips.map(c => {
+    const badge = c.injected
+      ? '<span style="color:var(--green);font-size:10px"> sent</span>'
+      : '<span style="color:var(--overlay0);font-size:10px"> saved</span>';
+    const info = `${c.clipId} (${c.frameCount} frames)`;
+    return `<span class="ann-ref-item" title="Click to copy clip ID" onclick="copyClipRef('${c.clipId}')">${info}${badge}</span>`;
+  }).join('');
+
+  panel.innerHTML = `
+    <span style="font-size:11px;color:var(--subtext1);font-weight:600">Clips:</span>
+    ${items}
+    <button class="ann-copy-all-btn" onclick="copyAllClipRefs()" title="Copy all clip IDs to clipboard">Copy all</button>
+  `;
+}
+
+window.copyClipRef = function(clipId) {
+  navigator.clipboard.writeText(clipId).then(() => {
+    const el = document.querySelector(`.ann-ref-item[onclick*="${clipId}"]`);
+    if (el) { const orig = el.innerHTML; el.textContent = 'Copied!'; setTimeout(() => { el.innerHTML = orig; }, 1000); }
+  });
+};
+
+window.copyAllClipRefs = function() {
+  const text = savedClips.map(c => c.clipId).join(', ');
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.querySelector('#clip-refs-panel .ann-copy-all-btn');
+    if (btn) { btn.textContent = 'Copied!'; setTimeout(() => { btn.textContent = 'Copy all'; }, 1000); }
+  });
+};
 
 document.getElementById('clip-preview-btn').addEventListener('click', generateClipPreview);
 document.getElementById('clip-save-btn').addEventListener('click', () => submitClip(false));
