@@ -4588,7 +4588,7 @@ function exitAnnotationMode() {
 }
 
 async function submitAnnotation(inject) {
-  if (!annotationCanvas || !annotationCanvas.hasAnnotations()) return;
+  if (!annotationCanvas) return;
   const note = document.getElementById('ann-note').value.trim();
   const blob = await annotationCanvas.composite();
   if (!blob) return;
