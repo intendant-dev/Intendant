@@ -3669,6 +3669,8 @@ class RecordingPlayer {
     this._msObjectUrl = null;
     this._mediaSource = null;
     this._mseReady = false;
+    this._mseAbort = null;
+    this._mseGeneration = 0;
 
     this.video.addEventListener('ended', () => this._onSegmentEnd());
     this.video.addEventListener('timeupdate', () => this._updateDisplay());
@@ -3940,6 +3942,12 @@ class RecordingPlayer {
   destroy() {
     this._stopAnimLoop();
     this.video.pause();
+    // Abort any in-flight MSE loading
+    this._mseGeneration++;
+    if (this._mseAbort) {
+      this._mseAbort.abort();
+      this._mseAbort = null;
+    }
     if (this._msObjectUrl) {
       URL.revokeObjectURL(this._msObjectUrl);
       this._msObjectUrl = null;
@@ -3947,12 +3955,23 @@ class RecordingPlayer {
     this._mediaSource = null;
     this.useMSE = false;
     this._mseReady = false;
+    // Remove any leftover loading overlay
+    const overlay = this.video.parentElement?.querySelector('.mse-loading-overlay');
+    if (overlay) overlay.remove();
     this.video.removeAttribute('src');
     this.video.load();
   }
 
   /** Load all fMP4 segments into MSE for instant seeking. */
   async _loadAllMSE() {
+    const generation = ++this._mseGeneration;
+    const abortCtrl = new AbortController();
+    this._mseAbort = abortCtrl;
+    const signal = abortCtrl.signal;
+
+    // Check if this load is still current
+    const alive = () => this._mseGeneration === generation && !signal.aborted;
+
     this.useMSE = true;
     const ms = new MediaSource();
     this._mediaSource = ms;
@@ -3966,75 +3985,90 @@ class RecordingPlayer {
     overlay.innerHTML = '<div class="mse-loading-inner"><div class="bar-track"><div class="bar-fill" id="_mse-bar"></div></div><span id="_mse-text">Loading segments...</span></div>';
     wrap.appendChild(overlay);
 
-    await new Promise(r => ms.addEventListener('sourceopen', r, { once: true }));
-    const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+    try {
+      await new Promise((r, rej) => {
+        ms.addEventListener('sourceopen', r, { once: true });
+        signal.addEventListener('abort', () => rej(new DOMException('Aborted', 'AbortError')), { once: true });
+      });
+      if (!alive()) return;
 
-    // Fetch all segments with controlled concurrency
-    const total = this.segments.length;
-    const buffers = new Array(total);
-    let loaded = 0;
-    const barEl = overlay.querySelector('#_mse-bar');
-    const textEl = overlay.querySelector('#_mse-text');
+      const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
 
-    const fetchSeg = async (i) => {
-      const seg = this.segments[i];
-      const url = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
-      const resp = await fetch(url);
-      buffers[i] = await resp.arrayBuffer();
-      loaded++;
-      const pct = (loaded / total * 100);
-      barEl.style.width = pct + '%';
-      textEl.textContent = `Loading ${loaded}/${total} segments...`;
-    };
+      // Fetch all segments with controlled concurrency
+      const total = this.segments.length;
+      const buffers = new Array(total);
+      let loaded = 0;
+      const barEl = overlay.querySelector('#_mse-bar');
+      const textEl = overlay.querySelector('#_mse-text');
 
-    // Parallel fetch with concurrency limit of 4
-    const pool = [];
-    for (let i = 0; i < total; i++) {
-      const p = fetchSeg(i);
-      pool.push(p);
-      if (pool.length >= 4) {
-        await Promise.race(pool);
-        // Remove resolved promises
-        for (let j = pool.length - 1; j >= 0; j--) {
-          const status = await Promise.race([pool[j].then(() => 'done'), Promise.resolve('pending')]);
-          if (status === 'done') pool.splice(j, 1);
+      const fetchSeg = async (i) => {
+        const seg = this.segments[i];
+        const url = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
+        const resp = await fetch(url, { signal });
+        buffers[i] = await resp.arrayBuffer();
+        loaded++;
+        if (barEl) {
+          barEl.style.width = (loaded / total * 100) + '%';
+          textEl.textContent = `Loading ${loaded}/${total} segments...`;
+        }
+      };
+
+      // Parallel fetch with concurrency limit of 4
+      const pool = [];
+      for (let i = 0; i < total; i++) {
+        if (!alive()) return;
+        const p = fetchSeg(i);
+        pool.push(p);
+        if (pool.length >= 4) {
+          await Promise.race(pool);
+          for (let j = pool.length - 1; j >= 0; j--) {
+            const status = await Promise.race([pool[j].then(() => 'done'), Promise.resolve('pending')]);
+            if (status === 'done') pool.splice(j, 1);
+          }
         }
       }
+      await Promise.all(pool);
+      if (!alive()) return;
+
+      // Helper to append to SourceBuffer and wait for completion
+      const appendAndWait = (data) => new Promise((resolve, reject) => {
+        if (!alive()) { reject(new DOMException('Aborted', 'AbortError')); return; }
+        const onEnd = () => { sb.removeEventListener('updateend', onEnd); sb.removeEventListener('error', onErr); resolve(); };
+        const onErr = () => { sb.removeEventListener('updateend', onEnd); sb.removeEventListener('error', onErr); reject(new Error('SourceBuffer error')); };
+        sb.addEventListener('updateend', onEnd);
+        sb.addEventListener('error', onErr);
+        sb.appendBuffer(data);
+      });
+
+      // Append init segment from first file (ftyp + moov boxes)
+      const initData = extractMp4Boxes(buffers[0], ['ftyp', 'moov']);
+      if (initData.byteLength > 0) {
+        await appendAndWait(initData);
+      }
+
+      // Append media data from each segment with timestamp offset
+      if (textEl) textEl.textContent = 'Buffering...';
+      for (let i = 0; i < total; i++) {
+        if (!alive()) return;
+        const mediaData = extractMp4Boxes(buffers[i], ['moof', 'mdat']);
+        if (mediaData.byteLength === 0) continue;
+        sb.timestampOffset = this.segments[i].start_secs;
+        await appendAndWait(mediaData);
+        if (barEl) barEl.style.width = ((i + 1) / total * 100) + '%';
+      }
+
+      if (!alive()) return;
+      ms.endOfStream();
+      this._mseReady = true;
+
+      // Clean up overlay
+      overlay.remove();
+      buffers.length = 0;
+    } catch (e) {
+      // Aborted or error — clean up overlay if still present
+      if (overlay.parentElement) overlay.remove();
+      if (e.name !== 'AbortError') console.warn('MSE load error:', e);
     }
-    await Promise.all(pool);
-
-    // Helper to append to SourceBuffer and wait for completion
-    const appendAndWait = (data) => new Promise((resolve, reject) => {
-      const onEnd = () => { sb.removeEventListener('updateend', onEnd); sb.removeEventListener('error', onErr); resolve(); };
-      const onErr = () => { sb.removeEventListener('updateend', onEnd); sb.removeEventListener('error', onErr); reject(new Error('SourceBuffer error')); };
-      sb.addEventListener('updateend', onEnd);
-      sb.addEventListener('error', onErr);
-      sb.appendBuffer(data);
-    });
-
-    // Append init segment from first file (ftyp + moov boxes)
-    const initData = extractMp4Boxes(buffers[0], ['ftyp', 'moov']);
-    if (initData.byteLength > 0) {
-      await appendAndWait(initData);
-    }
-
-    // Append media data from each segment with timestamp offset
-    textEl.textContent = 'Buffering...';
-    for (let i = 0; i < total; i++) {
-      const mediaData = extractMp4Boxes(buffers[i], ['moof', 'mdat']);
-      if (mediaData.byteLength === 0) continue;
-      sb.timestampOffset = this.segments[i].start_secs;
-      await appendAndWait(mediaData);
-      barEl.style.width = ((i + 1) / total * 100) + '%';
-    }
-
-    ms.endOfStream();
-    this._mseReady = true;
-
-    // Clean up overlay
-    overlay.remove();
-    // Free ArrayBuffers
-    buffers.length = 0;
   }
 }
 
