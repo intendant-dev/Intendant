@@ -829,10 +829,10 @@ html, body {
 .timeline-time-mark::after {
   content: attr(data-time);
   position: absolute;
-  top: 1px;
-  left: 2px;
-  font-size: 8px;
-  color: var(--overlay0);
+  top: 2px;
+  left: 3px;
+  font-size: 9px;
+  color: var(--subtext0);
   font-family: monospace;
   pointer-events: none;
 }
@@ -843,8 +843,7 @@ html, body {
   left: 0;
   width: 1px;
   height: 100%;
-  background: var(--surface1);
-  opacity: 0.4;
+  background: var(--overlay0);
 }
 
 /* ── Terminal Tab ── */
@@ -3723,6 +3722,50 @@ function toggleDisplayStrip() {
   requestAnimationFrame(() => {
     for (const slot of displaySlots.values()) {
       if (slot.rfb) slot.rfb.scaleViewport = true;
+    }
+  });
+}
+
+// ── Activity display strip split-drag ──
+{
+  const handle = document.getElementById('activity-split-handle');
+  const strip = document.getElementById('activity-display-strip');
+  const logStream = document.getElementById('log-stream');
+  let dragging = false;
+
+  handle.addEventListener('mousedown', (e) => {
+    if (!stripExpanded) return;
+    dragging = true;
+    handle.classList.add('dragging');
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const tab = document.getElementById('tab-activity');
+    if (!tab) return;
+    const tabRect = tab.getBoundingClientRect();
+    const y = e.clientY - tabRect.top;
+    const minPx = 60;
+    const maxPx = tabRect.height - 100;
+    const h = Math.max(minPx, Math.min(maxPx, y));
+    strip.style.height = h + 'px';
+    stripHeight = h;
+    requestAnimationFrame(() => {
+      for (const slot of displaySlots.values()) {
+        if (slot.rfb) slot.rfb.scaleViewport = true;
+      }
+    });
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (dragging) {
+      dragging = false;
+      handle.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
     }
   });
 }

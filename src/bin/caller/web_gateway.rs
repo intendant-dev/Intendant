@@ -782,7 +782,9 @@ fn list_sessions() -> String {
         // Refine status for sessions that never did model work:
         // - "idle": had some activity (recordings, display, task) but no model turns
         // - "abandoned": no turns, no task, no media — MCP probes, brief connections
-        if status != "completed" && status != "interrupted" {
+        // Also override "interrupted" → "idle" when no model work happened
+        // (process was killed before any model interaction — nothing was interrupted)
+        if status != "completed" {
             let has_model_work = turns > 0 || total_tokens > 0;
             if !has_model_work {
                 let has_media = recording_count > 0 || annotation_count > 0 || clip_count > 0;
