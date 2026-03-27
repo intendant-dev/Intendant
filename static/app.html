@@ -4613,30 +4613,33 @@ function showAnnotationResult(path) {
   }
 }
 
-// Wire up annotation toolbar
+// Wire up annotation toolbar — works for both single-frame and clip annotation
+function _activeAnnCanvas() { return annotationCanvas || clipAnnCanvas; }
+
 document.getElementById('annotation-toolbar').addEventListener('click', (e) => {
+  const ac = _activeAnnCanvas();
   const btn = e.target.closest('[data-tool]');
-  if (btn && annotationCanvas) {
-    annotationCanvas.setTool(btn.dataset.tool);
+  if (btn && ac) {
+    ac.setTool(btn.dataset.tool);
     document.querySelectorAll('.ann-btn').forEach(b => b.classList.toggle('active', b === btn));
     return;
   }
   const colorBtn = e.target.closest('[data-color]');
-  if (colorBtn && annotationCanvas) {
-    annotationCanvas.setColor(colorBtn.dataset.color);
+  if (colorBtn && ac) {
+    ac.setColor(colorBtn.dataset.color);
     document.querySelectorAll('.ann-color').forEach(b => b.classList.toggle('active', b === colorBtn));
     return;
   }
   const thickBtn = e.target.closest('[data-thick]');
-  if (thickBtn && annotationCanvas) {
-    annotationCanvas.setThickness(parseInt(thickBtn.dataset.thick));
+  if (thickBtn && ac) {
+    ac.setThickness(parseInt(thickBtn.dataset.thick));
     document.querySelectorAll('.ann-thick').forEach(b => b.classList.toggle('active', b === thickBtn));
     return;
   }
 });
-document.getElementById('ann-undo').addEventListener('click', () => annotationCanvas && annotationCanvas.undo());
-document.getElementById('ann-redo').addEventListener('click', () => annotationCanvas && annotationCanvas.redo());
-document.getElementById('ann-clear').addEventListener('click', () => annotationCanvas && annotationCanvas.clear());
+document.getElementById('ann-undo').addEventListener('click', () => { const ac = _activeAnnCanvas(); if (ac) ac.undo(); });
+document.getElementById('ann-redo').addEventListener('click', () => { const ac = _activeAnnCanvas(); if (ac) ac.redo(); });
+document.getElementById('ann-clear').addEventListener('click', () => { const ac = _activeAnnCanvas(); if (ac) ac.clear(); });
 document.getElementById('ann-save-btn').addEventListener('click', () => submitAnnotation(false));
 document.getElementById('ann-submit-btn').addEventListener('click', () => submitAnnotation(true));
 document.getElementById('ann-close').addEventListener('click', exitAnnotationMode);
@@ -4763,6 +4766,7 @@ function exitClipMode() {
   clipAnnotatingRange = false;
   clipKeyframeMode = false;
   clipAnnSettingRange = false;
+  if (window._clipAnnResizeObserver) { window._clipAnnResizeObserver.disconnect(); window._clipAnnResizeObserver = null; }
   if (clipAnnCanvas) {
     clipAnnCanvas.deactivate();
     clipAnnCanvas = null;
@@ -5126,6 +5130,7 @@ function cancelClipAnnotateRange() {
   clipAnnRangeStart = null;
   clipAnnRangeEnd = null;
   clipAnnHoverTime = null;
+  if (window._clipAnnResizeObserver) { window._clipAnnResizeObserver.disconnect(); window._clipAnnResizeObserver = null; }
   if (clipAnnCanvas) {
     clipAnnCanvas.deactivate();
     clipAnnCanvas = null;
@@ -5148,6 +5153,13 @@ function beginClipAnnotationDraw() {
 
   clipAnnCanvas = new AnnotationCanvas(overlay, video);
   clipAnnCanvas.activate();
+
+  // Re-align canvas on resize (split handle drag, window resize)
+  if (window._clipAnnResizeObserver) window._clipAnnResizeObserver.disconnect();
+  window._clipAnnResizeObserver = new ResizeObserver(() => {
+    if (clipAnnCanvas && clipAnnotatingRange) clipAnnCanvas._alignToSource();
+  });
+  window._clipAnnResizeObserver.observe(document.getElementById('recording-player-wrap'));
 
   // Show annotation toolbar (reuse existing one, but swap save/send buttons)
   document.getElementById('annotation-toolbar').classList.remove('hidden');
@@ -5178,6 +5190,7 @@ function finishClipAnnotationLayer() {
     color: CLIP_ANN_COLORS[colorIdx],
   });
 
+  if (window._clipAnnResizeObserver) { window._clipAnnResizeObserver.disconnect(); window._clipAnnResizeObserver = null; }
   clipAnnCanvas.deactivate();
   clipAnnCanvas = null;
   clipAnnotatingRange = false;
