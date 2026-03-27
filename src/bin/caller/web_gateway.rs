@@ -734,27 +734,6 @@ fn list_sessions() -> String {
             status = "completed".to_string();
         }
 
-        // Sessions with 0 turns and no task are abandoned (e.g., MCP probes,
-        // brief connections that never started work)
-        if status != "completed" && status != "interrupted" && turns == 0 && task.is_none() {
-            status = "abandoned".to_string();
-        }
-
-        // Fall back to directory mtime for created_at
-        if created_at.is_none() {
-            if let Ok(metadata) = std::fs::metadata(&dir) {
-                if let Ok(modified) = metadata.modified() {
-                    let dt: chrono::DateTime<chrono::Local> = modified.into();
-                    created_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
-                }
-            }
-        }
-
-        // Estimate cost using the model's pricing (blended rate without cache info)
-        let estimated_cost = model.as_deref()
-            .and_then(|m| crate::app_state_pricing::estimate_session_cost(m, prompt_tokens, completion_tokens))
-            .unwrap_or(0.0);
-
         // Recording / annotation / clip stats from disk
         let mut recording_count: u64 = 0;
         let mut recording_bytes: u64 = 0;
@@ -767,7 +746,6 @@ fn list_sessions() -> String {
                 for re in rd.flatten() {
                     if re.path().is_dir() {
                         recording_count += 1;
-                        // Sum segment file sizes
                         if let Ok(files) = std::fs::read_dir(re.path()) {
                             for f in files.flatten() {
                                 let name = f.file_name().to_string_lossy().to_string();
@@ -792,7 +770,6 @@ fn list_sessions() -> String {
                     if name.starts_with("ann-") && name.ends_with(".jpg") {
                         annotation_count += 1;
                     } else if name.starts_with("clip-") && name.ends_with(".jpg") {
-                        // Extract clip ID: clip-stream-N-fXXX.jpg → clip-stream-N
                         if let Some(pos) = name.rfind("-f") {
                             clip_ids.insert(name[..pos].to_string());
                         }
@@ -801,6 +778,36 @@ fn list_sessions() -> String {
                 clip_count = clip_ids.len() as u64;
             }
         }
+
+        // Refine status for sessions that never did model work:
+        // - "idle": had some activity (recordings, display, task) but no model turns
+        // - "abandoned": no turns, no task, no media — MCP probes, brief connections
+        if status != "completed" && status != "interrupted" {
+            let has_model_work = turns > 0 || total_tokens > 0;
+            if !has_model_work {
+                let has_media = recording_count > 0 || annotation_count > 0 || clip_count > 0;
+                if task.is_some() || has_media {
+                    status = "idle".to_string();
+                } else {
+                    status = "abandoned".to_string();
+                }
+            }
+        }
+
+        // Fall back to directory mtime for created_at
+        if created_at.is_none() {
+            if let Ok(metadata) = std::fs::metadata(&dir) {
+                if let Ok(modified) = metadata.modified() {
+                    let dt: chrono::DateTime<chrono::Local> = modified.into();
+                    created_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                }
+            }
+        }
+
+        // Estimate cost using the model's pricing (blended rate without cache info)
+        let estimated_cost = model.as_deref()
+            .and_then(|m| crate::app_state_pricing::estimate_session_cost(m, prompt_tokens, completion_tokens))
+            .unwrap_or(0.0);
 
         sessions.push(serde_json::json!({
             "session_id": session_id,

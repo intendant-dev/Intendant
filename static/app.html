@@ -732,6 +732,18 @@ html, body {
   background: color-mix(in srgb, var(--yellow) 15%, transparent);
   color: var(--yellow);
 }
+.session-card .sc-status.idle {
+  background: color-mix(in srgb, var(--overlay0) 15%, transparent);
+  color: var(--overlay0);
+}
+.session-card .sc-status.abandoned {
+  background: color-mix(in srgb, var(--surface2) 15%, transparent);
+  color: var(--surface2);
+}
+.session-card .sc-status.interrupted {
+  background: color-mix(in srgb, var(--peach) 15%, transparent);
+  color: var(--peach);
+}
 .session-card .sc-role {
   font-size: 10px;
   text-transform: uppercase;
@@ -779,6 +791,61 @@ html, body {
 .session-card .sc-meta .value { color: var(--subtext0); }
 .session-card .sc-meta .provider-val { color: var(--blue); }
 .session-card .sc-meta .model-val { color: var(--green); }
+.session-card .sc-meta.sc-media {
+  padding-top: 4px;
+  border-top: 1px solid var(--surface1);
+  margin-top: 4px;
+}
+.session-card.dimmed {
+  opacity: 0.45;
+}
+.session-card.dimmed:hover {
+  opacity: 0.7;
+}
+.sessions-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--overlay0);
+  margin-left: 8px;
+}
+.sessions-filter label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+}
+.sessions-filter input[type="checkbox"] {
+  accent-color: var(--blue);
+}
+.timeline-time-mark {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
+}
+.timeline-time-mark::after {
+  content: attr(data-time);
+  position: absolute;
+  top: 1px;
+  left: 2px;
+  font-size: 8px;
+  color: var(--overlay0);
+  font-family: monospace;
+  pointer-events: none;
+}
+.timeline-time-mark::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 100%;
+  background: var(--surface1);
+  opacity: 0.4;
+}
 
 /* ── Terminal Tab ── */
 .terminal-container {
@@ -2149,6 +2216,10 @@ html, body {
             <button onclick="startNewSession()" style="padding:4px 12px;border:1px solid var(--green);border-radius:4px;background:var(--green);color:var(--base);font-size:12px;font-weight:600;cursor:pointer">Start</button>
           </div>
           <button class="sessions-refresh" onclick="loadSessions()" style="margin-left:8px">Refresh</button>
+          <div class="sessions-filter" id="sessions-filter">
+            <label><input type="checkbox" id="filter-abandoned" checked> abandoned</label>
+            <label><input type="checkbox" id="filter-idle" checked> idle</label>
+          </div>
         </div>
         <div class="sessions-aggregate" id="sessions-aggregate"></div>
         <div class="sessions-list" id="sessions-list">
@@ -3966,7 +4037,7 @@ class RecordingPlayer {
 
   _renderSegmentMarks() {
     // Remove old marks
-    this.timelineEl.querySelectorAll('.timeline-segment-mark').forEach(el => el.remove());
+    this.timelineEl.querySelectorAll('.timeline-segment-mark, .timeline-time-mark').forEach(el => el.remove());
     if (this.totalDuration === 0) return;
     // Add segment boundary markers (skip first)
     for (let i = 1; i < this.segments.length; i++) {
@@ -3974,6 +4045,16 @@ class RecordingPlayer {
       const mark = document.createElement('div');
       mark.className = 'timeline-segment-mark';
       mark.style.left = pct + '%';
+      this.timelineEl.appendChild(mark);
+    }
+    // Add time markers at regular intervals
+    const interval = this.totalDuration <= 30 ? 5 : this.totalDuration <= 120 ? 10 : 30;
+    for (let t = interval; t < this.totalDuration; t += interval) {
+      const pct = (t / this.totalDuration) * 100;
+      const mark = document.createElement('div');
+      mark.className = 'timeline-time-mark';
+      mark.style.left = pct + '%';
+      mark.dataset.time = fmtTime(t);
       this.timelineEl.appendChild(mark);
     }
   }
@@ -5859,6 +5940,7 @@ function onDebugScreenTornDown() {
 
 // ── Sessions Tab ──
 let sessionsLoaded = false;
+let _cachedSessions = [];
 
 function loadSessions() {
   const listEl = document.getElementById('sessions-list');
@@ -5869,6 +5951,7 @@ function loadSessions() {
     .then(r => r.json())
     .then(sessions => {
       sessionsLoaded = true;
+      _cachedSessions = sessions;
       renderSessionsAggregate(sessions, aggEl);
       renderSessionsList(sessions, listEl);
     })
@@ -5876,6 +5959,14 @@ function loadSessions() {
       listEl.innerHTML = '<div class="empty-state">Failed to load sessions</div>';
     });
 }
+
+function _refilterSessions() {
+  if (_cachedSessions.length > 0) {
+    renderSessionsList(_cachedSessions, document.getElementById('sessions-list'));
+  }
+}
+document.getElementById('filter-abandoned')?.addEventListener('change', _refilterSessions);
+document.getElementById('filter-idle')?.addEventListener('change', _refilterSessions);
 
 function renderSessionsAggregate(sessions, el) {
   const totalSessions = sessions.length;
@@ -5920,12 +6011,27 @@ function renderSessionsList(sessions, el) {
 
   const currentSessionId = (document.getElementById('sb-session').textContent || '').trim();
 
+  const showAbandoned = document.getElementById('filter-abandoned')?.checked ?? true;
+  const showIdle = document.getElementById('filter-idle')?.checked ?? true;
+
   for (const s of sessions) {
-    const card = document.createElement('div');
-    card.className = 'session-card';
     const shortId = (s.session_id || '').substring(0, 8);
     const isCurrent = currentSessionId && s.session_id && s.session_id.startsWith(currentSessionId);
+
+    // Override status for current session — never show as abandoned/idle
+    let displayStatus = s.status || 'in_progress';
+    if (isCurrent && (displayStatus === 'abandoned' || displayStatus === 'idle')) {
+      displayStatus = 'in_progress';
+    }
+
+    // Apply filters
+    if (!showAbandoned && displayStatus === 'abandoned') continue;
+    if (!showIdle && displayStatus === 'idle') continue;
+
+    const card = document.createElement('div');
+    card.className = 'session-card';
     if (isCurrent) card.classList.add('current');
+    if (displayStatus === 'abandoned') card.classList.add('dimmed');
 
     // Top row: ID + status badges
     const top = document.createElement('div');
@@ -5937,8 +6043,8 @@ function renderSessionsList(sessions, el) {
     top.appendChild(idEl);
 
     const statusEl = document.createElement('span');
-    statusEl.className = 'sc-status ' + (s.status || 'in_progress');
-    statusEl.textContent = (s.status || 'in_progress').replace('_', ' ');
+    statusEl.className = 'sc-status ' + displayStatus;
+    statusEl.textContent = displayStatus.replace('_', ' ');
     top.appendChild(statusEl);
 
     if (s.role) {
@@ -6058,7 +6164,7 @@ function renderSessionsList(sessions, el) {
     const hasMedia = (s.recordings > 0 || s.annotations > 0 || s.clips > 0);
     if (hasMedia) {
       const mediaMeta = document.createElement('div');
-      mediaMeta.className = 'sc-meta';
+      mediaMeta.className = 'sc-meta sc-media';
       const addMediaField = (label, value, color) => {
         const span = document.createElement('span');
         const l = document.createElement('span');
