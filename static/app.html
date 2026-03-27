@@ -3672,16 +3672,20 @@ class RecordingPlayer {
     this._mseAbort = null;
     this._mseGeneration = 0;
 
-    this.video.addEventListener('ended', () => this._onSegmentEnd());
-    this.video.addEventListener('timeupdate', () => this._updateDisplay());
-
-    this.timelineEl.addEventListener('click', (e) => {
+    // Bound handlers — stored so destroy() can remove them
+    this._onEnded = () => this._onSegmentEnd();
+    this._onTimeUpdate = () => this._updateDisplay();
+    this._onTimelineClick = (e) => {
       const rect = this.timelineEl.getBoundingClientRect();
       const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
       this.seekToGlobal(pct * this.totalDuration);
-    });
+    };
+    this._onPlayClick = () => this.togglePlayback();
 
-    playBtn.addEventListener('click', () => this.togglePlayback());
+    this.video.addEventListener('ended', this._onEnded);
+    this.video.addEventListener('timeupdate', this._onTimeUpdate);
+    this.timelineEl.addEventListener('click', this._onTimelineClick);
+    playBtn.addEventListener('click', this._onPlayClick);
   }
 
   async load(streamName) {
@@ -3942,6 +3946,11 @@ class RecordingPlayer {
   destroy() {
     this._stopAnimLoop();
     this.video.pause();
+    // Remove event listeners to prevent stale handlers on the shared video element
+    this.video.removeEventListener('ended', this._onEnded);
+    this.video.removeEventListener('timeupdate', this._onTimeUpdate);
+    this.timelineEl.removeEventListener('click', this._onTimelineClick);
+    this.playBtn.removeEventListener('click', this._onPlayClick);
     // Abort any in-flight MSE loading
     this._mseGeneration++;
     if (this._mseAbort) {
