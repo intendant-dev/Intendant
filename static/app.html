@@ -2903,9 +2903,18 @@ async function main() {
     }
   });
 
-  // Connect to server
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = proto + '//' + location.host;
+  // Connect to server.
+  // When running in the macOS app bundle, the page is served from a custom
+  // scheme (intendant://) for secure-context access to getUserMedia. WebSocket
+  // connections bypass the scheme handler and need the real backend address.
+  function buildWsUrl(path) {
+    if (window.__intendantPort) {
+      return 'ws://127.0.0.1:' + window.__intendantPort + (path || '');
+    }
+    const p = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return p + '//' + location.host + (path || '');
+  }
+  const wsUrl = buildWsUrl();
 
   // Store app globally for reconnect
   window.__presenceWeb = app;
@@ -3495,9 +3504,8 @@ class DisplaySlot {
   _connectVNC() {
     const RFB = window.__noVNC_RFB;
     if (!RFB) return;
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     try {
-      this.rfb = new RFB(this.canvasEl, `${proto}//${location.host}/vnc?port=${this.vncPort}`);
+      this.rfb = new RFB(this.canvasEl, buildWsUrl(`/vnc?port=${this.vncPort}`));
       this.rfb.viewOnly = true; this.rfb.scaleViewport = true;
       this.rfb.resizeSession = false; this.rfb.background = '#1e1e2e';
       this.rfb.showDotCursor = true; // Fallback cursor when VNC server doesn't send one

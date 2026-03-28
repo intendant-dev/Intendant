@@ -1,6 +1,79 @@
 import Cocoa
 import WebKit
 
+// MARK: - Scheme Handler
+
+/// Proxies requests from the custom `intendant://` scheme to the local HTTP
+/// backend. WKWebView does not treat `http://localhost` as a secure context,
+/// so navigator.mediaDevices (mic/camera) is unavailable. Loading the page
+/// from a custom scheme registered via setURLSchemeHandler restores secure
+/// context status.
+class BackendSchemeHandler: NSObject, WKURLSchemeHandler {
+    let port: Int
+    private var stopped = Set<Int>()
+    private let lock = NSLock()
+
+    init(port: Int) {
+        self.port = port
+    }
+
+    func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
+        guard let originalURL = urlSchemeTask.request.url,
+              var components = URLComponents(url: originalURL, resolvingAgainstBaseURL: false) else {
+            urlSchemeTask.didFailWithError(URLError(.badURL))
+            return
+        }
+        components.scheme = "http"
+        components.host = "127.0.0.1"
+        components.port = port
+
+        guard let backendURL = components.url else {
+            urlSchemeTask.didFailWithError(URLError(.badURL))
+            return
+        }
+
+        var request = URLRequest(url: backendURL)
+        request.httpMethod = urlSchemeTask.request.httpMethod
+        request.httpBody = urlSchemeTask.request.httpBody
+        if let headers = urlSchemeTask.request.allHTTPHeaderFields {
+            for (key, value) in headers {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+        }
+
+        let taskHash = ObjectIdentifier(urlSchemeTask as AnyObject).hashValue
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { return }
+            self.lock.lock()
+            let wasStopped = self.stopped.remove(taskHash) != nil
+            self.lock.unlock()
+            if wasStopped { return }
+
+            if let error = error {
+                urlSchemeTask.didFailWithError(error)
+                return
+            }
+            if let response = response {
+                urlSchemeTask.didReceive(response)
+            }
+            if let data = data {
+                urlSchemeTask.didReceive(data)
+            }
+            urlSchemeTask.didFinish()
+        }.resume()
+    }
+
+    func webView(_ webView: WKWebView, stop urlSchemeTask: any WKURLSchemeTask) {
+        let taskHash = ObjectIdentifier(urlSchemeTask as AnyObject).hashValue
+        lock.lock()
+        stopped.insert(taskHash)
+        lock.unlock()
+    }
+}
+
+// MARK: - App Delegate
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var webView: WKWebView!
@@ -90,6 +163,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Allow media autoplay (for voice features)
         config.mediaTypesRequiringUserActionForPlayback = []
 
+        // Serve pages from a custom scheme so WKWebView grants a secure
+        // context (required for navigator.mediaDevices / getUserMedia).
+        config.setURLSchemeHandler(BackendSchemeHandler(port: port), forURLScheme: "intendant")
+
+        // Inject backend port so JS can build WebSocket URLs (WebSocket
+        // connections bypass the scheme handler and need the real address).
+        let script = WKUserScript(
+            source: "window.__intendantPort = \(port);",
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+        config.userContentController.addUserScript(script)
+
         webView = WKWebView(frame: .zero, configuration: config)
         webView.customUserAgent = "Intendant/1.0"
 
@@ -146,13 +232,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let url = URL(string: "http://localhost:\(port)/")!
-        var request = URLRequest(url: url, timeoutInterval: 1)
+        // Poll the HTTP backend directly
+        let healthURL = URL(string: "http://127.0.0.1:\(port)/")!
+        var request = URLRequest(url: healthURL, timeoutInterval: 1)
         request.httpMethod = "HEAD"
         URLSession.shared.dataTask(with: request) { _, response, error in
             if let http = response as? HTTPURLResponse, http.statusCode == 200 {
                 DispatchQueue.main.async {
-                    self.webView.load(URLRequest(url: url))
+                    // Load via custom scheme for secure context
+                    let appURL = URL(string: "intendant://backend/")!
+                    self.webView.load(URLRequest(url: appURL))
                 }
             } else {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {

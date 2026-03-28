@@ -78,6 +78,10 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
     <string>Intendant records your screen for display capture, computer use, and session replay.</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>Intendant uses AppleScript for keyboard/mouse automation and system control.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Intendant uses the microphone for voice conversations with the AI presence layer.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Intendant uses the camera for video input to the AI presence layer.</string>
 </dict>
 </plist>
 PLIST
