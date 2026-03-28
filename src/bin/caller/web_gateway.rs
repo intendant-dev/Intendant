@@ -2265,11 +2265,30 @@ pub fn spawn_web_gateway(
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
                     } else if request_line.starts_with("POST") && request_line.contains("/api/settings") {
-                        use tokio::io::AsyncWriteExt;
-                        let body_text = header_text
-                            .split("\r\n\r\n")
-                            .nth(1)
-                            .unwrap_or("");
+                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                        // Read POST body — may be partially or fully outside the peek buffer
+                        let content_length: usize = header_text
+                            .lines()
+                            .find(|l| l.to_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+                        let body_owned;
+                        let body_text = if peeked_body.len() >= content_length {
+                            &peeked_body[..content_length]
+                        } else {
+                            let remaining = content_length.saturating_sub(peeked_body.len());
+                            let mut full = peeked_body.to_string();
+                            if remaining > 0 {
+                                let mut rest = vec![0u8; remaining];
+                                if stream.read_exact(&mut rest).await.is_ok() {
+                                    full.push_str(&String::from_utf8_lossy(&rest));
+                                }
+                            }
+                            body_owned = full;
+                            &body_owned
+                        };
                         let result = match &project_root {
                             Some(root) => {
                                 match serde_json::from_str::<SettingsPayload>(body_text) {

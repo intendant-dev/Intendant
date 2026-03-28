@@ -2441,6 +2441,7 @@ html, body {
           <div class="settings-row">
             <label>Framerate</label>
             <input id="set-recording-framerate" type="number" min="1" max="60" placeholder="15">
+            <span id="framerate-warning" class="hidden" style="font-size:11px;color:var(--peach);margin-left:4px">screencapture backend caps at 15 fps</span>
           </div>
           <div class="settings-row">
             <label>Quality</label>
@@ -6091,6 +6092,7 @@ async function loadSettings() {
     document.getElementById('set-transcription-language').value = d.transcription_language || '';
     document.getElementById('set-recording-enabled').checked = d.recording_enabled;
     document.getElementById('set-recording-framerate').value = d.recording_framerate || 15;
+    updateFramerateWarning();
     document.getElementById('set-recording-quality').value = d.recording_quality || 'medium';
     document.getElementById('set-live-audio-enabled').checked = d.live_audio_enabled;
     document.getElementById('set-live-audio-timeout').value = d.live_audio_timeout_secs || 300;
@@ -6156,7 +6158,14 @@ async function saveSettings() {
 document.getElementById('settings-save-btn').addEventListener('click', saveSettings);
 document.getElementById('settings-reset-btn').addEventListener('click', () => { settingsLoaded = false; loadSettings(); });
 
-// ── All Sessions Usage (in Usage tab) ──
+function updateFramerateWarning() {
+  const val = parseInt(document.getElementById('set-recording-framerate').value) || 0;
+  const warn = document.getElementById('framerate-warning');
+  if (warn) warn.classList.toggle('hidden', val <= 15);
+}
+document.getElementById('set-recording-framerate').addEventListener('input', updateFramerateWarning);
+
+// ── All Sessions Usage (in Stats tab) ──
 let allSessionsUsageLoaded = false;
 
 function loadAllSessionsUsage() {
