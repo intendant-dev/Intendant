@@ -868,6 +868,23 @@ html, body {
 .sessions-filter input[type="checkbox"] {
   accent-color: var(--blue);
 }
+.sessions-sort {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--overlay0);
+  margin-left: 8px;
+}
+.sessions-sort select {
+  padding: 2px 6px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 11px;
+  font-family: inherit;
+}
 .timeline-time-mark {
   position: absolute;
   top: 0;
@@ -2038,7 +2055,7 @@ html, body {
   <!-- Tab Bar -->
   <nav class="tab-bar">
     <button class="tab-btn active" data-tab="activity">Activity<span class="badge" id="badge-activity"></span></button>
-    <button class="tab-btn" data-tab="usage">Usage</button>
+    <button class="tab-btn" data-tab="stats">Stats</button>
     <button class="tab-btn" data-tab="terminal">Terminal</button>
     <button class="tab-btn" data-tab="displays">Video</button>
     <button class="tab-btn" data-tab="sessions">Sessions</button>
@@ -2121,8 +2138,8 @@ html, body {
       </div>
     </div>
 
-    <!-- Usage Tab -->
-    <div id="tab-usage" class="tab-pane">
+    <!-- Stats Tab -->
+    <div id="tab-stats" class="tab-pane">
       <div class="usage-container" id="usage-container">
         <div class="empty-state" id="usage-empty">Waiting for usage data...</div>
         <div class="usage-cards" id="usage-cards" style="display:none"></div>
@@ -2137,6 +2154,10 @@ html, body {
         <div class="cost-section" id="all-sessions-usage" style="display:none">
           <div class="cost-title">All Sessions</div>
           <div class="cost-grid" id="all-sessions-grid"></div>
+        </div>
+        <div class="cost-section" id="disk-usage-section" style="display:none">
+          <div class="cost-title">Disk Usage</div>
+          <div class="cost-grid" id="disk-usage-grid"></div>
         </div>
       </div>
     </div>
@@ -2268,6 +2289,20 @@ html, body {
           <div class="sessions-filter" id="sessions-filter">
             <label><input type="checkbox" id="filter-abandoned" checked> abandoned</label>
             <label><input type="checkbox" id="filter-idle" checked> idle</label>
+          </div>
+          <div class="sessions-sort">
+            <label>Sort
+              <select id="sort-sessions">
+                <option value="date-desc" selected>Date (newest)</option>
+                <option value="date-asc">Date (oldest)</option>
+                <option value="cost-desc">Cost (highest)</option>
+                <option value="cost-asc">Cost (lowest)</option>
+                <option value="size-desc">Size (largest)</option>
+                <option value="size-asc">Size (smallest)</option>
+                <option value="turns-desc">Turns (most)</option>
+                <option value="turns-asc">Turns (fewest)</option>
+              </select>
+            </label>
           </div>
         </div>
         <div class="sessions-aggregate" id="sessions-aggregate"></div>
@@ -6025,7 +6060,7 @@ function switchTab(tabId) {
   if (tabId === 'sessions' && !sessionsLoaded) {
     loadSessions();
   }
-  if (tabId === 'usage' && !allSessionsUsageLoaded) {
+  if (tabId === 'stats' && !allSessionsUsageLoaded) {
     loadAllSessionsUsage();
   }
   if (tabId === 'settings' && !settingsLoaded) {
@@ -6130,6 +6165,7 @@ function loadAllSessionsUsage() {
     .then(sessions => {
       allSessionsUsageLoaded = true;
       renderAllSessionsUsage(sessions);
+      renderDiskUsage(sessions);
     })
     .catch(() => {});
 }
@@ -6191,6 +6227,46 @@ function renderAllSessionsUsage(sessions) {
       <span class="value" style="color:var(--green)">$${cost.toFixed(2)}</span>
     `;
   }
+}
+
+function renderDiskUsage(sessions) {
+  const el = document.getElementById('disk-usage-section');
+  const grid = document.getElementById('disk-usage-grid');
+  if (!el || !grid) return;
+
+  let totalRecordings = 0, totalFrames = 0, totalTurns = 0, totalLogs = 0, totalBytes = 0;
+  for (const s of sessions) {
+    totalRecordings += s.recording_bytes || 0;
+    totalFrames += s.frames_bytes || 0;
+    totalTurns += s.turns_bytes || 0;
+    totalLogs += s.logs_bytes || 0;
+    totalBytes += s.total_bytes || 0;
+  }
+
+  if (totalBytes === 0) return;
+
+  el.style.display = 'block';
+  grid.innerHTML = '';
+  grid.style.gridTemplateColumns = 'auto 1fr';
+
+  const rows = [
+    ['Recordings', totalRecordings],
+    ['Frames', totalFrames],
+    ['Turns', totalTurns],
+    ['Logs', totalLogs],
+  ];
+
+  for (const [label, bytes] of rows) {
+    if (bytes === 0) continue;
+    grid.innerHTML += `
+      <span class="label">${label}</span>
+      <span class="value">${_fmtBytes(bytes)}</span>
+    `;
+  }
+  grid.innerHTML += `
+    <span class="label" style="font-weight:600;color:var(--text);border-top:1px solid var(--surface0);padding-top:6px;margin-top:4px">Total</span>
+    <span class="value" style="font-weight:600;color:var(--text);border-top:1px solid var(--surface0);padding-top:6px;margin-top:4px">${_fmtBytes(totalBytes)}</span>
+  `;
 }
 
 // ── Session Lifecycle ──
@@ -6303,6 +6379,7 @@ function _refilterSessions() {
 }
 document.getElementById('filter-abandoned')?.addEventListener('change', _refilterSessions);
 document.getElementById('filter-idle')?.addEventListener('change', _refilterSessions);
+document.getElementById('sort-sessions')?.addEventListener('change', _refilterSessions);
 
 function renderSessionsAggregate(sessions, el) {
   const totalSessions = sessions.length;
@@ -6314,12 +6391,15 @@ function renderSessionsAggregate(sessions, el) {
 
   el.innerHTML = '';
 
+  const totalDiskBytes = sessions.reduce((sum, s) => sum + (s.total_bytes || 0), 0);
+
   const cards = [
     { label: 'Sessions', value: totalSessions.toLocaleString() + (activeSessions > 0 ? ` (${activeSessions} active)` : '') },
     { label: 'Total Tokens', value: totalTokens.toLocaleString() },
     { label: 'Input', value: totalInput.toLocaleString() },
     { label: 'Cached', value: totalCached.toLocaleString() },
     { label: 'Output', value: totalOutput.toLocaleString() },
+    { label: 'Disk', value: _fmtBytes(totalDiskBytes) },
   ];
 
   for (const c of cards) {
@@ -6345,12 +6425,41 @@ function renderSessionsList(sessions, el) {
     return;
   }
 
+  // Sort sessions based on dropdown
+  const sortVal = document.getElementById('sort-sessions')?.value || 'date-desc';
+  const sorted = [...sessions];
+  const [field, dir] = sortVal.split('-');
+  const asc = dir === 'asc';
+  sorted.sort((a, b) => {
+    let va, vb;
+    switch (field) {
+      case 'date':
+        va = a.created_at || '';
+        vb = b.created_at || '';
+        return asc ? va.localeCompare(vb) : vb.localeCompare(va);
+      case 'cost':
+        va = a.estimated_cost || 0;
+        vb = b.estimated_cost || 0;
+        break;
+      case 'size':
+        va = a.total_bytes || 0;
+        vb = b.total_bytes || 0;
+        break;
+      case 'turns':
+        va = a.turns || 0;
+        vb = b.turns || 0;
+        break;
+      default: return 0;
+    }
+    return asc ? va - vb : vb - va;
+  });
+
   const currentSessionId = (document.getElementById('sb-session').textContent || '').trim();
 
   const showAbandoned = document.getElementById('filter-abandoned')?.checked ?? true;
   const showIdle = document.getElementById('filter-idle')?.checked ?? true;
 
-  for (const s of sessions) {
+  for (const s of sorted) {
     const shortId = (s.session_id || '').substring(0, 8);
     const isCurrent = currentSessionId && s.session_id && s.session_id.startsWith(currentSessionId);
 
@@ -6496,9 +6605,9 @@ function renderSessionsList(sessions, el) {
       meta.appendChild(cost);
     }
 
-    // Media stats row (recordings, annotations, clips, size)
+    // Media stats row (recordings, annotations, clips) + total session size
     const hasMedia = (s.recordings > 0 || s.annotations > 0 || s.clips > 0);
-    if (hasMedia) {
+    if (hasMedia || s.total_bytes > 0) {
       const mediaMeta = document.createElement('div');
       mediaMeta.className = 'sc-meta sc-media';
       const addMediaField = (label, value, color) => {
@@ -6517,7 +6626,7 @@ function renderSessionsList(sessions, el) {
       if (s.recordings > 0) addMediaField('recordings', s.recordings, 'var(--blue)');
       if (s.annotations > 0) addMediaField('annotations', s.annotations, 'var(--peach)');
       if (s.clips > 0) addMediaField('clips', s.clips, 'var(--peach)');
-      if (s.recording_bytes > 0) addMediaField('size', _fmtBytes(s.recording_bytes), 'var(--overlay1)');
+      if (s.total_bytes > 0) addMediaField('size', _fmtBytes(s.total_bytes), 'var(--overlay1)');
       card.appendChild(mediaMeta);
     }
 

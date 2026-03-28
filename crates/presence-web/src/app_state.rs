@@ -1504,7 +1504,7 @@ mod tests {
     #[test]
     fn badge_on_approval_when_not_activity_tab() {
         let mut s = AppState::new();
-        s.active_tab = "usage".to_string();
+        s.active_tab = "stats".to_string();
         let msg = json!({"event": "approval_required", "id": 1, "command": "test", "category": "exec"});
         let cmds = s.handle_message(&msg);
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::ShowBadge { tab, .. } if tab == "activity")));
@@ -1667,9 +1667,9 @@ mod tests {
     #[test]
     fn set_active_tab() {
         let mut s = AppState::new();
-        let cmds = s.set_active_tab("usage");
+        let cmds = s.set_active_tab("stats");
         assert!(cmds.is_empty()); // no badge to clear
-        assert_eq!(s.active_tab, "usage");
+        assert_eq!(s.active_tab, "stats");
 
         let cmds = s.set_active_tab("activity");
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::HideBadge { tab } if tab == "activity")));

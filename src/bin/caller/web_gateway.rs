@@ -739,6 +739,9 @@ fn list_sessions() -> String {
         let mut recording_bytes: u64 = 0;
         let mut annotation_count: u64 = 0;
         let mut clip_count: u64 = 0;
+        let mut frames_bytes: u64 = 0;
+        let mut turns_bytes: u64 = 0;
+        let mut logs_bytes: u64 = 0;
 
         let recordings_dir = dir.join("recordings");
         if recordings_dir.is_dir() {
@@ -774,10 +777,40 @@ fn list_sessions() -> String {
                             clip_ids.insert(name[..pos].to_string());
                         }
                     }
+                    if let Ok(m) = fe.metadata() {
+                        if m.is_file() {
+                            frames_bytes += m.len();
+                        }
+                    }
                 }
                 clip_count = clip_ids.len() as u64;
             }
         }
+
+        // Turns directory size
+        let turns_dir = dir.join("turns");
+        if turns_dir.is_dir() {
+            if let Ok(td) = std::fs::read_dir(&turns_dir) {
+                for te in td.flatten() {
+                    if let Ok(m) = te.metadata() {
+                        if m.is_file() {
+                            turns_bytes += m.len();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Root-level log files size
+        for name in &["session.jsonl", "session_meta.json", "summary.json", "conversation.jsonl"] {
+            if let Ok(m) = std::fs::metadata(dir.join(name)) {
+                if m.is_file() {
+                    logs_bytes += m.len();
+                }
+            }
+        }
+
+        let total_bytes = recording_bytes + frames_bytes + turns_bytes + logs_bytes;
 
         // Refine status for sessions that never did model work:
         // - "idle": had some activity (recordings, display, task) but no model turns
@@ -829,6 +862,10 @@ fn list_sessions() -> String {
             "recording_bytes": recording_bytes,
             "annotations": annotation_count,
             "clips": clip_count,
+            "frames_bytes": frames_bytes,
+            "turns_bytes": turns_bytes,
+            "logs_bytes": logs_bytes,
+            "total_bytes": total_bytes,
         }));
     }
 
@@ -2829,7 +2866,7 @@ mod tests {
         assert!(!APP_HTML.is_empty());
         assert!(APP_HTML.contains("<!DOCTYPE html>"));
         assert!(APP_HTML.contains("tab-activity"));
-        assert!(APP_HTML.contains("tab-usage"));
+        assert!(APP_HTML.contains("tab-stats"));
         assert!(APP_HTML.contains("tab-terminal"));
         assert!(APP_HTML.contains("tab-displays"));
     }
