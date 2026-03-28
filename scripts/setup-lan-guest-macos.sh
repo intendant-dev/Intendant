@@ -39,6 +39,7 @@ parse_args() {
         case "$1" in
             --port)    HTTPS_PORT="$2"; shift 2 ;;
             --backend) BACKEND="$2"; shift 2 ;;
+            --lan-ip)  LAN_IP="$2"; shift 2 ;;
             --recert)  ACTION="recert"; shift ;;
             --force)   FORCE=true; shift ;;
             --remove)  ACTION="remove"; shift ;;

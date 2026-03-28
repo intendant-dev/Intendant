@@ -1,31 +1,34 @@
 #!/usr/bin/env bash
 #
-# Intendant LAN Access Setup for macOS hosts with a UTM Linux guest.
+# Intendant LAN Access Setup for macOS hosts with a VM guest (Linux or macOS).
+# Supports multiple VMs — each gets its own tunnel, ports, and certificates.
 #
 # Usage:
 #   ./setup-lan-macos.sh              # Interactive setup wizard
-#   ./setup-lan-macos.sh --remove     # Uninstall everything
+#   ./setup-lan-macos.sh --list       # Show configured VMs
 #   ./setup-lan-macos.sh --recert     # Regenerate server cert (IP changed)
+#   ./setup-lan-macos.sh --remove     # Remove a VM's LAN setup
 #
 set -euo pipefail
 
-LAUNCHD_LABEL="com.intendant.tunnel"
 SETUP_SCRIPT_NAME="setup-lan.sh"
+GUEST_OS="linux"
 
 REAL_USER="${SUDO_USER:-$(whoami)}"
 REAL_HOME=$(eval echo "~$REAL_USER")
-CONFIG_FILE="$REAL_HOME/.intendant-lan.conf"
-LAUNCHD_PLIST="$REAL_HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+CONFIG_DIR="$REAL_HOME/.intendant-lan"
 
 ACTION="setup"
 FORCE=false
 
-# State — populated by wizard or loaded from config
+# Instance state — populated by wizard, select_instance, or load_config
+INSTANCE_SLUG=""
+INSTANCE_NAME=""
 VM_IP=""
 VM_USER=""
 HTTPS_PORT=8443
 CERT_PORT=9999
-NET_MODE=""     # "shared" or "bridged"
+NET_MODE=""
 LAN_IFACE=""
 LAN_IP=""
 
@@ -34,13 +37,14 @@ info()  { echo ":: $*"; }
 warn()  { echo "!! $*" >&2; }
 
 usage() {
-    sed -n '3,9p' "$0" | sed 's/^# \?//'
+    sed -n '3,11p' "$0" | sed 's/^# \?//'
     exit 0
 }
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --list)    ACTION="list"; shift ;;
             --remove)  ACTION="remove"; shift ;;
             --recert)  ACTION="recert"; shift ;;
             --force)   FORCE=true; shift ;;
@@ -66,23 +70,171 @@ as_user() {
     fi
 }
 
+set_guest_script() {
+    if [[ "$GUEST_OS" == "macos" ]]; then
+        SETUP_SCRIPT_NAME="setup-lan-guest-macos.sh"
+    else
+        SETUP_SCRIPT_NAME="setup-lan.sh"
+    fi
+}
+
+# ── Instance management ──
+
+ip_to_slug() {
+    echo "$1" | tr '.' '-'
+}
+
+instance_config() { echo "$CONFIG_DIR/$INSTANCE_SLUG.conf"; }
+instance_label()  { echo "com.intendant.tunnel.$INSTANCE_SLUG"; }
+instance_plist()  { echo "$REAL_HOME/Library/LaunchAgents/$(instance_label).plist"; }
+
+next_free_port() {
+    local base=$1 field=$2
+    local used=()
+    if [[ -d "$CONFIG_DIR" ]]; then
+        for conf in "$CONFIG_DIR"/*.conf; do
+            [[ -f "$conf" ]] || continue
+            # Don't count the current instance's own port during reconfiguration
+            [[ -n "$INSTANCE_SLUG" && "$conf" == "$CONFIG_DIR/$INSTANCE_SLUG.conf" ]] && continue
+            local port
+            port=$(grep "^${field}=" "$conf" 2>/dev/null | cut -d= -f2)
+            [[ -n "$port" ]] && used+=("$port")
+        done
+    fi
+    if [[ ${#used[@]} -eq 0 ]]; then
+        echo "$base"
+        return
+    fi
+    local candidate=$base
+    while printf '%s\n' "${used[@]}" | grep -qx "$candidate"; do
+        candidate=$((candidate + 1))
+    done
+    echo "$candidate"
+}
+
+select_instance() {
+    local configs=()
+    if [[ -d "$CONFIG_DIR" ]]; then
+        for conf in "$CONFIG_DIR"/*.conf; do
+            [[ -f "$conf" ]] || continue
+            configs+=("$conf")
+        done
+    fi
+
+    if [[ ${#configs[@]} -eq 0 ]]; then
+        die "no VMs configured — run the setup wizard first"
+    fi
+
+    if [[ ${#configs[@]} -eq 1 ]]; then
+        INSTANCE_SLUG=$(basename "${configs[0]}" .conf)
+        local _name _ip
+        _name=$(grep '^INSTANCE_NAME=' "${configs[0]}" 2>/dev/null | cut -d'"' -f2)
+        _ip=$(grep '^VM_IP=' "${configs[0]}" 2>/dev/null | cut -d'"' -f2)
+        local display="$_ip"
+        [[ -n "$_name" ]] && display="$_name ($_ip)"
+        info "using $display"
+        return
+    fi
+
+    echo ""
+    echo "  Which VM?"
+    echo ""
+    local i=0
+    for conf in "${configs[@]}"; do
+        i=$((i + 1))
+        local _name _ip _os _port
+        _name=$(grep '^INSTANCE_NAME=' "$conf" 2>/dev/null | cut -d'"' -f2)
+        _ip=$(grep '^VM_IP=' "$conf" 2>/dev/null | cut -d'"' -f2)
+        _os=$(grep '^GUEST_OS=' "$conf" 2>/dev/null | cut -d'"' -f2)
+        _port=$(grep '^HTTPS_PORT=' "$conf" 2>/dev/null | cut -d= -f2)
+        local display="$_ip"
+        [[ -n "$_name" ]] && display="$_name ($_ip)"
+        echo "    $i) $display — $_os, port $_port"
+    done
+    echo ""
+
+    while true; do
+        local choice
+        read -rp "  Choose [1-${#configs[@]}]: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#configs[@]} )); then
+            INSTANCE_SLUG=$(basename "${configs[$((choice - 1))]}" .conf)
+            return
+        fi
+        echo "  Invalid choice, try again."
+    done
+}
+
+# ── Legacy migration ──
+
+migrate_legacy() {
+    local old="$REAL_HOME/.intendant-lan.conf"
+    [[ -f "$old" ]] || return 0
+
+    info "migrating existing LAN config to multi-VM format..."
+    mkdir -p "$CONFIG_DIR"
+    chown "$REAL_USER" "$CONFIG_DIR" 2>/dev/null || true
+
+    # shellcheck disable=SC1090
+    source "$old"
+
+    # Fill in fields that didn't exist in the old format
+    CERT_PORT="${CERT_PORT:-9999}"
+    INSTANCE_NAME="${INSTANCE_NAME:-}"
+    GUEST_OS="${GUEST_OS:-linux}"
+    INSTANCE_SLUG=$(ip_to_slug "$VM_IP")
+    set_guest_script
+
+    save_config
+
+    # Migrate launchd plist (old format used un-slugged label)
+    local old_plist="$REAL_HOME/Library/LaunchAgents/com.intendant.tunnel.plist"
+    if [[ -f "$old_plist" ]]; then
+        as_user launchctl unload "$old_plist" 2>/dev/null || true
+        rm -f "$old_plist"
+        if [[ "$NET_MODE" == "shared" ]]; then
+            setup_tunnel
+        fi
+    fi
+
+    rm -f "$old" "$REAL_HOME/.intendant-tunnel.log"
+    info "migrated → $CONFIG_DIR/$INSTANCE_SLUG.conf"
+
+    # Reset state so it doesn't leak into subsequent operations
+    INSTANCE_SLUG=""
+    VM_IP=""
+    VM_USER=""
+    HTTPS_PORT=8443
+    CERT_PORT=9999
+    NET_MODE=""
+    INSTANCE_NAME=""
+    GUEST_OS="linux"
+    SETUP_SCRIPT_NAME="setup-lan.sh"
+}
+
 # ── Config persistence ──
 
 save_config() {
-    cat > "$CONFIG_FILE" <<CFG
+    mkdir -p "$CONFIG_DIR"
+    chown "$REAL_USER" "$CONFIG_DIR" 2>/dev/null || true
+    cat > "$(instance_config)" <<CFG
 VM_IP="$VM_IP"
 VM_USER="$VM_USER"
 HTTPS_PORT=$HTTPS_PORT
+CERT_PORT=$CERT_PORT
 NET_MODE="$NET_MODE"
 LAN_IFACE="$LAN_IFACE"
+GUEST_OS="$GUEST_OS"
+INSTANCE_NAME="$INSTANCE_NAME"
 CFG
-    chown "$REAL_USER" "$CONFIG_FILE" 2>/dev/null || true
+    chown "$REAL_USER" "$(instance_config)" 2>/dev/null || true
 }
 
 load_config() {
-    [[ -f "$CONFIG_FILE" ]] || return 1
+    local conf
+    conf="$(instance_config)"
+    [[ -f "$conf" ]] || return 1
     # shellcheck disable=SC1090
-    source "$CONFIG_FILE"
+    source "$conf"
     return 0
 }
 
@@ -146,18 +298,23 @@ ensure_ssh_keys() {
 setup_tunnel() {
     info "setting up SSH tunnel service..."
 
+    local label plist
+    label=$(instance_label)
+    plist=$(instance_plist)
+
+    mkdir -p "$CONFIG_DIR"
     as_user mkdir -p "$REAL_HOME/Library/LaunchAgents"
 
     # Unload existing if present
-    as_user launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
+    as_user launchctl unload "$plist" 2>/dev/null || true
 
-    cat > "$LAUNCHD_PLIST" <<PLIST
+    cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>$LAUNCHD_LABEL</string>
+    <string>$label</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/ssh</string>
@@ -179,25 +336,27 @@ setup_tunnel() {
     <key>RunAtLoad</key>
     <true/>
     <key>StandardErrorPath</key>
-    <string>${REAL_HOME}/.intendant-tunnel.log</string>
+    <string>${CONFIG_DIR}/${INSTANCE_SLUG}.log</string>
 </dict>
 </plist>
 PLIST
-    chown "$REAL_USER" "$LAUNCHD_PLIST" 2>/dev/null || true
+    chown "$REAL_USER" "$plist" 2>/dev/null || true
 
-    as_user launchctl load "$LAUNCHD_PLIST"
+    as_user launchctl load "$plist"
     info "tunnel service started — forwarding 0.0.0.0:{$HTTPS_PORT,$CERT_PORT} → VM"
 }
 
 remove_tunnel() {
-    if [[ -f "$LAUNCHD_PLIST" ]]; then
-        as_user launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
-        rm -f "$LAUNCHD_PLIST"
+    local plist
+    plist=$(instance_plist)
+    if [[ -f "$plist" ]]; then
+        as_user launchctl unload "$plist" 2>/dev/null || true
+        rm -f "$plist"
         info "tunnel service removed"
     else
         info "no tunnel service found"
     fi
-    rm -f "$REAL_HOME/.intendant-tunnel.log"
+    rm -f "$CONFIG_DIR/$INSTANCE_SLUG.log"
 }
 
 # ── Interactive wizard ──
@@ -233,39 +392,103 @@ ask_choice() {
     done
 }
 
+print_existing() {
+    [[ -d "$CONFIG_DIR" ]] || return 0
+    local found=false
+    for conf in "$CONFIG_DIR"/*.conf; do
+        [[ -f "$conf" ]] || continue
+        if ! $found; then
+            echo ""
+            echo "  Already configured:"
+            found=true
+        fi
+        local _name _ip _os _port
+        _name=$(grep '^INSTANCE_NAME=' "$conf" 2>/dev/null | cut -d'"' -f2)
+        _ip=$(grep '^VM_IP=' "$conf" 2>/dev/null | cut -d'"' -f2)
+        _os=$(grep '^GUEST_OS=' "$conf" 2>/dev/null | cut -d'"' -f2)
+        _port=$(grep '^HTTPS_PORT=' "$conf" 2>/dev/null | cut -d= -f2)
+        local display="$_ip"
+        [[ -n "$_name" ]] && display="$_name ($_ip)"
+        echo "    • $display — $_os, port $_port"
+    done
+}
+
 run_wizard() {
     echo ""
     echo "════════════════════════════════════════════════════════"
-    echo "  Intendant LAN Access Setup (macOS → UTM)"
+    echo "  Intendant LAN Access Setup (macOS Host)"
     echo "════════════════════════════════════════════════════════"
 
-    # Step 1: Network mode
-    ask_choice "How is your UTM VM networked?" \
-        "Shared Network (NAT — default UTM setting)" \
+    print_existing
+
+    # Step 1: Guest OS
+    ask_choice "What OS is your VM running?" \
+        "Linux (Debian/Ubuntu)" \
+        "macOS"
+    local os_choice=$?
+    if [[ "$os_choice" -eq 0 ]]; then
+        GUEST_OS="linux"
+    else
+        GUEST_OS="macos"
+    fi
+    set_guest_script
+
+    # Step 2: Network mode
+    ask_choice "How is your VM networked?" \
+        "Shared Network (NAT — default VM setting)" \
         "Bridged — VM has its own LAN IP"
     local net_choice=$?
-
     if [[ "$net_choice" -eq 0 ]]; then
         NET_MODE="shared"
     else
         NET_MODE="bridged"
     fi
 
-    # Step 2: VM details
+    # Step 3: VM details
     echo ""
     VM_IP=$(ask "VM IP address")
     [[ -n "$VM_IP" ]] || die "IP address is required"
 
-    VM_USER=$(ask "SSH username on the VM" "$REAL_USER")
+    # Check for existing config with this IP
+    INSTANCE_SLUG=$(ip_to_slug "$VM_IP")
+    local is_reconfig=false
+    local default_user="$REAL_USER"
+    if [[ -f "$(instance_config)" ]]; then
+        local _name _os _port
+        _name=$(grep '^INSTANCE_NAME=' "$(instance_config)" 2>/dev/null | cut -d'"' -f2)
+        _os=$(grep '^GUEST_OS=' "$(instance_config)" 2>/dev/null | cut -d'"' -f2)
+        _port=$(grep '^HTTPS_PORT=' "$(instance_config)" 2>/dev/null | cut -d= -f2)
+        local display="$VM_IP"
+        [[ -n "$_name" ]] && display="$_name ($VM_IP)"
+        warn "already configured: $display — $_os, port $_port"
+        local replace
+        replace=$(ask "Reconfigure this VM? (y/n)" "y")
+        [[ "$replace" == "y" ]] || die "setup cancelled"
+        is_reconfig=true
+        # Load defaults from existing config (ports, name, user)
+        default_user=$(grep '^VM_USER=' "$(instance_config)" 2>/dev/null | cut -d'"' -f2)
+        default_user="${default_user:-$REAL_USER}"
+        HTTPS_PORT=$(grep '^HTTPS_PORT=' "$(instance_config)" 2>/dev/null | cut -d= -f2)
+        HTTPS_PORT="${HTTPS_PORT:-8443}"
+        CERT_PORT=$(grep '^CERT_PORT=' "$(instance_config)" 2>/dev/null | cut -d= -f2)
+        CERT_PORT="${CERT_PORT:-9999}"
+        INSTANCE_NAME=$(grep '^INSTANCE_NAME=' "$(instance_config)" 2>/dev/null | cut -d'"' -f2)
+    fi
 
-    # Step 3: Test SSH
+    VM_USER=$(ask "SSH username on the VM" "$default_user")
+
+    # Step 4: Test SSH
     info "testing SSH connection to ${VM_USER}@${VM_IP}..."
     if ! test_ssh; then
         warn "could not connect via SSH"
         echo ""
         echo "  Make sure:"
         echo "    - The VM is running"
-        echo "    - SSH server is installed: sudo apt install openssh-server"
+        if [[ "$GUEST_OS" == "linux" ]]; then
+            echo "    - SSH server is installed: sudo apt install openssh-server"
+        else
+            echo "    - Remote Login is enabled: System Settings → General → Sharing → Remote Login"
+        fi
         echo "    - You can SSH manually: ssh ${VM_USER}@${VM_IP}"
         echo ""
         echo "  If you were prompted for a password above and it was rejected,"
@@ -307,20 +530,32 @@ run_wizard() {
         fi
     fi
 
-    # Step 4: Port
+    # Step 5: Port
     echo ""
-    HTTPS_PORT=$(ask "HTTPS port for phone access" "8443")
+    if ! $is_reconfig; then
+        local suggested_https
+        suggested_https=$(next_free_port 8443 HTTPS_PORT)
+        HTTPS_PORT=$(ask "HTTPS port for phone access" "$suggested_https")
+        CERT_PORT=$(next_free_port 9999 CERT_PORT)
+    else
+        HTTPS_PORT=$(ask "HTTPS port for phone access" "$HTTPS_PORT")
+    fi
 
-    # Step 5: Detect host network
+    # Step 6: Name
+    INSTANCE_NAME=$(ask "Name for this VM (optional)" "${INSTANCE_NAME:-}")
+
+    # Step 7: Detect host network
     detect_lan_iface
     detect_lan_ip
 
-    # Step 6: Confirm
+    # Step 8: Confirm
     echo ""
     echo "════════════════════════════════════════════════════════"
     echo "  Setup Summary"
     echo "════════════════════════════════════════════════════════"
     echo ""
+    [[ -n "$INSTANCE_NAME" ]] && echo "  Name:          $INSTANCE_NAME"
+    echo "  Guest OS:      $GUEST_OS"
     echo "  Network mode:  $NET_MODE"
     echo "  VM address:    ${VM_USER}@${VM_IP}"
     echo "  Host LAN IP:   $LAN_IP"
@@ -335,7 +570,7 @@ run_wizard() {
     confirm=$(ask "Proceed with setup? (y/n)" "y")
     [[ "$confirm" == "y" ]] || exit 0
 
-    # Step 7: Execute
+    # Step 9: Execute
     echo ""
 
     # SSH tunnel for shared networking (before guest setup so cert port is reachable)
@@ -344,7 +579,7 @@ run_wizard() {
     fi
 
     # UTM shared networking often lacks IPv6 routing — tell apt to use IPv4
-    if [[ "$NET_MODE" == "shared" ]]; then
+    if [[ "$NET_MODE" == "shared" && "$GUEST_OS" == "linux" ]]; then
         info "configuring apt to prefer IPv4 on VM..."
         run_on_guest "echo 'Acquire::ForceIPv4 \"true\";' | sudo tee /etc/apt/apt.conf.d/99force-ipv4 >/dev/null"
     fi
@@ -353,7 +588,7 @@ run_wizard() {
     # (Ctrl+C to stop), which causes a non-zero exit that would skip save_config
     # under set -e if we waited until after run_on_guest.
     save_config
-    info "config saved to $CONFIG_FILE"
+    info "config saved to $(instance_config)"
 
     info "copying setup script to VM..."
     copy_to_guest
@@ -361,7 +596,11 @@ run_wizard() {
     info "running setup on VM..."
     local guest_args="--port $HTTPS_PORT"
     [[ "$NET_MODE" == "shared" ]] && guest_args="$guest_args --lan-ip $LAN_IP"
-    run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME $guest_args" || true
+    if [[ "$GUEST_OS" == "linux" ]]; then
+        run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME $guest_args" || true
+    else
+        run_on_guest "/tmp/$SETUP_SCRIPT_NAME $guest_args" || true
+    fi
 
     echo ""
     echo "════════════════════════════════════════════════════════"
@@ -372,14 +611,40 @@ run_wizard() {
     echo ""
     if [[ "$NET_MODE" == "shared" ]]; then
         info "SSH tunnel survives reboot (launchd service)"
-        info "  Logs: ~/.intendant-tunnel.log"
+        info "  Logs: $CONFIG_DIR/$INSTANCE_SLUG.log"
     fi
 }
 
 # ── Maintenance ──
 
+run_list() {
+    if [[ ! -d "$CONFIG_DIR" ]] || ! ls "$CONFIG_DIR"/*.conf &>/dev/null; then
+        info "no VMs configured"
+        return
+    fi
+
+    echo ""
+    echo "  Configured VMs:"
+    echo ""
+    for conf in "$CONFIG_DIR"/*.conf; do
+        [[ -f "$conf" ]] || continue
+        local _name _ip _os _port _net
+        _name=$(grep '^INSTANCE_NAME=' "$conf" 2>/dev/null | cut -d'"' -f2)
+        _ip=$(grep '^VM_IP=' "$conf" 2>/dev/null | cut -d'"' -f2)
+        _os=$(grep '^GUEST_OS=' "$conf" 2>/dev/null | cut -d'"' -f2)
+        _port=$(grep '^HTTPS_PORT=' "$conf" 2>/dev/null | cut -d= -f2)
+        _net=$(grep '^NET_MODE=' "$conf" 2>/dev/null | cut -d'"' -f2)
+        local display="$_ip"
+        [[ -n "$_name" ]] && display="$_name ($_ip)"
+        echo "    • $display — $_os, $_net, port $_port"
+    done
+    echo ""
+}
+
 run_recert() {
-    load_config || die "no saved config found — run the setup wizard first"
+    select_instance
+    load_config || die "could not load config"
+    set_guest_script
 
     detect_lan_iface
     detect_lan_ip
@@ -397,30 +662,45 @@ run_recert() {
     copy_to_guest
 
     info "regenerating server cert on VM..."
-    run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME $recert_args"
+    if [[ "$GUEST_OS" == "linux" ]]; then
+        run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME $recert_args"
+    else
+        run_on_guest "/tmp/$SETUP_SCRIPT_NAME $recert_args"
+    fi
 
     echo ""
     info "done — phone connects to: https://${LAN_IP}:${HTTPS_PORT}"
 }
 
 run_remove() {
+    select_instance
     if ! load_config; then
-        warn "no saved config found — using defaults"
-        HTTPS_PORT=8443
-        NET_MODE="shared"
+        warn "could not load config — removing local setup only"
+        remove_tunnel
+        rm -f "$(instance_config)"
+        info "done (VM-side config may need manual removal)"
+        return
     fi
+    set_guest_script
 
-    info "removing intendant LAN setup..."
+    local display="$VM_IP"
+    [[ -n "$INSTANCE_NAME" ]] && display="$INSTANCE_NAME ($VM_IP)"
+    info "removing LAN setup for $display..."
 
     if [[ "$NET_MODE" == "shared" ]]; then
         remove_tunnel
     fi
 
     info "removing VM-side config..."
-    run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME --remove" 2>/dev/null || \
-        warn "could not remove VM config — run 'sudo setup-lan.sh --remove' manually in the VM"
+    if [[ "$GUEST_OS" == "linux" ]]; then
+        run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME --remove" 2>/dev/null || \
+            warn "could not remove VM config — run 'sudo setup-lan.sh --remove' manually in the VM"
+    else
+        run_on_guest "/tmp/$SETUP_SCRIPT_NAME --remove" 2>/dev/null || \
+            warn "could not remove VM config — run 'setup-lan-guest-macos.sh --remove' manually in the VM"
+    fi
 
-    rm -f "$CONFIG_FILE"
+    rm -f "$(instance_config)"
     info "done"
 }
 
@@ -429,9 +709,11 @@ run_remove() {
 main() {
     parse_args "$@"
     check_macos
+    migrate_legacy
 
     case "$ACTION" in
         setup)  run_wizard ;;
+        list)   run_list ;;
         recert) run_recert ;;
         remove) run_remove ;;
     esac
