@@ -882,6 +882,77 @@ fn list_sessions() -> String {
     serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// Delete session data: entire session, media, recordings, frames, or turns.
+/// Returns a JSON result with `ok` and `bytes_freed`.
+fn delete_session_data(session_id: &str, target: &str) -> String {
+    // Path traversal protection
+    if session_id.contains("..") || session_id.contains('/') || session_id.contains('\\') {
+        return serde_json::json!({"ok": false, "error": "invalid session id"}).to_string();
+    }
+
+    let dir = match resolve_session_dir(session_id) {
+        Some(d) => d,
+        None => return serde_json::json!({"ok": false, "error": "session not found"}).to_string(),
+    };
+
+    let dir_byte_size = |path: &std::path::Path| -> u64 {
+        let mut total = 0u64;
+        if path.is_dir() {
+            fn walk(dir: &std::path::Path, total: &mut u64) {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        if p.is_dir() {
+                            walk(&p, total);
+                        } else if let Ok(m) = p.metadata() {
+                            *total += m.len();
+                        }
+                    }
+                }
+            }
+            walk(path, &mut total);
+        }
+        total
+    };
+
+    match target {
+        "session" => {
+            let bytes = dir_byte_size(&dir);
+            match std::fs::remove_dir_all(&dir) {
+                Ok(_) => serde_json::json!({"ok": true, "deleted": "session", "bytes_freed": bytes}).to_string(),
+                Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+            }
+        }
+        "media" => {
+            let rec_dir = dir.join("recordings");
+            let frames_dir = dir.join("frames");
+            let bytes = dir_byte_size(&rec_dir) + dir_byte_size(&frames_dir);
+            let _ = std::fs::remove_dir_all(&rec_dir);
+            let _ = std::fs::remove_dir_all(&frames_dir);
+            serde_json::json!({"ok": true, "deleted": "media", "bytes_freed": bytes}).to_string()
+        }
+        "recordings" => {
+            let target_dir = dir.join("recordings");
+            let bytes = dir_byte_size(&target_dir);
+            let _ = std::fs::remove_dir_all(&target_dir);
+            serde_json::json!({"ok": true, "deleted": "recordings", "bytes_freed": bytes}).to_string()
+        }
+        "frames" => {
+            let target_dir = dir.join("frames");
+            let bytes = dir_byte_size(&target_dir);
+            let _ = std::fs::remove_dir_all(&target_dir);
+            serde_json::json!({"ok": true, "deleted": "frames", "bytes_freed": bytes}).to_string()
+        }
+        "turns" => {
+            let target_dir = dir.join("turns");
+            let bytes = dir_byte_size(&target_dir);
+            let _ = std::fs::remove_dir_all(&target_dir);
+            serde_json::json!({"ok": true, "deleted": "turns", "bytes_freed": bytes}).to_string()
+        }
+        _ => serde_json::json!({"ok": false, "error": "invalid target"}).to_string(),
+    }
+}
+
 /// Settings payload for GET/POST /api/settings.
 /// Flattened view of intendant.toml sections relevant to the web dashboard.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2570,6 +2641,28 @@ pub fn spawn_web_gateway(
                         }
 
                         let body = serde_json::to_string(&all_entries).unwrap_or("[]".to_string());
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("DELETE") && request_line.contains("/api/session/") {
+                        use tokio::io::AsyncWriteExt;
+                        let rest = request_line
+                            .split("/api/session/")
+                            .nth(1)
+                            .and_then(|r| r.split_whitespace().next())
+                            .unwrap_or("");
+                        let rest_parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+                        let session_id = rest_parts.first().copied().unwrap_or("");
+                        let target = rest_parts.get(1).copied().unwrap_or("session");
+                        let body = delete_session_data(session_id, target);
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\

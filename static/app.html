@@ -845,6 +845,53 @@ html, body {
   border-top: 1px solid var(--surface1);
   margin-top: 4px;
 }
+.session-card .sc-actions {
+  display: flex;
+  gap: 6px;
+  padding-top: 6px;
+  margin-top: 4px;
+  border-top: 1px solid var(--surface1);
+  position: relative;
+}
+.sc-delete-btn {
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--overlay0);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.sc-delete-btn:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+.sc-delete-menu {
+  position: absolute;
+  left: 0;
+  bottom: 100%;
+  margin-bottom: 4px;
+  background: var(--mantle);
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  padding: 4px 0;
+  z-index: 50;
+  min-width: 220px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+.sc-delete-menu-item {
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.sc-delete-menu-item:hover { background: var(--surface0); }
+.sc-delete-menu-item .size-hint { color: var(--overlay0); font-size: 11px; }
+.sc-delete-menu-item.danger { color: var(--red); }
 .session-card.dimmed {
   opacity: 0.45;
 }
@@ -6639,10 +6686,94 @@ function renderSessionsList(sessions, el) {
       card.appendChild(mediaMeta);
     }
 
+    // Delete actions row
+    if (s.total_bytes > 0 || !isCurrent) {
+      const actions = document.createElement('div');
+      actions.className = 'sc-actions';
+      const btn = document.createElement('button');
+      btn.className = 'sc-delete-btn';
+      btn.textContent = 'Delete...';
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        // Close any existing menu
+        document.querySelectorAll('.sc-delete-menu').forEach(m => m.remove());
+        const menu = document.createElement('div');
+        menu.className = 'sc-delete-menu';
+
+        const addItem = (label, target, bytes, danger) => {
+          const item = document.createElement('div');
+          item.className = 'sc-delete-menu-item' + (danger ? ' danger' : '');
+          const txt = document.createElement('span');
+          txt.textContent = label;
+          item.appendChild(txt);
+          if (bytes > 0) {
+            const hint = document.createElement('span');
+            hint.className = 'size-hint';
+            hint.textContent = _fmtBytes(bytes);
+            item.appendChild(hint);
+          }
+          item.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            menu.remove();
+            deleteSessionData(s.session_id, target, label);
+          });
+          menu.appendChild(item);
+        };
+
+        if ((s.recording_bytes || 0) > 0) addItem('Delete recordings', 'recordings', s.recording_bytes);
+        if ((s.frames_bytes || 0) > 0) addItem('Delete frames', 'frames', s.frames_bytes);
+        if ((s.recording_bytes || 0) + (s.frames_bytes || 0) > 0) addItem('Delete all media', 'media', (s.recording_bytes || 0) + (s.frames_bytes || 0));
+        if ((s.turns_bytes || 0) > 0) addItem('Delete turn data', 'turns', s.turns_bytes);
+        if (!isCurrent) addItem('Delete session', 'session', s.total_bytes, true);
+
+        if (menu.children.length > 0) {
+          actions.appendChild(menu);
+          const close = (ev) => { if (!menu.contains(ev.target)) { menu.remove(); document.removeEventListener('click', close); } };
+          setTimeout(() => document.addEventListener('click', close), 0);
+        }
+      });
+      actions.appendChild(btn);
+      card.appendChild(actions);
+    }
+
     card.appendChild(meta);
     card.addEventListener('click', () => openSessionDetail(s.session_id, s.task || '(no task)'));
     el.appendChild(card);
   }
+}
+
+function deleteSessionData(sessionId, target, label) {
+  const shortId = sessionId.substring(0, 8);
+  if (!confirm(`${label} for session ${shortId}?\nThis cannot be undone.`)) return;
+
+  const url = target === 'session'
+    ? `/api/session/${sessionId}`
+    : `/api/session/${sessionId}/${target}`;
+
+  fetch(url, { method: 'DELETE' })
+    .then(r => r.json())
+    .then(result => {
+      if (!result.ok) { alert('Delete failed: ' + (result.error || 'unknown')); return; }
+      if (target === 'session') {
+        _cachedSessions = _cachedSessions.filter(s => s.session_id !== sessionId);
+      } else {
+        const s = _cachedSessions.find(s => s.session_id === sessionId);
+        if (s) {
+          const freed = result.bytes_freed || 0;
+          if (target === 'media' || target === 'recordings') {
+            s.recordings = 0; s.recording_bytes = 0;
+          }
+          if (target === 'media' || target === 'frames') {
+            s.annotations = 0; s.clips = 0; s.frames_bytes = 0;
+          }
+          if (target === 'turns') { s.turns_bytes = 0; }
+          s.total_bytes = Math.max(0, (s.total_bytes || 0) - freed);
+        }
+      }
+      renderSessionsAggregate(_cachedSessions, document.getElementById('sessions-aggregate'));
+      _refilterSessions();
+    })
+    .catch(e => alert('Delete failed: ' + e.message));
 }
 
 function openSessionDetail(sessionId, task) {
