@@ -507,7 +507,10 @@ EOF
 EOF
 
     cd "$serve_dir"
-    python3 -m http.server "$CERT_SERVE_PORT" --bind 0.0.0.0 2>/dev/null
+    python3 -m http.server "$CERT_SERVE_PORT" --bind 0.0.0.0 &
+    local http_pid=$!
+    trap "kill $http_pid 2>/dev/null; rm -rf '$serve_dir'" EXIT
+    wait $http_pid 2>/dev/null
     rm -rf "$serve_dir"
 }
 
