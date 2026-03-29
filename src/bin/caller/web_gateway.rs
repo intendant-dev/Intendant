@@ -927,27 +927,30 @@ fn delete_session_data(session_id: &str, target: &str) -> String {
             let rec_dir = dir.join("recordings");
             let frames_dir = dir.join("frames");
             let bytes = dir_byte_size(&rec_dir) + dir_byte_size(&frames_dir);
-            let _ = std::fs::remove_dir_all(&rec_dir);
-            let _ = std::fs::remove_dir_all(&frames_dir);
-            serde_json::json!({"ok": true, "deleted": "media", "bytes_freed": bytes}).to_string()
+            let mut errors = Vec::new();
+            if rec_dir.is_dir() {
+                if let Err(e) = std::fs::remove_dir_all(&rec_dir) { errors.push(format!("recordings: {}", e)); }
+            }
+            if frames_dir.is_dir() {
+                if let Err(e) = std::fs::remove_dir_all(&frames_dir) { errors.push(format!("frames: {}", e)); }
+            }
+            if errors.is_empty() {
+                serde_json::json!({"ok": true, "deleted": "media", "bytes_freed": bytes}).to_string()
+            } else {
+                serde_json::json!({"ok": false, "error": errors.join("; "), "bytes_freed": bytes}).to_string()
+            }
         }
-        "recordings" => {
-            let target_dir = dir.join("recordings");
+        "recordings" | "frames" | "turns" => {
+            let target_dir = dir.join(target);
             let bytes = dir_byte_size(&target_dir);
-            let _ = std::fs::remove_dir_all(&target_dir);
-            serde_json::json!({"ok": true, "deleted": "recordings", "bytes_freed": bytes}).to_string()
-        }
-        "frames" => {
-            let target_dir = dir.join("frames");
-            let bytes = dir_byte_size(&target_dir);
-            let _ = std::fs::remove_dir_all(&target_dir);
-            serde_json::json!({"ok": true, "deleted": "frames", "bytes_freed": bytes}).to_string()
-        }
-        "turns" => {
-            let target_dir = dir.join("turns");
-            let bytes = dir_byte_size(&target_dir);
-            let _ = std::fs::remove_dir_all(&target_dir);
-            serde_json::json!({"ok": true, "deleted": "turns", "bytes_freed": bytes}).to_string()
+            if !target_dir.is_dir() {
+                serde_json::json!({"ok": true, "deleted": target, "bytes_freed": 0}).to_string()
+            } else {
+                match std::fs::remove_dir_all(&target_dir) {
+                    Ok(_) => serde_json::json!({"ok": true, "deleted": target, "bytes_freed": bytes}).to_string(),
+                    Err(e) => serde_json::json!({"ok": false, "error": e.to_string(), "bytes_freed": 0}).to_string(),
+                }
+            }
         }
         _ => serde_json::json!({"ok": false, "error": "invalid target"}).to_string(),
     }
