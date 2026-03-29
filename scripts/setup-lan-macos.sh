@@ -609,11 +609,13 @@ run_wizard() {
     local guest_args="--port $HTTPS_PORT"
     [[ "$NET_MODE" == "shared" ]] && guest_args="$guest_args --lan-ip $LAN_IP --cert-port $CERT_PORT"
     guest_args="$guest_args --name '${INSTANCE_NAME:-$VM_IP}'"
-    local guest_ok=true
-    run_guest_script "$guest_args" || guest_ok=false
+    local guest_exit=0
+    run_guest_script "$guest_args" || guest_exit=$?
 
     echo ""
-    if $guest_ok; then
+    # Exit 0 = clean exit; >128 = killed by signal (Ctrl+C on cert server = normal)
+    # Exit 1-128 = script error (e.g. missing dependency)
+    if [[ $guest_exit -eq 0 || $guest_exit -gt 128 ]]; then
         echo "════════════════════════════════════════════════════════"
         echo "  Setup complete!"
         echo "════════════════════════════════════════════════════════"
