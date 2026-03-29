@@ -101,7 +101,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         addr.sin_addr.s_addr = inet_addr("127.0.0.1")
         addr.sin_port = UInt16(p).bigEndian
         let result = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
         }
         return result == 0
     }
@@ -116,7 +116,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         addr.sin_port = 0
         var addrCopy = addr
         let bindResult = withUnsafePointer(to: &addrCopy) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
         }
         guard bindResult == 0 else { return nil }
         var len = socklen_t(MemoryLayout<sockaddr_in>.size)
