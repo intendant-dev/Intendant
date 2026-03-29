@@ -74,7 +74,7 @@ class BackendSchemeHandler: NSObject, WKURLSchemeHandler {
 
 // MARK: - App Delegate
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate {
     var window: NSWindow!
     var webView: WKWebView!
     var backendProcess: Process?
@@ -93,6 +93,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         backendProcess?.terminate()
         backendProcess?.waitUntilExit()
+    }
+
+    // MARK: - WKUIDelegate (JS alert/confirm/prompt)
+
+    func webView(_ webView: WKWebView,
+                 runJavaScriptAlertPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping () -> Void) {
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+        completionHandler()
+    }
+
+    func webView(_ webView: WKWebView,
+                 runJavaScriptConfirmPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping (Bool) -> Void) {
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        completionHandler(alert.runModal() == .alertFirstButtonReturn)
+    }
+
+    func webView(_ webView: WKWebView,
+                 runJavaScriptTextInputPanelWithPrompt prompt: String,
+                 defaultText: String?,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping (String?) -> Void) {
+        let alert = NSAlert()
+        alert.messageText = prompt
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        input.stringValue = defaultText ?? ""
+        alert.accessoryView = input
+        completionHandler(alert.runModal() == .alertFirstButtonReturn ? input.stringValue : nil)
     }
 
     // MARK: - Backend
@@ -177,6 +216,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         config.userContentController.addUserScript(script)
 
         webView = WKWebView(frame: .zero, configuration: config)
+        webView.uiDelegate = self
         webView.customUserAgent = "Intendant/1.0"
 
         let screen = NSScreen.main ?? NSScreen.screens[0]
