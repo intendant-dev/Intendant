@@ -395,16 +395,16 @@ impl Agent {
 
         // macOS: use native screencapture (no display number needed)
         #[cfg(target_os = "macos")]
-        let status = {
+        let output = {
             Command::new("screencapture")
                 .args(["-x", &screenshot_path.to_string_lossy()])
-                .status()
+                .output()
                 .await?
         };
 
         // Linux / other: use ImageMagick import with X11 display
         #[cfg(not(target_os = "macos"))]
-        let status = {
+        let output = {
             let display = cmd.display.unwrap_or_else(|| {
                 std::env::var("DISPLAY")
                     .ok()
@@ -432,11 +432,11 @@ impl Agent {
             if let Some(ref xauth) = self.session_xauthority {
                 cmd_builder.env("XAUTHORITY", xauth);
             }
-            cmd_builder.status().await?
+            cmd_builder.output().await?
         };
 
-        let exit_code = status.code().unwrap_or(-1);
-        let process_status = if status.success() {
+        let exit_code = output.status.code().unwrap_or(-1);
+        let process_status = if output.status.success() {
             ProcessStatus::Completed
         } else {
             ProcessStatus::Failed
@@ -444,13 +444,31 @@ impl Agent {
 
         self.update_process_info(cmd.nonce, 0, process_status, exit_code)?;
 
-        Ok(serde_json::json!({
+        let mut result = serde_json::json!({
             "nonce": cmd.nonce,
             "exit_code": exit_code,
             "screenshot_path": screenshot_path.to_string_lossy(),
-            "success": status.success()
-        })
-        .to_string())
+            "success": output.status.success()
+        });
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let error_msg = if stderr.trim().is_empty() {
+                if cfg!(target_os = "macos") {
+                    "screencapture failed. Ensure Screen Recording permission is granted \
+                     in System Settings > Privacy & Security > Screen Recording for the \
+                     terminal app running intendant. A restart may be required after granting."
+                        .to_string()
+                } else {
+                    "Screenshot capture failed. Check DISPLAY and XAUTHORITY settings."
+                        .to_string()
+                }
+            } else {
+                stderr.trim().to_string()
+            };
+            result["error"] = serde_json::Value::String(error_msg);
+        }
+
+        Ok(result.to_string())
     }
 
     fn validate_path(path_str: &str) -> Result<PathBuf, AgentError> {

@@ -4018,7 +4018,40 @@ async fn auto_attach_display_frames(
     images
 }
 
-/// Try the CU-first path: send task to the fast CU model.
+//// Take a fresh screenshot of the user's display for CU-first routing.
+/// Used when the frame registry has no frames (browser streaming not active).
+async fn capture_display_screenshot(
+    log_dir: &std::path::Path,
+) -> Option<conversation::ImageData> {
+    let screenshot_path = log_dir.join("cu_reference.png");
+    let ok = if cfg!(target_os = "macos") {
+        tokio::process::Command::new("screencapture")
+            .args(["-x", &screenshot_path.to_string_lossy()])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    } else {
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
+        tokio::process::Command::new("import")
+            .args(["-window", "root", "-display", &display, &screenshot_path.to_string_lossy()])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    if !ok {
+        return None;
+    }
+    let data = std::fs::read(&screenshot_path).ok()?;
+    use base64::Engine;
+    Some(conversation::ImageData {
+        media_type: "image/png".to_string(),
+        data: base64::engine::general_purpose::STANDARD.encode(&data),
+    })
+}
+
+// Try the CU-first path: send task to the fast CU model.
 /// Returns None if CU is not available (no display, no provider).
 #[allow(clippy::too_many_arguments)]
 async fn try_cu_first(
@@ -4037,10 +4070,31 @@ async fn try_cu_first(
         ))
     });
 
-    if reference_images.is_empty() {
-        slog(session_log, |l| l.info("try_cu_first: no display images, returning None"));
-        return None;
-    }
+    let reference_images = if reference_images.is_empty() {
+        // No frames from browser streaming — try a fresh screenshot if user display
+        // is granted, so CU-first can work without the Stream button being active.
+        if std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok() {
+            slog(session_log, |l| {
+                l.info("try_cu_first: no registry frames, taking fresh screenshot")
+            });
+            match capture_display_screenshot(log_dir).await {
+                Some(img) => vec![img],
+                None => {
+                    slog(session_log, |l| {
+                        l.info("try_cu_first: fresh screenshot failed, returning None")
+                    });
+                    return None;
+                }
+            }
+        } else {
+            slog(session_log, |l| {
+                l.info("try_cu_first: no display images and no display grant, returning None")
+            });
+            return None;
+        }
+    } else {
+        reference_images.to_vec()
+    };
 
     let proj = Project::from_root(project_root.to_path_buf()).ok()?;
     let cu_provider = match provider::select_cu_provider(&proj.config.computer_use) {

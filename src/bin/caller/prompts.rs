@@ -82,13 +82,41 @@ fn resolve_system_prompt_inner(
         _ => None,
     };
 
-    match role_addition {
+    let combined = match role_addition {
         Some((filename, default)) => {
             let role_prompt = resolve_prompt(filename, default, project_root);
-            Ok(format!("{}\n\n{}", base_prompt, role_prompt))
+            format!("{}\n\n{}", base_prompt, role_prompt)
         }
-        None => Ok(base_prompt),
+        None => base_prompt,
+    };
+    Ok(substitute_platform(&combined))
+}
+
+/// Replace `{{PLATFORM}}` and `{{PLATFORM_DETAILS}}` placeholders with
+/// runtime OS information so the agent knows what tools are available.
+fn substitute_platform(prompt: &str) -> String {
+    if !prompt.contains("{{PLATFORM") {
+        return prompt.to_string();
     }
+    let (platform, details) = if cfg!(target_os = "macos") {
+        (
+            "macOS",
+            "You run as an unprivileged user. \
+             Screenshots use `screencapture`, input automation uses `cliclick`, \
+             and `osascript` is available for AppleScript. \
+             There is no X11 — do NOT use xdotool, xrandr, or import.",
+        )
+    } else {
+        (
+            "Debian 12",
+            "You run as an unprivileged user with passwordless sudo access \
+             and control over the desktop environment (XFCE4). \
+             Use `sudo` when commands require elevated privileges.",
+        )
+    };
+    prompt
+        .replace("{{PLATFORM}}", platform)
+        .replace("{{PLATFORM_DETAILS}}", details)
 }
 
 /// Resolve the presence layer system prompt via the standard 3-layer cascade.
@@ -211,36 +239,37 @@ mod tests {
     #[test]
     fn resolve_system_prompt_direct_role() {
         let result = resolve_system_prompt(&SubAgentRole::Custom("direct".into()), None).unwrap();
-        // Direct role should return just the base prompt (compiled-in default)
-        assert_eq!(result, DEFAULT_PROMPT);
+        // Direct role should return just the base prompt with platform substituted
+        assert_eq!(result, substitute_platform(DEFAULT_PROMPT));
+        assert!(!result.contains("{{PLATFORM"));
     }
 
     #[test]
     fn resolve_system_prompt_orchestrator_appends() {
         let result = resolve_system_prompt(&SubAgentRole::Orchestrator, None).unwrap();
-        assert!(result.contains(DEFAULT_PROMPT));
-        assert!(result.contains(DEFAULT_ORCHESTRATOR_PROMPT));
+        assert!(result.contains(&substitute_platform(DEFAULT_PROMPT)));
+        assert!(result.contains(&substitute_platform(DEFAULT_ORCHESTRATOR_PROMPT)));
         assert!(result.len() > DEFAULT_PROMPT.len());
     }
 
     #[test]
     fn resolve_system_prompt_research_appends() {
         let result = resolve_system_prompt(&SubAgentRole::Research, None).unwrap();
-        assert!(result.contains(DEFAULT_PROMPT));
+        assert!(result.contains(&substitute_platform(DEFAULT_PROMPT)));
         assert!(result.contains(DEFAULT_RESEARCH_PROMPT));
     }
 
     #[test]
     fn resolve_system_prompt_implementation_appends() {
         let result = resolve_system_prompt(&SubAgentRole::Implementation, None).unwrap();
-        assert!(result.contains(DEFAULT_PROMPT));
+        assert!(result.contains(&substitute_platform(DEFAULT_PROMPT)));
         assert!(result.contains(DEFAULT_IMPLEMENTATION_PROMPT));
     }
 
     #[test]
     fn resolve_system_prompt_testing_returns_base_only() {
         let result = resolve_system_prompt(&SubAgentRole::Testing, None).unwrap();
-        assert_eq!(result, DEFAULT_PROMPT);
+        assert_eq!(result, substitute_platform(DEFAULT_PROMPT));
     }
 
     #[test]
@@ -271,7 +300,7 @@ mod tests {
         // Base prompt not overridden — should use compiled-in default
 
         let result = resolve_system_prompt(&SubAgentRole::Orchestrator, Some(dir.path())).unwrap();
-        assert!(result.contains(DEFAULT_PROMPT));
+        assert!(result.contains(&substitute_platform(DEFAULT_PROMPT)));
         assert!(result.contains(custom_orch));
         assert!(!result.contains(DEFAULT_ORCHESTRATOR_PROMPT));
     }
@@ -292,16 +321,17 @@ mod tests {
     fn resolve_tools_prompt_direct_role() {
         let result =
             resolve_system_prompt_for_tools(&SubAgentRole::Custom("direct".into()), None).unwrap();
-        assert_eq!(result, DEFAULT_PROMPT_TOOLS);
+        assert_eq!(result, substitute_platform(DEFAULT_PROMPT_TOOLS));
         assert!(result.contains("Tool Calling Protocol"));
         assert!(!result.contains("JSON Schema"));
+        assert!(!result.contains("{{PLATFORM"));
     }
 
     #[test]
     fn resolve_tools_prompt_with_role_appends() {
         let result = resolve_system_prompt_for_tools(&SubAgentRole::Orchestrator, None).unwrap();
-        assert!(result.contains(DEFAULT_PROMPT_TOOLS));
-        assert!(result.contains(DEFAULT_ORCHESTRATOR_PROMPT));
+        assert!(result.contains(&substitute_platform(DEFAULT_PROMPT_TOOLS)));
+        assert!(result.contains(&substitute_platform(DEFAULT_ORCHESTRATOR_PROMPT)));
     }
 
     #[test]
