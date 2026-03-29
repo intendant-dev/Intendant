@@ -528,7 +528,7 @@ pub fn parse_segment_csv_pub(csv_path: &Path, segments_dir: &Path) -> Vec<Segmen
 fn parse_segment_csv(csv_path: &Path, segments_dir: &Path) -> Vec<SegmentInfo> {
     let content = match std::fs::read_to_string(csv_path) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(_) => String::new(),
     };
     let mut segments = Vec::new();
     for line in content.lines() {
@@ -550,6 +550,48 @@ fn parse_segment_csv(csv_path: &Path, segments_dir: &Path) -> Vec<SegmentInfo> {
             });
         }
     }
+
+    // Fallback: if segments.csv was empty or missing but segment files exist on
+    // disk, discover them directly.  This happens when ffmpeg was interrupted
+    // before flushing the CSV — the fMP4 segment files are still playable because
+    // fragmented MP4 stores its index (moof boxes) inline in each fragment rather
+    // than in a final moov atom, so each file is self-contained.
+    if segments.is_empty() {
+        if let Ok(entries) = std::fs::read_dir(segments_dir) {
+            let mut found: Vec<String> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.starts_with("seg_") && (name.ends_with(".mp4") || name.ends_with(".ts")) {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            found.sort();
+            // Without CSV timing data we estimate duration from file size and
+            // the configured segment duration as a rough upper bound per segment.
+            let fallback_dur = 60.0_f64;
+            let mut offset = 0.0_f64;
+            for name in found {
+                let path = segments_dir.join(&name);
+                let dur = if path.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+                    fallback_dur
+                } else {
+                    0.0
+                };
+                segments.push(SegmentInfo {
+                    filename: name,
+                    start_secs: offset,
+                    end_secs: offset + dur,
+                    path,
+                });
+                offset += dur;
+            }
+        }
+    }
+
     segments
 }
 
@@ -741,6 +783,21 @@ max_retention_hours = 48
     fn parse_segment_csv_missing_file() {
         let segments = parse_segment_csv(Path::new("/nonexistent/segments.csv"), Path::new("/tmp"));
         assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn parse_segment_csv_empty_discovers_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let csv = tmp.path().join("segments.csv");
+        std::fs::write(&csv, "").unwrap(); // empty CSV
+        std::fs::write(tmp.path().join("seg_00000.mp4"), b"fakedata").unwrap();
+        std::fs::write(tmp.path().join("seg_00001.mp4"), b"fakedata").unwrap();
+
+        let segments = parse_segment_csv(&csv, tmp.path());
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].filename, "seg_00000.mp4");
+        assert_eq!(segments[1].filename, "seg_00001.mp4");
+        assert!(segments[0].end_secs > 0.0);
     }
 
     #[test]
