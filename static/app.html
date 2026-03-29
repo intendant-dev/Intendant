@@ -760,6 +760,16 @@ html, body {
   cursor: pointer;
 }
 .sd-frame-lightbox img { max-width: 95vw; max-height: 95vh; object-fit: contain; }
+.sd-frame-group { padding: 0 8px 8px; }
+.sd-frame-group-header {
+  display: flex; align-items: center; gap: 6px; padding: 6px 0;
+  cursor: pointer; user-select: none; font-size: 12px; color: var(--subtext1);
+}
+.sd-frame-group-header:hover { color: var(--text); }
+.sd-frame-group-chevron { font-size: 11px; width: 12px; color: var(--overlay0); transition: transform 0.15s; }
+.sd-frame-group.collapsed .sd-frame-group-chevron { transform: rotate(-90deg); }
+.sd-frame-group.collapsed .sd-frames-gallery { display: none; }
+.sd-frame-group-badge { font-size: 11px; color: var(--overlay0); }
 .session-card {
   background: var(--surface0);
   border: 1px solid var(--surface1);
@@ -7012,21 +7022,30 @@ function renderSessionFrames(sessionId, frames) {
   const container = document.getElementById('session-detail-frames');
   section.style.display = '';
 
-  // Categorize
+  // Group frames by category
   const annotations = frames.filter(f => f.startsWith('ann-'));
-  const clips = frames.filter(f => f.startsWith('clip-'));
-  const other = frames.filter(f => !f.startsWith('ann-') && !f.startsWith('clip-'));
+  const clipMap = new Map(); // clipId → [filenames]
+  const other = [];
+  for (const f of frames) {
+    if (f.startsWith('ann-')) continue;
+    if (f.startsWith('clip-')) {
+      const m = f.match(/^(clip-.+-\d+)-f\d+/);
+      const key = m ? m[1] : f;
+      if (!clipMap.has(key)) clipMap.set(key, []);
+      clipMap.get(key).push(f);
+    } else {
+      other.push(f);
+    }
+  }
 
+  // Badge summary
   const parts = [];
   if (annotations.length) parts.push(annotations.length + ' annotation' + (annotations.length > 1 ? 's' : ''));
-  if (clips.length) parts.push(clips.length + ' clip' + (clips.length > 1 ? 's' : ''));
+  if (clipMap.size) parts.push(clipMap.size + ' clip' + (clipMap.size > 1 ? 's' : ''));
   if (other.length) parts.push(other.length + ' other');
   document.getElementById('sd-frames-badge').textContent = parts.join(' \u00b7 ');
 
-  const gallery = document.createElement('div');
-  gallery.className = 'sd-frames-gallery';
-
-  for (const name of frames) {
+  function makeThumb(name) {
     const thumb = document.createElement('div');
     thumb.className = 'sd-frame-thumb';
     const img = document.createElement('img');
@@ -7047,9 +7066,47 @@ function renderSessionFrames(sessionId, frames) {
       lb.addEventListener('click', () => lb.remove());
       document.body.appendChild(lb);
     });
-    gallery.appendChild(thumb);
+    return thumb;
   }
-  container.appendChild(gallery);
+
+  function makeGroup(title, badge, fileList, collapsed) {
+    const group = document.createElement('div');
+    group.className = 'sd-frame-group' + (collapsed ? ' collapsed' : '');
+    const header = document.createElement('div');
+    header.className = 'sd-frame-group-header';
+    header.innerHTML = `<span class="sd-frame-group-chevron">&#x25BE;</span>${title} <span class="sd-frame-group-badge">${badge}</span>`;
+    header.addEventListener('click', () => group.classList.toggle('collapsed'));
+    group.appendChild(header);
+    const gallery = document.createElement('div');
+    gallery.className = 'sd-frames-gallery';
+    for (const name of fileList) gallery.appendChild(makeThumb(name));
+    group.appendChild(gallery);
+    return group;
+  }
+
+  // Annotations — expanded
+  if (annotations.length) {
+    container.appendChild(makeGroup(
+      'Annotations', annotations.length + ' frame' + (annotations.length > 1 ? 's' : ''),
+      annotations, false
+    ));
+  }
+
+  // Clips — each collapsed
+  for (const [clipId, clipFrames] of clipMap) {
+    container.appendChild(makeGroup(
+      clipId, clipFrames.length + ' frame' + (clipFrames.length > 1 ? 's' : ''),
+      clipFrames, true
+    ));
+  }
+
+  // Other/raw frames — collapsed
+  if (other.length) {
+    container.appendChild(makeGroup(
+      'Raw frames', other.length + ' frame' + (other.length > 1 ? 's' : ''),
+      other, true
+    ));
+  }
 }
 
 let detailVerbosity = 'normal';
