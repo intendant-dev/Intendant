@@ -422,10 +422,11 @@ run_wizard() {
     print_existing
 
     # Step 1: Guest OS
+    local os_choice=0
     ask_choice "What OS is your VM running?" \
         "Linux (Debian/Ubuntu)" \
-        "macOS"
-    local os_choice=$?
+        "macOS" \
+        || os_choice=$?
     if [[ "$os_choice" -eq 0 ]]; then
         GUEST_OS="linux"
     else
@@ -434,10 +435,11 @@ run_wizard() {
     set_guest_script
 
     # Step 2: Network mode
+    local net_choice=0
     ask_choice "How is your VM networked?" \
         "Shared Network (NAT — default VM setting)" \
-        "Bridged — VM has its own LAN IP"
-    local net_choice=$?
+        "Bridged — VM has its own LAN IP" \
+        || net_choice=$?
     if [[ "$net_choice" -eq 0 ]]; then
         NET_MODE="shared"
     else
