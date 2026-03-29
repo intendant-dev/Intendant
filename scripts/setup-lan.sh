@@ -28,6 +28,7 @@ ACTION="setup"
 FORCE=false
 LAN_IP=""
 P12_PASS=""
+CERT_LABEL=""
 
 die()   { echo "error: $*" >&2; exit 1; }
 info()  { echo ":: $*"; }
@@ -46,6 +47,7 @@ parse_args() {
             --port)     HTTPS_PORT="$2"; shift 2 ;;
             --lan-ip)     LAN_IP="$2"; shift 2 ;;
             --cert-port) CERT_SERVE_PORT="$2"; shift 2 ;;
+            --name)      CERT_LABEL="$2"; shift 2 ;;
             --recert)    ACTION="recert"; shift ;;
             --force)    FORCE=true; shift ;;
             --remove)   ACTION="remove"; shift ;;
@@ -134,12 +136,14 @@ generate_certs() {
     info "generating certificates..."
     mkdir -p "$CERT_DIR"
 
+    local cert_id="${CERT_LABEL:-$LAN_IP}"
+
     # CA
     openssl genrsa -out "$CERT_DIR/ca.key" 2048 2>/dev/null
     openssl req -x509 -new -nodes \
         -key "$CERT_DIR/ca.key" \
         -days 3650 -out "$CERT_DIR/ca.crt" \
-        -subj "/CN=Intendant CA ($LAN_IP)" 2>/dev/null
+        -subj "/CN=Intendant CA ($cert_id)" 2>/dev/null
 
     # Server cert (SAN required by modern iOS/browsers)
     generate_server_cert
@@ -149,7 +153,7 @@ generate_certs() {
     openssl req -new \
         -key "$CERT_DIR/client.key" \
         -out "$CERT_DIR/client.csr" \
-        -subj "/CN=Intendant Client ($LAN_IP)" 2>/dev/null
+        -subj "/CN=Intendant Client ($cert_id)" 2>/dev/null
     openssl x509 -req \
         -in "$CERT_DIR/client.csr" \
         -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" -CAcreateserial \

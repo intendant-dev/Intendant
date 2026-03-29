@@ -608,6 +608,7 @@ run_wizard() {
     info "running setup on VM..."
     local guest_args="--port $HTTPS_PORT"
     [[ "$NET_MODE" == "shared" ]] && guest_args="$guest_args --lan-ip $LAN_IP --cert-port $CERT_PORT"
+    guest_args="$guest_args --name '${INSTANCE_NAME:-$VM_IP}'"
     local guest_ok=true
     run_guest_script "$guest_args" || guest_ok=false
 
