@@ -2753,6 +2753,7 @@ let workletReady = false;
 let isActiveBrowser = true;
 let storedConversationCtx = null;
 let voiceConnecting = false;
+let voiceHadPriorSession = false;
 let audioDropLogCount = 0;
 const audioQueue = [];
 let isPlaying = false;
@@ -2979,11 +2980,13 @@ async function startVideo() {
     // Send live-res frame to voice model (frame ID annotation is bundled in)
     app.send_frame(liveB64, frameId);
 
-    // Send HQ frame (full resolution) to server for archival
-    canvas.width = vw;
-    canvas.height = vh;
-    ctx.drawImage(videoEl, 0, 0);
-    const hqJpeg = canvas.toDataURL('image/jpeg', 0.92);
+    // Send HQ frame (logical resolution) to server for archival
+    const camMax = 1920;
+    const camScale = Math.min(1, camMax / Math.max(vw, vh));
+    canvas.width = Math.round(vw * camScale);
+    canvas.height = Math.round(vh * camScale);
+    ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+    const hqJpeg = canvas.toDataURL('image/jpeg', 0.80);
     const hqB64 = hqJpeg.split(',')[1];
     app.send_video_frame_to_server(hqB64, frameId, FRAME_STREAM);
 
@@ -3094,14 +3097,22 @@ async function main() {
 
   // ── Voice Callbacks ──
   app.set_on_voice_ready(() => {
+    const isReconnect = voiceHadPriorSession;
+    voiceHadPriorSession = false;
     modelConnected = true;
     document.getElementById('sb-voice').className = 'voice-dot ok';
     document.getElementById('videoBtn').classList.remove('is-disabled');
     const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
     document.getElementById('sb-voice-label').textContent = provider.charAt(0).toUpperCase() + provider.slice(1);
-    showVoiceStatus('Voice ready');
+    showVoiceStatus(isReconnect ? 'Reconnected' : 'Voice ready');
     setTimeout(hideVoiceStatus, 3000);
-    if (storedConversationCtx) {
+    if (isReconnect) {
+      // Reconnected after a disconnect — this is a fresh session with no prior
+      // context. Send a strong grounding message to prevent the model from
+      // confabulating a continuation of a conversation that no longer exists.
+      app.send_text('[System: Voice session reconnected after a disconnection. This is a fresh session — you have NO memory of any prior conversation, frames, or analysis. Briefly tell the user you reconnected, then wait for them to speak. Do NOT describe the screen or reference prior context.]');
+      try { app.send_voice_diagnostic('reconnected', provider + ' voice model reconnected after disconnect'); } catch(_) {}
+    } else if (storedConversationCtx) {
       app.send_text('[System: conversation so far]\n' + storedConversationCtx);
       storedConversationCtx = null;
     } else {
@@ -3141,6 +3152,7 @@ async function main() {
 
   app.set_on_error((msg) => {
     if (!msg.startsWith('Server')) {
+      if (modelConnected) voiceHadPriorSession = true;
       modelConnected = false;
       document.getElementById('sb-voice').className = 'voice-dot err';
       if (videoActive) stopVideo();
@@ -3170,7 +3182,22 @@ async function main() {
   });
 
   app.set_on_inject_voice_image((base64Data, label) => {
-    app.send_frame(base64Data, label);
+    // Cap at logical resolution (not Retina) before injecting into voice model.
+    // The stored HQ frames are already at logical res after our fix, but guard
+    // against older/oversized frames that could crash Gemini (~1MB limit).
+    const MAX_INJECT = 1920;
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, MAX_INJECT / Math.max(img.width, img.height));
+      const w = Math.round(img.width * scale);
+      const h = Math.round(img.height * scale);
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      c.getContext('2d').drawImage(img, 0, 0, w, h);
+      const b64 = c.toDataURL('image/jpeg', 0.8).split(',')[1];
+      app.send_frame(b64, label);
+    };
+    img.src = 'data:image/jpeg;base64,' + base64Data;
   });
 
   app.set_on_state_snapshot((msg) => {
@@ -3916,11 +3943,12 @@ class DisplaySlot {
       const liveJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.8);
       const liveB64 = liveJpeg.split(',')[1];
       app.send_frame(liveB64, frameId);
-      // HQ: full VNC resolution
-      this._streamCanvas.width = sw;
-      this._streamCanvas.height = sh;
-      ctx.drawImage(srcCanvas, 0, 0);
-      const hqJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.92);
+      // HQ: logical resolution (not Retina 2x)
+      const dpr = window.devicePixelRatio || 1;
+      this._streamCanvas.width = Math.round(sw / dpr);
+      this._streamCanvas.height = Math.round(sh / dpr);
+      ctx.drawImage(srcCanvas, 0, 0, this._streamCanvas.width, this._streamCanvas.height);
+      const hqJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.80);
       const hqB64 = hqJpeg.split(',')[1];
       app.send_video_frame_to_server(hqB64, frameId, streamName);
     }, 1000);
