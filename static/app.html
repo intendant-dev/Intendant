@@ -2728,6 +2728,7 @@ let activeTab = 'activity';
 let autoScroll = true;
 let logEntryCount = 0;
 let currentPhase = 'idle';
+let currentSessionFullId = '';
 let spinnerIdx = 0;
 let spinnerInterval = null;
 
@@ -3483,6 +3484,7 @@ function updateStatusBar(d) {
     el.style.color = colors[d.autonomy] || '#f9e2af';
   }
   if (d.session_id) {
+    currentSessionFullId = d.session_id;
     document.getElementById('sb-session').textContent = d.session_id.substring(0, 8);
   }
 }
@@ -5108,10 +5110,12 @@ function renderAnnotationRefs() {
     return `<span class="ann-ref-item" title="Click to copy frame ID" onclick="copyAnnotationRef('${a.frameId}')">${a.frameId}${badge}</span>`;
   }).join('');
 
+  const framesPath = currentSessionFullId ? `~/.intendant/logs/${currentSessionFullId}/frames/` : '';
   panel.innerHTML = `
     <span style="font-size:11px;color:var(--subtext1);font-weight:600">Annotations:</span>
     ${items}
     <button class="ann-copy-all-btn" onclick="copyAllAnnotationRefs()" title="Copy all frame IDs to clipboard">Copy all</button>
+    ${framesPath ? `<span class="ann-path-hint" style="display:block;font-size:10px;color:var(--overlay0);margin-top:4px;cursor:pointer" title="Click to copy" onclick="navigator.clipboard.writeText('${framesPath}').then(()=>{this.textContent='Copied!';setTimeout(()=>{this.textContent='${framesPath}'},1000)})">${framesPath}</span>` : ''}
   `;
 }
 
