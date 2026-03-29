@@ -44,8 +44,9 @@ parse_args() {
             --backend)  BACKEND="$2"; shift 2 ;;
             --tunnel)   TUNNEL_TARGET="$2"; shift 2 ;;
             --port)     HTTPS_PORT="$2"; shift 2 ;;
-            --lan-ip)   LAN_IP="$2"; shift 2 ;;
-            --recert)   ACTION="recert"; shift ;;
+            --lan-ip)     LAN_IP="$2"; shift 2 ;;
+            --cert-port) CERT_SERVE_PORT="$2"; shift 2 ;;
+            --recert)    ACTION="recert"; shift ;;
             --force)    FORCE=true; shift ;;
             --remove)   ACTION="remove"; shift ;;
             -h|--help)  usage ;;
