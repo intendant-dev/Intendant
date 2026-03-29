@@ -48,6 +48,20 @@ CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 
+# Unregister any stale Intendant.app bundles from other worktrees or Trash.
+# Multiple bundles with the same CFBundleIdentifier cause macOS LaunchServices
+# to launch the wrong one (possibly an old worktree build from days ago).
+LS=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+while IFS= read -r stale_path; do
+    # Skip our own target — only unregister OTHER copies
+    if [ "$stale_path" != "$PROJECT_ROOT/$APP" ]; then
+        $LS -u "$stale_path" 2>/dev/null || true
+        rm -rf "$stale_path" 2>/dev/null || true
+    fi
+done < <($LS -dump 2>/dev/null | grep -o '/[^ ]*Intendant\.app' | sort -u)
+
 rm -rf "$APP"
 mkdir -p "$MACOS" "$RESOURCES"
 
