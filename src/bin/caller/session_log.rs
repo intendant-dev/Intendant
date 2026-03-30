@@ -65,6 +65,9 @@ pub struct SessionLog {
     session_id: String,
     current_turn: usize,
     summary_builder: SessionSummaryBuilder,
+    /// Buffer for accumulating voice_log tokens into full utterances.
+    /// Flushed to transcript on turnComplete or user_transcript.
+    voice_utterance_buf: String,
 }
 
 /// Accumulates session statistics as events are logged.
@@ -77,6 +80,9 @@ struct SessionSummaryBuilder {
     voice_connections: usize,
     frames_sent: usize,
     cu_tasks: Vec<CuTaskSummary>,
+    /// CU task currently in progress (captured on cu_task_start, moved to cu_tasks on complete).
+    current_cu_task: Option<String>,
+    current_cu_turns: usize,
     errors: Vec<ErrorSummary>,
     user_transcripts: Vec<String>,
     total_tokens: u64,
@@ -164,6 +170,7 @@ impl SessionLog {
                 start_time: Some(Local::now()),
                 ..Default::default()
             },
+            voice_utterance_buf: String::new(),
         };
         log.emit(LogEvent {
             ts: Self::ts(),
@@ -365,6 +372,8 @@ impl SessionLog {
         cu_display: Option<(u32, u32)>,
         ref_images: usize,
     ) {
+        self.summary_builder.current_cu_task = Some(task.to_string());
+        self.summary_builder.current_cu_turns = 0;
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
@@ -395,6 +404,7 @@ impl SessionLog {
         completion_tokens: u64,
         actions: &[String],
     ) {
+        self.summary_builder.current_cu_turns = turn;
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
@@ -421,10 +431,15 @@ impl SessionLog {
     /// Log CU task completion.
     pub fn cu_task_complete(&mut self, turns: usize, success: bool, summary: &str) {
         self.summary_builder.cu_tasks.push(CuTaskSummary {
-            task: summary.to_string(),
+            task: self
+                .summary_builder
+                .current_cu_task
+                .take()
+                .unwrap_or_else(|| summary.to_string()),
             turns,
             success,
         });
+        self.summary_builder.current_cu_turns = 0;
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
@@ -502,12 +517,26 @@ impl SessionLog {
     // ---- Session summary ----
 
     /// Write `session_summary.json` with accumulated statistics.
-    pub fn write_session_summary(&self) {
+    pub fn write_session_summary(&mut self) {
+        self.flush_voice_utterance();
         let duration = self
             .summary_builder
             .start_time
             .map(|s| (Local::now() - s).num_milliseconds() as f64 / 1000.0)
             .unwrap_or(0.0);
+        // Include in-progress CU task if session ended mid-task
+        let mut cu_tasks = self.summary_builder.cu_tasks.clone();
+        if let Some(ref task) = self.summary_builder.current_cu_task {
+            // Only add if not already recorded as complete
+            let already_recorded = cu_tasks.iter().any(|t| t.task == *task);
+            if !already_recorded && self.summary_builder.current_cu_turns > 0 {
+                cu_tasks.push(CuTaskSummary {
+                    task: task.clone(),
+                    turns: self.summary_builder.current_cu_turns,
+                    success: false, // didn't complete
+                });
+            }
+        }
         let summary = SessionSummary {
             duration_secs: duration,
             voice_provider: self.summary_builder.voice_provider.clone(),
@@ -517,7 +546,7 @@ impl SessionLog {
                 .summary_builder
                 .voice_connections
                 .saturating_sub(1),
-            cu_tasks: self.summary_builder.cu_tasks.clone(),
+            cu_tasks,
             frames_sent: self.summary_builder.frames_sent,
             errors: self.summary_builder.errors.clone(),
             user_transcripts: self.summary_builder.user_transcripts.clone(),
@@ -593,28 +622,17 @@ impl SessionLog {
             file: None,
             file2: None,
         });
-        // Write to transcript (skip tool call annotations)
+        // Buffer voice tokens into full utterances (flushed on turnComplete
+        // via voice_protocol). Writing per-token produces unreadable transcripts.
         if tool_context.is_none() || tool_context == Some("transcript") {
-            let tools = if let Some(ctx) = tool_context {
-                if ctx != "transcript" {
-                    Some(vec![ctx.to_string()])
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            self.emit_transcript(TranscriptEntry {
-                ts: Self::ts(),
-                role: "model".to_string(),
-                text: text.to_string(),
-                tools_called: tools,
-            });
+            self.voice_utterance_buf.push_str(text);
         }
     }
 
     /// Log a server-side user speech transcript (from Whisper API).
     pub fn user_transcript(&mut self, text: &str, seq: u64) {
+        // Flush any buffered model speech before the user turn
+        self.flush_voice_utterance();
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
@@ -711,7 +729,25 @@ impl SessionLog {
 
     /// Protocol lifecycle: setupComplete, turnComplete, connected, interrupted, etc.
     pub fn voice_protocol(&mut self, kind: &str, detail: &str) {
+        // Flush buffered voice tokens to transcript on turnComplete
+        if detail.starts_with("turnComplete") || kind == "gemini_msg" && detail.contains("turnComplete") {
+            self.flush_voice_utterance();
+        }
         self.emit_voice("voice_protocol", "debug", kind, detail);
+    }
+
+    /// Flush the buffered voice utterance to transcript.jsonl.
+    fn flush_voice_utterance(&mut self) {
+        let text = self.voice_utterance_buf.trim().to_string();
+        if !text.is_empty() {
+            self.emit_transcript(TranscriptEntry {
+                ts: Self::ts(),
+                role: "model".to_string(),
+                text,
+                tools_called: None,
+            });
+        }
+        self.voice_utterance_buf.clear();
     }
 
     /// Video frame send telemetry.
@@ -722,6 +758,17 @@ impl SessionLog {
 
     /// Live model token usage.
     pub fn voice_usage(&mut self, kind: &str, detail: &str) {
+        // Extract total tokens from detail string like "tokens: total=3099 prompt=..."
+        if let Some(total_str) = detail.split("total=").nth(1) {
+            if let Some(num_str) = total_str.split_whitespace().next() {
+                if let Ok(total) = num_str.parse::<u64>() {
+                    // Use the max seen (cumulative) rather than adding (already cumulative)
+                    if total > self.summary_builder.total_tokens {
+                        self.summary_builder.total_tokens = total;
+                    }
+                }
+            }
+        }
         self.emit_voice("voice_usage", "debug", kind, detail);
     }
 
@@ -1145,6 +1192,10 @@ impl SessionLog {
         model: &str,
         total_tokens: u64,
     ) {
+        // Track cumulative live model tokens
+        if total_tokens > self.summary_builder.total_tokens {
+            self.summary_builder.total_tokens = total_tokens;
+        }
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
@@ -1591,6 +1642,7 @@ impl SessionLog {
     /// Mark the session as interrupted and flush logs.
     /// Called from signal handlers (SIGTERM) where Drop may not run.
     pub fn mark_interrupted(&mut self) {
+        self.flush_voice_utterance();
         let _ = self.writer.flush();
         let meta_path = self.dir.join("session_meta.json");
         if let Ok(meta_str) = fs::read_to_string(&meta_path) {
@@ -2404,6 +2456,9 @@ mod tests {
         log.voice_log("[tool] check_status({})", 3, Some("check_status"));
         log.user_transcript("can you fix the auth bug?", 4);
         log.voice_log("I'll submit that task now.", 5, Some("transcript"));
+        // Flush buffered voice utterance (normally happens on turnComplete/session end)
+        log.mark_interrupted();
+        drop(log);
 
         let turns = recent_conversation(&log_dir, 10);
         assert_eq!(turns.len(), 4); // tool call excluded
