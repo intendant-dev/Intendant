@@ -16,22 +16,8 @@
 set -euo pipefail
 
 BUNDLE_ID="com.intendant.app"
-RESET_PERMS=false
 
-for arg in "$@"; do
-    case "$arg" in
-        --reset-permissions) RESET_PERMS=true ;;
-    esac
-done
-
-# Filter out flags to get positional args
-PROFILE="release"
-for arg in "$@"; do
-    case "$arg" in
-        --*) ;;
-        *) PROFILE="$arg" ;;
-    esac
-done
+PROFILE="${1:-release}"
 
 if [ "$PROFILE" = "debug" ]; then
     BINARY="target/debug/intendant"
@@ -167,42 +153,7 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
 </plist>
 PLIST
 
-if [ "$RESET_PERMS" = true ]; then
-    echo "Resetting TCC permissions for $BUNDLE_ID..."
-    echo ""
-    echo "Which permissions to reset?"
-    echo "  1) Screen Recording only (most common fix)"
-    echo "  2) All permissions (Screen Recording + Accessibility + Mic + Camera)"
-    echo "  3) Cancel"
-    printf "Choice [1]: "
-    read -r choice
-    choice="${choice:-1}"
-    case "$choice" in
-        1)
-            tccutil reset ScreenCapture "$BUNDLE_ID" 2>/dev/null || true
-            echo "Screen Recording permission reset."
-            ;;
-        2)
-            tccutil reset ScreenCapture "$BUNDLE_ID" 2>/dev/null || true
-            tccutil reset Accessibility "$BUNDLE_ID" 2>/dev/null || true
-            tccutil reset Microphone "$BUNDLE_ID" 2>/dev/null || true
-            tccutil reset Camera "$BUNDLE_ID" 2>/dev/null || true
-            echo "All permissions reset."
-            ;;
-        3|*)
-            echo "Skipped."
-            ;;
-    esac
-    echo ""
-    echo "After launching, check System Settings > Privacy & Security and ensure"
-    echo "Intendant is toggled ON for: Screen Recording, Accessibility."
-    echo "macOS may not prompt automatically — you may need to toggle manually."
-fi
-
 echo "✅ Built: $APP"
 echo ""
 echo "Launch:"
 echo "  open target/Intendant.app"
-echo ""
-echo "If permissions seem stuck, rebuild with --reset-permissions:"
-echo "  ./scripts/bundle-macos.sh --reset-permissions"
