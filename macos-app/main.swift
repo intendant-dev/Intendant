@@ -96,6 +96,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         let sock = socket(AF_INET, SOCK_STREAM, 0)
         guard sock >= 0 else { return false }
         defer { close(sock) }
+        // Allow binding even when TIME_WAIT connections linger from a previous
+        // session — the backend uses SO_REUSEADDR too, so this matches.
+        var reuse: Int32 = 1
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_addr.s_addr = inet_addr("0.0.0.0")  // match backend bind address

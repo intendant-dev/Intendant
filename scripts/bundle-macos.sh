@@ -74,6 +74,14 @@ swiftc -O -o "$MACOS/Intendant" macos-app/main.swift \
 cp "$BINARY" "$MACOS/intendant-bin"
 cp "$RUNTIME" "$MACOS/intendant-runtime"
 
+# Code-sign the app bundle with a stable ad-hoc identity. This preserves
+# TCC permissions (Screen Recording, Accessibility) across recompiles.
+# Without signing, every recompile changes the binary hash and macOS
+# silently invalidates TCC grants — even though System Settings still
+# shows the app as "allowed".
+echo "Signing app bundle..."
+codesign --force --deep --sign - "$APP" 2>/dev/null || true
+
 # Copy app icon
 if [ -f "macos-app/AppIcon.icns" ]; then
     cp "macos-app/AppIcon.icns" "$RESOURCES/AppIcon.icns"
