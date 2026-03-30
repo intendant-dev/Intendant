@@ -2783,7 +2783,7 @@ pub fn select_cu_provider(
             let key = openai_key.ok_or_else(|| {
                 CallerError::Config("CU provider=openai but no OPENAI_API_KEY found.".into())
             })?;
-            let model = model_str.unwrap_or_else(|| "gpt-5.2-codex".to_string());
+            let model = model_str.unwrap_or_else(|| "gpt-5.4-mini".to_string());
             let display = crate::vision::display_config_for_provider("openai");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
@@ -2810,7 +2810,7 @@ pub fn select_cu_provider(
                 p.cu_display = Some((display.width, display.height));
                 Ok(Box::new(p))
             } else if let Some(key) = openai_key {
-                let model = model_str.unwrap_or_else(|| "gpt-5.2-codex".to_string());
+                let model = model_str.unwrap_or_else(|| "gpt-5.4-mini".to_string());
                 let display = crate::vision::display_config_for_provider("openai");
                 let ctx = resolve_context_window(&model);
                 let max_out = resolve_max_output_tokens(&model);
