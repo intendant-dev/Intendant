@@ -366,6 +366,16 @@ export class PresenceWeb {
         wasm.presenceweb_send_text(this.__wbg_ptr, ptr0, len0);
     }
     /**
+     * Send text without ending the user turn (turn_complete: false for Gemini).
+     * Used for tool result injection that arrives while the model is mid-response.
+     * @param {string} text
+     */
+    send_text_passive(text) {
+        const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.presenceweb_send_text_passive(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
      * Send a tool_request to the server, with a JS callback for the response.
      * @param {string} tool
      * @param {any} args
@@ -480,6 +490,12 @@ export class PresenceWeb {
      */
     set_on_inject_voice_text(f) {
         wasm.presenceweb_set_on_inject_voice_text(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_inject_voice_text_passive(f) {
+        wasm.presenceweb_set_on_inject_voice_text_passive(this.__wbg_ptr, f);
     }
     /**
      * @param {Function} f

@@ -452,6 +452,20 @@ impl GeminiProvider {
         }
     }
 
+    /// Send text without ending the user turn. Used for injecting tool results
+    /// and system messages that should not interrupt the model's current response.
+    pub fn send_text_passive(&self, text: &str) {
+        if let Some(ref ws) = self.ws {
+            let msg = serde_json::json!({
+                "client_content": {
+                    "turns": [{"role": "user", "parts": [{"text": text}]}],
+                    "turn_complete": false
+                }
+            });
+            let _ = ws.send_with_str(&msg.to_string());
+        }
+    }
+
     pub fn send_tool_response(&self, call: &JsValue, result: &JsValue) {
         if let Some(ref ws) = self.ws {
             let call_val: serde_json::Value =

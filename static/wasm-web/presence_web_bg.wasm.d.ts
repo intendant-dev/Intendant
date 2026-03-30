@@ -37,6 +37,7 @@ export const presenceweb_send_presence_checkpoint: (a: number, b: number, c: num
 export const presenceweb_send_resize: (a: number, b: number, c: number) => void;
 export const presenceweb_send_server_action: (a: number, b: any) => void;
 export const presenceweb_send_text: (a: number, b: number, c: number) => void;
+export const presenceweb_send_text_passive: (a: number, b: number, c: number) => void;
 export const presenceweb_send_tool_request: (a: number, b: number, c: number, d: any, e: any) => void;
 export const presenceweb_send_user_audio: (a: number, b: number, c: number) => void;
 export const presenceweb_send_video_frame_to_server: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
@@ -50,6 +51,7 @@ export const presenceweb_set_on_error: (a: number, b: any) => void;
 export const presenceweb_set_on_force_disconnect: (a: number, b: any) => void;
 export const presenceweb_set_on_inject_voice_image: (a: number, b: any) => void;
 export const presenceweb_set_on_inject_voice_text: (a: number, b: any) => void;
+export const presenceweb_set_on_inject_voice_text_passive: (a: number, b: any) => void;
 export const presenceweb_set_on_live_usage: (a: number, b: any) => void;
 export const presenceweb_set_on_raw_message: (a: number, b: any) => void;
 export const presenceweb_set_on_server_event: (a: number, b: any) => void;

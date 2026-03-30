@@ -154,6 +154,11 @@ impl PresenceWeb {
     }
 
     #[wasm_bindgen]
+    pub fn set_on_inject_voice_text_passive(&self, f: Function) {
+        *self.callbacks.on_inject_voice_text_passive.borrow_mut() = Some(f);
+    }
+
+    #[wasm_bindgen]
     pub fn set_on_inject_voice_image(&self, f: Function) {
         *self.callbacks.on_inject_voice_image.borrow_mut() = Some(f);
     }
@@ -304,8 +309,12 @@ impl PresenceWeb {
                             }
                         }
 
+                        // Inject tool result text passively (turn_complete: false)
+                        // to avoid interrupting the model's current response.
+                        // Using turn_complete: true crashes Gemini with code 1008
+                        // when the model is mid-response.
                         let text = format!("[System: {} result] {}", tool, truncated);
-                        cb.invoke_inject_voice_text(&text);
+                        cb.invoke_inject_voice_text_passive(&text);
                     }
                     _ => {
                         // Event messages (have "event" field)
@@ -487,6 +496,26 @@ impl PresenceWeb {
                 }
             }
             "openai" => {
+                if let Some(ref o) = *self.openai.borrow() {
+                    o.send_text(text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Send text without ending the user turn (turn_complete: false for Gemini).
+    /// Used for tool result injection that arrives while the model is mid-response.
+    #[wasm_bindgen]
+    pub fn send_text_passive(&self, text: &str) {
+        match self.active_provider.borrow().as_str() {
+            "gemini" => {
+                if let Some(ref g) = *self.gemini.borrow() {
+                    g.send_text_passive(text);
+                }
+            }
+            "openai" => {
+                // OpenAI Realtime doesn't have this distinction
                 if let Some(ref o) = *self.openai.borrow() {
                     o.send_text(text);
                 }

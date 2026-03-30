@@ -125,6 +125,11 @@ export class PresenceWeb {
     send_server_action(action: any): void;
     send_text(text: string): void;
     /**
+     * Send text without ending the user turn (turn_complete: false for Gemini).
+     * Used for tool result injection that arrives while the model is mid-response.
+     */
+    send_text_passive(text: string): void;
+    /**
      * Send a tool_request to the server, with a JS callback for the response.
      */
     send_tool_request(tool: string, args: any, on_result: Function): void;
@@ -158,6 +163,7 @@ export class PresenceWeb {
     set_on_force_disconnect(f: Function): void;
     set_on_inject_voice_image(f: Function): void;
     set_on_inject_voice_text(f: Function): void;
+    set_on_inject_voice_text_passive(f: Function): void;
     set_on_live_usage(f: Function): void;
     set_on_raw_message(f: Function): void;
     set_on_server_event(f: Function): void;
@@ -295,6 +301,7 @@ export interface InitOutput {
     readonly presenceweb_send_resize: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_server_action: (a: number, b: any) => void;
     readonly presenceweb_send_text: (a: number, b: number, c: number) => void;
+    readonly presenceweb_send_text_passive: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_tool_request: (a: number, b: number, c: number, d: any, e: any) => void;
     readonly presenceweb_send_user_audio: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_video_frame_to_server: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
@@ -308,6 +315,7 @@ export interface InitOutput {
     readonly presenceweb_set_on_force_disconnect: (a: number, b: any) => void;
     readonly presenceweb_set_on_inject_voice_image: (a: number, b: any) => void;
     readonly presenceweb_set_on_inject_voice_text: (a: number, b: any) => void;
+    readonly presenceweb_set_on_inject_voice_text_passive: (a: number, b: any) => void;
     readonly presenceweb_set_on_live_usage: (a: number, b: any) => void;
     readonly presenceweb_set_on_raw_message: (a: number, b: any) => void;
     readonly presenceweb_set_on_server_event: (a: number, b: any) => void;
