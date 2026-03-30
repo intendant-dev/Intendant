@@ -2825,6 +2825,7 @@ let frameCounter = 0;
 const FRAME_STREAM = 'cam0';
 const LIVE_RES = 768;  // 768x768 for live model
 const VIDEO_FPS = 1;
+let lastLiveFrameLen = 0; // For frame dedup — skip if JPEG size barely changed
 
 // ── Audio Helpers ──
 function downsample(buffer, fromRate, toRate) {
@@ -3036,10 +3037,18 @@ async function startVideo() {
     const liveJpeg = canvas.toDataURL('image/jpeg', 0.8);
     const liveB64 = liveJpeg.split(',')[1];
 
-    // Send live-res frame to voice model (frame ID annotation is bundled in)
-    app.send_frame(liveB64, frameId);
+    // Skip duplicate frames for voice model — if JPEG size barely changed, screen is static.
+    // Still send HQ to server for archival regardless.
+    const sizeDelta = Math.abs(liveB64.length - lastLiveFrameLen) / (lastLiveFrameLen || 1);
+    const frameDup = sizeDelta < 0.02 && lastLiveFrameLen > 0;
+    if (!frameDup) {
+      lastLiveFrameLen = liveB64.length;
+      app.send_frame(liveB64, frameId);
+    } else {
+      try { app.send_voice_diagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)'); } catch(_) {}
+    }
 
-    // Send HQ frame (logical resolution) to server for archival
+    // Send HQ frame (logical resolution) to server for archival (always)
     const camMax = 1920;
     const camScale = Math.min(1, camMax / Math.max(vw, vh));
     canvas.width = Math.round(vw * camScale);
@@ -3874,6 +3883,7 @@ class DisplaySlot {
         <button class="take-control-btn" id="ds-take-${displayId}" title="Take interactive control of this display (keyboard and mouse)">Take Control</button>
         <button class="release-control-btn" id="ds-release-${displayId}" style="display:none" title="Release control and return display to view-only mode">Release</button>
         <button class="delete-recording-btn" id="ds-delete-rec-${displayId}" style="display:none" title="Delete recording files for this display">&#x1F5D1; Delete</button>
+        <span class="stream-frame-id" id="ds-frame-${displayId}" style="display:none;font-size:10px;color:var(--overlay0);margin-left:auto"></span>
       </div>
       <div class="display-canvas" id="display-canvas-${displayId}">
         <div class="vnc-auth-overlay" id="ds-auth-${displayId}" style="display:none">
@@ -3894,6 +3904,7 @@ class DisplaySlot {
     this.takeBtn = this.el.querySelector(`#ds-take-${displayId}`);
     this.releaseBtn = this.el.querySelector(`#ds-release-${displayId}`);
     this.streamBtn = this.el.querySelector(`#ds-stream-${displayId}`);
+    this.frameIdEl = this.el.querySelector(`#ds-frame-${displayId}`);
     this.canvasEl = this.el.querySelector(`#display-canvas-${displayId}`);
     this.authOverlay = this.el.querySelector(`#ds-auth-${displayId}`);
     this.authUserInput = this.el.querySelector(`#ds-auth-user-${displayId}`);
@@ -4013,6 +4024,7 @@ class DisplaySlot {
     this.streaming = true;
     this.streamBtn.classList.add('active');
     this.streamBtn.innerHTML = '&#x1F441; Streaming';
+    this.frameIdEl.style.display = '';
     const streamName = 'display_' + this.displayId;
     const ctx = this._streamCanvas.getContext('2d');
     this._streamIntervalId = setInterval(() => {
@@ -4032,8 +4044,20 @@ class DisplaySlot {
       ctx.drawImage(srcCanvas, 0, 0, lw, lh);
       const liveJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.8);
       const liveB64 = liveJpeg.split(',')[1];
-      app.send_frame(liveB64, frameId);
-      // HQ: logical resolution (not Retina 2x)
+      // Skip duplicate frames for voice model — still send HQ to server for archival
+      const sizeDelta = Math.abs(liveB64.length - (this._lastFrameLen || 0)) / (this._lastFrameLen || 1);
+      const frameDup = sizeDelta < 0.02 && this._lastFrameLen > 0;
+      if (!frameDup) {
+        this._lastFrameLen = liveB64.length;
+        app.send_frame(liveB64, frameId);
+        this.frameIdEl.textContent = frameId.split('-').pop();
+        this.frameIdEl.style.color = 'var(--overlay0)';
+      } else {
+        this.frameIdEl.textContent = frameId.split('-').pop() + ' dropped';
+        this.frameIdEl.style.color = 'var(--yellow)';
+        try { app.send_voice_diagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)'); } catch(_) {}
+      }
+      // HQ: logical resolution (not Retina 2x) — always sent for archival
       const dpr = window.devicePixelRatio || 1;
       this._streamCanvas.width = Math.round(sw / dpr);
       this._streamCanvas.height = Math.round(sh / dpr);
@@ -4048,6 +4072,8 @@ class DisplaySlot {
     if (this._streamIntervalId) { clearInterval(this._streamIntervalId); this._streamIntervalId = null; }
     this.streamBtn.classList.remove('active');
     this.streamBtn.innerHTML = '&#x1F441; Stream';
+    this.frameIdEl.style.display = 'none';
+    this.frameIdEl.textContent = '';
   }
   toggleRecording() {
     if (!app) return;
