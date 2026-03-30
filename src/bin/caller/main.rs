@@ -3351,7 +3351,7 @@ async fn run_with_presence(
                 }
                 Some(Err(e)) => {
                     slog(&session_log, |l| {
-                        l.warn(&format!("CU error, escalating: {}", e))
+                        l.cu_task_error(&e.to_string(), Some("main agent"))
                     });
                     task_for_agent = Some(envelope.task.clone());
                 }
@@ -4352,6 +4352,7 @@ async fn run_cu_task(
         return Ok(CuTaskResult::Escalate { task: task.to_string() });
     }
 
+    let ref_image_count = reference_images.len();
     let mut conv = Conversation::new(system_prompt, provider.context_window());
 
     // Inject reference frames
@@ -4375,16 +4376,15 @@ async fn run_cu_task(
     // Add the task
     conv.add_user(task.to_string());
 
-    // Log initial conversation state
     slog(session_log, |l| {
-        l.info(&format!(
-            "CU task starting: {} messages, provider={}, model={}, cu_enabled={}, cu_display={:?}",
-            conv.messages().len(),
+        l.cu_task_start(
+            task,
             provider.name(),
             provider.model(),
             provider.cu_enabled(),
             provider.cu_display(),
-        ))
+            ref_image_count,
+        )
     });
 
     for turn in 1..=CU_TASK_MAX_TURNS {
@@ -4407,19 +4407,28 @@ async fn run_cu_task(
 
         conv.set_usage(response.usage.clone());
 
-        // Log full turn details
-        slog(session_log, |l| {
-            l.info(&format!(
-                "CU turn {} response: content_len={}, cu_calls={}, tool_calls={}, usage={{prompt={}, completion={}, total={}}}",
-                turn,
-                response.content.len(),
-                response.cu_calls.len(),
-                response.tool_calls.len(),
-                response.usage.prompt_tokens,
-                response.usage.completion_tokens,
-                response.usage.total_tokens,
-            ))
-        });
+        // Log structured CU turn
+        {
+            let mut actions_desc: Vec<String> = response
+                .cu_calls
+                .iter()
+                .flat_map(|cu| cu.actions.iter().map(|a| format!("{:?}", a)))
+                .collect();
+            for tc in &response.tool_calls {
+                actions_desc.push(format!("{}({})", tc.name, &tc.arguments[..tc.arguments.len().min(100)]));
+            }
+            slog(session_log, |l| {
+                l.cu_turn(
+                    turn,
+                    response.content.len(),
+                    response.cu_calls.len(),
+                    response.tool_calls.len(),
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens,
+                    &actions_desc,
+                )
+            });
+        }
         if !response.content.is_empty() {
             slog(session_log, |l| {
                 l.info(&format!(
@@ -4429,30 +4438,12 @@ async fn run_cu_task(
                 ))
             });
         }
-        for (i, cu) in response.cu_calls.iter().enumerate() {
-            slog(session_log, |l| {
-                l.info(&format!(
-                    "CU turn {} call[{}]: id={}, actions={:?}",
-                    turn, i, cu.call_id,
-                    cu.actions.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>()
-                ))
-            });
-        }
         // Check for escalation before processing anything else
         if let Some(esc_call) = response.tool_calls.iter().find(|tc| tc.name == "escalate_to_agent") {
             let args: serde_json::Value = serde_json::from_str(&esc_call.arguments).unwrap_or_default();
             let escalated_task = args["task"].as_str().unwrap_or(task).to_string();
-            slog(session_log, |l| l.info(&format!("CU escalating to agent: {}", escalated_task)));
+            slog(session_log, |l| l.cu_task_error("escalated", Some(&escalated_task)));
             return Ok(CuTaskResult::Escalate { task: escalated_task });
-        }
-
-        for tc in &response.tool_calls {
-            slog(session_log, |l| {
-                l.info(&format!(
-                    "CU turn {} function call: {}({})",
-                    turn, tc.name, &tc.arguments[..tc.arguments.len().min(200)]
-                ))
-            });
         }
 
         // Handle unrecognized function tool calls: return error results so the
@@ -4527,9 +4518,8 @@ async fn run_cu_task(
         }
 
         if is_done {
-            slog(session_log, |l| {
-                l.info(&format!("CU task complete at turn {}", turn))
-            });
+            let summary = &response.content[..response.content.len().min(200)];
+            slog(session_log, |l| l.cu_task_complete(turn, true, summary));
             break;
         }
 
@@ -4581,14 +4571,14 @@ async fn run_cu_task(
         // No CU calls and not done — model may be thinking or confused
         if response.cu_calls.is_empty() && response.tool_calls.is_empty() && !is_done {
             slog(session_log, |l| {
-                l.warn(&format!(
-                    "CU turn {}: no actions returned (text-only response)",
-                    turn
-                ))
+                l.cu_task_error(
+                    &format!("CU turn {}: no actions returned (text-only response)", turn),
+                    None,
+                )
             });
         }
         if turn >= CU_TASK_MAX_TURNS {
-            slog(session_log, |l| l.warn("CU task hit max turns"));
+            slog(session_log, |l| l.cu_task_error("CU task hit max turns", None));
         }
     }
 

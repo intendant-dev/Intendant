@@ -395,6 +395,92 @@ fn replay_session_log(contents: &str) -> Vec<serde_json::Value> {
             "warn" => ("system", message.to_string(), "warn"),
             "error" => ("system", message.to_string(), "error"),
 
+            // ── Typed voice events (new) + backward compat ──
+            "voice_audio" | "voice_frame" => continue, // Skip telemetry in replay
+            "voice_protocol" => {
+                ("live", message.to_string(), "debug")
+            }
+            "voice_usage" => {
+                ("live", message.to_string(), "debug")
+            }
+            "voice_error" => {
+                ("live", message.to_string(), "warn")
+            }
+            // Legacy: old logs still have "voice_diagnostic"
+            "voice_diagnostic" => {
+                let kind = obj
+                    .get("data")
+                    .and_then(|d| d.get("kind"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match kind {
+                    "audio_send" | "video_send" => continue,
+                    "error" | "gemini_close" => ("live", message.to_string(), "warn"),
+                    _ => ("live", message.to_string(), "debug"),
+                }
+            }
+
+            // ── CU (Computer Use) structured events ──
+            "cu_task_start" => {
+                let task = obj
+                    .get("data")
+                    .and_then(|d| d.get("task"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(message);
+                let provider = obj
+                    .get("data")
+                    .and_then(|d| d.get("provider"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let model = obj
+                    .get("data")
+                    .and_then(|d| d.get("model"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                (
+                    "worker",
+                    format!("CU task: {} ({}:{})", task, provider, model),
+                    "info",
+                )
+            }
+            "cu_turn" => {
+                let data = obj.get("data");
+                let t = data
+                    .and_then(|d| d.get("turn"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let actions = data
+                    .and_then(|d| d.get("actions"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                (
+                    "worker",
+                    format!("CU turn {}: {}", t, actions),
+                    "detail",
+                )
+            }
+            "cu_task_complete" => {
+                let turns = obj
+                    .get("data")
+                    .and_then(|d| d.get("turns"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                (
+                    "worker",
+                    format!("CU complete ({} turns)", turns),
+                    "info",
+                )
+            }
+            "cu_task_error" => {
+                ("worker", format!("CU error: {}", message), "warn")
+            }
+
             // ── Catch-all ──
             _ => {
                 if message.is_empty() { continue; }

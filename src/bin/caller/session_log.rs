@@ -60,9 +60,65 @@ pub struct SessionMeta {
 /// then drill into specific turn files for full content.
 pub struct SessionLog {
     writer: BufWriter<File>,
+    transcript_writer: Option<BufWriter<File>>,
     dir: PathBuf,
     session_id: String,
     current_turn: usize,
+    summary_builder: SessionSummaryBuilder,
+}
+
+/// Accumulates session statistics as events are logged.
+/// Written to `session_summary.json` at session end.
+#[derive(Default)]
+struct SessionSummaryBuilder {
+    start_time: Option<chrono::DateTime<chrono::Local>>,
+    voice_provider: Option<String>,
+    voice_model: Option<String>,
+    voice_connections: usize,
+    frames_sent: usize,
+    cu_tasks: Vec<CuTaskSummary>,
+    errors: Vec<ErrorSummary>,
+    user_transcripts: Vec<String>,
+    total_tokens: u64,
+}
+
+/// Summary of the entire session, written as `session_summary.json`.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SessionSummary {
+    pub duration_secs: f64,
+    pub voice_provider: Option<String>,
+    pub voice_model: Option<String>,
+    pub voice_turns: usize,
+    pub voice_reconnects: usize,
+    pub cu_tasks: Vec<CuTaskSummary>,
+    pub frames_sent: usize,
+    pub errors: Vec<ErrorSummary>,
+    pub user_transcripts: Vec<String>,
+    pub total_tokens: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CuTaskSummary {
+    pub task: String,
+    pub turns: usize,
+    pub success: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ErrorSummary {
+    pub category: String,
+    pub reason: String,
+    pub ts: String,
+}
+
+/// Entry in transcript.jsonl — simplified conversation log.
+#[derive(Serialize)]
+struct TranscriptEntry {
+    ts: String,
+    role: String,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools_called: Option<Vec<String>>,
 }
 
 impl SessionLog {
@@ -92,11 +148,22 @@ impl SessionLog {
             .create(true)
             .append(true)
             .open(dir.join("session.jsonl"))?;
+        let transcript_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("transcript.jsonl"))
+            .ok()
+            .map(BufWriter::new);
         let mut log = Self {
             writer: BufWriter::new(file),
+            transcript_writer: transcript_file,
             dir,
             session_id,
             current_turn: 0,
+            summary_builder: SessionSummaryBuilder {
+                start_time: Some(Local::now()),
+                ..Default::default()
+            },
         };
         log.emit(LogEvent {
             ts: Self::ts(),
@@ -277,6 +344,193 @@ impl SessionLog {
         }
     }
 
+    fn emit_transcript(&mut self, entry: TranscriptEntry) {
+        if let Some(ref mut w) = self.transcript_writer {
+            if let Ok(json) = serde_json::to_string(&entry) {
+                let _ = writeln!(w, "{}", json);
+                let _ = w.flush();
+            }
+        }
+    }
+
+    // ---- CU (Computer Use) structured events ----
+
+    /// Log the start of a CU task.
+    pub fn cu_task_start(
+        &mut self,
+        task: &str,
+        provider: &str,
+        model: &str,
+        cu_enabled: bool,
+        cu_display: Option<(u32, u32)>,
+        ref_images: usize,
+    ) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "cu_task_start".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("CU task: {} ({}:{})", task, provider, model)),
+            data: Some(serde_json::json!({
+                "task": task,
+                "provider": provider,
+                "model": model,
+                "cu_enabled": cu_enabled,
+                "cu_display": cu_display,
+                "ref_images": ref_images,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log a CU turn with structured data.
+    pub fn cu_turn(
+        &mut self,
+        turn: usize,
+        content_len: usize,
+        cu_calls: usize,
+        tool_calls: usize,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        actions: &[String],
+    ) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "cu_turn".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "CU turn {}: cu_calls={}, tool_calls={}, actions={:?}",
+                turn, cu_calls, tool_calls, actions
+            )),
+            data: Some(serde_json::json!({
+                "turn": turn,
+                "content_len": content_len,
+                "cu_calls": cu_calls,
+                "tool_calls": tool_calls,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "actions": actions,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log CU task completion.
+    pub fn cu_task_complete(&mut self, turns: usize, success: bool, summary: &str) {
+        self.summary_builder.cu_tasks.push(CuTaskSummary {
+            task: summary.to_string(),
+            turns,
+            success,
+        });
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "cu_task_complete".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("CU complete: {} ({} turns)", summary, turns)),
+            data: Some(serde_json::json!({
+                "turns": turns,
+                "success": success,
+                "summary": summary,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log CU task error or escalation.
+    pub fn cu_task_error(&mut self, error: &str, escalated_to: Option<&str>) {
+        self.summary_builder.errors.push(ErrorSummary {
+            category: "cu_error".to_string(),
+            reason: error.to_string(),
+            ts: Self::ts(),
+        });
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "cu_task_error".to_string(),
+            level: Some("warn".to_string()),
+            message: Some(format!("CU error: {}", error)),
+            data: Some(serde_json::json!({
+                "error": error,
+                "escalated_to": escalated_to,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    // ---- Error categorization ----
+
+    /// Log a categorized error with structured metadata.
+    pub fn categorized_error(
+        &mut self,
+        category: &str,
+        reason: &str,
+        code: Option<&str>,
+        provider: Option<&str>,
+    ) {
+        self.summary_builder.errors.push(ErrorSummary {
+            category: category.to_string(),
+            reason: reason.to_string(),
+            ts: Self::ts(),
+        });
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
+            event: "error".to_string(),
+            level: Some("error".to_string()),
+            message: Some(reason.to_string()),
+            data: Some(serde_json::json!({
+                "category": category,
+                "code": code,
+                "reason": reason,
+                "provider": provider,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    // ---- Session summary ----
+
+    /// Write `session_summary.json` with accumulated statistics.
+    pub fn write_session_summary(&self) {
+        let duration = self
+            .summary_builder
+            .start_time
+            .map(|s| (Local::now() - s).num_milliseconds() as f64 / 1000.0)
+            .unwrap_or(0.0);
+        let summary = SessionSummary {
+            duration_secs: duration,
+            voice_provider: self.summary_builder.voice_provider.clone(),
+            voice_model: self.summary_builder.voice_model.clone(),
+            voice_turns: self.summary_builder.voice_connections,
+            voice_reconnects: self
+                .summary_builder
+                .voice_connections
+                .saturating_sub(1),
+            cu_tasks: self.summary_builder.cu_tasks.clone(),
+            frames_sent: self.summary_builder.frames_sent,
+            errors: self.summary_builder.errors.clone(),
+            user_transcripts: self.summary_builder.user_transcripts.clone(),
+            total_tokens: self.summary_builder.total_tokens,
+        };
+        let path = self.dir.join("session_summary.json");
+        if let Ok(json) = serde_json::to_string_pretty(&summary) {
+            if let Err(e) = fs::write(&path, &json) {
+                eprintln!("session_log: failed to write session_summary.json: {}", e);
+            }
+        }
+    }
+
     /// Write content to a turn-specific file and return its relative path.
     fn write_turn_file(&self, suffix: &str, content: &str) -> Option<String> {
         let relative = format!("turns/turn_{:03}_{}", self.current_turn, suffix);
@@ -339,6 +593,24 @@ impl SessionLog {
             file: None,
             file2: None,
         });
+        // Write to transcript (skip tool call annotations)
+        if tool_context.is_none() || tool_context == Some("transcript") {
+            let tools = if let Some(ctx) = tool_context {
+                if ctx != "transcript" {
+                    Some(vec![ctx.to_string()])
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            self.emit_transcript(TranscriptEntry {
+                ts: Self::ts(),
+                role: "model".to_string(),
+                text: text.to_string(),
+                tools_called: tools,
+            });
+        }
     }
 
     /// Log a server-side user speech transcript (from Whisper API).
@@ -352,6 +624,13 @@ impl SessionLog {
             data: Some(serde_json::json!({ "seq": seq })),
             file: None,
             file2: None,
+        });
+        self.summary_builder.user_transcripts.push(text.to_string());
+        self.emit_transcript(TranscriptEntry {
+            ts: Self::ts(),
+            role: "user".to_string(),
+            text: text.to_string(),
+            tools_called: None,
         });
     }
 
@@ -373,6 +652,13 @@ impl SessionLog {
 
     /// Log a browser presence connect event.
     pub fn presence_connected(&mut self, provider: Option<&str>, model: Option<&str>) {
+        self.summary_builder.voice_connections += 1;
+        if let Some(p) = provider {
+            self.summary_builder.voice_provider = Some(p.to_string());
+        }
+        if let Some(m) = model {
+            self.summary_builder.voice_model = Some(m.to_string());
+        }
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
@@ -406,16 +692,54 @@ impl SessionLog {
         });
     }
 
-    /// Log a voice/presence diagnostic (errors, disconnects, routine events).
+    /// Log a voice/presence diagnostic — delegates to typed event methods.
+    /// Kept as the public API so callers don't need to change.
     pub fn voice_diagnostic(&mut self, kind: &str, detail: &str) {
-        let level = match kind {
-            "error" | "gemini_close" => "warn",
-            _ => "debug",
-        };
+        match kind {
+            "audio_send" => self.voice_audio(kind, detail),
+            "video_send" => self.voice_frame(kind, detail),
+            "gemini_usage" => self.voice_usage(kind, detail),
+            "error" | "gemini_close" | "action_drop" => self.voice_error(kind, detail),
+            _ => self.voice_protocol(kind, detail),
+        }
+    }
+
+    /// Audio chunk telemetry (high-frequency, skip in most views).
+    pub fn voice_audio(&mut self, kind: &str, detail: &str) {
+        self.emit_voice("voice_audio", "debug", kind, detail);
+    }
+
+    /// Protocol lifecycle: setupComplete, turnComplete, connected, interrupted, etc.
+    pub fn voice_protocol(&mut self, kind: &str, detail: &str) {
+        self.emit_voice("voice_protocol", "debug", kind, detail);
+    }
+
+    /// Video frame send telemetry.
+    pub fn voice_frame(&mut self, kind: &str, detail: &str) {
+        self.summary_builder.frames_sent += 1;
+        self.emit_voice("voice_frame", "debug", kind, detail);
+    }
+
+    /// Live model token usage.
+    pub fn voice_usage(&mut self, kind: &str, detail: &str) {
+        self.emit_voice("voice_usage", "debug", kind, detail);
+    }
+
+    /// Voice/presence errors (disconnects, failures).
+    pub fn voice_error(&mut self, kind: &str, detail: &str) {
+        self.summary_builder.errors.push(ErrorSummary {
+            category: format!("voice_{}", kind),
+            reason: detail.to_string(),
+            ts: Self::ts(),
+        });
+        self.emit_voice("voice_error", "warn", kind, detail);
+    }
+
+    fn emit_voice(&mut self, event: &str, level: &str, kind: &str, detail: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
-            event: "voice_diagnostic".to_string(),
+            event: event.to_string(),
             level: Some(level.to_string()),
             message: Some(format!("[voice:{}] {}", kind, detail)),
             data: Some(serde_json::json!({
@@ -1020,6 +1344,7 @@ impl SessionLog {
         total_tokens: u64,
         cached_tokens: u64,
     ) {
+        self.summary_builder.total_tokens += total_tokens;
         let file = self.write_turn_file("model.txt", content);
         let preview: String = content.chars().take(200).collect();
         self.emit(LogEvent {
@@ -1258,6 +1583,9 @@ impl SessionLog {
             file: Some("summary.json".to_string()),
             file2: None,
         });
+
+        // Write the rich session summary alongside the simple one
+        self.write_session_summary();
     }
 
     /// Mark the session as interrupted and flush logs.
@@ -1276,6 +1604,8 @@ impl SessionLog {
                 }
             }
         }
+        // Write partial session summary even on interrupt
+        self.write_session_summary();
     }
 }
 
@@ -1311,6 +1641,30 @@ pub struct ConversationTurn {
 /// Reconstruct recent conversation turns from voice_log and user_transcript events
 /// in session.jsonl. Returns the last `max_entries` turns ordered by seq.
 pub fn recent_conversation(log_dir: &Path, max_entries: usize) -> Vec<ConversationTurn> {
+    // Prefer transcript.jsonl (simpler, faster to parse) if available
+    let transcript_path = log_dir.join("transcript.jsonl");
+    if transcript_path.exists() {
+        if let Ok(content) = fs::read_to_string(&transcript_path) {
+            let mut turns: Vec<ConversationTurn> = Vec::new();
+            for line in content.lines() {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    let role = val["role"].as_str().unwrap_or("");
+                    let text = val["text"].as_str().unwrap_or("").to_string();
+                    if !text.is_empty() && (role == "user" || role == "model") {
+                        turns.push(ConversationTurn {
+                            role: role.to_string(),
+                            text,
+                            seq: 0,
+                        });
+                    }
+                }
+            }
+            let start = turns.len().saturating_sub(max_entries);
+            return turns[start..].to_vec();
+        }
+    }
+
+    // Fall back to session.jsonl parsing
     let path = log_dir.join("session.jsonl");
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
