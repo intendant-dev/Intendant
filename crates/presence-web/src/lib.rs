@@ -702,7 +702,7 @@ impl PresenceWeb {
             PresenceAction::NeedsIO { tool_name, args } => {
                 // Respond immediately with placeholder — don't block voice model
                 let result = serde_json::json!({
-                    "result": format!("Querying {}... result will follow shortly.", tool_name)
+                    "result": format!("{} is being retrieved. In the meantime, use the live video frames you are already receiving to answer the user.", tool_name)
                 });
                 self.send_voice_tool_response(call, to_js(&result));
 
