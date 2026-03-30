@@ -382,7 +382,17 @@ async fn execute_single(
         },
         CuAction::Type { text } => match backend {
             DisplayBackend::MacOS => {
-                run_cliclick(&[&format!("t:{}", text)]).await
+                // CU models often append \n to Type text expecting Enter.
+                // cliclick's t: command types literally, so strip \n and
+                // append kp:return as a separate keystroke.
+                let has_newline = text.ends_with('\n');
+                let clean = text.trim_end_matches('\n');
+                let mut args = vec![format!("t:{}", clean)];
+                if has_newline {
+                    args.push("kp:return".to_string());
+                }
+                let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                run_cliclick(&refs).await
             }
             _ => {
                 run_xdotool(display, &["type", "--clearmodifiers", text]).await
