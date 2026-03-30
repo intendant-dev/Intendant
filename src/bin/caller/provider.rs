@@ -2356,18 +2356,14 @@ fn build_gemini_request_parts(
             }));
         }
         if has_cu {
-            let mut cu_config = serde_json::json!({
+            // Gemini v1beta only supports ENVIRONMENT_BROWSER for computer_use.
+            // No display_size field is available — the model infers dimensions
+            // from screenshot resolution and uses normalized 0-999 coordinates.
+            tools_arr.push(serde_json::json!({
                 "computer_use": {
-                    "environment": "ENVIRONMENT_DESKTOP"
+                    "environment": "ENVIRONMENT_BROWSER"
                 }
-            });
-            if let Some((w, h)) = provider.cu_display {
-                cu_config["computer_use"]["display_size"] = serde_json::json!({
-                    "width": w,
-                    "height": h
-                });
-            }
-            tools_arr.push(cu_config);
+            }));
         }
         request_body["tools"] = serde_json::Value::Array(tools_arr);
     }
