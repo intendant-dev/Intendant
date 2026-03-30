@@ -2356,11 +2356,18 @@ fn build_gemini_request_parts(
             }));
         }
         if has_cu {
-            tools_arr.push(serde_json::json!({
+            let mut cu_config = serde_json::json!({
                 "computer_use": {
-                    "environment": "ENVIRONMENT_BROWSER"
+                    "environment": "ENVIRONMENT_DESKTOP"
                 }
-            }));
+            });
+            if let Some((w, h)) = provider.cu_display {
+                cu_config["computer_use"]["display_size"] = serde_json::json!({
+                    "width": w,
+                    "height": h
+                });
+            }
+            tools_arr.push(cu_config);
         }
         request_body["tools"] = serde_json::Value::Array(tools_arr);
     }
