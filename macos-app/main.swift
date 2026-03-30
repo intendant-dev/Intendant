@@ -97,27 +97,38 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
     }
 
     func checkPermissions() {
-        // Accessibility: use Apple's API to check and prompt
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
-        let trusted = AXIsProcessTrustedWithOptions(options)
-        NSLog("Accessibility: \(trusted ? "granted" : "will prompt")")
+        // Check permissions using Apple APIs — don't trigger system prompts
+        // directly (they appear asynchronously and get covered by our window).
+        // Instead, show our own alert if anything is missing.
+        let hasAccessibility = AXIsProcessTrusted()
+        let hasScreenRecording = CGPreflightScreenCaptureAccess()
+        NSLog("Permissions: accessibility=\(hasAccessibility), screenRecording=\(hasScreenRecording)")
 
-        // Screen Recording: trigger by running screencapture synchronously
-        // (must happen before window creation so the prompt is visible)
-        let tmp = NSTemporaryDirectory() + "intendant_perm_check.png"
-        let sc = Process()
-        sc.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        sc.arguments = ["-x", tmp]
-        sc.standardOutput = FileHandle.nullDevice
-        sc.standardError = FileHandle.nullDevice
-        try? sc.run()
-        sc.waitUntilExit()
-        if sc.terminationStatus == 0 {
-            NSLog("Screen Recording: granted")
-        } else {
-            NSLog("Screen Recording: will prompt (or denied)")
+        var missing: [String] = []
+        if !hasAccessibility { missing.append("Accessibility (for mouse/keyboard control)") }
+        if !hasScreenRecording { missing.append("Screen Recording (for screenshots and display capture)") }
+
+        if !missing.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "Permissions Required"
+            alert.informativeText = "Intendant needs these permissions to work properly:\n\n"
+                + missing.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
+                + "\n\nOpen System Settings > Privacy & Security and toggle each one ON for Intendant."
+                + "\n\nIf already toggled on, toggle OFF then ON again (macOS may need a refresh after recompiling)."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Open Settings")
+            alert.addButton(withTitle: "Continue Anyway")
+
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                // Open the Privacy & Security pane
+                if !hasAccessibility {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                } else {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+                }
+            }
         }
-        try? FileManager.default.removeItem(atPath: tmp)
     }
 
     func isPortAvailable(_ p: Int) -> Bool {
