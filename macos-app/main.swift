@@ -87,9 +87,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
             port = findFreePort() ?? port
             NSLog("Using port \(port)")
         }
+        // Check permissions BEFORE creating the window so system prompts
+        // aren't hidden behind it. AXIsProcessTrustedWithOptions is the
+        // official way to trigger the Accessibility prompt.
+        checkPermissions()
         startBackend()
         createWindow()
         pollUntilReady()
+    }
+
+    func checkPermissions() {
+        // Accessibility: use Apple's API to check and prompt
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+        let trusted = AXIsProcessTrustedWithOptions(options)
+        NSLog("Accessibility: \(trusted ? "granted" : "will prompt")")
+
+        // Screen Recording: trigger by running screencapture synchronously
+        // (must happen before window creation so the prompt is visible)
+        let tmp = NSTemporaryDirectory() + "intendant_perm_check.png"
+        let sc = Process()
+        sc.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        sc.arguments = ["-x", tmp]
+        sc.standardOutput = FileHandle.nullDevice
+        sc.standardError = FileHandle.nullDevice
+        try? sc.run()
+        sc.waitUntilExit()
+        if sc.terminationStatus == 0 {
+            NSLog("Screen Recording: granted")
+        } else {
+            NSLog("Screen Recording: will prompt (or denied)")
+        }
+        try? FileManager.default.removeItem(atPath: tmp)
     }
 
     func isPortAvailable(_ p: Int) -> Bool {
@@ -246,36 +274,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         let logHandle = FileHandle(forWritingAtPath: logFile.path)
         process.standardOutput = logHandle ?? FileHandle.nullDevice
         process.standardError = logHandle ?? FileHandle.nullDevice
-
-        // Pre-check macOS permissions by running screencapture and cliclick once.
-        // This triggers the system permission dialogs at launch rather than failing
-        // silently during a CU task minutes later.
-        DispatchQueue.global(qos: .utility).async {
-            let tmp = NSTemporaryDirectory() + "intendant_perm_check.png"
-            let sc = Process()
-            sc.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-            sc.arguments = ["-x", tmp]
-            sc.standardOutput = FileHandle.nullDevice
-            sc.standardError = FileHandle.nullDevice
-            try? sc.run()
-            sc.waitUntilExit()
-            try? FileManager.default.removeItem(atPath: tmp)
-
-            // cliclick: trigger Accessibility prompt by moving mouse 0 pixels
-            let cliclick = env["PATH"]?.split(separator: ":").compactMap { dir -> String? in
-                let p = "\(dir)/cliclick"
-                return FileManager.default.fileExists(atPath: p) ? p : nil
-            }.first
-            if let path = cliclick {
-                let cl = Process()
-                cl.executableURL = URL(fileURLWithPath: path)
-                cl.arguments = ["m:+0,+0"]
-                cl.standardOutput = FileHandle.nullDevice
-                cl.standardError = FileHandle.nullDevice
-                try? cl.run()
-                cl.waitUntilExit()
-            }
-        }
 
         do {
             try process.run()
