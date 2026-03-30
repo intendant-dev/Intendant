@@ -519,6 +519,45 @@ impl SessionLog {
     /// Write `session_summary.json` with accumulated statistics.
     pub fn write_session_summary(&mut self) {
         self.flush_voice_utterance();
+        // Rebuild transcript.jsonl from session.jsonl to ensure completeness.
+        // The real-time buffering may have missed events due to race conditions.
+        self.rebuild_transcript();
+
+        // Fallback: scan session.jsonl for data the builder might have missed
+        // due to race conditions (event bus hasn't flushed when summary writes).
+        let _ = self.writer.flush();
+        if let Ok(content) = fs::read_to_string(self.dir.join("session.jsonl")) {
+            for line in content.lines() {
+                let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                match val["event"].as_str().unwrap_or("") {
+                    "live_usage_update" | "presence_usage_update" => {
+                        if let Some(t) = val["data"]["total_tokens"].as_u64() {
+                            if t > self.summary_builder.total_tokens {
+                                self.summary_builder.total_tokens = t;
+                            }
+                        }
+                    }
+                    "voice_usage" => {
+                        // Parse from detail string "tokens: total=28000 ..."
+                        if let Some(detail) = val["data"]["detail"].as_str() {
+                            if let Some(ts) = detail.split("total=").nth(1) {
+                                if let Some(n) = ts.split_whitespace().next() {
+                                    if let Ok(t) = n.parse::<u64>() {
+                                        if t > self.summary_builder.total_tokens {
+                                            self.summary_builder.total_tokens = t;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let duration = self
             .summary_builder
             .start_time
@@ -527,13 +566,12 @@ impl SessionLog {
         // Include in-progress CU task if session ended mid-task
         let mut cu_tasks = self.summary_builder.cu_tasks.clone();
         if let Some(ref task) = self.summary_builder.current_cu_task {
-            // Only add if not already recorded as complete
             let already_recorded = cu_tasks.iter().any(|t| t.task == *task);
             if !already_recorded && self.summary_builder.current_cu_turns > 0 {
                 cu_tasks.push(CuTaskSummary {
                     task: task.clone(),
                     turns: self.summary_builder.current_cu_turns,
-                    success: false, // didn't complete
+                    success: false,
                 });
             }
         }
@@ -734,6 +772,125 @@ impl SessionLog {
             self.flush_voice_utterance();
         }
         self.emit_voice("voice_protocol", "debug", kind, detail);
+    }
+
+    /// Rebuild transcript.jsonl from session.jsonl at session end.
+    /// Aggregates per-token voice_log events into full utterances per turn,
+    /// using voice_protocol/turnComplete as turn boundaries.
+    fn rebuild_transcript(&mut self) {
+        let _ = self.writer.flush();
+        let session_path = self.dir.join("session.jsonl");
+        let content = match fs::read_to_string(&session_path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        let mut entries: Vec<TranscriptEntry> = Vec::new();
+        let mut model_buf = String::new();
+        let mut model_ts = String::new();
+
+        for line in content.lines() {
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let event = val["event"].as_str().unwrap_or("");
+            let ts = val["ts"].as_str().unwrap_or("").to_string();
+
+            match event {
+                "user_transcript" => {
+                    // Flush any buffered model speech first
+                    let trimmed = model_buf.trim().to_string();
+                    if !trimmed.is_empty() {
+                        entries.push(TranscriptEntry {
+                            ts: model_ts.clone(),
+                            role: "model".to_string(),
+                            text: trimmed,
+                            tools_called: None,
+                        });
+                        model_buf.clear();
+                    }
+                    let text = val["message"].as_str().unwrap_or("").to_string();
+                    if !text.is_empty() {
+                        entries.push(TranscriptEntry {
+                            ts,
+                            role: "user".to_string(),
+                            text,
+                            tools_called: None,
+                        });
+                    }
+                }
+                "voice_log" => {
+                    let ctx = val["data"]["tool_context"].as_str().unwrap_or("");
+                    if ctx.is_empty() || ctx == "transcript" {
+                        let text = val["message"].as_str().unwrap_or("");
+                        if model_buf.is_empty() {
+                            model_ts = ts;
+                        }
+                        model_buf.push_str(text);
+                    }
+                }
+                "voice_protocol" => {
+                    let detail = val["data"]["detail"].as_str().unwrap_or("");
+                    // Flush on turnComplete or interrupted
+                    if detail.contains("turnComplete") || detail.contains("interrupted") {
+                        let trimmed = model_buf.trim().to_string();
+                        if !trimmed.is_empty() {
+                            entries.push(TranscriptEntry {
+                                ts: model_ts.clone(),
+                                role: "model".to_string(),
+                                text: trimmed,
+                                tools_called: None,
+                            });
+                            model_buf.clear();
+                        }
+                    }
+                }
+                // Also handle legacy voice_diagnostic for older session.jsonl
+                "voice_diagnostic" => {
+                    let kind = val["data"]["kind"].as_str().unwrap_or("");
+                    let detail = val["data"]["detail"].as_str().unwrap_or("");
+                    if kind == "gemini_msg"
+                        && (detail.contains("turnComplete") || detail.contains("interrupted"))
+                    {
+                        let trimmed = model_buf.trim().to_string();
+                        if !trimmed.is_empty() {
+                            entries.push(TranscriptEntry {
+                                ts: model_ts.clone(),
+                                role: "model".to_string(),
+                                text: trimmed,
+                                tools_called: None,
+                            });
+                            model_buf.clear();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Flush remaining
+        let trimmed = model_buf.trim().to_string();
+        if !trimmed.is_empty() {
+            entries.push(TranscriptEntry {
+                ts: model_ts,
+                role: "model".to_string(),
+                text: trimmed,
+                tools_called: None,
+            });
+        }
+
+        // Overwrite transcript.jsonl with clean aggregated version
+        if !entries.is_empty() {
+            let transcript_path = self.dir.join("transcript.jsonl");
+            if let Ok(f) = File::create(&transcript_path) {
+                let mut w = BufWriter::new(f);
+                for entry in &entries {
+                    if let Ok(json) = serde_json::to_string(entry) {
+                        let _ = writeln!(w, "{}", json);
+                    }
+                }
+                let _ = w.flush();
+            }
+        }
     }
 
     /// Flush the buffered voice utterance to transcript.jsonl.
