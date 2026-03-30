@@ -27,10 +27,9 @@ async fn mint_session_token(provider: &str, model: &str) -> Result<String, Strin
                 .map_err(|_| "OPENAI_API_KEY not set on server".to_string())?;
             let body = serde_json::json!({
                 "model": model,
-                "voice": "alloy",
             });
             let resp = reqwest::Client::new()
-                .post("https://api.openai.com/v1/realtime/client_secrets")
+                .post("https://api.openai.com/v1/realtime/sessions")
                 .header("Authorization", format!("Bearer {}", api_key))
                 .json(&body)
                 .send()
