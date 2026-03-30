@@ -97,36 +97,46 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
     }
 
     func checkPermissions() {
-        // Check permissions using Apple APIs — don't trigger system prompts
-        // directly (they appear asynchronously and get covered by our window).
-        // Instead, show our own alert if anything is missing.
-        let hasAccessibility = AXIsProcessTrusted()
-        let hasScreenRecording = CGPreflightScreenCaptureAccess()
+        // Request permissions via Apple APIs. These calls REGISTER the app
+        // in System Settings (so it appears in the permission lists) and
+        // may trigger system prompts. We then check the result and show
+        // our own alert if anything is still missing.
+        let hasScreenRecording = CGRequestScreenCaptureAccess()
+        let accessibilityOpts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+        let hasAccessibility = AXIsProcessTrustedWithOptions(accessibilityOpts)
         NSLog("Permissions: accessibility=\(hasAccessibility), screenRecording=\(hasScreenRecording)")
 
+        // Both granted — nothing to do
+        if hasAccessibility && hasScreenRecording { return }
+
+        // Give system prompts a moment to appear and be dismissed
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.5))
+
+        // Re-check after system prompts
+        let finalAccessibility = AXIsProcessTrusted()
+        let finalScreenRecording = CGPreflightScreenCaptureAccess()
+        if finalAccessibility && finalScreenRecording { return }
+
         var missing: [String] = []
-        if !hasAccessibility { missing.append("Accessibility (for mouse/keyboard control)") }
-        if !hasScreenRecording { missing.append("Screen Recording (for screenshots and display capture)") }
+        if !finalAccessibility { missing.append("Accessibility (for mouse/keyboard control)") }
+        if !finalScreenRecording { missing.append("Screen Recording (for screenshots and display capture)") }
 
-        if !missing.isEmpty {
-            let alert = NSAlert()
-            alert.messageText = "Permissions Required"
-            alert.informativeText = "Intendant needs these permissions to work properly:\n\n"
-                + missing.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
-                + "\n\nOpen System Settings > Privacy & Security and toggle each one ON for Intendant."
-                + "\n\nIf already toggled on, toggle OFF then ON again (macOS may need a refresh after recompiling)."
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "Open Settings")
-            alert.addButton(withTitle: "Continue Anyway")
+        let alert = NSAlert()
+        alert.messageText = "Permissions Required"
+        alert.informativeText = "Intendant needs these permissions to work properly:\n\n"
+            + missing.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
+            + "\n\nOpen System Settings > Privacy & Security and toggle each one ON for Intendant."
+            + "\n\nIf already toggled on, toggle OFF then ON again (macOS may need a refresh after recompiling)."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "Continue Anyway")
 
-            let response = alert.runModal()
-            if response == .alertFirstButtonReturn {
-                // Open the Privacy & Security pane
-                if !hasAccessibility {
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                } else {
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
-                }
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            if !finalAccessibility {
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+            } else {
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
             }
         }
     }
