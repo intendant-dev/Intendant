@@ -142,6 +142,7 @@ fn handle_client(stream: TcpStream, rate: u32) {
 }
 
 fn main() {
+    let mut bind = "127.0.0.1".to_string();
     let mut port = DEFAULT_PORT;
     let mut rate = DEFAULT_RATE;
 
@@ -149,6 +150,10 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--bind" => {
+                i += 1;
+                bind = args[i].clone();
+            }
             "--port" => {
                 i += 1;
                 port = args[i].parse().expect("invalid port");
@@ -158,7 +163,8 @@ fn main() {
                 rate = args[i].parse().expect("invalid rate");
             }
             "--help" | "-h" => {
-                eprintln!("Usage: bh-bridge [--port PORT] [--rate SAMPLE_RATE]");
+                eprintln!("Usage: bh-bridge [--bind ADDR] [--port PORT] [--rate SAMPLE_RATE]");
+                eprintln!("  --bind  Address to bind to (default: 127.0.0.1)");
                 eprintln!("  --port  TCP port to listen on (default: {})", DEFAULT_PORT);
                 eprintln!("  --rate  Sample rate in Hz (default: {})", DEFAULT_RATE);
                 eprintln!();
@@ -183,7 +189,7 @@ fn main() {
         }
     }
 
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("{}:{}", bind, port);
     let listener = TcpListener::bind(&addr).unwrap_or_else(|e| {
         eprintln!("[!] Failed to bind {}: {}", addr, e);
         std::process::exit(1);
