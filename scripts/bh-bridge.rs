@@ -3,12 +3,19 @@
 //! Captures from one BlackHole device (app output) and plays to another
 //! (app input), bridging audio to a remote client over a raw PCM TCP stream.
 //!
+//! Listens on 127.0.0.1 only. To reach from a VM, open a reverse SSH tunnel
+//! from the host:
+//!
+//!   Host:  ./bh-bridge
+//!   Host:  ssh -R 9900:127.0.0.1:9900 guest
+//!   Guest: connects to 127.0.0.1:9900 (tunneled to host)
+//!
 //! Build:  rustc -O scripts/bh-bridge.rs -o bh-bridge
 //! Run:    ./bh-bridge [--port 9900] [--rate 24000]
 //!
 //! Protocol: raw bidirectional PCM16 mono over TCP (no framing).
-//!   Host → Client: captured audio from BlackHole 16ch (app/call output)
-//!   Client → Host: audio to play into BlackHole 2ch (becomes app mic input)
+//!   Host -> Client: captured audio from BlackHole 16ch (app/call output)
+//!   Client -> Host: audio to play into BlackHole 2ch (becomes app mic input)
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -142,7 +149,6 @@ fn handle_client(stream: TcpStream, rate: u32) {
 }
 
 fn main() {
-    let mut bind = "127.0.0.1".to_string();
     let mut port = DEFAULT_PORT;
     let mut rate = DEFAULT_RATE;
 
@@ -150,10 +156,6 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--bind" => {
-                i += 1;
-                bind = args[i].clone();
-            }
             "--port" => {
                 i += 1;
                 port = args[i].parse().expect("invalid port");
@@ -163,10 +165,13 @@ fn main() {
                 rate = args[i].parse().expect("invalid rate");
             }
             "--help" | "-h" => {
-                eprintln!("Usage: bh-bridge [--bind ADDR] [--port PORT] [--rate SAMPLE_RATE]");
-                eprintln!("  --bind  Address to bind to (default: 127.0.0.1)");
+                eprintln!("Usage: bh-bridge [--port PORT] [--rate SAMPLE_RATE]");
                 eprintln!("  --port  TCP port to listen on (default: {})", DEFAULT_PORT);
                 eprintln!("  --rate  Sample rate in Hz (default: {})", DEFAULT_RATE);
+                eprintln!();
+                eprintln!("Listens on 127.0.0.1 only. To reach from a VM, use a reverse");
+                eprintln!("SSH tunnel from the host:");
+                eprintln!("  ssh -R 9900:127.0.0.1:9900 guest");
                 eprintln!();
                 eprintln!("Captures from '{}' and plays to '{}'.", CAPTURE_DEVICE, PLAYBACK_DEVICE);
                 eprintln!("Protocol: raw bidirectional PCM16 mono over TCP.");
@@ -189,15 +194,16 @@ fn main() {
         }
     }
 
-    let addr = format!("{}:{}", bind, port);
+    let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).unwrap_or_else(|e| {
         eprintln!("[!] Failed to bind {}: {}", addr, e);
         std::process::exit(1);
     });
 
     eprintln!("[*] bh-bridge listening on {} (rate={}Hz)", addr, rate);
-    eprintln!("[*] Capture: {} → TCP", CAPTURE_DEVICE);
-    eprintln!("[*] Playback: TCP → {}", PLAYBACK_DEVICE);
+    eprintln!("[*] Capture: {} -> TCP", CAPTURE_DEVICE);
+    eprintln!("[*] Playback: TCP -> {}", PLAYBACK_DEVICE);
+    eprintln!("[*] To expose to a VM: ssh -R 9900:127.0.0.1:9900 guest");
 
     for stream in listener.incoming() {
         match stream {
