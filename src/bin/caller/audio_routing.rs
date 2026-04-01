@@ -25,6 +25,10 @@ pub struct AudioBridge {
     /// When set, capture/playback bypass local audio devices and connect
     /// to a bh-bridge instance on the host over TCP.
     network_host: Option<String>,
+    /// Unix socket path for Vortex guest audio daemon.
+    /// When set, audio routes through the Vortex HAL plugin + daemon
+    /// locally inside the VM, with no host involvement.
+    vortex_socket_path: Option<String>,
 }
 
 impl AudioBridge {
@@ -55,6 +59,12 @@ impl AudioBridge {
     /// through local audio devices. Returns the host:port address.
     pub fn network_host(&self) -> Option<&str> {
         self.network_host.as_deref()
+    }
+
+    /// If set, audio is routed via the Vortex guest audio daemon over a Unix
+    /// socket. The daemon bridges shared memory (HAL plugin) ↔ this socket.
+    pub fn vortex_socket_path(&self) -> Option<&str> {
+        self.vortex_socket_path.as_deref()
     }
 }
 
@@ -87,7 +97,25 @@ pub async fn create_bridge(session_id: &str) -> Result<AudioBridge, CallerError>
         prev_default_source: None,
         prev_default_sink: None,
         network_host: None,
+        vortex_socket_path: None,
     })
+}
+
+/// Create an audio bridge that routes through the Vortex guest audio daemon.
+///
+/// The Vortex HAL plugin provides a "Vortex Audio" device visible to all apps.
+/// The daemon bridges the plugin's shared memory ring buffer to a Unix socket.
+/// intendant listens on the socket and exchanges PCM with the model.
+///
+/// No host involvement — all audio stays inside the VM.
+pub fn create_vortex_bridge(socket_path: &str) -> AudioBridge {
+    AudioBridge {
+        inner: PlatformBridge::stub(),
+        prev_default_source: None,
+        prev_default_sink: None,
+        network_host: None,
+        vortex_socket_path: Some(socket_path.to_string()),
+    }
 }
 
 /// Create an audio bridge that routes over TCP to a bh-bridge on the host.
@@ -120,6 +148,7 @@ pub async fn create_network_bridge(
         prev_default_source: None,
         prev_default_sink: None,
         network_host: Some(host_addr.to_string()),
+        vortex_socket_path: None,
     })
 }
 

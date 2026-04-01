@@ -481,6 +481,118 @@ impl AudioStreamBridge {
 ///
 /// - **Capture**: reads from PulseAudio monitor (app audio) and sends to the live model
 /// - **Playback**: receives model audio output and writes to PulseAudio sink (app mic input)
+// ---------------------------------------------------------------------------
+// Vortex wire protocol (must match VortexAudioDaemon)
+// ---------------------------------------------------------------------------
+
+const VORTEX_MSG_CONFIGURE: u32 = 0x01;
+const VORTEX_MSG_PCM_OUTPUT: u32 = 0x02;
+const VORTEX_MSG_PCM_INPUT: u32 = 0x03;
+const VORTEX_MSG_START: u32 = 0x04;
+const VORTEX_MSG_STOP: u32 = 0x05;
+
+/// Read one Vortex wire protocol message: [u32 LE type][u32 LE len][payload].
+async fn vortex_read_msg(
+    reader: &mut (impl AsyncReadExt + Unpin),
+) -> Result<(u32, Vec<u8>), CallerError> {
+    let mut hdr = [0u8; 8];
+    reader.read_exact(&mut hdr).await.map_err(|e| {
+        CallerError::Agent(format!("vortex: read header: {}", e))
+    })?;
+    let msg_type = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    let payload_len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+    let mut payload = vec![0u8; payload_len];
+    if payload_len > 0 {
+        reader.read_exact(&mut payload).await.map_err(|e| {
+            CallerError::Agent(format!("vortex: read payload: {}", e))
+        })?;
+    }
+    Ok((msg_type, payload))
+}
+
+/// Write one Vortex wire protocol message.
+async fn vortex_write_msg(
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    msg_type: u32,
+    payload: &[u8],
+) -> Result<(), CallerError> {
+    let mut hdr = [0u8; 8];
+    hdr[..4].copy_from_slice(&msg_type.to_le_bytes());
+    hdr[4..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    writer.write_all(&hdr).await.map_err(|e| {
+        CallerError::Agent(format!("vortex: write header: {}", e))
+    })?;
+    if !payload.is_empty() {
+        writer.write_all(payload).await.map_err(|e| {
+            CallerError::Agent(format!("vortex: write payload: {}", e))
+        })?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Format conversion: Vortex (Float32 stereo 48kHz) ↔ Model (PCM16 mono 24kHz)
+// ---------------------------------------------------------------------------
+
+/// Convert Vortex daemon PCM_OUTPUT (Float32 stereo 48kHz) to model input
+/// (PCM16 mono 24kHz). 8:1 size reduction.
+fn vortex_capture_convert(f32_stereo_48k: &[u8]) -> Vec<u8> {
+    // Each stereo frame = 2 floats = 8 bytes
+    // After mono downmix + 2:1 decimation + i16 conversion: 1 frame → 2 bytes
+    let num_floats = f32_stereo_48k.len() / 4;
+    let num_stereo_frames = num_floats / 2;
+    let num_output_samples = num_stereo_frames / 2; // 2:1 decimation
+    let mut out = Vec::with_capacity(num_output_samples * 2);
+
+    for i in (0..num_stereo_frames).step_by(2) {
+        // Read stereo pair (left + right)
+        let base = i * 8; // 2 floats * 4 bytes each
+        if base + 8 > f32_stereo_48k.len() {
+            break;
+        }
+        let left = f32::from_le_bytes([
+            f32_stereo_48k[base],
+            f32_stereo_48k[base + 1],
+            f32_stereo_48k[base + 2],
+            f32_stereo_48k[base + 3],
+        ]);
+        let right = f32::from_le_bytes([
+            f32_stereo_48k[base + 4],
+            f32_stereo_48k[base + 5],
+            f32_stereo_48k[base + 6],
+            f32_stereo_48k[base + 7],
+        ]);
+        let mono = (left + right) * 0.5;
+        let clamped = mono.clamp(-1.0, 1.0);
+        let sample = (clamped * 32767.0) as i16;
+        out.extend_from_slice(&sample.to_le_bytes());
+    }
+    out
+}
+
+/// Convert model output (PCM16 mono 24kHz) to Vortex daemon PCM_INPUT
+/// (Float32 stereo 48kHz). 8:1 size expansion.
+fn vortex_playback_convert(pcm16_mono_24k: &[u8]) -> Vec<u8> {
+    let num_samples = pcm16_mono_24k.len() / 2;
+    // Each mono sample → 2 stereo frames (upsample) × 2 channels × 4 bytes
+    let mut out = Vec::with_capacity(num_samples * 16);
+
+    for i in 0..num_samples {
+        let sample = i16::from_le_bytes([
+            pcm16_mono_24k[i * 2],
+            pcm16_mono_24k[i * 2 + 1],
+        ]);
+        let f = sample as f32 / 32768.0;
+        let bytes = f.to_le_bytes();
+        // Duplicate sample for 2:1 upsample, stereo (L=R)
+        for _ in 0..2 {
+            out.extend_from_slice(&bytes); // left
+            out.extend_from_slice(&bytes); // right
+        }
+    }
+    out
+}
+
 pub async fn start_audio_bridge(
     session_write: Arc<Mutex<WsSink>>,
     provider: LiveAudioProvider,
@@ -489,6 +601,18 @@ pub async fn start_audio_bridge(
     audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
 ) -> Result<AudioStreamBridge, CallerError> {
+    if let Some(socket_path) = bridge.vortex_socket_path() {
+        return start_vortex_audio_bridge(
+            session_write,
+            provider,
+            sample_rate,
+            socket_path,
+            audio_out_rx,
+            capture_tee_tx,
+        )
+        .await;
+    }
+
     if let Some(host) = bridge.network_host() {
         return start_network_audio_bridge(
             session_write,
@@ -515,6 +639,140 @@ pub async fn start_audio_bridge(
 /// Network audio bridge: connects to a bh-bridge on the host over TCP.
 /// The TCP stream is full-duplex raw PCM16 mono — host→client is captured
 /// app audio, client→host is model audio for playback.
+/// Vortex audio bridge: listens on a Unix socket for the Vortex guest daemon,
+/// speaks the Vortex wire protocol, and converts between Float32 stereo 48kHz
+/// (daemon) and PCM16 mono 24kHz (model).
+async fn start_vortex_audio_bridge(
+    session_write: Arc<Mutex<WsSink>>,
+    provider: LiveAudioProvider,
+    sample_rate: u32,
+    socket_path: &str,
+    audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+) -> Result<AudioStreamBridge, CallerError> {
+    // Clean up stale socket and bind
+    let _ = std::fs::remove_file(socket_path);
+    let listener = tokio::net::UnixListener::bind(socket_path).map_err(|e| {
+        CallerError::Agent(format!("vortex: bind {}: {}", socket_path, e))
+    })?;
+    eprintln!("live_audio: vortex bridge listening on {}", socket_path);
+
+    // Wait for daemon to connect (it retries every 2s)
+    let stream = tokio::time::timeout(Duration::from_secs(30), listener.accept())
+        .await
+        .map_err(|_| {
+            CallerError::Agent("vortex: daemon did not connect within 30s".into())
+        })?
+        .map_err(|e| CallerError::Agent(format!("vortex: accept: {}", e)))?
+        .0;
+    eprintln!("live_audio: vortex daemon connected");
+
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
+
+    // Handshake: read CONFIGURE
+    let (msg_type, payload) = vortex_read_msg(&mut read_half).await?;
+    if msg_type != VORTEX_MSG_CONFIGURE {
+        return Err(CallerError::Agent(format!(
+            "vortex: expected CONFIGURE (0x01), got 0x{:02x}",
+            msg_type
+        )));
+    }
+    if payload.len() >= 8 {
+        let daemon_rate = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let daemon_channels = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        eprintln!(
+            "live_audio: vortex daemon format: {}Hz {}ch float32",
+            daemon_rate, daemon_channels
+        );
+    }
+
+    // Read START
+    let (msg_type, _) = vortex_read_msg(&mut read_half).await?;
+    if msg_type != VORTEX_MSG_START {
+        return Err(CallerError::Agent(format!(
+            "vortex: expected START (0x04), got 0x{:02x}",
+            msg_type
+        )));
+    }
+    eprintln!("live_audio: vortex streaming started");
+
+    // Wrap write_half in Arc<Mutex> for shared access from playback task
+    let write_half = Arc::new(Mutex::new(write_half));
+
+    // Capture task: daemon PCM_OUTPUT → convert → model WebSocket
+    let capture_write = session_write;
+    let capture_rate = sample_rate;
+    let capture_provider = provider;
+    let capture_handle = tokio::spawn(async move {
+        let mut reader = read_half;
+        loop {
+            let msg = vortex_read_msg(&mut reader).await;
+            match msg {
+                Ok((VORTEX_MSG_PCM_OUTPUT, payload)) => {
+                    let pcm16 = vortex_capture_convert(&payload);
+                    if pcm16.is_empty() {
+                        continue;
+                    }
+                    let b64 = BASE64.encode(&pcm16);
+                    let ws_msg = match capture_provider {
+                        LiveAudioProvider::Gemini => serde_json::json!({
+                            "realtime_input": {
+                                "media_chunks": [{
+                                    "mime_type": format!("audio/pcm;rate={}", capture_rate),
+                                    "data": b64
+                                }]
+                            }
+                        }),
+                        LiveAudioProvider::OpenAI => serde_json::json!({
+                            "type": "input_audio_buffer.append",
+                            "audio": b64
+                        }),
+                    };
+                    if let Some(ref tee) = capture_tee_tx {
+                        let _ = tee.send(pcm16);
+                    }
+                    let mut sink = capture_write.lock().await;
+                    if sink.send(WsMessage::Text(ws_msg.to_string())).await.is_err() {
+                        break;
+                    }
+                }
+                Ok((VORTEX_MSG_STOP, _)) => {
+                    eprintln!("live_audio: vortex daemon sent STOP");
+                    break;
+                }
+                Ok((msg_type, _)) => {
+                    // Ignore other message types (LATENCY_QUERY, etc.)
+                    let _ = msg_type;
+                }
+                Err(_) => break,
+            }
+        }
+        eprintln!("live_audio: vortex capture ended");
+    });
+
+    // Playback task: model audio → convert → daemon PCM_INPUT
+    let playback_write = write_half;
+    let playback_handle = tokio::spawn(async move {
+        let mut rx = audio_out_rx;
+        while let Some(pcm_data) = rx.recv().await {
+            let f32_stereo = vortex_playback_convert(&pcm_data);
+            let mut writer = playback_write.lock().await;
+            if vortex_write_msg(&mut *writer, VORTEX_MSG_PCM_INPUT, &f32_stereo)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        eprintln!("live_audio: vortex playback ended");
+    });
+
+    Ok(AudioStreamBridge {
+        capture_handle,
+        playback_handle,
+    })
+}
+
 async fn start_network_audio_bridge(
     session_write: Arc<Mutex<WsSink>>,
     provider: LiveAudioProvider,
@@ -1133,6 +1391,96 @@ pub async fn run_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Vortex format conversion tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vortex_capture_convert_stereo_48k_to_mono_24k() {
+        // 4 stereo frames at 48kHz → 2 mono samples at 24kHz (2:1 decimation)
+        // Frame 0: L=0.5, R=0.5 → mono=0.5 → kept (even index)
+        // Frame 1: L=0.25, R=0.75 → mono=0.5 → skipped (odd index)
+        // Frame 2: L=-1.0, R=-1.0 → mono=-1.0 → kept
+        // Frame 3: L=0.0, R=0.0 → mono=0.0 → skipped
+        let mut input = Vec::new();
+        for &(l, r) in &[(0.5f32, 0.5f32), (0.25f32, 0.75f32), (-1.0f32, -1.0f32), (0.0f32, 0.0f32)] {
+            input.extend_from_slice(&l.to_le_bytes());
+            input.extend_from_slice(&r.to_le_bytes());
+        }
+        let output = vortex_capture_convert(&input);
+        assert_eq!(output.len(), 4); // 2 i16 samples × 2 bytes
+
+        let s0 = i16::from_le_bytes([output[0], output[1]]);
+        let s1 = i16::from_le_bytes([output[2], output[3]]);
+        // 0.5 * 32767 ≈ 16383
+        assert!((s0 - 16383).abs() <= 1, "s0={}", s0);
+        // -1.0 * 32767 = -32767
+        assert_eq!(s1, -32767);
+    }
+
+    #[test]
+    fn vortex_playback_convert_mono_24k_to_stereo_48k() {
+        // 2 mono samples at 24kHz → 4 stereo frames at 48kHz
+        let input: Vec<u8> = [16383i16, -32767i16]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let output = vortex_playback_convert(&input);
+        // 2 samples × 2 (upsample) × 2 (stereo) × 4 (f32) = 32 bytes
+        assert_eq!(output.len(), 32);
+
+        // First sample duplicated twice as stereo
+        let f0 = f32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+        let f1 = f32::from_le_bytes([output[4], output[5], output[6], output[7]]);
+        assert!((f0 - 16383.0 / 32768.0).abs() < 0.001);
+        assert_eq!(f0, f1); // stereo: L == R
+    }
+
+    #[test]
+    fn vortex_round_trip_preserves_signal() {
+        // Create a 440Hz tone as PCM16 mono 24kHz (model format)
+        let num_samples = 240; // 10ms
+        let mut pcm16 = Vec::with_capacity(num_samples * 2);
+        for i in 0..num_samples {
+            let t = i as f32 / 24000.0;
+            let val = (t * 440.0 * 2.0 * std::f32::consts::PI).sin();
+            let sample = (val * 32767.0) as i16;
+            pcm16.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        // Playback convert (24k mono → 48k stereo float32)
+        let f32_stereo = vortex_playback_convert(&pcm16);
+        // Capture convert back (48k stereo float32 → 24k mono pcm16)
+        let round_trip = vortex_capture_convert(&f32_stereo);
+
+        assert_eq!(round_trip.len(), pcm16.len());
+
+        // Samples should be close (quantization error ≤ 1)
+        for i in 0..num_samples {
+            let orig = i16::from_le_bytes([pcm16[i * 2], pcm16[i * 2 + 1]]);
+            let rt = i16::from_le_bytes([round_trip[i * 2], round_trip[i * 2 + 1]]);
+            assert!(
+                (orig - rt).abs() <= 1,
+                "sample {}: orig={} round_trip={}",
+                i, orig, rt
+            );
+        }
+    }
+
+    #[test]
+    fn vortex_capture_empty_input() {
+        assert!(vortex_capture_convert(&[]).is_empty());
+    }
+
+    #[test]
+    fn vortex_playback_empty_input() {
+        assert!(vortex_playback_convert(&[]).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Existing tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn gemini_setup_message_has_no_tools() {
