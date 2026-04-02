@@ -5,17 +5,18 @@ cd /d "%~dp0"
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Requesting administrator privileges...
-    powershell -Command "Start-Process '%~f0' -Verb RunAs"
+    powershell -Command "Start-Process cmd.exe -Verb RunAs -ArgumentList '/c cd /d \"%~dp0\" && \"%~f0\" %*'"
     exit /b
 )
 copy "%~f0" "%TEMP%\setup-lan.ps1" >nul
-powershell -ExecutionPolicy Bypass -NoProfile -File "%TEMP%\setup-lan.ps1" %*
+powershell -ExecutionPolicy Bypass -NoProfile -File "%TEMP%\setup-lan.ps1" -ScriptDir "%~dp0" %*
 del "%TEMP%\setup-lan.ps1" >nul 2>&1
 pause
 exit /b
 #>
 
 param(
+    [string]$ScriptDir = "",
     [switch]$Remove,
     [switch]$Recert,
     [switch]$Force
@@ -171,9 +172,11 @@ function Invoke-GuestCommand($cmd) {
 }
 
 function Find-LocalGuestScript {
-    # $PSScriptRoot is %TEMP% (bat copies itself there), so check $PWD first
-    # (the batch preamble does cd /d "%~dp0")
-    foreach ($dir in @($PWD.Path, $PSScriptRoot)) {
+    # $PSScriptRoot is %TEMP% (bat copies itself there as .ps1).
+    # $ScriptDir is the bat's real directory, passed via -ScriptDir from the batch preamble.
+    $dirs = @($PSScriptRoot, $PWD.Path)
+    if ($ScriptDir) { $dirs = @($ScriptDir) + $dirs }
+    foreach ($dir in $dirs) {
         $candidate = Join-Path $dir "setup-lan.sh"
         if (Test-Path $candidate) { return $candidate }
     }
@@ -181,6 +184,9 @@ function Find-LocalGuestScript {
 }
 
 function Copy-ScriptToGuest {
+    # Temporarily allow stderr from ssh/scp without crashing (host key warnings, etc.)
+    $ErrorActionPreference = "Continue"
+
     $scriptPath = Find-LocalGuestScript
     $ghUrl = "https://raw.githubusercontent.com/lovon-spec/intendant/main/scripts/setup-lan.sh"
 
@@ -199,12 +205,12 @@ function Copy-ScriptToGuest {
         if ($scriptPath) {
             $scpPort = if ($script:SshPort -ne 22) { @("-P", $script:SshPort) } else { @() }
             scp @scpPort $scriptPath "$($script:VmUser)@$($script:SshHost):/tmp/setup-lan.sh"
+            ssh @sshArgs "chmod +x /tmp/setup-lan.sh"
         } else {
             Info "setup-lan.sh not found locally — downloading on guest..."
-            ssh @sshArgs "curl -sfL '$ghUrl' -o /tmp/setup-lan.sh"
+            ssh @sshArgs "curl -sfL '$ghUrl' -o /tmp/setup-lan.sh && chmod +x /tmp/setup-lan.sh"
             if ($LASTEXITCODE -ne 0) { Die "failed to download setup-lan.sh on guest" }
         }
-        ssh @sshArgs "chmod +x /tmp/setup-lan.sh"
     }
 }
 
