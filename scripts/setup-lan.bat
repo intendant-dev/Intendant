@@ -191,8 +191,8 @@ function Copy-ScriptToGuest {
 function Test-GuestSsh {
     try {
         $portArgs = if ($script:SshPort -ne 22) { @("-p", $script:SshPort) } else { @() }
-        ssh -o BatchMode=yes -o ConnectTimeout=5 @portArgs "$($script:VmUser)@$($script:SshHost)" "echo ok" 2>$null | Out-Null
-        return $true
+        $result = ssh -o ConnectTimeout=5 @portArgs "$($script:VmUser)@$($script:SshHost)" "echo ok" 2>&1
+        return ($LASTEXITCODE -eq 0)
     } catch {
         return $false
     }
