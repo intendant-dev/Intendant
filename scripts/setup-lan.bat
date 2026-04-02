@@ -232,7 +232,7 @@ function Test-GuestSsh {
 function Run-Wizard {
     Write-Host ""
     Write-Host "========================================================" -ForegroundColor Cyan
-    Write-Host "  Intendant LAN Access Setup" -ForegroundColor Cyan
+    Write-Host "  Intendant LAN Access Setup  (v2)" -ForegroundColor Cyan
     Write-Host "========================================================" -ForegroundColor Cyan
 
     # Step 1: Guest type
