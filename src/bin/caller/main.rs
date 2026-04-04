@@ -4,6 +4,7 @@ mod computer_use;
 mod control;
 mod conversation;
 mod debug;
+mod display;
 mod error;
 mod event;
 mod frames;

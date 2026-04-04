@@ -1,0 +1,230 @@
+use super::EncodedFrame;
+
+/// Convert a BGRA image buffer to I420 (YCbCr 4:2:0) planar format.
+///
+/// The output layout is: Y plane (width*height) followed by U plane
+/// (width/2 * height/2) followed by V plane (width/2 * height/2).
+/// U and V are subsampled 2x2 by averaging the four contributing pixels.
+pub fn bgra_to_i420(bgra: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let s = stride as usize;
+
+    let uv_w = (w + 1) / 2;
+    let uv_h = (h + 1) / 2;
+
+    let y_size = w * h;
+    let uv_size = uv_w * uv_h;
+    let mut out = vec![0u8; y_size + 2 * uv_size];
+
+    let (y_plane, uv_planes) = out.split_at_mut(y_size);
+    let (u_plane, v_plane) = uv_planes.split_at_mut(uv_size);
+
+    // Compute Y for every pixel.
+    for row in 0..h {
+        let row_start = row * s;
+        for col in 0..w {
+            let px = row_start + col * 4;
+            let b = bgra[px] as f32;
+            let g = bgra[px + 1] as f32;
+            let r = bgra[px + 2] as f32;
+            let y = (0.299 * r + 0.587 * g + 0.114 * b).round();
+            y_plane[row * w + col] = y.clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    // Compute U, V by averaging 2x2 blocks.
+    for uv_row in 0..uv_h {
+        for uv_col in 0..uv_w {
+            let mut sum_r: f32 = 0.0;
+            let mut sum_g: f32 = 0.0;
+            let mut sum_b: f32 = 0.0;
+            let mut count: f32 = 0.0;
+
+            for dy in 0..2u32 {
+                let row = uv_row * 2 + dy as usize;
+                if row >= h {
+                    continue;
+                }
+                for dx in 0..2u32 {
+                    let col = uv_col * 2 + dx as usize;
+                    if col >= w {
+                        continue;
+                    }
+                    let px = row * s + col * 4;
+                    sum_b += bgra[px] as f32;
+                    sum_g += bgra[px + 1] as f32;
+                    sum_r += bgra[px + 2] as f32;
+                    count += 1.0;
+                }
+            }
+
+            let r = sum_r / count;
+            let g = sum_g / count;
+            let b = sum_b / count;
+
+            let u = (-0.169 * r - 0.331 * g + 0.500 * b + 128.0).round();
+            let v = (0.500 * r - 0.419 * g - 0.081 * b + 128.0).round();
+
+            let idx = uv_row * uv_w + uv_col;
+            u_plane[idx] = u.clamp(0.0, 255.0) as u8;
+            v_plane[idx] = v.clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    out
+}
+
+/// A single packet produced by the VP8 encoder.
+pub struct EncodedPacket {
+    pub data: Vec<u8>,
+    pub pts_ms: u64,
+    pub duration_ms: u64,
+    pub is_keyframe: bool,
+}
+
+/// VP8 encoder wrapping `vpx-encode`.
+pub struct Vp8Encoder {
+    encoder: vpx_encode::Encoder,
+    frame_count: u64,
+    pts_offset: u64,
+}
+
+impl Vp8Encoder {
+    /// Create a new VP8 encoder for the given resolution and target bitrate.
+    pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, String> {
+        let config = vpx_encode::Config {
+            width: width as _,
+            height: height as _,
+            timebase: [1, 1000],
+            bitrate: bitrate_kbps as _,
+            codec: vpx_encode::VideoCodecId::VP8,
+        };
+        let encoder = vpx_encode::Encoder::new(config).map_err(|e| format!("{e}"))?;
+        Ok(Self {
+            encoder,
+            frame_count: 0,
+            pts_offset: 0,
+        })
+    }
+
+    /// Encode one I420 frame. Returns zero or more encoded packets.
+    ///
+    /// `duration_ms` is the display duration of this frame (typically 1000/fps).
+    pub fn encode(&mut self, i420: &[u8], duration_ms: u64) -> Result<Vec<EncodedPacket>, String> {
+        let pts = self.pts_offset;
+        self.pts_offset += duration_ms;
+        self.frame_count += 1;
+
+        let packets = self
+            .encoder
+            .encode(pts as i64, i420)
+            .map_err(|e| format!("{e}"))?;
+
+        let mut out = Vec::new();
+        for pkt in packets {
+            out.push(EncodedPacket {
+                data: pkt.data.to_vec(),
+                pts_ms: pkt.pts as u64,
+                duration_ms,
+                is_keyframe: pkt.key,
+            });
+        }
+        Ok(out)
+    }
+}
+
+impl EncodedPacket {
+    /// Convert to the shared `EncodedFrame` type used by the display session.
+    pub fn into_encoded_frame(self) -> EncodedFrame {
+        EncodedFrame {
+            data: self.data,
+            pts_ms: self.pts_ms,
+            duration_ms: self.duration_ms,
+            is_keyframe: self.is_keyframe,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a 2x2 BGRA image with known pixel values.
+    fn make_2x2_bgra() -> Vec<u8> {
+        // Pixel layout (BGRA):
+        //   (0,0): pure red   -> B=0, G=0, R=255, A=255
+        //   (1,0): pure green -> B=0, G=255, R=0, A=255
+        //   (0,1): pure blue  -> B=255, G=0, R=0, A=255
+        //   (1,1): white      -> B=255, G=255, R=255, A=255
+        vec![
+            0, 0, 255, 255, // red
+            0, 255, 0, 255, // green
+            255, 0, 0, 255, // blue
+            255, 255, 255, 255, // white
+        ]
+    }
+
+    #[test]
+    fn bgra_to_i420_dimensions() {
+        let bgra = make_2x2_bgra();
+        let i420 = bgra_to_i420(&bgra, 2, 2, 8);
+        // Y: 2*2 = 4, U: 1*1 = 1, V: 1*1 = 1 => total 6
+        assert_eq!(i420.len(), 6);
+    }
+
+    #[test]
+    fn bgra_to_i420_y_values() {
+        let bgra = make_2x2_bgra();
+        let i420 = bgra_to_i420(&bgra, 2, 2, 8);
+
+        // Expected Y values (rounded):
+        // Red:   0.299*255 + 0.587*0   + 0.114*0   = 76.245 -> 76
+        // Green: 0.299*0   + 0.587*255 + 0.114*0   = 149.685 -> 150
+        // Blue:  0.299*0   + 0.587*0   + 0.114*255 = 29.07  -> 29
+        // White: 0.299*255 + 0.587*255 + 0.114*255 = 255    -> 255
+        assert_eq!(i420[0], 76);
+        assert_eq!(i420[1], 150);
+        assert_eq!(i420[2], 29);
+        assert_eq!(i420[3], 255);
+    }
+
+    #[test]
+    fn bgra_to_i420_stride_padding() {
+        // 2x2 image with stride=12 (4 bytes padding per row)
+        let mut bgra = vec![0u8; 24]; // 2 rows * 12 bytes
+        // Row 0: white, white
+        bgra[0..4].copy_from_slice(&[255, 255, 255, 255]);
+        bgra[4..8].copy_from_slice(&[255, 255, 255, 255]);
+        // Row 1: black, black
+        bgra[12..16].copy_from_slice(&[0, 0, 0, 255]);
+        bgra[16..20].copy_from_slice(&[0, 0, 0, 255]);
+
+        let i420 = bgra_to_i420(&bgra, 2, 2, 12);
+        assert_eq!(i420.len(), 6);
+        // White Y = 255, Black Y = 0
+        assert_eq!(i420[0], 255);
+        assert_eq!(i420[1], 255);
+        assert_eq!(i420[2], 0);
+        assert_eq!(i420[3], 0);
+    }
+
+    #[test]
+    fn vp8_encoder_produces_output() {
+        let mut enc = Vp8Encoder::new(320, 240, 500).expect("encoder creation");
+        // Solid gray I420 frame
+        let y_size = 320 * 240;
+        let uv_size = 160 * 120;
+        let mut i420 = vec![128u8; y_size + 2 * uv_size];
+        // Set U and V to 128 (neutral chroma)
+        for b in &mut i420[y_size..] {
+            *b = 128;
+        }
+
+        let packets = enc.encode(&i420, 33).expect("encode");
+        // VP8 typically emits at least one packet for the first frame (keyframe).
+        assert!(!packets.is_empty(), "expected at least one packet");
+        assert!(packets[0].is_keyframe, "first frame should be keyframe");
+        assert!(!packets[0].data.is_empty(), "packet data should not be empty");
+    }
+}

@@ -11,6 +11,8 @@ pub enum CallerError {
     Config(String),
     Toml(String),
     Tui(String),
+    Display(String),
+    WebRtc(String),
 }
 
 impl fmt::Display for CallerError {
@@ -25,6 +27,8 @@ impl fmt::Display for CallerError {
             CallerError::Config(msg) => write!(f, "Config error: {}", msg),
             CallerError::Toml(msg) => write!(f, "TOML error: {}", msg),
             CallerError::Tui(msg) => write!(f, "TUI error: {}", msg),
+            CallerError::Display(msg) => write!(f, "Display error: {}", msg),
+            CallerError::WebRtc(msg) => write!(f, "WebRTC error: {}", msg),
         }
     }
 }
@@ -117,6 +121,18 @@ mod tests {
             CallerError::Json(_) => {}
             _ => panic!("expected Json variant"),
         }
+    }
+
+    #[test]
+    fn display_error_display() {
+        let err = CallerError::Display("no frame".to_string());
+        assert_eq!(format!("{}", err), "Display error: no frame");
+    }
+
+    #[test]
+    fn webrtc_error_display() {
+        let err = CallerError::WebRtc("peer closed".to_string());
+        assert_eq!(format!("{}", err), "WebRTC error: peer closed");
     }
 
     #[test]

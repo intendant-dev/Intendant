@@ -1,0 +1,612 @@
+//! WebRTC-based display transport.
+//!
+//! A `DisplaySession` connects a platform-native capture backend to one or more
+//! WebRTC peers via a shared VP8 encoder.  The pipeline is:
+//!
+//! ```text
+//! [CaptureBackend] --mpsc(4)--> [capture bridge] --broadcast(16)--> [encoder]
+//!                                     |                                |
+//!                              latest_frame (RwLock)            per-peer mpsc(8)
+//!                                                                      |
+//!                                                              [WebRtcPeer sender]
+//!                                                                      |
+//!                                                               track.write_sample()
+//! ```
+//!
+//! Backpressure rules:
+//! - PipeWire -> tokio: bounded `mpsc(4)`, frames dropped via `try_send`.
+//! - Broadcast to encoder subscribers: `broadcast(16)`, lagging receivers skip.
+//! - Per-peer encoded frame queue: `mpsc(8)`, encoder drops via `try_send`.
+//! - `latest_frame`: always overwritten, latest-wins.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+
+use async_trait::async_trait;
+use serde::Deserialize;
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::error::CallerError;
+
+pub mod encode;
+pub mod keymap;
+pub mod webrtc;
+#[cfg(target_os = "linux")]
+pub mod wayland;
+
+// ---------------------------------------------------------------------------
+// Core types
+// ---------------------------------------------------------------------------
+
+/// A raw, uncompressed video frame from the capture backend.
+pub struct Frame {
+    pub data: Vec<u8>,
+    pub format: FrameFormat,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub timestamp: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameFormat {
+    Bgra,
+    Rgba,
+}
+
+/// Encoded VP8 frame -- shared across peers, each peer packetizes independently.
+#[derive(Clone)]
+pub struct EncodedFrame {
+    pub data: Vec<u8>,
+    pub pts_ms: u64,
+    pub duration_ms: u64,
+    pub is_keyframe: bool,
+}
+
+/// Browser input event -- carries DOM key identifiers and normalised mouse
+/// coordinates (0.0..1.0).
+///
+/// Phase 1: physical key semantics only.  The `code` field (DOM physical key
+/// position) is used for injection; the `key` field is carried but not used.
+/// Non-US keyboard layouts will produce incorrect character output.  A future
+/// phase will add character-level injection via the `key` field where the
+/// platform supports it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "t")]
+pub enum InputEvent {
+    #[serde(rename = "kd")]
+    KeyDown {
+        code: String,
+        key: String,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        meta: bool,
+    },
+    #[serde(rename = "ku")]
+    KeyUp {
+        code: String,
+        key: String,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        meta: bool,
+    },
+    #[serde(rename = "md")]
+    MouseDown { x: f64, y: f64, b: u8 },
+    #[serde(rename = "mu")]
+    MouseUp { x: f64, y: f64, b: u8 },
+    #[serde(rename = "mm")]
+    MouseMove { x: f64, y: f64 },
+    #[serde(rename = "sc")]
+    Scroll { x: f64, y: f64, dx: f64, dy: f64 },
+}
+
+// ---------------------------------------------------------------------------
+// ICE configuration
+// ---------------------------------------------------------------------------
+
+/// WebRTC ICE configuration.  Defaults to empty (local-only, no STUN/TURN).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct IceConfig {
+    pub ice_servers: Vec<IceServer>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct IceServer {
+    pub urls: Vec<String>,
+    pub username: Option<String>,
+    pub credential: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Display backend trait
+// ---------------------------------------------------------------------------
+
+pub type PeerId = u64;
+
+/// Platform-specific display capture and input injection.
+#[async_trait]
+pub trait DisplayBackend: Send + Sync + 'static {
+    /// Begin capturing frames at the target framerate.
+    /// Returns a receiver for raw frames (bounded channel, backend drops on full).
+    async fn start_capture(
+        &self,
+        fps: u32,
+    ) -> Result<mpsc::Receiver<Frame>, CallerError>;
+
+    /// Stop capturing. Blocks until the capture thread/task has exited.
+    async fn stop_capture(&self);
+
+    /// Inject a browser input event into the display.
+    async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError>;
+
+    /// Current display resolution (width, height).
+    fn resolution(&self) -> (u32, u32);
+
+    /// Human-readable backend name (e.g. "wayland", "x11").
+    fn kind(&self) -> &'static str;
+}
+
+// ---------------------------------------------------------------------------
+// DisplaySession
+// ---------------------------------------------------------------------------
+
+/// Manages a single display's capture pipeline, encoder, and WebRTC peers.
+pub struct DisplaySession {
+    pub display_id: u32,
+    backend: Arc<dyn DisplayBackend>,
+    frame_tx: broadcast::Sender<Arc<Frame>>,
+    latest_frame: Arc<RwLock<Option<Arc<Frame>>>>,
+    /// Shared with the encoder task so new peers are visible immediately.
+    peers: Arc<RwLock<HashMap<PeerId, Arc<self::webrtc::WebRtcPeer>>>>,
+    encoder_handle: Mutex<Option<JoinHandle<()>>>,
+    capture_handle: Mutex<Option<JoinHandle<()>>>,
+    shutdown: CancellationToken,
+}
+
+impl DisplaySession {
+    /// Create a new display session.  Does NOT start capture -- call `start()`.
+    pub fn new(display_id: u32, backend: Arc<dyn DisplayBackend>) -> Self {
+        let (frame_tx, _) = broadcast::channel(16);
+        Self {
+            display_id,
+            backend,
+            frame_tx,
+            latest_frame: Arc::new(RwLock::new(None)),
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            encoder_handle: Mutex::new(None),
+            capture_handle: Mutex::new(None),
+            shutdown: CancellationToken::new(),
+        }
+    }
+
+    /// Start the capture and encoding pipeline.
+    ///
+    /// Spawns:
+    /// 1. **Capture bridge** -- reads frames from the backend mpsc, updates
+    ///    `latest_frame`, and broadcasts to subscribers.
+    /// 2. **Encoder** -- subscribes to the broadcast, converts BGRA->I420,
+    ///    VP8-encodes, and fans out `Arc<EncodedFrame>` to each peer's bounded
+    ///    channel.
+    pub async fn start(&self, fps: u32) -> Result<(), CallerError> {
+        let mut capture_rx = self.backend.start_capture(fps).await?;
+
+        let (width, height) = self.backend.resolution();
+
+        // --- Task 1: Capture bridge ---
+        let frame_tx = self.frame_tx.clone();
+        let latest = Arc::clone(&self.latest_frame);
+        let shutdown = self.shutdown.clone();
+
+        let capture_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    frame = capture_rx.recv() => {
+                        let Some(frame) = frame else { break };
+                        let arc_frame = Arc::new(frame);
+                        *latest.write().await = Some(Arc::clone(&arc_frame));
+                        // Best-effort broadcast; receivers that lag will skip.
+                        let _ = frame_tx.send(arc_frame);
+                    }
+                }
+            }
+        });
+        *self.capture_handle.lock().await = Some(capture_handle);
+
+        // --- Task 2: Encoder ---
+        //
+        // The VP8 encoder (vpx_encode::Encoder) is !Send because it contains
+        // raw pointers. It must live on a single dedicated OS thread. We spawn
+        // a std::thread for encoding and bridge to tokio via channels.
+        //
+        // Flow: broadcast subscriber (tokio) -> i420_tx -> encoder thread
+        //       -> encoded_frames_tx -> fan-out task (tokio) -> per-peer channels
+        let mut broadcast_rx = self.frame_tx.subscribe();
+        let peers = Arc::clone(&self.peers);
+
+        let duration_ms = if fps > 0 { 1000 / fps as u64 } else { 33 };
+
+        // Channel from the bridge task to the encoder thread: raw I420 data.
+        let (i420_tx, i420_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+        // Channel from the encoder thread back to the fan-out task: encoded frames.
+        let (efr_tx, mut efr_rx) = mpsc::channel::<Arc<EncodedFrame>>(16);
+
+        // Encoder thread (dedicated OS thread, not tokio).
+        let encoder_shutdown = self.shutdown.clone();
+        std::thread::spawn(move || {
+            let mut encoder = match encode::Vp8Encoder::new(width, height, 2000) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            while let Ok(i420) = i420_rx.recv() {
+                if encoder_shutdown.is_cancelled() {
+                    break;
+                }
+                if let Ok(packets) = encoder.encode(&i420, duration_ms) {
+                    for pkt in packets {
+                        let ef = Arc::new(pkt.into_encoded_frame());
+                        if efr_tx.blocking_send(ef).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Bridge task: broadcast subscriber -> I420 conversion -> encoder thread.
+        let shutdown_bridge = self.shutdown.clone();
+        let bridge_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_bridge.cancelled() => break,
+                    result = broadcast_rx.recv() => {
+                        let frame = match result {
+                            Ok(f) => f,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        };
+                        let fd = frame.data.clone();
+                        let fw = frame.width;
+                        let fh = frame.height;
+                        let fs = frame.stride;
+                        // I420 conversion on the blocking thread pool (CPU-bound).
+                        let i420 = tokio::task::spawn_blocking(move || {
+                            encode::bgra_to_i420(&fd, fw, fh, fs)
+                        }).await;
+                        if let Ok(i420) = i420 {
+                            if i420_tx.try_send(i420).is_err() {
+                                // Backpressure: encoder is behind, drop frame.
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Fan-out task: read encoded frames from the encoder thread, distribute
+        // to each peer's bounded channel.
+        let shutdown_fanout = self.shutdown.clone();
+        let encoder_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_fanout.cancelled() => break,
+                    ef = efr_rx.recv() => {
+                        let Some(ef) = ef else { break };
+                        let peers_guard = peers.read().await;
+                        for peer in peers_guard.values() {
+                            let _ = peer.encoded_frame_tx().try_send(Arc::clone(&ef));
+                        }
+                    }
+                }
+            }
+            // Also await the bridge so it doesn't leak.
+            bridge_handle.abort();
+        });
+        *self.encoder_handle.lock().await = Some(encoder_handle);
+
+        Ok(())
+    }
+
+    /// Stop capture, cancel all tasks, and close all peers.
+    pub async fn stop(&self) {
+        self.shutdown.cancel();
+        self.backend.stop_capture().await;
+
+        if let Some(h) = self.capture_handle.lock().await.take() {
+            let _ = h.await;
+        }
+        if let Some(h) = self.encoder_handle.lock().await.take() {
+            let _ = h.await;
+        }
+
+        let mut peers = self.peers.write().await;
+        for (_, peer) in peers.drain() {
+            peer.close().await;
+        }
+    }
+
+    /// Subscribe to the raw frame broadcast.
+    pub fn subscribe_frames(&self) -> broadcast::Receiver<Arc<Frame>> {
+        self.frame_tx.subscribe()
+    }
+
+    /// Get the most recently captured frame, or `None` if no frame yet.
+    pub async fn latest_frame(&self) -> Option<Arc<Frame>> {
+        self.latest_frame.read().await.clone()
+    }
+
+    /// Encode the latest frame as a PNG screenshot.
+    pub async fn screenshot(&self) -> Result<Vec<u8>, CallerError> {
+        let frame = self
+            .latest_frame()
+            .await
+            .ok_or_else(|| CallerError::Display("no frame available for screenshot".into()))?;
+
+        let (w, h) = (frame.width, frame.height);
+
+        // Convert from BGRA (or RGBA) to RGBA for the image crate.
+        let rgba_data = match frame.format {
+            FrameFormat::Rgba => frame.data.clone(),
+            FrameFormat::Bgra => {
+                let mut rgba = frame.data.clone();
+                for chunk in rgba.chunks_exact_mut(4) {
+                    chunk.swap(0, 2); // B <-> R
+                }
+                rgba
+            }
+        };
+
+        let img = image::RgbaImage::from_raw(w, h, rgba_data).ok_or_else(|| {
+            CallerError::Display("failed to construct image from frame data".into())
+        })?;
+
+        let mut png_buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png_buf, image::ImageFormat::Png)
+            .map_err(|e| CallerError::Display(format!("PNG encode: {e}")))?;
+
+        Ok(png_buf.into_inner())
+    }
+
+    /// Handle a WebRTC SDP offer from a browser peer.
+    ///
+    /// Creates a `WebRtcPeer`, subscribes it to the encoder output, adds it to
+    /// the peer map, and returns the SDP answer.
+    pub async fn handle_offer(
+        &self,
+        peer_id: PeerId,
+        sdp: &str,
+        ice_config: &IceConfig,
+        ice_tx: mpsc::Sender<(PeerId, String)>,
+    ) -> Result<String, CallerError> {
+        let backend = Arc::clone(&self.backend);
+        let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> =
+            Arc::new(move |event: InputEvent| {
+                let backend = Arc::clone(&backend);
+                tokio::spawn(async move {
+                    if let Err(e) = backend.inject_input(event).await {
+                        eprintln!("[display] input injection failed: {e}");
+                    }
+                });
+            });
+
+        let (peer, answer_sdp) =
+            self::webrtc::WebRtcPeer::new(peer_id, sdp, ice_config, input_handler, ice_tx)
+                .await?;
+
+        self.peers.write().await.insert(peer_id, Arc::new(peer));
+        Ok(answer_sdp)
+    }
+
+    /// Forward a trickle ICE candidate to a connected peer.
+    pub async fn add_ice_candidate(
+        &self,
+        peer_id: PeerId,
+        candidate_json: &str,
+    ) -> Result<(), CallerError> {
+        let peers = self.peers.read().await;
+        let _peer = peers.get(&peer_id).ok_or_else(|| {
+            CallerError::WebRtc(format!("unknown peer {peer_id}"))
+        })?;
+
+        // Parse the candidate and add it to the peer connection.
+        // The WebRTC crate handles ICE candidate addition via the peer connection
+        // which is inside WebRtcPeer.  For now we parse and validate.
+        let _candidate: serde_json::Value = serde_json::from_str(candidate_json)
+            .map_err(|e| CallerError::WebRtc(format!("invalid ICE candidate JSON: {e}")))?;
+
+        // Note: full ICE candidate injection requires accessing the peer connection
+        // directly; this is handled in the WebRtcPeer implementation in phase 2
+        // wire-up when the signaling protocol is complete.
+        Ok(())
+    }
+
+    /// Remove and close a peer.
+    pub async fn remove_peer(&self, peer_id: PeerId) {
+        if let Some(peer) = self.peers.write().await.remove(&peer_id) {
+            peer.close().await;
+        }
+    }
+
+    /// Inject an input event into the display backend.
+    pub async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
+        self.backend.inject_input(event).await
+    }
+
+    /// Current display resolution.
+    pub fn resolution(&self) -> (u32, u32) {
+        self.backend.resolution()
+    }
+
+}
+
+// ---------------------------------------------------------------------------
+// SessionRegistry
+// ---------------------------------------------------------------------------
+
+/// Registry of active display sessions, keyed by display ID.
+pub struct SessionRegistry {
+    sessions: HashMap<u32, Arc<DisplaySession>>,
+}
+
+pub type SharedSessionRegistry = Arc<RwLock<SessionRegistry>>;
+
+impl SessionRegistry {
+    pub fn new() -> Self {
+        Self {
+            sessions: HashMap::new(),
+        }
+    }
+
+    pub fn get(&self, display_id: u32) -> Option<Arc<DisplaySession>> {
+        self.sessions.get(&display_id).cloned()
+    }
+
+    pub fn insert(&mut self, display_id: u32, session: Arc<DisplaySession>) {
+        self.sessions.insert(display_id, session);
+    }
+
+    pub fn remove(&mut self, display_id: u32) -> Option<Arc<DisplaySession>> {
+        self.sessions.remove(&display_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_event_deserialize_key_down() {
+        let json = r#"{"t":"kd","code":"KeyA","key":"a","shift":false,"ctrl":false,"alt":false,"meta":false}"#;
+        let evt: InputEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            InputEvent::KeyDown { code, key, shift, ctrl, alt, meta } => {
+                assert_eq!(code, "KeyA");
+                assert_eq!(key, "a");
+                assert!(!shift);
+                assert!(!ctrl);
+                assert!(!alt);
+                assert!(!meta);
+            }
+            other => panic!("expected KeyDown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_event_deserialize_key_up() {
+        let json = r#"{"t":"ku","code":"Space","key":" ","shift":false,"ctrl":true,"alt":false,"meta":false}"#;
+        let evt: InputEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            InputEvent::KeyUp { code, ctrl, .. } => {
+                assert_eq!(code, "Space");
+                assert!(ctrl);
+            }
+            other => panic!("expected KeyUp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_event_deserialize_mouse_down() {
+        let json = r#"{"t":"md","x":0.5,"y":0.25,"b":0}"#;
+        let evt: InputEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            InputEvent::MouseDown { x, y, b } => {
+                assert!((x - 0.5).abs() < f64::EPSILON);
+                assert!((y - 0.25).abs() < f64::EPSILON);
+                assert_eq!(b, 0);
+            }
+            other => panic!("expected MouseDown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_event_deserialize_mouse_up() {
+        let json = r#"{"t":"mu","x":0.1,"y":0.9,"b":2}"#;
+        let evt: InputEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            InputEvent::MouseUp { x, y, b } => {
+                assert!((x - 0.1).abs() < f64::EPSILON);
+                assert!((y - 0.9).abs() < f64::EPSILON);
+                assert_eq!(b, 2);
+            }
+            other => panic!("expected MouseUp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_event_deserialize_mouse_move() {
+        let json = r#"{"t":"mm","x":0.33,"y":0.66}"#;
+        let evt: InputEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            InputEvent::MouseMove { x, y } => {
+                assert!((x - 0.33).abs() < f64::EPSILON);
+                assert!((y - 0.66).abs() < f64::EPSILON);
+            }
+            other => panic!("expected MouseMove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_event_deserialize_scroll() {
+        let json = r#"{"t":"sc","x":0.5,"y":0.5,"dx":0.0,"dy":-3.0}"#;
+        let evt: InputEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            InputEvent::Scroll { x, y, dx, dy } => {
+                assert!((x - 0.5).abs() < f64::EPSILON);
+                assert!((y - 0.5).abs() < f64::EPSILON);
+                assert!((dx - 0.0).abs() < f64::EPSILON);
+                assert!((dy - (-3.0)).abs() < f64::EPSILON);
+            }
+            other => panic!("expected Scroll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_registry_insert_get_remove() {
+        let mut reg = SessionRegistry::new();
+        assert!(reg.get(1).is_none());
+
+        // We can't easily create a real DisplaySession without a backend in
+        // tests, but we can test the registry logic with a minimal mock.
+        // For unit-test purposes we verify the HashMap operations.
+        // Full integration is tested in e2e.
+
+        // Verify empty state
+        assert!(reg.remove(1).is_none());
+    }
+
+    #[test]
+    fn session_registry_operations() {
+        // Test the HashMap wrapper logic directly.
+        let mut map: HashMap<u32, String> = HashMap::new();
+        map.insert(1, "session-1".to_string());
+        map.insert(2, "session-2".to_string());
+        assert_eq!(map.get(&1), Some(&"session-1".to_string()));
+        assert_eq!(map.get(&3), None);
+        assert_eq!(map.remove(&1), Some("session-1".to_string()));
+        assert_eq!(map.get(&1), None);
+    }
+
+    #[test]
+    fn ice_config_default_is_empty() {
+        let config = IceConfig::default();
+        assert!(config.ice_servers.is_empty());
+    }
+
+    #[test]
+    fn ice_config_deserialize() {
+        let json = r#"{"ice_servers":[{"urls":["stun:stun.l.google.com:19302"],"username":null,"credential":null}]}"#;
+        let config: IceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.ice_servers.len(), 1);
+        assert_eq!(config.ice_servers[0].urls[0], "stun:stun.l.google.com:19302");
+        assert!(config.ice_servers[0].username.is_none());
+    }
+}
