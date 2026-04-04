@@ -600,12 +600,11 @@ pub async fn start_audio_bridge(
     audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
 ) -> Result<AudioStreamBridge, CallerError> {
-    if let Some(socket_path) = bridge.vortex_socket_path() {
-        return start_vortex_audio_bridge(
+    if bridge.vortex_socket_path().is_some() {
+        return start_vortex_shm_bridge(
             session_write,
             provider,
             sample_rate,
-            socket_path,
             audio_out_rx,
             capture_tee_tx,
         )
@@ -638,6 +637,200 @@ pub async fn start_audio_bridge(
 /// Network audio bridge: connects to a bh-bridge on the host over TCP.
 /// The TCP stream is full-duplex raw PCM16 mono — host→client is captured
 /// app audio, client→host is model audio for playback.
+// ---------------------------------------------------------------------------
+// Vortex direct shared memory bridge (no daemon needed)
+// ---------------------------------------------------------------------------
+
+// Layout constants matching VortexSharedAudio.h
+const VORTEX_SHM_NAME: &[u8] = b"/vortex-audio\0";
+const VORTEX_SHM_MAGIC: u32 = 0x56585348;
+const VORTEX_RING_FRAMES: usize = 65536;
+const VORTEX_MAX_CHANNELS: usize = 2;
+const VORTEX_RING_SAMPLES: usize = VORTEX_RING_FRAMES * VORTEX_MAX_CHANNELS;
+const VORTEX_RING_MASK: u64 = (VORTEX_RING_SAMPLES - 1) as u64;
+
+// Field offsets into VortexSharedAudioState (bytes)
+const OFF_MAGIC: usize = 0;
+const OFF_IS_ACTIVE: usize = 16;
+const OFF_OUT_WRITE_POS: usize = 24;
+const OFF_OUT_READ_POS: usize = 32;
+const OFF_IN_WRITE_POS: usize = 40;
+const OFF_IN_READ_POS: usize = 48;
+const OFF_OUT_BUFFER: usize = 56;
+const OFF_IN_BUFFER: usize = OFF_OUT_BUFFER + VORTEX_RING_SAMPLES * 4;
+
+/// Direct shared memory bridge: reads/writes the Vortex HAL plugin's ring
+/// buffers without the daemon. No sockets, no IPC, no deadlocks.
+async fn start_vortex_shm_bridge(
+    session_write: Arc<Mutex<WsSink>>,
+    provider: LiveAudioProvider,
+    sample_rate: u32,
+    audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+) -> Result<AudioStreamBridge, CallerError> {
+    // Open and mmap the shared memory
+    let fd = unsafe {
+        libc::shm_open(
+            VORTEX_SHM_NAME.as_ptr() as *const libc::c_char,
+            libc::O_RDWR,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(CallerError::Agent(format!(
+            "vortex shm_open failed (errno {}). Are Vortex guest tools installed?",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let shm_size = OFF_IN_BUFFER + VORTEX_RING_SAMPLES * 4;
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            shm_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    unsafe { libc::close(fd) };
+    if ptr == libc::MAP_FAILED {
+        return Err(CallerError::Agent("vortex mmap failed".into()));
+    }
+    let base = ptr as *mut u8;
+
+    // Verify magic
+    let magic = unsafe { (base.add(OFF_MAGIC) as *const std::sync::atomic::AtomicU32).as_ref().unwrap() }
+        .load(std::sync::atomic::Ordering::Acquire);
+    if magic != VORTEX_SHM_MAGIC {
+        return Err(CallerError::Agent(format!(
+            "vortex shm magic mismatch: expected 0x{:08X}, got 0x{:08X}",
+            VORTEX_SHM_MAGIC, magic
+        )));
+    }
+
+    eprintln!("live_audio: vortex shm bridge attached");
+
+    // Raw pointers aren't Send. We use usize to pass the address to spawned
+    // tasks. This is safe because the mmap region lives for the process lifetime
+    // and both tasks only access disjoint rings (output vs input).
+    let base_usize = base as usize;
+
+    // Helper: read/write atomics via raw address (Send-safe)
+    fn atomic_load_u64(base: usize, offset: usize, order: std::sync::atomic::Ordering) -> u64 {
+        unsafe { &*((base + offset) as *const std::sync::atomic::AtomicU64) }.load(order)
+    }
+    fn atomic_store_u64(base: usize, offset: usize, val: u64, order: std::sync::atomic::Ordering) {
+        unsafe { &*((base + offset) as *const std::sync::atomic::AtomicU64) }.store(val, order);
+    }
+    fn read_f32(base: usize, buf_offset: usize, idx: usize) -> f32 {
+        unsafe { *((base + buf_offset) as *const f32).add(idx) }
+    }
+    fn write_f32(base: usize, buf_offset: usize, idx: usize, val: f32) {
+        unsafe { *((base + buf_offset) as *mut f32).add(idx) = val };
+    }
+
+    // Capture task: poll output ring → convert → model WebSocket
+    let capture_write = session_write;
+    let capture_rate = sample_rate;
+    let capture_provider = provider;
+    let capture_base = base_usize;
+    let capture_handle = tokio::spawn(async move {
+        use std::sync::atomic::Ordering;
+        let b = capture_base;
+        let mut ticker = tokio::time::interval(Duration::from_millis(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            ticker.tick().await;
+
+            let w = atomic_load_u64(b, OFF_OUT_WRITE_POS, Ordering::Acquire);
+            let r = atomic_load_u64(b, OFF_OUT_READ_POS, Ordering::Relaxed);
+            let avail = w.wrapping_sub(r) as usize;
+            if avail == 0 {
+                continue;
+            }
+
+            let to_read = avail.min(VORTEX_RING_SAMPLES);
+            let mut f32_buf = Vec::with_capacity(to_read);
+            for i in 0..to_read {
+                let idx = ((r + i as u64) & VORTEX_RING_MASK) as usize;
+                f32_buf.push(read_f32(b, OFF_OUT_BUFFER, idx));
+            }
+            atomic_store_u64(b, OFF_OUT_READ_POS, r + to_read as u64, Ordering::Release);
+
+            let f32_bytes: Vec<u8> = f32_buf.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let pcm16 = vortex_capture_convert(&f32_bytes);
+            if pcm16.is_empty() {
+                continue;
+            }
+
+            let b64 = BASE64.encode(&pcm16);
+            let ws_msg = match capture_provider {
+                LiveAudioProvider::Gemini => serde_json::json!({
+                    "realtime_input": {
+                        "media_chunks": [{
+                            "mime_type": format!("audio/pcm;rate={}", capture_rate),
+                            "data": b64
+                        }]
+                    }
+                }),
+                LiveAudioProvider::OpenAI => serde_json::json!({
+                    "type": "input_audio_buffer.append",
+                    "audio": b64
+                }),
+            };
+            if let Some(ref tee) = capture_tee_tx {
+                let _ = tee.send(pcm16);
+            }
+            let mut sink = capture_write.lock().await;
+            if sink.send(WsMessage::Text(ws_msg.to_string())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Playback task: model audio → convert → write to input ring
+    let playback_base = base_usize;
+    let playback_handle = tokio::spawn(async move {
+        use std::sync::atomic::Ordering;
+        let b = playback_base;
+        let mut rx = audio_out_rx;
+
+        while let Some(pcm_data) = rx.recv().await {
+            let f32_bytes = vortex_playback_convert(&pcm_data);
+            let samples: Vec<f32> = f32_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+
+            let mut written = 0;
+            while written < samples.len() {
+                let w = atomic_load_u64(b, OFF_IN_WRITE_POS, Ordering::Relaxed);
+                let r = atomic_load_u64(b, OFF_IN_READ_POS, Ordering::Acquire);
+                let space = VORTEX_RING_SAMPLES - (w.wrapping_sub(r)) as usize;
+                if space == 0 {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                let to_write = (samples.len() - written).min(space);
+                for i in 0..to_write {
+                    let idx = ((w + i as u64) & VORTEX_RING_MASK) as usize;
+                    write_f32(b, OFF_IN_BUFFER, idx, samples[written + i]);
+                }
+                atomic_store_u64(b, OFF_IN_WRITE_POS, w + to_write as u64, Ordering::Release);
+                written += to_write;
+            }
+        }
+    });
+
+    Ok(AudioStreamBridge {
+        capture_handle,
+        playback_handle,
+    })
+}
+
 /// Vortex audio bridge: listens on a Unix socket for the Vortex guest daemon,
 /// speaks the Vortex wire protocol, and converts between Float32 stereo 48kHz
 /// (daemon) and PCM16 mono 24kHz (model).
@@ -2037,8 +2230,9 @@ mod tests {
             });
         let vortex_dev_idx = match dev_output {
             Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                stderr
+                // pjsua prints device list to stdout
+                let output = String::from_utf8_lossy(&out.stdout);
+                output
                     .lines()
                     .filter(|l| l.contains("dev_id"))
                     .position(|l| l.contains("Vortex Audio"))
@@ -2066,40 +2260,48 @@ mod tests {
             }
         };
 
-        // Launch pjsua. NOTE: must run in the GUI login session for mic
-        // input to work. If running from SSH, wrap in a LaunchAgent.
-        let mut pjsua = tokio::process::Command::new(&pjsua_bin)
-            .args([
-                "--id=sip:intendant7@sip.linphone.org",
-                "--registrar=sip:sip.linphone.org",
-                "--realm=sip.linphone.org",
-                "--username=intendant7",
-                &format!("--password={}", sip_password),
-                &capture_arg,
-                &playback_arg,
-                "--auto-answer=200",
-                "--ec-tail=0",
-                "--no-vad",
-                "--use-srtp=2",
-                "--srtp-secure=0",
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to start pjsua");
+        // Launch pjsua AFTER the bridge connects (spawned with delay).
+        // pjsua opening Vortex Audio triggers a flood of PCM_OUTPUT from
+        // the daemon. The bridge's drain task must be running first.
+        // NOTE: pjsua must run in the GUI login session for mic input.
+        let pjsua_bin_clone = pjsua_bin.clone();
+        let pjsua_handle = tokio::spawn(async move {
+            // Wait for the bridge to connect and start draining
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            let mut pjsua = tokio::process::Command::new(&pjsua_bin_clone)
+                .args([
+                    "--id=sip:intendant7@sip.linphone.org",
+                    "--registrar=sip:sip.linphone.org",
+                    "--realm=sip.linphone.org",
+                    "--username=intendant7",
+                    &format!("--password={}", sip_password),
+                    &capture_arg,
+                    &playback_arg,
+                    "--auto-answer=200",
+                    "--ec-tail=0",
+                    "--no-vad",
+                    "--use-srtp=2",
+                    "--srtp-secure=0",
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to start pjsua");
 
-        // Wait for registration, then make outbound call
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        if let Some(ref mut stdin) = pjsua.stdin {
-            let _ = stdin.write_all(b"m\n").await;
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let _ = stdin
-                .write_all(b"sip:intendant8@sip.linphone.org\n")
-                .await;
-        }
-        eprintln!("  pjsua calling intendant8 — ANSWER YOUR PHONE!");
-        eprintln!("  Stay on for 30+ seconds. Timeout: 120s\n");
+            // Wait for registration, then make outbound call
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if let Some(ref mut stdin) = pjsua.stdin {
+                let _ = stdin.write_all(b"m\n").await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = stdin
+                    .write_all(b"sip:intendant8@sip.linphone.org\n")
+                    .await;
+            }
+            eprintln!("  pjsua calling intendant8 — ANSWER YOUR PHONE!");
+            pjsua
+        });
+        eprintln!("  pjsua will start after bridge connects. Timeout: 120s\n");
 
         let schema = crate::live_audio_types::ResponseSchema {
             fields: vec![
@@ -2162,10 +2364,12 @@ mod tests {
             .expect("run_session failed");
 
         // Stop pjsua
-        if let Some(mut stdin) = pjsua.stdin.take() {
-            let _ = stdin.write_all(b"q\n").await;
+        if let Ok(mut pjsua) = pjsua_handle.await {
+            if let Some(mut stdin) = pjsua.stdin.take() {
+                let _ = stdin.write_all(b"q\n").await;
+            }
+            let _ = pjsua.wait().await;
         }
-        let _ = pjsua.wait().await;
         drop(bridge);
 
         // Display transcript
