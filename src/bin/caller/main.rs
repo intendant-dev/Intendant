@@ -4249,23 +4249,35 @@ async fn activate_user_display(
         }
     }
 
-    // X11 / macOS: no DisplaySession yet — don't emit DisplayReady
-    // (would create a dead web slot since WebRTC needs a session).
+    // X11: detect display even without DISPLAY env var, but no DisplaySession
+    // yet (phase 2) — log what we found.
     #[cfg(target_os = "linux")]
-    if std::env::var("DISPLAY").is_ok() {
-        eprintln!("[user_display] X11 user display: no DisplaySession, no web slot (phase 2)");
-        return;
+    {
+        let has_x11 = std::env::var("DISPLAY").is_ok()
+            || vision::detect_x11_display().is_some();
+        if has_x11 {
+            // Ensure DISPLAY is set for downstream tools (xdotool, import, etc.)
+            if std::env::var("DISPLAY").is_err() {
+                if let Some(d) = vision::detect_x11_display() {
+                    std::env::set_var("DISPLAY", &d);
+                }
+            }
+            eprintln!("[user_display] X11 display detected (DISPLAY={}), no DisplaySession yet (phase 2)",
+                std::env::var("DISPLAY").unwrap_or_default());
+            return;
+        }
     }
 
     #[cfg(target_os = "macos")]
     {
+        // macOS always has a native display — no env var needed.
         eprintln!("[user_display] macOS user display: no DisplaySession, no web slot (phase 2)");
         return;
     }
 
     #[allow(unreachable_code)]
     {
-        eprintln!("[user_display] No supported display backend, no web slot");
+        eprintln!("[user_display] No supported display backend detected");
     }
 }
 

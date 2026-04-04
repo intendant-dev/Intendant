@@ -239,13 +239,27 @@ pub fn is_display_accessible() -> bool {
     true
 }
 
-/// Check whether the current DISPLAY environment variable points to an accessible X server.
-/// Returns `false` if DISPLAY is unset or `xdpyinfo` fails to connect.
+/// Check whether an X11 display is accessible.
+///
+/// First checks `DISPLAY` env var. If unset, probes `/tmp/.X11-unix/` for
+/// sockets (handles tty/ssh sessions where env vars aren't inherited from
+/// the graphical session). If a socket is found, sets `DISPLAY` so
+/// downstream code (xdotool, ImageMagick, etc.) can use it.
 #[cfg(not(target_os = "macos"))]
 pub fn is_display_accessible() -> bool {
     let display = match std::env::var("DISPLAY") {
         Ok(d) if !d.is_empty() => d,
-        _ => return false,
+        _ => {
+            // DISPLAY not set — try to detect an X11 socket.
+            match detect_x11_display() {
+                Some(d) => {
+                    eprintln!("[vision] DISPLAY not set, detected X11 socket: {}", d);
+                    std::env::set_var("DISPLAY", &d);
+                    d
+                }
+                None => return false,
+            }
+        }
     };
     std::process::Command::new("xdpyinfo")
         .args(["-display", &display])
@@ -254,6 +268,30 @@ pub fn is_display_accessible() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Detect an X11 display by scanning `/tmp/.X11-unix/` for sockets.
+/// Returns the display string (e.g. ":0") for the lowest-numbered socket,
+/// skipping Xvfb instances in the agent range (99+).
+#[cfg(not(target_os = "macos"))]
+pub fn detect_x11_display() -> Option<String> {
+    let entries = std::fs::read_dir("/tmp/.X11-unix").ok()?;
+    let mut displays: Vec<u32> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Files are named "X0", "X1", etc.
+        if let Some(num_str) = name.strip_prefix('X') {
+            if let Ok(num) = num_str.parse::<u32>() {
+                // Skip agent Xvfb range (99+) — prefer the user's real display.
+                if num < 50 {
+                    displays.push(num);
+                }
+            }
+        }
+    }
+    displays.sort();
+    displays.first().map(|n| format!(":{}", n))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
