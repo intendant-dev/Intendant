@@ -43,8 +43,6 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 tokio-util = { version = "0.7", features = ["rt"] }
 presence-core = { path = "crates/presence-core" }
 libc = "0.2"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-tokio-util = { version = "0.7", features = ["rt"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"

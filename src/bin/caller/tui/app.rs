@@ -1370,7 +1370,7 @@ impl App {
                 std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
                 self.log(LogLevel::Warn, "User display access granted".to_string());
                 self.broadcast_control(OutboundEvent::UserDisplayGranted);
-                // Emit to EventBus so spawn_user_display_listener activates VNC + recording
+                // Emit to EventBus so spawn_user_display_listener activates display + recording
                 self.pending_derived.push(AppEvent::UserDisplayGranted);
             }
             ControlMsg::RevokeUserDisplay { note } => {

@@ -4531,6 +4531,7 @@ async fn run_cu_task(
                     backend,
                     log_dir,
                     &mut cu_counter,
+                    &None,
                 )
                 .await;
 
@@ -4610,6 +4611,7 @@ async fn execute_cu_calls(
             backend,
             log_dir,
             counter,
+            &None,
         ).await;
 
         // Find the last screenshot from results
@@ -4913,7 +4915,7 @@ async fn main() -> Result<(), CallerError> {
             event::spawn_human_question_monitor(bus.clone(), human_question_path.clone());
         let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
         let _recording_listener = recording::spawn_recording_listener(
-            bus.subscribe(), recording_registry.clone(), bus.clone(),
+            bus.subscribe(), recording_registry.clone(), bus.clone(), Some(session_registry.clone()),
         );
         let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone());
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
@@ -5246,7 +5248,7 @@ async fn main() -> Result<(), CallerError> {
             event::shared_question_path(log_dir.join("human_question")),
         );
         let _recording_listener = recording::spawn_recording_listener(
-            bus.subscribe(), recording_registry.clone(), bus.clone(),
+            bus.subscribe(), recording_registry.clone(), bus.clone(), Some(session_registry.clone()),
         );
         let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone());
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
@@ -5791,7 +5793,7 @@ async fn main() -> Result<(), CallerError> {
         // Headless mode (--no-tui or non-TTY)
         let bus = EventBus::new();
         let _recording_listener = recording::spawn_recording_listener(
-            bus.subscribe(), recording_registry.clone(), bus.clone(),
+            bus.subscribe(), recording_registry.clone(), bus.clone(), Some(session_registry.clone()),
         );
         let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone());
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
