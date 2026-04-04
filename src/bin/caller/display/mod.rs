@@ -192,7 +192,13 @@ impl DisplaySession {
     /// 2. **Encoder** -- subscribes to the broadcast, converts BGRA->I420,
     ///    VP8-encodes, and fans out `Arc<EncodedFrame>` to each peer's bounded
     ///    channel.
-    pub async fn start(&self, fps: u32) -> Result<(), CallerError> {
+    /// 3. **FrameRegistry sampler** (if provided) -- 1 Hz JPEG capture for
+    ///    model sampling and presence tools.
+    pub async fn start(
+        &self,
+        fps: u32,
+        frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
+    ) -> Result<(), CallerError> {
         let mut capture_rx = self.backend.start_capture(fps).await?;
 
         let (width, height) = self.backend.resolution();
@@ -308,6 +314,65 @@ impl DisplaySession {
             bridge_handle.abort();
         });
         *self.encoder_handle.lock().await = Some(encoder_handle);
+
+        // --- Task 3: FrameRegistry sampler (1 Hz JPEG for model feeds) ---
+        if let Some(registry) = frame_registry {
+            let latest = Arc::clone(&self.latest_frame);
+            let shutdown_reg = self.shutdown.clone();
+            let display_id = self.display_id;
+            let mut frame_counter = 0u64;
+            let reg_handle = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    tokio::select! {
+                        _ = shutdown_reg.cancelled() => break,
+                        _ = interval.tick() => {
+                            let frame = latest.read().await.clone();
+                            let Some(frame) = frame else { continue };
+                            let w = frame.width;
+                            let h = frame.height;
+                            // Encode BGRA/RGBA → JPEG on blocking pool
+                            let jpeg = tokio::task::spawn_blocking(move || {
+                                let rgba_data = match frame.format {
+                                    FrameFormat::Rgba => frame.data.clone(),
+                                    FrameFormat::Bgra => {
+                                        let mut d = frame.data.clone();
+                                        for chunk in d.chunks_exact_mut(4) {
+                                            chunk.swap(0, 2);
+                                        }
+                                        d
+                                    }
+                                };
+                                let img = image::RgbaImage::from_raw(w, h, rgba_data)?;
+                                let mut buf = std::io::Cursor::new(Vec::new());
+                                img.write_to(&mut buf, image::ImageFormat::Jpeg).ok()?;
+                                Some(buf.into_inner())
+                            }).await.ok().flatten();
+                            if let Some(jpeg_bytes) = jpeg {
+                                frame_counter += 1;
+                                let stream = format!("display_{}", display_id);
+                                let frame_id = format!("{}-f{}", stream, frame_counter);
+                                let meta = presence_core::FrameMeta {
+                                    frame_id,
+                                    stream,
+                                    timestamp: chrono::Utc::now().to_rfc3339(),
+                                    sent_to_live: false,
+                                    live_resolution: None,
+                                    hq_resolution: Some(format!("{}x{}", w, h)),
+                                    note: None,
+                                };
+                                let mut reg = registry.write().await;
+                                let _ = reg.register(meta, &jpeg_bytes);
+                            }
+                        }
+                    }
+                }
+            });
+            // Store handle — stop() cancels via shutdown token.
+            // Reuse encoder_handle field slot since we don't have a dedicated one.
+            // Actually, let's just let it be managed by the CancellationToken.
+            drop(reg_handle); // Managed by shutdown token; task self-cancels.
+        }
 
         Ok(())
     }

@@ -660,10 +660,10 @@ async fn maybe_auto_launch_xvfb(
         return;
     }
     // If a display is already accessible (e.g. DISPLAY was set before launch,
-    // or on macOS where the native display is always available), emit
-    // DisplayReady so the web UI knows about it, but skip Xvfb launch.
+    // or on macOS where the native display is always available), skip Xvfb.
+    // Don't emit DisplayReady — no DisplaySession exists, so the web dashboard
+    // can't connect via WebRTC. Recording uses x11grab/avfoundation directly.
     if vision::is_display_accessible() {
-        // On macOS DISPLAY is typically unset; use 0 as sentinel for native display.
         let default_display = if cfg!(target_os = "macos") { 0 } else { 99 };
         let display_id = std::env::var("DISPLAY")
             .ok()
@@ -672,14 +672,9 @@ async fn maybe_auto_launch_xvfb(
         let (width, height) = query_display_resolution(display_id);
         slog(session_log, |l| {
             l.info(&format!(
-                "Using existing display :{} ({}x{})",
+                "Using existing display :{} ({}x{}) — no web slot (no DisplaySession)",
                 display_id, width, height
             ))
-        });
-        bus.send(AppEvent::DisplayReady {
-            display_id,
-            width,
-            height,
         });
         return;
     }
@@ -790,7 +785,8 @@ pub(crate) fn query_display_resolution(display_id: u32) -> (u32, u32) {
 }
 
 /// Start recording external displays (--record-display) directly on the registry.
-/// Also emits DisplayReady so the web UI shows the display slot.
+/// Does NOT emit DisplayReady — external displays have no DisplaySession, so the
+/// web dashboard can't connect. Recording uses x11grab independently.
 async fn start_external_display_recordings(
     displays: &[u32],
     registry: &std::sync::Arc<tokio::sync::RwLock<recording::RecordingRegistry>>,
@@ -813,11 +809,6 @@ async fn start_external_display_recordings(
         }
         match reg.start_external_display(id, width, height).await {
             Ok(stream_name) => {
-                bus.send(AppEvent::DisplayReady {
-                    display_id: id,
-                    width,
-                    height,
-                });
                 bus.send(AppEvent::RecordingStarted { stream_name });
             }
             Err(e) => eprintln!("Failed to start recording for :{}: {}", id, e),
@@ -3195,6 +3186,7 @@ async fn run_with_presence(
     approval_registry: event::ApprovalRegistry,
     frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     context_injection: event::ContextInjectionQueue,
+    session_registry: display::SharedSessionRegistry,
 ) -> Result<LoopStats, CallerError> {
     // 1. Create presence provider (small/fast model)
     let presence_provider = provider::select_presence_provider(
@@ -3339,7 +3331,7 @@ async fn run_with_presence(
 
             match try_cu_first(
                 &project_root, &reference_images, &frame_images,
-                &envelope.task, &session_log, &log_dir, &bus,
+                &envelope.task, &session_log, &log_dir, &bus, &session_registry,
             ).await {
                 Some(Ok(CuTaskResult::Completed(stats))) => {
                     cumulative_stats.turns += stats.turns;
@@ -4028,11 +4020,26 @@ async fn auto_attach_display_frames(
     images
 }
 
-//// Take a fresh screenshot of the user's display for CU-first routing.
-/// Used when the frame registry has no frames (browser streaming not active).
+/// Take a fresh screenshot of the user's display for CU-first routing.
+/// Tries DisplaySession first (works on Wayland), falls back to platform tools.
 async fn capture_display_screenshot(
     log_dir: &std::path::Path,
+    session_registry: &display::SharedSessionRegistry,
 ) -> Option<conversation::ImageData> {
+    // Try DisplaySession first — works on Wayland and any display with a session
+    if let Some(session) = session_registry.read().await.get(0) {
+        if let Ok(png_bytes) = session.screenshot().await {
+            let screenshot_path = log_dir.join("cu_reference.png");
+            std::fs::write(&screenshot_path, &png_bytes).ok()?;
+            use base64::Engine;
+            return Some(conversation::ImageData {
+                media_type: "image/png".to_string(),
+                data: base64::engine::general_purpose::STANDARD.encode(&png_bytes),
+            });
+        }
+    }
+
+    // Fallback: platform-native screenshot tools
     let screenshot_path = log_dir.join("cu_reference.png");
     let ok = if cfg!(target_os = "macos") {
         tokio::process::Command::new("screencapture")
@@ -4072,6 +4079,7 @@ async fn try_cu_first(
     session_log: &SharedSessionLog,
     log_dir: &std::path::Path,
     bus: &event::EventBus,
+    session_registry: &display::SharedSessionRegistry,
 ) -> Option<Result<CuTaskResult, CallerError>> {
     slog(session_log, |l| {
         l.info(&format!(
@@ -4087,7 +4095,7 @@ async fn try_cu_first(
             slog(session_log, |l| {
                 l.info("try_cu_first: no registry frames, taking fresh screenshot")
             });
-            match capture_display_screenshot(log_dir).await {
+            match capture_display_screenshot(log_dir, session_registry).await {
                 Some(img) => vec![img],
                 None => {
                     slog(session_log, |l| {
@@ -4166,26 +4174,38 @@ async fn try_cu_first(
     ).await)
 }
 
-/// Spawn a listener that reacts to `UserDisplayGranted` events by emitting
-/// `DisplayReady`. This ensures the user display is wired into the existing
-/// display lifecycle regardless of how the grant was triggered (approval flow,
-/// TUI hotkey, MCP, control socket).
+/// Spawn a listener that reacts to display grant/revoke events.
+/// On grant: create a DisplaySession (Wayland) and emit DisplayReady.
+/// On revoke: stop the session and remove it from the registry.
 pub fn spawn_user_display_listener(
     bus: EventBus,
     session_registry: display::SharedSessionRegistry,
+    frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<frames::FrameRegistry>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut rx = bus.subscribe();
         loop {
             match rx.recv().await {
                 Ok(AppEvent::UserDisplayGranted) => {
-                    activate_user_display(&bus, &session_registry).await;
+                    activate_user_display(&bus, &session_registry, frame_registry.clone()).await;
+                }
+                Ok(AppEvent::UserDisplayRevoked { .. }) => {
+                    deactivate_user_display(&session_registry).await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 _ => {}
             }
         }
     })
+}
+
+/// Tear down the user display session on revoke.
+async fn deactivate_user_display(session_registry: &display::SharedSessionRegistry) {
+    let display_id: u32 = 0;
+    if let Some(session) = session_registry.write().await.remove(display_id) {
+        eprintln!("[user_display] Stopping display session for :{}", display_id);
+        session.stop().await;
+    }
 }
 
 /// Handle user display grant: create a `DisplaySession` (on Wayland) and emit
@@ -4196,6 +4216,7 @@ pub fn spawn_user_display_listener(
 async fn activate_user_display(
     bus: &EventBus,
     session_registry: &display::SharedSessionRegistry,
+    frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<frames::FrameRegistry>>>,
 ) {
     let display_id: u32 = 0;
     let (width, height) = query_display_resolution(display_id);
@@ -4205,7 +4226,7 @@ async fn activate_user_display(
     if std::env::var("WAYLAND_DISPLAY").is_ok() {
         let backend = display::wayland::WaylandBackend::new();
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
-        if let Err(e) = session.start(30).await {
+        if let Err(e) = session.start(30, frame_registry).await {
             eprintln!("[user_display] Failed to start display session: {}", e);
         } else {
             let session = Arc::new(session);
@@ -4215,26 +4236,23 @@ async fn activate_user_display(
         }
     }
 
-    // X11 / macOS: no DisplaySession yet (phase 2)
-    // Still emit DisplayReady so recording can use x11grab path
+    // X11 / macOS: no DisplaySession yet — don't emit DisplayReady
+    // (would create a dead web slot since WebRTC needs a session).
     #[cfg(target_os = "linux")]
     if std::env::var("DISPLAY").is_ok() {
-        eprintln!("[user_display] X11 user display: no DisplaySession (phase 2)");
-        bus.send(AppEvent::DisplayReady { display_id, width, height });
+        eprintln!("[user_display] X11 user display: no DisplaySession, no web slot (phase 2)");
         return;
     }
 
     #[cfg(target_os = "macos")]
     {
-        eprintln!("[user_display] macOS user display: no DisplaySession (phase 2)");
-        bus.send(AppEvent::DisplayReady { display_id, width, height });
+        eprintln!("[user_display] macOS user display: no DisplaySession, no web slot (phase 2)");
         return;
     }
 
-    // Fallback: just emit DisplayReady
     #[allow(unreachable_code)]
     {
-        bus.send(AppEvent::DisplayReady { display_id, width, height });
+        eprintln!("[user_display] No supported display backend, no web slot");
     }
 }
 
@@ -4917,7 +4935,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(), Some(session_registry.clone()),
         );
-        let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone());
+        let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone(), Some(frame_registry.clone()));
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if flags.web {
             Some(debug::spawn_debug_screen_handler(
@@ -5250,7 +5268,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(), Some(session_registry.clone()),
         );
-        let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone());
+        let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone(), Some(frame_registry.clone()));
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if flags.web {
             Some(debug::spawn_debug_screen_handler(
@@ -5531,6 +5549,7 @@ async fn main() -> Result<(), CallerError> {
                     approval_registry_clone,
                     frame_registry.clone(),
                     context_injection_clone,
+                    session_registry.clone(),
                 )
                 .await;
 
@@ -5795,7 +5814,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(), Some(session_registry.clone()),
         );
-        let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone());
+        let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone(), Some(frame_registry.clone()));
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if flags.web {
             Some(debug::spawn_debug_screen_handler(
