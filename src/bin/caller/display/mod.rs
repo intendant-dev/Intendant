@@ -409,20 +409,10 @@ impl DisplaySession {
         candidate_json: &str,
     ) -> Result<(), CallerError> {
         let peers = self.peers.read().await;
-        let _peer = peers.get(&peer_id).ok_or_else(|| {
+        let peer = peers.get(&peer_id).ok_or_else(|| {
             CallerError::WebRtc(format!("unknown peer {peer_id}"))
         })?;
-
-        // Parse the candidate and add it to the peer connection.
-        // The WebRTC crate handles ICE candidate addition via the peer connection
-        // which is inside WebRtcPeer.  For now we parse and validate.
-        let _candidate: serde_json::Value = serde_json::from_str(candidate_json)
-            .map_err(|e| CallerError::WebRtc(format!("invalid ICE candidate JSON: {e}")))?;
-
-        // Note: full ICE candidate injection requires accessing the peer connection
-        // directly; this is handled in the WebRtcPeer implementation in phase 2
-        // wire-up when the signaling protocol is complete.
-        Ok(())
+        peer.add_ice_candidate(candidate_json).await
     }
 
     /// Remove and close a peer.

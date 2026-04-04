@@ -7,19 +7,28 @@
 
 use super::{DisplayBackend, Frame, FrameFormat, InputEvent};
 use crate::error::CallerError;
-use ashpd::desktop::remote_desktop::{DeviceType, KeyState, RemoteDesktop};
+use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
-use ashpd::desktop::PersistMode;
+use ashpd::desktop::{PersistMode, Session};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 /// Portal session handle + PipeWire capture thread.
+///
+/// Stores the `RemoteDesktop` proxy and its `Session` handle so that
+/// `inject_input()` can call the `notify_*` D-Bus methods on the original
+/// portal session.  Both types carry a `'static` lifetime because the
+/// underlying `zbus::Connection` is held in a global `OnceLock`.
 struct PortalSession {
     /// The PipeWire node ID (used for pointer_motion_absolute stream param).
     node_id: u32,
     pw_thread: Option<std::thread::JoinHandle<()>>,
+    /// The RemoteDesktop D-Bus proxy, kept alive for input injection.
+    remote_desktop: RemoteDesktop<'static>,
+    /// The session handle obtained from `create_session()`.
+    session: Session<'static, RemoteDesktop<'static>>,
 }
 
 /// Wayland screen capture and input injection backend.
@@ -121,10 +130,6 @@ impl DisplayBackend for WaylandBackend {
             .await
             .map_err(|e| CallerError::Display(format!("pipewire fd: {e}")))?;
 
-        // Drop the session handle -- the portal keeps the session alive as long
-        // as the PipeWire connection is active.
-        drop(session);
-
         // --- Bounded frame channel: PipeWire thread -> tokio ---
         let (tx, rx) = mpsc::channel::<Frame>(4);
 
@@ -134,9 +139,13 @@ impl DisplayBackend for WaylandBackend {
             run_pipewire_capture(pw_fd, node_id, tx, shutdown_flag, width, height);
         });
 
+        // Store the RemoteDesktop proxy and session handle so inject_input()
+        // can call notify_* methods on the original portal session.
         *self.portal_session.lock().await = Some(PortalSession {
             node_id,
             pw_thread: Some(pw_thread),
+            remote_desktop,
+            session,
         });
 
         Ok(rx)
@@ -153,32 +162,107 @@ impl DisplayBackend for WaylandBackend {
     }
 
     async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
-        let rd = RemoteDesktop::new()
-            .await
-            .map_err(|e| CallerError::Display(format!("RemoteDesktop proxy: {e}")))?;
-
-        // We need the session for injection.  Since the portal session lives
-        // on the D-Bus side as long as PipeWire is connected, we re-create
-        // a session proxy for input injection.  However, the portal requires
-        // injecting on the *original* session.
-        //
-        // For a full implementation the session would be stored in shared state
-        // accessible from the inject_input path.  For phase 1, input injection
-        // is a stub that logs the event.
         let (width, height) = *self.resolution.read().await;
-        let _guard = self.portal_session.lock().await;
-        let _ps = _guard.as_ref().ok_or_else(|| {
+        let guard = self.portal_session.lock().await;
+        let ps = guard.as_ref().ok_or_else(|| {
             CallerError::Display("no active portal session for input injection".to_string())
         })?;
 
-        // Input injection via the portal requires the Session handle which
-        // has a non-static lifetime tied to the RemoteDesktop proxy.  Storing
-        // this properly requires restructuring with a long-lived proxy.
-        // Phase 1 logs the intent; full wiring is done in phase 2.
-        eprintln!(
-            "[display/wayland] input event (w={width}, h={height}): {event:?}",
-        );
+        let rd = &ps.remote_desktop;
+        let session = &ps.session;
+        let node_id = ps.node_id;
 
+        match event {
+            InputEvent::KeyDown { ref code, .. } => {
+                if let Some(keycode) = super::keymap::dom_code_to_evdev(code) {
+                    rd.notify_keyboard_keycode(session, keycode as i32, KeyState::Pressed)
+                        .await
+                        .map_err(|e| CallerError::Display(format!("key inject: {e}")))?;
+                }
+            }
+            InputEvent::KeyUp { ref code, .. } => {
+                if let Some(keycode) = super::keymap::dom_code_to_evdev(code) {
+                    rd.notify_keyboard_keycode(session, keycode as i32, KeyState::Released)
+                        .await
+                        .map_err(|e| CallerError::Display(format!("key inject: {e}")))?;
+                }
+            }
+            InputEvent::MouseMove { x, y } => {
+                rd.notify_pointer_motion_absolute(
+                    session,
+                    node_id,
+                    x * width as f64,
+                    y * height as f64,
+                )
+                .await
+                .map_err(|e| CallerError::Display(format!("pointer inject: {e}")))?;
+            }
+            InputEvent::MouseDown { x, y, b } => {
+                // Move to position first (best-effort).
+                let _ = rd
+                    .notify_pointer_motion_absolute(
+                        session,
+                        node_id,
+                        x * width as f64,
+                        y * height as f64,
+                    )
+                    .await;
+                // Linux evdev button codes: BTN_LEFT=0x110, BTN_MIDDLE=0x112, BTN_RIGHT=0x111
+                let button_code: i32 = match b {
+                    0 => 0x110,
+                    1 => 0x112,
+                    2 => 0x111,
+                    _ => 0x110,
+                };
+                rd.notify_pointer_button(session, button_code, KeyState::Pressed)
+                    .await
+                    .map_err(|e| CallerError::Display(format!("button inject: {e}")))?;
+            }
+            InputEvent::MouseUp { x, y, b } => {
+                let _ = rd
+                    .notify_pointer_motion_absolute(
+                        session,
+                        node_id,
+                        x * width as f64,
+                        y * height as f64,
+                    )
+                    .await;
+                let button_code: i32 = match b {
+                    0 => 0x110,
+                    1 => 0x112,
+                    2 => 0x111,
+                    _ => 0x110,
+                };
+                rd.notify_pointer_button(session, button_code, KeyState::Released)
+                    .await
+                    .map_err(|e| CallerError::Display(format!("button inject: {e}")))?;
+            }
+            InputEvent::Scroll { dx, dy, .. } => {
+                // Use discrete axis scrolling: convert raw deltas to integer
+                // steps. Vertical scroll (dy) maps to Axis::Vertical, horizontal
+                // (dx) to Axis::Horizontal.
+                if dy.abs() > f64::EPSILON {
+                    let steps = dy.round() as i32;
+                    if steps != 0 {
+                        rd.notify_pointer_axis_discrete(session, Axis::Vertical, steps)
+                            .await
+                            .map_err(|e| {
+                                CallerError::Display(format!("scroll inject: {e}"))
+                            })?;
+                    }
+                }
+                if dx.abs() > f64::EPSILON {
+                    let steps = dx.round() as i32;
+                    if steps != 0 {
+                        rd.notify_pointer_axis_discrete(session, Axis::Horizontal, steps)
+                            .await
+                            .map_err(|e| {
+                                CallerError::Display(format!("scroll inject: {e}"))
+                            })?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

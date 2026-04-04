@@ -10,6 +10,7 @@ use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_VP8};
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
@@ -226,6 +227,34 @@ impl WebRtcPeer {
     /// if the channel is full the frame is dropped for this peer.
     pub fn encoded_frame_tx(&self) -> &mpsc::Sender<Arc<EncodedFrame>> {
         &self.encoded_frame_tx
+    }
+
+    /// Add a trickle ICE candidate from the remote peer.
+    ///
+    /// Parses the JSON-encoded candidate (as sent by the browser's
+    /// `RTCPeerConnection.onicecandidate`) and adds it to the underlying
+    /// peer connection.
+    pub async fn add_ice_candidate(&self, candidate_json: &str) -> Result<(), CallerError> {
+        let parsed: serde_json::Value = serde_json::from_str(candidate_json)
+            .map_err(|e| CallerError::WebRtc(format!("parse ICE candidate: {e}")))?;
+
+        let candidate_str = parsed["candidate"].as_str().unwrap_or("");
+        let sdp_mid = parsed["sdpMid"].as_str().map(String::from);
+        let sdp_mline_index = parsed["sdpMLineIndex"].as_u64().map(|n| n as u16);
+
+        let candidate = RTCIceCandidateInit {
+            candidate: candidate_str.to_string(),
+            sdp_mid,
+            sdp_mline_index,
+            username_fragment: None,
+        };
+
+        self.peer_connection
+            .add_ice_candidate(candidate)
+            .await
+            .map_err(|e| CallerError::WebRtc(format!("add ICE candidate: {e}")))?;
+
+        Ok(())
     }
 
     /// Gracefully close this peer: cancel the sender task and close the
