@@ -2154,24 +2154,37 @@ async fn run_agent_loop(
                             }
                         };
 
-                        // Create audio bridge: prefer Vortex (guest HAL plugin),
-                        // fall back to local platform audio devices.
-                        let mut bridge =
-                            if let Ok(socket_path) = std::env::var("VORTEX_AUDIO_SOCKET") {
-                                audio_routing::create_vortex_bridge(&socket_path)
+                        // Create audio bridge: auto-detect Vortex (guest HAL plugin)
+                        // by checking if /vortex-audio shm exists, fall back to
+                        // local platform audio devices (PulseAudio/BlackHole).
+                        let vortex_shm_available = unsafe {
+                            let fd = libc::shm_open(
+                                b"/vortex-audio\0".as_ptr() as *const libc::c_char,
+                                libc::O_RDONLY,
+                                0,
+                            );
+                            if fd >= 0 {
+                                libc::close(fd);
+                                true
                             } else {
-                                match audio_routing::create_bridge(session_id).await {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        conversation.add_tool_result(
-                                            call_id,
-                                            "spawn_live_audio",
-                                            &format!("Error creating audio bridge: {}", e),
-                                        );
-                                        continue;
-                                    }
+                                false
+                            }
+                        };
+                        let mut bridge = if vortex_shm_available {
+                            audio_routing::create_vortex_bridge("shm")
+                        } else {
+                            match audio_routing::create_bridge(session_id).await {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    conversation.add_tool_result(
+                                        call_id,
+                                        "spawn_live_audio",
+                                        &format!("Error creating audio bridge: {}", e),
+                                    );
+                                    continue;
                                 }
-                            };
+                            }
+                        };
 
                         // Set virtual devices as system defaults (not needed for Vortex)
                         if bridge.vortex_socket_path().is_none() {
