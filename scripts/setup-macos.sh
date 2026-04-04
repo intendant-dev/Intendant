@@ -37,11 +37,14 @@ has_cmd() { command -v "$1" &>/dev/null; }
 
 has_brew_pkg() { brew list --formula "$1" &>/dev/null 2>&1; }
 
-# Check if a BlackHole device exists in the audio system
-has_blackhole() {
+# Check if a named audio device exists in the audio system
+has_audio_device() {
     local name="$1"
     system_profiler SPAudioDataType 2>/dev/null | grep -q "$name"
 }
+
+# Legacy alias
+has_blackhole() { has_audio_device "$1"; }
 
 # ── Dependency definitions ──────────────────────────────────────────────────
 
@@ -102,6 +105,12 @@ check_computer_use() {
 
 # Audio routing deps: needed for spawn_live_audio (voice calls through apps).
 # Browser-based voice (Gemini Live / OpenAI Realtime via WebRTC) works without these.
+#
+# Two modes:
+#   1. Vortex Audio (preferred): HAL plugin with direct shm bridge. No system
+#      default changes, per-app routing, works in VMs.
+#   2. BlackHole (fallback): Virtual loopback via system default switching.
+#      Simpler setup but changes system-wide audio defaults during calls.
 check_audio() {
     local all_ok=true
 
@@ -122,19 +131,41 @@ check_audio() {
         all_ok=false
     fi
 
-    if has_blackhole "BlackHole 2ch"; then
-        ok "BlackHole 2ch"
+    # Vortex Audio (preferred)
+    if has_audio_device "Vortex Audio"; then
+        ok "Vortex Audio (HAL plugin)"
+        # Check if it's the default input
+        local cur_input
+        cur_input="$(SwitchAudioSource -c -t input 2>/dev/null)"
+        if [[ "$cur_input" == "Vortex Audio" ]]; then
+            ok "Vortex Audio is default input"
+        else
+            miss "Vortex Audio not default input" "current: $cur_input"
+            all_ok=false
+        fi
     else
-        miss "BlackHole 2ch" "brew install --cask blackhole-2ch (reboot required)"
-        all_ok=false
+        miss "Vortex Audio" "install Vortex guest tools (scripts/install-vortex-audio.sh)"
+        # Fall back to checking BlackHole
+        if has_blackhole "BlackHole 2ch"; then
+            ok "BlackHole 2ch (fallback)"
+        else
+            miss "BlackHole 2ch" "brew install --cask blackhole-2ch (reboot required)"
+            all_ok=false
+        fi
+        if has_blackhole "BlackHole 16ch"; then
+            ok "BlackHole 16ch (fallback)"
+        else
+            miss "BlackHole 16ch" "brew install --cask blackhole-16ch (reboot required)"
+            all_ok=false
+        fi
     fi
 
-    if has_blackhole "BlackHole 16ch"; then
-        ok "BlackHole 16ch"
-    else
-        miss "BlackHole 16ch" "brew install --cask blackhole-16ch (reboot required)"
-        all_ok=false
-    fi
+    # TCC mic access
+    echo ""
+    echo "Audio permissions:"
+    echo "   ⚠  macOS requires microphone permission for audio input."
+    echo "      Launch Intendant.app from Finder (not SSH) and approve"
+    echo "      the mic prompt on first run."
 
     $all_ok
 }
@@ -195,6 +226,43 @@ brew_install() {
     if has_brew_pkg "$pkg" || has_cmd "$pkg"; then return; fi
     info "installing $pkg..."
     brew install "$pkg"
+}
+
+install_vortex_audio() {
+    if has_audio_device "Vortex Audio"; then return; fi
+
+    local script_dir
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    local vortex_tools="$script_dir/../vendor/vortex-guest-tools"
+    local pkg="$vortex_tools/VortexGuestTools.pkg"
+
+    if [[ -f "$pkg" ]]; then
+        info "installing Vortex guest tools..."
+        sudo installer -pkg "$pkg" -target /
+        NEEDS_REBOOT=true
+    else
+        warn "Vortex guest tools not found at $pkg"
+        warn "Audio routing will fall back to BlackHole."
+        warn "To install Vortex: place VortexGuestTools.pkg in vendor/vortex-guest-tools/"
+    fi
+}
+
+set_vortex_defaults() {
+    if ! has_audio_device "Vortex Audio"; then return; fi
+    if ! has_cmd SwitchAudioSource; then return; fi
+
+    local cur_input cur_output
+    cur_input="$(SwitchAudioSource -c -t input 2>/dev/null)"
+    cur_output="$(SwitchAudioSource -c -t output 2>/dev/null)"
+
+    if [[ "$cur_input" != "Vortex Audio" ]]; then
+        info "setting Vortex Audio as default input..."
+        SwitchAudioSource -s "Vortex Audio" -t input
+    fi
+    if [[ "$cur_output" != "Vortex Audio" ]]; then
+        info "setting Vortex Audio as default output..."
+        SwitchAudioSource -s "Vortex Audio" -t output
+    fi
 }
 
 install_blackhole() {
@@ -284,14 +352,21 @@ run_install() {
     brew_install switchaudio-osx
     brew_install sox
 
-    # Phase 3: Audio routing (BlackHole virtual audio driver)
-    install_blackhole
+    # Phase 3: Audio routing
+    # Try Vortex first (preferred), fall back to BlackHole
+    install_vortex_audio
+    if ! has_audio_device "Vortex Audio"; then
+        install_blackhole
+    fi
 
     # Phase 4: Build
     echo ""
     build_intendant
 
-    # Phase 5: App bundle
+    # Phase 5: Set audio defaults
+    set_vortex_defaults
+
+    # Phase 6: App bundle
     echo ""
     info "building macOS app bundle..."
     if [ -f scripts/bundle-macos.sh ]; then
@@ -307,17 +382,21 @@ run_install() {
 
     if $NEEDS_REBOOT; then
         warn "Reboot required before audio routing will work."
-        echo "   BlackHole was installed but needs a reboot to register"
-        echo "   its virtual audio devices. You may also need to allow"
-        echo "   the system extension in System Settings → Privacy & Security."
+        echo "   Audio drivers were installed but need a reboot to load."
+        echo "   You may also need to allow the system extension in"
+        echo "   System Settings → Privacy & Security."
         echo ""
     fi
 
-    echo "  Run intendant (recommended — proper macOS permissions):"
+    echo "  IMPORTANT: Launch from the macOS GUI for audio to work:"
+    echo ""
     echo "    open target/Intendant.app --args --web"
     echo ""
-    echo "  Or without app bundle:"
-    echo "    ./target/release/intendant \"your task\""
+    echo "  macOS requires GUI session for audio input. Do NOT run"
+    echo "  from SSH — use the app bundle, Finder, or Terminal.app"
+    echo "  inside the VM's display."
+    echo ""
+    echo "  On first launch, approve the microphone permission prompt."
     echo ""
 }
 
