@@ -233,7 +233,13 @@ impl Agent {
     /// set in the environment.
     fn default_display(&self) -> i32 {
         if cfg!(target_os = "macos") {
-            return 0;
+            // Default to virtual display 99 so CLI-only commands (pjsua, curl,
+            // etc.) don't trigger the user session display access gate. Commands
+            // that need the real display (Computer Use) specify display:0 explicitly.
+            if std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok() {
+                return 0;
+            }
+            return 99;
         }
         // Prefer the DISPLAY env var (set by the caller when Xvfb is auto-launched)
         if let Ok(d) = std::env::var("DISPLAY") {
