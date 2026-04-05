@@ -686,7 +686,10 @@ impl DisplaySession {
     /// The task runs until the session's shutdown token is cancelled.
     /// Returns the join handle so callers can await it if desired, but
     /// typically the shutdown token handles cleanup.
-    pub fn spawn_metrics_logger(self: &Arc<Self>) -> JoinHandle<()> {
+    pub fn spawn_metrics_logger(
+        self: &Arc<Self>,
+        event_bus: Option<crate::event::EventBus>,
+    ) -> JoinHandle<()> {
         let session = Arc::clone(self);
         let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
@@ -713,6 +716,11 @@ impl DisplaySession {
                             m.resolution.0,
                             m.resolution.1,
                         );
+                        if let Some(ref bus) = event_bus {
+                            bus.send(crate::event::AppEvent::DisplayMetrics {
+                                snapshot: m,
+                            });
+                        }
                     }
                 }
             }

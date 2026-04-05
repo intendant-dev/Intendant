@@ -4260,6 +4260,7 @@ async fn activate_user_display(
             // Use the backend's resolution (from portal), not xdpyinfo.
             let (width, height) = session.resolution();
             let session = Arc::new(session);
+            session.spawn_metrics_logger(Some(bus.clone()));
             session_registry.write().await.insert(display_id, session);
             bus.send(AppEvent::DisplayReady { display_id, width, height });
             return;
@@ -4287,6 +4288,7 @@ async fn activate_user_display(
                 } else {
                     let (width, height) = session.resolution();
                     let session = Arc::new(session);
+                    session.spawn_metrics_logger(Some(bus.clone()));
                     session_registry.write().await.insert(display_id, session);
                     bus.send(AppEvent::DisplayReady { display_id, width, height });
                     return;
@@ -4316,6 +4318,7 @@ async fn activate_user_display(
         } else {
             let (width, height) = session.resolution();
             let session = Arc::new(session);
+            session.spawn_metrics_logger(Some(bus.clone()));
             session_registry.write().await.insert(display_id, session);
             bus.send(AppEvent::DisplayReady { display_id, width, height });
             return;
