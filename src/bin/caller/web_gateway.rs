@@ -1049,6 +1049,113 @@ fn apply_settings_payload(
     config.live_audio.default_timeout_secs = payload.live_audio_timeout_secs;
 }
 
+/// Return JSON with boolean flags indicating which API keys are configured.
+fn get_api_key_status_json() -> String {
+    let openai = std::env::var("OPENAI_API_KEY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let anthropic = std::env::var("ANTHROPIC_API_KEY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let gemini = std::env::var("GEMINI_API_KEY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    serde_json::json!({
+        "openai": openai,
+        "anthropic": anthropic,
+        "gemini": gemini,
+    })
+    .to_string()
+}
+
+/// Payload for POST /api/api-keys.
+#[derive(serde::Deserialize)]
+struct SetApiKeysPayload {
+    keys: std::collections::HashMap<String, String>,
+}
+
+/// Handle POST /api/api-keys: persist keys to ~/.config/intendant/.env and
+/// set them in the current process.
+fn handle_set_api_keys(body: &str) -> String {
+    let payload: SetApiKeysPayload = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(e) => {
+            return serde_json::json!({"error": format!("Invalid payload: {}", e)}).to_string();
+        }
+    };
+
+    // Only allow known key names.
+    const ALLOWED: &[&str] = &["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"];
+    for key in payload.keys.keys() {
+        if !ALLOWED.contains(&key.as_str()) {
+            return serde_json::json!({"error": format!("Unknown key: {}", key)}).to_string();
+        }
+    }
+
+    // Resolve config dir.
+    let config_dir = match dirs::config_dir() {
+        Some(d) => d.join("intendant"),
+        None => {
+            return serde_json::json!({"error": "Cannot determine config directory"}).to_string();
+        }
+    };
+
+    // Ensure the directory exists.
+    if let Err(e) = std::fs::create_dir_all(&config_dir) {
+        return serde_json::json!({"error": format!("Cannot create config dir: {}", e)})
+            .to_string();
+    }
+
+    let env_path = config_dir.join(".env");
+
+    // Read existing content (may not exist yet).
+    let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
+
+    // Build updated content: replace existing lines, append new ones.
+    let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
+    let mut written_keys = std::collections::HashSet::new();
+
+    for line in &mut lines {
+        let trimmed = line.trim().to_string();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(eq_pos) = trimmed.find('=') {
+            let var_name = trimmed[..eq_pos].trim().to_string();
+            if let Some(new_val) = payload.keys.get(&var_name) {
+                *line = format!("{}={}", var_name, new_val);
+                written_keys.insert(var_name);
+            }
+        }
+    }
+
+    // Append keys that weren't already in the file.
+    for (key, val) in &payload.keys {
+        if !written_keys.contains(key.as_str()) {
+            lines.push(format!("{}={}", key, val));
+        }
+    }
+
+    let new_content = lines.join("\n") + "\n";
+
+    // Atomic write: temp file + rename.
+    let tmp_path = config_dir.join(".env.tmp");
+    if let Err(e) = std::fs::write(&tmp_path, &new_content) {
+        return serde_json::json!({"error": format!("Write failed: {}", e)}).to_string();
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &env_path) {
+        return serde_json::json!({"error": format!("Rename failed: {}", e)}).to_string();
+    }
+
+    // Set env vars in the current process so future provider instantiations
+    // pick them up without requiring a restart.
+    for (key, val) in &payload.keys {
+        std::env::set_var(key, val);
+    }
+
+    serde_json::json!({"ok": true}).to_string()
+}
+
 pub fn spawn_web_gateway(
     port: u16,
     bus: EventBus,
@@ -2481,6 +2588,56 @@ pub fn spawn_web_gateway(
                             }
                             None => serde_json::json!({"error": "No project root"}).to_string(),
                         };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST") && request_line.contains("/api/api-keys") {
+                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                        let content_length: usize = header_text
+                            .lines()
+                            .find(|l| l.to_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+                        let body_owned;
+                        let body_text = if peeked_body.len() >= content_length {
+                            &peeked_body[..content_length]
+                        } else {
+                            let remaining = content_length.saturating_sub(peeked_body.len());
+                            let mut full = peeked_body.to_string();
+                            if remaining > 0 {
+                                let mut rest = vec![0u8; remaining];
+                                if stream.read_exact(&mut rest).await.is_ok() {
+                                    full.push_str(&String::from_utf8_lossy(&rest));
+                                }
+                            }
+                            body_owned = full;
+                            &body_owned
+                        };
+                        let result = handle_set_api_keys(body_text);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            result.len(), result
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.contains("/api/api-key-status") {
+                        use tokio::io::AsyncWriteExt;
+                        let body = get_api_key_status_json();
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\

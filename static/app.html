@@ -260,6 +260,28 @@ html, body {
   width: 16px;
   height: 16px;
 }
+.settings-row input[type="password"] {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 13px;
+}
+.settings-row input[type="password"]:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+.key-status {
+  font-size: 13px;
+  min-width: 16px;
+  text-align: center;
+}
+.key-status.configured {
+  color: var(--green);
+}
 
 /* ── Activity Toolbar ── */
 .activity-toolbar {
@@ -2425,6 +2447,33 @@ html, body {
         <p style="color:var(--subtext0);font-size:12px;margin:0 0 16px">
           Settings are saved to <code style="color:var(--blue)">intendant.toml</code> and take effect on the next task.
         </p>
+
+        <!-- API Keys -->
+        <fieldset class="settings-group">
+          <legend>API Keys</legend>
+          <p style="color:var(--subtext0);font-size:12px;margin:0 0 8px">
+            Saved to <code style="color:var(--blue)">~/.config/intendant/.env</code>
+          </p>
+          <div class="settings-row">
+            <label>OpenAI</label>
+            <input type="password" id="settings-key-openai" placeholder="sk-..." autocomplete="off">
+            <span class="key-status" id="key-status-openai"></span>
+          </div>
+          <div class="settings-row">
+            <label>Anthropic</label>
+            <input type="password" id="settings-key-anthropic" placeholder="sk-ant-..." autocomplete="off">
+            <span class="key-status" id="key-status-anthropic"></span>
+          </div>
+          <div class="settings-row">
+            <label>Gemini</label>
+            <input type="password" id="settings-key-gemini" placeholder="AI..." autocomplete="off">
+            <span class="key-status" id="key-status-gemini"></span>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
+            <button id="settings-save-keys" style="padding:6px 16px;border:none;border-radius:4px;background:var(--blue);color:var(--crust);cursor:pointer;font-weight:600;font-size:13px">Save Keys</button>
+            <span id="settings-keys-status" style="font-size:12px"></span>
+          </div>
+        </fieldset>
 
         <!-- Computer Use -->
         <fieldset class="settings-group">
@@ -6420,6 +6469,9 @@ function switchTab(tabId) {
   if (tabId === 'settings' && !settingsLoaded) {
     loadSettings();
   }
+  if (tabId === 'settings' && !apiKeyStatusLoaded) {
+    loadApiKeyStatus();
+  }
 }
 
 // ── Settings ──
@@ -6517,6 +6569,77 @@ function updateFramerateWarning() {
   if (warn) warn.classList.toggle('hidden', val <= 15);
 }
 document.getElementById('set-recording-framerate').addEventListener('input', updateFramerateWarning);
+
+// ── API Keys ──
+let apiKeyStatusLoaded = false;
+
+async function loadApiKeyStatus() {
+  try {
+    const resp = await fetch('/api/api-key-status');
+    const d = await resp.json();
+    if (d.error) { console.warn('API key status error:', d.error); return; }
+    for (const [key, configured] of Object.entries(d)) {
+      const el = document.getElementById('key-status-' + key);
+      if (el) {
+        el.textContent = configured ? '\u2713' : '';
+        el.classList.toggle('configured', !!configured);
+      }
+    }
+    apiKeyStatusLoaded = true;
+  } catch (e) {
+    console.error('Failed to load API key status:', e);
+  }
+}
+
+async function saveApiKeys() {
+  const keys = {};
+  const openai = document.getElementById('settings-key-openai').value.trim();
+  const anthropic = document.getElementById('settings-key-anthropic').value.trim();
+  const gemini = document.getElementById('settings-key-gemini').value.trim();
+  if (openai) keys.OPENAI_API_KEY = openai;
+  if (anthropic) keys.ANTHROPIC_API_KEY = anthropic;
+  if (gemini) keys.GEMINI_API_KEY = gemini;
+
+  if (Object.keys(keys).length === 0) {
+    const status = document.getElementById('settings-keys-status');
+    status.textContent = 'Enter at least one key';
+    status.style.color = 'var(--peach)';
+    setTimeout(() => { status.textContent = ''; }, 3000);
+    return;
+  }
+
+  try {
+    const resp = await fetch('/api/api-keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys }),
+    });
+    const data = await resp.json();
+    const status = document.getElementById('settings-keys-status');
+    if (data.ok) {
+      status.textContent = 'Saved';
+      status.style.color = 'var(--green)';
+      // Clear inputs after successful save
+      document.getElementById('settings-key-openai').value = '';
+      document.getElementById('settings-key-anthropic').value = '';
+      document.getElementById('settings-key-gemini').value = '';
+      // Refresh status indicators
+      loadApiKeyStatus();
+    } else {
+      status.textContent = 'Error: ' + (data.error || 'Unknown');
+      status.style.color = 'var(--red)';
+    }
+    setTimeout(() => { status.textContent = ''; }, 3000);
+  } catch (e) {
+    console.error('Failed to save API keys:', e);
+    const status = document.getElementById('settings-keys-status');
+    status.textContent = 'Network error';
+    status.style.color = 'var(--red)';
+    setTimeout(() => { status.textContent = ''; }, 3000);
+  }
+}
+
+document.getElementById('settings-save-keys').addEventListener('click', saveApiKeys);
 
 // ── All Sessions Usage (in Stats tab) ──
 let allSessionsUsageLoaded = false;
