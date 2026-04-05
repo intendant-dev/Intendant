@@ -211,19 +211,12 @@ impl DisplaySession {
         let latest = Arc::clone(&self.latest_frame);
         let shutdown = self.shutdown.clone();
 
-        let display_id_log = self.display_id;
         let capture_handle = tokio::spawn(async move {
-            let mut count = 0u64;
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     frame = capture_rx.recv() => {
                         let Some(frame) = frame else { break };
-                        count += 1;
-                        if count == 1 || count % 300 == 0 {
-                            eprintln!("[display/capture] display:{} frame #{} {}x{} stride={} data={}B",
-                                display_id_log, count, frame.width, frame.height, frame.stride, frame.data.len());
-                        }
                         let arc_frame = Arc::new(frame);
                         *latest.write().await = Some(Arc::clone(&arc_frame));
                         let _ = frame_tx.send(arc_frame);
@@ -246,10 +239,7 @@ impl DisplaySession {
             let encoder_shutdown = self.shutdown.clone();
             std::thread::spawn(move || {
                 let mut encoder = match encode::Vp8Encoder::new(width, height, 2000) {
-                    Ok(e) => {
-                        eprintln!("[display/encoder] VP8 encoder created: {}x{}", width, height);
-                        e
-                    }
+                    Ok(e) => e,
                     Err(e) => {
                         eprintln!("[display/encoder] VP8 encoder FAILED: {}", e);
                         return;
