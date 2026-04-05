@@ -7,6 +7,7 @@ mod debug;
 mod display;
 mod error;
 mod event;
+mod external_agent;
 mod frames;
 mod frontend;
 mod knowledge;
