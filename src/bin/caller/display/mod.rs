@@ -339,14 +339,32 @@ impl DisplaySession {
                             let h = frame.height;
                             // Encode BGRA/RGBA → JPEG on blocking pool
                             let jpeg = tokio::task::spawn_blocking(move || {
+                                // Strip row padding if stride > width * 4
+                                let row_bytes = w as usize * 4;
+                                let stride = frame.stride as usize;
                                 let rgba_data = match frame.format {
-                                    FrameFormat::Rgba => frame.data.clone(),
-                                    FrameFormat::Bgra => {
-                                        let mut d = frame.data.clone();
-                                        for chunk in d.chunks_exact_mut(4) {
-                                            chunk.swap(0, 2);
+                                    FrameFormat::Rgba if stride == row_bytes => frame.data.clone(),
+                                    FrameFormat::Rgba => {
+                                        let mut tight = Vec::with_capacity(row_bytes * h as usize);
+                                        for row in 0..h as usize {
+                                            let start = row * stride;
+                                            tight.extend_from_slice(&frame.data[start..start + row_bytes]);
                                         }
-                                        d
+                                        tight
+                                    }
+                                    FrameFormat::Bgra => {
+                                        let mut tight = Vec::with_capacity(row_bytes * h as usize);
+                                        for row in 0..h as usize {
+                                            let start = row * stride;
+                                            for col in 0..w as usize {
+                                                let px = start + col * 4;
+                                                tight.push(frame.data[px + 2]); // R
+                                                tight.push(frame.data[px + 1]); // G
+                                                tight.push(frame.data[px]);      // B
+                                                tight.push(frame.data[px + 3]); // A
+                                            }
+                                        }
+                                        tight
                                     }
                                 };
                                 let img = image::RgbaImage::from_raw(w, h, rgba_data)?;
@@ -420,15 +438,35 @@ impl DisplaySession {
 
         let (w, h) = (frame.width, frame.height);
 
-        // Convert from BGRA (or RGBA) to RGBA for the image crate.
+        // Convert from BGRA (or RGBA) to tightly-packed RGBA for the image crate.
+        // If stride > width * 4 the rows have alignment padding that must be stripped.
+        let row_bytes = w as usize * 4;
+        let stride = frame.stride as usize;
+
         let rgba_data = match frame.format {
-            FrameFormat::Rgba => frame.data.clone(),
-            FrameFormat::Bgra => {
-                let mut rgba = frame.data.clone();
-                for chunk in rgba.chunks_exact_mut(4) {
-                    chunk.swap(0, 2); // B <-> R
+            FrameFormat::Rgba if stride == row_bytes => frame.data.clone(),
+            FrameFormat::Rgba => {
+                let mut tight = Vec::with_capacity(row_bytes * h as usize);
+                for row in 0..h as usize {
+                    let start = row * stride;
+                    tight.extend_from_slice(&frame.data[start..start + row_bytes]);
                 }
-                rgba
+                tight
+            }
+            FrameFormat::Bgra => {
+                let mut tight = Vec::with_capacity(row_bytes * h as usize);
+                for row in 0..h as usize {
+                    let start = row * stride;
+                    for col in 0..w as usize {
+                        let px = start + col * 4;
+                        // Swap B <-> R while copying
+                        tight.push(frame.data[px + 2]); // R
+                        tight.push(frame.data[px + 1]); // G
+                        tight.push(frame.data[px]);      // B
+                        tight.push(frame.data[px + 3]); // A
+                    }
+                }
+                tight
             }
         };
 

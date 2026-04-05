@@ -654,17 +654,43 @@ pub fn spawn_recording_listener(
                                                 let jpeg_data = tokio::task::spawn_blocking({
                                                     let frame = frame.clone();
                                                     move || {
-                                                        // Convert BGRA/RGBA to RGBA for image crate
+                                                        // Convert BGRA/RGBA to tightly-packed RGBA for image crate.
+                                                        // Strip row padding if stride > width * 4.
+                                                        let row_bytes = frame.width as usize * 4;
+                                                        let stride = frame.stride as usize;
                                                         let rgba_data = match frame.format {
-                                                            crate::display::FrameFormat::Rgba => {
+                                                            crate::display::FrameFormat::Rgba
+                                                                if stride == row_bytes =>
+                                                            {
                                                                 frame.data.clone()
                                                             }
-                                                            crate::display::FrameFormat::Bgra => {
-                                                                let mut rgba = frame.data.clone();
-                                                                for chunk in rgba.chunks_exact_mut(4) {
-                                                                    chunk.swap(0, 2);
+                                                            crate::display::FrameFormat::Rgba => {
+                                                                let mut tight = Vec::with_capacity(
+                                                                    row_bytes * frame.height as usize,
+                                                                );
+                                                                for row in 0..frame.height as usize {
+                                                                    let start = row * stride;
+                                                                    tight.extend_from_slice(
+                                                                        &frame.data[start..start + row_bytes],
+                                                                    );
                                                                 }
-                                                                rgba
+                                                                tight
+                                                            }
+                                                            crate::display::FrameFormat::Bgra => {
+                                                                let mut tight = Vec::with_capacity(
+                                                                    row_bytes * frame.height as usize,
+                                                                );
+                                                                for row in 0..frame.height as usize {
+                                                                    let start = row * stride;
+                                                                    for col in 0..frame.width as usize {
+                                                                        let px = start + col * 4;
+                                                                        tight.push(frame.data[px + 2]); // R
+                                                                        tight.push(frame.data[px + 1]); // G
+                                                                        tight.push(frame.data[px]);      // B
+                                                                        tight.push(frame.data[px + 3]); // A
+                                                                    }
+                                                                }
+                                                                tight
                                                             }
                                                         };
                                                         let img = image::RgbaImage::from_raw(

@@ -158,6 +158,9 @@ impl DisplayBackend for WaylandBackend {
             if let Some(handle) = ps.pw_thread.take() {
                 let _ = handle.join();
             }
+            // Explicitly close the portal session so the GNOME sharing
+            // indicator disappears immediately on revoke.
+            let _ = ps.session.close().await;
         }
     }
 
@@ -348,15 +351,13 @@ fn run_pipewire_capture(
                 if let Some(buf) = buffer.datas_mut().first_mut() {
                     // Read chunk metadata before taking the mutable data borrow.
                     let stride = buf.chunk().stride() as u32;
-                    let chunk_size = buf.chunk().size();
 
                     if let Some(data) = buf.data() {
-                        let frame_w = if stride > 0 { stride / 4 } else { width };
-                        let frame_h = if stride > 0 {
-                            chunk_size / stride
-                        } else {
-                            height
-                        };
+                        // Use the stream's actual dimensions, not stride-derived.
+                        // stride may include row padding for memory alignment,
+                        // so stride / 4 can be wider than the real pixel width.
+                        let frame_w = width;
+                        let frame_h = height;
 
                         let frame = Frame {
                             data: data.to_vec(),

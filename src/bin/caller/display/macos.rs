@@ -43,17 +43,13 @@ pub struct MacOSBackend {
 }
 
 impl MacOSBackend {
-    /// Create a new macOS backend.  Resolution is populated from CGDisplay
-    /// immediately and updated when capture starts.
+    /// Create a new macOS backend.  Resolution is populated from the actual
+    /// captured display once `start_capture()` runs.
     pub fn new() -> Self {
-        let display = CGDisplay::main();
-        let w = display.pixels_wide() as u32;
-        let h = display.pixels_high() as u32;
-
         Self {
             capture: Mutex::new(None),
-            width: AtomicU32::new(w),
-            height: AtomicU32::new(h),
+            width: AtomicU32::new(0),
+            height: AtomicU32::new(0),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -77,9 +73,13 @@ impl DisplayBackend for MacOSBackend {
             .next()
             .ok_or_else(|| CallerError::Display("no display found".into()))?;
 
+        // Use the *captured* display's CGDisplay for resolution, so input
+        // injection targets the same monitor (avoids multi-monitor mismatch
+        // when the first SCDisplay is not CGDisplay::main()).
+        let cg_display = CGDisplay::new(display.display_id());
         // VP8 (and I420 color space) requires dimensions divisible by 2.
-        let width = (display.width() as u32) & !1;
-        let height = (display.height() as u32) & !1;
+        let width = (cg_display.pixels_wide() as u32) & !1;
+        let height = (cg_display.pixels_high() as u32) & !1;
         self.width.store(width, Ordering::SeqCst);
         self.height.store(height, Ordering::SeqCst);
 
