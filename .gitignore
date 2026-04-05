@@ -8,3 +8,4 @@ docs/book/
 .claude/
 .mcp.json
 intendant.toml
+.codex
