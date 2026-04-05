@@ -40,6 +40,8 @@ pub mod macos_keymap;
 pub mod webrtc;
 #[cfg(target_os = "linux")]
 pub mod wayland;
+#[cfg(target_os = "linux")]
+pub mod x11;
 
 // ---------------------------------------------------------------------------
 // Core types

@@ -4239,7 +4239,7 @@ async fn activate_user_display(
         }
         let backend = display::wayland::WaylandBackend::new();
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
-        if let Err(e) = session.start(30, frame_registry).await {
+        if let Err(e) = session.start(30, frame_registry.clone()).await {
             eprintln!("[user_display] Failed to start display session: {}", e);
         } else {
             // Use the backend's resolution (from portal), not xdpyinfo.
@@ -4251,8 +4251,7 @@ async fn activate_user_display(
         }
     }
 
-    // X11: detect display even without DISPLAY env var, but no DisplaySession
-    // yet (phase 2) — log what we found.
+    // X11: detect display and create a DisplaySession with X11Backend.
     #[cfg(target_os = "linux")]
     {
         let has_x11 = std::env::var("DISPLAY").is_ok()
@@ -4264,9 +4263,20 @@ async fn activate_user_display(
                     std::env::set_var("DISPLAY", &d);
                 }
             }
-            eprintln!("[user_display] X11 display detected (DISPLAY={}), no DisplaySession yet (phase 2)",
-                std::env::var("DISPLAY").unwrap_or_default());
-            return;
+            let backend = display::x11::X11Backend::new()
+                .map_err(|e| eprintln!("[user_display] X11 backend failed: {}", e));
+            if let Ok(backend) = backend {
+                let session = display::DisplaySession::new(display_id, Arc::new(backend));
+                if let Err(e) = session.start(30, frame_registry.clone()).await {
+                    eprintln!("[user_display] X11 display session failed: {}", e);
+                } else {
+                    let (width, height) = session.resolution();
+                    let session = Arc::new(session);
+                    session_registry.write().await.insert(display_id, session);
+                    bus.send(AppEvent::DisplayReady { display_id, width, height });
+                    return;
+                }
+            }
         }
     }
 
