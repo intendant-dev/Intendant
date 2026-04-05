@@ -4272,9 +4272,17 @@ async fn activate_user_display(
 
     #[cfg(target_os = "macos")]
     {
-        // macOS always has a native display — no env var needed.
-        eprintln!("[user_display] macOS user display: no DisplaySession, no web slot (phase 2)");
-        return;
+        let backend = display::macos::MacOSBackend::new();
+        let session = display::DisplaySession::new(display_id, Arc::new(backend));
+        if let Err(e) = session.start(30, frame_registry).await {
+            eprintln!("[user_display] macOS display session failed: {}", e);
+        } else {
+            let (width, height) = session.resolution();
+            let session = Arc::new(session);
+            session_registry.write().await.insert(display_id, session);
+            bus.send(AppEvent::DisplayReady { display_id, width, height });
+            return;
+        }
     }
 
     #[allow(unreachable_code)]

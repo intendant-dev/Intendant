@@ -34,6 +34,10 @@ use crate::error::CallerError;
 #[cfg(target_os = "linux")]
 pub mod encode;
 pub mod keymap;
+#[cfg(target_os = "macos")]
+pub mod macos;
+#[cfg(target_os = "macos")]
+pub mod macos_keymap;
 #[cfg(target_os = "linux")]
 pub mod webrtc;
 #[cfg(target_os = "linux")]
