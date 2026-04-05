@@ -77,8 +77,9 @@ impl DisplayBackend for MacOSBackend {
             .next()
             .ok_or_else(|| CallerError::Display("no display found".into()))?;
 
-        let width = display.width() as u32;
-        let height = display.height() as u32;
+        // VP8 (and I420 color space) requires dimensions divisible by 2.
+        let width = (display.width() as u32) & !1;
+        let height = (display.height() as u32) & !1;
         self.width.store(width, Ordering::SeqCst);
         self.height.store(height, Ordering::SeqCst);
 
