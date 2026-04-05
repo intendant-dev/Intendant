@@ -3967,7 +3967,7 @@ class DisplaySlot {
     this.pc.onicecandidate = (e) => {
       if (e.candidate && app) {
         app.send_server_action({
-          action: 'display_ice',
+          t: 'display_ice',
           display_id: this.displayId,
           candidate: e.candidate.toJSON()
         });
@@ -3995,7 +3995,7 @@ class DisplaySlot {
     }).then(() => {
       if (app) {
         app.send_server_action({
-          action: 'display_offer',
+          t: 'display_offer',
           display_id: this.displayId,
           sdp: this.pc.localDescription.sdp
         });
