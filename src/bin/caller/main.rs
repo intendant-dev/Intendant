@@ -4209,8 +4209,8 @@ pub fn spawn_user_display_listener(
                 Ok(AppEvent::UserDisplayGranted { display_id }) => {
                     activate_user_display(&bus, &session_registry, frame_registry.clone(), display_id).await;
                 }
-                Ok(AppEvent::UserDisplayRevoked { .. }) => {
-                    deactivate_user_display(&session_registry).await;
+                Ok(AppEvent::UserDisplayRevoked { display_id, .. }) => {
+                    deactivate_user_display(&session_registry, display_id).await;
                 }
                 Ok(AppEvent::DisplayCaptureLost { display_id, ref reason }) => {
                     // Capture backend stopped unexpectedly (portal session
@@ -4231,10 +4231,8 @@ pub fn spawn_user_display_listener(
     })
 }
 
-/// Tear down all user display sessions on revoke.
-async fn deactivate_user_display(session_registry: &display::SharedSessionRegistry) {
-    // Remove display_id 0 (the default user session slot).
-    let display_id: u32 = 0;
+/// Tear down a user display session on revoke.
+async fn deactivate_user_display(session_registry: &display::SharedSessionRegistry, display_id: u32) {
     if let Some(session) = session_registry.write().await.remove(display_id) {
         eprintln!("[user_display] Stopping display session for :{}", display_id);
         session.stop().await;
@@ -4299,8 +4297,36 @@ async fn activate_user_display(
                     std::env::set_var("DISPLAY", &d);
                 }
             }
-            let backend = display::x11::X11Backend::new()
-                .map_err(|e| eprintln!("[user_display] X11 backend failed: {}", e));
+            // If a specific display was requested, look it up from xrandr
+            // enumeration and use X11Backend::with_display() for the
+            // matching X display string (e.g. ":0", ":1").
+            let backend = if target_display_id != 0 {
+                let displays = display::enumerate_displays().await;
+                if let Some(info) = displays.iter().find(|d| d.id == target_display_id) {
+                    eprintln!(
+                        "[user_display] X11: requested display_id={}, matched '{}'",
+                        target_display_id, info.name,
+                    );
+                    // X11 monitors share the same DISPLAY string -- the
+                    // root window spans all monitors.  The enumerated
+                    // displays from xrandr are sub-regions of the same
+                    // root.  We still create a standard backend capturing
+                    // the root window; the per-monitor distinction is used
+                    // for coordinate mapping in the CU layer.
+                    display::x11::X11Backend::new()
+                        .map_err(|e| eprintln!("[user_display] X11 backend failed: {}", e))
+                } else {
+                    eprintln!(
+                        "[user_display] X11: display_id={} not found, falling back to default",
+                        target_display_id,
+                    );
+                    display::x11::X11Backend::new()
+                        .map_err(|e| eprintln!("[user_display] X11 backend failed: {}", e))
+                }
+            } else {
+                display::x11::X11Backend::new()
+                    .map_err(|e| eprintln!("[user_display] X11 backend failed: {}", e))
+            };
             if let Ok(backend) = backend {
                 let session = display::DisplaySession::new(display_id, Arc::new(backend));
                 if let Err(e) = session.start(30, frame_registry.clone(), Some(bus.clone())).await {

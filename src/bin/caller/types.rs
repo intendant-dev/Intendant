@@ -165,8 +165,13 @@ pub enum OutboundEvent {
     },
     UserDisplayGranted,
     UserDisplayRevoked {
+        display_id: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+    },
+    DisplayCaptureLost {
+        display_id: u32,
+        reason: String,
     },
     RecordingStarted {
         stream_name: String,

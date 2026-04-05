@@ -847,6 +847,7 @@ impl App {
                             .unwrap_or(false);
                         if granted {
                             self.handle_control_command(ControlMsg::RevokeUserDisplay {
+                                display_id: None,
                                 note: None,
                             });
                         } else {
@@ -1378,7 +1379,8 @@ impl App {
                 // ListDisplays is async — handled at the caller level, not in the TUI.
                 self.log(LogLevel::Info, "ListDisplays: use the control socket or web API".to_string());
             }
-            ControlMsg::RevokeUserDisplay { note } => {
+            ControlMsg::RevokeUserDisplay { display_id, note } => {
+                let did = display_id.unwrap_or(0);
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     let autonomy = self.autonomy.clone();
                     handle.spawn(async move {
@@ -1390,14 +1392,15 @@ impl App {
                 }
                 std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
                 let msg = format!(
-                    "User display access revoked{}",
+                    "User display access revoked (display_id: {}){}",
+                    did,
                     note.as_ref()
                         .map(|n| format!(". Note: {}", n))
                         .unwrap_or_default()
                 );
                 self.log(LogLevel::Warn, msg);
-                self.broadcast_control(OutboundEvent::UserDisplayRevoked { note: note.clone() });
-                self.pending_derived.push(AppEvent::UserDisplayRevoked { note });
+                self.broadcast_control(OutboundEvent::UserDisplayRevoked { display_id: did, note: note.clone() });
+                self.pending_derived.push(AppEvent::UserDisplayRevoked { display_id: did, note });
             }
             ControlMsg::InvokeSkill {
                 skill_name,
@@ -1764,11 +1767,11 @@ impl App {
             AppEvent::UserDisplayGranted { display_id } => {
                 self.log(LogLevel::Warn, format!("User display access granted (display_id: {})", display_id));
             }
-            AppEvent::UserDisplayRevoked { ref note } => {
+            AppEvent::UserDisplayRevoked { display_id, ref note } => {
                 let msg = if let Some(n) = note {
-                    format!("User display access revoked: {}", n)
+                    format!("User display access revoked (display_id: {}): {}", display_id, n)
                 } else {
-                    "User display access revoked".to_string()
+                    format!("User display access revoked (display_id: {})", display_id)
                 };
                 self.log(LogLevel::Warn, msg);
             }

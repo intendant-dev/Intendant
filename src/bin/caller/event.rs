@@ -178,6 +178,8 @@ pub enum AppEvent {
         display_id: u32,
     },
     UserDisplayRevoked {
+        /// The display ID being revoked.  0 = primary (default).
+        display_id: u32,
         note: Option<String>,
     },
 
@@ -444,6 +446,10 @@ pub enum ControlMsg {
         display_id: Option<u32>,
     },
     RevokeUserDisplay {
+        /// Optional display ID to revoke.  When `None`, revokes the primary
+        /// display (id 0) -- backwards-compatible with single-monitor setups.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_id: Option<u32>,
         #[serde(default)]
         note: Option<String>,
     },
@@ -630,7 +636,8 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             })
         }
         AppEvent::UserDisplayGranted { .. } => Some(OutboundEvent::UserDisplayGranted),
-        AppEvent::UserDisplayRevoked { note } => Some(OutboundEvent::UserDisplayRevoked {
+        AppEvent::UserDisplayRevoked { display_id, note } => Some(OutboundEvent::UserDisplayRevoked {
+            display_id: *display_id,
             note: note.clone(),
         }),
         AppEvent::ContextManagement { turn } => Some(OutboundEvent::ContextManagement {
@@ -757,6 +764,12 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             resolution_width: snapshot.resolution.0,
             resolution_height: snapshot.resolution.1,
         }),
+        AppEvent::DisplayCaptureLost { display_id, reason } => {
+            Some(OutboundEvent::DisplayCaptureLost {
+                display_id: *display_id,
+                reason: reason.clone(),
+            })
+        }
         // Terminal-only / internal events — not broadcast to external consumers
         AppEvent::Key(_)
         | AppEvent::Resize(_, _)
@@ -772,7 +785,6 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         | AppEvent::VoiceLog { .. }
         | AppEvent::PresenceCheckpointReceived { .. }
         | AppEvent::VoiceDiagnostic { .. }
-        | AppEvent::DisplayCaptureLost { .. }
         | AppEvent::LiveAudioStarted { .. }
         | AppEvent::LiveAudioProgress { .. }
         | AppEvent::LiveAudioCompleted { .. } => None,
@@ -907,11 +919,11 @@ fn write_event_to_session_log(
         AppEvent::UserDisplayGranted { display_id } => {
             log.info(&format!("User display access granted (display_id: {})", display_id));
         }
-        AppEvent::UserDisplayRevoked { note } => {
+        AppEvent::UserDisplayRevoked { display_id, note } => {
             let msg = if let Some(n) = note {
-                format!("User display access revoked: {}", n)
+                format!("User display access revoked (display_id: {}): {}", display_id, n)
             } else {
-                "User display access revoked".to_string()
+                format!("User display access revoked (display_id: {})", display_id)
             };
             log.info(&msg);
         }
@@ -1270,6 +1282,7 @@ mod tests {
             },
             ControlMsg::GrantUserDisplay { display_id: None },
             ControlMsg::RevokeUserDisplay {
+                display_id: None,
                 note: Some("done with user display".to_string()),
             },
             ControlMsg::InvokeSkill {
@@ -1476,7 +1489,8 @@ mod tests {
         let json = r#"{"action":"revoke_user_display","note":"testing done"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ControlMsg::RevokeUserDisplay { note } => {
+            ControlMsg::RevokeUserDisplay { display_id, note } => {
+                assert_eq!(display_id, None);
                 assert_eq!(note.as_deref(), Some("testing done"));
             }
             _ => panic!("expected RevokeUserDisplay"),
@@ -1488,8 +1502,22 @@ mod tests {
         let json = r#"{"action":"revoke_user_display"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ControlMsg::RevokeUserDisplay { note } => {
+            ControlMsg::RevokeUserDisplay { display_id, note } => {
+                assert_eq!(display_id, None);
                 assert!(note.is_none());
+            }
+            _ => panic!("expected RevokeUserDisplay"),
+        }
+    }
+
+    #[test]
+    fn control_msg_revoke_user_display_with_id() {
+        let json = r#"{"action":"revoke_user_display","display_id":3,"note":"done"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::RevokeUserDisplay { display_id, note } => {
+                assert_eq!(display_id, Some(3));
+                assert_eq!(note.as_deref(), Some("done"));
             }
             _ => panic!("expected RevokeUserDisplay"),
         }
