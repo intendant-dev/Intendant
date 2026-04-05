@@ -4145,25 +4145,38 @@ class DisplaySlot {
       e.preventDefault();
       sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
     };
-    this._boundHandlers.mousedown = (e) => {
+    this._boundHandlers.pointerdown = (e) => {
       e.preventDefault();
       vid.focus();
+      vid.setPointerCapture(e.pointerId);
       const { x, y } = normalize(e);
       sendControl({ t: 'md', x, y, b: e.button });
     };
-    this._boundHandlers.mouseup = (e) => {
+    this._boundHandlers.pointerup = (e) => {
       e.preventDefault();
+      vid.releasePointerCapture(e.pointerId);
       const { x, y } = normalize(e);
       sendControl({ t: 'mu', x, y, b: e.button });
     };
-    this._boundHandlers.mousemove = (e) => {
+    this._boundHandlers.pointermove = (e) => {
       const { x, y } = normalize(e);
       sendPointer({ t: 'mm', x, y, buttons: e.buttons });
     };
     this._boundHandlers.wheel = (e) => {
       e.preventDefault();
       const { x, y } = normalize(e);
-      sendPointer({ t: 'sc', x, y, dx: e.deltaX, dy: e.deltaY });
+      // Normalize pixel deltas to discrete scroll notches.
+      // DOM_DELTA_PIXEL (0): divide by 100 to approximate notches.
+      // DOM_DELTA_LINE (1): use as-is (already logical lines).
+      // DOM_DELTA_PAGE (2): multiply by 3 (approximate lines per page).
+      let dx = e.deltaX, dy = e.deltaY;
+      if (e.deltaMode === 0) {
+        dx = Math.round(dx / 100) || (dx > 0 ? 1 : dx < 0 ? -1 : 0);
+        dy = Math.round(dy / 100) || (dy > 0 ? 1 : dy < 0 ? -1 : 0);
+      } else if (e.deltaMode === 2) {
+        dx *= 3; dy *= 3;
+      }
+      sendPointer({ t: 'sc', x, y, dx, dy });
     };
     this._boundHandlers.contextmenu = (e) => e.preventDefault();
 
