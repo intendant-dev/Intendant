@@ -110,7 +110,7 @@ impl DisplayBackend for X11Backend {
                     run_xdotool(display, &["keyup", key_name]).await?;
                 }
             }
-            InputEvent::MouseMove { x, y } => {
+            InputEvent::MouseMove { x, y, .. } => {
                 let px = (x * width) as i32;
                 let py = (y * height) as i32;
                 let sx = px.to_string();
