@@ -2151,6 +2151,9 @@ pub fn spawn_event_listener(
                         let q_note = if quarantine_count > 0 { format!(" ({} quarantined)", quarantine_count) } else { String::new() };
                         s.push_log(LogLevel::Info, format!("Live audio '{}': {}{}", id, status, q_note));
                     }
+                    AppEvent::DisplayMetrics { .. } => {
+                        // Broadcast-only — handled by outbound event converter.
+                    }
                 }
             }
 

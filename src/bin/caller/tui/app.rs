@@ -1932,7 +1932,8 @@ impl App {
                 self.handle_key(key);
             }
             AppEvent::ApprovalResolved { .. }
-            | AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::LiveUsageUpdate { .. } => {
+            | AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::LiveUsageUpdate { .. }
+            | AppEvent::DisplayMetrics { .. } => {
                 // Derived events — just pass through to outbound broadcaster.
                 // App doesn't need to handle its own output.
             }

@@ -893,7 +893,8 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::DebugScreenTornDown { .. }
         | AppEvent::LiveAudioStarted { .. }
         | AppEvent::LiveAudioProgress { .. }
-        | AppEvent::LiveAudioCompleted { .. } => None,
+        | AppEvent::LiveAudioCompleted { .. }
+        | AppEvent::DisplayMetrics { .. } => None,
     }
 }
 
