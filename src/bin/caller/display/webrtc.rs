@@ -245,9 +245,6 @@ impl WebRtcPeer {
             .await
             .map(|d| d.sdp)
             .unwrap_or_default();
-        eprintln!("[display/webrtc] Answer SDP ({} bytes, {} candidates)", answer_sdp.len(),
-            answer_sdp.lines().filter(|l| l.starts_with("a=candidate")).count());
-
         // --- Per-peer encoded frame channel (bounded, backpressure via drop) ---
         let (encoded_frame_tx, mut encoded_frame_rx) = mpsc::channel::<Arc<EncodedFrame>>(8);
 

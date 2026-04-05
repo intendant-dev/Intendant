@@ -2363,7 +2363,7 @@ pub fn spawn_web_gateway(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/wasm\r\n\
                              Content-Length: {}\r\n\
-                             Cache-Control: public, max-age=31536000, immutable\r\n\
+                             Cache-Control: no-cache, must-revalidate\r\n\
                              Connection: close\r\n\
                              \r\n",
                             wasm_data.len()
@@ -3079,7 +3079,7 @@ pub fn spawn_web_gateway(
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else {
                         let (content_type, body, cache) = if request_line.contains("/wasm-web/presence_web.js") {
-                            ("application/javascript", WASM_WEB_JS.to_string(), "public, max-age=31536000, immutable")
+                            ("application/javascript", WASM_WEB_JS.to_string(), "no-cache, must-revalidate")
                         } else if request_line.contains("/audio-processor.js") {
                             ("application/javascript", AUDIO_PROCESSOR_JS.to_string(), "no-cache")
                         } else if request_line.contains("/config") {
