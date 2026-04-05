@@ -31,8 +31,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::CallerError;
 
+#[cfg(target_os = "linux")]
 pub mod encode;
 pub mod keymap;
+#[cfg(target_os = "linux")]
 pub mod webrtc;
 #[cfg(target_os = "linux")]
 pub mod wayland;
@@ -161,7 +163,7 @@ pub struct DisplaySession {
     backend: Arc<dyn DisplayBackend>,
     frame_tx: broadcast::Sender<Arc<Frame>>,
     latest_frame: Arc<RwLock<Option<Arc<Frame>>>>,
-    /// Shared with the encoder task so new peers are visible immediately.
+    #[cfg(target_os = "linux")]
     peers: Arc<RwLock<HashMap<PeerId, Arc<self::webrtc::WebRtcPeer>>>>,
     encoder_handle: Mutex<Option<JoinHandle<()>>>,
     capture_handle: Mutex<Option<JoinHandle<()>>>,
@@ -177,6 +179,7 @@ impl DisplaySession {
             backend,
             frame_tx,
             latest_frame: Arc::new(RwLock::new(None)),
+            #[cfg(target_os = "linux")]
             peers: Arc::new(RwLock::new(HashMap::new())),
             encoder_handle: Mutex::new(None),
             capture_handle: Mutex::new(None),
@@ -224,104 +227,88 @@ impl DisplaySession {
         });
         *self.capture_handle.lock().await = Some(capture_handle);
 
-        // --- Task 2: Encoder ---
-        //
-        // The VP8 encoder (vpx_encode::Encoder) is !Send because it contains
-        // raw pointers. It must live on a single dedicated OS thread. We spawn
-        // a std::thread for encoding and bridge to tokio via channels.
-        //
-        // Flow: broadcast subscriber (tokio) -> i420_tx -> encoder thread
-        //       -> encoded_frames_tx -> fan-out task (tokio) -> per-peer channels
-        let mut broadcast_rx = self.frame_tx.subscribe();
-        let peers = Arc::clone(&self.peers);
+        // --- Task 2: VP8 Encoder + WebRTC fan-out (Linux only) ---
+        #[cfg(target_os = "linux")]
+        {
+            let mut broadcast_rx = self.frame_tx.subscribe();
+            let peers = Arc::clone(&self.peers);
 
-        let duration_ms = if fps > 0 { 1000 / fps as u64 } else { 33 };
+            let duration_ms = if fps > 0 { 1000 / fps as u64 } else { 33 };
 
-        // Channel from the bridge task to the encoder thread: raw I420 data.
-        let (i420_tx, i420_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
-        // Channel from the encoder thread back to the fan-out task: encoded frames.
-        let (efr_tx, mut efr_rx) = mpsc::channel::<Arc<EncodedFrame>>(16);
+            let (i420_tx, i420_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+            let (efr_tx, mut efr_rx) = mpsc::channel::<Arc<EncodedFrame>>(16);
 
-        // Encoder thread (dedicated OS thread, not tokio).
-        let encoder_shutdown = self.shutdown.clone();
-        std::thread::spawn(move || {
-            let mut encoder = match encode::Vp8Encoder::new(width, height, 2000) {
-                Ok(e) => e,
-                Err(_) => return,
-            };
-            while let Ok(i420) = i420_rx.recv() {
-                if encoder_shutdown.is_cancelled() {
-                    break;
-                }
-                if let Ok(packets) = encoder.encode(&i420, duration_ms) {
-                    for pkt in packets {
-                        let ef = Arc::new(pkt.into_encoded_frame());
-                        if efr_tx.blocking_send(ef).is_err() {
-                            return;
-                        }
+            let encoder_shutdown = self.shutdown.clone();
+            std::thread::spawn(move || {
+                let mut encoder = match encode::Vp8Encoder::new(width, height, 2000) {
+                    Ok(e) => e,
+                    Err(_) => return,
+                };
+                while let Ok(i420) = i420_rx.recv() {
+                    if encoder_shutdown.is_cancelled() {
+                        break;
                     }
-                }
-            }
-        });
-
-        // Bridge task: broadcast subscriber -> I420 conversion -> encoder thread.
-        // Rate-limit to target fps to prevent CPU overload.
-        let shutdown_bridge = self.shutdown.clone();
-        let frame_interval = std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
-        let bridge_handle = tokio::spawn(async move {
-            let mut last_encode = tokio::time::Instant::now();
-            loop {
-                tokio::select! {
-                    _ = shutdown_bridge.cancelled() => break,
-                    result = broadcast_rx.recv() => {
-                        // Rate limit: skip frames that arrive faster than target fps.
-                        if last_encode.elapsed() < frame_interval {
-                            continue;
-                        }
-                        last_encode = tokio::time::Instant::now();
-                        let frame = match result {
-                            Ok(f) => f,
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(broadcast::error::RecvError::Closed) => break,
-                        };
-                        let fd = frame.data.clone();
-                        let fw = frame.width;
-                        let fh = frame.height;
-                        let fs = frame.stride;
-                        // I420 conversion on the blocking thread pool (CPU-bound).
-                        let i420 = tokio::task::spawn_blocking(move || {
-                            encode::bgra_to_i420(&fd, fw, fh, fs)
-                        }).await;
-                        if let Ok(i420) = i420 {
-                            if i420_tx.try_send(i420).is_err() {
-                                // Backpressure: encoder is behind, drop frame.
+                    if let Ok(packets) = encoder.encode(&i420, duration_ms) {
+                        for pkt in packets {
+                            let ef = Arc::new(pkt.into_encoded_frame());
+                            if efr_tx.blocking_send(ef).is_err() {
+                                return;
                             }
                         }
                     }
                 }
-            }
-        });
+            });
 
-        // Fan-out task: read encoded frames from the encoder thread, distribute
-        // to each peer's bounded channel.
-        let shutdown_fanout = self.shutdown.clone();
-        let encoder_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = shutdown_fanout.cancelled() => break,
-                    ef = efr_rx.recv() => {
-                        let Some(ef) = ef else { break };
-                        let peers_guard = peers.read().await;
-                        for peer in peers_guard.values() {
-                            let _ = peer.encoded_frame_tx().try_send(Arc::clone(&ef));
+            let shutdown_bridge = self.shutdown.clone();
+            let frame_interval = std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
+            let bridge_handle = tokio::spawn(async move {
+                let mut last_encode = tokio::time::Instant::now();
+                loop {
+                    tokio::select! {
+                        _ = shutdown_bridge.cancelled() => break,
+                        result = broadcast_rx.recv() => {
+                            if last_encode.elapsed() < frame_interval {
+                                continue;
+                            }
+                            last_encode = tokio::time::Instant::now();
+                            let frame = match result {
+                                Ok(f) => f,
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            };
+                            let fd = frame.data.clone();
+                            let fw = frame.width;
+                            let fh = frame.height;
+                            let fs = frame.stride;
+                            let i420 = tokio::task::spawn_blocking(move || {
+                                encode::bgra_to_i420(&fd, fw, fh, fs)
+                            }).await;
+                            if let Ok(i420) = i420 {
+                                if i420_tx.try_send(i420).is_err() {}
+                            }
                         }
                     }
                 }
-            }
-            // Also await the bridge so it doesn't leak.
-            bridge_handle.abort();
-        });
-        *self.encoder_handle.lock().await = Some(encoder_handle);
+            });
+
+            let shutdown_fanout = self.shutdown.clone();
+            let encoder_handle = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = shutdown_fanout.cancelled() => break,
+                        ef = efr_rx.recv() => {
+                            let Some(ef) = ef else { break };
+                            let peers_guard = peers.read().await;
+                            for peer in peers_guard.values() {
+                                let _ = peer.encoded_frame_tx().try_send(Arc::clone(&ef));
+                            }
+                        }
+                    }
+                }
+                bridge_handle.abort();
+            });
+            *self.encoder_handle.lock().await = Some(encoder_handle);
+        }
 
         // --- Task 3: FrameRegistry sampler (1 Hz JPEG for model feeds) ---
         if let Some(registry) = frame_registry {
@@ -397,9 +384,12 @@ impl DisplaySession {
             let _ = h.await;
         }
 
-        let mut peers = self.peers.write().await;
-        for (_, peer) in peers.drain() {
-            peer.close().await;
+        #[cfg(target_os = "linux")]
+        {
+            let mut peers = self.peers.write().await;
+            for (_, peer) in peers.drain() {
+                peer.close().await;
+            }
         }
     }
 
@@ -449,6 +439,7 @@ impl DisplaySession {
     ///
     /// Creates a `WebRtcPeer`, subscribes it to the encoder output, adds it to
     /// the peer map, and returns the SDP answer.
+    #[cfg(target_os = "linux")]
     pub async fn handle_offer(
         &self,
         peer_id: PeerId,
@@ -476,6 +467,7 @@ impl DisplaySession {
     }
 
     /// Forward a trickle ICE candidate to a connected peer.
+    #[cfg(target_os = "linux")]
     pub async fn add_ice_candidate(
         &self,
         peer_id: PeerId,
@@ -489,6 +481,7 @@ impl DisplaySession {
     }
 
     /// Remove and close a peer.
+    #[cfg(target_os = "linux")]
     pub async fn remove_peer(&self, peer_id: PeerId) {
         if let Some(peer) = self.peers.write().await.remove(&peer_id) {
             peer.close().await;
