@@ -311,6 +311,11 @@ pub enum AppEvent {
         turn: Option<usize>,
     },
 
+    /// Display transport pipeline metrics snapshot.
+    DisplayMetrics {
+        snapshot: crate::display::DisplayMetricsSnapshot,
+    },
+
     // TUI internal
     Tick,
     #[allow(dead_code)]
@@ -706,6 +711,18 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         } => Some(OutboundEvent::RecordingError {
             stream_name: stream_name.clone(),
             message: message.clone(),
+        }),
+        AppEvent::DisplayMetrics { snapshot } => Some(OutboundEvent::DisplayMetrics {
+            display_id: snapshot.display_id,
+            capture_fps: snapshot.capture_fps,
+            capture_drops: snapshot.capture_drops,
+            encode_fps: snapshot.encode_fps,
+            encode_latency_avg_ms: snapshot.encode_latency_avg_ms,
+            encode_drops: snapshot.encode_drops,
+            peer_count: snapshot.peer_count,
+            peer_drops: snapshot.peer_drops,
+            resolution_width: snapshot.resolution.0,
+            resolution_height: snapshot.resolution.1,
         }),
         // Terminal-only / internal events — not broadcast to external consumers
         AppEvent::Key(_)

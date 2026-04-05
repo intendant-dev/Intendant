@@ -20,11 +20,12 @@
 //! - `latest_frame`: always overwritten, latest-wins.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -134,6 +135,111 @@ pub struct IceServer {
 
 pub type PeerId = u64;
 
+// ---------------------------------------------------------------------------
+// Display metrics (atomic counters for the hot path)
+// ---------------------------------------------------------------------------
+
+/// Atomic counters embedded in the capture/encode/fan-out pipeline.
+///
+/// All counters are updated with `Relaxed` ordering -- they are advisory
+/// telemetry, not synchronisation primitives.  Rate computation happens in
+/// `DisplayMetricsSnapshot::from_counters()`, never on the hot path.
+pub struct DisplayMetricsCounters {
+    /// Total raw frames received from the capture backend.
+    pub capture_frames: AtomicU64,
+    /// Frames dropped at the broadcast send (no subscribers or lagging).
+    pub capture_drops: AtomicU64,
+
+    /// Total frames successfully VP8-encoded.
+    pub encode_frames: AtomicU64,
+    /// I420 buffers dropped by try_send to the encoder thread.
+    pub encode_drops: AtomicU64,
+    /// Cumulative encode latency in microseconds (capture-to-encoded-output).
+    pub encode_latency_us_sum: AtomicU64,
+
+    /// Total per-peer try_send failures in the fan-out task.
+    pub peer_drops: AtomicU64,
+    /// Current number of connected WebRTC peers.
+    pub peer_count: AtomicU64,
+
+    /// Monotonic microsecond timestamp of the last metrics reset.
+    pub epoch_us: AtomicU64,
+}
+
+impl DisplayMetricsCounters {
+    pub fn new() -> Self {
+        let now_us = Instant::now().elapsed().as_micros() as u64;
+        Self {
+            capture_frames: AtomicU64::new(0),
+            capture_drops: AtomicU64::new(0),
+            encode_frames: AtomicU64::new(0),
+            encode_drops: AtomicU64::new(0),
+            encode_latency_us_sum: AtomicU64::new(0),
+            peer_drops: AtomicU64::new(0),
+            peer_count: AtomicU64::new(0),
+            epoch_us: AtomicU64::new(now_us),
+        }
+    }
+}
+
+/// A point-in-time snapshot of display pipeline metrics, suitable for
+/// serialisation and logging.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayMetricsSnapshot {
+    pub display_id: u32,
+    pub capture_fps: f64,
+    pub capture_drops: u64,
+    pub encode_fps: f64,
+    pub encode_latency_avg_ms: f64,
+    pub encode_drops: u64,
+    pub peer_count: u64,
+    pub peer_drops: u64,
+    pub resolution: (u32, u32),
+}
+
+impl DisplayMetricsSnapshot {
+    /// Read the atomic counters and compute rates over the elapsed window.
+    /// Resets counters after reading so the next call covers a fresh window.
+    pub fn from_counters(
+        counters: &DisplayMetricsCounters,
+        display_id: u32,
+        resolution: (u32, u32),
+        elapsed: &Instant,
+    ) -> Self {
+        let capture_frames = counters.capture_frames.swap(0, Ordering::Relaxed);
+        let capture_drops = counters.capture_drops.swap(0, Ordering::Relaxed);
+        let encode_frames = counters.encode_frames.swap(0, Ordering::Relaxed);
+        let encode_drops = counters.encode_drops.swap(0, Ordering::Relaxed);
+        let encode_latency_us = counters.encode_latency_us_sum.swap(0, Ordering::Relaxed);
+        let peer_drops = counters.peer_drops.swap(0, Ordering::Relaxed);
+        let peer_count = counters.peer_count.load(Ordering::Relaxed);
+
+        let elapsed_secs = elapsed.elapsed().as_secs_f64().max(0.001);
+
+        let encode_latency_avg_ms = if encode_frames > 0 {
+            (encode_latency_us as f64 / encode_frames as f64) / 1000.0
+        } else {
+            0.0
+        };
+
+        Self {
+            display_id,
+            capture_fps: capture_frames as f64 / elapsed_secs,
+            capture_drops,
+            encode_fps: encode_frames as f64 / elapsed_secs,
+            encode_latency_avg_ms,
+            encode_drops,
+            peer_count,
+            peer_drops,
+            resolution,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Display backend trait
+// ---------------------------------------------------------------------------
+
 /// Platform-specific display capture and input injection.
 #[async_trait]
 pub trait DisplayBackend: Send + Sync + 'static {
@@ -171,6 +277,9 @@ pub struct DisplaySession {
     encoder_handle: Mutex<Option<JoinHandle<()>>>,
     capture_handle: Mutex<Option<JoinHandle<()>>>,
     shutdown: CancellationToken,
+    counters: Arc<DisplayMetricsCounters>,
+    /// Instant used as the epoch for rate computations.
+    metrics_epoch: Mutex<Instant>,
 }
 
 impl DisplaySession {
@@ -186,6 +295,8 @@ impl DisplaySession {
             encoder_handle: Mutex::new(None),
             capture_handle: Mutex::new(None),
             shutdown: CancellationToken::new(),
+            counters: Arc::new(DisplayMetricsCounters::new()),
+            metrics_epoch: Mutex::new(Instant::now()),
         }
     }
 
@@ -212,6 +323,7 @@ impl DisplaySession {
         let frame_tx = self.frame_tx.clone();
         let latest = Arc::clone(&self.latest_frame);
         let shutdown = self.shutdown.clone();
+        let cap_counters = Arc::clone(&self.counters);
 
         let capture_handle = tokio::spawn(async move {
             loop {
@@ -219,9 +331,13 @@ impl DisplaySession {
                     _ = shutdown.cancelled() => break,
                     frame = capture_rx.recv() => {
                         let Some(frame) = frame else { break };
+                        cap_counters.capture_frames.fetch_add(1, Ordering::Relaxed);
                         let arc_frame = Arc::new(frame);
                         *latest.write().await = Some(Arc::clone(&arc_frame));
-                        let _ = frame_tx.send(arc_frame);
+                        // If no subscribers, the send fails -- count as a drop.
+                        if frame_tx.send(arc_frame).is_err() {
+                            cap_counters.capture_drops.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -235,9 +351,13 @@ impl DisplaySession {
 
             let duration_ms = if fps > 0 { 1000 / fps as u64 } else { 33 };
 
-            let (i420_tx, i420_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+            // Channel carries (i420_data, arrival_instant) so the encoder
+            // thread can measure end-to-end latency.
+            let (i420_tx, i420_rx) =
+                std::sync::mpsc::sync_channel::<(Vec<u8>, Instant)>(4);
             let (efr_tx, mut efr_rx) = mpsc::channel::<Arc<EncodedFrame>>(16);
 
+            let enc_counters = Arc::clone(&self.counters);
             let encoder_shutdown = self.shutdown.clone();
             std::thread::spawn(move || {
                 let mut encoder = match encode::Vp8Encoder::new(width, height, 2000) {
@@ -247,12 +367,17 @@ impl DisplaySession {
                         return;
                     }
                 };
-                while let Ok(i420) = i420_rx.recv() {
+                while let Ok((i420, arrived)) = i420_rx.recv() {
                     if encoder_shutdown.is_cancelled() {
                         break;
                     }
                     if let Ok(packets) = encoder.encode(&i420, duration_ms) {
+                        let latency_us = arrived.elapsed().as_micros() as u64;
                         for pkt in packets {
+                            enc_counters.encode_frames.fetch_add(1, Ordering::Relaxed);
+                            enc_counters
+                                .encode_latency_us_sum
+                                .fetch_add(latency_us, Ordering::Relaxed);
                             let ef = Arc::new(pkt.into_encoded_frame());
                             if efr_tx.blocking_send(ef).is_err() {
                                 return;
@@ -262,6 +387,7 @@ impl DisplaySession {
                 }
             });
 
+            let bridge_counters = Arc::clone(&self.counters);
             let shutdown_bridge = self.shutdown.clone();
             let frame_interval = std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
             let bridge_handle = tokio::spawn(async move {
@@ -279,6 +405,7 @@ impl DisplaySession {
                                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                                 Err(broadcast::error::RecvError::Closed) => break,
                             };
+                            let arrived = Instant::now();
                             let fd = frame.data.clone();
                             let fw = frame.width;
                             let fh = frame.height;
@@ -287,13 +414,18 @@ impl DisplaySession {
                                 encode::bgra_to_i420(&fd, fw, fh, fs)
                             }).await;
                             if let Ok(i420) = i420 {
-                                if i420_tx.try_send(i420).is_err() {}
+                                if i420_tx.try_send((i420, arrived)).is_err() {
+                                    bridge_counters
+                                        .encode_drops
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
                 }
             });
 
+            let fanout_counters = Arc::clone(&self.counters);
             let shutdown_fanout = self.shutdown.clone();
             let encoder_handle = tokio::spawn(async move {
                 loop {
@@ -303,7 +435,11 @@ impl DisplaySession {
                             let Some(ef) = ef else { break };
                             let peers_guard = peers.read().await;
                             for peer in peers_guard.values() {
-                                let _ = peer.encoded_frame_tx().try_send(Arc::clone(&ef));
+                                if peer.encoded_frame_tx().try_send(Arc::clone(&ef)).is_err() {
+                                    fanout_counters
+                                        .peer_drops
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
@@ -391,6 +527,60 @@ impl DisplaySession {
         }
 
         Ok(())
+    }
+
+    /// Read the current metrics snapshot and reset the rate counters.
+    ///
+    /// The returned snapshot covers the window since the last call to
+    /// `metrics()` (or since `start()` if this is the first call).
+    pub async fn metrics(&self) -> DisplayMetricsSnapshot {
+        let mut epoch = self.metrics_epoch.lock().await;
+        let snap = DisplayMetricsSnapshot::from_counters(
+            &self.counters,
+            self.display_id,
+            self.backend.resolution(),
+            &epoch,
+        );
+        *epoch = Instant::now();
+        snap
+    }
+
+    /// Spawn a background task that logs a one-line metrics summary every 30s.
+    ///
+    /// The task runs until the session's shutdown token is cancelled.
+    /// Returns the join handle so callers can await it if desired, but
+    /// typically the shutdown token handles cleanup.
+    pub fn spawn_metrics_logger(self: &Arc<Self>) -> JoinHandle<()> {
+        let session = Arc::clone(self);
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(30));
+            // Skip the immediate first tick.
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = interval.tick() => {
+                        let m = session.metrics().await;
+                        eprintln!(
+                            "[display/metrics] id={} capture={:.1}fps encode={:.1}fps \
+                             drops=cap:{}/enc:{}/peer:{} peers={} latency_avg={:.1}ms res={}x{}",
+                            m.display_id,
+                            m.capture_fps,
+                            m.encode_fps,
+                            m.capture_drops,
+                            m.encode_drops,
+                            m.peer_drops,
+                            m.peer_count,
+                            m.encode_latency_avg_ms,
+                            m.resolution.0,
+                            m.resolution.1,
+                        );
+                    }
+                }
+            }
+        })
     }
 
     /// Stop capture, cancel all tasks, and close all peers.
@@ -500,6 +690,7 @@ impl DisplaySession {
                 .await?;
 
         self.peers.write().await.insert(peer_id, Arc::new(peer));
+        self.counters.peer_count.fetch_add(1, Ordering::Relaxed);
         Ok(answer_sdp)
     }
 
@@ -519,6 +710,7 @@ impl DisplaySession {
     /// Remove and close a peer.
     pub async fn remove_peer(&self, peer_id: PeerId) {
         if let Some(peer) = self.peers.write().await.remove(&peer_id) {
+            self.counters.peer_count.fetch_sub(1, Ordering::Relaxed);
             peer.close().await;
         }
     }
@@ -728,5 +920,83 @@ mod tests {
         assert_eq!(config.ice_servers.len(), 1);
         assert_eq!(config.ice_servers[0].urls[0], "stun:stun.l.google.com:19302");
         assert!(config.ice_servers[0].username.is_none());
+    }
+
+    #[test]
+    fn metrics_counters_init_zeroed() {
+        let c = DisplayMetricsCounters::new();
+        assert_eq!(c.capture_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(c.capture_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(c.encode_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(c.encode_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(c.encode_latency_us_sum.load(Ordering::Relaxed), 0);
+        assert_eq!(c.peer_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(c.peer_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn metrics_snapshot_computes_rates() {
+        let c = DisplayMetricsCounters::new();
+        // Simulate 150 captured frames, 2 drops, 140 encoded, 1 encode drop,
+        // 3 peer drops over the window.
+        c.capture_frames.store(150, Ordering::Relaxed);
+        c.capture_drops.store(2, Ordering::Relaxed);
+        c.encode_frames.store(140, Ordering::Relaxed);
+        c.encode_drops.store(1, Ordering::Relaxed);
+        // 140 frames * 5000us avg = 700_000us total
+        c.encode_latency_us_sum.store(700_000, Ordering::Relaxed);
+        c.peer_drops.store(3, Ordering::Relaxed);
+        c.peer_count.store(2, Ordering::Relaxed);
+
+        // Pretend the window started 5 seconds ago.
+        let epoch = Instant::now() - std::time::Duration::from_secs(5);
+        let snap = DisplayMetricsSnapshot::from_counters(&c, 99, (1920, 1080), &epoch);
+
+        assert_eq!(snap.display_id, 99);
+        assert_eq!(snap.resolution, (1920, 1080));
+        // ~30 fps capture (150 / 5s)
+        assert!((snap.capture_fps - 30.0).abs() < 1.0);
+        assert_eq!(snap.capture_drops, 2);
+        // ~28 fps encode (140 / 5s)
+        assert!((snap.encode_fps - 28.0).abs() < 1.0);
+        assert_eq!(snap.encode_drops, 1);
+        // 700_000us / 140 frames = 5000us = 5.0ms avg
+        assert!((snap.encode_latency_avg_ms - 5.0).abs() < 0.01);
+        assert_eq!(snap.peer_count, 2);
+        assert_eq!(snap.peer_drops, 3);
+
+        // Counters should be reset after snapshot (except peer_count which is gauge).
+        assert_eq!(c.capture_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(c.encode_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(c.peer_count.load(Ordering::Relaxed), 2); // gauge, not reset
+    }
+
+    #[test]
+    fn metrics_snapshot_zero_frames() {
+        let c = DisplayMetricsCounters::new();
+        let epoch = Instant::now() - std::time::Duration::from_secs(5);
+        let snap = DisplayMetricsSnapshot::from_counters(&c, 0, (640, 480), &epoch);
+        assert!((snap.capture_fps - 0.0).abs() < f64::EPSILON);
+        assert!((snap.encode_fps - 0.0).abs() < f64::EPSILON);
+        assert!((snap.encode_latency_avg_ms - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn metrics_snapshot_serializes() {
+        let snap = DisplayMetricsSnapshot {
+            display_id: 1,
+            capture_fps: 30.0,
+            capture_drops: 5,
+            encode_fps: 28.5,
+            encode_latency_avg_ms: 4.2,
+            encode_drops: 2,
+            peer_count: 1,
+            peer_drops: 0,
+            resolution: (1920, 1080),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"display_id\":1"));
+        assert!(json.contains("\"capture_fps\":30.0"));
+        assert!(json.contains("\"encode_drops\":2"));
     }
 }

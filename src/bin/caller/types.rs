@@ -291,6 +291,19 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         turn: Option<usize>,
     },
+    /// Display transport pipeline metrics snapshot.
+    DisplayMetrics {
+        display_id: u32,
+        capture_fps: f64,
+        capture_drops: u64,
+        encode_fps: f64,
+        encode_latency_avg_ms: f64,
+        encode_drops: u64,
+        peer_count: u64,
+        peer_drops: u64,
+        resolution_width: u32,
+        resolution_height: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
