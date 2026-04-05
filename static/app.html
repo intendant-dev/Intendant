@@ -3956,6 +3956,11 @@ class DisplaySlot {
     const config = { iceServers: [] };
     this.pc = new RTCPeerConnection(config);
 
+    // Add a recvonly video transceiver so the SDP offer includes a video
+    // media section. Without this, the server can't attach its video track
+    // because the answerer can't introduce new media lines.
+    this.pc.addTransceiver('video', { direction: 'recvonly' });
+
     // Create data channels BEFORE offer (browser is the offerer)
     this.controlChannel = this.pc.createDataChannel('control', { ordered: true });
     this.pointerChannel = this.pc.createDataChannel('pointer', {
