@@ -1635,7 +1635,8 @@ async fn handle_control_command_mcp(
             emit_control_result(control_tx, "list_displays", true, json, None);
             None
         }
-        ControlMsg::RevokeUserDisplay { note } => {
+        ControlMsg::RevokeUserDisplay { display_id, note } => {
+            let did = display_id.unwrap_or(0);
             {
                 let s = state.read().await;
                 let autonomy = s.autonomy.clone();
@@ -1644,8 +1645,8 @@ async fn handle_control_command_mcp(
                 a.user_display_granted = false;
             }
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
-            bus.send(AppEvent::UserDisplayRevoked { note: note.clone() });
-            emit_control_result(control_tx, "revoke_user_display", true, "User display access revoked".to_string(), None);
+            bus.send(AppEvent::UserDisplayRevoked { display_id: did, note: note.clone() });
+            emit_control_result(control_tx, "revoke_user_display", true, format!("User display access revoked (display_id: {})", did), None);
             Some(RESOURCE_LOGS_URI)
         }
         ControlMsg::InvokeSkill { skill_name, arguments } => {
@@ -2026,9 +2027,10 @@ pub fn spawn_event_listener(
                         resource_changed = Some("intendant://logs");
                     }
 
-                    AppEvent::UserDisplayRevoked { ref note } => {
+                    AppEvent::UserDisplayRevoked { display_id, ref note } => {
                         let msg = format!(
-                            "User display access revoked{}",
+                            "User display access revoked (display_id: {}){}",
+                            display_id,
                             note.as_ref()
                                 .map(|n| format!(". Note: {}", n))
                                 .unwrap_or_default()

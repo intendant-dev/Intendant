@@ -1218,10 +1218,14 @@ pub fn spawn_web_gateway(
                             }
                         }
                         // Evict display_ready cache when display is revoked.
-                        if line.contains("\"event\":\"user_display_revoked\"") {
-                            if let Ok(mut guard) = display_cache.lock() {
-                                // User display is always id 0.
-                                guard.remove(&0);
+                        if line.contains("\"event\":\"user_display_revoked\"")
+                            || line.contains("\"event\":\"display_capture_lost\"")
+                        {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
+                                let did = parsed["display_id"].as_u64().unwrap_or(0) as u32;
+                                if let Ok(mut guard) = display_cache.lock() {
+                                    guard.remove(&did);
+                                }
                             }
                         }
                         if line.contains("\"event\":\"usage_update\"")

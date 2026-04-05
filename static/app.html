@@ -3225,7 +3225,17 @@ async function main() {
         setUserDisplayState(true);
       } else if (d.event === 'user_display_revoked') {
         setUserDisplayState(false);
-        removeDisplaySlot(0);
+        removeDisplaySlot(Number(d.display_id || 0));
+      }
+      // Handle display capture lost — disconnect but keep slot for possible re-grant
+      if (d.event === 'display_capture_lost') {
+        const id = Number(d.display_id || 0);
+        const slot = displaySlots.get(id);
+        if (slot) {
+          slot.disconnect();
+          slot.statusEl.textContent = 'Display lost: ' + (d.reason || 'capture ended');
+          slot.statusEl.className = 'display-status error';
+        }
       }
       // Track recording state on display slots
       if (d.event === 'recording_started' && d.stream_name) {

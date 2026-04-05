@@ -4189,8 +4189,8 @@ pub fn spawn_user_display_listener(
                 Ok(AppEvent::UserDisplayGranted { display_id }) => {
                     activate_user_display(&bus, &session_registry, frame_registry.clone(), display_id).await;
                 }
-                Ok(AppEvent::UserDisplayRevoked { .. }) => {
-                    deactivate_user_display(&session_registry).await;
+                Ok(AppEvent::UserDisplayRevoked { display_id, .. }) => {
+                    deactivate_user_display(&session_registry, display_id).await;
                 }
                 Ok(AppEvent::DisplayCaptureLost { display_id, ref reason }) => {
                     // Capture backend stopped unexpectedly (portal session
@@ -4211,10 +4211,8 @@ pub fn spawn_user_display_listener(
     })
 }
 
-/// Tear down all user display sessions on revoke.
-async fn deactivate_user_display(session_registry: &display::SharedSessionRegistry) {
-    // Remove display_id 0 (the default user session slot).
-    let display_id: u32 = 0;
+/// Tear down a user display session on revoke.
+async fn deactivate_user_display(session_registry: &display::SharedSessionRegistry, display_id: u32) {
     if let Some(session) = session_registry.write().await.remove(display_id) {
         eprintln!("[user_display] Stopping display session for :{}", display_id);
         session.stop().await;
