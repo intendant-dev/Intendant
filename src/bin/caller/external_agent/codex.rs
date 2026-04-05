@@ -89,7 +89,6 @@ pub struct CodexAgent {
     next_id: AtomicU64,
     pending_requests: PendingRequests,
     pending_approvals: PendingApprovals,
-    approval_counter: AtomicU64,
     reader_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -111,7 +110,6 @@ impl CodexAgent {
             next_id: AtomicU64::new(1),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
-            approval_counter: AtomicU64::new(1),
             reader_handle: None,
         }
     }
@@ -478,7 +476,7 @@ impl ExternalAgent for CodexAgent {
             .current_dir(&config.working_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
             .spawn()
             .map_err(|e| {
                 CallerError::ExternalAgent(format!(
@@ -503,12 +501,7 @@ impl ExternalAgent for CodexAgent {
         // Spawn reader task
         let pending_requests = Arc::clone(&self.pending_requests);
         let pending_approvals = Arc::clone(&self.pending_approvals);
-        // Share the counter via an Arc so the reader can allocate approval ids.
         let approval_counter = Arc::new(AtomicU64::new(1));
-        // Keep our local counter in sync (the reader owns it from here).
-        // We don't read approval_counter from CodexAgent after this point;
-        // resolve_approval uses pending_approvals which is keyed by string id.
-        let _ = &self.approval_counter; // suppress unused warning intent
 
         let handle = tokio::spawn(reader_task(
             stdout,
@@ -646,6 +639,18 @@ impl ExternalAgent for CodexAgent {
         self.child = None;
 
         Ok(())
+    }
+}
+
+impl Drop for CodexAgent {
+    fn drop(&mut self) {
+        // Kill the child process synchronously to prevent orphans.
+        if let Some(ref mut child) = self.child {
+            let _ = child.start_kill();
+        }
+        if let Some(handle) = self.reader_handle.take() {
+            handle.abort();
+        }
     }
 }
 

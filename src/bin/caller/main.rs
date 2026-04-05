@@ -3965,30 +3965,29 @@ async fn run_external_agent_mode(
         println!("---");
     }
 
-    // Construct the agent based on backend
-    let mut agent: Box<dyn external_agent::ExternalAgent> = match &backend {
+    // Construct the agent and its config based on backend
+    let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match &backend {
         AgentBackend::Codex => {
             let cfg = &project.config.agent.codex;
-            Box::new(external_agent::codex::CodexAgent::new(
+            let agent = Box::new(external_agent::codex::CodexAgent::new(
                 cfg.command.clone(),
                 cfg.model.clone(),
                 cfg.approval_policy.clone(),
                 cfg.sandbox != "dangerFullAccess",
-            ))
+            ));
+            let config = AgentConfig {
+                model: cfg.model.clone(),
+                working_dir: project.root.clone(),
+                approval_policy: cfg.approval_policy.clone(),
+                sandbox: cfg.sandbox != "dangerFullAccess",
+            };
+            (agent, config)
         }
         AgentBackend::ClaudeCode => {
             return Err(CallerError::ExternalAgent(
                 "Claude Code backend not yet implemented".into(),
             ));
         }
-    };
-
-    // Initialize and get event stream
-    let config = AgentConfig {
-        model: project.config.agent.codex.model.clone(),
-        working_dir: project.root.clone(),
-        approval_policy: project.config.agent.codex.approval_policy.clone(),
-        sandbox: project.config.agent.codex.sandbox != "dangerFullAccess",
     };
     let mut event_rx = agent.initialize(config).await?;
     slog(&session_log, |l| l.info("External agent initialized"));

@@ -221,61 +221,6 @@ pub struct ProjectConfig {
     pub live_audio: LiveAudioConfig,
     #[serde(default)]
     pub webrtc: WebRtcConfig,
-    #[serde(default)]
-    pub agent: ExternalAgentConfig,
-}
-
-/// External agent backend configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ExternalAgentConfig {
-    /// Default backend when --agent is not specified (e.g. "codex", "claude-code").
-    #[serde(default)]
-    pub default_backend: Option<String>,
-    #[serde(default)]
-    pub codex: CodexConfig,
-    #[serde(default)]
-    pub claude_code: ClaudeCodeConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CodexConfig {
-    #[serde(default = "default_codex_command")]
-    pub command: String,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default = "default_codex_approval_policy")]
-    pub approval_policy: String,
-    #[serde(default = "default_codex_sandbox")]
-    pub sandbox: String,
-}
-
-fn default_codex_command() -> String {
-    "codex".to_string()
-}
-fn default_codex_approval_policy() -> String {
-    "onRequest".to_string()
-}
-fn default_codex_sandbox() -> String {
-    "workspaceWrite".to_string()
-}
-
-impl Default for CodexConfig {
-    fn default() -> Self {
-        Self {
-            command: default_codex_command(),
-            model: None,
-            approval_policy: default_codex_approval_policy(),
-            sandbox: default_codex_sandbox(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ClaudeCodeConfig {
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
 }
 
 /// Recording configuration in intendant.toml.
