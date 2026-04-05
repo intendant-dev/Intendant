@@ -40,6 +40,7 @@ RESOURCES="$CONTENTS/Resources"
 LS=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 while IFS= read -r stale_path; do
     # Skip our own target — only unregister OTHER copies
     if [ "$stale_path" != "$PROJECT_ROOT/$APP" ]; then
