@@ -3232,6 +3232,7 @@ async fn run_with_presence(
     frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     context_injection: event::ContextInjectionQueue,
     session_registry: display::SharedSessionRegistry,
+    agent_backend_override: Option<external_agent::AgentBackend>,
 ) -> Result<LoopStats, CallerError> {
     // 1. Create presence provider (small/fast model)
     let presence_provider = provider::select_presence_provider(
@@ -3340,10 +3341,20 @@ async fn run_with_presence(
     let mut cumulative_stats = LoopStats::default();
     let project_root = project.root.clone();
 
+    // Resolve external agent backend: CLI override > config default > None.
+    let agent_backend = agent_backend_override.or_else(|| {
+        project.config.agent.default_backend.as_ref()
+            .and_then(|s| external_agent::AgentBackend::from_str_loose(s))
+    });
+
     // Conversation, provider, project — created on first task, reused thereafter.
     let mut persistent_conv: Option<Conversation> = None;
     let mut persistent_provider: Option<Box<dyn provider::ChatProvider>> = None;
     let mut persistent_project: Option<Project> = None;
+    // External agent + thread — created on first task, reused for subsequent messages.
+    let mut persistent_agent: Option<Box<dyn external_agent::ExternalAgent>> = None;
+    let mut persistent_thread: Option<external_agent::AgentThread> = None;
+    let mut persistent_event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>> = None;
 
     while let Some(envelope) = task_rx.recv().await {
         slog(&session_log, |l| {
@@ -3414,136 +3425,301 @@ async fn run_with_presence(
         // ── Regular agent path (for escalated or non-CU tasks) ──
         let task_text = task_for_agent.unwrap_or_else(|| envelope.task.clone());
 
-        if persistent_conv.is_none() {
-            // ── First task: full initialization ──
-            let proj = match Project::from_root(project_root.clone()) {
-                Ok(p) => p,
-                Err(e) => {
-                    bus.send(AppEvent::PresenceLog {
-                        message: format!("Project error: {}", e),
-                        level: Some(types::LogLevel::Error),
-                        turn: None,
-                    });
-                    continue;
-                }
-            };
-
-            // CU tasks are handled by the ephemeral path above; this is the
-            // persistent conversation path for regular coding tasks.
-            let task_provider = match provider::select_provider() {
-                Ok(p) => p,
-                Err(e) => {
-                    bus.send(AppEvent::PresenceLog {
-                        message: format!("Provider error: {}", e),
-                        level: Some(types::LogLevel::Error),
-                        turn: None,
-                    });
-                    continue;
-                }
-            };
-
-            slog(&session_log, |l| {
-                l.info(&format!(
-                    "Mode: direct (provider: {}, context: {})",
-                    task_provider.name(), task_provider.context_window()
-                ));
-            });
-
-            let role = sub_agent::SubAgentRole::Custom("direct".to_string());
-            let system_prompt = if task_provider.use_tools() {
-                prompts::resolve_system_prompt_for_tools(&role, Some(&proj.root))?
-            } else {
-                prompts::resolve_system_prompt(&role, Some(&proj.root))?
-            };
-
-            let mut conv = Conversation::new(system_prompt, task_provider.context_window());
-            setup_fresh_conversation_no_task(&mut conv, &proj);
-
-            // Frame directory awareness
-            let frames_dir = log_dir.join("frames");
-            conv.add_user(format!(
-                "[System] Video frames from the user's camera are stored at: {}\n\
-                 Each frame is a JPEG named by frame ID (e.g., cam0-f00001.jpg).\n\
-                 When you receive frame references, you can read them from this path.",
-                frames_dir.display()
-            ));
-            conv.add_assistant("Understood.".to_string());
-
-            // Add task with optional frame images
-            if frame_images.is_empty() {
-                conv.add_user(task_text.clone());
-            } else {
-                conv.add_user_with_images(task_text.clone(), frame_images);
+        if let Some(ref backend) = agent_backend {
+            // ── External agent path ──
+            // The external agent manages its own conversation; we keep the
+            // agent + thread alive across tasks dispatched by presence.
+            if persistent_agent.is_none() {
+                use external_agent::{AgentBackend, AgentConfig};
+                let proj = match Project::from_root(project_root.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        bus.send(AppEvent::PresenceLog {
+                            message: format!("Project error: {}", e),
+                            level: Some(types::LogLevel::Error),
+                            turn: None,
+                        });
+                        continue;
+                    }
+                };
+                let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend {
+                    AgentBackend::Codex => {
+                        let cfg = &proj.config.agent.codex;
+                        let agent = Box::new(external_agent::codex::CodexAgent::new(
+                            cfg.command.clone(), cfg.model.clone(),
+                            cfg.approval_policy.clone(), cfg.sandbox != "dangerFullAccess",
+                        ));
+                        let config = AgentConfig {
+                            model: cfg.model.clone(),
+                            working_dir: proj.root.clone(),
+                            approval_policy: cfg.approval_policy.clone(),
+                            sandbox: cfg.sandbox != "dangerFullAccess",
+                        };
+                        (agent, config)
+                    }
+                    AgentBackend::ClaudeCode => {
+                        bus.send(AppEvent::PresenceLog {
+                            message: "Claude Code backend not yet implemented".into(),
+                            level: Some(types::LogLevel::Error), turn: None,
+                        });
+                        continue;
+                    }
+                };
+                let event_rx = match agent.initialize(config).await {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        bus.send(AppEvent::PresenceLog {
+                            message: format!("External agent init error: {}", e),
+                            level: Some(types::LogLevel::Error), turn: None,
+                        });
+                        continue;
+                    }
+                };
+                let thread = match agent.start_thread().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        bus.send(AppEvent::PresenceLog {
+                            message: format!("External agent thread error: {}", e),
+                            level: Some(types::LogLevel::Error), turn: None,
+                        });
+                        continue;
+                    }
+                };
+                slog(&session_log, |l| l.info(&format!(
+                    "Mode: external agent ({}) via presence, thread: {}",
+                    backend, thread.thread_id
+                )));
+                persistent_agent = Some(agent);
+                persistent_thread = Some(thread);
+                persistent_event_rx = Some(event_rx);
             }
 
-            persistent_project = Some(proj);
-            persistent_provider = Some(task_provider);
-            persistent_conv = Some(conv);
-        } else {
-            // ── Subsequent task: inject into existing conversation ──
-            let conv = persistent_conv.as_mut().unwrap();
+            // Send the task as a new turn in the existing thread
+            let agent = persistent_agent.as_mut().unwrap();
+            let thread = persistent_thread.as_ref().unwrap();
+            if let Err(e) = agent.send_message(thread, &task_text).await {
+                bus.send(AppEvent::PresenceLog {
+                    message: format!("External agent send error: {}", e),
+                    level: Some(types::LogLevel::Error), turn: None,
+                });
+                continue;
+            }
 
-            // If the previous round exited with dangling tool calls (e.g. the
-            // agent loop returned due to denial, error, or budget exhaustion
-            // after the assistant message was recorded but before tool results
-            // were added), resolve them now.  Without this, the API will reject
-            // the conversation with "No tool output found for function call …".
-            let resolved = conv.resolve_dangling_tool_calls();
-            if resolved > 0 {
+            // Drain events until this turn completes
+            let event_rx = persistent_event_rx.as_mut().unwrap();
+            loop {
+                match event_rx.recv().await {
+                    Some(external_agent::AgentEvent::TurnCompleted { .. }) => {
+                        cumulative_stats.turns += 1;
+                        cumulative_stats.rounds += 1;
+                        break;
+                    }
+                    Some(external_agent::AgentEvent::MessageDelta { text }) => {
+                        bus.send(AppEvent::ModelResponseDelta { text });
+                    }
+                    Some(external_agent::AgentEvent::ToolStarted { preview, tool_name, .. }) => {
+                        bus.send(AppEvent::AgentStarted {
+                            turn: cumulative_stats.turns + 1,
+                            commands_preview: format!("{}: {}", tool_name, preview),
+                        });
+                    }
+                    Some(external_agent::AgentEvent::ToolOutputDelta { text, .. }) => {
+                        bus.send(AppEvent::AgentOutput { stdout: text, stderr: String::new() });
+                    }
+                    Some(external_agent::AgentEvent::ApprovalRequest { request_id, command, category }) => {
+                        let cat = match category {
+                            external_agent::ApprovalCategory::CommandExecution => autonomy::ActionCategory::CommandExec,
+                            external_agent::ApprovalCategory::FileChange => autonomy::ActionCategory::FileWrite,
+                        };
+                        let needs = { autonomy.read().await.needs_approval(cat) };
+                        if !needs {
+                            bus.send(AppEvent::AutoApproved { preview: command });
+                            let _ = agent.resolve_approval(&request_id, external_agent::ApprovalDecision::Accept).await;
+                        } else {
+                            let id = cumulative_stats.turns as u64 * 1000 + 1;
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            { approval_registry.lock().unwrap().insert(id, tx); }
+                            bus.send(AppEvent::ApprovalRequired { id, command_preview: command, category: cat });
+                            let decision = match rx.await {
+                                Ok(event::ApprovalResponse::Approve) => external_agent::ApprovalDecision::Accept,
+                                Ok(event::ApprovalResponse::ApproveAll) => external_agent::ApprovalDecision::AcceptForSession,
+                                Ok(event::ApprovalResponse::Deny) => external_agent::ApprovalDecision::Decline,
+                                Ok(event::ApprovalResponse::Skip) | Err(_) => external_agent::ApprovalDecision::Cancel,
+                            };
+                            let _ = agent.resolve_approval(&request_id, decision).await;
+                        }
+                    }
+                    Some(external_agent::AgentEvent::FileApprovalRequest { request_id, path, .. }) => {
+                        let needs = { autonomy.read().await.needs_approval(autonomy::ActionCategory::FileWrite) };
+                        if !needs {
+                            bus.send(AppEvent::AutoApproved { preview: format!("file change: {}", path) });
+                            let _ = agent.resolve_approval(&request_id, external_agent::ApprovalDecision::Accept).await;
+                        } else {
+                            let id = cumulative_stats.turns as u64 * 1000 + 2;
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            { approval_registry.lock().unwrap().insert(id, tx); }
+                            bus.send(AppEvent::ApprovalRequired {
+                                id, command_preview: format!("file change: {}", path),
+                                category: autonomy::ActionCategory::FileWrite,
+                            });
+                            let decision = match rx.await {
+                                Ok(event::ApprovalResponse::Approve) => external_agent::ApprovalDecision::Accept,
+                                Ok(event::ApprovalResponse::ApproveAll) => external_agent::ApprovalDecision::AcceptForSession,
+                                Ok(event::ApprovalResponse::Deny) => external_agent::ApprovalDecision::Decline,
+                                Ok(event::ApprovalResponse::Skip) | Err(_) => external_agent::ApprovalDecision::Cancel,
+                            };
+                            let _ = agent.resolve_approval(&request_id, decision).await;
+                        }
+                    }
+                    Some(external_agent::AgentEvent::Terminated { reason, .. }) => {
+                        bus.send(AppEvent::PresenceLog {
+                            message: format!("External agent terminated: {}", reason),
+                            level: Some(types::LogLevel::Error), turn: None,
+                        });
+                        // Agent is gone — clear persistent state so next task re-initializes
+                        persistent_agent = None;
+                        persistent_thread = None;
+                        persistent_event_rx = None;
+                        break;
+                    }
+                    Some(_) => {} // other events (DiffUpdated, ToolCompleted, Message) — logged but not blocking
+                    None => {
+                        // Channel closed unexpectedly
+                        persistent_agent = None;
+                        persistent_thread = None;
+                        persistent_event_rx = None;
+                        break;
+                    }
+                }
+            }
+        } else {
+            // ── Native agent path ──
+            if persistent_conv.is_none() {
+                // ── First task: full initialization ──
+                let proj = match Project::from_root(project_root.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        bus.send(AppEvent::PresenceLog {
+                            message: format!("Project error: {}", e),
+                            level: Some(types::LogLevel::Error),
+                            turn: None,
+                        });
+                        continue;
+                    }
+                };
+
+                // CU tasks are handled by the ephemeral path above; this is the
+                // persistent conversation path for regular coding tasks.
+                let task_provider = match provider::select_provider() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        bus.send(AppEvent::PresenceLog {
+                            message: format!("Provider error: {}", e),
+                            level: Some(types::LogLevel::Error),
+                            turn: None,
+                        });
+                        continue;
+                    }
+                };
+
                 slog(&session_log, |l| {
                     l.info(&format!(
-                        "Resolved {} dangling tool call(s) from previous round",
-                        resolved
-                    ))
+                        "Mode: direct (provider: {}, context: {})",
+                        task_provider.name(), task_provider.context_window()
+                    ));
                 });
-            }
 
-            if frame_images.is_empty() {
-                conv.add_user(format!("[New Task] {}", task_text));
+                let role = sub_agent::SubAgentRole::Custom("direct".to_string());
+                let system_prompt = if task_provider.use_tools() {
+                    prompts::resolve_system_prompt_for_tools(&role, Some(&proj.root))?
+                } else {
+                    prompts::resolve_system_prompt(&role, Some(&proj.root))?
+                };
+
+                let mut conv = Conversation::new(system_prompt, task_provider.context_window());
+                setup_fresh_conversation_no_task(&mut conv, &proj);
+
+                // Frame directory awareness
+                let frames_dir = log_dir.join("frames");
+                conv.add_user(format!(
+                    "[System] Video frames from the user's camera are stored at: {}\n\
+                     Each frame is a JPEG named by frame ID (e.g., cam0-f00001.jpg).\n\
+                     When you receive frame references, you can read them from this path.",
+                    frames_dir.display()
+                ));
+                conv.add_assistant("Understood.".to_string());
+
+                // Add task with optional frame images
+                if frame_images.is_empty() {
+                    conv.add_user(task_text.clone());
+                } else {
+                    conv.add_user_with_images(task_text.clone(), frame_images);
+                }
+
+                persistent_project = Some(proj);
+                persistent_provider = Some(task_provider);
+                persistent_conv = Some(conv);
             } else {
-                conv.add_user_with_images(
-                    format!("[New Task] {}", task_text),
-                    frame_images,
-                );
+                // ── Subsequent task: inject into existing conversation ──
+                let conv = persistent_conv.as_mut().unwrap();
+
+                let resolved = conv.resolve_dangling_tool_calls();
+                if resolved > 0 {
+                    slog(&session_log, |l| {
+                        l.info(&format!(
+                            "Resolved {} dangling tool call(s) from previous round",
+                            resolved
+                        ))
+                    });
+                }
+
+                if frame_images.is_empty() {
+                    conv.add_user(format!("[New Task] {}", task_text));
+                } else {
+                    conv.add_user_with_images(
+                        format!("[New Task] {}", task_text),
+                        frame_images,
+                    );
+                }
             }
-        }
 
-        // Run one round (agent loop until done/budget/error)
-        let (follow_up_tx, mut follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
-        drop(follow_up_tx); // single-round per task dispatch
+            // Run one round (agent loop until done/budget/error)
+            let (follow_up_tx, mut follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+            drop(follow_up_tx); // single-round per task dispatch
 
-        let result = run_round_loop(
-            persistent_provider.as_ref().unwrap().as_ref(),
-            persistent_conv.as_mut().unwrap(),
-            persistent_project.as_ref().unwrap(),
-            None, // not sub-agent
-            &bus,
-            autonomy.clone(),
-            session_log.clone(),
-            &log_dir,
-            None, // no MCP
-            &mut follow_up_rx,
-            None, // no JSON approval
-            &approval_registry,
-            &context_injection, // shared with presence
-            false, // not headless
-        ).await;
+            let result = run_round_loop(
+                persistent_provider.as_ref().unwrap().as_ref(),
+                persistent_conv.as_mut().unwrap(),
+                persistent_project.as_ref().unwrap(),
+                None, // not sub-agent
+                &bus,
+                autonomy.clone(),
+                session_log.clone(),
+                &log_dir,
+                None, // no MCP
+                &mut follow_up_rx,
+                None, // no JSON approval
+                &approval_registry,
+                &context_injection, // shared with presence
+                false, // not headless
+            ).await;
 
-        match result {
-            Ok(stats) => {
-                cumulative_stats.turns += stats.turns;
-                cumulative_stats.rounds += stats.rounds;
-                cumulative_stats.usage.prompt_tokens += stats.usage.prompt_tokens;
-                cumulative_stats.usage.completion_tokens += stats.usage.completion_tokens;
-                cumulative_stats.usage.total_tokens += stats.usage.total_tokens;
-            }
-            Err(e) => {
-                // Log error but DON'T discard conversation — it persists
-                bus.send(AppEvent::PresenceLog {
-                    message: format!("Task error: {}", e),
-                    level: Some(types::LogLevel::Error),
-                    turn: None,
-                });
+            match result {
+                Ok(stats) => {
+                    cumulative_stats.turns += stats.turns;
+                    cumulative_stats.rounds += stats.rounds;
+                    cumulative_stats.usage.prompt_tokens += stats.usage.prompt_tokens;
+                    cumulative_stats.usage.completion_tokens += stats.usage.completion_tokens;
+                    cumulative_stats.usage.total_tokens += stats.usage.total_tokens;
+                }
+                Err(e) => {
+                    // Log error but DON'T discard conversation — it persists
+                    bus.send(AppEvent::PresenceLog {
+                        message: format!("Task error: {}", e),
+                        level: Some(types::LogLevel::Error),
+                        turn: None,
+                    });
+                }
             }
         }
     }
@@ -6039,6 +6215,7 @@ async fn main() -> Result<(), CallerError> {
                 }
             });
 
+            let agent_backend_for_presence = agent_backend.clone();
             tokio::spawn(async move {
                 let result = run_with_presence(
                     task,
@@ -6059,6 +6236,7 @@ async fn main() -> Result<(), CallerError> {
                     frame_registry.clone(),
                     context_injection_clone,
                     session_registry.clone(),
+                    agent_backend_for_presence,
                 )
                 .await;
 
