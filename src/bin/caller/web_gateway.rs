@@ -173,6 +173,10 @@ pub struct WebGatewayConfig {
     /// Whether server-side transcription is enabled (browser should send user_audio).
     #[serde(default)]
     pub transcription_enabled: bool,
+    /// ICE servers for WebRTC peer connections (STUN/TURN).
+    /// Empty by default (local-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ice_servers: Vec<crate::display::IceServer>,
 }
 
 impl Default for WebGatewayConfig {
@@ -183,6 +187,7 @@ impl Default for WebGatewayConfig {
             input_sample_rate: 16000,
             output_sample_rate: 24000,
             transcription_enabled: false,
+            ice_servers: Vec::new(),
         }
     }
 }
@@ -1169,6 +1174,11 @@ pub fn spawn_web_gateway(
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
+    // Pre-build ICE config for WebRTC display sessions from the gateway config.
+    let ice_config = crate::display::IceConfig {
+        ice_servers: config.ice_servers.clone(),
+    };
+
     // Inject content-hash version into WASM/JS URLs for cache-busting.
     let v = asset_version_hash();
     let session_provider = config.provider.clone();
@@ -1257,6 +1267,7 @@ pub fn spawn_web_gateway(
             let bus = bus.clone();
             let broadcast_tx = broadcast_tx.clone();
             let config_json = config_json.clone();
+            let ice_config = ice_config.clone();
             let shared_session = shared_session.clone();
             let voice_debug = voice_debug.clone();
             let session_provider = session_provider.clone();
@@ -2272,8 +2283,6 @@ pub fn spawn_web_gateway(
                                             if let Some(ref sr) = session_registry_inbound {
                                                 if let Some(session) = sr.read().await.get(display_id) {
                                                     let (ice_tx, mut ice_rx) = mpsc::channel::<(crate::display::PeerId, String)>(64);
-                                                    let ice_config = crate::display::IceConfig::default();
-
                                                     match session.handle_offer(peer_id, &sdp, &ice_config, ice_tx).await {
                                                         Ok(answer_sdp) => {
                                                             peer_display_ids.push(display_id);
@@ -3274,6 +3283,7 @@ pub fn build_config(
     live_provider: Option<&str>,
     live_model: Option<&str>,
     transcription_enabled: bool,
+    ice_servers: Vec<crate::display::IceServer>,
 ) -> WebGatewayConfig {
     // If an explicit provider is given, use it directly.
     if let Some(provider) = live_provider {
@@ -3292,6 +3302,7 @@ pub fn build_config(
             input_sample_rate: input_rate,
             output_sample_rate: output_rate,
             transcription_enabled,
+            ice_servers,
         };
     }
 
@@ -3304,6 +3315,7 @@ pub fn build_config(
                 input_sample_rate: 24000,
                 output_sample_rate: 24000,
                 transcription_enabled,
+                ice_servers,
             };
         }
         return WebGatewayConfig {
@@ -3312,6 +3324,7 @@ pub fn build_config(
             input_sample_rate: 16000,
             output_sample_rate: 24000,
             transcription_enabled,
+            ice_servers,
         };
     }
 
@@ -3323,10 +3336,12 @@ pub fn build_config(
             input_sample_rate: 24000,
             output_sample_rate: 24000,
             transcription_enabled,
+            ice_servers,
         }
     } else {
         let mut cfg = WebGatewayConfig::default();
         cfg.transcription_enabled = transcription_enabled;
+        cfg.ice_servers = ice_servers;
         cfg
     }
 }
@@ -3370,21 +3385,21 @@ mod tests {
 
     #[test]
     fn test_build_config_gemini_model() {
-        let config = build_config(None, Some("gemini-2.5-flash-native-audio-preview-12-2025"), false);
+        let config = build_config(None, Some("gemini-2.5-flash-native-audio-preview-12-2025"), false, Vec::new());
         assert_eq!(config.provider, "gemini");
         assert_eq!(config.input_sample_rate, 16000);
     }
 
     #[test]
     fn test_build_config_openai_model() {
-        let config = build_config(None, Some("gpt-4o-realtime-preview"), false);
+        let config = build_config(None, Some("gpt-4o-realtime-preview"), false, Vec::new());
         assert_eq!(config.provider, "openai");
         assert_eq!(config.input_sample_rate, 24000);
     }
 
     #[test]
     fn test_build_config_explicit_provider() {
-        let config = build_config(Some("openai"), None, false);
+        let config = build_config(Some("openai"), None, false, Vec::new());
         assert_eq!(config.provider, "openai");
         assert_eq!(config.model, "gpt-4o-realtime-preview");
     }
@@ -3393,7 +3408,7 @@ mod tests {
     fn test_build_config_no_model() {
         // With no model and no env vars set in a predictable way,
         // this should default to gemini
-        let config = build_config(None, None, false);
+        let config = build_config(None, None, false, Vec::new());
         // Either gemini or openai depending on env, but it shouldn't panic
         assert!(!config.provider.is_empty());
     }
@@ -3560,6 +3575,7 @@ mod tests {
             input_sample_rate: 24000,
             output_sample_rate: 24000,
             transcription_enabled: false,
+            ice_servers: Vec::new(),
         };
         let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

@@ -45,6 +45,43 @@ pub struct McpServerConfig {
     pub env: std::collections::HashMap<String, String>,
 }
 
+/// WebRTC configuration: ICE servers for STUN/TURN.
+/// Configured via `[webrtc]` in intendant.toml.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WebRtcConfig {
+    /// ICE servers (STUN/TURN) for WebRTC peer connections.
+    /// Empty by default (local-only, no STUN/TURN).
+    #[serde(default)]
+    pub ice_servers: Vec<WebRtcIceServerConfig>,
+}
+
+/// A single ICE server entry in intendant.toml `[webrtc]` configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebRtcIceServerConfig {
+    pub urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+}
+
+impl WebRtcConfig {
+    /// Convert to the display module's `IceConfig`.
+    pub fn to_ice_config(&self) -> crate::display::IceConfig {
+        crate::display::IceConfig {
+            ice_servers: self
+                .ice_servers
+                .iter()
+                .map(|s| crate::display::IceServer {
+                    urls: s.urls.clone(),
+                    username: s.username.clone(),
+                    credential: s.credential.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Computer use configuration: provider/model overrides for tasks that involve
 /// visual grounding (reference frames). Configured via `[computer_use]` in
 /// intendant.toml or `CU_PROVIDER`/`CU_MODEL` env vars.
@@ -92,6 +129,8 @@ pub struct ProjectConfig {
     pub computer_use: ComputerUseConfig,
     #[serde(default)]
     pub live_audio: LiveAudioConfig,
+    #[serde(default)]
+    pub webrtc: WebRtcConfig,
 }
 
 /// Recording configuration in intendant.toml.
@@ -566,5 +605,76 @@ max_retention_hours = 48
         assert_eq!(config.recording.quality, "high");
         assert_eq!(config.recording.max_retention_hours, Some(48));
         assert_eq!(config.recording.crf(), 20);
+    }
+
+    #[test]
+    fn parse_webrtc_config_defaults() {
+        let config: ProjectConfig = toml::from_str("").unwrap();
+        assert!(config.webrtc.ice_servers.is_empty());
+    }
+
+    #[test]
+    fn parse_webrtc_config_stun_only() {
+        let toml_str = r#"
+[webrtc]
+ice_servers = [
+    { urls = ["stun:stun.l.google.com:19302"] },
+]
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.webrtc.ice_servers.len(), 1);
+        assert_eq!(
+            config.webrtc.ice_servers[0].urls,
+            vec!["stun:stun.l.google.com:19302"]
+        );
+        assert!(config.webrtc.ice_servers[0].username.is_none());
+        assert!(config.webrtc.ice_servers[0].credential.is_none());
+    }
+
+    #[test]
+    fn parse_webrtc_config_stun_and_turn() {
+        let toml_str = r#"
+[webrtc]
+ice_servers = [
+    { urls = ["stun:stun.l.google.com:19302"] },
+    { urls = ["turn:turn.example.com:3478"], username = "user", credential = "pass" },
+]
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.webrtc.ice_servers.len(), 2);
+        assert_eq!(
+            config.webrtc.ice_servers[0].urls,
+            vec!["stun:stun.l.google.com:19302"]
+        );
+        assert_eq!(
+            config.webrtc.ice_servers[1].urls,
+            vec!["turn:turn.example.com:3478"]
+        );
+        assert_eq!(
+            config.webrtc.ice_servers[1].username.as_deref(),
+            Some("user")
+        );
+        assert_eq!(
+            config.webrtc.ice_servers[1].credential.as_deref(),
+            Some("pass")
+        );
+    }
+
+    #[test]
+    fn webrtc_config_to_ice_config() {
+        let toml_str = r#"
+[webrtc]
+ice_servers = [
+    { urls = ["stun:stun.l.google.com:19302"] },
+    { urls = ["turn:turn.example.com:3478"], username = "u", credential = "p" },
+]
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let ice = config.webrtc.to_ice_config();
+        assert_eq!(ice.ice_servers.len(), 2);
+        assert_eq!(ice.ice_servers[0].urls, vec!["stun:stun.l.google.com:19302"]);
+        assert!(ice.ice_servers[0].username.is_none());
+        assert_eq!(ice.ice_servers[1].username.as_deref(), Some("u"));
+        assert_eq!(ice.ice_servers[1].credential.as_deref(), Some("p"));
     }
 }

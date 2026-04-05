@@ -4005,8 +4005,16 @@ class DisplaySlot {
   }
 
   connect() {
-    // ICE config — default empty for local, can be injected by server
-    const config = { iceServers: [] };
+    // ICE config — read STUN/TURN servers from gateway config, default empty for local
+    const iceServers = (gatewayConfig && gatewayConfig.ice_servers)
+      ? gatewayConfig.ice_servers.map(s => {
+          const entry = { urls: s.urls };
+          if (s.username) entry.username = s.username;
+          if (s.credential) entry.credential = s.credential;
+          return entry;
+        })
+      : [];
+    const config = { iceServers };
     this.pc = new RTCPeerConnection(config);
 
     // Add a recvonly video transceiver so the SDP offer includes a video
