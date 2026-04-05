@@ -31,7 +31,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::CallerError;
 
-#[cfg(target_os = "linux")]
 pub mod encode;
 pub mod keymap;
 #[cfg(target_os = "macos")]
@@ -228,8 +227,7 @@ impl DisplaySession {
         });
         *self.capture_handle.lock().await = Some(capture_handle);
 
-        // --- Task 2: VP8 Encoder + WebRTC fan-out (Linux only) ---
-        #[cfg(target_os = "linux")]
+        // --- Task 2: VP8 Encoder + WebRTC fan-out ---
         {
             let mut broadcast_rx = self.frame_tx.subscribe();
             let peers = Arc::clone(&self.peers);
