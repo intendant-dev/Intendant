@@ -3210,6 +3210,7 @@ async function main() {
         setUserDisplayState(true);
       } else if (d.event === 'user_display_revoked') {
         setUserDisplayState(false);
+        removeDisplaySlot(0);
       }
       // Track recording state on display slots
       if (d.event === 'recording_started' && d.stream_name) {
@@ -4285,12 +4286,31 @@ class DisplaySlot {
   }
 }
 
+function removeDisplaySlot(displayId) {
+  displayId = Number(displayId);
+  const slot = displaySlots.get(displayId);
+  if (!slot) return;
+  slot.disconnect();
+  if (slot.el && slot.el.parentNode) slot.el.parentNode.removeChild(slot.el);
+  displaySlots.delete(displayId);
+  removeDisplayThumb(displayId);
+  if (displaySlots.size === 0) {
+    const placeholder = document.getElementById('displays-placeholder');
+    const container = document.getElementById('displays-container');
+    if (placeholder) placeholder.style.display = '';
+    if (container) container.classList.remove('has-displays');
+  }
+}
+
 function addDisplaySlot(displayId, width, height) {
   // WASM serializes u64 as BigInt; normalize to Number for Map keys and JSON.stringify.
   displayId = Number(displayId);
   width = Number(width);
   height = Number(height);
-  if (displaySlots.has(displayId)) return;
+  // Remove stale slot if it exists (e.g. from a previous grant/revoke cycle)
+  if (displaySlots.has(displayId)) {
+    removeDisplaySlot(displayId);
+  }
   const slot = new DisplaySlot(displayId, width, height);
   displaySlots.set(displayId, slot);
   const container = document.getElementById('displays-container');
@@ -4322,6 +4342,18 @@ function addDisplayThumb(displayId) {
   if (activeTab === 'activity') {
     const slot = displaySlots.get(displayId);
     if (slot) moveCanvasToThumb(slot);
+  }
+}
+
+function removeDisplayThumb(displayId) {
+  displayId = Number(displayId);
+  const thumb = displayThumbs.get(displayId);
+  if (!thumb) return;
+  if (thumb.parentNode) thumb.parentNode.removeChild(thumb);
+  displayThumbs.delete(displayId);
+  document.getElementById('strip-count').textContent = displayThumbs.size;
+  if (displayThumbs.size === 0) {
+    document.getElementById('activity-display-strip').classList.add('hidden');
   }
 }
 
