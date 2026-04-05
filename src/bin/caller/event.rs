@@ -157,6 +157,12 @@ pub enum AppEvent {
         note: Option<String>,
     },
 
+    // Display capture lost (backend crashed or portal session ended)
+    DisplayCaptureLost {
+        display_id: u32,
+        reason: String,
+    },
+
     // User session display grant/revoke
     UserDisplayGranted {
         /// The display ID that was granted.  0 = primary (default).
@@ -748,6 +754,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         | AppEvent::VoiceLog { .. }
         | AppEvent::PresenceCheckpointReceived { .. }
         | AppEvent::VoiceDiagnostic { .. }
+        | AppEvent::DisplayCaptureLost { .. }
         | AppEvent::LiveAudioStarted { .. }
         | AppEvent::LiveAudioProgress { .. }
         | AppEvent::LiveAudioCompleted { .. } => None,
@@ -869,6 +876,12 @@ fn write_event_to_session_log(
         }
         AppEvent::DisplayReleased { display_id, note } => {
             log.display_released(*display_id, note.as_deref());
+        }
+        AppEvent::DisplayCaptureLost { display_id, reason } => {
+            log.warn(&format!(
+                "Display :{} capture lost: {}",
+                display_id, reason
+            ));
         }
         AppEvent::UserDisplayGranted { display_id } => {
             log.info(&format!("User display access granted (display_id: {})", display_id));

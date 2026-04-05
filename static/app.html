@@ -3958,6 +3958,7 @@ class DisplaySlot {
     this.streaming = false;
     this._answerApplied = false;     // true after setRemoteDescription completes
     this._pendingCandidates = [];    // queued until answer is applied
+    this._reconnectAttempts = 0;     // ICE failure reconnect counter
     this._streamIntervalId = null;
     this._streamFrameCounter = 0;
     this._streamCanvas = document.createElement('canvas');
@@ -4051,17 +4052,35 @@ class DisplaySlot {
       }
     };
 
-    // Connection state changes
+    // Connection state changes — auto-reconnect on failure
     this.pc.onconnectionstatechange = () => {
       const state = this.pc.connectionState;
       if (state === 'connected') {
         this.connected = true;
+        this._reconnectAttempts = 0;
         const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
         this.statusEl.textContent = `Connected (view-only)${res}`;
         this.statusEl.className = 'display-status connected';
-      } else if (state === 'disconnected' || state === 'failed') {
+      } else if (state === 'failed') {
+        // ICE negotiation failed — tear down and create a fresh
+        // offer/answer exchange.  The server-side DisplaySession stays
+        // alive; only the WebRTC peer is recreated.
         this.connected = false;
-        this.statusEl.textContent = `Connection ${state}`;
+        const attempts = (this._reconnectAttempts || 0) + 1;
+        this._reconnectAttempts = attempts;
+        if (attempts <= 5) {
+          const delay = Math.min(2000 * attempts, 10000);
+          this.statusEl.textContent = `Connection failed, reconnecting in ${delay/1000}s (attempt ${attempts})...`;
+          this.statusEl.className = 'display-status error';
+          this.disconnect();
+          setTimeout(() => this.connect(), delay);
+        } else {
+          this.statusEl.textContent = 'Connection failed after 5 attempts';
+          this.statusEl.className = 'display-status error';
+        }
+      } else if (state === 'disconnected') {
+        this.connected = false;
+        this.statusEl.textContent = 'Connection disconnected';
         this.statusEl.className = 'display-status error';
       }
     };

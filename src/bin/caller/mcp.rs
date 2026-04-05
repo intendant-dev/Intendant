@@ -2154,6 +2154,9 @@ pub fn spawn_event_listener(
                     AppEvent::DisplayMetrics { .. } => {
                         // Broadcast-only — handled by outbound event converter.
                     }
+                    AppEvent::DisplayCaptureLost { display_id, ref reason } => {
+                        s.push_log(LogLevel::Warn, format!("Display :{} capture lost: {}", display_id, reason));
+                    }
                 }
             }
 

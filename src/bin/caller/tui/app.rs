@@ -1987,6 +1987,9 @@ impl App {
                 };
                 self.log(LogLevel::Info, format!("Live audio '{}': {}{}", id, status, q_note));
             }
+            AppEvent::DisplayCaptureLost { display_id, reason } => {
+                self.log(LogLevel::Warn, format!("Display :{} capture lost: {}", display_id, reason));
+            }
         }
 
         // Drain log entries emitted during this handle_event call

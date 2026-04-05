@@ -381,6 +381,7 @@ impl DisplaySession {
         &self,
         fps: u32,
         frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
+        event_bus: Option<crate::event::EventBus>,
     ) -> Result<(), CallerError> {
         let mut capture_rx = self.backend.start_capture(fps).await?;
 
@@ -391,13 +392,24 @@ impl DisplaySession {
         let latest = Arc::clone(&self.latest_frame);
         let shutdown = self.shutdown.clone();
         let cap_counters = Arc::clone(&self.counters);
+        let cap_display_id = self.display_id;
 
         let capture_handle = tokio::spawn(async move {
+            let mut clean_shutdown = false;
             loop {
                 tokio::select! {
-                    _ = shutdown.cancelled() => break,
+                    _ = shutdown.cancelled() => { clean_shutdown = true; break; }
                     frame = capture_rx.recv() => {
-                        let Some(frame) = frame else { break };
+                        let Some(frame) = frame else {
+                            // Backend stopped — portal session ended, capture
+                            // thread crashed, or display was disconnected.
+                            eprintln!(
+                                "[display/capture] display {} capture backend stopped \
+                                 (channel closed), capture bridge exiting",
+                                cap_display_id,
+                            );
+                            break;
+                        };
                         cap_counters.capture_frames.fetch_add(1, Ordering::Relaxed);
                         let arc_frame = Arc::new(frame);
                         *latest.write().await = Some(Arc::clone(&arc_frame));
@@ -406,6 +418,16 @@ impl DisplaySession {
                             cap_counters.capture_drops.fetch_add(1, Ordering::Relaxed);
                         }
                     }
+                }
+            }
+            // If the backend stopped unexpectedly (not a clean shutdown),
+            // emit DisplayCaptureLost so the session can be cleaned up.
+            if !clean_shutdown {
+                if let Some(ref bus) = event_bus {
+                    bus.send(crate::event::AppEvent::DisplayCaptureLost {
+                        display_id: cap_display_id,
+                        reason: "capture backend stopped".to_string(),
+                    });
                 }
             }
         });
@@ -494,12 +516,23 @@ impl DisplaySession {
 
             let fanout_counters = Arc::clone(&self.counters);
             let shutdown_fanout = self.shutdown.clone();
+            let fanout_display_id = self.display_id;
             let encoder_handle = tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         _ = shutdown_fanout.cancelled() => break,
                         ef = efr_rx.recv() => {
-                            let Some(ef) = ef else { break };
+                            let Some(ef) = ef else {
+                                // Encoder thread exited (panic, init failure,
+                                // or clean shutdown).  Log and stop the
+                                // BGRA->I420 bridge so the pipeline drains.
+                                eprintln!(
+                                    "[display/fanout] display {} encoder channel \
+                                     closed, fan-out exiting",
+                                    fanout_display_id,
+                                );
+                                break;
+                            };
                             let peers_guard = peers.read().await;
                             for peer in peers_guard.values() {
                                 if peer.encoded_frame_tx().try_send(Arc::clone(&ef)).is_err() {

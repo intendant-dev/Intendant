@@ -3,6 +3,7 @@ use crate::event::{AppEvent, ControlMsg, EventBus};
 use crate::types::LogLevel;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1193,22 +1194,34 @@ pub fn spawn_web_gateway(
     let last_live_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache the latest status event (has autonomy, session_id, task).
     let last_status_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    // Cache the last display_ready JSON for late-connecting browsers.
-    let last_display_ready_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Cache display_ready JSON per display_id for late-connecting browsers.
+    // Using a HashMap so multiple concurrent display sessions are all replayed.
+    let display_ready_cache: Arc<Mutex<HashMap<u32, String>>> = Arc::new(Mutex::new(HashMap::new()));
     {
         let usage_cache = last_usage_json.clone();
         let live_usage_cache = last_live_usage_json.clone();
         let status_cache = last_status_json.clone();
-        let display_cache = last_display_ready_json.clone();
+        let display_cache = display_ready_cache.clone();
         let mut usage_rx = broadcast_tx.subscribe();
         tokio::spawn(async move {
             loop {
                 match usage_rx.recv().await {
                     Ok(line) => {
-                        // Cache display_ready events for late-connecting browsers
+                        // Cache display_ready events per display_id for
+                        // late-connecting browsers.
                         if line.contains("\"event\":\"display_ready\"") {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
+                                let did = parsed["display_id"].as_u64().unwrap_or(0) as u32;
+                                if let Ok(mut guard) = display_cache.lock() {
+                                    guard.insert(did, line.clone());
+                                }
+                            }
+                        }
+                        // Evict display_ready cache when display is revoked.
+                        if line.contains("\"event\":\"user_display_revoked\"") {
                             if let Ok(mut guard) = display_cache.lock() {
-                                *guard = Some(line.clone());
+                                // User display is always id 0.
+                                guard.remove(&0);
                             }
                         }
                         if line.contains("\"event\":\"usage_update\"")
@@ -1278,7 +1291,7 @@ pub fn spawn_web_gateway(
             let last_usage_json = last_usage_json.clone();
             let last_live_usage_json = last_live_usage_json.clone();
             let last_status_json = last_status_json.clone();
-            let last_display_ready_json = last_display_ready_json.clone();
+            let display_ready_cache = display_ready_cache.clone();
             let web_tui_tx = web_tui_tx.clone();
             let task_tx = task_tx.clone();
             let project_root = project_root.clone();
@@ -1378,11 +1391,33 @@ pub fn spawn_web_gateway(
                         }
                     }
 
-                    // Send cached display_ready so late-connecting browsers
-                    // auto-create display slots.
-                    if let Ok(guard) = last_display_ready_json.lock() {
-                        if let Some(ref display_json) = *guard {
-                            let _ = direct_tx.send(display_json.clone());
+                    // Replay display_ready for every active display session so
+                    // late-connecting browsers (including refreshes) recreate
+                    // their DisplaySlots and initiate WebRTC.  Prefer the
+                    // live session registry over the broadcast cache — it is
+                    // authoritative and handles multiple concurrent displays.
+                    if let Some(ref sr) = session_registry {
+                        let reg = sr.read().await;
+                        for did in reg.display_ids() {
+                            if let Some(session) = reg.get(did) {
+                                let (w, h) = session.resolution();
+                                let msg = serde_json::json!({
+                                    "event": "display_ready",
+                                    "display_id": did,
+                                    "width": w,
+                                    "height": h,
+                                });
+                                let _ = direct_tx.send(msg.to_string());
+                            }
+                        }
+                    } else {
+                        // Fallback: use the broadcast-derived cache when no
+                        // session registry is available (shouldn't happen in
+                        // practice, but keeps the old behaviour as safety net).
+                        if let Ok(guard) = display_ready_cache.lock() {
+                            for display_json in guard.values() {
+                                let _ = direct_tx.send(display_json.clone());
+                            }
                         }
                     }
 
