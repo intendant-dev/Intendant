@@ -56,6 +56,7 @@ x11rb = { version = "0.13", features = ["shm"] }
 screencapturekit = "1.5"
 core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
+shiguredo_video_toolbox = "2026.1"
 
 [dev-dependencies]
 tempfile = "3"
