@@ -192,12 +192,15 @@ fn print_help() {
     println!("    REASONING_SUMMARY     Reasoning summary: auto, concise, detailed");
 }
 
-/// Try binding to ports starting from `preferred`, returning the first available.
-async fn find_available_port(preferred: u16) -> Result<u16, CallerError> {
+/// Try binding to ports starting from `preferred`, returning the bound listener.
+/// Avoids TOCTOU by keeping the listener alive instead of probing and releasing.
+async fn find_available_port(
+    preferred: u16,
+) -> Result<(u16, tokio::net::TcpListener), CallerError> {
     for offset in 0..20u16 {
         let port = preferred.checked_add(offset).unwrap_or(preferred);
-        match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await {
-            Ok(_listener) => return Ok(port), // drop releases the port
+        match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+            Ok(listener) => return Ok((port, listener)),
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
             Err(e) => {
                 return Err(CallerError::Config(format!(
@@ -3277,6 +3280,7 @@ async fn run_with_presence(
     context_injection: event::ContextInjectionQueue,
     session_registry: display::SharedSessionRegistry,
     agent_backend_override: Option<external_agent::AgentBackend>,
+    web_port: Option<u16>,
 ) -> Result<LoopStats, CallerError> {
     // 1. Create presence provider (small/fast model)
     let presence_provider = provider::select_presence_provider(
@@ -3396,6 +3400,7 @@ async fn run_with_presence(
     let mut persistent_provider: Option<Box<dyn provider::ChatProvider>> = None;
     let mut persistent_project: Option<Project> = None;
     // External agent + thread — created on first task, reused for subsequent messages.
+    let presence_approval_counter = std::sync::atomic::AtomicU64::new(1);
     let mut persistent_agent: Option<Box<dyn external_agent::ExternalAgent>> = None;
     let mut persistent_thread: Option<external_agent::AgentThread> = None;
     let mut persistent_event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>> = None;
@@ -3492,14 +3497,14 @@ async fn run_with_presence(
                         let agent = Box::new(external_agent::codex::CodexAgent::new(
                             cfg.command.clone(), cfg.model.clone(),
                             cfg.approval_policy.clone(), cfg.sandbox != "dangerFullAccess",
-                            None,
+                            web_port,
                         ));
                         let config = AgentConfig {
                             model: cfg.model.clone(),
                             working_dir: proj.root.clone(),
                             approval_policy: cfg.approval_policy.clone(),
                             sandbox: cfg.sandbox != "dangerFullAccess",
-                            web_port: None,
+                            web_port,
                         };
                         (agent, config)
                     }
@@ -3582,7 +3587,7 @@ async fn run_with_presence(
                             bus.send(AppEvent::AutoApproved { preview: command });
                             let _ = agent.resolve_approval(&request_id, external_agent::ApprovalDecision::Accept).await;
                         } else {
-                            let id = cumulative_stats.turns as u64 * 1000 + 1;
+                            let id = presence_approval_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let (tx, rx) = tokio::sync::oneshot::channel();
                             { approval_registry.lock().unwrap().insert(id, tx); }
                             bus.send(AppEvent::ApprovalRequired { id, command_preview: command, category: cat });
@@ -3601,7 +3606,7 @@ async fn run_with_presence(
                             bus.send(AppEvent::AutoApproved { preview: format!("file change: {}", path) });
                             let _ = agent.resolve_approval(&request_id, external_agent::ApprovalDecision::Accept).await;
                         } else {
-                            let id = cumulative_stats.turns as u64 * 1000 + 2;
+                            let id = presence_approval_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let (tx, rx) = tokio::sync::oneshot::channel();
                             { approval_registry.lock().unwrap().insert(id, tx); }
                             bus.send(AppEvent::ApprovalRequired {
@@ -4174,6 +4179,7 @@ async fn run_external_agent_mode(
     _json_approval: Option<JsonApprovalSlot>,
     approval_registry: event::ApprovalRegistry,
     headless: bool,
+    web_port: u16,
 ) -> Result<LoopStats, CallerError> {
     use external_agent::{AgentBackend, AgentConfig, AgentEvent, ApprovalCategory, ApprovalDecision};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4196,14 +4202,14 @@ async fn run_external_agent_mode(
                 cfg.model.clone(),
                 cfg.approval_policy.clone(),
                 cfg.sandbox != "dangerFullAccess",
-                None, // web_port — set in config below
+                Some(web_port),
             ));
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
                 approval_policy: cfg.approval_policy.clone(),
                 sandbox: cfg.sandbox != "dangerFullAccess",
-                web_port: None, // TODO: pass resolved web port
+                web_port: Some(web_port),
             };
             (agent, config)
         }
@@ -5565,11 +5571,12 @@ async fn main() -> Result<(), CallerError> {
     // in MCP/JSON modes that own stdio.
     let use_web = !flags.no_web && !flags.mcp && !flags.json_output;
 
-    // Resolve web port via auto-discovery (try preferred port, then +1..+19).
-    let web_port = if use_web {
-        find_available_port(flags.web_port).await?
+    // Resolve web port via auto-discovery, keeping the listener alive (no TOCTOU).
+    let (web_port, mut web_listener) = if use_web {
+        let (port, listener) = find_available_port(flags.web_port).await?;
+        (port, Some(listener))
     } else {
-        flags.web_port
+        (flags.web_port, None)
     };
 
     let provider_result = provider::select_provider();
@@ -5736,8 +5743,17 @@ async fn main() -> Result<(), CallerError> {
                     session_registry: Some(session_registry.clone()),
                 },
             ));
+            let mut mcp_http_state = mcp::McpAppState::new(
+                "none".into(), "none".into(), autonomy.clone(), log_dir.clone(),
+            );
+            mcp_http_state.frame_registry = Some(frame_registry.clone());
+            mcp_http_state.session_registry = Some(session_registry.clone());
+            mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
+            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
+                Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
+            )));
             let handle = web_gateway::spawn_web_gateway(
-                web_port,
+                web_listener.take().expect("web listener must exist when use_web"),
                 bus.clone(),
                 broadcast_tx,
                 config,
@@ -5746,7 +5762,7 @@ async fn main() -> Result<(), CallerError> {
                 None, // MCP mode: no WebTui
                 None, // No task_tx in MCP mode
                 Some(project.root.clone()),
-                None, // No MCP server for HTTP transport in MCP mode
+                mcp_http_server,
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -5772,6 +5788,9 @@ async fn main() -> Result<(), CallerError> {
         mcp_app_state.context_window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
         mcp_app_state.session_id = session_log.lock().map(|l| l.session_id().to_string()).unwrap_or_default();
         mcp_app_state.task_description = task.clone().unwrap_or_default();
+        mcp_app_state.frame_registry = Some(frame_registry.clone());
+        mcp_app_state.session_registry = Some(session_registry.clone());
+        mcp_app_state.screenshot_dir = Some(log_dir.join("screenshots"));
         let mcp_state = std::sync::Arc::new(tokio::sync::RwLock::new(mcp_app_state));
 
         // Build a launcher closure that can spawn the agent loop on demand.
@@ -5879,6 +5898,7 @@ async fn main() -> Result<(), CallerError> {
                             None,
                             approval_registry,
                             false,
+                            web_port,
                         )
                         .await
                     } else if use_orchestration {
@@ -6197,8 +6217,18 @@ async fn main() -> Result<(), CallerError> {
                     session_registry: Some(session_registry.clone()),
                 },
             ));
+            // Create MCP server for HTTP transport (display/CU tools for external agents)
+            let mut mcp_http_state = mcp::McpAppState::new(
+                "none".into(), "none".into(), autonomy.clone(), log_dir.clone(),
+            );
+            mcp_http_state.frame_registry = Some(frame_registry.clone());
+            mcp_http_state.session_registry = Some(session_registry.clone());
+            mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
+            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
+                Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
+            )));
             let handle = web_gateway::spawn_web_gateway(
-                web_port,
+                web_listener.take().expect("web listener must exist when use_web"),
                 bus.clone(),
                 broadcast_tx,
                 config,
@@ -6207,7 +6237,7 @@ async fn main() -> Result<(), CallerError> {
                 web_tui_tx.clone(),
                 Some(task_tx.clone()),
                 Some(project.root.clone()),
-                None, // MCP server for HTTP transport
+                mcp_http_server,
             );
             app.log(
                 types::LogLevel::Info,
@@ -6298,6 +6328,7 @@ async fn main() -> Result<(), CallerError> {
                     context_injection_clone,
                     session_registry.clone(),
                     agent_backend_for_presence,
+                    if use_web { Some(web_port) } else { None },
                 )
                 .await;
 
@@ -6362,6 +6393,7 @@ async fn main() -> Result<(), CallerError> {
                         None,
                         approval_registry_clone,
                         false, // not headless — TUI handles approval
+                        web_port,
                     )
                     .await
                 } else {
@@ -6554,7 +6586,7 @@ async fn main() -> Result<(), CallerError> {
                                             backend, new_task.clone(), new_project,
                                             bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
                                             new_log_dir, follow_up_rx, None,
-                                            event::ApprovalRegistry::default(), true,
+                                            event::ApprovalRegistry::default(), true, web_port,
                                         ).await
                                     } else {
                                         let new_provider = match provider::select_provider() {
@@ -6672,8 +6704,17 @@ async fn main() -> Result<(), CallerError> {
                     session_registry: Some(session_registry.clone()),
                 },
             ));
+            let mut mcp_http_state = mcp::McpAppState::new(
+                "none".into(), "none".into(), autonomy.clone(), log_dir.clone(),
+            );
+            mcp_http_state.frame_registry = Some(frame_registry.clone());
+            mcp_http_state.session_registry = Some(session_registry.clone());
+            mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
+            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
+                Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
+            )));
             let _web_handle = web_gateway::spawn_web_gateway(
-                web_port,
+                web_listener.take().expect("web listener must exist when use_web"),
                 bus.clone(),
                 outbound_tx.clone(),
                 config,
@@ -6682,7 +6723,7 @@ async fn main() -> Result<(), CallerError> {
                 None, // Headless mode: no WebTui
                 None, // No task_tx in headless mode
                 Some(project.root.clone()),
-                None, // MCP server for HTTP transport
+                mcp_http_server,
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",
@@ -6812,6 +6853,7 @@ async fn main() -> Result<(), CallerError> {
                 json_approval_slot,
                 event::ApprovalRegistry::default(),
                 true, // headless mode
+                web_port,
             )
             .await
         } else {
@@ -6990,7 +7032,7 @@ async fn main() -> Result<(), CallerError> {
                                             backend, new_task.clone(), new_project,
                                             bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
                                             new_log_dir, follow_up_rx, None,
-                                            event::ApprovalRegistry::default(), true,
+                                            event::ApprovalRegistry::default(), true, web_port,
                                         ).await
                                     } else {
                                         let new_provider = match provider::select_provider() {
