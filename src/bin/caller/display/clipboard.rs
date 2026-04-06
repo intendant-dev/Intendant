@@ -5,7 +5,8 @@
 //!
 //! Platform support:
 //! - **macOS**: `pbpaste` / `pbcopy`
-//! - **Linux**: `xclip -o -selection clipboard` / `xclip -i -selection clipboard`
+//! - **Linux (Wayland)**: `wl-paste --no-newline` / `wl-copy` (from `wl-clipboard`)
+//! - **Linux (X11)**: `xclip -o -selection clipboard` / `xclip -i -selection clipboard`
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -127,15 +128,47 @@ async fn write_clipboard(text: &str) -> Result<(), String> {
 // Platform: Linux
 // ---------------------------------------------------------------------------
 
+/// Which clipboard tool to use on Linux.
+#[cfg(target_os = "linux")]
+enum ClipboardTool {
+    /// wl-clipboard (wl-copy / wl-paste) for Wayland.
+    WlClipboard,
+    /// xclip for X11.
+    Xclip,
+}
+
+/// Detect whether we're on Wayland or X11 and pick the appropriate tool.
+#[cfg(target_os = "linux")]
+fn clipboard_tool() -> ClipboardTool {
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        ClipboardTool::WlClipboard
+    } else {
+        ClipboardTool::Xclip
+    }
+}
+
 #[cfg(target_os = "linux")]
 async fn read_clipboard() -> Option<String> {
-    let output = tokio::process::Command::new("xclip")
-        .args(["-o", "-selection", "clipboard"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
+    let output = match clipboard_tool() {
+        ClipboardTool::WlClipboard => {
+            tokio::process::Command::new("wl-paste")
+                .arg("--no-newline")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .await
+                .ok()?
+        }
+        ClipboardTool::Xclip => {
+            tokio::process::Command::new("xclip")
+                .args(["-o", "-selection", "clipboard"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .await
+                .ok()?
+        }
+    };
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
@@ -146,24 +179,28 @@ async fn read_clipboard() -> Option<String> {
 #[cfg(target_os = "linux")]
 async fn write_clipboard(text: &str) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
-    let mut child = tokio::process::Command::new("xclip")
-        .args(["-i", "-selection", "clipboard"])
+    let (cmd, args): (&str, &[&str]) = match clipboard_tool() {
+        ClipboardTool::WlClipboard => ("wl-copy", &[]),
+        ClipboardTool::Xclip => ("xclip", &["-i", "-selection", "clipboard"]),
+    };
+    let mut child = tokio::process::Command::new(cmd)
+        .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| format!("spawn xclip: {e}"))?;
+        .map_err(|e| format!("spawn {cmd}: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(text.as_bytes())
             .await
-            .map_err(|e| format!("write to xclip: {e}"))?;
+            .map_err(|e| format!("write to {cmd}: {e}"))?;
     }
-    let status = child.wait().await.map_err(|e| format!("wait xclip: {e}"))?;
+    let status = child.wait().await.map_err(|e| format!("wait {cmd}: {e}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err("xclip exited with non-zero status".to_string())
+        Err(format!("{cmd} exited with non-zero status"))
     }
 }
 
