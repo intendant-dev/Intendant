@@ -1,102 +1,123 @@
 use super::EncodedFrame;
 
-/// MIME type string for VP8 video.  Matches `webrtc::api::media_engine::MIME_TYPE_VP8`.
-pub const MIME_TYPE_VP8: &str = "video/VP8";
+#[cfg(target_os = "linux")]
+pub mod h264_linux;
+#[cfg(target_os = "macos")]
+pub mod h264_macos;
 
-/// Object-safe encoder trait.
+pub const MIME_TYPE_VP8: &str = "video/VP8";
+pub const MIME_TYPE_H264: &str = "video/H264";
+
+// ---------------------------------------------------------------------------
+// Encoder trait
+// ---------------------------------------------------------------------------
+
+/// Codec-agnostic encoder interface.
 ///
-/// Implementations convert raw I420 frames into codec-specific packets.
-/// `Vp8Encoder` is the built-in software encoder; future hardware encoders
-/// (H264, etc.) will implement this same trait.
+/// Implementations accept I420 frames and produce encoded packets.  The trait
+/// is `Send + 'static` so the encoder can live on a dedicated `std::thread`.
 pub trait Encoder: Send + 'static {
-    /// Encode one I420 frame. Returns zero or more encoded packets.
+    /// Encode one I420 frame.  Returns zero or more encoded packets.
     ///
     /// `duration_ms` is the display duration of this frame (typically 1000/fps).
     fn encode(&mut self, i420: &[u8], duration_ms: u64) -> Result<Vec<EncodedPacket>, String>;
 
-    /// The MIME type this encoder produces (e.g. `"video/VP8"`).
+    /// The MIME type of the encoded output (e.g. `"video/VP8"`, `"video/H264"`).
     fn codec_mime(&self) -> &'static str;
 }
 
-/// Result of codec negotiation: an encoder instance paired with its MIME type.
-pub struct CodecChoice {
-    /// WebRTC MIME type string (e.g. `"video/VP8"`).
-    pub mime_type: &'static str,
-    /// The encoder that produces frames for this codec.
-    pub encoder: Box<dyn Encoder>,
+// ---------------------------------------------------------------------------
+// Codec selection
+// ---------------------------------------------------------------------------
+
+/// Which codec was selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecChoice {
+    Vp8,
+    H264,
 }
 
-/// Select the best mutually-supported codec given the browser's SDP offer.
-///
-/// Parses `a=rtpmap:` lines from `offer_sdp` to discover which video codecs the
-/// browser advertises, then checks local encoder availability.  Returns the best
-/// match with VP8 as the universal fallback.
-pub fn select_codec(offer_sdp: &str, width: u32, height: u32, bitrate_kbps: u32) -> Result<CodecChoice, String> {
-    // Parse offered codecs from the SDP (case-insensitive comparison).
-    let offered: Vec<String> = offer_sdp
-        .lines()
-        .filter_map(|line| {
-            // a=rtpmap:<payload> <codec>/<clockrate>[/<channels>]
-            let line = line.trim();
-            if !line.starts_with("a=rtpmap:") {
-                return None;
-            }
-            let after_colon = line.strip_prefix("a=rtpmap:")?;
-            // Skip the payload type number.
-            let codec_part = after_colon.split_whitespace().nth(1)?;
-            // Take the codec name before the '/' (e.g. "VP8" from "VP8/90000").
-            let codec_name = codec_part.split('/').next()?;
-            Some(codec_name.to_uppercase())
-        })
-        .collect();
-
-    if !offered.is_empty() {
-        eprintln!(
-            "[display/codec] browser offers: {}",
-            offered.join(", "),
-        );
-    }
-
-    // Preference order for future expansion.  For now only VP8 has a local
-    // encoder, but the infrastructure is in place for H264/VP9/AV1.
-    //
-    // H264 would be preferred when hardware encoding is available (phase 5).
-    // For now we unconditionally select VP8.
-    let selected_mime: &str = MIME_TYPE_VP8;
-    let encoder = Vp8Encoder::new(width, height, bitrate_kbps)?;
-
-    eprintln!(
-        "[display/codec] selected {} ({}x{}, {} kbps)",
-        selected_mime, width, height, bitrate_kbps,
-    );
-
-    Ok(CodecChoice {
-        mime_type: selected_mime,
-        encoder: Box::new(encoder),
-    })
-}
-
-/// Create an encoder for a known MIME type string.
-///
-/// Used by `spawn_encoder_thread` when the codec has already been negotiated
-/// and we just need a fresh encoder instance (e.g. after a resolution change).
-/// Falls back to VP8 if the MIME type is unrecognised.
-pub fn select_codec_for_mime(
-    codec_mime: &str,
-    width: u32,
-    height: u32,
-    bitrate_kbps: u32,
-) -> Result<Box<dyn Encoder>, String> {
-    // Currently only VP8 is implemented.  When H264/VP9/AV1 encoders are
-    // added, match on `codec_mime` here to construct the right one.
-    match codec_mime {
-        _ => {
-            // VP8 fallback for any MIME type (including "video/VP8").
-            let enc = Vp8Encoder::new(width, height, bitrate_kbps)?;
-            Ok(Box::new(enc))
+impl CodecChoice {
+    pub fn mime(&self) -> &'static str {
+        match self {
+            CodecChoice::Vp8 => "video/VP8",
+            CodecChoice::H264 => "video/H264",
         }
     }
 }
+
+/// Try to create an encoder for the given codec and resolution.
+///
+/// Returns `(encoder, codec)` on success.
+pub fn select_codec_for_mime(
+    mime: &str,
+    width: u32,
+    height: u32,
+    bitrate_kbps: u32,
+) -> Result<(Box<dyn Encoder>, CodecChoice), String> {
+    match mime {
+        "video/H264" => create_h264_encoder(width, height, bitrate_kbps),
+        _ => {
+            let enc = Vp8Encoder::new(width, height, bitrate_kbps)?;
+            Ok((Box::new(enc), CodecChoice::Vp8))
+        }
+    }
+}
+
+/// Pick the best available codec.
+///
+/// Tries H264 (hardware) first, falls back to VP8 (software).
+pub fn select_codec(
+    width: u32,
+    height: u32,
+    bitrate_kbps: u32,
+) -> (Box<dyn Encoder>, CodecChoice) {
+    match create_h264_encoder(width, height, bitrate_kbps) {
+        Ok(pair) => pair,
+        Err(reason) => {
+            eprintln!(
+                "[display/encoder] H264 hardware encoder unavailable ({}), using VP8 software fallback",
+                reason,
+            );
+            let enc = Vp8Encoder::new(width, height, bitrate_kbps)
+                .expect("VP8 encoder creation must not fail");
+            (Box::new(enc), CodecChoice::Vp8)
+        }
+    }
+}
+
+/// Platform-specific H264 encoder creation.
+#[cfg(target_os = "macos")]
+fn create_h264_encoder(
+    width: u32,
+    height: u32,
+    bitrate_kbps: u32,
+) -> Result<(Box<dyn Encoder>, CodecChoice), String> {
+    let enc = h264_macos::VideoToolboxEncoder::new(width, height, bitrate_kbps)?;
+    eprintln!(
+        "[display/encoder] Using H264 (VideoToolbox) for {}x{}",
+        width, height,
+    );
+    Ok((Box::new(enc), CodecChoice::H264))
+}
+
+#[cfg(target_os = "linux")]
+fn create_h264_encoder(
+    width: u32,
+    height: u32,
+    bitrate_kbps: u32,
+) -> Result<(Box<dyn Encoder>, CodecChoice), String> {
+    let enc = h264_linux::FfmpegH264Encoder::new(width, height, bitrate_kbps)?;
+    eprintln!(
+        "[display/encoder] Using H264 (ffmpeg VA-API) for {}x{}",
+        width, height,
+    );
+    Ok((Box::new(enc), CodecChoice::H264))
+}
+
+// ---------------------------------------------------------------------------
+// Color space conversion
+// ---------------------------------------------------------------------------
 
 /// Convert a BGRA image buffer to I420 (YCbCr 4:2:0) planar format.
 ///
@@ -182,20 +203,16 @@ pub struct EncodedPacket {
 }
 
 /// VP8 encoder wrapping `vpx-encode`.
-///
-/// # Safety
-///
-/// `vpx_encode::Encoder` contains raw pointers (`*const c_void` etc.) which
-/// prevent auto-deriving `Send`.  The encoder is only ever used from a single
-/// dedicated thread (`spawn_encoder_thread`), so sending it there is safe.
-// SAFETY: Vp8Encoder is used on exactly one thread after being moved there.
-unsafe impl Send for Vp8Encoder {}
-
 pub struct Vp8Encoder {
     encoder: vpx_encode::Encoder,
     frame_count: u64,
     pts_offset: u64,
 }
+
+// vpx_encode::Encoder contains raw pointers from the C FFI that are not
+// marked Send.  The encoder is only ever used from a single dedicated
+// thread so sending the owning struct across threads is safe.
+unsafe impl Send for Vp8Encoder {}
 
 impl Vp8Encoder {
     /// Create a new VP8 encoder for the given resolution and target bitrate.
@@ -214,11 +231,10 @@ impl Vp8Encoder {
             pts_offset: 0,
         })
     }
+}
 
-    /// Encode one I420 frame. Returns zero or more encoded packets.
-    ///
-    /// `duration_ms` is the display duration of this frame (typically 1000/fps).
-    pub fn encode(&mut self, i420: &[u8], duration_ms: u64) -> Result<Vec<EncodedPacket>, String> {
+impl Encoder for Vp8Encoder {
+    fn encode(&mut self, i420: &[u8], duration_ms: u64) -> Result<Vec<EncodedPacket>, String> {
         let pts = self.pts_offset;
         self.pts_offset += duration_ms;
         self.frame_count += 1;
@@ -239,16 +255,9 @@ impl Vp8Encoder {
         }
         Ok(out)
     }
-}
-
-impl Encoder for Vp8Encoder {
-    fn encode(&mut self, i420: &[u8], duration_ms: u64) -> Result<Vec<EncodedPacket>, String> {
-        // Delegate to the inherent method.
-        Vp8Encoder::encode(self, i420, duration_ms)
-    }
 
     fn codec_mime(&self) -> &'static str {
-        MIME_TYPE_VP8
+        "video/VP8"
     }
 }
 
