@@ -842,16 +842,13 @@ impl DisplaySession {
         ice_config: &IceConfig,
         ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<String, CallerError> {
-        // Negotiate codec from the offer SDP.
+        // Select the best available codec (H264 hardware preferred, VP8 fallback).
         let (width, height) = self.backend.resolution();
-        let codec_choice = encode::select_codec(sdp, width, height, 2000)
-            .map_err(|e| CallerError::WebRtc(format!("codec selection: {e}")))?;
+        let (_encoder, codec_choice) = encode::select_codec(width, height, 2000);
+        let codec_mime = codec_choice.mime();
 
         // Store the negotiated codec for the encoder pipeline.
-        // The first peer's codec wins; subsequent peers use the same codec.
-        *self.codec_mime.write().await = codec_choice.mime_type;
-
-        let codec_mime = codec_choice.mime_type;
+        *self.codec_mime.write().await = codec_mime;
 
         let backend = Arc::clone(&self.backend);
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> =
@@ -990,7 +987,7 @@ fn spawn_encoder_thread(
 ) {
     std::thread::spawn(move || {
         let mut encoder: Box<dyn encode::Encoder> = match encode::select_codec_for_mime(codec_mime, width, height, 2000) {
-            Ok(e) => e,
+            Ok((enc, _choice)) => enc,
             Err(e) => {
                 eprintln!("[display/encoder] {} encoder FAILED for {}x{}: {}", codec_mime, width, height, e);
                 return;
