@@ -875,8 +875,20 @@ impl DisplaySession {
         let codec_mime = {
             let mut init = self.encoder_init_lock.lock().await;
             if *init {
-                // Encoder already running -- use the established codec.
-                *self.codec_mime.read().await
+                // Encoder already running -- verify the new peer supports it.
+                let locked_mime = *self.codec_mime.read().await;
+                let browser_codecs = encode::parse_offered_codecs(sdp);
+                let locked_name = locked_mime.split('/').last().unwrap_or("");
+                if !browser_codecs
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(locked_name))
+                {
+                    return Err(CallerError::WebRtc(format!(
+                        "peer does not support session codec {} (offered: {:?})",
+                        locked_mime, browser_codecs,
+                    )));
+                }
+                locked_mime
             } else {
                 // First peer -- negotiate codec from SDP and start encoder.
                 let (width, height) = self.backend.resolution();
