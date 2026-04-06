@@ -106,6 +106,8 @@ pub struct AgentConfig {
     pub working_dir: PathBuf,
     pub approval_policy: String,
     pub sandbox: bool,
+    /// Web gateway port for MCP-over-HTTP config generation.
+    pub web_port: Option<u16>,
 }
 
 /// Handle to a conversation thread within an external agent.

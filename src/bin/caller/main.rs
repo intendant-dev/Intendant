@@ -3492,12 +3492,14 @@ async fn run_with_presence(
                         let agent = Box::new(external_agent::codex::CodexAgent::new(
                             cfg.command.clone(), cfg.model.clone(),
                             cfg.approval_policy.clone(), cfg.sandbox != "dangerFullAccess",
+                            None,
                         ));
                         let config = AgentConfig {
                             model: cfg.model.clone(),
                             working_dir: proj.root.clone(),
                             approval_policy: cfg.approval_policy.clone(),
                             sandbox: cfg.sandbox != "dangerFullAccess",
+                            web_port: None,
                         };
                         (agent, config)
                     }
@@ -4194,12 +4196,14 @@ async fn run_external_agent_mode(
                 cfg.model.clone(),
                 cfg.approval_policy.clone(),
                 cfg.sandbox != "dangerFullAccess",
+                None, // web_port — set in config below
             ));
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
                 approval_policy: cfg.approval_policy.clone(),
                 sandbox: cfg.sandbox != "dangerFullAccess",
+                web_port: None, // TODO: pass resolved web port
             };
             (agent, config)
         }
