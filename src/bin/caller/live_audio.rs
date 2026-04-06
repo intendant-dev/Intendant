@@ -1423,6 +1423,10 @@ pub async fn run_session(
     let mut model_text = String::new();
     let mut model_transcript_buf = String::new();
     let mut quarantine_ids = Vec::new();
+    // Silence watchdog state
+    let mut last_model_output = Instant::now();
+    let mut silence_nudged = false;
+
     // Event processing loop
     let status = loop {
         let elapsed = start.elapsed();
@@ -1431,12 +1435,26 @@ pub async fn run_session(
         }
         let remaining = timeout - elapsed;
 
-        match tokio::time::timeout(remaining, session.event_rx.recv()).await {
+        // Silence watchdog: if no model output for 15s, nudge the model.
+        // This prevents indefinite hangs when the model freezes on
+        // unexpected input.
+        let silence_limit = Duration::from_secs(15);
+        let time_since_output = last_model_output.elapsed();
+        if time_since_output >= silence_limit && !silence_nudged {
+            silence_nudged = true;
+            let _ = session.send_text("Are you still there? Please continue the conversation.").await;
+        }
+
+        match tokio::time::timeout(remaining.min(silence_limit), session.event_rx.recv()).await {
             Ok(Some(event)) => match event {
                 LiveAudioEvent::AudioOut(pcm) => {
+                    last_model_output = Instant::now();
+                    silence_nudged = false;
                     let _ = audio_out_tx.send(pcm);
                 }
                 LiveAudioEvent::ModelTranscript(text) => {
+                    last_model_output = Instant::now();
+                    silence_nudged = false;
                     let _ = transcript.log("model", &text).await;
                     model_transcript_buf.push_str(&text);
 
