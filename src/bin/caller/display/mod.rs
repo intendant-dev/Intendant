@@ -20,7 +20,7 @@
 //! - `latest_frame`: always overwritten, latest-wins.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -353,6 +353,13 @@ pub struct DisplaySession {
     /// Negotiated codec MIME type for the encoder pipeline.
     /// Set on the first peer connection, all subsequent peers use the same codec.
     codec_mime: RwLock<&'static str>,
+    /// Whether the encoder pipeline has been started.  The encoder is deferred
+    /// until the first `handle_offer()` so we know which codec the peer selected.
+    encoder_started: AtomicBool,
+    /// Capture FPS stored from `start()` for deferred encoder startup.
+    fps: Mutex<u32>,
+    /// EventBus stored from `start()` for deferred encoder startup.
+    encoder_event_bus: Mutex<Option<crate::event::EventBus>>,
     /// Clipboard monitor for bidirectional clipboard sync.
     clipboard_monitor: Arc<clipboard::ClipboardMonitor>,
     /// Handle for the clipboard forwarding task (remote -> browser).
@@ -375,6 +382,9 @@ impl DisplaySession {
             counters: Arc::new(DisplayMetricsCounters::new()),
             metrics_epoch: Mutex::new(Instant::now()),
             codec_mime: RwLock::new(encode::MIME_TYPE_VP8),
+            encoder_started: AtomicBool::new(false),
+            fps: Mutex::new(30),
+            encoder_event_bus: Mutex::new(None),
             clipboard_monitor: Arc::new(clipboard::ClipboardMonitor::new()),
             clipboard_handle: Mutex::new(None),
         }
@@ -452,155 +462,11 @@ impl DisplaySession {
         });
         *self.capture_handle.lock().await = Some(capture_handle);
 
-        // --- Task 2: VP8 Encoder + WebRTC fan-out ---
-        {
-            let mut broadcast_rx = self.frame_tx.subscribe();
-            let peers = Arc::clone(&self.peers);
-
-            let duration_ms = if fps > 0 { 1000 / fps as u64 } else { 33 };
-
-            // Encoded frame channel — survives encoder restarts.  The fanout
-            // task reads from `efr_rx`; each encoder thread gets a clone of
-            // `efr_tx` so dropping+respawning the encoder thread does not
-            // close the channel.
-            let (efr_tx, mut efr_rx) = mpsc::channel::<Arc<EncodedFrame>>(16);
-
-            // Spawn the initial encoder thread.
-            let (i420_tx, i420_rx) =
-                std::sync::mpsc::sync_channel::<(Vec<u8>, Instant)>(4);
-
-            let enc_counters = Arc::clone(&self.counters);
-            let encoder_shutdown = self.shutdown.clone();
-            let session_codec_mime = *self.codec_mime.read().await;
-            spawn_encoder_thread(
-                width, height, duration_ms,
-                session_codec_mime,
-                i420_rx, efr_tx.clone(),
-                Arc::clone(&enc_counters), encoder_shutdown,
-            );
-
-            let bridge_counters = Arc::clone(&self.counters);
-            let shutdown_bridge = self.shutdown.clone();
-            let frame_interval = std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
-            let display_id = self.display_id;
-            let event_bus = event_bus_for_encoder;
-            let codec_mime_for_bridge = session_codec_mime;
-            let bridge_handle = tokio::spawn(async move {
-                let mut last_encode = tokio::time::Instant::now();
-                // Track current encoder dimensions for resize detection.
-                let mut enc_width = width;
-                let mut enc_height = height;
-                let mut i420_tx = i420_tx;
-                loop {
-                    tokio::select! {
-                        _ = shutdown_bridge.cancelled() => break,
-                        result = broadcast_rx.recv() => {
-                            if last_encode.elapsed() < frame_interval {
-                                continue;
-                            }
-                            last_encode = tokio::time::Instant::now();
-                            let frame = match result {
-                                Ok(f) => f,
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(broadcast::error::RecvError::Closed) => break,
-                            };
-
-                            // -- Resize detection --
-                            // Round to even dimensions for VP8 compatibility.
-                            let frame_w = frame.width & !1;
-                            let frame_h = frame.height & !1;
-                            if frame_w > 0 && frame_h > 0
-                                && (frame_w != enc_width || frame_h != enc_height)
-                            {
-                                eprintln!(
-                                    "[display/bridge] resolution changed {}x{} -> {}x{}, recreating encoder",
-                                    enc_width, enc_height, frame_w, frame_h,
-                                );
-                                enc_width = frame_w;
-                                enc_height = frame_h;
-
-                                // Drop the old sender — the encoder thread's
-                                // `i420_rx.recv()` will return Err and the
-                                // thread will exit cleanly.
-                                drop(i420_tx);
-
-                                // Spawn a fresh encoder thread at the new
-                                // dimensions, reusing the same `efr_tx`.
-                                let (new_tx, new_rx) =
-                                    std::sync::mpsc::sync_channel::<(Vec<u8>, Instant)>(4);
-                                i420_tx = new_tx;
-                                let counters_clone = Arc::clone(&bridge_counters);
-                                let shutdown_clone = shutdown_bridge.clone();
-                                spawn_encoder_thread(
-                                    enc_width, enc_height, duration_ms,
-                                    codec_mime_for_bridge,
-                                    new_rx, efr_tx.clone(),
-                                    counters_clone, shutdown_clone,
-                                );
-
-                                if let Some(ref bus) = event_bus {
-                                    bus.send(crate::event::AppEvent::DisplayResize {
-                                        display_id,
-                                        width: enc_width,
-                                        height: enc_height,
-                                    });
-                                }
-                            }
-
-                            let arrived = Instant::now();
-                            let fd = frame.data.clone();
-                            let fw = frame.width;
-                            let fh = frame.height;
-                            let fs = frame.stride;
-                            let i420 = tokio::task::spawn_blocking(move || {
-                                encode::bgra_to_i420(&fd, fw, fh, fs)
-                            }).await;
-                            if let Ok(i420) = i420 {
-                                if i420_tx.try_send((i420, arrived)).is_err() {
-                                    bridge_counters
-                                        .encode_drops
-                                        .fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-
-            let fanout_counters = Arc::clone(&self.counters);
-            let shutdown_fanout = self.shutdown.clone();
-            let fanout_display_id = self.display_id;
-            let encoder_handle = tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = shutdown_fanout.cancelled() => break,
-                        ef = efr_rx.recv() => {
-                            let Some(ef) = ef else {
-                                // Encoder thread exited (panic, init failure,
-                                // or clean shutdown).  Log and stop the
-                                // BGRA->I420 bridge so the pipeline drains.
-                                eprintln!(
-                                    "[display/fanout] display {} encoder channel \
-                                     closed, fan-out exiting",
-                                    fanout_display_id,
-                                );
-                                break;
-                            };
-                            let peers_guard = peers.read().await;
-                            for peer in peers_guard.values() {
-                                if peer.encoded_frame_tx().try_send(Arc::clone(&ef)).is_err() {
-                                    fanout_counters
-                                        .peer_drops
-                                        .fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    }
-                }
-                bridge_handle.abort();
-            });
-            *self.encoder_handle.lock().await = Some(encoder_handle);
-        }
+        // Store fps and event_bus for deferred encoder startup.
+        // The encoder pipeline is started on the first handle_offer() call
+        // so we know which codec the peer negotiated.
+        *self.fps.lock().await = fps;
+        *self.encoder_event_bus.lock().await = event_bus_for_encoder;
 
         // --- Task 3: FrameRegistry sampler (1 Hz JPEG for model feeds) ---
         if let Some(registry) = frame_registry {
@@ -828,11 +694,169 @@ impl DisplaySession {
         Ok(png_buf.into_inner())
     }
 
+    /// Start the encoder pipeline with the given codec.
+    ///
+    /// Called on the first `handle_offer()` so the encoder matches the
+    /// negotiated codec.  Subsequent calls are no-ops (guarded by
+    /// `encoder_started`).
+    async fn ensure_encoder_running(&self, codec_mime: &'static str) {
+        if self.encoder_started.swap(true, Ordering::SeqCst) {
+            return; // already running
+        }
+
+        let fps = *self.fps.lock().await;
+        let event_bus = self.encoder_event_bus.lock().await.clone();
+
+        let (width, height) = self.backend.resolution();
+        let mut broadcast_rx = self.frame_tx.subscribe();
+        let peers = Arc::clone(&self.peers);
+
+        let duration_ms = if fps > 0 { 1000 / fps as u64 } else { 33 };
+
+        // Encoded frame channel -- survives encoder restarts.  The fanout
+        // task reads from `efr_rx`; each encoder thread gets a clone of
+        // `efr_tx` so dropping+respawning the encoder thread does not
+        // close the channel.
+        let (efr_tx, mut efr_rx) = mpsc::channel::<Arc<EncodedFrame>>(16);
+
+        // Spawn the initial encoder thread.
+        let (i420_tx, i420_rx) =
+            std::sync::mpsc::sync_channel::<(Vec<u8>, Instant)>(4);
+
+        let enc_counters = Arc::clone(&self.counters);
+        let encoder_shutdown = self.shutdown.clone();
+        spawn_encoder_thread(
+            width, height, duration_ms,
+            codec_mime,
+            i420_rx, efr_tx.clone(),
+            Arc::clone(&enc_counters), encoder_shutdown,
+        );
+
+        let bridge_counters = Arc::clone(&self.counters);
+        let shutdown_bridge = self.shutdown.clone();
+        let frame_interval = std::time::Duration::from_millis(
+            if fps > 0 { 1000 / fps as u64 } else { 33 },
+        );
+        let display_id = self.display_id;
+        let codec_mime_for_bridge = codec_mime;
+        let bridge_handle = tokio::spawn(async move {
+            let mut last_encode = tokio::time::Instant::now();
+            // Track current encoder dimensions for resize detection.
+            let mut enc_width = width;
+            let mut enc_height = height;
+            let mut i420_tx = i420_tx;
+            loop {
+                tokio::select! {
+                    _ = shutdown_bridge.cancelled() => break,
+                    result = broadcast_rx.recv() => {
+                        if last_encode.elapsed() < frame_interval {
+                            continue;
+                        }
+                        last_encode = tokio::time::Instant::now();
+                        let frame = match result {
+                            Ok(f) => f,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        };
+
+                        // -- Resize detection --
+                        // Round to even dimensions for codec compatibility.
+                        let frame_w = frame.width & !1;
+                        let frame_h = frame.height & !1;
+                        if frame_w > 0 && frame_h > 0
+                            && (frame_w != enc_width || frame_h != enc_height)
+                        {
+                            eprintln!(
+                                "[display/bridge] resolution changed {}x{} -> {}x{}, recreating encoder",
+                                enc_width, enc_height, frame_w, frame_h,
+                            );
+                            enc_width = frame_w;
+                            enc_height = frame_h;
+
+                            // Drop the old sender -- the encoder thread's
+                            // `i420_rx.recv()` will return Err and the
+                            // thread will exit cleanly.
+                            drop(i420_tx);
+
+                            // Spawn a fresh encoder thread at the new
+                            // dimensions, reusing the same `efr_tx`.
+                            let (new_tx, new_rx) =
+                                std::sync::mpsc::sync_channel::<(Vec<u8>, Instant)>(4);
+                            i420_tx = new_tx;
+                            let counters_clone = Arc::clone(&bridge_counters);
+                            let shutdown_clone = shutdown_bridge.clone();
+                            spawn_encoder_thread(
+                                enc_width, enc_height, duration_ms,
+                                codec_mime_for_bridge,
+                                new_rx, efr_tx.clone(),
+                                counters_clone, shutdown_clone,
+                            );
+
+                            if let Some(ref bus) = event_bus {
+                                bus.send(crate::event::AppEvent::DisplayResize {
+                                    display_id,
+                                    width: enc_width,
+                                    height: enc_height,
+                                });
+                            }
+                        }
+
+                        let arrived = Instant::now();
+                        let fd = frame.data.clone();
+                        let fw = frame.width;
+                        let fh = frame.height;
+                        let fs = frame.stride;
+                        let i420 = tokio::task::spawn_blocking(move || {
+                            encode::bgra_to_i420(&fd, fw, fh, fs)
+                        }).await;
+                        if let Ok(i420) = i420 {
+                            if i420_tx.try_send((i420, arrived)).is_err() {
+                                bridge_counters
+                                    .encode_drops
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let fanout_counters = Arc::clone(&self.counters);
+        let shutdown_fanout = self.shutdown.clone();
+        let fanout_display_id = self.display_id;
+        let encoder_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_fanout.cancelled() => break,
+                    ef = efr_rx.recv() => {
+                        let Some(ef) = ef else {
+                            eprintln!(
+                                "[display/fanout] display {} encoder channel \
+                                 closed, fan-out exiting",
+                                fanout_display_id,
+                            );
+                            break;
+                        };
+                        let peers_guard = peers.read().await;
+                        for peer in peers_guard.values() {
+                            if peer.encoded_frame_tx().try_send(Arc::clone(&ef)).is_err() {
+                                fanout_counters
+                                    .peer_drops
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+            bridge_handle.abort();
+        });
+        *self.encoder_handle.lock().await = Some(encoder_handle);
+    }
+
     /// Handle a WebRTC SDP offer from a browser peer.
     ///
-    /// Negotiates the codec from the SDP offer, creates a `WebRtcPeer` with the
-    /// selected codec, subscribes it to the encoder output, adds it to the peer
-    /// map, and returns the SDP answer.
+    /// On the first call, selects the best available codec and starts the
+    /// encoder pipeline.  Subsequent peers reuse the running encoder.
     /// Creates a `WebRtcPeer`, subscribes it to the encoder output, adds it to
     /// the peer map, starts clipboard monitoring, and returns the SDP answer.
     pub async fn handle_offer(
@@ -847,8 +871,9 @@ impl DisplaySession {
         let (_encoder, codec_choice) = encode::select_codec(width, height, 2000);
         let codec_mime = codec_choice.mime();
 
-        // Store the negotiated codec for the encoder pipeline.
+        // Store the negotiated codec and start the encoder if not yet running.
         *self.codec_mime.write().await = codec_mime;
+        self.ensure_encoder_running(codec_mime).await;
 
         let backend = Arc::clone(&self.backend);
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> =

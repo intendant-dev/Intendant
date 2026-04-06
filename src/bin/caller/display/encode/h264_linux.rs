@@ -326,10 +326,15 @@ impl Drop for FfmpegH264Encoder {
 
 /// Split a buffer of Annex-B H264 data into individual NAL units.
 ///
-/// Looks for `00 00 00 01` or `00 00 01` start codes.  Incomplete NAL
-/// units at the end of the buffer are left in `buf` for the next call.
+/// Looks for `00 00 00 01` or `00 00 01` start codes.  All NAL units are
+/// returned, including the last one.  This is correct because ffmpeg
+/// processes frames synchronously: we write exactly one I420 frame, then
+/// read all encoded output for that frame.  The output is always a
+/// complete access unit, so there is no risk of a truncated trailing NAL.
 ///
-/// Returns `(nal_data_without_start_code, is_idr)` for each complete NAL.
+/// The buffer is cleared after extraction.
+///
+/// Returns `(nal_data_without_start_code, is_idr)` for each NAL.
 fn split_annexb_nals(buf: &mut Vec<u8>) -> Vec<(Vec<u8>, bool)> {
     let mut nals = Vec::new();
 
@@ -356,12 +361,16 @@ fn split_annexb_nals(buf: &mut Vec<u8>) -> Vec<(Vec<u8>, bool)> {
         return nals;
     }
 
-    // Extract complete NAL units (all except the last, which may be incomplete).
-    for w in starts.windows(2) {
-        let (start, sc_len) = w[0];
-        let (next_start, _) = w[1];
+    // Extract all NAL units, including the last one.
+    for idx in 0..starts.len() {
+        let (start, sc_len) = starts[idx];
         let nal_start = start + sc_len;
-        let nal_data = buf[nal_start..next_start].to_vec();
+        let nal_end = if idx + 1 < starts.len() {
+            starts[idx + 1].0
+        } else {
+            buf.len()
+        };
+        let nal_data = buf[nal_start..nal_end].to_vec();
 
         if !nal_data.is_empty() {
             let nal_type = nal_data[0] & 0x1F;
@@ -370,10 +379,8 @@ fn split_annexb_nals(buf: &mut Vec<u8>) -> Vec<(Vec<u8>, bool)> {
         }
     }
 
-    // Keep the last NAL (potentially incomplete) in the buffer.
-    let (last_start, _) = starts[starts.len() - 1];
-    let remainder = buf[last_start..].to_vec();
-    *buf = remainder;
+    // All NALs consumed -- clear the buffer.
+    buf.clear();
 
     nals
 }
@@ -383,7 +390,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_annexb_single_complete() {
+    fn split_annexb_all_nals_emitted() {
         // Two NAL units separated by 4-byte start codes.
         let mut buf = vec![
             0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A, // SPS
@@ -391,12 +398,14 @@ mod tests {
         ];
 
         let nals = split_annexb_nals(&mut buf);
-        assert_eq!(nals.len(), 1); // Only first NAL is "complete"
+        assert_eq!(nals.len(), 2); // Both NALs emitted
         assert_eq!(nals[0].0, vec![0x67, 0x42, 0x00, 0x0A]); // SPS
         assert!(!nals[0].1); // SPS is not IDR
+        assert_eq!(nals[1].0, vec![0x68, 0xCE, 0x38, 0x80]); // PPS
+        assert!(!nals[1].1); // PPS is not IDR
 
-        // Remainder should be the second start code + PPS.
-        assert_eq!(buf, vec![0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x38, 0x80]);
+        // Buffer should be cleared.
+        assert!(buf.is_empty());
     }
 
     #[test]
@@ -408,8 +417,10 @@ mod tests {
         ];
 
         let nals = split_annexb_nals(&mut buf);
-        assert_eq!(nals.len(), 1);
+        assert_eq!(nals.len(), 2);
         assert!(nals[0].1); // First NAL is IDR
+        assert!(!nals[1].1); // Second NAL is non-IDR
+        assert!(buf.is_empty());
     }
 
     #[test]
