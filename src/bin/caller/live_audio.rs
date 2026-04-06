@@ -1426,6 +1426,9 @@ pub async fn run_session(
     // Silence watchdog state
     let mut last_model_output = Instant::now();
     let mut silence_nudged = false;
+    // Turn counter: nudge the model to emit JSON after enough turns
+    let mut turn_complete_count = 0u32;
+    let mut json_nudged = false;
 
     // Event processing loop
     let status = loop {
@@ -1491,15 +1494,12 @@ pub async fn run_session(
                     break LiveAudioStatus::Failed(e);
                 }
                 LiveAudioEvent::TurnComplete => {
+                    turn_complete_count += 1;
+
                     // Check if the model has output a complete JSON response.
-                    // Realtime models may deliver JSON via text (response.text.delta)
-                    // or via audio transcript (response.audio_transcript.delta) —
-                    // check both, preferring explicit text output.
                     let json_source = if !model_text.is_empty() {
                         Some(&model_text)
                     } else {
-                        // Extract JSON from transcript: the model may speak prose
-                        // before/after the JSON object, so find the outermost { ... }.
                         None
                     };
 
@@ -1519,7 +1519,16 @@ pub async fn run_session(
                             break LiveAudioStatus::Completed;
                         }
                     }
-                    // Otherwise continue listening for more turns
+
+                    // After several turns without JSON, nudge the model to
+                    // wrap up and emit the structured response. The model may
+                    // keep making small talk indefinitely otherwise.
+                    if turn_complete_count >= 6 && !json_nudged {
+                        json_nudged = true;
+                        let _ = session.send_text(
+                            "The conversation is complete. Stop speaking and output ONLY the JSON response object now."
+                        ).await;
+                    }
                 }
                 LiveAudioEvent::Interrupted => {}
                 LiveAudioEvent::Connected | LiveAudioEvent::SetupComplete => {}
