@@ -4176,10 +4176,10 @@ async fn run_external_agent_mode(
     session_log: SharedSessionLog,
     _log_dir: PathBuf,
     mut follow_up_rx: FollowUpReceiver,
-    _json_approval: Option<JsonApprovalSlot>,
+    json_approval: Option<JsonApprovalSlot>,
     approval_registry: event::ApprovalRegistry,
     headless: bool,
-    web_port: u16,
+    web_port: Option<u16>,
 ) -> Result<LoopStats, CallerError> {
     use external_agent::{AgentBackend, AgentConfig, AgentEvent, ApprovalCategory, ApprovalDecision};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4202,14 +4202,14 @@ async fn run_external_agent_mode(
                 cfg.model.clone(),
                 cfg.approval_policy.clone(),
                 cfg.sandbox != "dangerFullAccess",
-                Some(web_port),
+                web_port,
             ));
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
                 approval_policy: cfg.approval_policy.clone(),
                 sandbox: cfg.sandbox != "dangerFullAccess",
-                web_port: Some(web_port),
+                web_port,
             };
             (agent, config)
         }
@@ -4304,20 +4304,30 @@ async fn run_external_agent_mode(
                             if let Err(e) = agent.resolve_approval(&request_id, ApprovalDecision::Accept).await {
                                 slog(&session_log, |l| l.warn(&format!("Failed to auto-approve: {}", e)));
                             }
+                        } else if headless && json_approval.is_none() {
+                            // Headless non-JSON: no way to ask user, auto-deny
+                            slog(&session_log, |l| l.warn(&format!("Headless auto-deny: {}", command)));
+                            bus.send(AppEvent::ApprovalResolved { id: 0, action: "deny".to_string() });
+                            let _ = agent.resolve_approval(&request_id, ApprovalDecision::Decline).await;
                         } else {
                             let id = approval_counter.fetch_add(1, Ordering::Relaxed);
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            {
-                                let mut registry = approval_registry.lock().unwrap();
-                                registry.insert(id, tx);
-                            }
                             bus.send(AppEvent::ApprovalRequired {
                                 id,
                                 command_preview: command.clone(),
                                 category: cat,
                             });
 
-                            // Wait for approval response
+                            // Wait for approval: JSON slot (headless) or registry (TUI/web)
+                            let rx = if let Some(ref slot) = json_approval {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                { let mut guard = slot.lock().unwrap(); *guard = Some((id, tx)); }
+                                rx
+                            } else {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                { approval_registry.lock().unwrap().insert(id, tx); }
+                                rx
+                            };
+
                             match rx.await {
                                 Ok(response) => {
                                     let (decision, action_str) = match response {
@@ -4343,7 +4353,6 @@ async fn run_external_agent_mode(
                         }
                     }
                     AgentEvent::FileApprovalRequest { request_id, path, diff } => {
-                        // Handle file approval the same as command approval but with FileWrite category
                         let cat = autonomy::ActionCategory::FileWrite;
                         let needs = {
                             let state = autonomy.read().await;
@@ -4357,18 +4366,27 @@ async fn run_external_agent_mode(
                             if let Err(e) = agent.resolve_approval(&request_id, ApprovalDecision::Accept).await {
                                 slog(&session_log, |l| l.warn(&format!("Failed to auto-approve file change: {}", e)));
                             }
+                        } else if headless && json_approval.is_none() {
+                            slog(&session_log, |l| l.warn(&format!("Headless auto-deny: {}", preview)));
+                            bus.send(AppEvent::ApprovalResolved { id: 0, action: "deny".to_string() });
+                            let _ = agent.resolve_approval(&request_id, ApprovalDecision::Decline).await;
                         } else {
                             let id = approval_counter.fetch_add(1, Ordering::Relaxed);
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            {
-                                let mut registry = approval_registry.lock().unwrap();
-                                registry.insert(id, tx);
-                            }
                             bus.send(AppEvent::ApprovalRequired {
                                 id,
                                 command_preview: format!("{}\n{}", preview, diff),
                                 category: cat,
                             });
+
+                            let rx = if let Some(ref slot) = json_approval {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                { let mut guard = slot.lock().unwrap(); *guard = Some((id, tx)); }
+                                rx
+                            } else {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                { approval_registry.lock().unwrap().insert(id, tx); }
+                                rx
+                            };
 
                             match rx.await {
                                 Ok(response) => {
@@ -5578,6 +5596,8 @@ async fn main() -> Result<(), CallerError> {
     } else {
         (flags.web_port, None)
     };
+    // Only expose the web port to external agents when the web gateway is actually running.
+    let web_port_for_agent: Option<u16> = if use_web { Some(web_port) } else { None };
 
     let provider_result = provider::select_provider();
     let provider = match provider_result {
@@ -5898,7 +5918,7 @@ async fn main() -> Result<(), CallerError> {
                             None,
                             approval_registry,
                             false,
-                            web_port,
+                            web_port_for_agent,
                         )
                         .await
                     } else if use_orchestration {
@@ -6393,7 +6413,7 @@ async fn main() -> Result<(), CallerError> {
                         None,
                         approval_registry_clone,
                         false, // not headless — TUI handles approval
-                        web_port,
+                        web_port_for_agent,
                     )
                     .await
                 } else {
@@ -6586,7 +6606,7 @@ async fn main() -> Result<(), CallerError> {
                                             backend, new_task.clone(), new_project,
                                             bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
                                             new_log_dir, follow_up_rx, None,
-                                            event::ApprovalRegistry::default(), true, web_port,
+                                            event::ApprovalRegistry::default(), true, web_port_for_agent,
                                         ).await
                                     } else {
                                         let new_provider = match provider::select_provider() {
@@ -6853,7 +6873,7 @@ async fn main() -> Result<(), CallerError> {
                 json_approval_slot,
                 event::ApprovalRegistry::default(),
                 true, // headless mode
-                web_port,
+                web_port_for_agent,
             )
             .await
         } else {
@@ -7032,7 +7052,7 @@ async fn main() -> Result<(), CallerError> {
                                             backend, new_task.clone(), new_project,
                                             bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
                                             new_log_dir, follow_up_rx, None,
-                                            event::ApprovalRegistry::default(), true, web_port,
+                                            event::ApprovalRegistry::default(), true, web_port_for_agent,
                                         ).await
                                     } else {
                                         let new_provider = match provider::select_provider() {

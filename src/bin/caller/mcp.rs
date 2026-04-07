@@ -2274,6 +2274,21 @@ pub struct StartTaskParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TakeDisplayParams {
+    /// Display ID to claim (e.g. 99 for virtual display :99).
+    pub display_id: u32,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReleaseDisplayParams {
+    /// Display ID to release.
+    pub display_id: u32,
+    /// Optional note explaining why control was released.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TakeScreenshotParams {
     /// Display target: "user_session", ":99", etc. Auto-detects if omitted.
     #[serde(default)]
@@ -2499,6 +2514,15 @@ impl IntendantServer {
             }
             "get_controller_loop_status" => Ok(self.get_controller_loop_status().await),
             "reload" => Ok(self.reload().await),
+            "list_displays" => Ok(self.list_displays().await),
+            "take_display" => {
+                let params: TakeDisplayParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.take_display(Parameters(params)).await)
+            }
+            "release_display" => {
+                let params: ReleaseDisplayParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.release_display(Parameters(params)).await)
+            }
             "take_screenshot" => {
                 let params: TakeScreenshotParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
                 Ok(self.take_screenshot(Parameters(params)).await)
@@ -3224,6 +3248,35 @@ impl IntendantServer {
         });
 
         "ok - reloading in-place (MCP connection preserved)".to_string()
+    }
+
+    #[tool(description = "Enumerate available displays with their IDs, names, and resolutions.")]
+    async fn list_displays(&self) -> String {
+        let displays = crate::display::enumerate_displays().await;
+        serde_json::to_string_pretty(&displays).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    #[tool(description = "Claim control of a virtual display by ID (e.g. 99 for :99).")]
+    async fn take_display(
+        &self,
+        Parameters(params): Parameters<TakeDisplayParams>,
+    ) -> String {
+        self.bus.send(AppEvent::DisplayTaken {
+            display_id: params.display_id,
+        });
+        format!("Took control of :{}", params.display_id)
+    }
+
+    #[tool(description = "Release control of a virtual display.")]
+    async fn release_display(
+        &self,
+        Parameters(params): Parameters<ReleaseDisplayParams>,
+    ) -> String {
+        self.bus.send(AppEvent::DisplayReleased {
+            display_id: params.display_id,
+            note: params.note.clone(),
+        });
+        format!("Released control of :{}", params.display_id)
     }
 
     #[tool(description = "Take a screenshot of a display. Returns base64-encoded image data.")]
