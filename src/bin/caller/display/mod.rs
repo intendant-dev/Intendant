@@ -876,6 +876,9 @@ impl DisplaySession {
             let mut init = self.encoder_init_lock.lock().await;
             if *init {
                 // Encoder already running -- verify the new peer supports it.
+                // NOTE: name-only check (e.g. "H264"). Does not validate
+                // fmtp parameters (profile-level-id, packetization-mode).
+                // See encode::select_codec() doc for details.
                 let locked_mime = *self.codec_mime.read().await;
                 let browser_codecs = encode::parse_offered_codecs(sdp);
                 let locked_name = locked_mime.split('/').last().unwrap_or("");

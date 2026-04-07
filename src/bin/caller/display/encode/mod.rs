@@ -70,6 +70,13 @@ pub fn select_codec_for_mime(
 /// then intersects with locally available encoders.  Tries H264 first (if
 /// the browser offered it *and* a local encoder is available), falls back to
 /// VP8 (universally supported by all WebRTC browsers).
+///
+/// **Limitation**: H264 matching is name-only (checks `a=rtpmap:` for "H264").
+/// It does not validate `a=fmtp:` parameters like `profile-level-id` or
+/// `packetization-mode`. Our encoders produce Constrained Baseline / Level 4.1
+/// / packetization-mode 1, which is the WebRTC mandatory-to-support profile
+/// and works with all mainstream browsers. Full fmtp negotiation is a
+/// follow-up item.
 pub fn select_codec(
     offer_sdp: &str,
     width: u32,
@@ -103,6 +110,8 @@ pub fn select_codec(
 /// Parse `a=rtpmap:` lines from an SDP offer to extract codec names.
 ///
 /// Returns codec names such as `"VP8"`, `"VP9"`, `"H264"`, `"AV1"`.
+/// Does NOT parse `a=fmtp:` parameters — see `select_codec()` doc for
+/// the limitation on H264 profile/level matching.
 pub fn parse_offered_codecs(sdp: &str) -> Vec<String> {
     let mut codecs = Vec::new();
     for line in sdp.lines() {
