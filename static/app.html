@@ -4265,6 +4265,7 @@ class DisplaySlot {
     const vid = this.videoEl;
     vid.tabIndex = 0;
     vid.focus();
+    this._heldModifiers = new Set();
 
     const normalize = (e) => {
       const rect = vid.getBoundingClientRect();
@@ -4285,12 +4286,20 @@ class DisplaySlot {
       }
     };
 
+    // NOTE: Both `code` (physical key position) and `key` (logical character) are sent
+    // in KeyDown/KeyUp events. Backends currently use `code` only for physical key
+    // injection (xdotool key / CGEvent keycode). Using `key` for character-based text
+    // input (e.g. xdotool type, CGEvent character input) is a follow-up.
     this._boundHandlers.keydown = (e) => {
       e.preventDefault();
+      if (['ShiftLeft','ShiftRight','ControlLeft','ControlRight','AltLeft','AltRight','MetaLeft','MetaRight'].includes(e.code)) {
+        this._heldModifiers.add(e.code);
+      }
       sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
     };
     this._boundHandlers.keyup = (e) => {
       e.preventDefault();
+      this._heldModifiers.delete(e.code);
       sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
     };
     this._boundHandlers.pointerdown = (e) => {
@@ -4328,6 +4337,22 @@ class DisplaySlot {
     };
     this._boundHandlers.contextmenu = (e) => e.preventDefault();
 
+    // Release all held modifier keys when the video element loses focus
+    // (e.g. Alt+Tab away). Without this, the remote side thinks modifiers
+    // are still held because no keyup event fires for them.
+    this._boundHandlers.blur = () => {
+      for (const code of this._heldModifiers) {
+        sendControl({ t: 'ku', code, key: '', shift: false, ctrl: false, alt: false, meta: false });
+      }
+      this._heldModifiers.clear();
+    };
+
+    // Re-focus the video element when the pointer enters it while interactive.
+    // This restores keyboard input after Alt+Tab back to the dashboard.
+    this._boundHandlers.pointerenter = () => {
+      if (this.interactive) vid.focus();
+    };
+
     // Clipboard: intercept paste events and send to remote display
     this._boundHandlers.paste = (e) => {
       const text = e.clipboardData?.getData('text');
@@ -4346,6 +4371,7 @@ class DisplaySlot {
 
   releaseControl() {
     this.interactive = false;
+    if (this._heldModifiers) this._heldModifiers.clear();
     const vid = this.videoEl;
     for (const [evt, handler] of Object.entries(this._boundHandlers)) {
       if (evt === 'paste') {
