@@ -119,10 +119,17 @@ export class PresenceWeb {
         return ret;
     }
     /**
-     * Grant agent access to the user's session display.
+     * Grant agent access to the user's session display (primary / id 0).
      */
     grant_user_display() {
         wasm.presenceweb_grant_user_display(this.__wbg_ptr);
+    }
+    /**
+     * Grant agent access to a specific user display by ID.
+     * @param {number} display_id
+     */
+    grant_user_display_with_id(display_id) {
+        wasm.presenceweb_grant_user_display_with_id(this.__wbg_ptr, display_id);
     }
     /**
      * Handle live model usage from Gemini Live / OpenAI Realtime.

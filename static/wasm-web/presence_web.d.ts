@@ -33,9 +33,13 @@ export class PresenceWeb {
      */
     get_tools(): any;
     /**
-     * Grant agent access to the user's session display.
+     * Grant agent access to the user's session display (primary / id 0).
      */
     grant_user_display(): void;
+    /**
+     * Grant agent access to a specific user display by ID.
+     */
+    grant_user_display_with_id(display_id: number): void;
     /**
      * Handle live model usage from Gemini Live / OpenAI Realtime.
      * Updates dashboard state, sends to server, returns `UiCommand[]`.
@@ -283,6 +287,7 @@ export interface InitOutput {
     readonly presenceweb_get_state: (a: number) => any;
     readonly presenceweb_get_tools: (a: number) => any;
     readonly presenceweb_grant_user_display: (a: number) => void;
+    readonly presenceweb_grant_user_display_with_id: (a: number, b: number) => void;
     readonly presenceweb_handle_live_usage: (a: number, b: any) => any;
     readonly presenceweb_handle_server_event: (a: number, b: any) => number;
     readonly presenceweb_handle_server_message: (a: number, b: any) => any;

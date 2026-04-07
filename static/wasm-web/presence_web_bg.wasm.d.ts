@@ -12,6 +12,7 @@ export const presenceweb_get_prompt: (a: number) => [number, number];
 export const presenceweb_get_state: (a: number) => any;
 export const presenceweb_get_tools: (a: number) => any;
 export const presenceweb_grant_user_display: (a: number) => void;
+export const presenceweb_grant_user_display_with_id: (a: number, b: number) => void;
 export const presenceweb_handle_live_usage: (a: number, b: any) => any;
 export const presenceweb_handle_server_event: (a: number, b: any) => number;
 export const presenceweb_handle_server_message: (a: number, b: any) => any;

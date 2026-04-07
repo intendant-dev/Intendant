@@ -78,6 +78,31 @@ html, body {
 .status-bar .autonomy { font-weight: 600; }
 .status-bar .sep { color: var(--surface2); }
 .status-bar .field-label { color: var(--overlay0); font-size: 10px; margin-right: -6px; }
+.display-toggle-wrap { position: relative; display: inline-flex; align-items: center; }
+.display-picker {
+  display: none;
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--surface0);
+  border: 1px solid var(--surface2);
+  border-radius: 6px;
+  padding: 4px 0;
+  z-index: 200;
+  min-width: 200px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+}
+.display-picker.visible { display: block; }
+.display-picker-item {
+  padding: 6px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text);
+}
+.display-picker-item:hover { background: var(--surface1); }
+.display-picker-item .dp-primary { color: var(--green); font-size: 10px; margin-left: 4px; }
 .budget-bar {
   display: inline-flex;
   align-items: center;
@@ -2104,8 +2129,11 @@ html, body {
     <span class="field-label">autonomy</span>
     <span class="autonomy" id="sb-autonomy">Medium</span>
     <span class="sep">|</span>
-    <span class="field-label" id="sb-display-label" style="cursor:pointer" onclick="toggleUserDisplay()" title="Your display (d) — grant/revoke agent access to your screen for computer use tasks">your display</span>
-    <span id="sb-display-access" style="cursor:pointer;font-weight:600;color:#f38ba8" onclick="toggleUserDisplay()" title="Your display (d) — grant/revoke agent access to your screen for computer use tasks">off</span>
+    <span class="display-toggle-wrap">
+      <span class="field-label" id="sb-display-label" style="cursor:pointer" onclick="toggleUserDisplay()" title="Your display (d) — grant/revoke agent access to your screen for computer use tasks">your display</span>
+      <span id="sb-display-access" style="cursor:pointer;font-weight:600;color:#f38ba8" onclick="toggleUserDisplay()" title="Your display (d) — grant/revoke agent access to your screen for computer use tasks">off</span>
+      <div class="display-picker" id="display-picker"></div>
+    </span>
     <span class="sep">|</span>
     <span class="field-label">session</span>
     <span class="session" id="sb-session"></span>
@@ -7716,15 +7744,68 @@ window.sendFollowUp = function() {
 
 // ── User display access toggle ──
 let userDisplayGranted = false;
+let displayPickerVisible = false;
+let cachedDisplays = null;
+
+function hideDisplayPicker() {
+  const picker = document.getElementById('display-picker');
+  picker.classList.remove('visible');
+  displayPickerVisible = false;
+}
+
+function showDisplayPicker(displays) {
+  const picker = document.getElementById('display-picker');
+  picker.innerHTML = '';
+  for (const d of displays) {
+    const item = document.createElement('div');
+    item.className = 'display-picker-item';
+    const label = d.name + ' (' + d.width + 'x' + d.height + ')';
+    item.textContent = label;
+    if (d.is_primary) {
+      const badge = document.createElement('span');
+      badge.className = 'dp-primary';
+      badge.textContent = 'primary';
+      item.appendChild(badge);
+    }
+    item.addEventListener('click', (e) => {
+      e.stopPropagation();
+      hideDisplayPicker();
+      if (!app) return;
+      app.grant_user_display_with_id(d.id);
+      setUserDisplayState(true);
+    });
+    picker.appendChild(item);
+  }
+  picker.classList.add('visible');
+  displayPickerVisible = true;
+}
+
 window.toggleUserDisplay = function() {
   if (!app) return;
   if (userDisplayGranted) {
     app.revoke_user_display();
     setUserDisplayState(false);
-  } else {
-    app.grant_user_display();
-    setUserDisplayState(true);
+    return;
   }
+  // Fetch available displays, show picker if multiple
+  fetch('/api/displays')
+    .then(r => r.json())
+    .then(displays => {
+      cachedDisplays = displays;
+      if (!displays || displays.length <= 1) {
+        // Single display or fallback: grant immediately (unchanged behavior)
+        app.grant_user_display();
+        setUserDisplayState(true);
+      } else {
+        // Multiple displays: show picker
+        showDisplayPicker(displays);
+      }
+    })
+    .catch(() => {
+      // Fetch failed: fall back to granting default display
+      app.grant_user_display();
+      setUserDisplayState(true);
+    });
 };
 function setUserDisplayState(granted) {
   userDisplayGranted = granted;
@@ -7737,6 +7818,16 @@ function setUserDisplayState(granted) {
     el.style.color = '#f38ba8'; // red
   }
 }
+
+// Dismiss display picker on click outside or Escape
+document.addEventListener('click', (e) => {
+  if (!displayPickerVisible) return;
+  const picker = document.getElementById('display-picker');
+  if (!picker.contains(e.target)) hideDisplayPicker();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && displayPickerVisible) hideDisplayPicker();
+});
 
 // Enter to submit
 document.querySelectorAll('#human-input, #followup-input').forEach(ta => {

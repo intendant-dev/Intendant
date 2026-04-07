@@ -3241,6 +3241,23 @@ pub fn spawn_web_gateway(
                             );
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
+                    } else if request_line.contains("/api/displays") {
+                        // Display enumeration endpoint
+                        use tokio::io::AsyncWriteExt;
+                        let displays = crate::display::enumerate_displays().await;
+                        let body = serde_json::to_string(&displays).unwrap_or_else(|_| "[]".to_string());
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/api/sessions") {
                         // Session listing endpoint
                         let body = list_sessions();
