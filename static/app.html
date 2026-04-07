@@ -4144,8 +4144,21 @@ class DisplaySlot {
     this.clipboardChannel.onmessage = (e) => {
       try {
         const d = JSON.parse(e.data);
-        if (d.t === 'clipboard_update' && d.text !== undefined && this.interactive) {
-          navigator.clipboard.writeText(d.text).catch(() => {});
+        if (d.t === 'clipboard_update' && this.interactive) {
+          const mime = d.mime || 'text/plain';
+          if (mime.startsWith('image/') && d.data) {
+            // Image clipboard: decode base64 and write as ClipboardItem.
+            try {
+              const binary = atob(d.data);
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+              const blob = new Blob([bytes], { type: mime });
+              const item = new ClipboardItem({ [mime]: blob });
+              navigator.clipboard.write([item]).catch(() => {});
+            } catch {}
+          } else if (d.text !== undefined) {
+            navigator.clipboard.writeText(d.text).catch(() => {});
+          }
         }
       } catch {}
     };
@@ -4355,9 +4368,39 @@ class DisplaySlot {
 
     // Clipboard: intercept paste events and send to remote display
     this._boundHandlers.paste = (e) => {
+      if (this.clipboardChannel?.readyState !== 'open') return;
+      // Check for image content first.
+      if (e.clipboardData?.items) {
+        for (const item of e.clipboardData.items) {
+          if (item.type.startsWith('image/')) {
+            const blob = item.getAsFile();
+            if (!blob) continue;
+            // 5 MB size limit.
+            if (blob.size > 5 * 1024 * 1024) {
+              console.warn('[clipboard] skipping image paste: exceeds 5 MB limit');
+              e.preventDefault();
+              return;
+            }
+            const mime = item.type;
+            const reader = new FileReader();
+            reader.onload = () => {
+              const base64 = reader.result.split(',')[1];
+              if (base64 && this.clipboardChannel?.readyState === 'open') {
+                this.clipboardChannel.send(JSON.stringify({
+                  t: 'clipboard_set', mime, data: base64
+                }));
+              }
+            };
+            reader.readAsDataURL(blob);
+            e.preventDefault();
+            return;
+          }
+        }
+      }
+      // Fall back to text.
       const text = e.clipboardData?.getData('text');
-      if (text !== undefined && this.clipboardChannel?.readyState === 'open') {
-        this.clipboardChannel.send(JSON.stringify({t: 'clipboard_set', text}));
+      if (text !== undefined) {
+        this.clipboardChannel.send(JSON.stringify({t: 'clipboard_set', mime: 'text/plain', text}));
         e.preventDefault();
       }
     };

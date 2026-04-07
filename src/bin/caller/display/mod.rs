@@ -928,12 +928,21 @@ impl DisplaySession {
 
         // Clipboard handler: browser -> remote clipboard.
         let clipboard_monitor = Arc::clone(&self.clipboard_monitor);
-        let clipboard_handler: Arc<dyn Fn(String) + Send + Sync> =
-            Arc::new(move |text: String| {
+        let clipboard_handler: Arc<dyn Fn(clipboard::ClipboardContent) + Send + Sync> =
+            Arc::new(move |content: clipboard::ClipboardContent| {
                 let monitor = Arc::clone(&clipboard_monitor);
                 tokio::spawn(async move {
-                    if let Err(e) = monitor.set_text(&text).await {
-                        eprintln!("[display/clipboard] set_text failed: {e}");
+                    match content {
+                        clipboard::ClipboardContent::Text(text) => {
+                            if let Err(e) = monitor.set_text(&text).await {
+                                eprintln!("[display/clipboard] set_text failed: {e}");
+                            }
+                        }
+                        clipboard::ClipboardContent::Image { mime, data } => {
+                            if let Err(e) = monitor.set_image(&mime, &data).await {
+                                eprintln!("[display/clipboard] set_image failed: {e}");
+                            }
+                        }
                     }
                 });
             });
@@ -977,11 +986,11 @@ impl DisplaySession {
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
-                    text = rx.recv() => {
-                        let Some(text) = text else { break };
+                    content = rx.recv() => {
+                        let Some(content) = content else { break };
                         let peers_guard = peers.read().await;
                         for peer in peers_guard.values() {
-                            if let Err(e) = peer.send_clipboard(&text).await {
+                            if let Err(e) = peer.send_clipboard(&content).await {
                                 eprintln!("[display/clipboard] send to peer failed: {e}");
                             }
                         }

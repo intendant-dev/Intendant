@@ -1,3 +1,4 @@
+use super::clipboard::ClipboardContent;
 use super::{EncodedFrame, IceConfig, InputEvent, PeerId};
 use crate::error::CallerError;
 use std::sync::Arc;
@@ -49,15 +50,15 @@ impl WebRtcPeer {
     /// `input_handler` is invoked for each `InputEvent` received on the peer's
     /// data channels.
     ///
-    /// `clipboard_handler` is invoked when the browser sends clipboard text via
-    /// the `clipboard` data channel.
+    /// `clipboard_handler` is invoked when the browser sends clipboard content
+    /// (text or image) via the `clipboard` data channel.
     pub async fn new(
         peer_id: PeerId,
         offer_sdp: &str,
         codec_mime: &str,
         ice_config: &IceConfig,
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
-        clipboard_handler: Arc<dyn Fn(String) + Send + Sync>,
+        clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
         ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<(Self, String), CallerError> {
         // --- Media engine ---
@@ -182,11 +183,30 @@ impl WebRtcPeer {
                         *setter.lock().await = Some(Arc::clone(&dc));
                         dc.on_message(Box::new(move |msg: DataChannelMessage| {
                             if let Ok(text) = std::str::from_utf8(&msg.data) {
-                                // Parse {"t":"clipboard_set","text":"..."}
+                                // Parse clipboard_set messages (text or image).
                                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
                                     if parsed.get("t").and_then(|v| v.as_str()) == Some("clipboard_set") {
-                                        if let Some(clipboard_text) = parsed.get("text").and_then(|v| v.as_str()) {
-                                            handler(clipboard_text.to_string());
+                                        let mime = parsed
+                                            .get("mime")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("text/plain");
+                                        if mime.starts_with("image/") {
+                                            // Image clipboard: base64-encoded data.
+                                            if let Some(b64) = parsed.get("data").and_then(|v| v.as_str()) {
+                                                use base64::Engine;
+                                                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                                                    handler(ClipboardContent::Image {
+                                                        mime: mime.to_string(),
+                                                        data: bytes,
+                                                    });
+                                                }
+                                            }
+                                        } else if let Some(clipboard_text) =
+                                            parsed.get("text").and_then(|v| v.as_str())
+                                        {
+                                            handler(ClipboardContent::Text(
+                                                clipboard_text.to_string(),
+                                            ));
                                         }
                                     }
                                 }
@@ -333,13 +353,24 @@ impl WebRtcPeer {
     ///
     /// Returns `Ok(true)` if the message was sent, `Ok(false)` if no clipboard
     /// channel is available yet, or `Err` on send failure.
-    pub async fn send_clipboard(&self, text: &str) -> Result<bool, CallerError> {
+    pub async fn send_clipboard(&self, content: &ClipboardContent) -> Result<bool, CallerError> {
         let guard = self.clipboard_channel.lock().await;
         if let Some(ref dc) = *guard {
-            let msg = serde_json::json!({
-                "t": "clipboard_update",
-                "text": text,
-            });
+            let msg = match content {
+                ClipboardContent::Text(text) => serde_json::json!({
+                    "t": "clipboard_update",
+                    "mime": "text/plain",
+                    "text": text,
+                }),
+                ClipboardContent::Image { mime, data } => {
+                    use base64::Engine;
+                    serde_json::json!({
+                        "t": "clipboard_update",
+                        "mime": mime,
+                        "data": base64::engine::general_purpose::STANDARD.encode(data),
+                    })
+                }
+            };
             dc.send_text(msg.to_string())
                 .await
                 .map_err(|e| CallerError::WebRtc(format!("clipboard send: {e}")))?;
