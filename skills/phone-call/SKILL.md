@@ -79,16 +79,18 @@ The audio bridge polls shared memory — it works before the call connects.
 The model hears silence until the caller picks up, then starts speaking.
 This eliminates the 12+ second delay the caller would otherwise experience.
 
-**Key parameters:**
+**Key parameters (ALL required):**
 - `id`: unique session identifier
-- `provider`: `openai` (recommended: gpt-realtime-1.5)
+- `provider`: `openai`
 - `playbook`: the conversation script
-- `response_schema`: fields to extract (see schema format below)
+- `response_schema`: REQUIRED — defines the structured response fields.
+  This is a security boundary: the untrusted voice model's output is
+  validated against this schema. Without it, the call is rejected.
+  See the Response Schema Format section below for the exact JSON structure.
 - `timeout_secs`: max call duration (default 120)
 - `voice`: model voice (e.g. `alloy`, `shimmer`)
-- `initial_message`: Do NOT set this. The model will start speaking
-  when it hears the caller. Setting it causes the model to speak before
-  the call connects — the caller misses the opening words.
+- Do NOT set `initial_message` — the model will start speaking when
+  it hears the caller. Setting it causes speech before the call connects.
 
 ### 5. Process the result
 

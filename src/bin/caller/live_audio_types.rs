@@ -17,7 +17,6 @@ pub struct LiveAudioSpec {
     #[serde(default)]
     pub model: Option<String>,
     pub playbook: String,
-    #[serde(default)]
     pub response_schema: ResponseSchema,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
