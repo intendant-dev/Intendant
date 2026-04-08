@@ -274,7 +274,30 @@ fn replay_session_log(contents: &str) -> Vec<serde_json::Value> {
 
             // ── Agent I/O ──
             "agent_input" => {
-                ("agent", format!("Commands: {}", message), "detail")
+                // Parse the JSON commands and show human-readable previews
+                let display = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(message) {
+                    if let Some(cmds) = parsed.get("commands").and_then(|v| v.as_array()) {
+                        cmds.iter().filter_map(|cmd| {
+                            let func = cmd.get("function").and_then(|v| v.as_str()).unwrap_or("?");
+                            match func {
+                                "execAsAgent" => cmd.get("command").and_then(|v| v.as_str())
+                                    .map(|c| format!("exec: {}", &c[..c.len().min(120)])),
+                                "inspectPath" => cmd.get("path").and_then(|v| v.as_str())
+                                    .map(|p| format!("inspect: {}", p)),
+                                "editFile" | "writeFile" => cmd.get("file_path").and_then(|v| v.as_str())
+                                    .map(|p| format!("{}: {}", func, p)),
+                                "spawn_live_audio" => Some(format!("spawn_live_audio ({})",
+                                    cmd.get("provider").and_then(|v| v.as_str()).unwrap_or("?"))),
+                                _ => Some(func.to_string()),
+                            }
+                        }).collect::<Vec<_>>().join(" | ")
+                    } else {
+                        message.to_string()
+                    }
+                } else {
+                    message.to_string()
+                };
+                ("agent", display, "agent")
             }
             "agent_output" => {
                 // Parse runtime JSON to extract stdout_tail for display.
