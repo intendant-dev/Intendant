@@ -9,12 +9,6 @@ autonomy: full
 
 # Voice Call via App + Live Audio
 
-## Overview
-
-Use computer use to open an app, navigate to a contact, start a voice
-call, then spawn_live_audio to conduct the conversation through Vortex
-Audio. Works with any app that uses system audio devices.
-
 ## Prerequisites
 
 - **Vortex Audio** HAL plugin installed and set as default input AND output
@@ -24,27 +18,64 @@ Audio. Works with any app that uses system audio devices.
 
 ## Steps
 
-### 1. Open the app and navigate to the contact
+### 1. Determine the display scale factor
 
-Use `execAsAgent` to open the app, then `captureScreen` + `cliclick`
-to navigate the UI. Keep it simple — don't write pixel analysis scripts.
-Use captureScreen to see the UI, identify buttons by their position,
-and click them with cliclick.
+Screenshots are in pixel coordinates but `cliclick` uses logical points.
+On Retina displays these differ by a scale factor. Compute it FIRST:
 
 ```bash
-open -a "Element" && sleep 2
+captureScreen  # take a screenshot
 ```
 
-Then capture and click. Typical flow:
-1. captureScreen → see the app
-2. Click the search bar or room list entry
-3. Click the call/voice button (usually a phone icon in the header)
+Then in the same turn or the next:
 
-### 2. IMMEDIATELY call spawn_live_audio
+```bash
+python3 -c "
+from PIL import Image
+import subprocess, json
+img = Image.open('SCREENSHOT_PATH')
+px_w, px_h = img.size
+# Get logical display size
+out = subprocess.check_output(['system_profiler', 'SPDisplaysDataType', '-json'])
+displays = json.loads(out)['SPDisplaysDataType']
+for gpu in displays:
+    for d in gpu.get('spdisplays_ndrvs', []):
+        res = d.get('_spdisplays_resolution', d.get('spdisplays_resolution', ''))
+        if 'x' in res:
+            parts = res.replace(' ','').split('x')
+            log_w = int(parts[0])
+            scale = px_w / log_w
+            print(f'scale={scale} pixel={px_w}x{px_h} logical={log_w}x{px_h//int(scale)}')
+            break
+"
+```
 
-As soon as you click the call button, call `spawn_live_audio` on the
-VERY NEXT command. Do NOT wait, do NOT take another screenshot, do NOT
-read source code. The audio bridge works before the call connects.
+Use this scale factor for ALL subsequent coordinate conversions:
+`cliclick_x = pixel_x / scale`, `cliclick_y = pixel_y / scale`.
+
+### 2. Open the app and navigate to the contact
+
+```bash
+open -a "AppName" && sleep 2
+```
+
+Then use `captureScreen` + `cliclick` to navigate. When you identify
+a target in the screenshot image, estimate its pixel coordinates in the
+image, divide by the scale factor, and pass to cliclick.
+
+### 3. Click the call button and VERIFY
+
+After clicking what you think is the call/voice button:
+1. Take another `captureScreen`
+2. Verify the call UI appeared (ringing screen, call dialog, etc.)
+3. Handle any confirmation dialogs (e.g. "Voice call using: Element Call")
+4. Handle any permission dialogs (e.g. "Allow local network access")
+
+Only proceed to step 4 once you can see the call is actually ringing.
+
+### 4. Call spawn_live_audio
+
+Once the call is confirmed ringing, call `spawn_live_audio`.
 
 **ALL of these parameters are REQUIRED:**
 - `id`: unique session identifier
@@ -55,14 +86,14 @@ read source code. The audio bridge works before the call connects.
 - `voice`: e.g. `alloy`, `shimmer`
 - Do NOT set `initial_message`
 
-### 3. Process the result
+### 5. Process the result
 
 `spawn_live_audio` returns `LiveAudioResult` with `status`:
 - **Completed**: model called `submit_response` with structured data
 - **TimedOut**: exceeded timeout without submitting response
 - **SchemaError**: response didn't match schema
 
-### 4. Clean up
+### 6. Clean up
 
 Hang up the call if still connected (captureScreen + click end call).
 
