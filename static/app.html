@@ -2156,7 +2156,7 @@ html, body {
     </div>
     <span class="sep">|</span>
     <span class="field-label">autonomy</span>
-    <span class="autonomy" id="sb-autonomy">Medium</span>
+    <span class="autonomy" id="sb-autonomy" style="cursor:pointer;text-decoration:underline dotted" onclick="cycleAutonomy()" title="Click to cycle: Low → Medium → High → Full">Medium</span>
     <span class="sep">|</span>
     <span class="display-toggle-wrap">
       <span class="field-label" id="sb-display-label" style="cursor:pointer" onclick="toggleUserDisplay()" title="Your display (d) — grant/revoke agent access to your screen for computer use tasks">your display</span>
@@ -7936,6 +7936,19 @@ function showDisplayPicker(displays) {
   picker.classList.add('visible');
   displayPickerVisible = true;
 }
+
+window.cycleAutonomy = function() {
+  const levels = ['Low', 'Medium', 'High', 'Full'];
+  const el = document.getElementById('sb-autonomy');
+  const current = el.textContent.trim();
+  const idx = levels.indexOf(current);
+  const next = levels[(idx + 1) % levels.length];
+  // Send to server
+  if (app) {
+    app.send_raw(JSON.stringify({action: 'set_autonomy', level: next.toLowerCase()}));
+  }
+  el.textContent = next;
+};
 
 window.toggleUserDisplay = function() {
   if (!app) return;
