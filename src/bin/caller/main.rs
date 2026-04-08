@@ -646,6 +646,35 @@ fn encode_screenshot(result_text: &str) -> Option<Vec<conversation::ImageData>> 
 /// 4. Launch Xvfb, store guard, set DISPLAY
 /// 5. On failure → log warning, let commands fail naturally
 ///
+/// Format raw agent JSON into a human-readable preview for the Activity tab.
+fn format_commands_preview(json_str: &str) -> String {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+        if let Some(cmds) = parsed.get("commands").and_then(|v| v.as_array()) {
+            let parts: Vec<String> = cmds.iter().filter_map(|cmd| {
+                let func = cmd.get("function").and_then(|v| v.as_str()).unwrap_or("?");
+                match func {
+                    "execAsAgent" => cmd.get("command").and_then(|v| v.as_str())
+                        .map(|c| {
+                            let truncated: String = c.chars().take(120).collect();
+                            format!("exec: {}", truncated)
+                        }),
+                    "inspectPath" => cmd.get("path").and_then(|v| v.as_str())
+                        .map(|p| format!("inspect: {}", p)),
+                    "editFile" | "writeFile" => cmd.get("file_path").and_then(|v| v.as_str())
+                        .map(|p| format!("{}: {}", func, p)),
+                    "spawn_live_audio" => Some(format!("spawn_live_audio ({})",
+                        cmd.get("provider").and_then(|v| v.as_str()).unwrap_or("?"))),
+                    _ => Some(func.to_string()),
+                }
+            }).collect();
+            if !parts.is_empty() {
+                return parts.join(" | ");
+            }
+        }
+    }
+    json_str.chars().take(200).collect()
+}
+
 /// We launch on execAsAgent (not just captureScreen) because GUI applications
 /// started in early turns must share the same display that captureScreen will
 /// later capture. Launching only on captureScreen is too late — the app would
@@ -2466,7 +2495,7 @@ async fn run_agent_loop(
             slog(&session_log, |l| l.agent_input(&json_str));
             maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log, bus)
                 .await;
-            let preview = json_str.chars().take(300).collect::<String>();
+            let preview = format_commands_preview(&json_str);
             bus.send(AppEvent::AgentStarted {
                 turn,
                 commands_preview: preview.clone(),
@@ -2836,7 +2865,7 @@ Proceed with explicit assumptions and continue without additional questions."
             maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log, bus)
                 .await;
 
-            let preview = json_str.chars().take(300).collect::<String>();
+            let preview = format_commands_preview(&json_str);
             bus.send(AppEvent::AgentStarted {
                 turn,
                 commands_preview: preview.clone(),

@@ -273,30 +273,16 @@ fn replay_session_log(contents: &str) -> Vec<serde_json::Value> {
             }
 
             // ── Agent I/O ──
-            "agent_input" => {
-                // Parse the JSON commands and show human-readable previews
-                let display = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(message) {
-                    if let Some(cmds) = parsed.get("commands").and_then(|v| v.as_array()) {
-                        cmds.iter().filter_map(|cmd| {
-                            let func = cmd.get("function").and_then(|v| v.as_str()).unwrap_or("?");
-                            match func {
-                                "execAsAgent" => cmd.get("command").and_then(|v| v.as_str())
-                                    .map(|c| format!("exec: {}", &c[..c.len().min(120)])),
-                                "inspectPath" => cmd.get("path").and_then(|v| v.as_str())
-                                    .map(|p| format!("inspect: {}", p)),
-                                "editFile" | "writeFile" => cmd.get("file_path").and_then(|v| v.as_str())
-                                    .map(|p| format!("{}: {}", func, p)),
-                                "spawn_live_audio" => Some(format!("spawn_live_audio ({})",
-                                    cmd.get("provider").and_then(|v| v.as_str()).unwrap_or("?"))),
-                                _ => Some(func.to_string()),
-                            }
-                        }).collect::<Vec<_>>().join(" | ")
-                    } else {
-                        message.to_string()
-                    }
+            "agent_input" => continue, // Superseded by agent_started which has the full commands
+            "agent_started" => {
+                // New sessions have pre-formatted previews; old sessions have raw JSON.
+                // Try to detect raw JSON and format it, otherwise use as-is.
+                let display = if message.starts_with('{') {
+                    crate::format_commands_preview(message)
                 } else {
                     message.to_string()
                 };
+                if display.is_empty() { continue; }
                 ("agent", display, "agent")
             }
             "agent_output" => {
@@ -335,6 +321,10 @@ fn replay_session_log(contents: &str) -> Vec<serde_json::Value> {
             }
 
             // ── Voice / presence lifecycle ──
+            "presence_log" => {
+                if message.is_empty() { continue; }
+                ("presence", message.to_string(), level)
+            }
             "voice_log" => {
                 let text = obj.get("data")
                     .and_then(|d| d.get("text"))

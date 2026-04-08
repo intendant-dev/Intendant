@@ -1129,10 +1129,25 @@ impl AppState {
 /// Parse agent runtime JSON output into human-readable text.
 pub fn format_agent_output(raw: &str) -> String {
     let mut parts = Vec::new();
-    for line in raw.trim().split('\n') {
+    let mut parsed_any_result = false;
+
+    // The runtime outputs one JSON object per result, separated by newlines.
+    // But stdout_tail/stderr_tail may themselves contain newlines, so naive
+    // split('\n') breaks mid-JSON. Instead, extract top-level JSON objects
+    // by finding balanced braces.
+    let objects = extract_json_objects(raw);
+    let lines: Vec<&str> = if objects.is_empty() {
+        // Fallback to line-by-line for non-JSON output
+        raw.trim().split('\n').collect()
+    } else {
+        objects.iter().map(|s| s.as_str()).collect()
+    };
+
+    for line in &lines {
         match serde_json::from_str::<serde_json::Value>(line) {
             Ok(obj) => {
                 if obj["type"].as_str() == Some("result") {
+                    parsed_any_result = true;
                     // data may be a JSON string or object
                     let data = match obj.get("data") {
                         Some(serde_json::Value::String(s)) => {
@@ -1157,20 +1172,35 @@ pub fn format_agent_output(raw: &str) -> String {
                     if let Some(content) = data["content"].as_str() {
                         parts.push(content.to_string());
                     }
-                    if let Some(exists) = data.get("exists") {
-                        parts.push(format!("exists: {}", exists));
+                    // inspectPath results
+                    if let Some(path) = data["path"].as_str() {
+                        let exists = data["exists"].as_bool().unwrap_or(false);
+                        if exists {
+                            let kind = data["type"].as_str().unwrap_or("?");
+                            let size = data["size"].as_u64().unwrap_or(0);
+                            parts.push(format!("{} ({}, {} bytes)", path, kind, size));
+                        } else {
+                            parts.push(format!("{} (not found)", path));
+                        }
                     }
+                    // editFile / writeFile results
+                    if let Some(file_path) = data["file_path"].as_str() {
+                        let op = data["operation"].as_str().unwrap_or("write");
+                        let success = data["success"].as_bool().unwrap_or(false);
+                        if success {
+                            parts.push(format!("{}: {}", op, file_path));
+                        } else {
+                            parts.push(format!("{} failed: {}", op, file_path));
+                        }
+                    }
+                    // Non-zero exit codes
                     if let Some(exit_code) = data["exit_code"].as_i64() {
                         if exit_code != 0 {
                             parts.push(format!("exit code: {}", exit_code));
                         }
                     }
-                    // Fallback: if nothing extracted, show raw data
-                    if parts.is_empty() {
-                        if let Some(obj) = data.as_object() {
-                            parts.push(serde_json::to_string_pretty(obj).unwrap_or_default());
-                        }
-                    }
+                    // Fallback for empty exec results: show nothing (skip)
+                    // rather than dumping raw JSON
                 } else if obj["type"].as_str() == Some("status") {
                     // Skip status lines
                 } else {
@@ -1182,11 +1212,60 @@ pub fn format_agent_output(raw: &str) -> String {
             }
         }
     }
-    if parts.is_empty() {
+    if parts.is_empty() && parsed_any_result {
+        // All results parsed but nothing to display (e.g. empty stdout, exit 0)
+        String::new()
+    } else if parts.is_empty() {
         raw.to_string()
     } else {
         parts.join("\n")
     }
+}
+
+/// Extract top-level JSON objects from a string that may contain multiple
+/// concatenated objects with embedded newlines. Uses balanced-brace scanning
+/// with string awareness to avoid splitting inside JSON string values.
+fn extract_json_objects(raw: &str) -> Vec<String> {
+    let mut objects = Vec::new();
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            let mut depth = 0i32;
+            let mut in_string = false;
+            let mut escape = false;
+            let start = i;
+            for j in start..bytes.len() {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                match bytes[j] {
+                    b'\\' if in_string => escape = true,
+                    b'"' => in_string = !in_string,
+                    b'{' if !in_string => depth += 1,
+                    b'}' if !in_string => {
+                        depth -= 1;
+                        if depth == 0 {
+                            objects.push(raw[start..=j].to_string());
+                            i = j + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                if j == bytes.len() - 1 {
+                    i = bytes.len();
+                }
+            }
+            if depth != 0 {
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    objects
 }
 
 /// Format a number with commas (e.g. 1234567 → "1,234,567").

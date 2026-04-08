@@ -27,7 +27,13 @@ pub enum LiveAudioEvent {
     ModelTranscript(String),
     /// Model text output (non-audio, e.g. the structured response).
     ModelText(String),
-    /// Model attempted a tool call (will be quarantined).
+    /// Model called a whitelisted function (submit_response or end_call).
+    FunctionCall {
+        name: String,
+        call_id: String,
+        args: serde_json::Value,
+    },
+    /// Model attempted an unknown tool call (will be quarantined).
     ToolCallAttempted {
         name: String,
         args: serde_json::Value,
@@ -36,6 +42,100 @@ pub enum LiveAudioEvent {
     Interrupted,
     Disconnected(String),
     Error(String),
+}
+
+/// Names of the two whitelisted functions the live audio model may call.
+const FN_SUBMIT_RESPONSE: &str = "submit_response";
+const FN_END_CALL: &str = "end_call";
+
+/// Build tool definitions for the live audio session from a ResponseSchema.
+/// Returns JSON arrays suitable for OpenAI and Gemini tool formats.
+fn build_live_audio_tools(schema: &ResponseSchema) -> (serde_json::Value, serde_json::Value) {
+    // Build JSON Schema properties from ResponseSchema fields
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for field in &schema.fields {
+        let prop = match &field.field_type {
+            FieldType::String { max_length, allowed_values, .. } => {
+                let mut p = serde_json::json!({"type": "string"});
+                if let Some(max) = max_length {
+                    p["maxLength"] = serde_json::json!(max);
+                }
+                if let Some(vals) = allowed_values {
+                    p["enum"] = serde_json::json!(vals);
+                }
+                p
+            }
+            FieldType::Integer { min, max } => {
+                let mut p = serde_json::json!({"type": "integer"});
+                if let Some(min) = min { p["minimum"] = serde_json::json!(min); }
+                if let Some(max) = max { p["maximum"] = serde_json::json!(max); }
+                p
+            }
+            FieldType::Boolean => serde_json::json!({"type": "boolean"}),
+            FieldType::Array { element_type, max_items } => {
+                let items = match element_type.as_ref() {
+                    FieldType::String { .. } => serde_json::json!({"type": "string"}),
+                    FieldType::Integer { .. } => serde_json::json!({"type": "integer"}),
+                    FieldType::Boolean => serde_json::json!({"type": "boolean"}),
+                    _ => serde_json::json!({"type": "string"}),
+                };
+                let mut p = serde_json::json!({"type": "array", "items": items});
+                if let Some(max) = max_items { p["maxItems"] = serde_json::json!(max); }
+                p
+            }
+        };
+        if let Some(desc) = &field.description {
+            let mut prop = prop;
+            prop["description"] = serde_json::json!(desc);
+            properties.insert(field.name.clone(), prop);
+        } else {
+            properties.insert(field.name.clone(), prop);
+        }
+        if field.required {
+            required.push(serde_json::Value::String(field.name.clone()));
+        }
+    }
+
+    let submit_params = serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+    });
+
+    // OpenAI format
+    let openai_tools = serde_json::json!([
+        {
+            "type": "function",
+            "name": FN_SUBMIT_RESPONSE,
+            "description": "Submit the structured response data collected from the conversation. Call this once you have all the information.",
+            "parameters": submit_params,
+        },
+        {
+            "type": "function",
+            "name": FN_END_CALL,
+            "description": "Signal that the conversation is complete and you are ready to hang up. Call this after submit_response, or if the call cannot be completed.",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    ]);
+
+    // Gemini format
+    let gemini_tools = serde_json::json!([{
+        "function_declarations": [
+            {
+                "name": FN_SUBMIT_RESPONSE,
+                "description": "Submit the structured response data collected from the conversation.",
+                "parameters": submit_params,
+            },
+            {
+                "name": FN_END_CALL,
+                "description": "Signal that the conversation is complete.",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+    }]);
+
+    (openai_tools, gemini_tools)
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +242,7 @@ pub async fn connect_gemini(
     playbook: &str,
     voice: Option<&str>,
     sample_rate: u32,
+    tools: &serde_json::Value,
 ) -> Result<LiveAudioSession, CallerError> {
     let model_name = model.unwrap_or(DEFAULT_GEMINI_MODEL);
     let url = format!("{}?key={}", GEMINI_API_BASE, api_key);
@@ -173,7 +274,7 @@ pub async fn connect_gemini(
             "system_instruction": {
                 "parts": [{ "text": playbook }]
             },
-            "tools": []
+            "tools": tools
         }
     });
 
@@ -237,13 +338,18 @@ async fn gemini_read_loop(
             continue;
         }
 
-        // toolCall — quarantine, not dispatch
+        // toolCall — dispatch whitelisted, quarantine others
         if let Some(tool_call) = msg.get("toolCall") {
             if let Some(fcs) = tool_call.get("functionCalls").and_then(|v| v.as_array()) {
                 for fc in fcs {
                     let name = fc["name"].as_str().unwrap_or("unknown").to_string();
                     let args = fc.get("args").cloned().unwrap_or_default();
-                    let _ = event_tx.send(LiveAudioEvent::ToolCallAttempted { name, args });
+                    let call_id = fc["id"].as_str().unwrap_or("").to_string();
+                    if name == FN_SUBMIT_RESPONSE || name == FN_END_CALL {
+                        let _ = event_tx.send(LiveAudioEvent::FunctionCall { name, call_id, args });
+                    } else {
+                        let _ = event_tx.send(LiveAudioEvent::ToolCallAttempted { name, args });
+                    }
                 }
             }
             continue;
@@ -302,13 +408,18 @@ async fn gemini_read_loop(
                             let _ =
                                 event_tx.send(LiveAudioEvent::ModelText(text.to_string()));
                         }
-                        // Function call in model turn — quarantine
+                        // Function call in model turn
                         if let Some(fc) = part.get("functionCall") {
                             let name =
                                 fc["name"].as_str().unwrap_or("unknown").to_string();
                             let args = fc.get("args").cloned().unwrap_or_default();
-                            let _ = event_tx
-                                .send(LiveAudioEvent::ToolCallAttempted { name, args });
+                            let call_id = fc["id"].as_str().unwrap_or("").to_string();
+                            if name == FN_SUBMIT_RESPONSE || name == FN_END_CALL {
+                                let _ = event_tx.send(LiveAudioEvent::FunctionCall { name, call_id, args });
+                            } else {
+                                let _ = event_tx
+                                    .send(LiveAudioEvent::ToolCallAttempted { name, args });
+                            }
                         }
                     }
                 }
@@ -329,6 +440,7 @@ pub async fn connect_openai(
     playbook: &str,
     voice: Option<&str>,
     sample_rate: u32,
+    tools: &serde_json::Value,
 ) -> Result<LiveAudioSession, CallerError> {
     let model_name = model.unwrap_or(DEFAULT_OPENAI_MODEL);
     let url = format!("wss://api.openai.com/v1/realtime?model={}", model_name);
@@ -361,7 +473,7 @@ pub async fn connect_openai(
     let ws_write: Arc<Mutex<WsSink>> = Arc::new(Mutex::new(ws_write));
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-    // Send session.update (zero tools)
+    // Send session.update with whitelisted tools
     let setup = serde_json::json!({
         "type": "session.update",
         "session": {
@@ -370,7 +482,7 @@ pub async fn connect_openai(
             "voice": voice_name,
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm16",
-            "tools": []
+            "tools": tools
         }
     });
 
@@ -442,11 +554,16 @@ async fn openai_read_loop(
             }
             "response.function_call_arguments.done" => {
                 let name = msg["name"].as_str().unwrap_or("unknown").to_string();
+                let call_id = msg["call_id"].as_str().unwrap_or("").to_string();
                 let args = serde_json::from_str::<serde_json::Value>(
                     msg["arguments"].as_str().unwrap_or("{}"),
                 )
                 .unwrap_or_default();
-                let _ = event_tx.send(LiveAudioEvent::ToolCallAttempted { name, args });
+                if name == FN_SUBMIT_RESPONSE || name == FN_END_CALL {
+                    let _ = event_tx.send(LiveAudioEvent::FunctionCall { name, call_id, args });
+                } else {
+                    let _ = event_tx.send(LiveAudioEvent::ToolCallAttempted { name, args });
+                }
             }
             "input_audio_buffer.speech_started" => {
                 let _ = event_tx.send(LiveAudioEvent::Interrupted);
@@ -1358,6 +1475,9 @@ pub async fn run_session(
     let start = Instant::now();
     let timeout = Duration::from_secs(spec.timeout_secs);
 
+    // Build whitelisted tool definitions from the response schema
+    let (openai_tools, gemini_tools) = build_live_audio_tools(&spec.response_schema);
+
     // Connect to the live model
     let mut session = match spec.provider {
         LiveAudioProvider::Gemini => {
@@ -1367,6 +1487,7 @@ pub async fn run_session(
                 &spec.playbook,
                 spec.voice.as_deref(),
                 24000,
+                &gemini_tools,
             )
             .await?
         }
@@ -1377,6 +1498,7 @@ pub async fn run_session(
                 &spec.playbook,
                 spec.voice.as_deref(),
                 24000,
+                &openai_tools,
             )
             .await?
         }
@@ -1433,7 +1555,7 @@ pub async fn run_session(
     let mut last_progress_emit = Instant::now();
 
     // Event processing loop
-    let status = loop {
+    let mut status = loop {
         let elapsed = start.elapsed();
         if elapsed >= timeout {
             break LiveAudioStatus::TimedOut;
@@ -1489,8 +1611,31 @@ pub async fn run_session(
                 LiveAudioEvent::ModelText(text) => {
                     model_text.push_str(&text);
                 }
+                LiveAudioEvent::FunctionCall { name, call_id, args } => {
+                    if name == FN_SUBMIT_RESPONSE {
+                        // The model submitted structured response via function call
+                        model_text = serde_json::to_string(&args).unwrap_or_default();
+                        // Send function call output back to acknowledge (OpenAI requires this)
+                        if spec.provider == LiveAudioProvider::OpenAI && !call_id.is_empty() {
+                            let ack = serde_json::json!({
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "function_call_output",
+                                    "call_id": call_id,
+                                    "output": "{\"status\":\"ok\"}"
+                                }
+                            });
+                            let mut sink = session.ws_write.lock().await;
+                            let _ = sink.send(WsMessage::Text(ack.to_string())).await;
+                        }
+                        break LiveAudioStatus::Completed;
+                    } else if name == FN_END_CALL {
+                        // Model signaled call is done without submitting data
+                        break LiveAudioStatus::Completed;
+                    }
+                }
                 LiveAudioEvent::ToolCallAttempted { name, args } => {
-                    // Quarantine the tool call attempt
+                    // Quarantine unknown tool call attempts
                     let content = serde_json::json!({"name": name, "args": args}).to_string();
                     match quarantine::store_payload(&spec.id, "tool_call_attempt", &content) {
                         Ok(payload) => quarantine_ids.push(payload.payload_id),
@@ -1506,37 +1651,21 @@ pub async fn run_session(
                 LiveAudioEvent::TurnComplete => {
                     turn_complete_count += 1;
 
-                    // Check if the model has output a complete JSON response.
-                    let json_source = if !model_text.is_empty() {
-                        Some(&model_text)
-                    } else {
-                        None
-                    };
+                    // Fallback: check if JSON appeared in text/transcript (for models
+                    // that speak JSON instead of using function calls).
+                    let extracted = extract_json_object(&model_text)
+                        .or_else(|| extract_json_object(&model_transcript_buf));
 
-                    if let Some(src) = json_source {
-                        if let Ok(parsed) =
-                            serde_json::from_str::<serde_json::Value>(src)
-                        {
-                            if parsed.is_object() {
-                                break LiveAudioStatus::Completed;
-                            }
-                        }
-                    } else if !model_transcript_buf.is_empty() {
-                        if let Some(json_str) =
-                            extract_json_object(&model_transcript_buf)
-                        {
-                            model_text = json_str;
-                            break LiveAudioStatus::Completed;
-                        }
+                    if let Some(json_str) = extracted {
+                        model_text = json_str;
+                        break LiveAudioStatus::Completed;
                     }
 
-                    // After several turns without JSON, nudge the model to
-                    // wrap up and emit the structured response. The model may
-                    // keep making small talk indefinitely otherwise.
+                    // Nudge the model to call submit_response after enough turns
                     if turn_complete_count >= 6 && !json_nudged {
                         json_nudged = true;
                         let _ = session.send_text(
-                            "The conversation is complete. Stop speaking and output ONLY the JSON response object now."
+                            "The conversation is complete. Please call the submit_response function now with the data you collected, then call end_call."
                         ).await;
                     }
                 }
@@ -1560,6 +1689,19 @@ pub async fn run_session(
 
     // Close the WebSocket
     session.close().await;
+
+    // Final attempt to extract JSON from accumulated buffers (covers timeout/disconnect
+    // cases where no TurnComplete fired after the model produced JSON).
+    if model_text.is_empty() || serde_json::from_str::<serde_json::Value>(&model_text).is_err() {
+        if let Some(json_str) = extract_json_object(&model_text)
+            .or_else(|| extract_json_object(&model_transcript_buf))
+        {
+            model_text = json_str;
+            if status == LiveAudioStatus::TimedOut {
+                status = LiveAudioStatus::Completed;
+            }
+        }
+    }
 
     // Validate the structured response
     let (response_data, final_status) = if !model_text.is_empty() {
@@ -1931,12 +2073,14 @@ mod tests {
             None => return,
         };
 
+        let empty_tools = serde_json::json!([]);
         let mut session = connect_openai(
             &api_key,
             Some(TEST_MODEL),
             "You are a test agent.",
             Some("alloy"),
             24000,
+            &empty_tools,
         )
         .await
         .expect("connect_openai failed");
@@ -1981,12 +2125,14 @@ mod tests {
             None => return,
         };
 
+        let empty_tools = serde_json::json!([]);
         let mut session = connect_openai(
             &api_key,
             Some(TEST_MODEL),
             "You are a test assistant. Respond in one short sentence.",
             Some("alloy"),
             24000,
+            &empty_tools,
         )
         .await
         .expect("connect_openai failed");
@@ -2100,12 +2246,14 @@ mod tests {
         let playbook = "You are running an automated test. There is nobody on the line. \
                          Say 'test complete' once, then output the JSON: {\"status\": \"ok\"}";
 
+        let empty_tools = serde_json::json!([]);
         let mut session = connect_openai(
             &api_key,
             Some(TEST_MODEL),
             playbook,
             Some("alloy"),
             24000,
+            &empty_tools,
         )
         .await
         .expect("connect_openai failed");
@@ -2184,6 +2332,10 @@ mod tests {
                         eprintln!("  TURN_COMPLETE #{}", turn_completes);
                         // Stop after first completed turn
                         break;
+                    }
+                    LiveAudioEvent::FunctionCall { name, args, .. } => {
+                        eprintln!("  FUNCTION_CALL: {} {:?}", name, args);
+                        tool_calls.push(name);
                     }
                     LiveAudioEvent::ToolCallAttempted { name, args } => {
                         eprintln!("  TOOL_CALL: {} {:?}", name, args);

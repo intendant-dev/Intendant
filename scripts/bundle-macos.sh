@@ -22,11 +22,11 @@ PROFILE="${1:-release}"
 if [ "$PROFILE" = "debug" ]; then
     BINARY="target/debug/intendant"
     RUNTIME="target/debug/intendant-runtime"
-    cargo build
+    cargo build --bin intendant --bin intendant-runtime
 else
     BINARY="target/release/intendant"
     RUNTIME="target/release/intendant-runtime"
-    cargo build --release
+    cargo build --release --bin intendant --bin intendant-runtime
 fi
 
 APP="target/Intendant.app"

@@ -13,6 +13,13 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/presence-web/src/");
     println!("cargo:rerun-if-changed=crates/presence-core/src/");
     println!("cargo:rerun-if-changed=static/wasm-web/presence_web_bg.wasm");
+    println!("cargo:rerun-if-changed=static/wasm-web/presence_web.js");
+
+    // Write a hash of the WASM binary to OUT_DIR so cargo detects changes
+    // reliably. `rerun-if-changed` on binary files can be flaky across
+    // worktrees; writing a derived file to OUT_DIR is bulletproof because
+    // cargo always checks OUT_DIR contents.
+    write_wasm_hash();
 
     let wasm_bin = Path::new("static/wasm-web/presence_web_bg.wasm");
     let src_dir = Path::new("crates/presence-web/src");
@@ -76,6 +83,40 @@ fn main() {
         Err(_) => {
             println!("cargo:warning=wasm-pack not found. Install: cargo install wasm-pack");
         }
+    }
+}
+
+/// Write a content hash of the WASM files to OUT_DIR. Cargo always tracks
+/// OUT_DIR for changes, so when the WASM is rebuilt the hash file changes
+/// and cargo recompiles the crate (re-running `include_bytes!`).
+fn write_wasm_hash() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::io::Read;
+
+    let out_dir = match std::env::var("OUT_DIR") {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    let mut hasher = DefaultHasher::new();
+    for path in &[
+        "static/wasm-web/presence_web_bg.wasm",
+        "static/wasm-web/presence_web.js",
+    ] {
+        if let Ok(mut f) = std::fs::File::open(path) {
+            let mut buf = Vec::new();
+            let _ = f.read_to_end(&mut buf);
+            buf.hash(&mut hasher);
+        }
+    }
+    let hash = format!("{:016x}", hasher.finish());
+
+    let hash_path = Path::new(&out_dir).join("wasm_hash.txt");
+    // Only write if changed, to avoid unnecessary rebuilds
+    let existing = std::fs::read_to_string(&hash_path).unwrap_or_default();
+    if existing.trim() != hash {
+        let _ = std::fs::write(&hash_path, &hash);
     }
 }
 

@@ -12,6 +12,8 @@ class BackendSchemeHandler: NSObject, WKURLSchemeHandler {
     let port: Int
     private var stopped = Set<Int>()
     private let lock = NSLock()
+    /// Ephemeral session — no disk or memory cache, so WASM/JS always loads fresh.
+    private let session = URLSession(configuration: .ephemeral)
 
     init(port: Int) {
         self.port = port
@@ -32,7 +34,7 @@ class BackendSchemeHandler: NSObject, WKURLSchemeHandler {
             return
         }
 
-        var request = URLRequest(url: backendURL)
+        var request = URLRequest(url: backendURL, cachePolicy: .reloadIgnoringLocalCacheData)
         request.httpMethod = urlSchemeTask.request.httpMethod
         request.httpBody = urlSchemeTask.request.httpBody
         if let headers = urlSchemeTask.request.allHTTPHeaderFields {
@@ -43,7 +45,7 @@ class BackendSchemeHandler: NSObject, WKURLSchemeHandler {
 
         let taskHash = ObjectIdentifier(urlSchemeTask as AnyObject).hashValue
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        session.dataTask(with: request) { [weak self] data, response, error in
             guard let self = self else { return }
             self.lock.lock()
             let wasStopped = self.stopped.remove(taskHash) != nil
