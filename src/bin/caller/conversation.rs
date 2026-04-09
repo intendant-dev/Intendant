@@ -278,6 +278,20 @@ impl Conversation {
         &self.messages
     }
 
+    /// Strip all screenshot images from the conversation except the most recent one.
+    /// Required when the OpenAI `computer` tool is active — it rejects multiple images.
+    pub fn strip_old_images(&mut self) {
+        // Find the index of the last message with images
+        let last_with_images = self.messages.iter().rposition(|m| m.images.is_some());
+        if let Some(last_idx) = last_with_images {
+            for (i, msg) in self.messages.iter_mut().enumerate() {
+                if i < last_idx {
+                    msg.images = None;
+                }
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.messages.len()

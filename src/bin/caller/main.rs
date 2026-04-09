@@ -1837,6 +1837,12 @@ async fn run_agent_loop(
             }
         });
 
+        // When CU is enabled, the OpenAI computer tool rejects multiple images.
+        // Strip all but the most recent screenshot before each API call.
+        if provider.cu_enabled() {
+            conversation.strip_old_images();
+        }
+
         let response = {
             const STREAM_RETRIES: u32 = 3;
             let mut last_stream_err = None;
