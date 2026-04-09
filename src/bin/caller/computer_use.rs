@@ -352,50 +352,45 @@ pub async fn execute_actions(
     results
 }
 
-/// Get the macOS Retina scale factor by comparing screencapture pixel size
-/// to the logical display size. Cached after first call.
-#[cfg(target_os = "macos")]
-fn macos_retina_scale() -> f64 {
+/// Get the logical display size for the main display. Cached after first call.
+/// Used to map CU model coordinates (which are in a normalized 1024-wide space)
+/// to actual logical points for cliclick/xdotool.
+fn logical_display_size() -> (u32, u32) {
     use std::sync::OnceLock;
-    static SCALE: OnceLock<f64> = OnceLock::new();
-    *SCALE.get_or_init(|| {
-        // Query logical display size via CGMainDisplayID
-        #[link(name = "CoreGraphics", kind = "framework")]
-        extern "C" {
-            fn CGMainDisplayID() -> u32;
-            fn CGDisplayPixelsWide(display: u32) -> usize;
-            fn CGDisplayPixelsHigh(display: u32) -> usize;
+    static SIZE: OnceLock<(u32, u32)> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        {
+            #[link(name = "CoreGraphics", kind = "framework")]
+            extern "C" {
+                fn CGMainDisplayID() -> u32;
+                fn CGDisplayPixelsWide(display: u32) -> usize;
+                fn CGDisplayPixelsHigh(display: u32) -> usize;
+            }
+            let (w, h) = unsafe {
+                let d = CGMainDisplayID();
+                (CGDisplayPixelsWide(d) as u32, CGDisplayPixelsHigh(d) as u32)
+            };
+            if w > 0 && h > 0 { return (w, h); }
         }
-        // screencapture gives backing (pixel) resolution, CGDisplay gives logical
-        let (logical_w, _logical_h) = unsafe {
-            let d = CGMainDisplayID();
-            (CGDisplayPixelsWide(d), CGDisplayPixelsHigh(d))
-        };
-        if logical_w == 0 { return 1.0; }
-        // Take a tiny screenshot to get the actual pixel width
-        let tmp = std::env::temp_dir().join("_intendant_scale_probe.png");
-        let _ = std::process::Command::new("screencapture")
-            .args(["-x", "-C", "-t", "png"])
-            .arg(tmp.as_os_str())
-            .output();
-        let pixel_w = image::open(&tmp)
-            .map(|img| img.width() as usize)
-            .unwrap_or(logical_w);
-        let _ = std::fs::remove_file(&tmp);
-        if pixel_w <= logical_w { 1.0 } else { pixel_w as f64 / logical_w as f64 }
+        // Fallback: assume 1:1 mapping
+        (1024, 768)
     })
 }
 
-/// Scale pixel coordinates to logical points for macOS.
-#[cfg(target_os = "macos")]
+/// The CU model outputs coordinates in a normalized space (typically 1024x768).
+/// Map them to actual logical display coordinates for cliclick/xdotool.
 fn scale_coords(x: i32, y: i32) -> (i32, i32) {
-    let s = macos_retina_scale();
-    if s <= 1.0 { return (x, y); }
-    ((x as f64 / s).round() as i32, (y as f64 / s).round() as i32)
+    // OpenAI CU models use a 1024-wide coordinate space derived from the
+    // screenshot image. The height varies by aspect ratio.
+    const MODEL_W: f64 = 1024.0;
+    const MODEL_H: f64 = 768.0;
+    let (disp_w, disp_h) = logical_display_size();
+    (
+        (x as f64 / MODEL_W * disp_w as f64).round() as i32,
+        (y as f64 / MODEL_H * disp_h as f64).round() as i32,
+    )
 }
-
-#[cfg(not(target_os = "macos"))]
-fn scale_coords(x: i32, y: i32) -> (i32, i32) { (x, y) }
 
 /// Execute a single CU action, dispatching to the appropriate backend.
 async fn execute_single(
