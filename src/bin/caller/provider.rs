@@ -985,23 +985,24 @@ fn build_openai_request_parts(
             if m.role == "tool" {
                 if let Some(ref call_id) = m.tool_call_id {
                     if m.is_cu_result {
-                        // Native CU result: computer_call_output format
+                        // Native CU result: computer_call_output format.
+                        // The output.image_url must be a valid data URI.
+                        // If the screenshot was stripped (strip_old_images),
+                        // use a 1x1 transparent PNG placeholder.
                         let screenshot = m.images.as_ref().and_then(|imgs| imgs.first());
-                        let output = if let Some(img) = screenshot {
-                            serde_json::json!({
-                                "type": "computer_screenshot",
-                                "image_url": format!("data:{};base64,{}", img.media_type, img.data),
-                            })
+                        let image_url = if let Some(img) = screenshot {
+                            format!("data:{};base64,{}", img.media_type, img.data)
                         } else {
-                            serde_json::json!({
-                                "type": "computer_screenshot",
-                                "image_url": "",
-                            })
+                            // 1x1 transparent PNG
+                            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNjN9GQAAAAlwSFlzAAAWJQAAFiUBSVIk8AAAAA0lEQVQI12P4z8BQDwAEgAF/QualzQAAAABJRU5ErkJggg==".to_string()
                         };
                         items.push(serde_json::json!({
                             "type": "computer_call_output",
                             "call_id": call_id,
-                            "output": output,
+                            "output": {
+                                "type": "computer_screenshot",
+                                "image_url": image_url,
+                            },
                         }));
                     } else {
                         items.push(openai_function_call_output(call_id, &m.content));
