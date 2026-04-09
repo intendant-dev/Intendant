@@ -1075,8 +1075,8 @@ fn build_openai_request_parts(
         if let Some((w, h)) = provider.cu_display {
             tools_vec.push(serde_json::json!({
                 "type": "computer_use_preview",
-                "display_width_px": w,
-                "display_height_px": h,
+                "display_width": w,
+                "display_height": h,
                 "environment": if cfg!(target_os = "macos") { "mac" }
                     else if cfg!(target_os = "windows") { "windows" }
                     else { "linux" }
