@@ -1611,12 +1611,13 @@ impl SessionLog {
     ) {
         self.summary_builder.total_tokens += total_tokens;
         let file = self.write_turn_file("model.txt", content);
+        let preview: String = content.chars().take(200).collect();
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: Some(self.current_turn),
             event: "model_response".to_string(),
             level: Some("info".to_string()),
-            message: Some(content.to_string()),
+            message: Some(preview),
             data: Some(serde_json::json!({
                 "tokens": {
                     "prompt": prompt_tokens,
@@ -1682,6 +1683,7 @@ impl SessionLog {
             None
         };
 
+        let preview: String = stdout.chars().take(200).collect();
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: Some(self.current_turn),
@@ -1694,7 +1696,7 @@ impl SessionLog {
             message: if stdout.is_empty() && stderr.is_empty() {
                 Some("(no output)".to_string())
             } else {
-                Some(stdout.to_string())
+                Some(preview)
             },
             data: Some(serde_json::json!({
                 "stdout_length": stdout.len(),

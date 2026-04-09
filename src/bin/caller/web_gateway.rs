@@ -202,7 +202,7 @@ impl Default for WebGatewayConfig {
 ///   Unix control socket in `control.rs`.
 /// Convert session.jsonl entries into OutboundEvent-compatible JSON objects
 /// for replaying to late-connecting browsers.
-fn replay_session_log(contents: &str) -> Vec<serde_json::Value> {
+fn replay_session_log(contents: &str, log_dir: &std::path::Path) -> Vec<serde_json::Value> {
     let mut entries = Vec::new();
     for line in contents.lines() {
         let line = line.trim();
@@ -286,39 +286,19 @@ fn replay_session_log(contents: &str) -> Vec<serde_json::Value> {
                 ("agent", display, "agent")
             }
             "agent_output" => {
-                // Parse runtime JSON to extract stdout_tail for display.
-                let mut parts = Vec::new();
-                for json_line in message.lines() {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_line) {
-                        if parsed.get("type").and_then(|v| v.as_str()) == Some("result") {
-                            if let Some(data_str) = parsed.get("data").and_then(|v| v.as_str()) {
-                                if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
-                                    if let Some(stdout) = data.get("stdout_tail").and_then(|v| v.as_str()) {
-                                        let trimmed = stdout.trim();
-                                        if !trimmed.is_empty() {
-                                            parts.push(trimmed.to_string());
-                                        }
-                                    }
-                                    if let Some(stderr) = data.get("stderr_tail").and_then(|v| v.as_str()) {
-                                        let trimmed = stderr.trim();
-                                        if !trimmed.is_empty() {
-                                            parts.push(format!("[stderr] {}", trimmed));
-                                        }
-                                    }
-                                    // Show non-zero exit codes
-                                    if let Some(code) = data.get("exit_code").and_then(|v| v.as_i64()) {
-                                        if code != 0 {
-                                            parts.push(format!("exit code: {}", code));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if parts.is_empty() { continue; }
-                let level = if parts.iter().any(|p| p.starts_with("[stderr]")) { "warn" } else { "agent" };
-                ("agent", parts.join("\n"), level)
+                // Read full content from the turn file (message is a preview).
+                let full_stdout = obj.get("file")
+                    .and_then(|f| f.as_str())
+                    .and_then(|f| std::fs::read_to_string(log_dir.join(f)).ok())
+                    .unwrap_or_else(|| message.to_string());
+                let full_stderr = obj.get("file2")
+                    .and_then(|f| f.as_str())
+                    .and_then(|f| std::fs::read_to_string(log_dir.join(f)).ok())
+                    .unwrap_or_default();
+                let formatted = crate::tui::app::format_agent_output_for_tui(&full_stdout, &full_stderr);
+                if formatted.is_empty() { continue; }
+                let level = if !full_stderr.is_empty() { "warn" } else { "agent" };
+                ("agent", formatted, level)
             }
 
             // ── Voice / presence lifecycle ──
@@ -605,7 +585,7 @@ fn get_session_detail(session_id: &str) -> String {
 
     let jsonl_path = session_dir.join("session.jsonl");
     let entries = if let Ok(contents) = std::fs::read_to_string(&jsonl_path) {
-        replay_session_log(&contents)
+        replay_session_log(&contents, &session_dir)
     } else {
         Vec::new()
     };
@@ -1446,7 +1426,7 @@ pub fn spawn_web_gateway(
                         if let Ok(contents) = std::fs::read_to_string(&session_jsonl) {
                             let replay = serde_json::json!({
                                 "t": "log_replay",
-                                "entries": replay_session_log(&contents),
+                                "entries": replay_session_log(&contents, &ctx.log_dir),
                             });
                             let _ = direct_tx.send(replay.to_string());
                         }

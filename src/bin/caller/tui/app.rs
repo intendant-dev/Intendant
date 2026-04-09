@@ -2016,9 +2016,54 @@ impl App {
 
 /// Parse runtime JSON output into human-readable text for the TUI.
 /// Mirrors the WASM format_agent_output logic.
+/// Extract top-level JSON objects from a string using balanced-brace scanning.
+/// Handles embedded newlines inside JSON string values correctly.
+fn extract_json_objects(raw: &str) -> Vec<String> {
+    let mut objects = Vec::new();
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            let mut depth = 0i32;
+            let mut in_string = false;
+            let mut escape = false;
+            let start = i;
+            for j in start..bytes.len() {
+                if escape { escape = false; continue; }
+                match bytes[j] {
+                    b'\\' if in_string => escape = true,
+                    b'"' => in_string = !in_string,
+                    b'{' if !in_string => depth += 1,
+                    b'}' if !in_string => {
+                        depth -= 1;
+                        if depth == 0 {
+                            objects.push(raw[start..=j].to_string());
+                            i = j + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                if j == bytes.len() - 1 { i = bytes.len(); }
+            }
+            if depth != 0 { break; }
+        } else {
+            i += 1;
+        }
+    }
+    objects
+}
+
 pub fn format_agent_output_for_tui(stdout: &str, stderr: &str) -> String {
     let mut parts = Vec::new();
-    for line in stdout.trim().split('\n') {
+    // Use balanced-brace extraction to handle embedded newlines in JSON values
+    let objects = extract_json_objects(stdout);
+    let lines: Vec<&str> = if objects.is_empty() {
+        stdout.trim().split('\n').collect()
+    } else {
+        objects.iter().map(|s| s.as_str()).collect()
+    };
+    for line in &lines {
         if line.is_empty() { continue; }
         if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
             if obj["type"].as_str() == Some("result") {
