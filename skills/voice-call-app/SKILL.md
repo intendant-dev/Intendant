@@ -17,32 +17,25 @@ compatibility: macOS or Linux with display. Requires Vortex Audio HAL plugin and
 
 ## Steps
 
-### 1. Open the app
+### 1. Navigate to the app and start the call
 
-```bash
-open -a "AppName" && sleep 2
-```
+Use your native computer use actions to interact with the screen.
+Take a screenshot, find the app (in the dock, taskbar, or already open),
+click to foreground it, navigate to the contact, and click the call button.
 
-### 2. Navigate to the contact and start the call
+Do NOT use exec commands for GUI navigation. Use your built-in
+click, type, scroll, and screenshot actions for everything visual.
 
-Use your **native computer use actions** (click, type, screenshot) to
-navigate the app's UI. Do NOT use exec cliclick or AppleScript — use
-your built-in CU actions directly.
+### 2. Verify the call connected
 
-1. Take a screenshot to see the app
-2. Click the contact/room in the sidebar
-3. Click the call/voice button (usually a phone icon in the header)
-
-### 3. Verify the call connected
-
-After clicking the call button:
-1. Take a screenshot to verify the call UI appeared
-2. Handle any confirmation dialogs (e.g. "Voice call using: Element Call")
-3. Handle any permission dialogs (e.g. "Allow local network access")
+After clicking the call button, take a screenshot to verify:
+- The call UI appeared (ringing screen, timer, etc.)
+- Handle any confirmation dialogs
+- Handle any permission dialogs
 
 Only proceed once you can see the call is actually ringing.
 
-### 4. Call spawn_live_audio
+### 3. Call spawn_live_audio
 
 Once the call is confirmed ringing, call `spawn_live_audio`.
 
@@ -55,14 +48,14 @@ Once the call is confirmed ringing, call `spawn_live_audio`.
 - `voice`: e.g. `alloy`, `shimmer`
 - Do NOT set `initial_message`
 
-### 5. Process the result
+### 4. Process the result
 
 `spawn_live_audio` returns `LiveAudioResult` with `status`:
 - **Completed**: model called `submit_response` with structured data
 - **TimedOut**: exceeded timeout without submitting response
 - **SchemaError**: response didn't match schema
 
-### 6. Clean up
+### 5. Clean up
 
 Hang up the call if still connected (screenshot + click end call).
 
