@@ -45,12 +45,17 @@ pub fn validate(
     for field_spec in &schema.fields {
         let field_value = obj.get(&field_spec.name);
 
-        if field_spec.required && field_value.is_none() {
-            errors.push(ValidationError {
-                field: field_spec.name.clone(),
-                message: "required field missing".into(),
-            });
-            continue;
+        if field_spec.required {
+            let is_missing = field_value.is_none()
+                || field_value == Some(&serde_json::Value::Null)
+                || field_value.and_then(|v| v.as_str()) == Some("");
+            if is_missing {
+                errors.push(ValidationError {
+                    field: field_spec.name.clone(),
+                    message: "required field missing or empty".into(),
+                });
+                continue;
+            }
         }
 
         if let Some(val) = field_value {

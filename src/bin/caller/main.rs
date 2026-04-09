@@ -2146,13 +2146,12 @@ async fn run_agent_loop(
                 }
             }
 
-            // Handle live audio spawn requests
+            // Handle live audio spawn requests (blocking)
             for (call_id, session_id, args) in &batch.live_audio_spawns {
                 let spec_result =
                     serde_json::from_value::<live_audio_types::LiveAudioSpec>(args.clone());
                 match spec_result {
                     Ok(mut spec) => {
-                        // Build the full system prompt from playbook + schema
                         let system_prompt = prompts::build_live_audio_prompt(
                             &spec.playbook,
                             &spec.response_schema,
@@ -2160,7 +2159,6 @@ async fn run_agent_loop(
                         );
                         spec.playbook = system_prompt;
 
-                        // Resolve API key for the chosen provider
                         let api_key_var = match spec.provider {
                             live_audio_types::LiveAudioProvider::Gemini => "GEMINI_API_KEY",
                             live_audio_types::LiveAudioProvider::OpenAI => "OPENAI_API_KEY",
@@ -2177,9 +2175,6 @@ async fn run_agent_loop(
                             }
                         };
 
-                        // Create audio bridge: auto-detect Vortex (guest HAL plugin)
-                        // by checking if /vortex-audio shm exists, fall back to
-                        // local platform audio devices (PulseAudio/BlackHole).
                         let vortex_shm_available = unsafe {
                             let fd = libc::shm_open(
                                 b"/vortex-audio\0".as_ptr() as *const libc::c_char,
@@ -2209,12 +2204,11 @@ async fn run_agent_loop(
                             }
                         };
 
-                        // Set virtual devices as system defaults (not needed for Vortex)
                         if bridge.vortex_socket_path().is_none() {
                             if let Err(e) = audio_routing::set_as_default(&mut bridge).await {
                                 slog(&session_log, |l| {
                                     l.warn(&format!(
-                                        "Could not set audio bridge as default: {} (per-app routing may be needed)",
+                                        "Could not set audio bridge as default: {}",
                                         e
                                     ))
                                 });
@@ -2228,7 +2222,6 @@ async fn run_agent_loop(
                             ))
                         });
 
-                        // Run the session (blocks until complete or timeout)
                         let result = live_audio::run_session(
                             &spec,
                             &api_key,
@@ -2238,7 +2231,6 @@ async fn run_agent_loop(
                         )
                         .await;
 
-                        // Bridge is dropped here, cleaning up PulseAudio modules
                         drop(bridge);
 
                         match result {

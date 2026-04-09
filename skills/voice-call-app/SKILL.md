@@ -27,28 +27,11 @@ Mark all data fields you need to collect as `required: true` in the
 schema. The voice model cannot submit until all required fields are
 filled — this prevents premature hangups.
 
-### 2. Call spawn_live_audio FIRST
+### 2. Navigate to the app and click call
 
-Call `spawn_live_audio` with the arguments you prepared in step 1
-BEFORE you click the call button. The audio bridge polls and works
-before the call connects — it waits silently until audio flows.
-This eliminates dead air for the callee.
-
-**ALL of these parameters are REQUIRED:**
-- `id`: unique session identifier
-- `provider`: `openai`
-- `playbook`: the conversation script
-- `response_schema`: MANDATORY — see below
-- `timeout_secs`: max call duration (default 120)
-- `voice`: e.g. `alloy`, `shimmer`
-- Do NOT set `initial_message` — the model waits for the other party
-  to speak first, then responds naturally per the playbook.
-
-### 3. Navigate to the app and click call
-
-Now use your native computer use actions to navigate the screen.
-Take a screenshot, find the app (in the dock, taskbar, or already open),
-click to foreground it, navigate to the contact, and click the call button.
+Use your native CU actions to navigate the screen. Take a screenshot,
+find the app in the dock, click to foreground it, navigate to the
+contact, and click the call button.
 
 Do NOT use exec commands for GUI navigation. Use your built-in
 click, type, scroll, and screenshot actions for everything visual.
@@ -58,8 +41,19 @@ click, type, scroll, and screenshot actions for everything visual.
 (not Element Call). Element Call is a conference that requires the other
 party to manually join; Legacy call rings their device directly.
 
-The audio bridge is already running from step 2 — it will pick up
-audio as soon as the call connects. No further action needed.
+### 3. Call spawn_live_audio
+
+After clicking the call button, call `spawn_live_audio` with the
+arguments you prepared in step 1.
+
+**ALL of these parameters are REQUIRED:**
+- `id`: unique session identifier
+- `provider`: `openai`
+- `playbook`: the conversation script
+- `response_schema`: MANDATORY — see below
+- `timeout_secs`: max call duration (default 120)
+- `voice`: e.g. `alloy`, `shimmer`
+- Do NOT set `initial_message`
 
 ### 4. Write the result immediately
 
