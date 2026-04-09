@@ -982,8 +982,15 @@ fn write_event_to_session_log(
             log.live_audio_completed(id, status, *quarantine_count);
         }
 
+        // Agent output — external agent paths emit AppEvent::AgentOutput
+        // without inline slog() calls, so the EventBus writer is the only
+        // path to disk for these.
+        AppEvent::AgentOutput { stdout, stderr } => {
+            log.agent_output(stdout, stderr);
+        }
+
         // ---- Events already logged inline by the agent loop or web_gateway ----
-        // turn_start, model_response, agent_input/output, approval decisions,
+        // turn_start, model_response, agent_input, approval decisions,
         // json_extracted, reasoning, budget warnings, loop errors, context
         // management, voice_log, voice_diagnostic, presence_connected/disconnected,
         // presence_checkpoint, user_transcript — all have slog() calls at their

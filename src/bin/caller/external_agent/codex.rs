@@ -400,8 +400,10 @@ fn translate_notification(
                         preview: path,
                     });
                 }
-                "agentMessage" => {
-                    // Message deltas will follow; nothing to emit here.
+                "agentMessage" | "userMessage" | "reasoning" => {
+                    // agentMessage: deltas will follow via item/agentMessage/delta.
+                    // userMessage: echo of the user's input; nothing to emit.
+                    // reasoning: model reasoning trace; nothing to emit.
                 }
                 other => {
                     eprintln!("[codex] unknown item type in item/started: {:?}", other);
@@ -475,6 +477,27 @@ fn translate_notification(
                 files_changed,
                 unified_diff,
             });
+        }
+
+        // Informational Codex v2 notifications — no action needed.
+        // turn/started: turn began processing.
+        // thread/started: thread is active.
+        // thread/tokenUsage/updated: token usage stats.
+        // account/rateLimits/updated: rate limit info.
+        // mcpServer/startupStatus/updated: MCP server startup status.
+        // configWarning: configuration warning from the Codex backend.
+        "turn/started" | "thread/started" | "thread/tokenUsage/updated"
+        | "account/rateLimits/updated" | "mcpServer/startupStatus/updated"
+        | "configWarning" => {}
+
+        // thread/status/changed may signal turn or thread completion.
+        // Codex v2 uses this alongside (or instead of) turn/completed.
+        "thread/status/changed" => {
+            if let Some(status) = params.get("status").and_then(|v| v.as_str()) {
+                if status == "completed" || status == "idle" {
+                    let _ = event_tx.send(AgentEvent::TurnCompleted { message: None });
+                }
+            }
         }
 
         other => {
@@ -619,9 +642,9 @@ impl ExternalAgent for CodexAgent {
             serde_json::Value::String(self.approval_policy.clone()),
         );
         let sandbox_value = if self.sandbox {
-            "workspaceWrite"
+            "workspace-write"
         } else {
-            "dangerFullAccess"
+            "danger-full-access"
         };
         params.insert(
             "sandbox".into(),
@@ -633,11 +656,11 @@ impl ExternalAgent for CodexAgent {
             .await?;
 
         let thread_id = result
-            .get("id")
+            .pointer("/thread/id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 CallerError::ExternalAgent(
-                    "thread/start response missing 'id' field".into(),
+                    "thread/start response missing 'thread.id' field".into(),
                 )
             })?
             .to_string();
@@ -660,8 +683,9 @@ impl ExternalAgent for CodexAgent {
             "threadId": thread.thread_id,
             "input": [{"type": "text", "text": augmented}],
         });
-        // turn/start is a notification (fire-and-forget)
-        self.send_notification("turn/start", Some(params)).await
+        // turn/start is a request — Codex v2 requires an id to start processing
+        let _ = self.send_request("turn/start", Some(params)).await?;
+        Ok(())
     }
 
     async fn resolve_approval(
@@ -1037,6 +1061,95 @@ mod tests {
     }
 
     #[test]
+    fn translate_item_started_user_message_ignored() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "itemId": "item-10",
+            "item": {"type": "userMessage"}
+        });
+        translate_notification("item/started", &params, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "userMessage start should emit nothing"
+        );
+    }
+
+    #[test]
+    fn translate_item_started_reasoning_ignored() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "itemId": "item-11",
+            "item": {"type": "reasoning"}
+        });
+        translate_notification("item/started", &params, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "reasoning start should emit nothing"
+        );
+    }
+
+    #[test]
+    fn translate_thread_status_changed_completed() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({"status": "completed"});
+        translate_notification("thread/status/changed", &params, &tx);
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::TurnCompleted { message } => {
+                assert_eq!(message, None);
+            }
+            other => panic!("expected TurnCompleted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_thread_status_changed_idle() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({"status": "idle"});
+        translate_notification("thread/status/changed", &params, &tx);
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::TurnCompleted { message } => {
+                assert_eq!(message, None);
+            }
+            other => panic!("expected TurnCompleted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_thread_status_changed_running_no_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({"status": "running"});
+        translate_notification("thread/status/changed", &params, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "running status should not emit TurnCompleted"
+        );
+    }
+
+    #[test]
+    fn translate_informational_notifications_silent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let empty = serde_json::json!({});
+        let methods = [
+            "turn/started",
+            "thread/started",
+            "thread/tokenUsage/updated",
+            "account/rateLimits/updated",
+            "mcpServer/startupStatus/updated",
+            "configWarning",
+        ];
+        for method in &methods {
+            translate_notification(method, &empty, &tx);
+            assert!(
+                rx.try_recv().is_err(),
+                "{} should not emit any event",
+                method
+            );
+        }
+    }
+
+    #[test]
     fn translate_unknown_method_does_not_panic() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({});
@@ -1085,13 +1198,13 @@ mod tests {
         let agent = CodexAgent::new(
             "codex".into(),
             Some("o4-mini".into()),
-            "auto-edit".into(),
+            "on-request".into(),
             true,
             None,
         );
         assert_eq!(agent.command, "codex");
         assert_eq!(agent.model, Some("o4-mini".into()));
-        assert_eq!(agent.approval_policy, "auto-edit");
+        assert_eq!(agent.approval_policy, "on-request");
         assert!(agent.sandbox);
         assert!(agent.child.is_none());
         assert!(agent.writer.is_none());

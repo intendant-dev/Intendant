@@ -3544,14 +3544,14 @@ async fn run_with_presence(
                         let cfg = &proj.config.agent.codex;
                         let agent = Box::new(external_agent::codex::CodexAgent::new(
                             cfg.command.clone(), cfg.model.clone(),
-                            cfg.approval_policy.clone(), cfg.sandbox != "dangerFullAccess",
+                            cfg.approval_policy.clone(), cfg.sandbox != "danger-full-access",
                             web_port,
                         ));
                         let config = AgentConfig {
                             model: cfg.model.clone(),
                             working_dir: proj.root.clone(),
                             approval_policy: cfg.approval_policy.clone(),
-                            sandbox: cfg.sandbox != "dangerFullAccess",
+                            sandbox: cfg.sandbox != "danger-full-access",
                             web_port,
                         };
                         (agent, config)
@@ -3606,24 +3606,49 @@ async fn run_with_presence(
 
             // Drain events until this turn completes
             let event_rx = persistent_event_rx.as_mut().unwrap();
+            let mut turn_in_round = 0usize;
             loop {
                 match event_rx.recv().await {
-                    Some(external_agent::AgentEvent::TurnCompleted { .. }) => {
+                    Some(external_agent::AgentEvent::TurnCompleted { message }) => {
                         cumulative_stats.turns += 1;
                         cumulative_stats.rounds += 1;
+                        bus.send(AppEvent::DoneSignal { message: message.clone() });
+                        bus.send(AppEvent::RoundComplete {
+                            round: cumulative_stats.rounds,
+                            turns_in_round: turn_in_round,
+                        });
                         break;
                     }
                     Some(external_agent::AgentEvent::MessageDelta { text }) => {
                         bus.send(AppEvent::ModelResponseDelta { text });
                     }
+                    Some(external_agent::AgentEvent::Message { text }) => {
+                        bus.send(AppEvent::ModelResponse {
+                            turn: cumulative_stats.turns,
+                            content: text,
+                            usage: provider::TokenUsage::default(),
+                            reasoning: None,
+                        });
+                    }
                     Some(external_agent::AgentEvent::ToolStarted { preview, tool_name, .. }) => {
+                        turn_in_round += 1;
                         bus.send(AppEvent::AgentStarted {
-                            turn: cumulative_stats.turns + 1,
+                            turn: cumulative_stats.turns + turn_in_round,
                             commands_preview: format!("{}: {}", tool_name, preview),
                         });
                     }
                     Some(external_agent::AgentEvent::ToolOutputDelta { text, .. }) => {
                         bus.send(AppEvent::AgentOutput { stdout: text, stderr: String::new() });
+                    }
+                    Some(external_agent::AgentEvent::ToolCompleted { item_id, status }) => {
+                        let status_str = match &status {
+                            external_agent::ToolCompletionStatus::Success => "completed",
+                            external_agent::ToolCompletionStatus::Failed { .. } => "failed",
+                            external_agent::ToolCompletionStatus::Cancelled => "cancelled",
+                        };
+                        bus.send(AppEvent::AutoApproved {
+                            preview: format!("[{}] {}", status_str, item_id),
+                        });
                     }
                     Some(external_agent::AgentEvent::ApprovalRequest { request_id, command, category }) => {
                         let cat = match category {
@@ -3670,6 +3695,15 @@ async fn run_with_presence(
                             let _ = agent.resolve_approval(&request_id, decision).await;
                         }
                     }
+                    Some(external_agent::AgentEvent::DiffUpdated { files_changed, unified_diff }) => {
+                        slog(&session_log, |l| {
+                            l.info(&format!(
+                                "External agent diff: {} files changed\n{}",
+                                files_changed.len(),
+                                unified_diff
+                            ));
+                        });
+                    }
                     Some(external_agent::AgentEvent::Terminated { reason, .. }) => {
                         bus.send(AppEvent::PresenceLog {
                             message: format!("External agent terminated: {}", reason),
@@ -3681,7 +3715,6 @@ async fn run_with_presence(
                         persistent_event_rx = None;
                         break;
                     }
-                    Some(_) => {} // other events (DiffUpdated, ToolCompleted, Message) — logged but not blocking
                     None => {
                         // Channel closed unexpectedly
                         persistent_agent = None;
@@ -4255,14 +4288,14 @@ async fn run_external_agent_mode(
                 cfg.command.clone(),
                 cfg.model.clone(),
                 cfg.approval_policy.clone(),
-                cfg.sandbox != "dangerFullAccess",
+                cfg.sandbox != "danger-full-access",
                 web_port,
             ));
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
                 approval_policy: cfg.approval_policy.clone(),
-                sandbox: cfg.sandbox != "dangerFullAccess",
+                sandbox: cfg.sandbox != "danger-full-access",
                 web_port,
             };
             (agent, config)

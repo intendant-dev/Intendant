@@ -261,7 +261,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binPath)
-        process.arguments = ["--web", String(port)]
+        // Forward any extra CLI arguments (e.g. --agent codex) to the backend
+        var args = ["--web", String(port)]
+        let extra = Array(ProcessInfo.processInfo.arguments.dropFirst())
+        args.append(contentsOf: extra)
+        process.arguments = args
 
         // Inherit environment + ensure Homebrew PATH
         var env = ProcessInfo.processInfo.environment

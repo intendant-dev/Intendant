@@ -125,7 +125,7 @@ pub struct CodexConfig {
     /// Model to use (e.g. "o4-mini", "codex-mini-latest").
     #[serde(default)]
     pub model: Option<String>,
-    /// Approval policy: "never", "onRequest", "onFailure", "unlessTrusted".
+    /// Approval policy: "never", "on-request", "on-failure", "untrusted", "granular".
     #[serde(default = "default_codex_approval_policy")]
     pub approval_policy: String,
     /// Sandbox mode within Codex.
@@ -138,11 +138,11 @@ fn default_codex_command() -> String {
 }
 
 fn default_codex_approval_policy() -> String {
-    "onRequest".to_string()
+    "on-request".to_string()
 }
 
 fn default_codex_sandbox() -> String {
-    "workspaceWrite".to_string()
+    "workspace-write".to_string()
 }
 
 impl Default for CodexConfig {
@@ -780,8 +780,8 @@ context_window = 200000
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert!(config.agent.default_backend.is_none());
         assert_eq!(config.agent.codex.command, "codex");
-        assert_eq!(config.agent.codex.approval_policy, "onRequest");
-        assert_eq!(config.agent.codex.sandbox, "workspaceWrite");
+        assert_eq!(config.agent.codex.approval_policy, "on-request");
+        assert_eq!(config.agent.codex.sandbox, "workspace-write");
         assert!(config.agent.codex.model.is_none());
         assert_eq!(config.agent.claude_code.command, "claude");
         assert_eq!(config.agent.claude_code.permission_mode, "auto");
@@ -799,7 +799,7 @@ default_backend = "codex"
 command = "/usr/local/bin/codex"
 model = "o4-mini"
 approval_policy = "never"
-sandbox = "workspaceWrite"
+sandbox = "workspace-write"
 
 [agent.claude_code]
 command = "/usr/local/bin/claude"
@@ -812,7 +812,7 @@ allowed_tools = ["Read", "Edit", "Bash"]
         assert_eq!(config.agent.codex.command, "/usr/local/bin/codex");
         assert_eq!(config.agent.codex.model.as_deref(), Some("o4-mini"));
         assert_eq!(config.agent.codex.approval_policy, "never");
-        assert_eq!(config.agent.codex.sandbox, "workspaceWrite");
+        assert_eq!(config.agent.codex.sandbox, "workspace-write");
         assert_eq!(config.agent.claude_code.command, "/usr/local/bin/claude");
         assert_eq!(
             config.agent.claude_code.model.as_deref(),
@@ -835,8 +835,8 @@ default_backend = "codex"
         assert_eq!(config.agent.default_backend.as_deref(), Some("codex"));
         assert_eq!(config.agent.codex.command, "codex");
         assert!(config.agent.codex.model.is_none());
-        assert_eq!(config.agent.codex.approval_policy, "onRequest");
-        assert_eq!(config.agent.codex.sandbox, "workspaceWrite");
+        assert_eq!(config.agent.codex.approval_policy, "on-request");
+        assert_eq!(config.agent.codex.sandbox, "workspace-write");
         assert_eq!(config.agent.claude_code.command, "claude");
         assert!(config.agent.claude_code.model.is_none());
         assert_eq!(config.agent.claude_code.permission_mode, "auto");
@@ -848,7 +848,7 @@ default_backend = "codex"
         let config = CodexConfig::default();
         assert_eq!(config.command, "codex");
         assert!(config.model.is_none());
-        assert_eq!(config.approval_policy, "onRequest");
-        assert_eq!(config.sandbox, "workspaceWrite");
+        assert_eq!(config.approval_policy, "on-request");
+        assert_eq!(config.sandbox, "workspace-write");
     }
 }
