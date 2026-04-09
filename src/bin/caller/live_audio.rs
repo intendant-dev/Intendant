@@ -1613,7 +1613,9 @@ pub async fn run_session(
                 }
                 LiveAudioEvent::FunctionCall { name, call_id, args } => {
                     if name == FN_SUBMIT_RESPONSE {
-                        // The model submitted structured response via function call
+                        // The model submitted structured response via function call.
+                        // Don't break yet — the model may still be speaking.
+                        // Wait for end_call or a drain timeout.
                         model_text = serde_json::to_string(&args).unwrap_or_default();
                         // Send function call output back to acknowledge (OpenAI requires this)
                         if spec.provider == LiveAudioProvider::OpenAI && !call_id.is_empty() {
@@ -1628,9 +1630,22 @@ pub async fn run_session(
                             let mut sink = session.ws_write.lock().await;
                             let _ = sink.send(WsMessage::Text(ack.to_string())).await;
                         }
+                        // Drain: keep playing audio for up to 5s waiting for end_call
+                        let drain_deadline = Instant::now() + Duration::from_secs(5);
+                        loop {
+                            let remaining = drain_deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() { break; }
+                            match tokio::time::timeout(remaining, session.event_rx.recv()).await {
+                                Ok(Some(LiveAudioEvent::FunctionCall { name, .. })) if name == FN_END_CALL => break,
+                                Ok(Some(LiveAudioEvent::AudioOut(pcm))) => { let _ = audio_out_tx.send(pcm); }
+                                Ok(Some(LiveAudioEvent::Disconnected(_))) | Ok(None) | Err(_) => break,
+                                Ok(Some(_)) => {} // keep draining other events
+                            }
+                        }
                         break LiveAudioStatus::Completed;
                     } else if name == FN_END_CALL {
-                        // Model signaled call is done without submitting data
+                        // Model signaled call is done — allow buffered audio to finish
+                        tokio::time::sleep(Duration::from_secs(2)).await;
                         break LiveAudioStatus::Completed;
                     }
                 }
