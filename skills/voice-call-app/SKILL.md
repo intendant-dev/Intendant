@@ -4,7 +4,7 @@ description: >
   Make a voice call through any app (Element, FaceTime, WhatsApp, etc.)
   using computer use to navigate the UI and spawn_live_audio for the
   AI voice conversation. Returns typed structured data.
-compatibility: macOS only. Requires Vortex Audio HAL plugin, cliclick, and a GUI session with TCC mic permission.
+compatibility: macOS or Linux with display. Requires Vortex Audio HAL plugin and a GUI session with TCC mic permission.
 ---
 
 # Voice Call via App + Live Audio
@@ -14,64 +14,33 @@ compatibility: macOS only. Requires Vortex Audio HAL plugin, cliclick, and a GUI
 - **Vortex Audio** HAL plugin installed and set as default input AND output
 - **Intendant launched from GUI** (required for macOS mic access / TCC)
 - **Target app** installed and logged in
-- **Autonomy Full** (CU requires display grant + command approval)
 
 ## Steps
 
-### 1. Determine the display scale factor
-
-Screenshots are in pixel coordinates but `cliclick` uses logical points.
-On Retina displays these differ by a scale factor. Compute it FIRST:
-
-```bash
-captureScreen  # take a screenshot
-```
-
-Then in the same turn or the next:
-
-```bash
-python3 -c "
-from PIL import Image
-import subprocess, json
-img = Image.open('SCREENSHOT_PATH')
-px_w, px_h = img.size
-# Get logical display size
-out = subprocess.check_output(['system_profiler', 'SPDisplaysDataType', '-json'])
-displays = json.loads(out)['SPDisplaysDataType']
-for gpu in displays:
-    for d in gpu.get('spdisplays_ndrvs', []):
-        res = d.get('_spdisplays_resolution', d.get('spdisplays_resolution', ''))
-        if 'x' in res:
-            parts = res.replace(' ','').split('x')
-            log_w = int(parts[0])
-            scale = px_w / log_w
-            print(f'scale={scale} pixel={px_w}x{px_h} logical={log_w}x{px_h//int(scale)}')
-            break
-"
-```
-
-Use this scale factor for ALL subsequent coordinate conversions:
-`cliclick_x = pixel_x / scale`, `cliclick_y = pixel_y / scale`.
-
-### 2. Open the app and navigate to the contact
+### 1. Open the app
 
 ```bash
 open -a "AppName" && sleep 2
 ```
 
-Then use `captureScreen` + `cliclick` to navigate. When you identify
-a target in the screenshot image, estimate its pixel coordinates in the
-image, divide by the scale factor, and pass to cliclick.
+### 2. Navigate to the contact and start the call
 
-### 3. Click the call button and VERIFY
+Use your **native computer use actions** (click, type, screenshot) to
+navigate the app's UI. Do NOT use exec cliclick or AppleScript — use
+your built-in CU actions directly.
 
-After clicking what you think is the call/voice button:
-1. Take another `captureScreen`
-2. Verify the call UI appeared (ringing screen, call dialog, etc.)
-3. Handle any confirmation dialogs (e.g. "Voice call using: Element Call")
-4. Handle any permission dialogs (e.g. "Allow local network access")
+1. Take a screenshot to see the app
+2. Click the contact/room in the sidebar
+3. Click the call/voice button (usually a phone icon in the header)
 
-Only proceed to step 4 once you can see the call is actually ringing.
+### 3. Verify the call connected
+
+After clicking the call button:
+1. Take a screenshot to verify the call UI appeared
+2. Handle any confirmation dialogs (e.g. "Voice call using: Element Call")
+3. Handle any permission dialogs (e.g. "Allow local network access")
+
+Only proceed once you can see the call is actually ringing.
 
 ### 4. Call spawn_live_audio
 
@@ -95,7 +64,7 @@ Once the call is confirmed ringing, call `spawn_live_audio`.
 
 ### 6. Clean up
 
-Hang up the call if still connected (captureScreen + click end call).
+Hang up the call if still connected (screenshot + click end call).
 
 ## Response Schema — REQUIRED
 

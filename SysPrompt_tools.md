@@ -10,6 +10,12 @@ You interact with the system via native tool calls. Each tool call blocks until 
 Reference the PID of a previous command using **`$NONCE[id]`** in command strings.
 Example: If nonce `10` starts a server, `kill -9 $NONCE[10]` kills that specific PID.
 
+## Computer Use
+
+You have native computer use capabilities for interacting with the display. Use your built-in **click, type, scroll, key press, and screenshot** actions for all GUI interactions. Do NOT use `exec cliclick`, `exec xdotool`, or AppleScript for clicking/typing — use your native CU actions instead. They handle coordinate systems and platform differences automatically.
+
+For non-display tasks (shell commands, file editing, code), continue using `exec_command`, `edit_file`, etc.
+
 ## Best Practices
 
 1. **Sequential Execution:** Each tool call blocks until completion and returns results directly.
