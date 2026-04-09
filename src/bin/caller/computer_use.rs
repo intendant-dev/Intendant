@@ -352,6 +352,51 @@ pub async fn execute_actions(
     results
 }
 
+/// Get the macOS Retina scale factor by comparing screencapture pixel size
+/// to the logical display size. Cached after first call.
+#[cfg(target_os = "macos")]
+fn macos_retina_scale() -> f64 {
+    use std::sync::OnceLock;
+    static SCALE: OnceLock<f64> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        // Query logical display size via CGMainDisplayID
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGMainDisplayID() -> u32;
+            fn CGDisplayPixelsWide(display: u32) -> usize;
+            fn CGDisplayPixelsHigh(display: u32) -> usize;
+        }
+        // screencapture gives backing (pixel) resolution, CGDisplay gives logical
+        let (logical_w, _logical_h) = unsafe {
+            let d = CGMainDisplayID();
+            (CGDisplayPixelsWide(d), CGDisplayPixelsHigh(d))
+        };
+        if logical_w == 0 { return 1.0; }
+        // Take a tiny screenshot to get the actual pixel width
+        let tmp = std::env::temp_dir().join("_intendant_scale_probe.png");
+        let _ = std::process::Command::new("screencapture")
+            .args(["-x", "-C", "-t", "png"])
+            .arg(tmp.as_os_str())
+            .output();
+        let pixel_w = image::open(&tmp)
+            .map(|img| img.width() as usize)
+            .unwrap_or(logical_w);
+        let _ = std::fs::remove_file(&tmp);
+        if pixel_w <= logical_w { 1.0 } else { pixel_w as f64 / logical_w as f64 }
+    })
+}
+
+/// Scale pixel coordinates to logical points for macOS.
+#[cfg(target_os = "macos")]
+fn scale_coords(x: i32, y: i32) -> (i32, i32) {
+    let s = macos_retina_scale();
+    if s <= 1.0 { return (x, y); }
+    ((x as f64 / s).round() as i32, (y as f64 / s).round() as i32)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn scale_coords(x: i32, y: i32) -> (i32, i32) { (x, y) }
+
 /// Execute a single CU action, dispatching to the appropriate backend.
 async fn execute_single(
     action: &CuAction,
@@ -363,7 +408,8 @@ async fn execute_single(
     match action {
         CuAction::Click { x, y, button } => match backend {
             DisplayBackend::MacOS => {
-                run_cliclick(&[&format!("{}:{},{}", button.cliclick_prefix(), x, y)]).await
+                let (sx, sy) = scale_coords(*x, *y);
+                run_cliclick(&[&format!("{}:{},{}", button.cliclick_prefix(), sx, sy)]).await
             }
             _ => {
                 run_xdotool(display, &[
@@ -374,7 +420,8 @@ async fn execute_single(
         },
         CuAction::DoubleClick { x, y, .. } => match backend {
             DisplayBackend::MacOS => {
-                run_cliclick(&[&format!("dc:{},{}", x, y)]).await
+                let (sx, sy) = scale_coords(*x, *y);
+                run_cliclick(&[&format!("dc:{},{}", sx, sy)]).await
             }
             _ => {
                 run_xdotool(display, &[
@@ -412,7 +459,8 @@ async fn execute_single(
         },
         CuAction::Scroll { x, y, direction, amount } => match backend {
             DisplayBackend::MacOS => {
-                execute_macos_scroll(*x, *y, *direction, *amount).await
+                let (sx, sy) = scale_coords(*x, *y);
+                execute_macos_scroll(sx, sy, *direction, *amount).await
             }
             _ => {
                 let mut result = run_xdotool(display, &[
@@ -430,7 +478,8 @@ async fn execute_single(
         },
         CuAction::MoveMouse { x, y } => match backend {
             DisplayBackend::MacOS => {
-                run_cliclick(&[&format!("m:{},{}", x, y)]).await
+                let (sx, sy) = scale_coords(*x, *y);
+                run_cliclick(&[&format!("m:{},{}", sx, sy)]).await
             }
             _ => {
                 run_xdotool(display, &[
@@ -440,9 +489,11 @@ async fn execute_single(
         },
         CuAction::Drag { start_x, start_y, end_x, end_y } => match backend {
             DisplayBackend::MacOS => {
+                let (sx1, sy1) = scale_coords(*start_x, *start_y);
+                let (sx2, sy2) = scale_coords(*end_x, *end_y);
                 run_cliclick(&[
-                    &format!("dd:{},{}", start_x, start_y),
-                    &format!("du:{},{}", end_x, end_y),
+                    &format!("dd:{},{}", sx1, sy1),
+                    &format!("du:{},{}", sx2, sy2),
                 ]).await
             }
             _ => {
@@ -583,7 +634,7 @@ fn translate_single_key(key: &str) -> &str {
         "ctrl" | "control" | "control_l" | "control_r" => "ctrl",
         "alt" | "alt_l" | "alt_r" => "alt",
         "shift" | "shift_l" | "shift_r" => "shift",
-        "super" | "super_l" | "super_r" | "meta" => "cmd",
+        "super" | "super_l" | "super_r" | "meta" | "cmd" | "command" => "cmd",
         "f1" => "f1",
         "f2" => "f2",
         "f3" => "f3",
@@ -1294,6 +1345,17 @@ mod tests {
         // Unrecognized keys pass through as-is
         assert_eq!(translate_single_key("a"), "a");
         assert_eq!(translate_single_key("z"), "z");
+    }
+
+    #[test]
+    fn translate_single_key_cmd_variants() {
+        // OpenAI CU sends "CMD", Gemini sends "super"/"meta"
+        assert_eq!(translate_single_key("CMD"), "cmd");
+        assert_eq!(translate_single_key("cmd"), "cmd");
+        assert_eq!(translate_single_key("command"), "cmd");
+        assert_eq!(translate_single_key("super"), "cmd");
+        assert_eq!(translate_single_key("meta"), "cmd");
+        assert_eq!(translate_single_key("Meta"), "cmd");
     }
 
     #[test]
