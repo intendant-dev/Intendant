@@ -17,7 +17,17 @@ compatibility: macOS or Linux with display. Requires Vortex Audio HAL plugin and
 
 ## Steps
 
-### 1. Navigate to the app and start the call
+### 1. Prepare the call BEFORE dialing
+
+Compose the `spawn_live_audio` arguments (playbook, response_schema,
+timeout_secs, voice, id) BEFORE you start the call. You will need them
+ready to fire instantly once the call connects.
+
+Mark all data fields you need to collect as `required: true` in the
+schema. The voice model cannot submit until all required fields are
+filled — this prevents premature hangups.
+
+### 2. Navigate to the app and start the call
 
 Use your native computer use actions to interact with the screen.
 Take a screenshot, find the app (in the dock, taskbar, or already open),
@@ -31,11 +41,12 @@ click, type, scroll, and screenshot actions for everything visual.
 (not Element Call). Element Call is a conference that requires the other
 party to manually join; Legacy call rings their device directly.
 
-### 2. Call spawn_live_audio immediately
+### 3. Call spawn_live_audio immediately
 
 As soon as you click the call button (or select "Legacy call"),
-call `spawn_live_audio` on the VERY NEXT turn. Do NOT take a verification
-screenshot first — the audio bridge works before the call connects.
+call `spawn_live_audio` on the VERY NEXT turn with the arguments you
+prepared in step 1. Do NOT compose them now — that adds seconds of
+dead air for the callee.
 
 **ALL of these parameters are REQUIRED:**
 - `id`: unique session identifier
@@ -47,14 +58,18 @@ screenshot first — the audio bridge works before the call connects.
 - Do NOT set `initial_message` — the model waits for the other party
   to speak first, then responds naturally per the playbook.
 
-### 3. Process the result
+### 4. Write the result immediately
 
-`spawn_live_audio` returns `LiveAudioResult` with `status`:
+`spawn_live_audio` returns `LiveAudioResult` with `response_data`.
+Write the result to the output file IMMEDIATELY from `response_data` —
+do NOT re-read the transcript or take screenshots first.
+
+Status values:
 - **Completed**: model called `submit_response` with structured data
 - **TimedOut**: exceeded timeout without submitting response
 - **SchemaError**: response didn't match schema
 
-### 4. Clean up
+### 5. Clean up
 
 Hang up the call if still connected (screenshot + click end call).
 
@@ -65,6 +80,8 @@ schema) and `end_call`. It calls `submit_response` when it has the data,
 then `end_call` to signal completion.
 
 **You MUST always include `response_schema` with concrete fields.**
+Mark every field you need as `required: true` — the model cannot submit
+until all required fields are populated.
 
 Example for a reservation confirmation:
 
