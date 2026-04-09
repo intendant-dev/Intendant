@@ -986,24 +986,20 @@ fn build_openai_request_parts(
                 if let Some(ref call_id) = m.tool_call_id {
                     if m.is_cu_result {
                         // Native CU result: computer_call_output format.
-                        // The output.image_url must be a valid data URI.
-                        // If the screenshot was stripped (strip_old_images),
-                        // use a 1x1 transparent PNG placeholder.
+                        // CU images are preserved by strip_old_images so
+                        // the screenshot should always be present.
                         let screenshot = m.images.as_ref().and_then(|imgs| imgs.first());
-                        let image_url = if let Some(img) = screenshot {
-                            format!("data:{};base64,{}", img.media_type, img.data)
-                        } else {
-                            // 1x1 transparent PNG
-                            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNjN9GQAAAAlwSFlzAAAWJQAAFiUBSVIk8AAAAA0lEQVQI12P4z8BQDwAEgAF/QualzQAAAABJRU5ErkJggg==".to_string()
-                        };
-                        items.push(serde_json::json!({
+                        let mut output_item = serde_json::json!({
                             "type": "computer_call_output",
                             "call_id": call_id,
-                            "output": {
+                        });
+                        if let Some(img) = screenshot {
+                            output_item["output"] = serde_json::json!({
                                 "type": "computer_screenshot",
-                                "image_url": image_url,
-                            },
-                        }));
+                                "image_url": format!("data:{};base64,{}", img.media_type, img.data),
+                            });
+                        }
+                        items.push(output_item);
                     } else {
                         items.push(openai_function_call_output(call_id, &m.content));
                         if let Some(ref images) = m.images {

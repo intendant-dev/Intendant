@@ -278,14 +278,19 @@ impl Conversation {
         &self.messages
     }
 
-    /// Strip all screenshot images from the conversation except the most recent one.
-    /// Required when the OpenAI `computer` tool is active — it rejects multiple images.
+    /// Strip non-CU screenshot images from the conversation, keeping only the most
+    /// recent one. CU result images (`is_cu_result`) are never stripped — the API
+    /// requires them in `computer_call_output`.
+    /// Required when the OpenAI `computer` tool is active — it rejects multiple
+    /// non-CU images.
     pub fn strip_old_images(&mut self) {
-        // Find the index of the last message with images
-        let last_with_images = self.messages.iter().rposition(|m| m.images.is_some());
-        if let Some(last_idx) = last_with_images {
+        // Find the index of the last non-CU message with images
+        let last_non_cu = self.messages.iter().rposition(|m| {
+            m.images.is_some() && !m.is_cu_result
+        });
+        if let Some(last_idx) = last_non_cu {
             for (i, msg) in self.messages.iter_mut().enumerate() {
-                if i < last_idx {
+                if i < last_idx && !msg.is_cu_result {
                     msg.images = None;
                 }
             }
