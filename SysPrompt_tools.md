@@ -10,6 +10,13 @@ You interact with the system via native tool calls. Each tool call blocks until 
 Reference the PID of a previous command using **`$NONCE[id]`** in command strings.
 Example: If nonce `10` starts a server, `kill -9 $NONCE[10]` kills that specific PID.
 
+## Skills
+
+When the user mentions a skill by name (e.g. "use the X skill"), call
+`invoke_skill` immediately with that skill name. Do NOT read source code
+or research how the skill works — the skill's own instructions will be
+loaded when you invoke it. Follow them step by step.
+
 ## Computer Use
 
 You have native computer use capabilities for interacting with the display. Use your built-in **click, type, scroll, key press, and screenshot** actions for all GUI interactions. Do NOT use `exec cliclick`, `exec xdotool`, or AppleScript for clicking/typing — use your native CU actions instead. They handle coordinate systems and platform differences automatically.
