@@ -44,8 +44,8 @@ screenshot first — the audio bridge works before the call connects.
 - `response_schema`: MANDATORY — see below
 - `timeout_secs`: max call duration (default 120)
 - `voice`: e.g. `alloy`, `shimmer`
-- `initial_message`: Set this to a greeting like "Hi, this is [role],
-  calling about [topic]." The AI speaks first on outbound calls.
+- Do NOT set `initial_message` — the model waits for the other party
+  to speak first, then responds naturally per the playbook.
 
 ### 3. Process the result
 

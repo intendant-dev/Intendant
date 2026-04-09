@@ -1692,8 +1692,14 @@ pub async fn run_session(
                 break LiveAudioStatus::Disconnected;
             }
             Err(_) => {
-                // Timeout
-                break LiveAudioStatus::TimedOut;
+                // Inner timeout (silence_limit) expired — check if the
+                // overall session timeout has been reached. If not, loop
+                // back so the silence watchdog nudge gets a chance to work.
+                if start.elapsed() >= timeout {
+                    break LiveAudioStatus::TimedOut;
+                }
+                // Otherwise continue the loop — the silence nudge at the
+                // top of the loop will fire on the next iteration.
             }
         }
     };
