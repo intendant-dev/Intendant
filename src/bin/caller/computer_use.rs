@@ -378,18 +378,11 @@ fn logical_display_size() -> (u32, u32) {
     })
 }
 
-/// The CU model outputs coordinates in a normalized space (typically 1024x768).
-/// Map them to actual logical display coordinates for cliclick/xdotool.
+/// Screenshots are resized to logical display size before sending to the model,
+/// so model coordinates are already in logical (cliclick/xdotool) space.
+/// This function is a no-op but kept as the single place to adjust if needed.
 fn scale_coords(x: i32, y: i32) -> (i32, i32) {
-    // OpenAI CU models use a 1024-wide coordinate space derived from the
-    // screenshot image. The height varies by aspect ratio.
-    const MODEL_W: f64 = 1024.0;
-    const MODEL_H: f64 = 768.0;
-    let (disp_w, disp_h) = logical_display_size();
-    (
-        (x as f64 / MODEL_W * disp_w as f64).round() as i32,
-        (y as f64 / MODEL_H * disp_h as f64).round() as i32,
-    )
+    (x, y)
 }
 
 /// Execute a single CU action, dispatching to the appropriate backend.
@@ -764,13 +757,38 @@ async fn take_screenshot(
         ));
     }
 
-    // Read file and encode as base64
-    let bytes = tokio::fs::read(&path)
+    // Read file, resize to logical display size (so model coordinates = cliclick
+    // coordinates), and encode as base64.
+    let raw_bytes = tokio::fs::read(&path)
         .await
         .map_err(|e| format!("read screenshot: {}", e))?;
 
-    // Get dimensions from the PNG header (first 24 bytes: signature + IHDR)
-    let (width, height) = png_dimensions(&bytes).unwrap_or((0, 0));
+    let (raw_w, raw_h) = png_dimensions(&raw_bytes).unwrap_or((0, 0));
+    let (logical_w, logical_h) = logical_display_size();
+
+    let bytes = if raw_w > logical_w && logical_w > 0 && logical_h > 0 {
+        // Resize to logical display size so model coords = logical coords
+        match image::load_from_memory(&raw_bytes) {
+            Ok(img) => {
+                let resized = img.resize_exact(
+                    logical_w,
+                    logical_h,
+                    image::imageops::FilterType::Triangle,
+                );
+                let mut buf = std::io::Cursor::new(Vec::new());
+                if resized.write_to(&mut buf, image::ImageFormat::Png).is_ok() {
+                    buf.into_inner()
+                } else {
+                    raw_bytes
+                }
+            }
+            Err(_) => raw_bytes,
+        }
+    } else {
+        raw_bytes
+    };
+
+    let (width, height) = png_dimensions(&bytes).unwrap_or((raw_w, raw_h));
 
     use base64::Engine;
     let base64_png = base64::engine::general_purpose::STANDARD.encode(&bytes);
