@@ -2245,9 +2245,11 @@ mod tests {
             stdout: "line1\nline2".to_string(),
             stderr: "warn".to_string(),
         });
-        assert_eq!(app.log_entries.len(), 3);
-        assert_eq!(app.log_entries[0].level, LogLevel::Agent);
-        assert_eq!(app.log_entries[2].level, LogLevel::Warn);
+        // format_agent_output_for_tui produces one combined entry
+        assert_eq!(app.log_entries.len(), 1);
+        assert_eq!(app.log_entries[0].level, LogLevel::Warn); // stderr present → warn level
+        assert!(app.log_entries[0].content.contains("line1"));
+        assert!(app.log_entries[0].content.contains("[stderr] warn"));
     }
 
     #[test]

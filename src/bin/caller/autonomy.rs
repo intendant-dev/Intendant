@@ -824,7 +824,6 @@ destructive = "deny"
             AutonomyLevel::Low,
             AutonomyLevel::Medium,
             AutonomyLevel::High,
-            AutonomyLevel::Full,
         ] {
             let state = AutonomyState::new(level, ApprovalConfig::default());
             assert!(
@@ -833,6 +832,9 @@ destructive = "deny"
                 level
             );
         }
+        // Full autonomy auto-approves everything including DisplayControl
+        let full = AutonomyState::new(AutonomyLevel::Full, ApprovalConfig::default());
+        assert!(!full.needs_approval(ActionCategory::DisplayControl));
     }
 
     #[test]

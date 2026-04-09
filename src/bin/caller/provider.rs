@@ -148,6 +148,9 @@ pub trait ChatProvider: Send + Sync {
         None
     }
 
+    /// Enable or disable native computer-use on this provider instance.
+    fn set_cu_enabled(&mut self, _enabled: bool) {}
+
     /// Override display dimensions for CU. Used when the actual display size
     /// differs from the default (e.g. user's real display vs virtual display).
     fn set_cu_display(&mut self, _dims: (u32, u32)) {}
@@ -656,6 +659,10 @@ impl ChatProvider for OpenAIProvider {
 
     fn cu_enabled(&self) -> bool {
         self.cu_enabled
+    }
+
+    fn set_cu_enabled(&mut self, enabled: bool) {
+        self.cu_enabled = enabled;
     }
 
     fn cu_display(&self) -> Option<(u32, u32)> {
@@ -1359,6 +1366,10 @@ impl ChatProvider for AnthropicProvider {
         self.cu_enabled
     }
 
+    fn set_cu_enabled(&mut self, enabled: bool) {
+        self.cu_enabled = enabled;
+    }
+
     fn cu_display(&self) -> Option<(u32, u32)> {
         self.cu_display
     }
@@ -2016,6 +2027,10 @@ impl ChatProvider for GeminiProvider {
 
     fn cu_enabled(&self) -> bool {
         self.cu_enabled
+    }
+
+    fn set_cu_enabled(&mut self, enabled: bool) {
+        self.cu_enabled = enabled;
     }
 
     fn cu_display(&self) -> Option<(u32, u32)> {
