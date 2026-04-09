@@ -26,18 +26,16 @@ click to foreground it, navigate to the contact, and click the call button.
 Do NOT use exec commands for GUI navigation. Use your built-in
 click, type, scroll, and screenshot actions for everything visual.
 
-### 2. Verify the call connected
+**Element-specific:** When you click the phone icon, a dropdown asks
+"Voice call using: Element Call / Legacy call". Always pick **Legacy call**
+(not Element Call). Element Call is a conference that requires the other
+party to manually join; Legacy call rings their device directly.
 
-After clicking the call button, take a screenshot to verify:
-- The call UI appeared (ringing screen, timer, etc.)
-- Handle any confirmation dialogs
-- Handle any permission dialogs
+### 2. Call spawn_live_audio immediately
 
-Only proceed once you can see the call is actually ringing.
-
-### 3. Call spawn_live_audio
-
-Once the call is confirmed ringing, call `spawn_live_audio`.
+As soon as you click the call button (or select "Legacy call"),
+call `spawn_live_audio` on the VERY NEXT turn. Do NOT take a verification
+screenshot first — the audio bridge works before the call connects.
 
 **ALL of these parameters are REQUIRED:**
 - `id`: unique session identifier
@@ -46,16 +44,17 @@ Once the call is confirmed ringing, call `spawn_live_audio`.
 - `response_schema`: MANDATORY — see below
 - `timeout_secs`: max call duration (default 120)
 - `voice`: e.g. `alloy`, `shimmer`
-- Do NOT set `initial_message`
+- `initial_message`: Set this to a greeting like "Hi, this is [role],
+  calling about [topic]." The AI speaks first on outbound calls.
 
-### 4. Process the result
+### 3. Process the result
 
 `spawn_live_audio` returns `LiveAudioResult` with `status`:
 - **Completed**: model called `submit_response` with structured data
 - **TimedOut**: exceeded timeout without submitting response
 - **SchemaError**: response didn't match schema
 
-### 5. Clean up
+### 4. Clean up
 
 Hang up the call if still connected (screenshot + click end call).
 
