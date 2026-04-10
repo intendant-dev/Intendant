@@ -260,7 +260,7 @@ function Run-Wizard {
         if ($guestChoice -eq 2) {
             Write-Host ""
             Write-Host "  How to check:" -ForegroundColor Yellow
-            Write-Host "    Open VirtualBox > select your VM > Settings > Network."
+            Write-Host "    Open VirtualBox `> select your VM `> Settings `> Network."
             Write-Host "    'Attached to' shows your network mode."
             Write-Host ""
             $netChoice = Ask-Choice "What network mode is the VM using?" @(
@@ -283,8 +283,8 @@ function Run-Wizard {
             Write-Host ""
             Write-Host "  Before continuing, set up port forwarding in VirtualBox:" -ForegroundColor Yellow
             Write-Host ""
-            Write-Host "    1. Open VirtualBox > select your VM > Settings > Network"
-            Write-Host "    2. Expand 'Advanced' > click 'Port Forwarding'"
+            Write-Host "    1. Open VirtualBox `> select your VM `> Settings `> Network"
+            Write-Host "    2. Expand 'Advanced' `> click 'Port Forwarding'"
             Write-Host "    3. Add these rules (click the + icon):"
             Write-Host ""
             Write-Host "       Name      Host IP      Host Port   Guest Port" -ForegroundColor Cyan
