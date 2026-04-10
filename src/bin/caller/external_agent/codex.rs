@@ -20,10 +20,11 @@ use super::{
 // ---------------------------------------------------------------------------
 
 const DISPLAY_TOOLS_PROMPT: &str = "\n\n\
-## Display & Computer-Use Tools (via Intendant MCP)\n\
+## Intendant MCP Tools\n\
 \n\
-You have access to display and computer-use tools through the `intendant` MCP server:\n\
+You have access to these tools through the `intendant` MCP server:\n\
 \n\
+### Display & Computer Use\n\
 - **take_screenshot(display_target?)**: Capture the current display. Returns base64-encoded PNG.\n\
 - **execute_cu_actions(actions, display_target?)**: Execute computer-use actions on a display.\n\
   Action types: click, double_click, type, key, scroll, move_mouse, drag, screenshot, wait.\n\
@@ -32,7 +33,12 @@ You have access to display and computer-use tools through the `intendant` MCP se
 - **read_frame(frame_id, stream?)**: Read a frame's image data (base64 JPEG). Use frame_id=\"latest\".\n\
 - **list_displays()**: Enumerate available displays.\n\
 - **take_display(display_id)**: Claim control of a virtual display.\n\
-- **start_task(task, display_target?)**: Delegate a visual task to Intendant's CU-first routing.\n\
+\n\
+### Voice / Live Audio\n\
+- **spawn_live_audio(id, provider, playbook, response_schema, timeout_secs?, voice?, model?, initial_message?)**: Spawn a voice conversation via OpenAI Realtime or Gemini Live. Routes audio through Vortex Audio. The voice model follows the playbook and returns structured data matching response_schema. Blocks until complete.\n\
+\n\
+### Task Delegation\n\
+- **start_task(task, display_target?)**: Delegate a task to Intendant's internal agent.\n\
 \n\
 Display targets: \"user_session\" (user's display), \":99\" (virtual display 99).\n\
 ";
@@ -406,6 +412,21 @@ fn translate_notification(
                     // userMessage: echo of the user's input; nothing to emit.
                     // reasoning: model reasoning trace; nothing to emit.
                 }
+                "mcpToolCall" => {
+                    // Codex is calling an MCP tool (e.g. spawn_live_audio, take_screenshot).
+                    // The MCP server handles execution; we just surface it in the Activity tab.
+                    let tool_name = params
+                        .pointer("/item/name")
+                        .or_else(|| params.pointer("/item/toolName"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("mcp_tool")
+                        .to_string();
+                    let _ = event_tx.send(AgentEvent::ToolStarted {
+                        item_id,
+                        tool_name: format!("mcp:{}", tool_name),
+                        preview: String::new(),
+                    });
+                }
                 other => {
                     eprintln!("[codex] unknown item type in item/started: {:?}", other);
                 }
@@ -442,6 +463,24 @@ fn translate_notification(
                         let _ = event_tx.send(AgentEvent::ToolOutputDelta {
                             item_id: item_id.clone(),
                             text: output.to_string(),
+                        });
+                    }
+                }
+            }
+
+            // Extract MCP tool call results
+            if item_type == "mcpToolCall" {
+                // MCP results may contain structured data; surface as output
+                if let Some(result) = item.get("result") {
+                    let text = if let Some(s) = result.as_str() {
+                        s.to_string()
+                    } else {
+                        serde_json::to_string_pretty(result).unwrap_or_default()
+                    };
+                    if !text.is_empty() {
+                        let _ = event_tx.send(AgentEvent::ToolOutputDelta {
+                            item_id: item_id.clone(),
+                            text,
                         });
                     }
                 }
@@ -507,15 +546,18 @@ fn translate_notification(
         }
 
         // Informational Codex v2 notifications — no action needed.
-        // turn/started: turn began processing.
-        // thread/started: thread is active.
-        // thread/tokenUsage/updated: token usage stats.
-        // account/rateLimits/updated: rate limit info.
-        // mcpServer/startupStatus/updated: MCP server startup status.
-        // configWarning: configuration warning from the Codex backend.
         "turn/started" | "thread/started" | "thread/tokenUsage/updated"
-        | "account/rateLimits/updated" | "mcpServer/startupStatus/updated"
-        | "configWarning" => {}
+        | "account/rateLimits/updated" | "configWarning" => {}
+
+        "mcpServer/startupStatus/updated" => {
+            let status = params.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(error) = params.get("error").and_then(|v| v.as_str()) {
+                if !error.is_empty() {
+                    eprintln!("[codex] MCP server '{}' {}: {}", name, status, error);
+                }
+            }
+        }
 
         // thread/status/changed may signal turn or thread completion.
         // Codex v2 uses this alongside (or instead of) turn/completed.
@@ -585,8 +627,14 @@ impl ExternalAgent for CodexAgent {
             }
         }
 
+        // Pass MCP server config via -c flag so Codex connects to intendant's MCP
+        let mcp_url = format!("http://localhost:{}/mcp", self.web_port.unwrap_or(8765));
         let mut child = Command::new(&self.command)
-            .args(["app-server"])
+            .args([
+                "app-server",
+                "-c", &format!("mcp_servers.intendant.type=\"http\""),
+                "-c", &format!("mcp_servers.intendant.url=\"{}\"", mcp_url),
+            ])
             .current_dir(&config.working_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

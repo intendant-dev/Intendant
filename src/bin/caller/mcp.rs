@@ -2563,6 +2563,10 @@ impl IntendantServer {
                 let params: ReadFrameParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
                 Ok(self.read_frame(Parameters(params)).await)
             }
+            "spawn_live_audio" => {
+                let params: SpawnLiveAudioParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.spawn_live_audio(Parameters(params)).await)
+            }
             _ => Err(format!("Unknown tool: {}", name)),
         }
     }

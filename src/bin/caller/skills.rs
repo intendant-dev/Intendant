@@ -194,11 +194,6 @@ pub fn discover_skills(project_root: Option<&Path>) -> Vec<Skill> {
             &root.join(".intendant").join("skills"),
             SkillSource::Project, &mut skills, &mut seen_names,
         );
-        // Legacy: skills/
-        load_skills_from_dir(
-            &root.join("skills"),
-            SkillSource::Project, &mut skills, &mut seen_names,
-        );
     }
 
     // 2. Personal skills (standard path first, then legacy)
