@@ -377,12 +377,53 @@ function Run-Wizard {
     Add-PortForwarding
     Add-FirewallRule
 
-    Info "running setup on guest (follow the prompts there)..."
+    Info "running setup on guest..."
     Copy-AndRunOnGuest "--port $($script:Port) --lan-ip $hostIp"
 
     # Save config for future --recert / --remove
     Save-Config
     Info "config saved to $($script:ConfigPath)"
+
+    # --- Certificate installation (interactive, on the Windows console) ---
+    # The guest script started a background HTTP cert server. Read the
+    # P12 password from the guest so we can display it here.
+    $p12Pass = ""
+    try {
+        $p12Pass = (Invoke-GuestCommand "cat /etc/intendant-lan/p12_password 2>/dev/null").Trim()
+    } catch {}
+
+    if ($p12Pass) {
+        $caUrl   = "http://${hostIp}:$($script:CertPort)/ca.crt"
+        $p12Url  = "http://${hostIp}:$($script:CertPort)/client.p12"
+
+        Write-Host ""
+        Write-Host "========================================================" -ForegroundColor Cyan
+        Write-Host "  Certificate Installation" -ForegroundColor Cyan
+        Write-Host "========================================================" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  Your phone needs two certificates to connect securely."
+        Write-Host "  Open these URLs in the phone's browser:"
+        Write-Host ""
+        Write-Host "  1. CA certificate (trust anchor):" -ForegroundColor White
+        Write-Host "     $caUrl"
+        Write-Host ""
+        Write-Host "  2. Client certificate (identity):" -ForegroundColor White
+        Write-Host "     $p12Url"
+        Write-Host "     Password: $p12Pass" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  After downloading, install both certificates:" -ForegroundColor White
+        Write-Host "    iOS:     Settings `> General `> VPN & Device Mgmt `> Install each"
+        Write-Host "             Settings `> General `> About `> Certificate Trust `> Enable CA"
+        Write-Host "    Android: Settings `> Security `> Install a certificate"
+        Write-Host ""
+
+        $null = Read-Host "  Press Enter when certs are installed on your phone"
+
+        # Stop the background cert server on the guest
+        try { Copy-AndRunOnGuest "--stop-cert-server" } catch {}
+    } else {
+        Warn "could not read cert password from guest -- run setup-lan.sh on the guest directly for cert setup"
+    }
 
     # WSL warning
     if ($script:Mode -eq "wsl") {
