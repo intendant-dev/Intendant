@@ -2508,14 +2508,18 @@ impl IntendantServer {
     }
 
     /// Return MCP tool definitions as JSON for the HTTP transport.
+    /// Schemas are flattened (all `$ref`/`$defs` inlined) for compatibility
+    /// with clients that don't resolve JSON Schema references (e.g. Codex).
     pub fn list_tools_json(&self) -> serde_json::Value {
         let tools: Vec<serde_json::Value> = self.tool_router.list_all()
             .iter()
             .map(|tool| {
+                let mut schema = serde_json::to_value(&*tool.input_schema).unwrap_or_default();
+                inline_schema_refs(&mut schema);
                 serde_json::json!({
                     "name": tool.name,
                     "description": tool.description,
-                    "inputSchema": tool.input_schema,
+                    "inputSchema": schema,
                 })
             })
             .collect();
@@ -4037,6 +4041,72 @@ pub async fn run_mcp_server(
     running.waiting().await?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Schema $ref inlining
+// ---------------------------------------------------------------------------
+
+/// Resolve all `$ref`/`$defs` in a JSON Schema by inlining referenced
+/// definitions. This produces an equivalent schema with no `$ref` pointers,
+/// which is needed for clients that don't resolve references (e.g. Codex).
+///
+/// The function modifies the schema in place:
+/// 1. Collects all definitions from `$defs` (or `definitions`)
+/// 2. Recursively replaces every `{"$ref": "#/$defs/Foo"}` with the
+///    corresponding definition (also recursively resolved)
+/// 3. Removes the top-level `$defs`/`definitions` key
+fn inline_schema_refs(schema: &mut serde_json::Value) {
+    // Extract $defs / definitions from the top level
+    let defs = schema
+        .as_object_mut()
+        .and_then(|obj| {
+            obj.remove("$defs")
+                .or_else(|| obj.remove("definitions"))
+        })
+        .and_then(|v| match v {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    if !defs.is_empty() {
+        resolve_refs(schema, &defs);
+    }
+}
+
+/// Recursively walk a JSON value and replace `{"$ref": "#/$defs/Name"}` or
+/// `{"$ref": "#/definitions/Name"}` with the corresponding definition.
+fn resolve_refs(value: &mut serde_json::Value, defs: &serde_json::Map<String, serde_json::Value>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            // Check if this object is a $ref
+            if let Some(ref_val) = map.get("$ref").and_then(|v| v.as_str()).map(String::from) {
+                let name = ref_val
+                    .strip_prefix("#/$defs/")
+                    .or_else(|| ref_val.strip_prefix("#/definitions/"));
+                if let Some(def_name) = name {
+                    if let Some(def) = defs.get(def_name) {
+                        let mut resolved = def.clone();
+                        // Recursively resolve nested $refs in the inlined definition
+                        resolve_refs(&mut resolved, defs);
+                        *value = resolved;
+                        return;
+                    }
+                }
+            }
+            // Recurse into all values
+            for v in map.values_mut() {
+                resolve_refs(v, defs);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                resolve_refs(v, defs);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -5624,5 +5694,75 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(json["ok"].as_bool(), Some(true));
         assert_eq!(json["restart_id"].as_str(), Some(restart_id.as_str()));
+    }
+
+    #[test]
+    fn inline_schema_refs_resolves_defs() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "actions": {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/CuAction" }
+                }
+            },
+            "$defs": {
+                "CuAction": {
+                    "type": "object",
+                    "properties": {
+                        "type": { "type": "string" },
+                        "x": { "type": "integer" }
+                    }
+                }
+            }
+        });
+        inline_schema_refs(&mut schema);
+        // $defs should be removed
+        assert!(schema.get("$defs").is_none());
+        // $ref should be replaced with the actual definition
+        let items = &schema["properties"]["actions"]["items"];
+        assert_eq!(items["type"], "object");
+        assert!(items["properties"]["x"]["type"] == "integer");
+        assert!(items.get("$ref").is_none());
+    }
+
+    #[test]
+    fn inline_schema_refs_nested() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "field": { "$ref": "#/$defs/Outer" }
+            },
+            "$defs": {
+                "Outer": {
+                    "type": "object",
+                    "properties": {
+                        "inner": { "$ref": "#/$defs/Inner" }
+                    }
+                },
+                "Inner": {
+                    "type": "string",
+                    "maxLength": 100
+                }
+            }
+        });
+        inline_schema_refs(&mut schema);
+        let inner = &schema["properties"]["field"]["properties"]["inner"];
+        assert_eq!(inner["type"], "string");
+        assert_eq!(inner["maxLength"], 100);
+        assert!(inner.get("$ref").is_none());
+    }
+
+    #[test]
+    fn inline_schema_refs_noop_without_defs() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" }
+            }
+        });
+        let original = schema.clone();
+        inline_schema_refs(&mut schema);
+        assert_eq!(schema, original);
     }
 }
