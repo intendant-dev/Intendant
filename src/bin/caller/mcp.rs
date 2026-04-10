@@ -2294,8 +2294,10 @@ pub struct SpawnLiveAudioParams {
     pub provider: String,
     /// System prompt with goal, talking points, and decision tree for the conversation.
     pub playbook: String,
-    /// Schema defining the structured response fields. Contains 'fields' array.
-    pub response_schema: serde_json::Value,
+    /// Schema defining the structured response fields. Must be an object with a
+    /// "fields" array. Each field has: name (string), field_type (object with
+    /// "type": "string"|"integer"|"boolean"|"array"), required (bool), description (string).
+    pub response_schema: McpResponseSchema,
     /// Hard timeout in seconds. Default: 300.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
@@ -2310,6 +2312,53 @@ pub struct SpawnLiveAudioParams {
     pub initial_message: Option<String>,
 }
 
+/// Response schema for spawn_live_audio. Mirrors live_audio_types::ResponseSchema
+/// but derives JsonSchema so MCP advertises concrete types instead of "any".
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpResponseSchema {
+    /// Array of field definitions.
+    pub fields: Vec<McpFieldSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpFieldSpec {
+    /// Field name.
+    pub name: String,
+    /// Field type definition (e.g. {"type":"string","max_length":100,"tainted":true}).
+    pub field_type: McpFieldType,
+    /// Whether this field is required for submission.
+    #[serde(default)]
+    pub required: bool,
+    /// Description of the field.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum McpFieldType {
+    String {
+        #[serde(default)]
+        max_length: Option<usize>,
+        #[serde(default)]
+        allowed_values: Option<Vec<String>>,
+        #[serde(default)]
+        tainted: bool,
+    },
+    Integer {
+        #[serde(default)]
+        min: Option<i64>,
+        #[serde(default)]
+        max: Option<i64>,
+    },
+    Boolean,
+    Array {
+        element_type: Box<McpFieldType>,
+        #[serde(default)]
+        max_items: Option<usize>,
+    },
+}
+
 fn default_timeout() -> u64 { 300 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2321,8 +2370,10 @@ pub struct TakeScreenshotParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExecuteCuActionsParams {
-    /// Array of computer-use actions to execute.
-    pub actions: Vec<serde_json::Value>,
+    /// Array of computer-use actions to execute. Each action is a tagged object
+    /// with "type" (click, double_click, type, key, scroll, move_mouse, drag,
+    /// screenshot, wait) and type-specific fields.
+    pub actions: Vec<crate::computer_use::CuAction>,
     /// Display target. Auto-detects if omitted.
     #[serde(default)]
     pub display_target: Option<String>,
@@ -3353,16 +3404,9 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<ExecuteCuActionsParams>,
     ) -> String {
-        use crate::computer_use::{CuAction, DisplayBackend, execute_actions};
+        use crate::computer_use::{DisplayBackend, execute_actions};
 
-        // Parse actions from JSON values
-        let actions: Vec<CuAction> = match params.actions.iter()
-            .map(|v| serde_json::from_value::<CuAction>(v.clone()))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(a) => a,
-            Err(e) => return format!("Failed to parse actions: {}", e),
-        };
+        let actions = params.actions;
 
         if actions.is_empty() {
             return "No actions provided".to_string();

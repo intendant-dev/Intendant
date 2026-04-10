@@ -37,6 +37,10 @@ language based on context clues.
 Use CU actions to navigate the screen. Take a screenshot, find the app,
 click to foreground it, navigate to the contact, and click the call button.
 
+**Note:** `take_display_control` is NOT required for `execute_cu_actions` —
+it works without display control. Only take display control if you need
+exclusive access (e.g. preventing concurrent input from other agents).
+
 **Element-specific:** When you click the phone icon, a dropdown asks
 "Voice call using: Element Call / Legacy call". Always pick **Legacy call**
 (not Element Call). Element Call is a conference that requires the other
