@@ -22,7 +22,9 @@ use super::{
 const DISPLAY_TOOLS_PROMPT: &str = "\n\n\
 ## Intendant MCP Tools\n\
 \n\
-You have access to these tools through the `intendant` MCP server:\n\
+You have access to these tools through the `intendant` MCP server.\n\
+\n\
+**GUI interaction rule:** For all GUI tasks, use CU actions (take_screenshot, execute_cu_actions). Look at screenshots and click what you see. Do NOT use osascript, accessibility queries, shell commands, or app binary inspection to find or interact with UI elements.\n\
 \n\
 ### Display & Computer Use\n\
 - **take_screenshot(display_target?)**: Capture the current display. Returns base64-encoded PNG.\n\
