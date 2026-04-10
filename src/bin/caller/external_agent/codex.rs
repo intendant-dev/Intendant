@@ -26,10 +26,11 @@ You have access to these tools through the `intendant` MCP server.\n\
 \n\
 **GUI interaction rule:** For all GUI tasks, use take_screenshot and execute_cu_actions. Look at screenshots and click what you see. Do NOT use osascript, accessibility queries, shell commands, or app binary inspection for GUI interaction.\n\
 \n\
-### Display & Computer Use\n\
-- **take_screenshot(display_target?)**: Capture the current display. Returns base64-encoded PNG.\n\
+### Computer Use (always available)\n\
+Direct capture and interaction with displays.\n\
+- **take_screenshot(display_target?)**: On-demand capture. Returns base64 PNG image.\n\
 - **execute_cu_actions(actions, display_target?)**: Execute actions AND return a screenshot.\n\
-  A screenshot is automatically taken after the last action — you will see the result.\n\
+  A screenshot is automatically taken after the last action.\n\
   Actions is a JSON array. Action types:\n\
   - `{\"type\": \"click\", \"x\": 100, \"y\": 200, \"button\": \"left\"}` — button: left/right/middle\n\
   - `{\"type\": \"double_click\", \"x\": 100, \"y\": 200}`\n\
@@ -40,7 +41,15 @@ You have access to these tools through the `intendant` MCP server.\n\
   - `{\"type\": \"drag\", \"start_x\": 100, \"start_y\": 200, \"end_x\": 300, \"end_y\": 400}`\n\
   - `{\"type\": \"wait\", \"ms\": 1000}`\n\
   Coordinates are in logical display points.\n\
-- **list_displays()**: Enumerate available displays.\n\
+- **list_displays()**: Enumerate available displays with IDs and resolutions.\n\
+\n\
+### Display Streaming & Frames (requires active web dashboard)\n\
+These access the frame registry populated by the web dashboard's WebRTC\n\
+display stream. Returns empty if no dashboard is streaming.\n\
+- **list_frames(stream?, count?)**: List captured frames with metadata.\n\
+- **read_frame(frame_id, stream?)**: Read a frame image (base64 JPEG). Use frame_id=\"latest\" for most recent.\n\
+- **take_display(display_id)**: Signal you are using a display. Notifies the dashboard UI.\n\
+- **release_display(display_id, note?)**: Signal you are done with a display.\n\
 \n\
 ### Voice / Live Audio\n\
 - **spawn_live_audio(id, provider, playbook, response_schema, timeout_secs?, voice?, model?, initial_message?)**: Spawn a voice conversation via OpenAI Realtime or Gemini Live. Routes audio through Vortex Audio. The voice model follows the playbook and returns structured data matching response_schema. Blocks until complete.\n\
