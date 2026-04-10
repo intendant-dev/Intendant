@@ -576,14 +576,26 @@ impl AppState {
                 }
             }
 
+            // For agent output, parse MCP content blocks to extract images
+            let (display_content, images) = if level == "agent" {
+                let out = format_agent_output(content);
+                (out.text, out.images)
+            } else {
+                (content.to_string(), vec![])
+            };
+
+            let is_collapsible = !images.is_empty()
+                || display_content.split('\n').count() > COLLAPSE_LINE_THRESHOLD
+                || display_content.len() > COLLAPSE_CHAR_THRESHOLD;
+
             cmds.push(UiCommand::AddLogEntry {
                 ts: ts[..8.min(ts.len())].to_string(),
                 level: level.to_string(),
                 source: source_label(source).to_string(),
-                content: content.to_string(),
+                content: display_content,
                 collapsible: is_collapsible,
                 turn: None, // separator already handled
-                images: vec![],
+                images,
             });
         }
 
@@ -839,16 +851,16 @@ impl AppState {
 
             "display_taken" => {
                 let id = msg["display_id"].as_u64().unwrap_or(0);
-                cmds.extend(self.add_log("warn", &format!("User took control of display :{}", id), None, "system"));
+                cmds.extend(self.add_log("info", &format!("Display :{} in use", id), None, "system"));
             }
 
             "display_released" => {
                 let id = msg["display_id"].as_u64().unwrap_or(0);
                 let note = msg["note"].as_str().unwrap_or("");
                 let text = if note.is_empty() {
-                    format!("User released control of display :{}", id)
+                    format!("Display :{} released", id)
                 } else {
-                    format!("User released control of display :{}. Note: {}", id, note)
+                    format!("Display :{} released: {}", id, note)
                 };
                 cmds.extend(self.add_log("info", &text, None, "system"));
             }
