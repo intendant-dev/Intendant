@@ -61,6 +61,9 @@ pub enum AppEvent {
         content: String,
         usage: TokenUsage,
         reasoning: Option<String>,
+        /// Override source label in Activity tab (e.g. "Codex").
+        #[allow(dead_code)]
+        source: Option<String>,
     },
     /// Incremental text delta from streaming model response.
     ModelResponseDelta {
@@ -75,10 +78,12 @@ pub enum AppEvent {
     AgentStarted {
         turn: usize,
         commands_preview: String,
+        source: Option<String>,
     },
     AgentOutput {
         stdout: String,
         stderr: String,
+        source: Option<String>,
     },
     SubAgentResult {
         formatted: String,
@@ -535,6 +540,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             turn,
             content,
             reasoning,
+            source,
             ..
         } => {
             let summary = crate::types::format_model_summary(content);
@@ -542,6 +548,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 turn: *turn,
                 summary,
                 reasoning_summary: reasoning.clone(),
+                source: source.clone(),
             })
         }
         AppEvent::ModelResponseDelta { text } => {
@@ -550,13 +557,16 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::AgentStarted {
             turn,
             commands_preview,
+            source,
         } => Some(OutboundEvent::AgentStarted {
             turn: *turn,
             commands_preview: commands_preview.clone(),
+            source: source.clone(),
         }),
-        AppEvent::AgentOutput { stdout, stderr } => Some(OutboundEvent::AgentOutput {
+        AppEvent::AgentOutput { stdout, stderr, source } => Some(OutboundEvent::AgentOutput {
             stdout: stdout.clone(),
             stderr: stderr.clone(),
+            source: source.clone(),
         }),
         AppEvent::DoneSignal { message } => Some(OutboundEvent::DoneSignal {
             message: message.clone(),
@@ -860,7 +870,7 @@ fn write_event_to_session_log(
         // ---- Events NOT logged inline — this writer is their only path to disk ----
 
         // Agent lifecycle
-        AppEvent::AgentStarted { turn, commands_preview } => {
+        AppEvent::AgentStarted { turn, commands_preview, .. } => {
             log.agent_started(*turn, commands_preview);
         }
         AppEvent::DoneSignal { message } => {
@@ -982,11 +992,24 @@ fn write_event_to_session_log(
             log.live_audio_completed(id, status, *quarantine_count);
         }
 
-        // Agent output — external agent paths emit AppEvent::AgentOutput
-        // without inline slog() calls, so the EventBus writer is the only
-        // path to disk for these.
-        AppEvent::AgentOutput { stdout, stderr } => {
+        // External agent paths emit these AppEvents without inline slog()
+        // calls, so the EventBus writer is the only path to disk.
+        AppEvent::AgentOutput { stdout, stderr, .. } => {
             log.agent_output(stdout, stderr);
+        }
+        AppEvent::ModelResponse { turn, content, usage, reasoning, .. } => {
+            if !content.is_empty() {
+                log.model_response(
+                    content,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.total_tokens,
+                    usage.cached_tokens,
+                );
+            }
+            if let Some(ref r) = reasoning {
+                log.reasoning_content(Some(r.as_str()), None);
+            }
         }
 
         // ---- Events already logged inline by the agent loop or web_gateway ----
@@ -1582,6 +1605,7 @@ mod tests {
         let event = AppEvent::AgentOutput {
             stdout: "hello".to_string(),
             stderr: "".to_string(),
+            source: None,
         };
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();

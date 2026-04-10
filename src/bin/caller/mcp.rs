@@ -1828,6 +1828,7 @@ pub fn spawn_event_listener(
                         content,
                         usage,
                         reasoning,
+                        ..
                     } => {
                         s.session_tokens += usage.total_tokens;
                         let preview = if content.len() > 500 {
@@ -1865,13 +1866,14 @@ pub fn spawn_event_listener(
                     AppEvent::AgentStarted {
                         turn,
                         commands_preview,
+                        ..
                     } => {
                         s.set_phase(Phase::RunningAgent);
                         s.push_log(LogLevel::Agent, format!("[T{}] {}", turn, commands_preview));
                         resource_changed = Some("intendant://status");
                     }
 
-                    AppEvent::AgentOutput { stdout, stderr } => {
+                    AppEvent::AgentOutput { stdout, stderr, .. } => {
                         let formatted = crate::tui::app::format_agent_output_for_tui(&stdout, &stderr);
                         if !formatted.is_empty() {
                             let level = if !stderr.is_empty() { LogLevel::Warn } else { LogLevel::Agent };

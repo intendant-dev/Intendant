@@ -247,7 +247,7 @@ pub struct TokenHistoryEntry {
 
 // ── Source labels ──────────────────────────────────────────────────
 
-fn source_label(source: &str) -> &'static str {
+fn source_label(source: &str) -> &str {
     match source {
         "system" => "\u{2139}",  // ℹ
         "worker" => "Model",
@@ -257,6 +257,8 @@ fn source_label(source: &str) -> &'static str {
         "live" => "Live",
         "sub" => "Sub",
         "orch" => "Orch",
+        // External agent sources pass through as-is (e.g. "Codex", "Claude Code")
+        other if !other.is_empty() => other,
         _ => "\u{2139}",
     }
 }
@@ -619,14 +621,15 @@ impl AppState {
 
             "model_response" => {
                 let summary = msg["summary"].as_str().unwrap_or("");
+                let source = msg["source"].as_str().unwrap_or("worker");
                 let display = if summary.is_empty() {
                     "Model response".to_string()
                 } else {
                     summary.to_string()
                 };
-                cmds.extend(self.add_log("model", &display, None, "worker"));
+                cmds.extend(self.add_log("model", &display, None, source));
                 if let Some(rs) = msg["reasoning_summary"].as_str() {
-                    cmds.extend(self.add_log("detail", &format!("Reasoning: {}", rs), None, "worker"));
+                    cmds.extend(self.add_log("detail", &format!("Reasoning: {}", rs), None, source));
                 }
             }
 
@@ -636,19 +639,21 @@ impl AppState {
 
             "agent_started" => {
                 let preview = msg["commands_preview"].as_str().unwrap_or("");
+                let source = msg["source"].as_str().unwrap_or("agent");
                 if !self.known_displays.is_empty() {
-                    cmds.extend(self.add_log("detail", "Running on display", None, "agent"));
+                    cmds.extend(self.add_log("detail", "Running on display", None, source));
                 }
-                cmds.extend(self.add_log("agent", preview, None, "agent"));
+                cmds.extend(self.add_log("agent", preview, None, source));
                 cmds.push(UiCommand::SetPhase { phase: "running".into() });
                 self.phase = "running".to_string();
             }
 
             "agent_output" => {
+                let source = msg["source"].as_str().unwrap_or("agent");
                 if let Some(stdout) = msg["stdout"].as_str() {
                     if !stdout.is_empty() {
                         let formatted = format_agent_output(stdout);
-                        cmds.extend(self.add_log("agent", &formatted, None, "agent"));
+                        cmds.extend(self.add_log("agent", &formatted, None, source));
                     }
                 }
                 if let Some(stderr) = msg["stderr"].as_str() {

@@ -1021,7 +1021,7 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             s.last_command_preview = commands_preview.clone();
             s.pending_approval = None;
         }
-        AppEvent::AgentOutput { stdout, stderr } => {
+        AppEvent::AgentOutput { stdout, stderr, .. } => {
             // Keep a truncated summary
             let combined = if stderr.is_empty() {
                 stdout.clone()
@@ -1206,6 +1206,7 @@ mod tests {
         let event = AppEvent::AgentOutput {
             stdout: "hello".to_string(),
             stderr: String::new(),
+            source: None,
         };
         assert!(filter_event(&event, &mut last_phase).is_none());
 
@@ -1239,6 +1240,7 @@ mod tests {
             content: "hi".to_string(),
             usage: provider::TokenUsage::default(),
             reasoning: None,
+            source: None,
         };
         assert!(filter_event(&event, &mut last_phase).is_some());
         assert_eq!(last_phase, "thinking");
@@ -1281,6 +1283,7 @@ mod tests {
             &AppEvent::AgentStarted {
                 turn: 5,
                 commands_preview: "echo hello".to_string(),
+                source: None,
             },
             &state,
         );
@@ -1294,6 +1297,7 @@ mod tests {
             &AppEvent::AgentOutput {
                 stdout: "hello world".to_string(),
                 stderr: String::new(),
+                source: None,
             },
             &state,
         );

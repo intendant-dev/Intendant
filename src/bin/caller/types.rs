@@ -113,6 +113,8 @@ pub enum OutboundEvent {
     AgentOutput {
         stdout: String,
         stderr: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     ApprovalRequired {
         id: u64,
@@ -227,6 +229,9 @@ pub enum OutboundEvent {
     AgentStarted {
         turn: usize,
         commands_preview: String,
+        /// When set, overrides the default "agent"/"Run" source label (e.g. "Codex").
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     DoneSignal {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -263,6 +268,9 @@ pub enum OutboundEvent {
         summary: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_summary: Option<String>,
+        /// When set, overrides the default "worker"/"Model" source label.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     HumanResponseSent,
     SafetyCapReached,

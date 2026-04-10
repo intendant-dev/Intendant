@@ -1482,6 +1482,7 @@ impl App {
                 content,
                 usage,
                 reasoning,
+                ..
             } => {
                 self.turn = turn;
                 self.session_tokens += usage.total_tokens;
@@ -1554,6 +1555,7 @@ impl App {
             AppEvent::AgentStarted {
                 turn,
                 commands_preview,
+                ..
             } => {
                 self.current_phase = Phase::RunningAgent;
                 self.log_sourced(
@@ -1563,7 +1565,7 @@ impl App {
                     Some(turn),
                 );
             }
-            AppEvent::AgentOutput { stdout, stderr } => {
+            AppEvent::AgentOutput { stdout, stderr, .. } => {
                 // Parse runtime JSON to extract human-readable output.
                 // Web UI receives AgentOutput directly and formats via WASM;
                 // TUI formats here. Do NOT broadcast raw lines as LogEntry
@@ -2289,6 +2291,7 @@ mod tests {
         app.handle_event(AppEvent::AgentOutput {
             stdout: "line1\nline2".to_string(),
             stderr: "warn".to_string(),
+            source: None,
         });
         // format_agent_output_for_tui produces one combined entry
         assert_eq!(app.log_entries.len(), 1);
@@ -2657,6 +2660,7 @@ mod tests {
             ..Default::default()
             },
             reasoning: None,
+            source: None,
         });
         assert!(app.streaming_buffer.is_empty());
     }
@@ -2845,6 +2849,7 @@ mod tests {
             ..Default::default()
             },
             reasoning: None,
+            source: None,
         });
         // All entries from ModelResponse should be Agent source with turn 2
         for entry in &app.log_entries {

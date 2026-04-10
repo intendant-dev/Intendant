@@ -2088,6 +2088,7 @@ async fn run_agent_loop(
             content: display_content,
             usage: response.usage.clone(),
             reasoning: response.reasoning_summary.clone(),
+            source: None,
         });
 
         // ====== TOOL CALL PATH vs TEXT EXTRACTION PATH ======
@@ -2573,6 +2574,7 @@ async fn run_agent_loop(
             bus.send(AppEvent::AgentStarted {
                 turn,
                 commands_preview: preview.clone(),
+                source: None,
             });
 
             let output = agent_runner::run_agent(&json_str, log_dir).await?;
@@ -2585,6 +2587,7 @@ async fn run_agent_loop(
             bus.send(AppEvent::AgentOutput {
                 stdout: output.stdout.clone(),
                 stderr: output.stderr.clone(),
+                source: None,
             });
 
             // Map results back to individual tool responses
@@ -2943,6 +2946,7 @@ Proceed with explicit assumptions and continue without additional questions."
             bus.send(AppEvent::AgentStarted {
                 turn,
                 commands_preview: preview.clone(),
+                source: None,
             });
 
             let output = agent_runner::run_agent(&json_str, log_dir).await?;
@@ -2955,6 +2959,7 @@ Proceed with explicit assumptions and continue without additional questions."
             bus.send(AppEvent::AgentOutput {
                 stdout: output.stdout.clone(),
                 stderr: output.stderr.clone(),
+                source: None,
             });
 
             // Check for completed sub-agent results
@@ -3607,6 +3612,7 @@ async fn run_with_presence(
             // Drain events until this turn completes
             let event_rx = persistent_event_rx.as_mut().unwrap();
             let mut turn_in_round = 0usize;
+            let agent_source = Some(backend.to_string());
             loop {
                 match event_rx.recv().await {
                     Some(external_agent::AgentEvent::TurnCompleted { message }) => {
@@ -3628,6 +3634,7 @@ async fn run_with_presence(
                             content: text,
                             usage: provider::TokenUsage::default(),
                             reasoning: None,
+                            source: agent_source.clone(),
                         });
                     }
                     Some(external_agent::AgentEvent::ToolStarted { preview, tool_name, .. }) => {
@@ -3635,10 +3642,11 @@ async fn run_with_presence(
                         bus.send(AppEvent::AgentStarted {
                             turn: cumulative_stats.turns + turn_in_round,
                             commands_preview: format!("{}: {}", tool_name, preview),
+                            source: agent_source.clone(),
                         });
                     }
                     Some(external_agent::AgentEvent::ToolOutputDelta { text, .. }) => {
-                        bus.send(AppEvent::AgentOutput { stdout: text, stderr: String::new() });
+                        bus.send(AppEvent::AgentOutput { stdout: text, stderr: String::new(), source: agent_source.clone() });
                     }
                     Some(external_agent::AgentEvent::ToolCompleted { item_id, status }) => {
                         match &status {
@@ -4342,6 +4350,7 @@ async fn run_external_agent_mode(
                             content: text,
                             usage: provider::TokenUsage::default(),
                             reasoning: None,
+                            source: None,
                         });
                     }
                     AgentEvent::ToolStarted { preview, tool_name, .. } => {
@@ -4350,12 +4359,14 @@ async fn run_external_agent_mode(
                         bus.send(AppEvent::AgentStarted {
                             turn,
                             commands_preview: preview_text,
+                            source: None,
                         });
                     }
                     AgentEvent::ToolOutputDelta { text, .. } => {
                         bus.send(AppEvent::AgentOutput {
                             stdout: text,
                             stderr: String::new(),
+                            source: None,
                         });
                     }
                     AgentEvent::ToolCompleted { item_id, status } => {
