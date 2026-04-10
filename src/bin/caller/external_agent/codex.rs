@@ -26,13 +26,22 @@ You have access to these tools through the `intendant` MCP server:\n\
 \n\
 ### Display & Computer Use\n\
 - **take_screenshot(display_target?)**: Capture the current display. Returns base64-encoded PNG.\n\
-- **execute_cu_actions(actions, display_target?)**: Execute computer-use actions on a display.\n\
-  Action types: click, double_click, type, key, scroll, move_mouse, drag, screenshot, wait.\n\
-  Example: `{\"actions\": [{\"type\": \"click\", \"x\": 100, \"y\": 200, \"button\": \"left\"}]}`\n\
+- **execute_cu_actions(actions, display_target?)**: Execute computer-use actions.\n\
+  Actions is a JSON array. Action types and their fields:\n\
+  - `{\"type\": \"click\", \"x\": 100, \"y\": 200, \"button\": \"left\"}` — button: left/right/middle\n\
+  - `{\"type\": \"double_click\", \"x\": 100, \"y\": 200}`\n\
+  - `{\"type\": \"type\", \"text\": \"hello\"}` — types text literally\n\
+  - `{\"type\": \"key\", \"key\": \"cmd+space\"}` — key combos: cmd, ctrl, alt, shift + key name. Examples: cmd+tab, cmd+space, enter, escape, tab, up, down, left, right, f1-f12\n\
+  - `{\"type\": \"scroll\", \"x\": 400, \"y\": 300, \"direction\": \"down\", \"amount\": 3}` — direction: up/down/left/right\n\
+  - `{\"type\": \"move_mouse\", \"x\": 100, \"y\": 200}`\n\
+  - `{\"type\": \"drag\", \"start_x\": 100, \"start_y\": 200, \"end_x\": 300, \"end_y\": 400}`\n\
+  - `{\"type\": \"screenshot\"}` — capture after actions (auto-appended if not last)\n\
+  - `{\"type\": \"wait\", \"ms\": 1000}` — pause in milliseconds\n\
+  Coordinates are in logical display points (not pixels).\n\
+- **list_displays()**: Enumerate available displays.\n\
+- **take_display(display_id)**: Signal that you are using a display. Optional — only needed to notify the dashboard UI. Not a prerequisite for screenshots or CU actions.\n\
 - **list_frames(stream?, count?)**: List captured display frames with metadata.\n\
 - **read_frame(frame_id, stream?)**: Read a frame's image data (base64 JPEG). Use frame_id=\"latest\".\n\
-- **list_displays()**: Enumerate available displays.\n\
-- **take_display(display_id)**: Claim control of a virtual display.\n\
 \n\
 ### Voice / Live Audio\n\
 - **spawn_live_audio(id, provider, playbook, response_schema, timeout_secs?, voice?, model?, initial_message?)**: Spawn a voice conversation via OpenAI Realtime or Gemini Live. Routes audio through Vortex Audio. The voice model follows the playbook and returns structured data matching response_schema. Blocks until complete.\n\

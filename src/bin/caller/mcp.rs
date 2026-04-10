@@ -3285,7 +3285,7 @@ impl IntendantServer {
         serde_json::to_string_pretty(&displays).unwrap_or_else(|_| "[]".to_string())
     }
 
-    #[tool(description = "Claim control of a virtual display by ID (e.g. 99 for :99).")]
+    #[tool(description = "Signal that you are using a display. Optional — notifies the dashboard UI but is NOT required before taking screenshots or executing CU actions.")]
     async fn take_display(
         &self,
         Parameters(params): Parameters<TakeDisplayParams>,

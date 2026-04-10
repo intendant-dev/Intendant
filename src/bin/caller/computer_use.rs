@@ -590,8 +590,14 @@ fn translate_key_for_cliclick(key: &str) -> Vec<String> {
             for m in &modifiers {
                 args.push(format!("kd:{}", translate_single_key(m)));
             }
-            // Press the base key
-            args.push(format!("kp:{}", translate_single_key(base_key)));
+            // Press the base key — use kp: for special keys, t: for single characters
+            let translated = translate_single_key(base_key);
+            if translated == base_key && base_key.len() == 1 {
+                // Single character (e.g. 'w', 'a') — cliclick kp: doesn't accept these
+                args.push(format!("t:{}", base_key));
+            } else {
+                args.push(format!("kp:{}", translated));
+            }
             // Release modifiers in reverse
             for m in modifiers.iter().rev() {
                 args.push(format!("ku:{}", translate_single_key(m)));
@@ -599,7 +605,12 @@ fn translate_key_for_cliclick(key: &str) -> Vec<String> {
             return args;
         }
     }
-    vec![format!("kp:{}", translate_single_key(key))]
+    let translated = translate_single_key(key);
+    if translated == key && key.len() == 1 {
+        vec![format!("t:{}", key)]
+    } else {
+        vec![format!("kp:{}", translated)]
+    }
 }
 
 /// Map a single key name from xdotool convention to cliclick convention.
@@ -1346,11 +1357,16 @@ mod tests {
 
     #[test]
     fn translate_modifier_combo() {
+        // Single chars use t: (type) since cliclick kp: only accepts special key names
         let args = translate_key_for_cliclick("ctrl+c");
-        assert_eq!(args, vec!["kd:ctrl", "kp:c", "ku:ctrl"]);
+        assert_eq!(args, vec!["kd:ctrl", "t:c", "ku:ctrl"]);
 
         let args = translate_key_for_cliclick("super+shift+a");
-        assert_eq!(args, vec!["kd:cmd", "kd:shift", "kp:a", "ku:shift", "ku:cmd"]);
+        assert_eq!(args, vec!["kd:cmd", "kd:shift", "t:a", "ku:shift", "ku:cmd"]);
+
+        // Special keys still use kp:
+        let args = translate_key_for_cliclick("cmd+space");
+        assert_eq!(args, vec!["kd:cmd", "kp:space", "ku:cmd"]);
     }
 
     #[test]
