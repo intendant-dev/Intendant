@@ -22,6 +22,10 @@ pub enum UiCommand {
         collapsible: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn: Option<u64>,
+        /// Base64-encoded images (screenshots) associated with this entry.
+        /// Sent separately from content so JS can lazy-load them on expand.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
     },
     ClearLogs,
     AddTurnSeparator {
@@ -385,6 +389,7 @@ impl AppState {
                 content: entry.content.clone(),
                 collapsible: entry.collapsible,
                 turn: None, // separator already handled
+                images: vec![],
             });
         }
         cmds
@@ -578,6 +583,7 @@ impl AppState {
                 content: content.to_string(),
                 collapsible: is_collapsible,
                 turn: None, // separator already handled
+                images: vec![],
             });
         }
 
@@ -652,8 +658,12 @@ impl AppState {
                 let source = msg["source"].as_str().unwrap_or("agent");
                 if let Some(stdout) = msg["stdout"].as_str() {
                     if !stdout.is_empty() {
-                        let formatted = format_agent_output(stdout);
-                        cmds.extend(self.add_log("agent", &formatted, None, source));
+                        let out = format_agent_output(stdout);
+                        if !out.text.is_empty() || !out.images.is_empty() {
+                            cmds.extend(self.add_log_with_images(
+                                "agent", &out.text, None, source, out.images,
+                            ));
+                        }
                     }
                 }
                 if let Some(stderr) = msg["stderr"].as_str() {
@@ -969,9 +979,22 @@ impl AppState {
 
     /// Add a log entry, respecting verbosity. Returns AddLogEntry command if visible.
     fn add_log(&mut self, level: &str, content: &str, turn: Option<u64>, source: &str) -> Vec<UiCommand> {
+        self.add_log_with_images(level, content, turn, source, Vec::new())
+    }
+
+    /// Add a log entry with optional images, respecting verbosity.
+    fn add_log_with_images(
+        &mut self,
+        level: &str,
+        content: &str,
+        turn: Option<u64>,
+        source: &str,
+        images: Vec<String>,
+    ) -> Vec<UiCommand> {
         let ts = current_time_str();
         let source_str = source_label(source).to_string();
-        let is_collapsible = content.split('\n').count() > COLLAPSE_LINE_THRESHOLD
+        let is_collapsible = !images.is_empty()
+            || content.split('\n').count() > COLLAPSE_LINE_THRESHOLD
             || content.len() > COLLAPSE_CHAR_THRESHOLD;
 
         let entry = LogEntry {
@@ -1005,6 +1028,7 @@ impl AppState {
             content: content.to_string(),
             collapsible: is_collapsible,
             turn: None, // separator already emitted
+            images,
         });
         cmds
     }
@@ -1137,9 +1161,17 @@ impl AppState {
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-/// Parse agent runtime JSON output into human-readable text.
-pub fn format_agent_output(raw: &str) -> String {
+/// Structured output from format_agent_output: text + extracted images.
+pub struct FormattedOutput {
+    pub text: String,
+    pub images: Vec<String>,
+}
+
+/// Parse agent runtime JSON output into human-readable text,
+/// extracting base64 images separately for lazy rendering.
+pub fn format_agent_output(raw: &str) -> FormattedOutput {
     let mut parts = Vec::new();
+    let mut images = Vec::new();
     let mut parsed_any_result = false;
 
     // The runtime outputs one JSON object per result, separated by newlines.
@@ -1157,6 +1189,32 @@ pub fn format_agent_output(raw: &str) -> String {
     for line in &lines {
         match serde_json::from_str::<serde_json::Value>(line) {
             Ok(obj) => {
+                // MCP content blocks from external agent tool results:
+                // {"content": [{"text":"...", "type":"text"}, {"data":"iVBOR...", "type":"image"}]}
+                if let Some(content_arr) = obj.get("content").and_then(|v| v.as_array()) {
+                    let mut has_mcp_blocks = false;
+                    for block in content_arr {
+                        if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                            has_mcp_blocks = true;
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() {
+                                parts.push(trimmed.to_string());
+                            }
+                        }
+                        if let Some(data) = block.get("data").and_then(|v| v.as_str()) {
+                            has_mcp_blocks = true;
+                            // Base64 image — extract separately for lazy loading
+                            if data.len() > 100 {
+                                images.push(data.to_string());
+                            }
+                        }
+                    }
+                    if has_mcp_blocks {
+                        parsed_any_result = true;
+                        continue;
+                    }
+                }
+
                 if obj["type"].as_str() == Some("result") {
                     parsed_any_result = true;
                     // data may be a JSON string or object
@@ -1223,14 +1281,14 @@ pub fn format_agent_output(raw: &str) -> String {
             }
         }
     }
-    if parts.is_empty() && parsed_any_result {
-        // All results parsed but nothing to display (e.g. empty stdout, exit 0)
+    let text = if parts.is_empty() && parsed_any_result {
         String::new()
     } else if parts.is_empty() {
         raw.to_string()
     } else {
         parts.join("\n")
-    }
+    };
+    FormattedOutput { text, images }
 }
 
 /// Extract top-level JSON objects from a string that may contain multiple
@@ -1358,27 +1416,44 @@ mod tests {
     #[test]
     fn format_agent_output_json() {
         let raw = r#"{"type":"result","data":"{\"exit_code\":0,\"stdout_tail\":\"hello world\",\"stderr_tail\":\"\"}"}"#;
-        assert_eq!(format_agent_output(raw), "hello world");
+        assert_eq!(format_agent_output(raw).text, "hello world");
     }
 
     #[test]
     fn format_agent_output_plain_text() {
-        assert_eq!(format_agent_output("just plain text"), "just plain text");
+        assert_eq!(format_agent_output("just plain text").text, "just plain text");
     }
 
     #[test]
     fn format_agent_output_exit_code() {
         let raw = r#"{"type":"result","data":"{\"exit_code\":1,\"stdout_tail\":\"\",\"stderr_tail\":\"error msg\"}"}"#;
         let result = format_agent_output(raw);
-        assert!(result.contains("[stderr] error msg"));
-        assert!(result.contains("exit code: 1"));
+        assert!(result.text.contains("[stderr] error msg"));
+        assert!(result.text.contains("exit code: 1"));
     }
 
     #[test]
     fn format_agent_output_skip_status() {
         let raw = r#"{"type":"status","nonce":1,"state":"running"}
 {"type":"result","data":"{\"exit_code\":0,\"stdout_tail\":\"ok\",\"stderr_tail\":\"\"}"}"#;
-        assert_eq!(format_agent_output(raw), "ok");
+        assert_eq!(format_agent_output(raw).text, "ok");
+    }
+
+    #[test]
+    fn format_agent_output_mcp_content_blocks() {
+        let raw = r#"{"content":[{"text":"action[0]: ok","type":"text"},{"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==","type":"image","mimeType":"image/png"}]}"#;
+        let result = format_agent_output(raw);
+        assert_eq!(result.text, "action[0]: ok");
+        assert_eq!(result.images.len(), 1);
+        assert!(result.images[0].starts_with("iVBOR"));
+    }
+
+    #[test]
+    fn format_agent_output_mcp_text_only() {
+        let raw = r#"{"content":[{"text":"Took control of :0","type":"text"}]}"#;
+        let result = format_agent_output(raw);
+        assert_eq!(result.text, "Took control of :0");
+        assert!(result.images.is_empty());
     }
 
     #[test]
@@ -1631,6 +1706,7 @@ mod tests {
             content: "hello".into(),
             collapsible: false,
             turn: None,
+            images: vec![],
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"cmd\":\"add_log_entry\""));
