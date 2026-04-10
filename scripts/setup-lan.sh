@@ -469,6 +469,8 @@ serve_certs() {
     # server as a background daemon and exit immediately so SSH can return.
     # The .bat handles the interactive cert-installation UX on its own console.
     if [[ ! -t 0 ]]; then
+        # Kill any leftover cert server from a previous run.
+        stop_cert_server
         cd "$serve_dir"
         nohup python3 -m http.server "$CERT_SERVE_PORT" --bind 0.0.0.0 > /dev/null 2>&1 &
         echo $! > "$CERT_DIR/cert_server.pid"
