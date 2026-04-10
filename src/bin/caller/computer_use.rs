@@ -136,11 +136,13 @@ pub enum CuAction {
     Click {
         x: i32,
         y: i32,
+        #[serde(default)]
         button: MouseButton,
     },
     DoubleClick {
         x: i32,
         y: i32,
+        #[serde(default)]
         button: MouseButton,
     },
     Type {
@@ -153,6 +155,7 @@ pub enum CuAction {
         x: i32,
         y: i32,
         direction: ScrollDirection,
+        #[serde(default = "default_scroll_amount")]
         amount: i32,
     },
     MoveMouse {
@@ -170,6 +173,8 @@ pub enum CuAction {
         ms: u64,
     },
 }
+
+fn default_scroll_amount() -> i32 { 3 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
