@@ -389,7 +389,7 @@ function Run-Wizard {
     # P12 password from the guest so we can display it here.
     $p12Pass = ""
     try {
-        $p12Pass = (Invoke-GuestCommand "cat /etc/intendant-lan/p12_password 2>/dev/null").Trim()
+        $p12Pass = (Invoke-GuestCommand "sudo cat /etc/intendant-lan/p12_password 2>/dev/null").Trim()
     } catch {}
 
     if ($p12Pass) {
