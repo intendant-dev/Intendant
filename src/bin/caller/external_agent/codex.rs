@@ -532,11 +532,18 @@ fn translate_notification(
                 .unwrap_or("completed");
             let status = match status_str {
                 "failed" => {
-                    let message = item
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown error")
-                        .to_string();
+                    let message = match item.get("error") {
+                        Some(serde_json::Value::String(s)) => s.clone(),
+                        Some(serde_json::Value::Object(obj)) => {
+                            // MCP error: {"message": "...", "code": ...}
+                            obj.get("message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown error")
+                                .to_string()
+                        }
+                        Some(other) => other.to_string(),
+                        None => "unknown error".to_string(),
+                    };
                     ToolCompletionStatus::Failed { message }
                 }
                 "cancelled" => ToolCompletionStatus::Cancelled,
