@@ -130,7 +130,7 @@ impl std::fmt::Display for DisplayTarget {
 /// A single computer-use action, normalized across all providers.
 /// Coordinates are always in absolute pixels (Gemini's 0-999 grid is converted
 /// at parse time).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CuAction {
     Click {
@@ -171,7 +171,7 @@ pub enum CuAction {
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MouseButton {
     #[default]
@@ -201,7 +201,7 @@ impl MouseButton {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ScrollDirection {
     Up,
