@@ -1157,8 +1157,15 @@ fn handle_set_api_keys(body: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// MCP-over-HTTP types
+// MCP-over-HTTP (Streamable HTTP) types
 // ---------------------------------------------------------------------------
+//
+// rmcp's Streamable HTTP transport expects:
+//   - Requests (with `id`):   200 OK + application/json body
+//   - Notifications (no `id`): 202 Accepted + empty body
+//
+// Returning 200+JSON for notifications causes rmcp to try deserializing the
+// body as ServerJsonRpcMessage, which fails because there's no valid `id`.
 
 #[derive(Deserialize)]
 struct McpHttpRequest {
@@ -1188,14 +1195,22 @@ struct McpHttpError {
     message: String,
 }
 
+/// Result from handling an MCP-over-HTTP request.
+enum McpHttpOutcome {
+    /// JSON-RPC response (requests with `id`) -- return 200 OK + JSON body.
+    Response(McpHttpResponse),
+    /// Notification acknowledged -- return 202 Accepted with empty body.
+    Accepted,
+}
+
 async fn handle_mcp_http_request(
     body: &str,
     server: &crate::mcp::IntendantServer,
-) -> McpHttpResponse {
+) -> McpHttpOutcome {
     let request: McpHttpRequest = match serde_json::from_str(body) {
         Ok(r) => r,
         Err(e) => {
-            return McpHttpResponse {
+            return McpHttpOutcome::Response(McpHttpResponse {
                 jsonrpc: "2.0".into(),
                 id: None,
                 result: None,
@@ -1203,9 +1218,13 @@ async fn handle_mcp_http_request(
                     code: -32700,
                     message: format!("Parse error: {}", e),
                 }),
-            };
+            });
         }
     };
+
+    // JSON-RPC notifications have no `id` and expect no response body.
+    // The MCP Streamable HTTP spec requires 202 Accepted for these.
+    let is_notification = request.id.is_none();
 
     let result = match request.method.as_str() {
         "initialize" => Ok(serde_json::json!({
@@ -1216,7 +1235,11 @@ async fn handle_mcp_http_request(
                 "version": env!("CARGO_PKG_VERSION"),
             }
         })),
-        "notifications/initialized" => Ok(serde_json::json!({})),
+        "notifications/initialized" | "notifications/cancelled" | "notifications/progress"
+        | "notifications/roots/list_changed" => {
+            // All notification methods: acknowledge and return 202.
+            return McpHttpOutcome::Accepted;
+        }
         "tools/list" => Ok(server.list_tools_json()),
         "tools/call" => {
             let params = request.params.unwrap_or_default();
@@ -1238,18 +1261,24 @@ async fn handle_mcp_http_request(
                 }),
             }
         }
-        _ => Err(McpHttpError {
-            code: -32601,
-            message: format!("Method not found: {}", request.method),
-        }),
+        other => {
+            // Unknown notification (no id): accept silently per spec.
+            if is_notification {
+                return McpHttpOutcome::Accepted;
+            }
+            Err(McpHttpError {
+                code: -32601,
+                message: format!("Method not found: {}", other),
+            })
+        }
     };
 
-    McpHttpResponse {
+    McpHttpOutcome::Response(McpHttpResponse {
         jsonrpc: "2.0".into(),
         id: request.id,
         result: result.as_ref().ok().cloned(),
         error: result.err(),
-    }
+    })
 }
 
 pub fn spawn_web_gateway(
@@ -3385,7 +3414,13 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST") && request_line.contains(" /mcp") {
-                        // MCP-over-HTTP endpoint
+                        // MCP Streamable HTTP endpoint.
+                        //
+                        // rmcp expects:
+                        //   - Requests (has `id`):   200 OK + Content-Type: application/json
+                        //   - Notifications (no `id`): 202 Accepted + empty body
+                        //   - GET for SSE stream:    405 Method Not Allowed (we don't support SSE push)
+                        //   - DELETE for session:    405 Method Not Allowed (stateless)
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
                         if let Some(ref mcp) = mcp_server {
                             let content_length: usize = header_text
@@ -3410,19 +3445,31 @@ pub fn spawn_web_gateway(
                                 body_owned = full;
                                 &body_owned
                             };
-                            let mcp_response = handle_mcp_http_request(body_text, mcp).await;
-                            let response_json = serde_json::to_string(&mcp_response).unwrap_or_default();
-                            let http_response = format!(
-                                "HTTP/1.1 200 OK\r\n\
-                                 Content-Type: application/json\r\n\
-                                 Access-Control-Allow-Origin: *\r\n\
-                                 Content-Length: {}\r\n\
-                                 Connection: close\r\n\
-                                 \r\n\
-                                 {}",
-                                response_json.len(),
-                                response_json
-                            );
+                            eprintln!("[mcp] POST /mcp body: {}", body_text);
+                            let outcome = handle_mcp_http_request(body_text, mcp).await;
+                            let http_response = match outcome {
+                                McpHttpOutcome::Response(resp) => {
+                                    let json = serde_json::to_string(&resp).unwrap_or_default();
+                                    eprintln!("[mcp] -> 200 OK ({}B): {}", json.len(), json);
+                                    format!(
+                                        "HTTP/1.1 200 OK\r\n\
+                                         Content-Type: application/json\r\n\
+                                         Access-Control-Allow-Origin: *\r\n\
+                                         Content-Length: {}\r\n\
+                                         \r\n\
+                                         {}",
+                                        json.len(),
+                                        json,
+                                    )
+                                }
+                                McpHttpOutcome::Accepted => {
+                                    eprintln!("[mcp] -> 202 Accepted (notification)");
+                                    "HTTP/1.1 202 Accepted\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Content-Length: 0\r\n\
+                                     \r\n".to_string()
+                                }
+                            };
                             let _ = stream.write_all(http_response.as_bytes()).await;
                         } else {
                             let err = r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"MCP server not available"}}"#;
@@ -3430,13 +3477,26 @@ pub fn spawn_web_gateway(
                                 "HTTP/1.1 503 Service Unavailable\r\n\
                                  Content-Type: application/json\r\n\
                                  Content-Length: {}\r\n\
-                                 Connection: close\r\n\
                                  \r\n\
                                  {}",
                                 err.len(), err
                             );
                             let _ = stream.write_all(http.as_bytes()).await;
                         }
+                    } else if (request_line.starts_with("GET") || request_line.starts_with("DELETE"))
+                        && request_line.contains(" /mcp")
+                    {
+                        // MCP Streamable HTTP: GET (SSE stream) and DELETE (session cleanup)
+                        // are not supported by our stateless endpoint.  Return 405 so rmcp
+                        // gracefully falls back (skips SSE / ignores session delete).
+                        use tokio::io::AsyncWriteExt;
+                        let method = if request_line.starts_with("GET") { "GET" } else { "DELETE" };
+                        eprintln!("[mcp] {} /mcp -> 405 Method Not Allowed", method);
+                        let http = "HTTP/1.1 405 Method Not Allowed\r\n\
+                                    Access-Control-Allow-Origin: *\r\n\
+                                    Content-Length: 0\r\n\
+                                    \r\n";
+                        let _ = stream.write_all(http.as_bytes()).await;
                     } else {
                         let (content_type, body, cache) = if request_line.contains("/wasm-web/presence_web.js") {
                             ("application/javascript", WASM_WEB_JS.to_string(), "no-cache, must-revalidate")
