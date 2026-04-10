@@ -2286,6 +2286,32 @@ pub struct ReleaseDisplayParams {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SpawnLiveAudioParams {
+    /// Unique identifier for this live audio session.
+    pub id: String,
+    /// Live audio model provider: "openai" or "gemini".
+    pub provider: String,
+    /// System prompt with goal, talking points, and decision tree for the conversation.
+    pub playbook: String,
+    /// Schema defining the structured response fields. Contains 'fields' array.
+    pub response_schema: serde_json::Value,
+    /// Hard timeout in seconds. Default: 300.
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
+    /// Voice name (e.g. "alloy" for OpenAI, "Aoede" for Gemini).
+    #[serde(default)]
+    pub voice: Option<String>,
+    /// Optional model override (e.g. "gpt-4o-realtime-preview").
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional text sent to the model after setup, before audio bridging.
+    #[serde(default)]
+    pub initial_message: Option<String>,
+}
+
+fn default_timeout() -> u64 { 300 }
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TakeScreenshotParams {
     /// Display target: "user_session", ":99", etc. Auto-detects if omitted.
@@ -3429,6 +3455,85 @@ impl IntendantServer {
                 format!("data:image/jpeg;base64,{}", b64)
             }
             Err(e) => format!("Error reading frame '{}': {}", frame_id, e),
+        }
+    }
+
+    #[tool(description = "Spawn a live audio voice conversation. Connects to OpenAI Realtime or Gemini Live via WebSocket and routes audio through the virtual audio bridge (Vortex/PulseAudio). The voice model follows a playbook and returns structured data matching the response_schema. Blocks until the conversation completes or times out. The voice model has two functions: submit_response (with schema fields) and end_call.")]
+    async fn spawn_live_audio(
+        &self,
+        Parameters(params): Parameters<SpawnLiveAudioParams>,
+    ) -> String {
+        use crate::{live_audio, live_audio_types, audio_routing, prompts};
+
+        let spec_json = serde_json::to_value(&params).unwrap_or_default();
+        let spec_result = serde_json::from_value::<live_audio_types::LiveAudioSpec>(spec_json);
+        let mut spec = match spec_result {
+            Ok(s) => s,
+            Err(e) => return format!("Error parsing LiveAudioSpec: {}", e),
+        };
+
+        // Build system prompt from playbook + schema
+        let project_root = std::env::var("INTENDANT_PROJECT_ROOT")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let system_prompt = prompts::build_live_audio_prompt(
+            &spec.playbook,
+            &spec.response_schema,
+            project_root.as_deref(),
+        );
+        spec.playbook = system_prompt;
+
+        // Resolve API key
+        let api_key_var = match spec.provider {
+            live_audio_types::LiveAudioProvider::Gemini => "GEMINI_API_KEY",
+            live_audio_types::LiveAudioProvider::OpenAI => "OPENAI_API_KEY",
+        };
+        let api_key = match std::env::var(api_key_var) {
+            Ok(k) => k,
+            Err(_) => return format!("Error: {} not set", api_key_var),
+        };
+
+        // Create audio bridge
+        let vortex_shm_available = unsafe {
+            let fd = libc::shm_open(
+                b"/vortex-audio\0".as_ptr() as *const libc::c_char,
+                libc::O_RDONLY,
+                0,
+            );
+            if fd >= 0 { libc::close(fd); true } else { false }
+        };
+        let mut bridge = if vortex_shm_available {
+            audio_routing::create_vortex_bridge("shm")
+        } else {
+            match audio_routing::create_bridge(&spec.id).await {
+                Ok(b) => b,
+                Err(e) => return format!("Error creating audio bridge: {}", e),
+            }
+        };
+        if bridge.vortex_socket_path().is_none() {
+            let _ = audio_routing::set_as_default(&mut bridge).await;
+        }
+
+        let log_dir = {
+            let state = self.state.read().await;
+            state.log_dir.clone()
+        };
+
+        self.bus.send(crate::event::AppEvent::PresenceLog {
+            message: format!("Live audio session '{}' starting ({:?})", spec.id, spec.provider),
+            level: None, turn: None,
+        });
+
+        let result = live_audio::run_session(
+            &spec, &api_key, &bridge, &log_dir, Some(&self.bus),
+        ).await;
+
+        drop(bridge);
+
+        match result {
+            Ok(la_result) => serde_json::to_string_pretty(&la_result)
+                .unwrap_or_else(|_| format!("{:?}", la_result)),
+            Err(e) => format!("Error: {}", e),
         }
     }
 }
