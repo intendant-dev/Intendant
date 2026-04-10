@@ -201,7 +201,7 @@ function Copy-AndRunOnGuest($setupArgs) {
             wsl curl -sfL $ghUrl -o /tmp/setup-lan.sh
             if ($LASTEXITCODE -ne 0) { Die "failed to download setup-lan.sh in WSL" }
         }
-        wsl bash -c "chmod +x /tmp/setup-lan.sh && $runCmd"
+        wsl bash -c "sed -i 's/\r`$//' /tmp/setup-lan.sh && chmod +x /tmp/setup-lan.sh && $runCmd"
     } else {
         $sshArgs = Get-SshArgs
         if ($scriptPath) {
@@ -209,11 +209,12 @@ function Copy-AndRunOnGuest($setupArgs) {
             scp @scpPort $scriptPath "$($script:VmUser)@$($script:SshHost):/tmp/setup-lan.sh"
         }
         # Single SSH session: download (if needed) + chmod + run
+        # Strip \r in case the file was checked out with CRLF on Windows.
         $remoteCmd = ""
         if (-not $scriptPath) {
             $remoteCmd = "curl -sfL '$ghUrl' -o /tmp/setup-lan.sh && "
         }
-        $remoteCmd += "chmod +x /tmp/setup-lan.sh && $runCmd"
+        $remoteCmd += "sed -i 's/\r`$//' /tmp/setup-lan.sh && chmod +x /tmp/setup-lan.sh && $runCmd"
         ssh @sshArgs $remoteCmd
     }
 }
