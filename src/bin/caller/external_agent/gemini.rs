@@ -519,24 +519,25 @@ fn translate_session_update(update: &SessionUpdate) -> Vec<AgentEvent> {
             }
         }
         SessionUpdate::ToolCall(tc) => {
-            // Use title as primary preview (human-readable, e.g. "Run command: ls -la")
-            // Use kind for tool_name; fall back to raw_input formatted for preview
-            let tool_name = format!("{:?}", tc.kind).to_lowercase();
-            let preview = if !tc.title.is_empty() {
+            // Use title for the tool name (e.g. "mcp_intendant_execute_cu_actions")
+            // Use raw_input for the preview (actual arguments, not model reasoning)
+            let tool_name = if !tc.title.is_empty() {
                 tc.title.clone()
             } else {
-                tc.raw_input
-                    .as_ref()
-                    .map(|v| {
-                        if let serde_json::Value::String(s) = v {
-                            s.chars().take(200).collect()
-                        } else {
-                            let s = v.to_string();
-                            s.chars().take(200).collect()
-                        }
-                    })
-                    .unwrap_or_default()
+                format!("{:?}", tc.kind).to_lowercase()
             };
+            let preview = tc
+                .raw_input
+                .as_ref()
+                .map(|v| {
+                    let s = if let serde_json::Value::String(s) = v {
+                        s.clone()
+                    } else {
+                        v.to_string()
+                    };
+                    s.chars().take(200).collect::<String>()
+                })
+                .unwrap_or_default();
 
             let item_id = tc.tool_call_id.to_string();
             events.push(AgentEvent::ToolStarted {
@@ -1049,8 +1050,8 @@ mod tests {
                 preview,
             } => {
                 assert_eq!(item_id, "call-1");
-                assert_eq!(tool_name, "other"); // default ToolKind
-                assert_eq!(preview, "Run command: ls -la");
+                assert_eq!(tool_name, "Run command: ls -la"); // title becomes tool_name
+                assert!(preview.is_empty()); // no raw_input on default ToolCall
             }
             _ => panic!("expected ToolStarted"),
         }
@@ -1167,7 +1168,7 @@ mod tests {
 
         // Should emit: ToolStarted, ToolOutputDelta, ToolCompleted
         assert_eq!(events.len(), 3);
-        assert!(matches!(&events[0], AgentEvent::ToolStarted { tool_name, .. } if tool_name == "read"));
+        assert!(matches!(&events[0], AgentEvent::ToolStarted { tool_name, .. } if tool_name == "Read file: main.rs"));
         assert!(matches!(&events[1], AgentEvent::ToolOutputDelta { text, .. } if text == "file contents"));
         assert!(matches!(&events[2], AgentEvent::ToolCompleted { status: ToolCompletionStatus::Success, .. }));
     }

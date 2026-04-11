@@ -3463,23 +3463,32 @@ impl IntendantServer {
             &session_registry,
         ).await;
 
-        // Format results — include the last screenshot as base64 so the caller
-        // can see the display state after actions without a separate take_screenshot call.
+        // Format results with action details (type, coordinates) for debugging.
         let mut summaries = Vec::new();
-        for (i, r) in results.iter().enumerate() {
-            let status = if r.error.is_some() { "failed" } else { "ok" };
-            let detail = r.error.as_deref().unwrap_or("");
+        for (i, (action, result)) in actions.iter().zip(results.iter()).enumerate() {
+            let status = if result.error.is_some() { "failed" } else { "ok" };
+            let action_desc = format_cu_action_brief(action);
+            let detail = result.error.as_deref().unwrap_or("");
             if detail.is_empty() {
-                summaries.push(format!("action[{}]: {}", i, status));
+                summaries.push(format!("action[{}] {}: {}", i, action_desc, status));
             } else {
-                summaries.push(format!("action[{}]: {}: {}", i, status, detail));
+                summaries.push(format!("action[{}] {}: {}: {}", i, action_desc, status, detail));
             }
         }
 
-        // Attach the last screenshot inline, annotated with click markers
+        // Attach the last screenshot inline, annotated with click markers.
+        // Also save the annotated version to disk so substitute_screenshot_from_disk
+        // picks it up for the Activity tab.
         let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
         if let Some(ss) = last_screenshot {
             let annotated = annotate_screenshot_with_clicks(&ss.base64_png, &actions);
+            // Save annotated screenshot to disk (overwrite the raw one)
+            if let Ok(bytes) = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &annotated,
+            ) {
+                let _ = std::fs::write(&ss.path, &bytes);
+            }
             summaries.push(format!(
                 "screenshot: data:image/png;base64,{}",
                 annotated
@@ -4074,6 +4083,29 @@ pub async fn run_mcp_server(
 // ---------------------------------------------------------------------------
 // Screenshot click annotation
 // ---------------------------------------------------------------------------
+
+/// Format a CU action as a short description for logs.
+fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {
+    use crate::computer_use::CuAction;
+    match action {
+        CuAction::Click { x, y, button } => format!("(click {},{} {:?})", x, y, button),
+        CuAction::DoubleClick { x, y, button } => format!("(dblclick {},{} {:?})", x, y, button),
+        CuAction::Type { text } => {
+            let preview = if text.len() > 30 { &text[..30] } else { text };
+            format!("(type \"{}\")", preview)
+        }
+        CuAction::Key { key } => format!("(key {})", key),
+        CuAction::Scroll { x, y, direction, amount } => {
+            format!("(scroll {},{} {:?} {})", x, y, direction, amount)
+        }
+        CuAction::MoveMouse { x, y } => format!("(move {},{})", x, y),
+        CuAction::Drag { start_x, start_y, end_x, end_y } => {
+            format!("(drag {},{}->{},{})", start_x, start_y, end_x, end_y)
+        }
+        CuAction::Screenshot => "(screenshot)".to_string(),
+        CuAction::Wait { ms } => format!("(wait {}ms)", ms),
+    }
+}
 
 /// Draw red crosshairs on a screenshot at click/double_click coordinates.
 /// Returns annotated base64 PNG, or the original if annotation fails.
