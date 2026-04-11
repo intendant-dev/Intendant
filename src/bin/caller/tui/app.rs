@@ -1055,14 +1055,7 @@ impl App {
 
     fn set_autonomy_level(&self, level: &str) {
         let parsed = crate::autonomy::AutonomyLevel::from_str_loose(level);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let autonomy = self.autonomy.clone();
-            handle.spawn(async move {
-                let mut state = autonomy.write().await;
-                state.level = parsed;
-            });
-        }
-        // Broadcast the change so all connected clients update their status bar
+        // Shared state updated by ControlPlane -- only broadcast for display here
         let label = format!("{}", parsed);
         self.broadcast_control(OutboundEvent::Status {
             turn: self.turn,

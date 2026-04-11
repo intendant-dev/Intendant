@@ -2,6 +2,7 @@ mod agent_runner;
 mod autonomy;
 mod computer_use;
 mod control;
+mod control_plane;
 mod conversation;
 mod debug;
 mod display;
@@ -741,14 +742,9 @@ async fn run_daemon_loop(config: DaemonConfig) {
                         });
                     }
                     Ok(AppEvent::ControlCommand(event::ControlMsg::SetExternalAgent { agent })) => {
-                        let parsed = agent.as_deref()
-                            .filter(|s| !s.is_empty())
-                            .and_then(external_agent::AgentBackend::from_str_loose);
-                        let label = parsed.as_ref()
-                            .map(|b| b.to_string())
-                            .unwrap_or_else(|| "none".to_string());
-                        *config.shared_external_agent.write().await = parsed;
+                        let label = agent.as_deref().unwrap_or("none");
                         eprintln!("External agent set to {} (takes effect on next task)", label);
+                        // Shared state updated by ControlPlane
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -6890,6 +6886,13 @@ async fn main() -> Result<(), CallerError> {
         // Seeded with the resolved CLI/config value; updated by SetExternalAgent ControlMsg.
         let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
             Arc::new(tokio::sync::RwLock::new(agent_backend.clone()));
+        let _control_plane_handle = control_plane::spawn(
+            bus.subscribe(),
+            control_plane::ControlPlaneState {
+                autonomy: autonomy.clone(),
+                external_agent: shared_external_agent.clone(),
+            },
+        );
         let mut loop_handle = if use_presence {
             // Presence mode: the presence layer mediates between user and agent
             let presence_user_rx = presence_user_rx.unwrap();
@@ -7352,6 +7355,13 @@ async fn main() -> Result<(), CallerError> {
         // Shared state for dynamic external agent selection from the web UI (headless mode).
         let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
             Arc::new(tokio::sync::RwLock::new(agent_backend.clone()));
+        let _control_plane_handle = control_plane::spawn(
+            bus.subscribe(),
+            control_plane::ControlPlaneState {
+                autonomy: autonomy.clone(),
+                external_agent: shared_external_agent.clone(),
+            },
+        );
 
         let result = if let Some(backend) = agent_backend {
             run_external_agent_mode(

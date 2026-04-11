@@ -1073,13 +1073,7 @@ async fn handle_control_command_mcp(
         }
         ControlMsg::SetAutonomy { level } => {
             let parsed = AutonomyLevel::from_str_loose(&level);
-            {
-                let s = state.read().await;
-                let autonomy = s.autonomy.clone();
-                drop(s);
-                let mut a = autonomy.write().await;
-                a.level = parsed;
-            }
+            // Shared state updated by ControlPlane
             emit_control_result(
                 control_tx,
                 "set_autonomy",
