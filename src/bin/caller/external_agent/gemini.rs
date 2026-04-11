@@ -10,7 +10,8 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use agent_client_protocol_schema::{
     ContentBlock, RequestPermissionOutcome, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, ToolCallStatus,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, ToolCallContent,
+    ToolCallStatus,
 };
 
 use crate::error::CallerError;
@@ -223,11 +224,18 @@ async fn reader_task(
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
     let approval_counter = AtomicU64::new(1);
+    let mut accumulated_message = String::new();
 
     loop {
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
             Ok(None) => {
+                // Flush accumulated message before termination
+                if !accumulated_message.is_empty() {
+                    let _ = event_tx.send(AgentEvent::Message {
+                        text: std::mem::take(&mut accumulated_message),
+                    });
+                }
                 let _ = event_tx.send(AgentEvent::Terminated {
                     reason: "Agent process closed stdout".into(),
                     exit_code: None,
@@ -235,6 +243,12 @@ async fn reader_task(
                 break;
             }
             Err(e) => {
+                // Flush accumulated message before termination
+                if !accumulated_message.is_empty() {
+                    let _ = event_tx.send(AgentEvent::Message {
+                        text: std::mem::take(&mut accumulated_message),
+                    });
+                }
                 let _ = event_tx.send(AgentEvent::Terminated {
                     reason: format!("IO error reading agent stdout: {}", e),
                     exit_code: None,
@@ -245,16 +259,20 @@ async fn reader_task(
 
         let msg: JsonRpcMessage = match serde_json::from_str(&line) {
             Ok(m) => m,
-            Err(_) => {
-                eprintln!("[gemini-acp] non-JSON: {}", &line[..line.len().min(200)]);
-                continue;
-            }
+            Err(_) => continue, // skip non-JSON lines
         };
-        eprintln!("[gemini-acp] method={:?} id={:?}", msg.method, msg.id);
 
         // 1. Response to our request (has id + result/error, no method)
         if msg.method.is_none() {
             if let Some(id) = msg.id {
+                // A JSON-RPC response means a turn ended (e.g. session/prompt
+                // completed). Flush any accumulated message text.
+                if !accumulated_message.is_empty() {
+                    let _ = event_tx.send(AgentEvent::Message {
+                        text: std::mem::take(&mut accumulated_message),
+                    });
+                }
+
                 let mut pending = pending_requests.lock().await;
                 if let Some(tx) = pending.remove(&id) {
                     if let Some(err) = msg.error {
@@ -339,7 +357,24 @@ async fn reader_task(
         // 3. Notification (has method, no id) — session updates
         if method == "session/update" {
             if let Ok(notif) = serde_json::from_value::<SessionNotification>(params) {
-                translate_session_update(&notif.update, &event_tx);
+                // If the update is NOT an AgentMessageChunk and we have
+                // accumulated text, flush it as a complete Message first.
+                if !matches!(notif.update, SessionUpdate::AgentMessageChunk(_)) {
+                    if !accumulated_message.is_empty() {
+                        let _ = event_tx.send(AgentEvent::Message {
+                            text: std::mem::take(&mut accumulated_message),
+                        });
+                    }
+                }
+
+                let events = translate_session_update(&notif.update);
+                for event in events {
+                    // Accumulate MessageDelta text for complete Message emission
+                    if let AgentEvent::MessageDelta { ref text } = event {
+                        accumulated_message.push_str(text);
+                    }
+                    let _ = event_tx.send(event);
+                }
             }
         }
         // Other notifications are silently ignored.
@@ -371,40 +406,122 @@ struct PermissionOption_ {
     kind: String,
 }
 
+/// Extract human-readable text from a `ToolCallContent` block.
+fn extract_tool_content_text(block: &ToolCallContent) -> String {
+    match block {
+        ToolCallContent::Content(c) => match &c.content {
+            ContentBlock::Text(t) => t.text.clone(),
+            ContentBlock::Image(_) => "[image]".to_string(),
+            _ => String::new(),
+        },
+        ToolCallContent::Diff(d) => {
+            let old_len = d.old_text.as_ref().map(|t| t.len()).unwrap_or(0);
+            let new_len = d.new_text.len();
+            format!("diff {}: {} -> {} bytes", d.path.display(), old_len, new_len)
+        }
+        ToolCallContent::Terminal(t) => {
+            format!("[terminal {}]", t.terminal_id)
+        }
+        _ => String::new(),
+    }
+}
+
+/// Extract an error message from a ToolCallUpdate's Failed status.
+/// Gemini puts errors in content[0].content.text; fall back to raw_output.
+fn extract_failed_message(fields: &agent_client_protocol_schema::ToolCallUpdateFields) -> String {
+    // Try content first (Gemini's preferred location for error messages)
+    if let Some(ref content) = fields.content {
+        for block in content {
+            let text = extract_tool_content_text(block);
+            if !text.is_empty() {
+                return text;
+            }
+        }
+    }
+    // Fall back to raw_output
+    if let Some(ref raw) = fields.raw_output {
+        if let Some(s) = raw.as_str() {
+            return s.to_string();
+        }
+        return raw.to_string();
+    }
+    "failed".to_string()
+}
+
 /// Translate an ACP SessionUpdate into AgentEvent(s).
-fn translate_session_update(
-    update: &SessionUpdate,
-    event_tx: &mpsc::UnboundedSender<AgentEvent>,
-) {
+fn translate_session_update(update: &SessionUpdate) -> Vec<AgentEvent> {
+    let mut events = Vec::new();
+
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             // ContentChunk has a single `content: ContentBlock` field
             if let ContentBlock::Text(text) = &chunk.content {
-                let _ = event_tx.send(AgentEvent::MessageDelta {
+                events.push(AgentEvent::MessageDelta {
                     text: text.text.clone(),
                 });
             }
         }
         SessionUpdate::ToolCall(tc) => {
-            let tool_name = tc.title.clone();
-            let preview = tc
-                .raw_input
-                .as_ref()
-                .map(|v| {
-                    if let serde_json::Value::String(s) = v {
-                        s.chars().take(200).collect()
-                    } else {
-                        let s = v.to_string();
-                        s.chars().take(200).collect()
-                    }
-                })
-                .unwrap_or_default();
+            // Use title as primary preview (human-readable, e.g. "Run command: ls -la")
+            // Use kind for tool_name; fall back to raw_input formatted for preview
+            let tool_name = format!("{:?}", tc.kind).to_lowercase();
+            let preview = if !tc.title.is_empty() {
+                tc.title.clone()
+            } else {
+                tc.raw_input
+                    .as_ref()
+                    .map(|v| {
+                        if let serde_json::Value::String(s) = v {
+                            s.chars().take(200).collect()
+                        } else {
+                            let s = v.to_string();
+                            s.chars().take(200).collect()
+                        }
+                    })
+                    .unwrap_or_default()
+            };
 
-            let _ = event_tx.send(AgentEvent::ToolStarted {
-                item_id: tc.tool_call_id.to_string(),
+            let item_id = tc.tool_call_id.to_string();
+            events.push(AgentEvent::ToolStarted {
+                item_id: item_id.clone(),
                 tool_name,
                 preview,
             });
+
+            // If the tool call already has content and a terminal status (history
+            // replay or already-completed), emit content + completion now.
+            let is_terminal = matches!(
+                tc.status,
+                ToolCallStatus::Completed | ToolCallStatus::Failed
+            );
+            if is_terminal {
+                for block in &tc.content {
+                    let text = extract_tool_content_text(block);
+                    if !text.is_empty() {
+                        events.push(AgentEvent::ToolOutputDelta {
+                            item_id: item_id.clone(),
+                            text,
+                        });
+                    }
+                }
+                let status = match tc.status {
+                    ToolCallStatus::Completed => ToolCompletionStatus::Success,
+                    ToolCallStatus::Failed => {
+                        let message = tc
+                            .raw_output
+                            .as_ref()
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("failed")
+                            .to_string();
+                        ToolCompletionStatus::Failed { message }
+                    }
+                    _ => unreachable!(),
+                };
+                events.push(AgentEvent::ToolCompleted {
+                    item_id,
+                    status,
+                });
+            }
         }
         SessionUpdate::ToolCallUpdate(tcu) => {
             let item_id = tcu.tool_call_id.to_string();
@@ -413,10 +530,9 @@ fn translate_session_update(
             // Emit output delta if there's content
             if let Some(ref content) = fields.content {
                 for block in content {
-                    // ToolCallContent may contain text; extract what we can
-                    let text = serde_json::to_string(block).unwrap_or_default();
+                    let text = extract_tool_content_text(block);
                     if !text.is_empty() {
-                        let _ = event_tx.send(AgentEvent::ToolOutputDelta {
+                        events.push(AgentEvent::ToolOutputDelta {
                             item_id: item_id.clone(),
                             text,
                         });
@@ -429,17 +545,12 @@ fn translate_session_update(
                 let completion = match status {
                     ToolCallStatus::Completed => Some(ToolCompletionStatus::Success),
                     ToolCallStatus::Failed => Some(ToolCompletionStatus::Failed {
-                        message: fields
-                            .raw_output
-                            .as_ref()
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("failed")
-                            .to_string(),
+                        message: extract_failed_message(fields),
                     }),
                     _ => None, // Pending, InProgress — not terminal
                 };
                 if let Some(status) = completion {
-                    let _ = event_tx.send(AgentEvent::ToolCompleted { item_id, status });
+                    events.push(AgentEvent::ToolCompleted { item_id, status });
                 }
             }
         }
@@ -450,6 +561,8 @@ fn translate_session_update(
             // Plan, AvailableCommandsUpdate, CurrentModeUpdate, etc. — not mapped
         }
     }
+
+    events
 }
 
 // ---------------------------------------------------------------------------
@@ -828,30 +941,29 @@ mod tests {
         let update = SessionUpdate::AgentMessageChunk(
             ContentChunk::new(ContentBlock::Text(TextContent::new("hello world"))),
         );
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        translate_session_update(&update, &tx);
-        let event = rx.try_recv().unwrap();
-        match event {
+        let events = translate_session_update(&update);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             AgentEvent::MessageDelta { text } => assert_eq!(text, "hello world"),
-            _ => panic!("expected MessageDelta, got {:?}", event),
+            _ => panic!("expected MessageDelta, got {:?}", events[0]),
         }
     }
 
     #[test]
     fn translate_tool_call() {
-        let tc = agent_client_protocol_schema::ToolCall::new("call-1", "run_shell_command");
+        let tc = agent_client_protocol_schema::ToolCall::new("call-1", "Run command: ls -la");
         let update = SessionUpdate::ToolCall(tc);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        translate_session_update(&update, &tx);
-        let event = rx.try_recv().unwrap();
-        match event {
+        let events = translate_session_update(&update);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             AgentEvent::ToolStarted {
                 item_id,
                 tool_name,
-                ..
+                preview,
             } => {
                 assert_eq!(item_id, "call-1");
-                assert_eq!(tool_name, "run_shell_command");
+                assert_eq!(tool_name, "other"); // default ToolKind
+                assert_eq!(preview, "Run command: ls -la");
             }
             _ => panic!("expected ToolStarted"),
         }
@@ -863,13 +975,12 @@ mod tests {
         let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
         let tcu = agent_client_protocol_schema::ToolCallUpdate::new("call-1", fields);
         let update = SessionUpdate::ToolCallUpdate(tcu);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        translate_session_update(&update, &tx);
-        let event = rx.try_recv().unwrap();
-        match event {
+        let events = translate_session_update(&update);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             AgentEvent::ToolCompleted { item_id, status } => {
                 assert_eq!(item_id, "call-1");
-                assert_eq!(status, ToolCompletionStatus::Success);
+                assert_eq!(*status, ToolCompletionStatus::Success);
             }
             _ => panic!("expected ToolCompleted"),
         }
@@ -881,16 +992,120 @@ mod tests {
         let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Failed);
         let tcu = agent_client_protocol_schema::ToolCallUpdate::new("call-1", fields);
         let update = SessionUpdate::ToolCallUpdate(tcu);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        translate_session_update(&update, &tx);
-        let event = rx.try_recv().unwrap();
-        match event {
+        let events = translate_session_update(&update);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             AgentEvent::ToolCompleted { item_id, status } => {
                 assert_eq!(item_id, "call-1");
                 assert!(matches!(status, ToolCompletionStatus::Failed { .. }));
             }
             _ => panic!("expected ToolCompleted"),
         }
+    }
+
+    #[test]
+    fn translate_tool_call_update_text_content_extracts_text() {
+        use agent_client_protocol_schema::{ToolCallUpdateFields, TextContent};
+        use agent_client_protocol_schema::Content;
+
+        let text_block = ToolCallContent::Content(Content::new(
+            ContentBlock::Text(TextContent::new("command output here")),
+        ));
+        let fields = ToolCallUpdateFields::new()
+            .content(vec![text_block]);
+        let tcu = agent_client_protocol_schema::ToolCallUpdate::new("call-1", fields);
+        let update = SessionUpdate::ToolCallUpdate(tcu);
+        let events = translate_session_update(&update);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::ToolOutputDelta { item_id, text } => {
+                assert_eq!(item_id, "call-1");
+                assert_eq!(text, "command output here");
+            }
+            _ => panic!("expected ToolOutputDelta, got {:?}", events[0]),
+        }
+    }
+
+    #[test]
+    fn translate_tool_call_update_failed_extracts_error_from_content() {
+        use agent_client_protocol_schema::{ToolCallUpdateFields, TextContent};
+        use agent_client_protocol_schema::Content;
+
+        let error_block = ToolCallContent::Content(Content::new(
+            ContentBlock::Text(TextContent::new("permission denied")),
+        ));
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Failed)
+            .content(vec![error_block]);
+        let tcu = agent_client_protocol_schema::ToolCallUpdate::new("call-1", fields);
+        let update = SessionUpdate::ToolCallUpdate(tcu);
+        let events = translate_session_update(&update);
+
+        // Should have ToolOutputDelta + ToolCompleted
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            AgentEvent::ToolOutputDelta { text, .. } => {
+                assert_eq!(text, "permission denied");
+            }
+            _ => panic!("expected ToolOutputDelta, got {:?}", events[0]),
+        }
+        match &events[1] {
+            AgentEvent::ToolCompleted { item_id, status } => {
+                assert_eq!(item_id, "call-1");
+                match status {
+                    ToolCompletionStatus::Failed { message } => {
+                        assert_eq!(message, "permission denied");
+                    }
+                    _ => panic!("expected Failed status"),
+                }
+            }
+            _ => panic!("expected ToolCompleted, got {:?}", events[1]),
+        }
+    }
+
+    #[test]
+    fn translate_tool_call_completed_status_emits_full_lifecycle() {
+        use agent_client_protocol_schema::{TextContent, ToolKind};
+        use agent_client_protocol_schema::Content;
+
+        let text_block = ToolCallContent::Content(Content::new(
+            ContentBlock::Text(TextContent::new("file contents")),
+        ));
+        let tc = agent_client_protocol_schema::ToolCall::new("call-1", "Read file: main.rs")
+            .kind(ToolKind::Read)
+            .status(ToolCallStatus::Completed)
+            .content(vec![text_block]);
+        let update = SessionUpdate::ToolCall(tc);
+        let events = translate_session_update(&update);
+
+        // Should emit: ToolStarted, ToolOutputDelta, ToolCompleted
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[0], AgentEvent::ToolStarted { tool_name, .. } if tool_name == "read"));
+        assert!(matches!(&events[1], AgentEvent::ToolOutputDelta { text, .. } if text == "file contents"));
+        assert!(matches!(&events[2], AgentEvent::ToolCompleted { status: ToolCompletionStatus::Success, .. }));
+    }
+
+    #[test]
+    fn extract_tool_content_text_diff() {
+        use agent_client_protocol_schema::Diff;
+
+        let diff = ToolCallContent::Diff(Diff::new("src/main.rs", "new content")
+            .old_text("old content".to_string()));
+        let text = extract_tool_content_text(&diff);
+        assert!(text.contains("src/main.rs"));
+        assert!(text.contains("11")); // old_text length
+        assert!(text.contains("11")); // new_text length
+    }
+
+    #[test]
+    fn extract_tool_content_text_image() {
+        use agent_client_protocol_schema::{ImageContent, Content};
+
+        let img = ToolCallContent::Content(Content::new(
+            ContentBlock::Image(ImageContent::new("base64data", "image/png")),
+        ));
+        let text = extract_tool_content_text(&img);
+        assert_eq!(text, "[image]");
     }
 
     #[test]
