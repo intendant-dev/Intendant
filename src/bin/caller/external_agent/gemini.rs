@@ -821,30 +821,40 @@ impl ExternalAgent for GeminiAgent {
             })?
         };
 
+
         // Map our decision to an ACP option_id.
-        // ACP provides specific option_ids — we pick the best match.
+        // ACP agents use different option ID conventions:
+        //   Standard ACP: allow_once, allow_always, reject_once, reject_always
+        //   Gemini CLI:   proceed_once, proceed_always, proceed_always_server,
+        //                 proceed_always_tool, cancel
+        // Match permissively to handle both.
+        let is_accept = |id: &&String| {
+            id.contains("allow") || (id.contains("proceed") && !id.contains("cancel"))
+        };
+        let is_reject = |id: &&String| {
+            id.contains("reject") || id.contains("cancel")
+        };
+
         let selected_option = match decision {
             ApprovalDecision::Accept => {
-                // Prefer "allow_once" or first allow option
                 option_ids
                     .iter()
-                    .find(|id| id.contains("allow") && id.contains("once"))
-                    .or_else(|| option_ids.iter().find(|id| id.contains("allow")))
+                    .find(|id| is_accept(id) && id.contains("once"))
+                    .or_else(|| option_ids.iter().find(|id| is_accept(id)))
                     .cloned()
             }
             ApprovalDecision::AcceptForSession => {
-                // Prefer "allow_always"
                 option_ids
                     .iter()
-                    .find(|id| id.contains("allow") && id.contains("always"))
-                    .or_else(|| option_ids.iter().find(|id| id.contains("allow")))
+                    .find(|id| is_accept(id) && id.contains("always"))
+                    .or_else(|| option_ids.iter().find(|id| is_accept(id)))
                     .cloned()
             }
             ApprovalDecision::Decline => {
                 option_ids
                     .iter()
-                    .find(|id| id.contains("reject") && id.contains("once"))
-                    .or_else(|| option_ids.iter().find(|id| id.contains("reject")))
+                    .find(|id| is_reject(id) && id.contains("once"))
+                    .or_else(|| option_ids.iter().find(|id| is_reject(id)))
                     .cloned()
             }
             ApprovalDecision::Cancel => None,
