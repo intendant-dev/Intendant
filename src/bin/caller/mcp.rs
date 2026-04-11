@@ -4144,38 +4144,55 @@ fn annotate_screenshot_with_clicks(
 
     let (w, h) = (img.width() as i32, img.height() as i32);
     let red = image::Rgba([255u8, 0, 0, 255]);
-    let arm = 15i32; // crosshair arm length
-    let thickness = 2i32;
+    let yellow = image::Rgba([255u8, 255, 0, 255]);
+    let arm = 20i32;
+    let thickness = 3i32;
 
     for (cx, cy) in &clicks {
-        // Draw crosshair
+        // Clamp to image bounds; use yellow for out-of-bounds clicks
+        let oob = *cx < 0 || *cx >= w || *cy < 0 || *cy >= h;
+        let color = if oob { yellow } else { red };
+        let dx = (*cx).max(0).min(w - 1);
+        let dy = (*cy).max(0).min(h - 1);
+
+        // Draw crosshair at clamped position
         for offset in -arm..=arm {
             for t in -thickness..=thickness {
-                // Horizontal arm
-                let hx = cx + offset;
-                let hy = cy + t;
+                let hx = dx + offset;
+                let hy = dy + t;
                 if hx >= 0 && hx < w && hy >= 0 && hy < h {
-                    img.put_pixel(hx as u32, hy as u32, red);
+                    img.put_pixel(hx as u32, hy as u32, color);
                 }
-                // Vertical arm
-                let vx = cx + t;
-                let vy = cy + offset;
+                let vx = dx + t;
+                let vy = dy + offset;
                 if vx >= 0 && vx < w && vy >= 0 && vy < h {
-                    img.put_pixel(vx as u32, vy as u32, red);
+                    img.put_pixel(vx as u32, vy as u32, color);
                 }
             }
         }
-        // Draw circle (radius 10)
-        let r = 10i32;
+        // Draw circle (radius 12)
+        let r = 12i32;
         for angle in 0..360 {
             let rad = (angle as f64) * std::f64::consts::PI / 180.0;
-            let px = *cx + (r as f64 * rad.cos()) as i32;
-            let py = *cy + (r as f64 * rad.sin()) as i32;
-            for t in 0..=1 {
+            let px = dx + (r as f64 * rad.cos()) as i32;
+            let py = dy + (r as f64 * rad.sin()) as i32;
+            for t in 0..=2 {
                 let px2 = px + t;
                 let py2 = py + t;
                 if px2 >= 0 && px2 < w && py2 >= 0 && py2 < h {
-                    img.put_pixel(px2 as u32, py2 as u32, red);
+                    img.put_pixel(px2 as u32, py2 as u32, color);
+                }
+            }
+        }
+
+        // Draw "OOB" indicator at top-left if out of bounds
+        if oob {
+            // Draw a solid yellow bar at the top of the image as a warning
+            for bx in 0..80i32 {
+                for by in 0..6i32 {
+                    if bx < w && by < h {
+                        img.put_pixel(bx as u32, by as u32, yellow);
+                    }
                 }
             }
         }
