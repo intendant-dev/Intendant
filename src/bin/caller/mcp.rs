@@ -109,6 +109,8 @@ pub struct McpAppState {
     pub session_registry: Option<crate::display::SharedSessionRegistry>,
     /// Directory for screenshot output.
     pub screenshot_dir: Option<std::path::PathBuf>,
+    /// Persistent counter for screenshot filenames (avoids overwriting).
+    pub screenshot_counter: std::sync::atomic::AtomicU64,
 }
 
 /// Tracks a pending approval info (responder is in the shared ApprovalRegistry).
@@ -159,6 +161,7 @@ impl McpAppState {
             frame_registry: None,
             session_registry: None,
             screenshot_dir: None,
+            screenshot_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -3402,7 +3405,8 @@ impl IntendantServer {
         drop(state);
 
         let _ = std::fs::create_dir_all(&screenshot_dir);
-        let mut counter = 0u64;
+        let mut counter = self.state.read().await.screenshot_counter
+            .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
         let results = execute_actions(
             &[CuAction::Screenshot],
             target,
@@ -3448,7 +3452,8 @@ impl IntendantServer {
         drop(state);
 
         let _ = std::fs::create_dir_all(&screenshot_dir);
-        let mut counter = 0u64;
+        let mut counter = self.state.read().await.screenshot_counter
+            .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
         let results = execute_actions(
             &actions,
             target,
