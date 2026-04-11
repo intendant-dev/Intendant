@@ -1801,7 +1801,7 @@ pub fn spawn_event_listener(
                 match event {
                     AppEvent::Key(_) => {} // MCP doesn't handle key events
                     AppEvent::Resize(_, _) => {}
-                    AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } => {} // Derived events — handled by outbound broadcaster
+                    AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::ExternalAgentChanged { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::Tick => {
                         // Detect stuck phases — warn every 30s after 120s
                         if matches!(

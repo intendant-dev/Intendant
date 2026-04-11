@@ -326,6 +326,12 @@ pub enum AppEvent {
         task: String,
     },
 
+    /// Emitted when the external agent backend changes (via Settings dropdown).
+    /// Broadcasted by the ControlPlane after updating shared state.
+    ExternalAgentChanged {
+        agent: Option<String>,
+    },
+
     /// Log entry emitted by the App for broadcast to external consumers.
     /// The TUI renders these from its internal deque; external consumers
     /// (web UI, control socket) receive them via the outbound broadcaster.
@@ -744,6 +750,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             task: task.clone(),
             external_agent: None,
+        }),
+        AppEvent::ExternalAgentChanged { agent } => Some(OutboundEvent::ExternalAgentChanged {
+            agent: agent.clone(),
         }),
         AppEvent::LogEntry {
             level,

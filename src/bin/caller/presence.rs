@@ -898,6 +898,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::LiveUsageUpdate { .. }
         | AppEvent::StatusUpdate { .. }
         | AppEvent::LogEntry { .. }
+        | AppEvent::ExternalAgentChanged { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::Key(_)
         | AppEvent::Resize(_, _)

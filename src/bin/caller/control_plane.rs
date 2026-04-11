@@ -10,12 +10,13 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::autonomy::SharedAutonomy;
-use crate::event::{AppEvent, ControlMsg};
+use crate::event::{AppEvent, ControlMsg, EventBus};
 use crate::external_agent;
 
 pub struct ControlPlaneState {
     pub autonomy: SharedAutonomy,
     pub external_agent: Arc<RwLock<Option<external_agent::AgentBackend>>>,
+    pub bus: EventBus,
 }
 
 /// Spawn the control plane as a background task. Returns a JoinHandle.
@@ -49,7 +50,11 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .and_then(external_agent::AgentBackend::from_str_loose);
-            *state.external_agent.write().await = parsed;
+            *state.external_agent.write().await = parsed.clone();
+            // Broadcast so frontends can update their status bars.
+            state.bus.send(AppEvent::ExternalAgentChanged {
+                agent: parsed.map(|b| b.to_string()),
+            });
         }
         _ => {} // Other control messages don't update shared state
     }
@@ -72,6 +77,7 @@ mod tests {
             ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: external_agent.clone(),
+                bus: bus.clone(),
             },
         );
 
@@ -102,6 +108,7 @@ mod tests {
             ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: external_agent.clone(),
+                bus: bus.clone(),
             },
         );
 
@@ -143,6 +150,7 @@ mod tests {
             ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: external_agent.clone(),
+                bus: bus.clone(),
             },
         );
 
@@ -170,6 +178,7 @@ mod tests {
             ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: external_agent.clone(),
+                bus: bus.clone(),
             },
         );
 

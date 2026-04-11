@@ -197,6 +197,10 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         external_agent: Option<String>,
     },
+    ExternalAgentChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+    },
     Usage {
         main: crate::frontend::ModelUsageSnapshot,
         #[serde(skip_serializing_if = "Option::is_none")]

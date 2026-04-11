@@ -6891,6 +6891,7 @@ async fn main() -> Result<(), CallerError> {
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
+                bus: bus.clone(),
             },
         );
         let mut loop_handle = if use_presence {
@@ -7360,6 +7361,7 @@ async fn main() -> Result<(), CallerError> {
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
+                bus: bus.clone(),
             },
         );
 

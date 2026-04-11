@@ -814,6 +814,14 @@ impl AppState {
                 }
             }
 
+            "external_agent_changed" => {
+                cmds.push(UiCommand::UpdateStatusBar {
+                    provider: None, model: None, turn: None, budget_pct: None,
+                    autonomy: None, session_id: None,
+                    external_agent: Some(msg["agent"].as_str().unwrap_or("").to_string()),
+                });
+            }
+
             "usage" | "usage_update" => {
                 if let Some(main) = msg.get("main") {
                     if let Ok(u) = serde_json::from_value::<UsageSnapshot>(main.clone()) {
