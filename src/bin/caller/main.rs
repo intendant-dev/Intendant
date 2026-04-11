@@ -72,6 +72,693 @@ fn slog(log: &SharedSessionLog, f: impl FnOnce(&mut session_log::SessionLog)) {
     }
 }
 
+/// Resolve external agent backend from an explicit override, falling back to
+/// the project config's `agent.default_backend` setting.
+fn resolve_agent_backend_from_config(
+    explicit: Option<external_agent::AgentBackend>,
+    project: &Project,
+) -> Option<external_agent::AgentBackend> {
+    explicit.or_else(|| {
+        project
+            .config
+            .agent
+            .default_backend
+            .as_ref()
+            .and_then(|s| external_agent::AgentBackend::from_str_loose(s))
+    })
+}
+
+/// Resolve external agent backend from shared state (written by the web UI),
+/// falling back to the project config default.
+async fn resolve_agent_backend(
+    shared: &Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
+    project: &Project,
+) -> Option<external_agent::AgentBackend> {
+    resolve_agent_backend_from_config(shared.read().await.clone(), project)
+}
+
+/// Construct, initialize, and start a thread for an external agent backend.
+///
+/// Returns the agent, thread handle, and event receiver. The caller owns the
+/// agent lifetime and is responsible for sending messages and draining events.
+async fn create_external_agent(
+    backend: &external_agent::AgentBackend,
+    project: &Project,
+    session_log: &SharedSessionLog,
+    web_port: Option<u16>,
+) -> Result<
+    (
+        Box<dyn external_agent::ExternalAgent>,
+        external_agent::AgentThread,
+        tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
+    ),
+    CallerError,
+> {
+    use external_agent::{AgentBackend, AgentConfig};
+
+    let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend
+    {
+        AgentBackend::Codex => {
+            let cfg = &project.config.agent.codex;
+            let agent = Box::new(external_agent::codex::CodexAgent::new(
+                cfg.command.clone(),
+                cfg.model.clone(),
+                cfg.approval_policy.clone(),
+                cfg.sandbox != "danger-full-access",
+                web_port,
+            ));
+            let config = AgentConfig {
+                model: cfg.model.clone(),
+                working_dir: project.root.clone(),
+                approval_policy: cfg.approval_policy.clone(),
+                sandbox: cfg.sandbox != "danger-full-access",
+                web_port,
+            };
+            (agent, config)
+        }
+        AgentBackend::GeminiCli => {
+            let cfg = &project.config.agent.gemini_cli;
+            let agent = Box::new(external_agent::gemini::GeminiAgent::new(
+                cfg.command.clone(),
+                cfg.model.clone(),
+                web_port,
+            ));
+            let config = AgentConfig {
+                model: cfg.model.clone(),
+                working_dir: project.root.clone(),
+                approval_policy: String::new(),
+                sandbox: false,
+                web_port,
+            };
+            (agent, config)
+        }
+        AgentBackend::ClaudeCode => {
+            return Err(CallerError::ExternalAgent(
+                "Claude Code backend not yet implemented".into(),
+            ));
+        }
+    };
+
+    let event_rx = agent.initialize(config).await?;
+    slog(session_log, |l| l.info("External agent initialized"));
+
+    let thread = agent.start_thread().await?;
+    slog(session_log, |l| {
+        l.info(&format!("External agent thread: {}", thread.thread_id))
+    });
+
+    Ok((agent, thread, event_rx))
+}
+
+/// Configuration for `drain_external_agent_events`.
+struct DrainConfig<'a> {
+    bus: &'a EventBus,
+    autonomy: SharedAutonomy,
+    session_log: &'a SharedSessionLog,
+    log_dir: &'a Path,
+    approval_registry: &'a event::ApprovalRegistry,
+    json_approval: Option<&'a JsonApprovalSlot>,
+    agent_source: Option<String>,
+    /// When true, `ToolStarted` just increments the turn counter without
+    /// emitting `AgentStarted`. The presence path sets this to avoid
+    /// duplicating the model reasoning that's already shown via ModelResponse.
+    suppress_agent_started: bool,
+    /// When true and no `json_approval` slot is set, auto-deny approval
+    /// requests (headless mode with no interactive input).
+    headless: bool,
+}
+
+/// Result of draining one batch of external agent events.
+enum DrainOutcome {
+    /// The agent's turn completed. The caller decides how to continue
+    /// (e.g., wait for follow-up, emit DoneSignal, break inner loop).
+    TurnCompleted {
+        message: Option<String>,
+        turns_in_round: usize,
+    },
+    /// The agent process terminated.
+    Terminated {
+        reason: String,
+        exit_code: Option<i32>,
+    },
+    /// The event channel was closed unexpectedly.
+    ChannelClosed,
+}
+
+/// Drain external agent events until a turn completes, the agent terminates,
+/// or the channel closes.
+///
+/// This is the unified event loop shared by both the presence path
+/// (`run_with_presence`) and the non-presence path (`run_external_agent_mode`).
+async fn drain_external_agent_events(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
+    config: &DrainConfig<'_>,
+    stats: &mut LoopStats,
+) -> DrainOutcome {
+    use std::sync::atomic::Ordering;
+
+    let approval_counter = std::sync::atomic::AtomicU64::new(1);
+    let mut turns_in_round = 0usize;
+
+    loop {
+        let event = match event_rx.recv().await {
+            Some(e) => e,
+            None => return DrainOutcome::ChannelClosed,
+        };
+
+        match event {
+            external_agent::AgentEvent::MessageDelta { text } => {
+                config.bus.send(AppEvent::ModelResponseDelta { text });
+            }
+            external_agent::AgentEvent::Message { text } => {
+                stats.last_response = Some(text.clone());
+                config.bus.send(AppEvent::ModelResponse {
+                    turn: stats.turns,
+                    content: text,
+                    usage: provider::TokenUsage::default(),
+                    reasoning: None,
+                    source: config.agent_source.clone(),
+                });
+            }
+            external_agent::AgentEvent::ToolStarted {
+                preview,
+                tool_name,
+                ..
+            } => {
+                turns_in_round += 1;
+                if !config.suppress_agent_started {
+                    stats.turns += 1;
+                    let preview_text = format!("{}: {}", tool_name, preview);
+                    config.bus.send(AppEvent::AgentStarted {
+                        turn: stats.turns,
+                        commands_preview: preview_text,
+                        source: config.agent_source.clone(),
+                    });
+                }
+            }
+            external_agent::AgentEvent::ToolOutputDelta { text, .. } => {
+                // Gemini CLI strips images from ACP, sending "[Image: image/png]".
+                // Substitute with the latest screenshot from disk so the Activity
+                // tab can render it.
+                let stdout = if text.contains("[Image: image/png]")
+                    || text.contains("[Image: image/jpeg]")
+                {
+                    substitute_screenshot_from_disk(&text, config.log_dir)
+                } else {
+                    text
+                };
+                config.bus.send(AppEvent::AgentOutput {
+                    stdout,
+                    stderr: String::new(),
+                    source: config.agent_source.clone(),
+                });
+            }
+            external_agent::AgentEvent::ToolCompleted { item_id, status } => {
+                let status_str = match &status {
+                    external_agent::ToolCompletionStatus::Success => "completed",
+                    external_agent::ToolCompletionStatus::Failed { message } => {
+                        slog(config.session_log, |l| {
+                            l.warn(&format!("Tool {} failed: {}", item_id, message))
+                        });
+                        "failed"
+                    }
+                    external_agent::ToolCompletionStatus::Cancelled => "cancelled",
+                };
+                config.bus.send(AppEvent::AutoApproved {
+                    preview: format!("[{}] {}", status_str, item_id),
+                });
+            }
+            external_agent::AgentEvent::ApprovalRequest {
+                request_id,
+                command,
+                category,
+            } => {
+                let cat = match category {
+                    external_agent::ApprovalCategory::CommandExecution => {
+                        autonomy::ActionCategory::CommandExec
+                    }
+                    external_agent::ApprovalCategory::FileChange => {
+                        autonomy::ActionCategory::FileWrite
+                    }
+                };
+                let needs = { config.autonomy.read().await.needs_approval(cat) };
+                if !needs {
+                    config
+                        .bus
+                        .send(AppEvent::AutoApproved { preview: command.clone() });
+                    slog(config.session_log, |l| l.auto_approved(&command));
+                    if let Err(e) = agent
+                        .resolve_approval(
+                            &request_id,
+                            external_agent::ApprovalDecision::Accept,
+                        )
+                        .await
+                    {
+                        slog(config.session_log, |l| {
+                            l.warn(&format!("Failed to auto-approve: {}", e))
+                        });
+                    }
+                } else if config.headless && config.json_approval.is_none() {
+                    slog(config.session_log, |l| {
+                        l.warn(&format!("Headless auto-deny: {}", command))
+                    });
+                    config.bus.send(AppEvent::ApprovalResolved {
+                        id: 0,
+                        action: "deny".to_string(),
+                    });
+                    let _ = agent
+                        .resolve_approval(
+                            &request_id,
+                            external_agent::ApprovalDecision::Decline,
+                        )
+                        .await;
+                } else {
+                    let id = approval_counter.fetch_add(1, Ordering::Relaxed);
+                    config.bus.send(AppEvent::ApprovalRequired {
+                        id,
+                        command_preview: command.clone(),
+                        category: cat,
+                    });
+
+                    let rx = if let Some(ref slot) = config.json_approval {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        {
+                            let mut guard = slot.lock().unwrap();
+                            *guard = Some((id, tx));
+                        }
+                        rx
+                    } else {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        {
+                            config.approval_registry.lock().unwrap().insert(id, tx);
+                        }
+                        rx
+                    };
+
+                    match rx.await {
+                        Ok(response) => {
+                            let (decision, action_str) = match response {
+                                event::ApprovalResponse::Approve => {
+                                    (external_agent::ApprovalDecision::Accept, "approve")
+                                }
+                                event::ApprovalResponse::ApproveAll => (
+                                    external_agent::ApprovalDecision::AcceptForSession,
+                                    "approve_all",
+                                ),
+                                event::ApprovalResponse::Deny => {
+                                    (external_agent::ApprovalDecision::Decline, "deny")
+                                }
+                                event::ApprovalResponse::Skip => {
+                                    (external_agent::ApprovalDecision::Cancel, "skip")
+                                }
+                            };
+                            config.bus.send(AppEvent::ApprovalResolved {
+                                id,
+                                action: action_str.to_string(),
+                            });
+                            slog(config.session_log, |l| l.approval_resolved(id, action_str));
+                            if let Err(e) = agent.resolve_approval(&request_id, decision).await {
+                                slog(config.session_log, |l| {
+                                    l.warn(&format!("Failed to resolve approval: {}", e))
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            slog(config.session_log, |l| {
+                                l.warn("Approval channel closed, denying")
+                            });
+                            let _ = agent
+                                .resolve_approval(
+                                    &request_id,
+                                    external_agent::ApprovalDecision::Decline,
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
+            external_agent::AgentEvent::FileApprovalRequest {
+                request_id,
+                path,
+                diff,
+            } => {
+                let cat = autonomy::ActionCategory::FileWrite;
+                let needs = { config.autonomy.read().await.needs_approval(cat) };
+                let preview = format!("file change: {}", path);
+
+                if !needs {
+                    config
+                        .bus
+                        .send(AppEvent::AutoApproved { preview: preview.clone() });
+                    slog(config.session_log, |l| l.auto_approved(&preview));
+                    if let Err(e) = agent
+                        .resolve_approval(
+                            &request_id,
+                            external_agent::ApprovalDecision::Accept,
+                        )
+                        .await
+                    {
+                        slog(config.session_log, |l| {
+                            l.warn(&format!("Failed to auto-approve file change: {}", e))
+                        });
+                    }
+                } else if config.headless && config.json_approval.is_none() {
+                    slog(config.session_log, |l| {
+                        l.warn(&format!("Headless auto-deny: {}", preview))
+                    });
+                    config.bus.send(AppEvent::ApprovalResolved {
+                        id: 0,
+                        action: "deny".to_string(),
+                    });
+                    let _ = agent
+                        .resolve_approval(
+                            &request_id,
+                            external_agent::ApprovalDecision::Decline,
+                        )
+                        .await;
+                } else {
+                    let id = approval_counter.fetch_add(1, Ordering::Relaxed);
+                    config.bus.send(AppEvent::ApprovalRequired {
+                        id,
+                        command_preview: format!("{}\n{}", preview, diff),
+                        category: cat,
+                    });
+
+                    let rx = if let Some(ref slot) = config.json_approval {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        {
+                            let mut guard = slot.lock().unwrap();
+                            *guard = Some((id, tx));
+                        }
+                        rx
+                    } else {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        {
+                            config.approval_registry.lock().unwrap().insert(id, tx);
+                        }
+                        rx
+                    };
+
+                    match rx.await {
+                        Ok(response) => {
+                            let (decision, action_str) = match response {
+                                event::ApprovalResponse::Approve => {
+                                    (external_agent::ApprovalDecision::Accept, "approve")
+                                }
+                                event::ApprovalResponse::ApproveAll => (
+                                    external_agent::ApprovalDecision::AcceptForSession,
+                                    "approve_all",
+                                ),
+                                event::ApprovalResponse::Deny => {
+                                    (external_agent::ApprovalDecision::Decline, "deny")
+                                }
+                                event::ApprovalResponse::Skip => {
+                                    (external_agent::ApprovalDecision::Cancel, "skip")
+                                }
+                            };
+                            config.bus.send(AppEvent::ApprovalResolved {
+                                id,
+                                action: action_str.to_string(),
+                            });
+                            slog(config.session_log, |l| l.approval_resolved(id, action_str));
+                            if let Err(e) = agent.resolve_approval(&request_id, decision).await {
+                                slog(config.session_log, |l| {
+                                    l.warn(&format!("Failed to resolve file approval: {}", e))
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            slog(config.session_log, |l| {
+                                l.warn("File approval channel closed, denying")
+                            });
+                            let _ = agent
+                                .resolve_approval(
+                                    &request_id,
+                                    external_agent::ApprovalDecision::Decline,
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
+            external_agent::AgentEvent::DiffUpdated {
+                files_changed,
+                unified_diff,
+            } => {
+                slog(config.session_log, |l| {
+                    l.info(&format!(
+                        "External agent diff: {} files changed\n{}",
+                        files_changed.len(),
+                        unified_diff
+                    ));
+                });
+            }
+            external_agent::AgentEvent::TurnCompleted { message } => {
+                if let Some(ref msg) = message {
+                    stats.last_response = Some(msg.clone());
+                }
+                return DrainOutcome::TurnCompleted {
+                    message,
+                    turns_in_round,
+                };
+            }
+            external_agent::AgentEvent::Terminated { reason, exit_code } => {
+                return DrainOutcome::Terminated { reason, exit_code };
+            }
+        }
+    }
+}
+
+/// Configuration for `run_daemon_loop`.
+struct DaemonConfig {
+    bus: EventBus,
+    project_root: PathBuf,
+    autonomy: SharedAutonomy,
+    shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
+    frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
+    web_port: Option<u16>,
+    flags_direct: bool,
+    /// Optional shared session state for headless mode (cleared between tasks).
+    shared_session: Option<web_gateway::SharedActiveSession>,
+}
+
+/// Daemon loop shared by the TUI post-exit path and the headless web-gateway path.
+///
+/// Waits for `StartTask` and `SetExternalAgent` control messages from the web
+/// UI, spawning agent tasks in the background. Exits on Ctrl+C or bus close.
+async fn run_daemon_loop(config: DaemonConfig) {
+    let mut event_rx = config.bus.subscribe();
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("Shutting down.");
+                break;
+            }
+            event = event_rx.recv() => {
+                match event {
+                    Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask {
+                        task: new_task,
+                        orchestrate,
+                        direct,
+                        reference_frame_ids,
+                        display_target,
+                    })) => {
+                        eprintln!(
+                            "New session{}: {}",
+                            if direct.unwrap_or(false) { " (direct)" } else { "" },
+                            &new_task[..new_task.len().min(80)]
+                        );
+
+                        // Create fresh session resources
+                        let new_log_dir = session_log::SessionLog::resolve_path(None);
+                        let new_session_log = match session_log::SessionLog::open(new_log_dir.clone()) {
+                            Ok(l) => Arc::new(Mutex::new(l)),
+                            Err(e) => {
+                                config.bus.send(AppEvent::LoopError(format!("Session create failed: {}", e)));
+                                continue;
+                            }
+                        };
+                        let new_project = match Project::from_root(config.project_root.clone()) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                config.bus.send(AppEvent::LoopError(format!("Project load failed: {}", e)));
+                                continue;
+                            }
+                        };
+
+                        // CU path: when reference_frame_ids are present, run ephemeral CU task
+                        if !reference_frame_ids.is_empty() {
+                            let reference_images = resolve_frame_ids(
+                                &reference_frame_ids, &config.frame_registry,
+                            ).await;
+                            if !reference_images.is_empty() {
+                                let cu_provider = match provider::select_cu_provider(
+                                    &new_project.config.computer_use,
+                                ) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        config.bus.send(AppEvent::LoopError(format!("CU provider failed: {}", e)));
+                                        continue;
+                                    }
+                                };
+                                config.bus.send(AppEvent::PresenceLog {
+                                    message: format!("Starting CU task: {}", new_task),
+                                    level: None,
+                                    turn: None,
+                                });
+                                let bus_cu = config.bus.clone();
+                                let session_log_cu = new_session_log.clone();
+                                let cu_config = new_project.config.computer_use.clone();
+                                tokio::spawn(async move {
+                                    let cu_target = display_target.as_deref()
+                                        .map(parse_display_target_str);
+                                    match run_cu_task(
+                                        cu_provider.as_ref(), &new_task, reference_images, vec![],
+                                        &session_log_cu, &new_log_dir, &bus_cu, &cu_config, cu_target,
+                                    ).await {
+                                        Ok(CuTaskResult::Completed(stats)) => {
+                                            bus_cu.send(AppEvent::PresenceLog {
+                                                message: format!("CU task complete ({} turns)", stats.turns),
+                                                level: None, turn: None,
+                                            });
+                                        }
+                                        Ok(CuTaskResult::Escalate { task }) => {
+                                            bus_cu.send(AppEvent::PresenceLog {
+                                                message: format!(
+                                                    "CU escalated (not a display task): {}",
+                                                    &task[..task.len().min(80)]
+                                                ),
+                                                level: None, turn: None,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            bus_cu.send(AppEvent::PresenceLog {
+                                                message: format!("CU task error: {}", e),
+                                                level: Some(types::LogLevel::Error), turn: None,
+                                            });
+                                        }
+                                    }
+                                });
+                                continue;
+                            }
+                        }
+
+                        // Update shared session state (headless mode)
+                        if let Some(ref shared_session) = config.shared_session {
+                            let mut ss = shared_session.write().await;
+                            ss.session_log = Some(new_session_log.clone());
+                        }
+
+                        let new_session_id = new_log_dir
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        config.bus.send(AppEvent::SessionStarted {
+                            session_id: new_session_id.clone(),
+                            task: Some(new_task.clone()),
+                        });
+
+                        let bus_spawn = config.bus.clone();
+                        let autonomy_spawn = config.autonomy.clone();
+                        let session_log_spawn = new_session_log.clone();
+                        let shared_cleanup = config.shared_session.clone();
+                        let use_direct = direct.unwrap_or(false)
+                            || orchestrate
+                                .map(|o| !o)
+                                .unwrap_or_else(|| config.flags_direct || is_simple_task(&new_task));
+                        // Read shared state (web UI may have changed it)
+                        let restart_agent_backend = resolve_agent_backend(
+                            &config.shared_external_agent, &new_project,
+                        ).await;
+                        let web_port_for_spawn = config.web_port;
+
+                        tokio::spawn(async move {
+                            let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+                            let result = if let Some(backend) = restart_agent_backend {
+                                run_external_agent_mode(
+                                    backend, new_task.clone(), new_project,
+                                    bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
+                                    new_log_dir, follow_up_rx, None,
+                                    event::ApprovalRegistry::default(), true, web_port_for_spawn,
+                                ).await
+                            } else {
+                                let new_provider = match provider::select_provider() {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        return bus_spawn.send(AppEvent::LoopError(
+                                            format!("Provider failed: {}", e),
+                                        ));
+                                    }
+                                };
+                                if use_direct {
+                                    run_direct_mode(
+                                        new_provider, new_task.clone(), new_project,
+                                        bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
+                                        new_log_dir, None, follow_up_rx, None,
+                                        event::ApprovalRegistry::default(),
+                                        event::ContextInjectionQueue::default(),
+                                        true,
+                                    ).await
+                                } else {
+                                    run_user_mode(
+                                        new_provider, new_task.clone(), new_project,
+                                        bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
+                                    ).await
+                                }
+                            };
+
+                            let reason = match &result {
+                                Ok(stats) => {
+                                    slog(&session_log_spawn, |l| {
+                                        l.write_summary_with_rounds(
+                                            &new_task, "completed",
+                                            stats.turns, Some(stats.rounds),
+                                        )
+                                    });
+                                    "completed".to_string()
+                                }
+                                Err(e) => {
+                                    slog(&session_log_spawn, |l| {
+                                        l.write_summary(&new_task, &format!("error: {}", e), 0)
+                                    });
+                                    format!("error: {}", e)
+                                }
+                            };
+
+                            bus_spawn.send(AppEvent::SessionEnded {
+                                session_id: new_session_id,
+                                reason,
+                            });
+
+                            // Clear session state (headless mode)
+                            if let Some(ref ss) = shared_cleanup {
+                                let mut state = ss.write().await;
+                                state.session_log = None;
+                                state.query_ctx = None;
+                            }
+                        });
+                    }
+                    Ok(AppEvent::ControlCommand(event::ControlMsg::SetExternalAgent { agent })) => {
+                        let parsed = agent.as_deref()
+                            .filter(|s| !s.is_empty())
+                            .and_then(external_agent::AgentBackend::from_str_loose);
+                        let label = parsed.as_ref()
+                            .map(|b| b.to_string())
+                            .unwrap_or_else(|| "none".to_string());
+                        *config.shared_external_agent.write().await = parsed;
+                        eprintln!("External agent set to {} (takes effect on next task)", label);
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+}
+
 const SAFETY_CAP: usize = 500;
 const MIN_BUDGET_TOKENS: u64 = 4096;
 const BUDGET_WARNING_THRESHOLD: f64 = 0.85;
@@ -3481,10 +4168,8 @@ async fn run_with_presence(
     let project_root = project.root.clone();
 
     // Resolve external agent backend: CLI override > web UI selection > config default > None.
-    let initial_agent_backend = agent_backend_override.or_else(|| {
-        project.config.agent.default_backend.as_ref()
-            .and_then(|s| external_agent::AgentBackend::from_str_loose(s))
-    });
+    let initial_agent_backend =
+        resolve_agent_backend_from_config(agent_backend_override, &project);
     // Seed the shared state so the web UI reflects the initial selection.
     {
         let mut guard = shared_external_agent.write().await;
@@ -3498,7 +4183,6 @@ async fn run_with_presence(
     let mut persistent_provider: Option<Box<dyn provider::ChatProvider>> = None;
     let mut persistent_project: Option<Project> = None;
     // External agent + thread — created on first task, reused for subsequent messages.
-    let presence_approval_counter = std::sync::atomic::AtomicU64::new(1);
     let mut persistent_agent: Option<Box<dyn external_agent::ExternalAgent>> = None;
     let mut persistent_thread: Option<external_agent::AgentThread> = None;
     let mut persistent_event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>> = None;
@@ -3603,7 +4287,6 @@ async fn run_with_presence(
             // The external agent manages its own conversation; we keep the
             // agent + thread alive across tasks dispatched by presence.
             if persistent_agent.is_none() {
-                use external_agent::{AgentBackend, AgentConfig};
                 let proj = match Project::from_root(project_root.clone()) {
                     Ok(p) => p,
                     Err(e) => {
@@ -3615,65 +4298,18 @@ async fn run_with_presence(
                         continue;
                     }
                 };
-                let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend {
-                    AgentBackend::Codex => {
-                        let cfg = &proj.config.agent.codex;
-                        let agent = Box::new(external_agent::codex::CodexAgent::new(
-                            cfg.command.clone(), cfg.model.clone(),
-                            cfg.approval_policy.clone(), cfg.sandbox != "danger-full-access",
-                            web_port,
-                        ));
-                        let config = AgentConfig {
-                            model: cfg.model.clone(),
-                            working_dir: proj.root.clone(),
-                            approval_policy: cfg.approval_policy.clone(),
-                            sandbox: cfg.sandbox != "danger-full-access",
-                            web_port,
-                        };
-                        (agent, config)
-                    }
-                    AgentBackend::GeminiCli => {
-                        let cfg = &proj.config.agent.gemini_cli;
-                        let agent = Box::new(external_agent::gemini::GeminiAgent::new(
-                            cfg.command.clone(), cfg.model.clone(), web_port,
-                        ));
-                        let config = AgentConfig {
-                            model: cfg.model.clone(),
-                            working_dir: proj.root.clone(),
-                            approval_policy: String::new(),
-                            sandbox: false,
-                            web_port,
-                        };
-                        (agent, config)
-                    }
-                    AgentBackend::ClaudeCode => {
-                        bus.send(AppEvent::PresenceLog {
-                            message: "Claude Code backend not yet implemented".into(),
-                            level: Some(types::LogLevel::Error), turn: None,
-                        });
-                        continue;
-                    }
-                };
-                let event_rx = match agent.initialize(config).await {
-                    Ok(rx) => rx,
-                    Err(e) => {
-                        bus.send(AppEvent::PresenceLog {
-                            message: format!("External agent init error: {}", e),
-                            level: Some(types::LogLevel::Error), turn: None,
-                        });
-                        continue;
-                    }
-                };
-                let thread = match agent.start_thread().await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        bus.send(AppEvent::PresenceLog {
-                            message: format!("External agent thread error: {}", e),
-                            level: Some(types::LogLevel::Error), turn: None,
-                        });
-                        continue;
-                    }
-                };
+                let (agent, thread, event_rx) =
+                    match create_external_agent(backend, &proj, &session_log, web_port).await {
+                        Ok(result) => result,
+                        Err(e) => {
+                            bus.send(AppEvent::PresenceLog {
+                                message: format!("External agent error: {}", e),
+                                level: Some(types::LogLevel::Error),
+                                turn: None,
+                            });
+                            continue;
+                        }
+                    };
                 slog(&session_log, |l| l.info(&format!(
                     "Mode: external agent ({}) via presence, thread: {}",
                     backend, thread.thread_id
@@ -3697,129 +4333,42 @@ async fn run_with_presence(
 
             // Drain events until this turn completes
             let event_rx = persistent_event_rx.as_mut().unwrap();
-            let mut turn_in_round = 0usize;
-            let agent_source = Some(backend.to_string());
-            loop {
-                match event_rx.recv().await {
-                    Some(external_agent::AgentEvent::TurnCompleted { message }) => {
-                        cumulative_stats.turns += 1;
-                        cumulative_stats.rounds += 1;
-                        bus.send(AppEvent::DoneSignal { message: message.clone() });
-                        bus.send(AppEvent::RoundComplete {
-                            round: cumulative_stats.rounds,
-                            turns_in_round: turn_in_round,
-                        });
-                        break;
-                    }
-                    Some(external_agent::AgentEvent::MessageDelta { text }) => {
-                        bus.send(AppEvent::ModelResponseDelta { text });
-                    }
-                    Some(external_agent::AgentEvent::Message { text }) => {
-                        bus.send(AppEvent::ModelResponse {
-                            turn: cumulative_stats.turns,
-                            content: text,
-                            usage: provider::TokenUsage::default(),
-                            reasoning: None,
-                            source: agent_source.clone(),
-                        });
-                    }
-                    Some(external_agent::AgentEvent::ToolStarted { .. }) => {
-                        // Don't emit AgentStarted for external agents — the model
-                        // reasoning is already shown via ModelResponse, and tool
-                        // results via AgentOutput. Emitting both duplicates text.
-                        turn_in_round += 1;
-                    }
-                    Some(external_agent::AgentEvent::ToolOutputDelta { text, .. }) => {
-                        // Gemini CLI strips images from ACP, sending "[Image: image/png]".
-                        // Substitute with the latest screenshot from disk so the Activity
-                        // tab can render it.
-                        let stdout = if text.contains("[Image: image/png]") || text.contains("[Image: image/jpeg]") {
-                            substitute_screenshot_from_disk(&text, &log_dir)
-                        } else {
-                            text
-                        };
-                        bus.send(AppEvent::AgentOutput { stdout, stderr: String::new(), source: agent_source.clone() });
-                    }
-                    Some(external_agent::AgentEvent::ToolCompleted { item_id, status }) => {
-                        match &status {
-                            external_agent::ToolCompletionStatus::Failed { message } => {
-                                slog(&session_log, |l| l.warn(&format!("Tool {} failed: {}", item_id, message)));
-                            }
-                            _ => {} // Success/Cancelled don't need logging — output already logged
-                        }
-                    }
-                    Some(external_agent::AgentEvent::ApprovalRequest { request_id, command, category }) => {
-                        let cat = match category {
-                            external_agent::ApprovalCategory::CommandExecution => autonomy::ActionCategory::CommandExec,
-                            external_agent::ApprovalCategory::FileChange => autonomy::ActionCategory::FileWrite,
-                        };
-                        let needs = { autonomy.read().await.needs_approval(cat) };
-                        if !needs {
-                            bus.send(AppEvent::AutoApproved { preview: command });
-                            let _ = agent.resolve_approval(&request_id, external_agent::ApprovalDecision::Accept).await;
-                        } else {
-                            let id = presence_approval_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            { approval_registry.lock().unwrap().insert(id, tx); }
-                            bus.send(AppEvent::ApprovalRequired { id, command_preview: command, category: cat });
-                            let decision = match rx.await {
-                                Ok(event::ApprovalResponse::Approve) => external_agent::ApprovalDecision::Accept,
-                                Ok(event::ApprovalResponse::ApproveAll) => external_agent::ApprovalDecision::AcceptForSession,
-                                Ok(event::ApprovalResponse::Deny) => external_agent::ApprovalDecision::Decline,
-                                Ok(event::ApprovalResponse::Skip) | Err(_) => external_agent::ApprovalDecision::Cancel,
-                            };
-                            let _ = agent.resolve_approval(&request_id, decision).await;
-                        }
-                    }
-                    Some(external_agent::AgentEvent::FileApprovalRequest { request_id, path, .. }) => {
-                        let needs = { autonomy.read().await.needs_approval(autonomy::ActionCategory::FileWrite) };
-                        if !needs {
-                            bus.send(AppEvent::AutoApproved { preview: format!("file change: {}", path) });
-                            let _ = agent.resolve_approval(&request_id, external_agent::ApprovalDecision::Accept).await;
-                        } else {
-                            let id = presence_approval_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            { approval_registry.lock().unwrap().insert(id, tx); }
-                            bus.send(AppEvent::ApprovalRequired {
-                                id, command_preview: format!("file change: {}", path),
-                                category: autonomy::ActionCategory::FileWrite,
-                            });
-                            let decision = match rx.await {
-                                Ok(event::ApprovalResponse::Approve) => external_agent::ApprovalDecision::Accept,
-                                Ok(event::ApprovalResponse::ApproveAll) => external_agent::ApprovalDecision::AcceptForSession,
-                                Ok(event::ApprovalResponse::Deny) => external_agent::ApprovalDecision::Decline,
-                                Ok(event::ApprovalResponse::Skip) | Err(_) => external_agent::ApprovalDecision::Cancel,
-                            };
-                            let _ = agent.resolve_approval(&request_id, decision).await;
-                        }
-                    }
-                    Some(external_agent::AgentEvent::DiffUpdated { files_changed, unified_diff }) => {
-                        slog(&session_log, |l| {
-                            l.info(&format!(
-                                "External agent diff: {} files changed\n{}",
-                                files_changed.len(),
-                                unified_diff
-                            ));
-                        });
-                    }
-                    Some(external_agent::AgentEvent::Terminated { reason, .. }) => {
-                        bus.send(AppEvent::PresenceLog {
-                            message: format!("External agent terminated: {}", reason),
-                            level: Some(types::LogLevel::Error), turn: None,
-                        });
-                        // Agent is gone — clear persistent state so next task re-initializes
-                        persistent_agent = None;
-                        persistent_thread = None;
-                        persistent_event_rx = None;
-                        break;
-                    }
-                    None => {
-                        // Channel closed unexpectedly
-                        persistent_agent = None;
-                        persistent_thread = None;
-                        persistent_event_rx = None;
-                        break;
-                    }
+            let drain_config = DrainConfig {
+                bus: &bus,
+                autonomy: autonomy.clone(),
+                session_log: &session_log,
+                log_dir: &log_dir,
+                approval_registry: &approval_registry,
+                json_approval: None,
+                agent_source: Some(backend.to_string()),
+                suppress_agent_started: true,
+                headless: false,
+            };
+            match drain_external_agent_events(agent, event_rx, &drain_config, &mut cumulative_stats).await {
+                DrainOutcome::TurnCompleted { message, turns_in_round } => {
+                    cumulative_stats.turns += 1;
+                    cumulative_stats.rounds += 1;
+                    bus.send(AppEvent::DoneSignal { message: message.clone() });
+                    bus.send(AppEvent::RoundComplete {
+                        round: cumulative_stats.rounds,
+                        turns_in_round,
+                    });
+                }
+                DrainOutcome::Terminated { reason, .. } => {
+                    bus.send(AppEvent::PresenceLog {
+                        message: format!("External agent terminated: {}", reason),
+                        level: Some(types::LogLevel::Error), turn: None,
+                    });
+                    // Agent is gone — clear persistent state so next task re-initializes
+                    persistent_agent = None;
+                    persistent_thread = None;
+                    persistent_event_rx = None;
+                }
+                DrainOutcome::ChannelClosed => {
+                    // Channel closed unexpectedly
+                    persistent_agent = None;
+                    persistent_thread = None;
+                    persistent_event_rx = None;
                 }
             }
         } else {
@@ -4366,9 +4915,6 @@ async fn run_external_agent_mode(
     headless: bool,
     web_port: Option<u16>,
 ) -> Result<LoopStats, CallerError> {
-    use external_agent::{AgentBackend, AgentConfig, AgentEvent, ApprovalCategory, ApprovalDecision};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     slog(&session_log, |l| {
         l.info(&format!("Mode: external agent ({})", backend));
     });
@@ -4378,304 +4924,99 @@ async fn run_external_agent_mode(
         println!("---");
     }
 
-    // Construct the agent and its config based on backend
-    let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match &backend {
-        AgentBackend::Codex => {
-            let cfg = &project.config.agent.codex;
-            let agent = Box::new(external_agent::codex::CodexAgent::new(
-                cfg.command.clone(),
-                cfg.model.clone(),
-                cfg.approval_policy.clone(),
-                cfg.sandbox != "danger-full-access",
-                web_port,
-            ));
-            let config = AgentConfig {
-                model: cfg.model.clone(),
-                working_dir: project.root.clone(),
-                approval_policy: cfg.approval_policy.clone(),
-                sandbox: cfg.sandbox != "danger-full-access",
-                web_port,
-            };
-            (agent, config)
-        }
-        AgentBackend::GeminiCli => {
-            let cfg = &project.config.agent.gemini_cli;
-            let agent = Box::new(external_agent::gemini::GeminiAgent::new(
-                cfg.command.clone(),
-                cfg.model.clone(),
-                web_port,
-            ));
-            let config = AgentConfig {
-                model: cfg.model.clone(),
-                working_dir: project.root.clone(),
-                approval_policy: String::new(),
-                sandbox: false,
-                web_port,
-            };
-            (agent, config)
-        }
-        AgentBackend::ClaudeCode => {
-            return Err(CallerError::ExternalAgent(
-                "Claude Code backend not yet implemented".into(),
-            ));
-        }
-    };
-    let mut event_rx = agent.initialize(config).await?;
-    slog(&session_log, |l| l.info("External agent initialized"));
-
-    // Start thread and send initial task
-    let thread = agent.start_thread().await?;
-    slog(&session_log, |l| {
-        l.info(&format!("External agent thread: {}", thread.thread_id));
-    });
+    // Construct, initialize, and start a thread for the external agent
+    let (mut agent, thread, mut event_rx) =
+        create_external_agent(&backend, &project, &session_log, web_port).await?;
 
     agent.send_message(&thread, &task).await?;
     slog(&session_log, |l| l.info("Initial task sent to external agent"));
 
     // Event loop
-    let mut turn = 0usize;
     let mut round = 1usize;
     let mut stats = LoopStats::default();
-    let approval_counter = AtomicU64::new(1);
+
+    let drain_config = DrainConfig {
+        bus: &bus,
+        autonomy: autonomy.clone(),
+        session_log: &session_log,
+        log_dir: &_log_dir,
+        approval_registry: &approval_registry,
+        json_approval: json_approval.as_ref(),
+        agent_source: None,
+        suppress_agent_started: false,
+        headless,
+    };
 
     loop {
-        tokio::select! {
-            event = event_rx.recv() => {
-                let Some(event) = event else {
-                    // Channel closed — agent terminated without explicit event
-                    slog(&session_log, |l| l.info("External agent event channel closed"));
-                    break;
-                };
+        match drain_external_agent_events(&mut agent, &mut event_rx, &drain_config, &mut stats)
+            .await
+        {
+            DrainOutcome::TurnCompleted {
+                message,
+                turns_in_round,
+            } => {
+                stats.rounds = round;
 
-                match event {
-                    AgentEvent::MessageDelta { text } => {
-                        bus.send(AppEvent::ModelResponseDelta { text });
-                    }
-                    AgentEvent::Message { text } => {
-                        stats.last_response = Some(text.clone());
-                        bus.send(AppEvent::ModelResponse {
-                            turn,
-                            content: text,
-                            usage: provider::TokenUsage::default(),
-                            reasoning: None,
-                            source: None,
-                        });
-                    }
-                    AgentEvent::ToolStarted { preview, tool_name, .. } => {
-                        turn += 1;
-                        let preview_text = format!("{}: {}", tool_name, preview);
-                        bus.send(AppEvent::AgentStarted {
-                            turn,
-                            commands_preview: preview_text,
-                            source: None,
-                        });
-                    }
-                    AgentEvent::ToolOutputDelta { text, .. } => {
-                        bus.send(AppEvent::AgentOutput {
-                            stdout: text,
-                            stderr: String::new(),
-                            source: None,
-                        });
-                    }
-                    AgentEvent::ToolCompleted { item_id, status } => {
-                        let status_str = match &status {
-                            external_agent::ToolCompletionStatus::Success => "completed",
-                            external_agent::ToolCompletionStatus::Failed { message } => {
-                                slog(&session_log, |l| l.warn(&format!("Tool {} failed: {}", item_id, message)));
-                                "failed"
-                            }
-                            external_agent::ToolCompletionStatus::Cancelled => "cancelled",
-                        };
-                        bus.send(AppEvent::AutoApproved {
-                            preview: format!("[{}] {}", status_str, item_id),
-                        });
-                    }
-                    AgentEvent::ApprovalRequest { request_id, command, category } => {
-                        let cat = match category {
-                            ApprovalCategory::CommandExecution => autonomy::ActionCategory::CommandExec,
-                            ApprovalCategory::FileChange => autonomy::ActionCategory::FileWrite,
-                        };
+                bus.send(AppEvent::DoneSignal {
+                    message: message.clone(),
+                });
+                bus.send(AppEvent::RoundComplete {
+                    round,
+                    turns_in_round,
+                });
+                slog(&session_log, |l| l.round_complete(round, turns_in_round));
 
-                        // Check autonomy — auto-approve if allowed
-                        let needs = {
-                            let state = autonomy.read().await;
-                            state.needs_approval(cat)
-                        };
-
-                        if !needs {
-                            bus.send(AppEvent::AutoApproved { preview: command.clone() });
-                            slog(&session_log, |l| l.auto_approved(&command));
-                            if let Err(e) = agent.resolve_approval(&request_id, ApprovalDecision::Accept).await {
-                                slog(&session_log, |l| l.warn(&format!("Failed to auto-approve: {}", e)));
-                            }
-                        } else if headless && json_approval.is_none() {
-                            // Headless non-JSON: no way to ask user, auto-deny
-                            slog(&session_log, |l| l.warn(&format!("Headless auto-deny: {}", command)));
-                            bus.send(AppEvent::ApprovalResolved { id: 0, action: "deny".to_string() });
-                            let _ = agent.resolve_approval(&request_id, ApprovalDecision::Decline).await;
-                        } else {
-                            let id = approval_counter.fetch_add(1, Ordering::Relaxed);
-                            bus.send(AppEvent::ApprovalRequired {
-                                id,
-                                command_preview: command.clone(),
-                                category: cat,
-                            });
-
-                            // Wait for approval: JSON slot (headless) or registry (TUI/web)
-                            let rx = if let Some(ref slot) = json_approval {
-                                let (tx, rx) = tokio::sync::oneshot::channel();
-                                { let mut guard = slot.lock().unwrap(); *guard = Some((id, tx)); }
-                                rx
-                            } else {
-                                let (tx, rx) = tokio::sync::oneshot::channel();
-                                { approval_registry.lock().unwrap().insert(id, tx); }
-                                rx
-                            };
-
-                            match rx.await {
-                                Ok(response) => {
-                                    let (decision, action_str) = match response {
-                                        event::ApprovalResponse::Approve => (ApprovalDecision::Accept, "approve"),
-                                        event::ApprovalResponse::ApproveAll => (ApprovalDecision::AcceptForSession, "approve_all"),
-                                        event::ApprovalResponse::Deny => (ApprovalDecision::Decline, "deny"),
-                                        event::ApprovalResponse::Skip => (ApprovalDecision::Cancel, "skip"),
-                                    };
-                                    bus.send(AppEvent::ApprovalResolved {
-                                        id,
-                                        action: action_str.to_string(),
-                                    });
-                                    slog(&session_log, |l| l.approval_resolved(id, action_str));
-                                    if let Err(e) = agent.resolve_approval(&request_id, decision).await {
-                                        slog(&session_log, |l| l.warn(&format!("Failed to resolve approval: {}", e)));
-                                    }
-                                }
-                                Err(_) => {
-                                    slog(&session_log, |l| l.warn("Approval channel closed, denying"));
-                                    let _ = agent.resolve_approval(&request_id, ApprovalDecision::Decline).await;
-                                }
-                            }
-                        }
-                    }
-                    AgentEvent::FileApprovalRequest { request_id, path, diff } => {
-                        let cat = autonomy::ActionCategory::FileWrite;
-                        let needs = {
-                            let state = autonomy.read().await;
-                            state.needs_approval(cat)
-                        };
-                        let preview = format!("file change: {}", path);
-
-                        if !needs {
-                            bus.send(AppEvent::AutoApproved { preview: preview.clone() });
-                            slog(&session_log, |l| l.auto_approved(&preview));
-                            if let Err(e) = agent.resolve_approval(&request_id, ApprovalDecision::Accept).await {
-                                slog(&session_log, |l| l.warn(&format!("Failed to auto-approve file change: {}", e)));
-                            }
-                        } else if headless && json_approval.is_none() {
-                            slog(&session_log, |l| l.warn(&format!("Headless auto-deny: {}", preview)));
-                            bus.send(AppEvent::ApprovalResolved { id: 0, action: "deny".to_string() });
-                            let _ = agent.resolve_approval(&request_id, ApprovalDecision::Decline).await;
-                        } else {
-                            let id = approval_counter.fetch_add(1, Ordering::Relaxed);
-                            bus.send(AppEvent::ApprovalRequired {
-                                id,
-                                command_preview: format!("{}\n{}", preview, diff),
-                                category: cat,
-                            });
-
-                            let rx = if let Some(ref slot) = json_approval {
-                                let (tx, rx) = tokio::sync::oneshot::channel();
-                                { let mut guard = slot.lock().unwrap(); *guard = Some((id, tx)); }
-                                rx
-                            } else {
-                                let (tx, rx) = tokio::sync::oneshot::channel();
-                                { approval_registry.lock().unwrap().insert(id, tx); }
-                                rx
-                            };
-
-                            match rx.await {
-                                Ok(response) => {
-                                    let (decision, action_str) = match response {
-                                        event::ApprovalResponse::Approve => (ApprovalDecision::Accept, "approve"),
-                                        event::ApprovalResponse::ApproveAll => (ApprovalDecision::AcceptForSession, "approve_all"),
-                                        event::ApprovalResponse::Deny => (ApprovalDecision::Decline, "deny"),
-                                        event::ApprovalResponse::Skip => (ApprovalDecision::Cancel, "skip"),
-                                    };
-                                    bus.send(AppEvent::ApprovalResolved { id, action: action_str.to_string() });
-                                    slog(&session_log, |l| l.approval_resolved(id, action_str));
-                                    if let Err(e) = agent.resolve_approval(&request_id, decision).await {
-                                        slog(&session_log, |l| l.warn(&format!("Failed to resolve file approval: {}", e)));
-                                    }
-                                }
-                                Err(_) => {
-                                    slog(&session_log, |l| l.warn("File approval channel closed, denying"));
-                                    let _ = agent.resolve_approval(&request_id, ApprovalDecision::Decline).await;
-                                }
-                            }
-                        }
-                    }
-                    AgentEvent::DiffUpdated { files_changed, unified_diff } => {
+                // Wait for follow-up or channel close
+                match follow_up_rx.recv().await {
+                    Some(followup) => {
+                        round += 1;
+                        stats.turns = 0;
                         slog(&session_log, |l| {
-                            l.info(&format!(
-                                "External agent diff: {} files changed\n{}",
-                                files_changed.len(),
-                                unified_diff
-                            ));
+                            l.info(&format!("Follow-up round {}: {}", round, followup));
                         });
-                    }
-                    AgentEvent::TurnCompleted { message } => {
-                        stats.turns = turn;
-                        stats.rounds = round;
-                        if let Some(ref msg) = message {
-                            stats.last_response = Some(msg.clone());
-                        }
-
-                        bus.send(AppEvent::DoneSignal { message: message.clone() });
-                        bus.send(AppEvent::RoundComplete { round, turns_in_round: turn });
-                        slog(&session_log, |l| l.round_complete(round, turn));
-
-                        // Wait for follow-up or channel close
-                        match follow_up_rx.recv().await {
-                            Some(followup) => {
-                                round += 1;
-                                turn = 0;
-                                slog(&session_log, |l| {
-                                    l.info(&format!("Follow-up round {}: {}", round, followup));
-                                });
-                                if let Err(e) = agent.send_message(&thread, &followup).await {
-                                    bus.send(AppEvent::LoopError(format!(
-                                        "Failed to send follow-up: {}", e
-                                    )));
-                                    break;
-                                }
-                            }
-                            None => {
-                                slog(&session_log, |l| l.info("Follow-up channel closed, exiting"));
-                                break;
-                            }
+                        if let Err(e) = agent.send_message(&thread, &followup).await {
+                            bus.send(AppEvent::LoopError(format!(
+                                "Failed to send follow-up: {}",
+                                e
+                            )));
+                            break;
                         }
                     }
-                    AgentEvent::Terminated { reason, exit_code } => {
-                        stats.turns = turn;
-                        stats.rounds = round;
+                    None => {
                         slog(&session_log, |l| {
-                            l.info(&format!(
-                                "External agent terminated: {} (exit code: {:?})",
-                                reason, exit_code
-                            ));
-                        });
-                        bus.send(AppEvent::TaskComplete {
-                            reason: reason.clone(),
-                            summary: stats.last_response.clone(),
+                            l.info("Follow-up channel closed, exiting")
                         });
                         break;
                     }
                 }
             }
+            DrainOutcome::Terminated { reason, exit_code } => {
+                stats.rounds = round;
+                slog(&session_log, |l| {
+                    l.info(&format!(
+                        "External agent terminated: {} (exit code: {:?})",
+                        reason, exit_code
+                    ));
+                });
+                bus.send(AppEvent::TaskComplete {
+                    reason: reason.clone(),
+                    summary: stats.last_response.clone(),
+                });
+                break;
+            }
+            DrainOutcome::ChannelClosed => {
+                slog(&session_log, |l| {
+                    l.info("External agent event channel closed")
+                });
+                break;
+            }
         }
     }
 
     if let Err(e) = agent.shutdown().await {
-        slog(&session_log, |l| l.warn(&format!("Agent shutdown error: {}", e)));
+        slog(&session_log, |l| {
+            l.warn(&format!("Agent shutdown error: {}", e))
+        });
     }
 
     Ok(stats)
@@ -6154,10 +6495,10 @@ async fn main() -> Result<(), CallerError> {
                 let session_log_summary = session_log.clone();
                 let mcp_state_cleanup = mcp_state.clone();
                 // Resolve external agent backend: MCP shared state > config default
-                let agent_backend = mcp_state.read().await.external_agent.clone().or_else(|| {
-                    project.config.agent.default_backend.as_ref()
-                        .and_then(|s| external_agent::AgentBackend::from_str_loose(s))
-                });
+                let agent_backend = resolve_agent_backend_from_config(
+                    mcp_state.read().await.external_agent.clone(),
+                    &project,
+                );
 
                 tokio::spawn(async move {
                     let result = if let Some(backend) = agent_backend {
@@ -6543,10 +6884,8 @@ async fn main() -> Result<(), CallerError> {
         };
         let force_direct = flags.direct;
         // Resolve external agent backend: CLI flag > config default > None
-        let agent_backend = flags.agent_backend.clone().or_else(|| {
-            project.config.agent.default_backend.as_ref()
-                .and_then(|s| external_agent::AgentBackend::from_str_loose(s))
-        });
+        let agent_backend =
+            resolve_agent_backend_from_config(flags.agent_backend.clone(), &project);
         // Shared state for dynamic external agent selection from the web UI.
         // Seeded with the resolved CLI/config value; updated by SetExternalAgent ControlMsg.
         let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
@@ -6784,135 +7123,16 @@ async fn main() -> Result<(), CallerError> {
             // Daemon mode: keep web gateway alive after TUI quits.
             // Fall through to a headless daemon loop (TUI is not re-created).
             eprintln!("TUI exited. Web gateway still running on port {}. Waiting for new tasks...", web_port);
-            let mut event_rx = bus.subscribe();
-            loop {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        eprintln!("Shutting down.");
-                        break;
-                    }
-                    event = event_rx.recv() => {
-                        match event {
-                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, direct, reference_frame_ids, display_target })) => {
-                                eprintln!("New session{}: {}", if direct.unwrap_or(false) { " (direct)" } else { "" }, &new_task[..new_task.len().min(80)]);
-                                // Create fresh session resources
-                                let new_log_dir = session_log::SessionLog::resolve_path(None);
-                                let new_session_log = match session_log::SessionLog::open(new_log_dir.clone()) {
-                                    Ok(l) => Arc::new(Mutex::new(l)),
-                                    Err(e) => { bus.send(AppEvent::LoopError(format!("Session create failed: {}", e))); continue; }
-                                };
-                                let new_project = match Project::from_root(project_root.clone()) {
-                                    Ok(p) => p,
-                                    Err(e) => { bus.send(AppEvent::LoopError(format!("Project load failed: {}", e))); continue; }
-                                };
-
-                                // CU path: when reference_frame_ids are present, run ephemeral CU task
-                                if !reference_frame_ids.is_empty() {
-                                    let reference_images = resolve_frame_ids(&reference_frame_ids, &frame_registry_for_events).await;
-                                    if !reference_images.is_empty() {
-                                        let cu_provider = match provider::select_cu_provider(&new_project.config.computer_use) {
-                                            Ok(p) => p,
-                                            Err(e) => { bus.send(AppEvent::LoopError(format!("CU provider failed: {}", e))); continue; }
-                                        };
-                                        bus.send(AppEvent::PresenceLog {
-                                            message: format!("Starting CU task: {}", new_task),
-                                            level: None, turn: None,
-                                        });
-                                        let bus_cu = bus.clone();
-                                        let session_log_cu = new_session_log.clone();
-                                        let cu_config = new_project.config.computer_use.clone();
-                                        tokio::spawn(async move {
-                                            let cu_target = display_target.as_deref()
-                                                .map(parse_display_target_str);
-                                            match run_cu_task(
-                                                cu_provider.as_ref(), &new_task, reference_images, vec![],
-                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config, cu_target,
-                                            ).await {
-                                                Ok(CuTaskResult::Completed(stats)) => {
-                                                    bus_cu.send(AppEvent::PresenceLog {
-                                                        message: format!("CU task complete ({} turns)", stats.turns),
-                                                        level: None, turn: None,
-                                                    });
-                                                }
-                                                Ok(CuTaskResult::Escalate { task }) => {
-                                                    bus_cu.send(AppEvent::PresenceLog {
-                                                        message: format!("CU escalated (not a display task): {}", &task[..task.len().min(80)]),
-                                                        level: None, turn: None,
-                                                    });
-                                                }
-                                                Err(e) => {
-                                                    bus_cu.send(AppEvent::PresenceLog {
-                                                        message: format!("CU task error: {}", e),
-                                                        level: Some(types::LogLevel::Error), turn: None,
-                                                    });
-                                                }
-                                            }
-                                        });
-                                        continue;
-                                    }
-                                }
-
-                                let new_session_id = new_log_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
-                                bus.send(AppEvent::SessionStarted { session_id: new_session_id.clone(), task: Some(new_task.clone()) });
-                                let bus_spawn = bus.clone();
-                                let autonomy_spawn = autonomy.clone();
-                                let session_log_spawn = new_session_log.clone();
-                                let use_direct = direct.unwrap_or(false) || orchestrate.map(|o| !o).unwrap_or_else(|| flags.direct || is_simple_task(&new_task));
-                                // Read shared state (web UI may have changed it)
-                                let restart_agent_backend = shared_external_agent.read().await.clone().or_else(|| {
-                                    new_project.config.agent.default_backend.as_ref()
-                                        .and_then(|s| external_agent::AgentBackend::from_str_loose(s))
-                                });
-                                tokio::spawn(async move {
-                                    let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
-                                    let result = if let Some(backend) = restart_agent_backend {
-                                        run_external_agent_mode(
-                                            backend, new_task.clone(), new_project,
-                                            bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
-                                            new_log_dir, follow_up_rx, None,
-                                            event::ApprovalRegistry::default(), true, web_port_for_agent,
-                                        ).await
-                                    } else {
-                                        let new_provider = match provider::select_provider() {
-                                            Ok(p) => p,
-                                            Err(e) => { return bus_spawn.send(AppEvent::LoopError(format!("Provider failed: {}", e))); }
-                                        };
-                                        if use_direct {
-                                            run_direct_mode(
-                                                new_provider, new_task.clone(), new_project,
-                                                bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
-                                                new_log_dir, None, follow_up_rx, None,
-                                                event::ApprovalRegistry::default(), event::ContextInjectionQueue::default(), true,
-                                            ).await
-                                        } else {
-                                            run_user_mode(
-                                                new_provider, new_task.clone(), new_project,
-                                                bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
-                                            ).await
-                                        }
-                                    };
-                                    let reason = match &result {
-                                        Ok(stats) => { slog(&session_log_spawn, |l| l.write_summary_with_rounds(&new_task, "completed", stats.turns, Some(stats.rounds))); "completed".to_string() }
-                                        Err(e) => { slog(&session_log_spawn, |l| l.write_summary(&new_task, &format!("error: {}", e), 0)); format!("error: {}", e) }
-                                    };
-                                    bus_spawn.send(AppEvent::SessionEnded { session_id: new_session_id, reason });
-                                });
-                            }
-                            Ok(AppEvent::ControlCommand(event::ControlMsg::SetExternalAgent { agent })) => {
-                                let parsed = agent.as_deref()
-                                    .filter(|s| !s.is_empty())
-                                    .and_then(external_agent::AgentBackend::from_str_loose);
-                                let label = parsed.as_ref().map(|b| b.to_string()).unwrap_or_else(|| "none".to_string());
-                                *shared_external_agent.write().await = parsed;
-                                eprintln!("External agent set to {} (takes effect on next task)", label);
-                            }
-                            Ok(_) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                }
-            }
+            run_daemon_loop(DaemonConfig {
+                bus: bus.clone(),
+                project_root: project_root.clone(),
+                autonomy: autonomy.clone(),
+                shared_external_agent: shared_external_agent.clone(),
+                frame_registry: frame_registry_for_events.clone(),
+                web_port: web_port_for_agent,
+                flags_direct: flags.direct,
+                shared_session: None,
+            }).await;
         }
 
         control::cleanup();
@@ -7127,10 +7347,8 @@ async fn main() -> Result<(), CallerError> {
         let autonomy_for_daemon = autonomy.clone();
 
         // Resolve external agent backend: CLI flag > config default > None
-        let agent_backend = flags.agent_backend.clone().or_else(|| {
-            project.config.agent.default_backend.as_ref()
-                .and_then(|s| external_agent::AgentBackend::from_str_loose(s))
-        });
+        let agent_backend =
+            resolve_agent_backend_from_config(flags.agent_backend.clone(), &project);
         // Shared state for dynamic external agent selection from the web UI (headless mode).
         let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
             Arc::new(tokio::sync::RwLock::new(agent_backend.clone()));
@@ -7218,185 +7436,16 @@ async fn main() -> Result<(), CallerError> {
             }
             eprintln!("Session ended ({}). Web gateway running on port {}. Waiting for new tasks...", reason, web_port);
 
-            // Daemon loop: wait for StartTask from web UI or Ctrl+C
-            let mut event_rx = bus.subscribe();
-            loop {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        eprintln!("Shutting down.");
-                        break;
-                    }
-                    event = event_rx.recv() => {
-                        match event {
-                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, direct, reference_frame_ids, display_target })) => {
-                                eprintln!("New session{}: {}", if direct.unwrap_or(false) { " (direct)" } else { "" }, &new_task[..new_task.len().min(80)]);
-
-                                // Create fresh session resources
-                                let new_log_dir = session_log::SessionLog::resolve_path(None);
-                                let new_session_log = match session_log::SessionLog::open(new_log_dir.clone()) {
-                                    Ok(l) => Arc::new(Mutex::new(l)),
-                                    Err(e) => {
-                                        bus.send(AppEvent::LoopError(format!("Failed to create session: {}", e)));
-                                        continue;
-                                    }
-                                };
-                                let new_project = match Project::from_root(project_root.clone()) {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        bus.send(AppEvent::LoopError(format!("Failed to load project: {}", e)));
-                                        continue;
-                                    }
-                                };
-
-                                // CU path: when reference_frame_ids are present, run ephemeral CU task
-                                if !reference_frame_ids.is_empty() {
-                                    let reference_images = resolve_frame_ids(&reference_frame_ids, &frame_registry).await;
-                                    if !reference_images.is_empty() {
-                                        let cu_provider = match provider::select_cu_provider(&new_project.config.computer_use) {
-                                            Ok(p) => p,
-                                            Err(e) => { bus.send(AppEvent::LoopError(format!("CU provider failed: {}", e))); continue; }
-                                        };
-                                        bus.send(AppEvent::PresenceLog {
-                                            message: format!("Starting CU task: {}", new_task),
-                                            level: None, turn: None,
-                                        });
-                                        let bus_cu = bus.clone();
-                                        let session_log_cu = new_session_log.clone();
-                                        let cu_config = new_project.config.computer_use.clone();
-                                        tokio::spawn(async move {
-                                            let cu_target = display_target.as_deref()
-                                                .map(parse_display_target_str);
-                                            match run_cu_task(
-                                                cu_provider.as_ref(), &new_task, reference_images, vec![],
-                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config, cu_target,
-                                            ).await {
-                                                Ok(CuTaskResult::Completed(stats)) => {
-                                                    bus_cu.send(AppEvent::PresenceLog {
-                                                        message: format!("CU task complete ({} turns)", stats.turns),
-                                                        level: None, turn: None,
-                                                    });
-                                                }
-                                                Ok(CuTaskResult::Escalate { task }) => {
-                                                    bus_cu.send(AppEvent::PresenceLog {
-                                                        message: format!("CU escalated (not a display task): {}", &task[..task.len().min(80)]),
-                                                        level: None, turn: None,
-                                                    });
-                                                }
-                                                Err(e) => {
-                                                    bus_cu.send(AppEvent::PresenceLog {
-                                                        message: format!("CU task error: {}", e),
-                                                        level: Some(types::LogLevel::Error), turn: None,
-                                                    });
-                                                }
-                                            }
-                                        });
-                                        continue;
-                                    }
-                                }
-
-                                // Update shared session state
-                                if let Some(ref shared_session) = headless_shared_session {
-                                    let mut ss = shared_session.write().await;
-                                    ss.session_log = Some(new_session_log.clone());
-                                }
-
-                                let new_session_id = new_log_dir
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("unknown")
-                                    .to_string();
-
-                                bus.send(AppEvent::SessionStarted {
-                                    session_id: new_session_id.clone(),
-                                    task: Some(new_task.clone()),
-                                });
-
-                                // Spawn new agent loop
-                                let bus_spawn = bus.clone();
-                                let autonomy_spawn = autonomy_for_daemon.clone();
-                                let session_log_spawn = new_session_log.clone();
-                                let shared_cleanup = headless_shared_session.clone();
-                                let use_direct = direct.unwrap_or(false) || orchestrate.map(|o| !o).unwrap_or_else(|| flags.direct || is_simple_task(&new_task));
-                                // Read shared state (web UI may have changed it)
-                                let restart_agent_backend = shared_external_agent.read().await.clone().or_else(|| {
-                                    new_project.config.agent.default_backend.as_ref()
-                                        .and_then(|s| external_agent::AgentBackend::from_str_loose(s))
-                                });
-
-                                tokio::spawn(async move {
-                                    let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
-                                    let result = if let Some(backend) = restart_agent_backend {
-                                        run_external_agent_mode(
-                                            backend, new_task.clone(), new_project,
-                                            bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
-                                            new_log_dir, follow_up_rx, None,
-                                            event::ApprovalRegistry::default(), true, web_port_for_agent,
-                                        ).await
-                                    } else {
-                                        let new_provider = match provider::select_provider() {
-                                            Ok(p) => p,
-                                            Err(e) => { return bus_spawn.send(AppEvent::LoopError(format!("Failed to create provider: {}", e))); }
-                                        };
-                                        if use_direct {
-                                            run_direct_mode(
-                                                new_provider, new_task.clone(), new_project,
-                                                bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
-                                                new_log_dir, None, follow_up_rx, None,
-                                                event::ApprovalRegistry::default(),
-                                                event::ContextInjectionQueue::default(),
-                                                true,
-                                            ).await
-                                        } else {
-                                            run_user_mode(
-                                                new_provider, new_task.clone(), new_project,
-                                                bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
-                                            ).await
-                                        }
-                                    };
-
-                                    let reason = match &result {
-                                        Ok(stats) => {
-                                            slog(&session_log_spawn, |l| {
-                                                l.write_summary_with_rounds(&new_task, "completed", stats.turns, Some(stats.rounds))
-                                            });
-                                            "completed".to_string()
-                                        }
-                                        Err(e) => {
-                                            slog(&session_log_spawn, |l| {
-                                                l.write_summary(&new_task, &format!("error: {}", e), 0)
-                                            });
-                                            format!("error: {}", e)
-                                        }
-                                    };
-
-                                    bus_spawn.send(AppEvent::SessionEnded {
-                                        session_id: new_session_id,
-                                        reason,
-                                    });
-
-                                    // Clear session state
-                                    if let Some(ref ss) = shared_cleanup {
-                                        let mut state = ss.write().await;
-                                        state.session_log = None;
-                                        state.query_ctx = None;
-                                    }
-                                });
-                            }
-                            Ok(AppEvent::ControlCommand(event::ControlMsg::SetExternalAgent { agent })) => {
-                                let parsed = agent.as_deref()
-                                    .filter(|s| !s.is_empty())
-                                    .and_then(external_agent::AgentBackend::from_str_loose);
-                                let label = parsed.as_ref().map(|b| b.to_string()).unwrap_or_else(|| "none".to_string());
-                                *shared_external_agent.write().await = parsed;
-                                eprintln!("External agent set to {} (takes effect on next task)", label);
-                            }
-                            Ok(_) => {} // Ignore other events
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                }
-            }
+            run_daemon_loop(DaemonConfig {
+                bus: bus.clone(),
+                project_root: project_root.clone(),
+                autonomy: autonomy_for_daemon.clone(),
+                shared_external_agent: shared_external_agent.clone(),
+                frame_registry: frame_registry.clone(),
+                web_port: web_port_for_agent,
+                flags_direct: flags.direct,
+                shared_session: headless_shared_session.clone(),
+            }).await;
         } else {
             result?;
         }
