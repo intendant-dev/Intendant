@@ -43,6 +43,19 @@ struct JsonRpcResponse {
     result: serde_json::Value,
 }
 
+#[derive(Serialize)]
+struct JsonRpcErrorResponse {
+    jsonrpc: String,
+    id: u64,
+    error: JsonRpcErrorObj,
+}
+
+#[derive(Serialize)]
+struct JsonRpcErrorObj {
+    code: i64,
+    message: String,
+}
+
 #[derive(Deserialize)]
 struct JsonRpcMessage {
     id: Option<u64>,
@@ -67,6 +80,8 @@ type RequestResult = Result<serde_json::Value, String>;
 type PendingRequests = Arc<Mutex<HashMap<u64, oneshot::Sender<RequestResult>>>>;
 /// Maps our synthetic approval request_id → (jsonrpc_id, vec of option_ids)
 type PendingApprovals = Arc<Mutex<HashMap<String, (u64, Vec<String>)>>>;
+/// Shared writer handle so both GeminiAgent and the reader task can write to stdin.
+type SharedWriter = Arc<Mutex<BufWriter<ChildStdin>>>;
 
 // ---------------------------------------------------------------------------
 // GeminiAgent
@@ -79,7 +94,7 @@ pub struct GeminiAgent {
     prompt_sent: bool,
     config_working_dir: Option<std::path::PathBuf>,
     child: Option<Child>,
-    writer: Option<BufWriter<ChildStdin>>,
+    writer: Option<SharedWriter>,
     event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
     next_id: AtomicU64,
     pending_requests: PendingRequests,
@@ -124,13 +139,15 @@ impl GeminiAgent {
         };
         let line = serde_json::to_string(&request)?;
 
-        let writer = self
+        let shared = self
             .writer
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?;
+        let mut writer = shared.lock().await;
         writer.write_all(line.as_bytes()).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
+        drop(writer);
 
         let result = rx
             .await
@@ -150,10 +167,11 @@ impl GeminiAgent {
             result,
         };
         let line = serde_json::to_string(&response)?;
-        let writer = self
+        let shared = self
             .writer
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?;
+        let mut writer = shared.lock().await;
         writer.write_all(line.as_bytes()).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
@@ -165,8 +183,39 @@ impl GeminiAgent {
 // Reader task: parse stdout JSONL, dispatch to events
 // ---------------------------------------------------------------------------
 
+/// Write a JSON-RPC error response to the shared writer.
+async fn send_error_to_writer(writer: &SharedWriter, id: u64, code: i64, message: String) {
+    let resp = JsonRpcErrorResponse {
+        jsonrpc: "2.0".to_string(),
+        id,
+        error: JsonRpcErrorObj { code, message },
+    };
+    if let Ok(line) = serde_json::to_string(&resp) {
+        let mut w = writer.lock().await;
+        let _ = w.write_all(line.as_bytes()).await;
+        let _ = w.write_all(b"\n").await;
+        let _ = w.flush().await;
+    }
+}
+
+/// Write a JSON-RPC success response to the shared writer.
+async fn send_response_to_writer(writer: &SharedWriter, id: u64, result: serde_json::Value) {
+    let resp = JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id,
+        result,
+    };
+    if let Ok(line) = serde_json::to_string(&resp) {
+        let mut w = writer.lock().await;
+        let _ = w.write_all(line.as_bytes()).await;
+        let _ = w.write_all(b"\n").await;
+        let _ = w.flush().await;
+    }
+}
+
 async fn reader_task(
     stdout: tokio::process::ChildStdout,
+    writer: SharedWriter,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_requests: PendingRequests,
     pending_approvals: PendingApprovals,
@@ -196,12 +245,8 @@ async fn reader_task(
 
         let msg: JsonRpcMessage = match serde_json::from_str(&line) {
             Ok(m) => m,
-            Err(_) => {
-                eprintln!("[gemini-acp] non-JSON: {}", &line[..line.len().min(200)]);
-                continue;
-            }
+            Err(_) => continue, // skip non-JSON lines
         };
-        eprintln!("[gemini-acp] method={:?} id={:?}", msg.method, msg.id);
 
         // 1. Response to our request (has id + result/error, no method)
         if msg.method.is_none() {
@@ -221,48 +266,69 @@ async fn reader_task(
         let method = msg.method.as_deref().unwrap_or("");
         let params = msg.params.unwrap_or(serde_json::Value::Null);
 
-        // 2. Server-initiated request (has method + id) — permission requests
+        // 2. Server-initiated request (has method + id) — requires a response
         if let Some(jsonrpc_id) = msg.id {
             if method == "session/request_permission" {
-                match serde_json::from_value::<RequestPermissionRequest_>(params.clone()) {
-                Ok(req) => {
-                    let request_id =
-                        format!("acp-approval-{}", approval_counter.fetch_add(1, Ordering::Relaxed));
-                    let option_ids: Vec<String> = req
-                        .options
-                        .iter()
-                        .map(|o| o.option_id.clone())
-                        .collect();
-                    pending_approvals
-                        .lock()
-                        .await
-                        .insert(request_id.clone(), (jsonrpc_id, option_ids));
+                match serde_json::from_value::<RequestPermissionRequest_>(params) {
+                    Ok(req) => {
+                        let request_id = format!(
+                            "acp-approval-{}",
+                            approval_counter.fetch_add(1, Ordering::Relaxed)
+                        );
+                        let option_ids: Vec<String> =
+                            req.options.iter().map(|o| o.option_id.clone()).collect();
+                        pending_approvals
+                            .lock()
+                            .await
+                            .insert(request_id.clone(), (jsonrpc_id, option_ids));
 
-                    // Extract command preview from tool_call
-                    let command = req.tool_call_title.unwrap_or_else(|| "unknown action".into());
-                    let category = if req.tool_call_kind.as_deref() == Some("edit")
-                        || req.tool_call_kind.as_deref() == Some("delete")
-                    {
-                        ApprovalCategory::FileChange
-                    } else {
-                        ApprovalCategory::CommandExecution
-                    };
+                        // Extract command preview from the nested tool_call object
+                        let command = req
+                            .tool_call
+                            .get("title")
+                            .or_else(|| req.tool_call.pointer("/fields/title"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown action")
+                            .to_string();
 
-                    let _ = event_tx.send(AgentEvent::ApprovalRequest {
-                        request_id,
-                        command,
-                        category,
-                    });
+                        let kind_str = req
+                            .tool_call
+                            .get("kind")
+                            .or_else(|| req.tool_call.pointer("/fields/kind"))
+                            .and_then(|v| v.as_str());
+                        let category = if kind_str == Some("edit") || kind_str == Some("delete") {
+                            ApprovalCategory::FileChange
+                        } else {
+                            ApprovalCategory::CommandExecution
+                        };
+
+                        let _ = event_tx.send(AgentEvent::ApprovalRequest {
+                            request_id,
+                            command,
+                            category,
+                        });
+                    }
+                    Err(_) => {
+                        // Parse failed — send a cancelled response so Gemini doesn't hang.
+                        let cancelled = serde_json::to_value(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Cancelled,
+                        ))
+                        .unwrap_or_default();
+                        send_response_to_writer(&writer, jsonrpc_id, cancelled).await;
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[gemini-acp] failed to parse permission request: {}", e);
-                    eprintln!("[gemini-acp] params: {}", serde_json::to_string(&params).unwrap_or_default());
-                }
-                }
+            } else {
+                // Unhandled server-initiated request (fs/read_text_file,
+                // terminal/create, etc.). We don't provide these services,
+                // so return a JSON-RPC "method not found" error to unblock Gemini.
+                send_error_to_writer(
+                    &writer,
+                    jsonrpc_id,
+                    -32601,
+                    format!("Method not supported: {}", method),
+                )
+                .await;
             }
-            // Other server-initiated requests — respond with "not supported" so Gemini
-            // doesn't hang waiting for a response.
-            eprintln!("[gemini-acp] unhandled request: {} (id={})", method, jsonrpc_id);
             continue;
         }
 
@@ -277,8 +343,9 @@ async fn reader_task(
 }
 
 /// Lightweight serde struct for permission request params.
-/// We use this instead of the schema crate's type to avoid needing the full
-/// ToolCallUpdate deserialization (which requires all fields).
+/// We only need `sessionId`, `toolCall` (as raw JSON for field extraction),
+/// and `options`. The tool call title/kind are extracted from the nested
+/// `toolCall` object in the reader task.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RequestPermissionRequest_ {
@@ -288,11 +355,6 @@ struct RequestPermissionRequest_ {
     tool_call: serde_json::Value,
     #[serde(default)]
     options: Vec<PermissionOption_>,
-    // Extracted from tool_call for convenience
-    #[serde(default)]
-    tool_call_title: Option<String>,
-    #[serde(default)]
-    tool_call_kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -463,16 +525,18 @@ impl ExternalAgent for GeminiAgent {
             .ok_or_else(|| CallerError::ExternalAgent("Failed to capture child stdout".into()))?;
 
         self.child = Some(child);
-        self.writer = Some(BufWriter::new(stdin));
+        let shared_writer: SharedWriter = Arc::new(Mutex::new(BufWriter::new(stdin)));
+        self.writer = Some(Arc::clone(&shared_writer));
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         self.event_tx = Some(event_tx.clone());
 
-        // Spawn reader task
+        // Spawn reader task (gets its own Arc to the shared writer for error responses)
         let pending_requests = Arc::clone(&self.pending_requests);
         let pending_approvals = Arc::clone(&self.pending_approvals);
         let handle = tokio::spawn(reader_task(
             stdout,
+            shared_writer,
             event_tx,
             pending_requests,
             pending_approvals,
@@ -481,7 +545,7 @@ impl ExternalAgent for GeminiAgent {
 
         // ACP initialize handshake with 10s timeout
         let init_params = serde_json::json!({
-            "protocolVersion": 1,
+            "protocolVersion": "1",
             "clientInfo": {
                 "name": "intendant",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -514,30 +578,19 @@ impl ExternalAgent for GeminiAgent {
     }
 
     async fn start_thread(&mut self) -> Result<AgentThread, CallerError> {
-        let cwd = std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-
-        // Build MCP server list — include Intendant's HTTP MCP if web port is set
-        let mcp_servers: Vec<serde_json::Value> = if let Some(port) = self.web_port {
-            vec![serde_json::json!({
-                "type": "http",
-                "name": "intendant",
-                "url": format!("http://127.0.0.1:{}/mcp", port),
-                "headers": [],
-            })]
-        } else {
-            vec![]
-        };
-
-        let params = serde_json::json!({
-            "cwd": cwd,
-            "mcpServers": mcp_servers,
-        });
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "cwd".into(),
+            serde_json::Value::String(
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        );
 
         let result = self
-            .send_request("session/new", Some(params))
+            .send_request("session/new", Some(serde_json::Value::Object(params)))
             .await?;
 
         let session_id = result
@@ -808,5 +861,86 @@ mod tests {
             RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["outcome"]["outcome"], "cancelled");
+    }
+
+    #[test]
+    fn error_response_serialization() {
+        let resp = JsonRpcErrorResponse {
+            jsonrpc: "2.0".to_string(),
+            id: 42,
+            error: JsonRpcErrorObj {
+                code: -32601,
+                message: "Method not supported: fs/read_text_file".into(),
+            },
+        };
+        let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["jsonrpc"], "2.0");
+        assert_eq!(json["id"], 42);
+        assert_eq!(json["error"]["code"], -32601);
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("fs/read_text_file"));
+    }
+
+    #[test]
+    fn parse_permission_request_extracts_title_from_tool_call() {
+        // Simulates the ACP permission request with tool_call containing a nested title
+        let params = serde_json::json!({
+            "sessionId": "sess-1",
+            "toolCall": {
+                "toolCallId": "tc-1",
+                "title": "Run command: ls -la",
+                "kind": "execute",
+                "status": "pending"
+            },
+            "options": [
+                {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+                {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"}
+            ]
+        });
+
+        let req: RequestPermissionRequest_ = serde_json::from_value(params).unwrap();
+
+        // Title should be extractable from the nested tool_call
+        let title = req
+            .tool_call
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown action");
+        assert_eq!(title, "Run command: ls -la");
+
+        let kind = req
+            .tool_call
+            .get("kind")
+            .and_then(|v| v.as_str());
+        assert_eq!(kind, Some("execute"));
+
+        assert_eq!(req.options.len(), 2);
+        assert_eq!(req.options[0].option_id, "allow_once");
+        assert_eq!(req.options[1].option_id, "reject_once");
+    }
+
+    #[test]
+    fn parse_permission_request_missing_title_fallback() {
+        // When tool_call has no title, we should get the fallback
+        let params = serde_json::json!({
+            "sessionId": "sess-1",
+            "toolCall": {
+                "toolCallId": "tc-1",
+                "status": "pending"
+            },
+            "options": []
+        });
+
+        let req: RequestPermissionRequest_ = serde_json::from_value(params).unwrap();
+
+        let title = req
+            .tool_call
+            .get("title")
+            .or_else(|| req.tool_call.pointer("/fields/title"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown action");
+        assert_eq!(title, "unknown action");
     }
 }
