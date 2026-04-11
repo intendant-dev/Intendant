@@ -196,8 +196,12 @@ async fn reader_task(
 
         let msg: JsonRpcMessage = match serde_json::from_str(&line) {
             Ok(m) => m,
-            Err(_) => continue, // skip non-JSON lines
+            Err(_) => {
+                eprintln!("[gemini-acp] non-JSON: {}", &line[..line.len().min(200)]);
+                continue;
+            }
         };
+        eprintln!("[gemini-acp] method={:?} id={:?}", msg.method, msg.id);
 
         // 1. Response to our request (has id + result/error, no method)
         if msg.method.is_none() {
@@ -220,7 +224,8 @@ async fn reader_task(
         // 2. Server-initiated request (has method + id) — permission requests
         if let Some(jsonrpc_id) = msg.id {
             if method == "session/request_permission" {
-                if let Ok(req) = serde_json::from_value::<RequestPermissionRequest_>(params) {
+                match serde_json::from_value::<RequestPermissionRequest_>(params.clone()) {
+                Ok(req) => {
                     let request_id =
                         format!("acp-approval-{}", approval_counter.fetch_add(1, Ordering::Relaxed));
                     let option_ids: Vec<String> = req
@@ -249,9 +254,15 @@ async fn reader_task(
                         category,
                     });
                 }
+                Err(e) => {
+                    eprintln!("[gemini-acp] failed to parse permission request: {}", e);
+                    eprintln!("[gemini-acp] params: {}", serde_json::to_string(&params).unwrap_or_default());
+                }
+                }
             }
-            // Other server-initiated requests (fs/read_text_file, terminal/create, etc.)
-            // are not handled — we don't provide filesystem/terminal services to the agent.
+            // Other server-initiated requests — respond with "not supported" so Gemini
+            // doesn't hang waiting for a response.
+            eprintln!("[gemini-acp] unhandled request: {} (id={})", method, jsonrpc_id);
             continue;
         }
 
@@ -503,19 +514,30 @@ impl ExternalAgent for GeminiAgent {
     }
 
     async fn start_thread(&mut self) -> Result<AgentThread, CallerError> {
-        let mut params = serde_json::Map::new();
-        params.insert(
-            "cwd".into(),
-            serde_json::Value::String(
-                std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-            ),
-        );
+        let cwd = std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        // Build MCP server list — include Intendant's HTTP MCP if web port is set
+        let mcp_servers: Vec<serde_json::Value> = if let Some(port) = self.web_port {
+            vec![serde_json::json!({
+                "type": "http",
+                "name": "intendant",
+                "url": format!("http://127.0.0.1:{}/mcp", port),
+                "headers": [],
+            })]
+        } else {
+            vec![]
+        };
+
+        let params = serde_json::json!({
+            "cwd": cwd,
+            "mcpServers": mcp_servers,
+        });
 
         let result = self
-            .send_request("session/new", Some(serde_json::Value::Object(params)))
+            .send_request("session/new", Some(params))
             .await?;
 
         let session_id = result
