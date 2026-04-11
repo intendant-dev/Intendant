@@ -37,6 +37,8 @@ $script:SshHost = ""
 $script:SshPort = 22
 $script:Port = 8443
 $script:CertPort = 9999
+$script:IsVBoxNat = $false
+$script:VmName = ""
 $script:ConfigPath = Join-Path $env:USERPROFILE ".intendant-lan.json"
 
 function Info($msg)  { Write-Host ":: $msg" -ForegroundColor Cyan }
@@ -76,6 +78,8 @@ function Save-Config {
         SshHost   = $script:SshHost
         SshPort   = $script:SshPort
         Port      = $script:Port
+        IsVBoxNat = $script:IsVBoxNat
+        VmName    = $script:VmName
     } | ConvertTo-Json | Set-Content $script:ConfigPath
 }
 
@@ -88,6 +92,8 @@ function Load-Config {
         $script:SshHost   = if ($cfg.SshHost) { $cfg.SshHost } else { $cfg.VmAddress }
         $script:SshPort   = if ($cfg.SshPort) { $cfg.SshPort } else { 22 }
         $script:Port      = $cfg.Port
+        $script:IsVBoxNat = if ($cfg.IsVBoxNat) { $cfg.IsVBoxNat } else { $false }
+        $script:VmName    = if ($cfg.VmName) { $cfg.VmName } else { "" }
         return $true
     }
     return $false
@@ -118,16 +124,48 @@ function Resolve-GuestIp {
     }
 }
 
+# -- VirtualBox helpers --
+
+function Find-VBoxManage {
+    $candidates = @(
+        "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
+    )
+    $fromPath = Get-Command VBoxManage -ErrorAction SilentlyContinue
+    if ($fromPath) { $candidates += $fromPath.Source }
+    foreach ($p in $candidates) {
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
 # -- Port forwarding & firewall --
 
 function Add-PortForwarding {
-    $ports = @($script:Port, $script:CertPort)
-    foreach ($p in $ports) {
-        netsh interface portproxy delete v4tov4 listenport=$p listenaddress=0.0.0.0 2>$null | Out-Null
-        Info "forwarding 0.0.0.0:$p -> $($script:GuestIp):$p"
-        netsh interface portproxy add v4tov4 `
-            listenport=$p listenaddress=0.0.0.0 `
-            connectport=$p connectaddress=$script:GuestIp | Out-Null
+    if ($script:IsVBoxNat) {
+        # VirtualBox NAT: configure rules directly via VBoxManage.
+        # Bind to all interfaces (empty host IP) so phones on the LAN
+        # can reach the guest without netsh portproxy (which would loop).
+        $vbm = Find-VBoxManage
+        if (-not $vbm) { Die "VBoxManage not found -- is VirtualBox installed?" }
+        $rules = @(
+            @{ Name = "HTTPS"; HP = $script:Port;     GP = $script:Port }
+            @{ Name = "Cert";  HP = $script:CertPort; GP = $script:CertPort }
+        )
+        foreach ($r in $rules) {
+            & $vbm controlvm $script:VmName natpf1 delete $r.Name 2>$null | Out-Null
+            Info "VBox NAT: 0.0.0.0:$($r.HP) -> guest:$($r.GP)"
+            & $vbm controlvm $script:VmName natpf1 "$($r.Name),tcp,,$($r.HP),,$($r.GP)"
+        }
+    } else {
+        # WSL/Hyper-V/Bridged: use netsh portproxy
+        $ports = @($script:Port, $script:CertPort)
+        foreach ($p in $ports) {
+            netsh interface portproxy delete v4tov4 listenport=$p listenaddress=0.0.0.0 2>$null | Out-Null
+            Info "forwarding 0.0.0.0:$p -> $($script:GuestIp):$p"
+            netsh interface portproxy add v4tov4 `
+                listenport=$p listenaddress=0.0.0.0 `
+                connectport=$p connectaddress=$script:GuestIp | Out-Null
+        }
     }
 }
 
@@ -145,10 +183,22 @@ function Add-FirewallRule {
 }
 
 function Remove-PortForwarding {
-    foreach ($p in @($script:Port, $script:CertPort)) {
-        netsh interface portproxy delete v4tov4 listenport=$p listenaddress=0.0.0.0 2>$null | Out-Null
+    if ($script:IsVBoxNat) {
+        $vbm = Find-VBoxManage
+        if ($vbm -and $script:VmName) {
+            foreach ($name in @("HTTPS", "Cert")) {
+                & $vbm controlvm $script:VmName natpf1 delete $name 2>$null | Out-Null
+            }
+            Info "VBox NAT forwarding rules removed"
+        } else {
+            Warn "could not find VBoxManage or VM name -- remove VBox NAT rules manually"
+        }
+    } else {
+        foreach ($p in @($script:Port, $script:CertPort)) {
+            netsh interface portproxy delete v4tov4 listenport=$p listenaddress=0.0.0.0 2>$null | Out-Null
+        }
+        Info "port forwarding rules removed"
     }
-    Info "port forwarding rules removed"
 }
 
 function Remove-FirewallRule {
@@ -281,29 +331,45 @@ function Run-Wizard {
         }
 
         if ($isVirtualBoxNat) {
-            Write-Host ""
-            Info "VirtualBox NAT mode: connections go through port forwarding"
-            Write-Host ""
-            Write-Host "  Before continuing, set up port forwarding in VirtualBox:" -ForegroundColor Yellow
-            Write-Host ""
-            Write-Host "    1. Open VirtualBox `> select your VM `> Settings `> Network"
-            Write-Host "    2. Expand 'Advanced' `> click 'Port Forwarding'"
-            Write-Host "    3. Add these rules (click the + icon):"
-            Write-Host ""
-            Write-Host "       Name      Host IP      Host Port   Guest Port" -ForegroundColor Cyan
-            Write-Host "       SSH       127.0.0.1    2222        22"
-            Write-Host "       HTTPS     127.0.0.1    8443        8443"
-            Write-Host "       Cert      127.0.0.1    9999        9999"
-            Write-Host ""
-            Write-Host "    4. Click OK, then OK again to save."
-            Write-Host ""
+            $script:IsVBoxNat = $true
 
-            $ready = Ask "Press Enter when done (or 'q' to quit)" ""
-            if ($ready -eq "q") { exit 0 }
+            # Find VBoxManage
+            $vbm = Find-VBoxManage
+            if (-not $vbm) {
+                Die "could not find VBoxManage.exe -- is VirtualBox installed in the default location?"
+            }
+
+            # Detect running VMs
+            $vmLines = (& $vbm list runningvms 2>$null) -split "`n" | Where-Object { $_ -match '^"(.+)"\s+\{' }
+            $vmNames = @()
+            foreach ($line in $vmLines) {
+                if ($line -match '^"(.+)"\s+\{') { $vmNames += $Matches[1] }
+            }
+
+            if ($vmNames.Count -eq 0) {
+                Die "no running VirtualBox VMs found -- start the VM first"
+            } elseif ($vmNames.Count -eq 1) {
+                $script:VmName = $vmNames[0]
+                Info "detected VM: $($script:VmName)"
+            } else {
+                $vmChoice = Ask-Choice "Which VM is running intendant?" $vmNames
+                $script:VmName = $vmNames[$vmChoice]
+            }
+
+            # Ensure SSH port forwarding exists (localhost only)
+            $vmInfo = & $vbm showvminfo $script:VmName --machinereadable 2>$null
+            $sshRule = $vmInfo | Select-String 'Forwarding.*"SSH'
+            if ($sshRule -and $sshRule -match ',(\d+),,22"') {
+                $script:SshPort = [int]$Matches[1]
+                Info "SSH rule found: 127.0.0.1:$($script:SshPort) -> guest:22"
+            } else {
+                $sshPortInput = Ask "SSH host port (for 127.0.0.1 -> guest:22)" "2222"
+                $script:SshPort = [int]$sshPortInput
+                Info "adding VBox NAT SSH rule..."
+                & $vbm controlvm $script:VmName natpf1 "SSH,tcp,127.0.0.1,$($script:SshPort),,22"
+            }
 
             $script:SshHost = "127.0.0.1"
-            $sshPortInput = Ask "SSH host port from step 3 above" "2222"
-            $script:SshPort = [int]$sshPortInput
             $script:VmAddress = "127.0.0.1"
             $script:GuestIp = "127.0.0.1"
         } else {
@@ -326,7 +392,6 @@ function Run-Wizard {
             Write-Host "    - The VM is running"
             Write-Host "    - SSH server is installed: sudo apt install openssh-server"
             if ($isVirtualBoxNat) {
-                Write-Host "    - VirtualBox port forwarding is configured (see above)"
                 Write-Host "    - You can SSH manually: ssh -p $($script:SshPort) $($script:VmUser)@$($script:SshHost)"
             } else {
                 Write-Host "    - You can SSH manually: ssh $($script:VmUser)@$($script:SshHost)"
@@ -374,7 +439,7 @@ function Run-Wizard {
 
     # Set up port forwarding FIRST -- setup-lan.sh will start a temporary
     # HTTP server for cert download, which needs to be reachable from the phone
-    Info "setting up Windows port forwarding..."
+    Info "setting up port forwarding..."
     Add-PortForwarding
     Add-FirewallRule
 
