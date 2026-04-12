@@ -2839,6 +2839,7 @@ html, body {
             <select id="set-external-agent">
               <option value="">None (internal agent)</option>
               <option value="codex">Codex (OpenAI)</option>
+              <option value="claude-code">Claude Code (Anthropic)</option>
               <option value="gemini">Gemini CLI (Google)</option>
             </select>
           </div>
@@ -4168,7 +4169,7 @@ function updateStatusBar(d) {
     if (sel) {
       const v = (d.external_agent || '').toLowerCase();
       // Map display names (from AgentBackend::Display) to option values
-      const map = { 'codex': 'codex', 'gemini cli': 'gemini', 'claude code': '', 'gemini_cli': 'gemini' };
+      const map = { 'codex': 'codex', 'gemini cli': 'gemini', 'claude code': 'claude-code', 'gemini_cli': 'gemini' };
       sel.value = map[v] !== undefined ? map[v] : '';
     }
   }
