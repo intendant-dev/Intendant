@@ -202,8 +202,10 @@ impl Default for WebGatewayConfig {
 ///   Unix control socket in `control.rs`.
 /// Scan session.jsonl for persisted provider/model/autonomy values.
 ///
-/// The agent loop writes these as plain `info` log entries at startup
-/// (`Provider: X`, `Model: Y`, `Autonomy: Z`).  Replay uses this to seed
+/// The agent loop writes these as plain log entries at startup
+/// (`Provider: X`, `Model: Y`, `Autonomy: Z`).  Today the writer uses
+/// `l.debug(...)`, so event_type is `debug` for newer sessions and
+/// `info` for older ones — scan both.  Replay uses the result to seed
 /// the status bar before any events are rendered, replacing the old
 /// prefix-based parsing inside `handle_log_replay`.
 fn scan_replay_status(
@@ -216,7 +218,8 @@ fn scan_replay_status(
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if v.get("event").and_then(|x| x.as_str()) != Some("info") {
+        let ev = v.get("event").and_then(|x| x.as_str()).unwrap_or("");
+        if !matches!(ev, "info" | "debug" | "warn" | "error") {
             continue;
         }
         let Some(msg) = v.get("message").and_then(|x| x.as_str()) else {
@@ -3578,6 +3581,25 @@ mod tests {
         assert_eq!(p.as_deref(), Some("openai"));
         assert_eq!(m.as_deref(), Some("gpt-5"));
         assert_eq!(a.as_deref(), Some("High"));
+    }
+
+    #[test]
+    fn test_scan_replay_status_reads_debug_level_entries() {
+        // Newer sessions write Provider/Model/Autonomy as `l.debug(...)`
+        // so the event_type is "debug", not "info".  scan_replay_status
+        // must pick those up too.
+        let contents = concat!(
+            r#"{"ts":"10:00:00","event":"debug","level":"debug","message":"Provider: anthropic"}"#,
+            "\n",
+            r#"{"ts":"10:00:01","event":"debug","level":"debug","message":"Model: claude-sonnet-4-6"}"#,
+            "\n",
+            r#"{"ts":"10:00:02","event":"debug","level":"debug","message":"Autonomy: Medium"}"#,
+            "\n",
+        );
+        let (p, m, a) = scan_replay_status(contents);
+        assert_eq!(p.as_deref(), Some("anthropic"));
+        assert_eq!(m.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(a.as_deref(), Some("Medium"));
     }
 
     #[test]
