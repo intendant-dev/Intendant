@@ -1608,25 +1608,30 @@ impl SessionLog {
         completion_tokens: u64,
         total_tokens: u64,
         cached_tokens: u64,
+        source: Option<&str>,
     ) {
         self.summary_builder.total_tokens += total_tokens;
         let file = self.write_turn_file("model.txt", content);
         let preview: String = content.chars().take(200).collect();
+        let mut data = serde_json::json!({
+            "tokens": {
+                "prompt": prompt_tokens,
+                "completion": completion_tokens,
+                "total": total_tokens,
+                "cached": cached_tokens,
+            },
+            "content_length": content.len(),
+        });
+        if let Some(src) = source {
+            data["source"] = serde_json::Value::String(src.to_string());
+        }
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: Some(self.current_turn),
             event: "model_response".to_string(),
             level: Some("info".to_string()),
             message: Some(preview),
-            data: Some(serde_json::json!({
-                "tokens": {
-                    "prompt": prompt_tokens,
-                    "completion": completion_tokens,
-                    "total": total_tokens,
-                    "cached": cached_tokens,
-                },
-                "content_length": content.len(),
-            })),
+            data: Some(data),
             file,
             file2: None,
         });
@@ -1671,7 +1676,7 @@ impl SessionLog {
     }
 
     /// Log agent runtime output. Written to per-turn files.
-    pub fn agent_output(&mut self, stdout: &str, stderr: &str) {
+    pub fn agent_output(&mut self, stdout: &str, stderr: &str, source: Option<&str>) {
         let file = if !stdout.is_empty() {
             self.write_turn_file("stdout.txt", stdout)
         } else {
@@ -1684,6 +1689,13 @@ impl SessionLog {
         };
 
         let preview: String = stdout.chars().take(200).collect();
+        let mut data = serde_json::json!({
+            "stdout_length": stdout.len(),
+            "stderr_length": stderr.len(),
+        });
+        if let Some(src) = source {
+            data["source"] = serde_json::Value::String(src.to_string());
+        }
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: Some(self.current_turn),
@@ -1698,10 +1710,7 @@ impl SessionLog {
             } else {
                 Some(preview)
             },
-            data: Some(serde_json::json!({
-                "stdout_length": stdout.len(),
-                "stderr_length": stderr.len(),
-            })),
+            data: Some(data),
             file,
             file2,
         });
@@ -2150,7 +2159,7 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(1, 0.0, 200_000);
-        log.model_response("Hello, I will help you.\nHere is my plan.", 100, 50, 150, 0);
+        log.model_response("Hello, I will help you.\nHere is my plan.", 100, 50, 150, 0, None);
         drop(log);
 
         let model_file = log_dir.join("turns/turn_001_model.txt");
@@ -2183,7 +2192,7 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(1, 0.0, 200_000);
-        log.agent_output("stdout content", "stderr content");
+        log.agent_output("stdout content", "stderr content", None);
         drop(log);
 
         assert!(log_dir.join("turns/turn_001_stdout.txt").exists());
@@ -2198,7 +2207,7 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(1, 0.0, 200_000);
-        log.agent_output("stdout only", "");
+        log.agent_output("stdout only", "", None);
         drop(log);
 
         assert!(log_dir.join("turns/turn_001_stdout.txt").exists());
@@ -2354,14 +2363,14 @@ mod tests {
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
 
         log.turn_start(1, 0.0, 200_000);
-        log.model_response("Response 1", 100, 50, 150, 0);
+        log.model_response("Response 1", 100, 50, 150, 0, None);
         log.agent_input(r#"{"commands":[{"function":"execAsAgent","nonce":1}]}"#);
-        log.agent_output("out1", "");
+        log.agent_output("out1", "", None);
 
         log.turn_start(2, 5.0, 190_000);
-        log.model_response("Response 2", 200, 100, 300, 0);
+        log.model_response("Response 2", 200, 100, 300, 0, None);
         log.agent_input(r#"{"commands":[{"function":"writeFile","nonce":2}]}"#);
-        log.agent_output("out2", "err2");
+        log.agent_output("out2", "err2", None);
 
         drop(log);
 

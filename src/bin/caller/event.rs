@@ -1049,10 +1049,10 @@ fn write_event_to_session_log(
 
         // External agent paths emit these AppEvents without inline slog()
         // calls, so the EventBus writer is the only path to disk.
-        AppEvent::AgentOutput { stdout, stderr, .. } => {
-            log.agent_output(stdout, stderr);
+        AppEvent::AgentOutput { stdout, stderr, source } => {
+            log.agent_output(stdout, stderr, source.as_deref());
         }
-        AppEvent::ModelResponse { turn, content, usage, reasoning, .. } => {
+        AppEvent::ModelResponse { content, usage, reasoning, source, .. } => {
             if !content.is_empty() {
                 log.model_response(
                     content,
@@ -1060,6 +1060,7 @@ fn write_event_to_session_log(
                     usage.completion_tokens,
                     usage.total_tokens,
                     usage.cached_tokens,
+                    source.as_deref(),
                 );
             }
             if let Some(ref r) = reasoning {

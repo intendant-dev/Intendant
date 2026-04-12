@@ -2810,6 +2810,7 @@ async fn run_agent_loop(
                 response.usage.completion_tokens,
                 response.usage.total_tokens,
                 response.usage.cached_tokens,
+                None,
             )
         });
 
@@ -3372,7 +3373,7 @@ async fn run_agent_loop(
 
             // Log agent output
             slog(&session_log, |l| {
-                l.agent_output(&output.stdout, &output.stderr)
+                l.agent_output(&output.stdout, &output.stderr, None)
             });
 
             bus.send(AppEvent::AgentOutput {
@@ -3744,7 +3745,7 @@ Proceed with explicit assumptions and continue without additional questions."
 
             // Log agent output
             slog(&session_log, |l| {
-                l.agent_output(&output.stdout, &output.stderr)
+                l.agent_output(&output.stdout, &output.stderr, None)
             });
 
             bus.send(AppEvent::AgentOutput {

@@ -240,12 +240,18 @@ fn replay_session_log(contents: &str, log_dir: &std::path::Path) -> Vec<serde_js
                     .and_then(|d| d.get("tokens"))
                     .and_then(|t| t.get("total"))
                     .and_then(|v| v.as_u64());
+                // Use the persisted source label if present (e.g. "Codex", "Gemini CLI"),
+                // otherwise fall back to the generic "worker" → MODEL.
+                let src = obj.get("data")
+                    .and_then(|d| d.get("source"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("worker");
                 let summary = if full_content.is_empty() {
                     format!("Model response{}", tokens.map(|t| format!(" ({} tokens)", t)).unwrap_or_default())
                 } else {
                     format!("{}{}", full_content, tokens.map(|t| format!(" ({} tokens)", t)).unwrap_or_default())
                 };
-                ("worker", summary, "model")
+                (src, summary, "model")
             }
 
             // ── Reasoning ──
@@ -303,7 +309,11 @@ fn replay_session_log(contents: &str, log_dir: &std::path::Path) -> Vec<serde_js
                 let formatted = crate::tui::app::format_agent_output_for_tui(&full_stdout, &full_stderr);
                 if formatted.is_empty() { continue; }
                 let level = if !full_stderr.is_empty() { "warn" } else { "agent" };
-                ("agent", formatted, level)
+                let src = obj.get("data")
+                    .and_then(|d| d.get("source"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("agent");
+                (src, formatted, level)
             }
 
             // ── Voice / presence lifecycle ──
