@@ -727,7 +727,21 @@ impl App {
         self.log_sourced(level, content, LogSource::System, None);
     }
 
-    pub fn log_sourced(
+    /// Append an entry to the TUI's in-memory log buffer WITHOUT broadcasting
+    /// it back onto the EventBus as a synthetic `AppEvent::LogEntry`.
+    ///
+    /// Use this from inside `handle_event` match arms when the incoming event
+    /// already has its own `OutboundEvent` conversion path (e.g.
+    /// `ModelResponse`, `AgentOutput`, `PresenceLog`, `TurnStarted`, etc.).
+    /// Calling `log_sourced` in those handlers would re-broadcast the same
+    /// content as a `LogEntry`, producing duplicate entries in the web UI
+    /// and Swift app on top of the original event.
+    ///
+    /// For new log entries that the TUI is synthesizing (keyboard responses,
+    /// internal state messages from control commands, events with no outbound
+    /// variant), use `log_sourced` instead — that path is how those reach
+    /// external consumers at all.
+    pub fn log_local_only(
         &mut self,
         level: LogLevel,
         content: String,
@@ -737,7 +751,26 @@ impl App {
         if self.log_entries.len() >= MAX_LOG_ENTRIES {
             self.log_entries.pop_front();
         }
-        // Broadcast to external consumers (web UI, control socket)
+        self.log_entries.push_back(LogEntry {
+            ts: Local::now().format("%H:%M:%S").to_string(),
+            level,
+            content,
+            source,
+            turn,
+        });
+    }
+
+    pub fn log_sourced(
+        &mut self,
+        level: LogLevel,
+        content: String,
+        source: LogSource,
+        turn: Option<usize>,
+    ) {
+        // Broadcast to external consumers (web UI, control socket) via a
+        // synthetic `LogEntry` event. This is the ONLY path to external
+        // consumers for events without their own `OutboundEvent` variant
+        // and for log lines the TUI originates itself.
         let level_str = crate::frontend::log_level_to_str(&level).to_string();
         let source_str = match source {
             LogSource::System => "system",
@@ -751,13 +784,7 @@ impl App {
             content: content.clone(),
             turn,
         });
-        self.log_entries.push_back(LogEntry {
-            ts: Local::now().format("%H:%M:%S").to_string(),
-            level,
-            content,
-            source,
-            turn,
-        });
+        self.log_local_only(level, content, source, turn);
     }
 
     /// Flush accumulated voice transcript fragments into a single Info log entry.
@@ -1483,7 +1510,9 @@ impl App {
                 self.turn = turn;
                 self.budget_pct = budget_pct;
                 self.current_phase = Phase::Thinking;
-                self.log_sourced(
+                // Local-only: OutboundEvent::TurnStarted already reaches
+                // external consumers, which synthesize their own log entry.
+                self.log_local_only(
                     LogLevel::Detail,
                     format!("Turn {} started ({:.0}% budget)", turn, budget_pct),
                     LogSource::Agent,
@@ -1516,57 +1545,39 @@ impl App {
                     presence: self.presence_usage_snapshot(),
                 });
                 self.streaming_buffer.clear();
-                // Show human-readable command summary at Model level (visible at Normal verbosity).
-                // Push directly to log_entries instead of log_sourced to avoid
-                // broadcasting a duplicate LogEntry — the outbound bridge already
-                // sends OutboundEvent::ModelResponse to web/control consumers.
+                // Local-only: OutboundEvent::ModelResponse already reaches
+                // external consumers, which synthesize their own log entry.
                 let summary = format_model_summary(&content);
                 let turn_opt = Some(turn);
-                if self.log_entries.len() >= MAX_LOG_ENTRIES {
-                    self.log_entries.pop_front();
-                }
-                self.log_entries.push_back(LogEntry {
-                    ts: chrono::Local::now().format("%H:%M:%S").to_string(),
-                    level: LogLevel::Model,
-                    content: format!("T{}: {}", turn, summary),
-                    source: LogSource::Agent,
-                    turn: turn_opt,
-                });
+                self.log_local_only(
+                    LogLevel::Model,
+                    format!("T{}: {}", turn, summary),
+                    LogSource::Agent,
+                    turn_opt,
+                );
                 if let Some(ref reasoning_text) = reasoning {
-                    if self.log_entries.len() >= MAX_LOG_ENTRIES {
-                        self.log_entries.pop_front();
-                    }
-                    self.log_entries.push_back(LogEntry {
-                        ts: chrono::Local::now().format("%H:%M:%S").to_string(),
-                        level: LogLevel::Model,
-                        content: format!("Reasoning: {}", reasoning_text),
-                        source: LogSource::Agent,
-                        turn: turn_opt,
-                    });
+                    self.log_local_only(
+                        LogLevel::Model,
+                        format!("Reasoning: {}", reasoning_text),
+                        LogSource::Agent,
+                        turn_opt,
+                    );
                 }
-                if self.log_entries.len() >= MAX_LOG_ENTRIES {
-                    self.log_entries.pop_front();
-                }
-                self.log_entries.push_back(LogEntry {
-                    ts: chrono::Local::now().format("%H:%M:%S").to_string(),
-                    level: LogLevel::Detail,
-                    content: format!(
+                self.log_local_only(
+                    LogLevel::Detail,
+                    format!(
                         "tokens: prompt={} completion={} total={}",
                         usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
                     ),
-                    source: LogSource::Agent,
-                    turn: turn_opt,
-                });
-                if self.log_entries.len() >= MAX_LOG_ENTRIES {
-                    self.log_entries.pop_front();
-                }
-                self.log_entries.push_back(LogEntry {
-                    ts: chrono::Local::now().format("%H:%M:%S").to_string(),
-                    level: LogLevel::Debug,
-                    content: format!("Raw model response: {}", content),
-                    source: LogSource::Agent,
-                    turn: turn_opt,
-                });
+                    LogSource::Agent,
+                    turn_opt,
+                );
+                self.log_local_only(
+                    LogLevel::Debug,
+                    format!("Raw model response: {}", content),
+                    LogSource::Agent,
+                    turn_opt,
+                );
             }
             AppEvent::ModelResponseDelta { text } => {
                 // Accumulate streaming text; shown at Debug level to avoid noise
@@ -1584,7 +1595,9 @@ impl App {
             AppEvent::DoneSignal { message } => {
                 if let Some(msg) = message {
                     let t = self.turn;
-                    self.log_sourced(
+                    // Local-only: OutboundEvent::DoneSignal already reaches
+                    // external consumers.
+                    self.log_local_only(
                         LogLevel::Info,
                         msg,
                         LogSource::Agent,
@@ -1599,7 +1612,9 @@ impl App {
                 ..
             } => {
                 self.current_phase = Phase::RunningAgent;
-                self.log_sourced(
+                // Local-only: OutboundEvent::AgentStarted already reaches
+                // external consumers.
+                self.log_local_only(
                     LogLevel::Detail,
                     format!("Agent running (turn {}): {}", turn, commands_preview),
                     LogSource::Agent,
@@ -1609,28 +1624,22 @@ impl App {
             AppEvent::AgentOutput { stdout, stderr, .. } => {
                 // Parse runtime JSON to extract human-readable output.
                 // Web UI receives AgentOutput directly and formats via WASM;
-                // TUI formats here. Do NOT broadcast raw lines as LogEntry
-                // (that causes duplicate unformatted entries in the Activity tab).
+                // TUI formats here. Local-only: OutboundEvent::AgentOutput
+                // already reaches external consumers (which format it on
+                // their own side).
                 let t = self.turn;
                 let turn_opt = if t > 0 { Some(t) } else { None };
                 let formatted = format_agent_output_for_tui(&stdout, &stderr);
                 if !formatted.is_empty() {
                     let level = if !stderr.is_empty() { LogLevel::Warn } else { LogLevel::Agent };
-                    if self.log_entries.len() >= MAX_LOG_ENTRIES {
-                        self.log_entries.pop_front();
-                    }
-                    self.log_entries.push_back(LogEntry {
-                        ts: chrono::Local::now().format("%H:%M:%S").to_string(),
-                        level,
-                        content: formatted,
-                        source: LogSource::Agent,
-                        turn: turn_opt,
-                    });
+                    self.log_local_only(level, formatted, LogSource::Agent, turn_opt);
                 }
             }
             AppEvent::SubAgentResult { formatted } => {
                 self.turn += 1;
-                self.log_sourced(LogLevel::SubAgent, formatted, LogSource::Agent, Some(self.turn));
+                // Local-only: OutboundEvent::SubAgentResult already reaches
+                // external consumers.
+                self.log_local_only(LogLevel::SubAgent, formatted, LogSource::Agent, Some(self.turn));
             }
             AppEvent::OrchestratorProgress {
                 turn,
@@ -1644,13 +1653,17 @@ impl App {
                 } else {
                     format!("Orchestrator T{}: {} — {}", turn, status, last_action)
                 };
-                self.log_sourced(LogLevel::SubAgent, summary, LogSource::Agent, Some(turn));
+                // Local-only: OutboundEvent::OrchestratorProgress already
+                // reaches external consumers.
+                self.log_local_only(LogLevel::SubAgent, summary, LogSource::Agent, Some(turn));
             }
             AppEvent::OrchestratorLog { message, level } => {
                 self.log_sourced(level, message, LogSource::Agent, Some(self.turn));
             }
             AppEvent::ContextManagement { turn } => {
-                self.log_sourced(
+                // Local-only: OutboundEvent::ContextManagement already
+                // reaches external consumers.
+                self.log_local_only(
                     LogLevel::Detail,
                     format!("Context management (turn {})", turn),
                     LogSource::Agent,
@@ -1659,9 +1672,21 @@ impl App {
             }
             AppEvent::TaskComplete { reason, summary } => {
                 self.current_phase = Phase::Done;
-                self.log(LogLevel::Info, format!("--- {} ---", reason));
+                // Local-only: OutboundEvent::TaskComplete already reaches
+                // external consumers.
+                self.log_local_only(
+                    LogLevel::Info,
+                    format!("--- {} ---", reason),
+                    LogSource::System,
+                    None,
+                );
                 if let Some(ref brief) = summary {
-                    self.log(LogLevel::Detail, format!("Task brief: {}", brief));
+                    self.log_local_only(
+                        LogLevel::Detail,
+                        format!("Task brief: {}", brief),
+                        LogSource::System,
+                        None,
+                    );
                 }
                 // Create a follow-up textarea so the user can submit follow-ups
                 // after task completion (press f to reopen).
@@ -1675,25 +1700,42 @@ impl App {
             }
             AppEvent::BudgetWarning { pct, remaining } => {
                 self.budget_pct = pct;
-                self.log(
+                // Local-only: OutboundEvent::BudgetWarning already reaches
+                // external consumers.
+                self.log_local_only(
                     LogLevel::Warn,
                     format!("Budget warning: {:.0}% used, {} remaining", pct, remaining),
+                    LogSource::System,
+                    None,
                 );
             }
             AppEvent::BudgetExhausted { remaining } => {
                 self.budget_pct = 100.0;
-                self.log(
+                // Local-only: OutboundEvent::BudgetExhausted already reaches
+                // external consumers.
+                self.log_local_only(
                     LogLevel::Error,
                     format!("Budget exhausted ({} remaining)", remaining),
+                    LogSource::System,
+                    None,
                 );
                 self.current_phase = Phase::Done;
             }
             AppEvent::SafetyCapReached => {
-                self.log(LogLevel::Error, "Safety cap reached".to_string());
+                // Local-only: OutboundEvent::SafetyCapReached already
+                // reaches external consumers.
+                self.log_local_only(
+                    LogLevel::Error,
+                    "Safety cap reached".to_string(),
+                    LogSource::System,
+                    None,
+                );
                 self.current_phase = Phase::Done;
             }
             AppEvent::LoopError(msg) => {
-                self.log(LogLevel::Error, msg);
+                // Local-only: OutboundEvent::LoopError already reaches
+                // external consumers.
+                self.log_local_only(LogLevel::Error, msg, LogSource::System, None);
                 self.current_phase = Phase::Done;
             }
             AppEvent::PresenceLog { message, level, turn } => {
@@ -1707,20 +1749,9 @@ impl App {
                         }
                     }
                 }
-                // Push directly to log_entries for TUI display. Do NOT call
-                // log_sourced which re-broadcasts as AppEvent::LogEntry —
-                // PresenceLog already has its own path to session log and
-                // web UI (presence_log event).
-                if self.log_entries.len() >= MAX_LOG_ENTRIES {
-                    self.log_entries.pop_front();
-                }
-                self.log_entries.push_back(LogEntry {
-                    ts: chrono::Local::now().format("%H:%M:%S").to_string(),
-                    level: lvl,
-                    content: message,
-                    source: LogSource::Presence,
-                    turn,
-                });
+                // Local-only: OutboundEvent::PresenceLog already reaches
+                // external consumers.
+                self.log_local_only(lvl, message, LogSource::Presence, turn);
             }
             AppEvent::HumanQuestionDetected { question } => {
                 self.human_question = Some(question.clone());
@@ -1729,10 +1760,24 @@ impl App {
                 let mut textarea = tui_textarea::TextArea::default();
                 textarea.set_cursor_line_style(ratatui::style::Style::default());
                 self.human_textarea = Some(textarea);
-                self.log(LogLevel::Info, format!("Human question: {}", question));
+                // Local-only: OutboundEvent::AskHuman already reaches
+                // external consumers.
+                self.log_local_only(
+                    LogLevel::Info,
+                    format!("Human question: {}", question),
+                    LogSource::System,
+                    None,
+                );
             }
             AppEvent::HumanResponseSent => {
-                self.log(LogLevel::Detail, "Human prompt closed by runtime".to_string());
+                // Local-only: OutboundEvent::HumanResponseSent already
+                // reaches external consumers.
+                self.log_local_only(
+                    LogLevel::Detail,
+                    "Human prompt closed by runtime".to_string(),
+                    LogSource::System,
+                    None,
+                );
             }
             AppEvent::ApprovalRequired {
                 id,
@@ -1747,7 +1792,9 @@ impl App {
                     category: category.to_string(),
                 });
                 let t = self.turn;
-                self.log_sourced(
+                // Local-only: OutboundEvent::ApprovalRequired already
+                // reaches external consumers.
+                self.log_local_only(
                     LogLevel::Warn,
                     format!(
                         "Approval needed [{}]: {}",
@@ -1763,7 +1810,9 @@ impl App {
             }
             AppEvent::AutoApproved { preview } => {
                 let t = self.turn;
-                self.log_sourced(
+                // Local-only: OutboundEvent::AutoApproved already reaches
+                // external consumers.
+                self.log_local_only(
                     LogLevel::Detail,
                     format!("auto-approved: {}", preview),
                     LogSource::Agent,
@@ -1780,12 +1829,16 @@ impl App {
                 let mut textarea = tui_textarea::TextArea::default();
                 textarea.set_cursor_line_style(ratatui::style::Style::default());
                 self.follow_up_textarea = Some(textarea);
-                self.log(
+                // Local-only: OutboundEvent::RoundComplete already reaches
+                // external consumers.
+                self.log_local_only(
                     LogLevel::Info,
                     format!(
                         "Round {} complete ({} turns). Press f to write a follow-up, q to quit.",
                         round, turns_in_round
                     ),
+                    LogSource::System,
+                    None,
                 );
             }
             AppEvent::DisplayReady {
@@ -1794,14 +1847,23 @@ impl App {
             } => {
                 let info = format!(":{}", display_id);
                 self.display_info = Some(info.clone());
-                self.log(LogLevel::Detail, format!("Display :{} ready", display_id));
+                // Local-only: OutboundEvent::DisplayReady already reaches
+                // external consumers.
+                self.log_local_only(
+                    LogLevel::Detail,
+                    format!("Display :{} ready", display_id),
+                    LogSource::System,
+                    None,
+                );
             }
             AppEvent::DisplayTaken { display_id } => {
                 let msg = format!(
                     "User has taken manual control of display :{}. They may be interacting with the screen. Avoid mouse/keyboard automation until they release control.",
                     display_id
                 );
-                self.log(LogLevel::Warn, msg.clone());
+                // Local-only: OutboundEvent::DisplayTaken already reaches
+                // external consumers.
+                self.log_local_only(LogLevel::Warn, msg.clone(), LogSource::System, None);
                 if let Ok(mut q) = self.context_injection.lock() {
                     q.push(crate::event::ContextInjection::text(msg));
                 }
@@ -1818,12 +1880,17 @@ impl App {
                         display_id
                     )
                 };
-                self.log(LogLevel::Info, msg.clone());
+                // Local-only: OutboundEvent::DisplayReleased already reaches
+                // external consumers.
+                self.log_local_only(LogLevel::Info, msg.clone(), LogSource::System, None);
                 if let Ok(mut q) = self.context_injection.lock() {
                     q.push(crate::event::ContextInjection::text(msg));
                 }
             }
             AppEvent::UserDisplayGranted { display_id } => {
+                // UserDisplayGranted has an outbound variant but the browser
+                // WASM handler has no dedicated path — the TUI's synthetic
+                // LogEntry is the primary visible source.
                 self.log(LogLevel::Warn, format!("User display access granted (display_id: {})", display_id));
             }
             AppEvent::UserDisplayRevoked { display_id, ref note } => {
@@ -1832,6 +1899,9 @@ impl App {
                 } else {
                     format!("User display access revoked (display_id: {})", display_id)
                 };
+                // UserDisplayRevoked has an outbound variant but the browser
+                // WASM handler has no dedicated path — the TUI's synthetic
+                // LogEntry is the primary visible source.
                 self.log(LogLevel::Warn, msg);
             }
             AppEvent::SessionDirChanged { .. } => {
@@ -1973,7 +2043,14 @@ impl App {
             AppEvent::UserTranscript { ref text, .. } => {
                 // Log at Info level — no turn grouping so user speech is never
                 // collapsed inside a voice model response.
-                self.log_sourced(LogLevel::Info, format!("[You] {}", text), LogSource::Live, None);
+                // Local-only: OutboundEvent::UserTranscript already reaches
+                // external consumers.
+                self.log_local_only(
+                    LogLevel::Info,
+                    format!("[You] {}", text),
+                    LogSource::Live,
+                    None,
+                );
             }
             AppEvent::Tick => {
                 self.tick_count += 1;
@@ -2005,33 +2082,89 @@ impl App {
                 self.should_quit = true;
             }
             AppEvent::RecordingStarted { ref stream_name } => {
-                self.log(LogLevel::Detail, format!("Recording started: {}", stream_name));
+                // Local-only: OutboundEvent::RecordingStarted already
+                // reaches external consumers.
+                self.log_local_only(
+                    LogLevel::Detail,
+                    format!("Recording started: {}", stream_name),
+                    LogSource::System,
+                    None,
+                );
             }
             AppEvent::RecordingStopped { ref stream_name } => {
-                self.log(LogLevel::Detail, format!("Recording stopped: {}", stream_name));
+                // Local-only: OutboundEvent::RecordingStopped already
+                // reaches external consumers.
+                self.log_local_only(
+                    LogLevel::Detail,
+                    format!("Recording stopped: {}", stream_name),
+                    LogSource::System,
+                    None,
+                );
             }
             AppEvent::RecordingError { ref stream_name, ref message } => {
-                self.log(LogLevel::Warn, format!("Recording error ({}): {}", stream_name, message));
+                // Local-only: OutboundEvent::RecordingError already reaches
+                // external consumers.
+                self.log_local_only(
+                    LogLevel::Warn,
+                    format!("Recording error ({}): {}", stream_name, message),
+                    LogSource::System,
+                    None,
+                );
             }
             AppEvent::RecordingDeleted { ref stream_name } => {
+                // RecordingDeleted has an outbound variant but the browser
+                // WASM handler has no dedicated path — the TUI's synthetic
+                // LogEntry is the primary visible source.
                 self.log(LogLevel::Info, format!("Recording deleted: {}", stream_name));
             }
             AppEvent::SessionStarted { ref session_id, ref task } => {
-                self.log(LogLevel::Info, format!("Session started: {} — {}", session_id, task.as_deref().unwrap_or("(idle)")));
+                // Local-only: OutboundEvent::SessionStarted already reaches
+                // external consumers.
+                self.log_local_only(
+                    LogLevel::Info,
+                    format!("Session started: {} — {}", session_id, task.as_deref().unwrap_or("(idle)")),
+                    LogSource::System,
+                    None,
+                );
             }
             AppEvent::SessionEnded { ref session_id, ref reason } => {
-                self.log(LogLevel::Info, format!("Session ended: {} — {}", session_id, reason));
+                // Local-only: OutboundEvent::SessionEnded already reaches
+                // external consumers.
+                self.log_local_only(
+                    LogLevel::Info,
+                    format!("Session ended: {} — {}", session_id, reason),
+                    LogSource::System,
+                    None,
+                );
             }
             AppEvent::DebugScreenReady { display_id } => {
-                self.log(LogLevel::Info, format!("Debug screen ready on :{}", display_id));
+                // Local-only: OutboundEvent::DebugScreenReady already
+                // reaches external consumers.
+                self.log_local_only(
+                    LogLevel::Info,
+                    format!("Debug screen ready on :{}", display_id),
+                    LogSource::System,
+                    None,
+                );
             }
             AppEvent::DebugScreenTornDown { display_id } => {
-                self.log(LogLevel::Info, format!("Debug screen :{} torn down", display_id));
+                // Local-only: OutboundEvent::DebugScreenTornDown already
+                // reaches external consumers.
+                self.log_local_only(
+                    LogLevel::Info,
+                    format!("Debug screen :{} torn down", display_id),
+                    LogSource::System,
+                    None,
+                );
             }
             AppEvent::LiveAudioStarted { id, provider } => {
+                // LiveAudio* events have no outbound variant — the TUI's
+                // synthetic LogEntry is the only path to external consumers.
                 self.log(LogLevel::Info, format!("Live audio session '{}' started ({})", id, provider));
             }
             AppEvent::LiveAudioProgress { id, state, elapsed_secs, transcript_preview } => {
+                // LiveAudio* events have no outbound variant — the TUI's
+                // synthetic LogEntry is the only path to external consumers.
                 self.log(LogLevel::Detail, format!(
                     "Live audio '{}': {} ({:.0}s) - {}",
                     id, state, elapsed_secs,
@@ -2051,9 +2184,14 @@ impl App {
                 } else {
                     String::new()
                 };
+                // LiveAudio* events have no outbound variant — the TUI's
+                // synthetic LogEntry is the only path to external consumers.
                 self.log(LogLevel::Info, format!("Live audio '{}': {}{}", id, status, q_note));
             }
             AppEvent::DisplayCaptureLost { display_id, reason } => {
+                // DisplayCaptureLost has an outbound variant but the browser
+                // WASM handler has no dedicated path — the TUI's synthetic
+                // LogEntry is the primary visible source.
                 self.log(LogLevel::Warn, format!("Display :{} capture lost: {}", display_id, reason));
             }
         }
@@ -2939,6 +3077,174 @@ mod tests {
             turn: None,
         });
         assert_eq!(app.log_entries[2].turn, None);
+    }
+
+    /// Regression test for the recurring "TUI re-broadcasts LogEntry"
+    /// duplicate bug. Events that have their own `OutboundEvent` conversion
+    /// (ModelResponse, AgentOutput, PresenceLog, TurnStarted, TaskComplete,
+    /// BudgetWarning, etc.) must NOT produce synthetic `AppEvent::LogEntry`
+    /// entries in the derived list returned by `handle_event` — external
+    /// consumers would otherwise see two entries for the same underlying
+    /// event (the original outbound + a rebroadcast LogEntry).
+    #[test]
+    fn handle_event_no_duplicate_log_entry_broadcast() {
+        fn count_log_entries(derived: &[AppEvent]) -> usize {
+            derived
+                .iter()
+                .filter(|e| matches!(e, AppEvent::LogEntry { .. }))
+                .count()
+        }
+
+        let mut app = test_app();
+
+        // TurnStarted: outbound OutboundEvent::TurnStarted → no LogEntry
+        let derived = app.handle_event(AppEvent::TurnStarted {
+            turn: 1,
+            budget_pct: 5.0,
+            remaining: 100,
+        });
+        assert_eq!(count_log_entries(&derived), 0, "TurnStarted rebroadcast LogEntry");
+
+        // ModelResponse: outbound OutboundEvent::ModelResponse → no LogEntry
+        let derived = app.handle_event(AppEvent::ModelResponse {
+            turn: 1,
+            content: r#"{"commands":[]}"#.to_string(),
+            usage: crate::provider::TokenUsage::default(),
+            reasoning: None,
+            source: None,
+        });
+        assert_eq!(count_log_entries(&derived), 0, "ModelResponse rebroadcast LogEntry");
+
+        // AgentOutput: outbound OutboundEvent::AgentOutput → no LogEntry
+        let derived = app.handle_event(AppEvent::AgentOutput {
+            stdout: "hello".to_string(),
+            stderr: String::new(),
+            source: None,
+        });
+        assert_eq!(count_log_entries(&derived), 0, "AgentOutput rebroadcast LogEntry");
+
+        // PresenceLog: outbound OutboundEvent::PresenceLog → no LogEntry
+        let derived = app.handle_event(AppEvent::PresenceLog {
+            message: "test".to_string(),
+            level: None,
+            turn: Some(1),
+        });
+        assert_eq!(count_log_entries(&derived), 0, "PresenceLog rebroadcast LogEntry");
+
+        // TaskComplete: outbound OutboundEvent::TaskComplete → no LogEntry
+        let derived = app.handle_event(AppEvent::TaskComplete {
+            reason: "done".to_string(),
+            summary: Some("ok".to_string()),
+        });
+        assert_eq!(count_log_entries(&derived), 0, "TaskComplete rebroadcast LogEntry");
+
+        // BudgetWarning: outbound OutboundEvent::BudgetWarning → no LogEntry
+        let derived = app.handle_event(AppEvent::BudgetWarning {
+            pct: 85.0,
+            remaining: 1000,
+        });
+        assert_eq!(count_log_entries(&derived), 0, "BudgetWarning rebroadcast LogEntry");
+
+        // RoundComplete: outbound OutboundEvent::RoundComplete → no LogEntry
+        let derived = app.handle_event(AppEvent::RoundComplete {
+            round: 1,
+            turns_in_round: 3,
+        });
+        assert_eq!(count_log_entries(&derived), 0, "RoundComplete rebroadcast LogEntry");
+
+        // ApprovalRequired: outbound OutboundEvent::ApprovalRequired → no LogEntry
+        let derived = app.handle_event(AppEvent::ApprovalRequired {
+            id: 1,
+            command_preview: "ls".to_string(),
+            category: crate::autonomy::ActionCategory::CommandExec,
+        });
+        assert_eq!(count_log_entries(&derived), 0, "ApprovalRequired rebroadcast LogEntry");
+
+        // AutoApproved: outbound OutboundEvent::AutoApproved → no LogEntry
+        let derived = app.handle_event(AppEvent::AutoApproved {
+            preview: "ls".to_string(),
+        });
+        assert_eq!(count_log_entries(&derived), 0, "AutoApproved rebroadcast LogEntry");
+
+        // AgentStarted: outbound OutboundEvent::AgentStarted → no LogEntry
+        let derived = app.handle_event(AppEvent::AgentStarted {
+            turn: 1,
+            commands_preview: "ls".to_string(),
+            source: None,
+        });
+        assert_eq!(count_log_entries(&derived), 0, "AgentStarted rebroadcast LogEntry");
+    }
+
+    /// Complement to `handle_event_no_duplicate_log_entry_broadcast`: events
+    /// WITHOUT an `OutboundEvent` conversion path rely on the TUI's
+    /// synthetic `LogEntry` to reach external consumers. Those calls should
+    /// still produce LogEntry entries in the derived list.
+    #[test]
+    fn handle_event_unmapped_events_still_broadcast_log_entry() {
+        fn count_log_entries(derived: &[AppEvent]) -> usize {
+            derived
+                .iter()
+                .filter(|e| matches!(e, AppEvent::LogEntry { .. }))
+                .count()
+        }
+
+        let mut app = test_app();
+
+        // JsonExtracted: no OutboundEvent → TUI log_sourced is the only path
+        let derived = app.handle_event(AppEvent::JsonExtracted {
+            preview: "{ \"foo\": 1 }".to_string(),
+        });
+        assert_eq!(count_log_entries(&derived), 1, "JsonExtracted missing LogEntry");
+
+        // OrchestratorLog: no OutboundEvent → TUI log_sourced is the only path
+        let derived = app.handle_event(AppEvent::OrchestratorLog {
+            message: "hello".to_string(),
+            level: LogLevel::Info,
+        });
+        assert_eq!(count_log_entries(&derived), 1, "OrchestratorLog missing LogEntry");
+
+        // LiveAudioStarted: no OutboundEvent → TUI log is the only path
+        let derived = app.handle_event(AppEvent::LiveAudioStarted {
+            id: "abc".to_string(),
+            provider: "gemini".to_string(),
+        });
+        assert_eq!(count_log_entries(&derived), 1, "LiveAudioStarted missing LogEntry");
+    }
+
+    /// Ensures `log_local_only` pushes to the local buffer WITHOUT queuing a
+    /// synthetic `LogEntry` in `pending_derived`.
+    #[test]
+    fn log_local_only_does_not_broadcast() {
+        let mut app = test_app();
+        app.log_local_only(
+            LogLevel::Info,
+            "local only".to_string(),
+            LogSource::Agent,
+            Some(1),
+        );
+        assert_eq!(app.log_entries.len(), 1);
+        assert_eq!(app.log_entries[0].content, "local only");
+        assert!(app.pending_derived.is_empty(),
+            "log_local_only must not queue a LogEntry for broadcast");
+    }
+
+    /// Ensures `log_sourced` pushes to the local buffer AND queues a
+    /// synthetic `LogEntry` in `pending_derived` so external consumers see it.
+    #[test]
+    fn log_sourced_queues_broadcast_log_entry() {
+        let mut app = test_app();
+        app.log_sourced(
+            LogLevel::Info,
+            "broadcast me".to_string(),
+            LogSource::Agent,
+            Some(1),
+        );
+        assert_eq!(app.log_entries.len(), 1);
+        assert_eq!(app.pending_derived.len(), 1);
+        assert!(matches!(
+            &app.pending_derived[0],
+            AppEvent::LogEntry { content, .. } if content == "broadcast me"
+        ));
     }
 
     #[test]
