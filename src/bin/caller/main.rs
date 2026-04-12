@@ -681,16 +681,7 @@ async fn run_daemon_loop(config: DaemonConfig) {
                         let attachment_images = resolve_frame_ids(
                             &attachments, &config.frame_registry,
                         ).await;
-                        if !attachment_images.is_empty() {
-                            config.bus.send(AppEvent::PresenceLog {
-                                message: format!(
-                                    "[runtime] Task dispatched with {} attachment(s)",
-                                    attachment_images.len()
-                                ),
-                                level: None,
-                                turn: None,
-                            });
-                        }
+                        // (TUI already logs the dispatch with task text + attachment count)
 
                         tokio::spawn(async move {
                             let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
@@ -4240,14 +4231,7 @@ async fn run_with_presence(
             &envelope.attachment_frame_ids, &frame_registry
         ).await;
         if !attachment_images.is_empty() {
-            bus.send(AppEvent::PresenceLog {
-                message: format!(
-                    "[runtime] Task dispatched with {} attachment(s)",
-                    attachment_images.len()
-                ),
-                level: None,
-                turn: None,
-            });
+            // (TUI already logs the dispatch with task text + attachment count)
             slog(&session_log, |l| {
                 l.info(&format!(
                     "Task has {} user attachment(s)",
