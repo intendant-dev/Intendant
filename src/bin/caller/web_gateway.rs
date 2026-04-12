@@ -200,324 +200,113 @@ impl Default for WebGatewayConfig {
 /// - WebSocket connections are bridged to the EventBus (inbound control
 ///   messages) and broadcast channel (outbound events), mirroring the
 ///   Unix control socket in `control.rs`.
-/// Convert session.jsonl entries into OutboundEvent-compatible JSON objects
-/// for replaying to late-connecting browsers.
-fn replay_session_log(contents: &str, log_dir: &std::path::Path) -> Vec<serde_json::Value> {
-    let mut entries = Vec::new();
+/// Scan session.jsonl for persisted provider/model/autonomy values.
+///
+/// The agent loop writes these as plain log entries at startup
+/// (`Provider: X`, `Model: Y`, `Autonomy: Z`).  Today the writer uses
+/// `l.debug(...)`, so event_type is `debug` for newer sessions and
+/// `info` for older ones — scan both.  Replay uses the result to seed
+/// the status bar before any events are rendered, replacing the old
+/// prefix-based parsing inside `handle_log_replay`.
+fn scan_replay_status(
+    contents: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let mut provider: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut autonomy: Option<String> = None;
+    for line in contents.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let ev = v.get("event").and_then(|x| x.as_str()).unwrap_or("");
+        if !matches!(ev, "info" | "debug" | "warn" | "error") {
+            continue;
+        }
+        let Some(msg) = v.get("message").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        if provider.is_none() {
+            if let Some(rest) = msg.strip_prefix("Provider: ") {
+                provider = Some(
+                    rest.split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            }
+        }
+        if model.is_none() {
+            if let Some(rest) = msg.strip_prefix("Model: ") {
+                model = Some(rest.to_string());
+            }
+        }
+        if autonomy.is_none() {
+            if let Some(rest) = msg.strip_prefix("Autonomy: ") {
+                autonomy = Some(rest.to_string());
+            }
+        }
+        if provider.is_some() && model.is_some() && autonomy.is_some() {
+            break;
+        }
+    }
+    (provider, model, autonomy)
+}
+
+/// Convert session.jsonl contents into a stream of OutboundEvent-shaped
+/// JSON objects ready to be sent as a `log_replay` message.
+///
+/// The first entry is always a `replay_start` marker carrying
+/// provider/model/autonomy so the WASM `handle_log_replay` can seed the
+/// status bar.  Subsequent entries are the result of running each JSONL
+/// row through `session_log_entry_to_app_event` → `app_event_to_outbound`
+/// and injecting the original `ts` field, so replay drives the exact
+/// same rendering path as live broadcast.
+fn replay_jsonl_to_outbound_entries(
+    contents: &str,
+    log_dir: &std::path::Path,
+) -> Vec<serde_json::Value> {
+    let (provider, model, autonomy) = scan_replay_status(contents);
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    entries.push(serde_json::json!({
+        "event": "replay_start",
+        "provider": provider,
+        "model": model,
+        "autonomy": autonomy,
+    }));
+
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        let ts = obj.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let level = obj.get("level").and_then(|v| v.as_str()).unwrap_or("info");
-        let event_type = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
-        let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
-        let turn = obj.get("turn").and_then(|v| v.as_u64());
-
-        // Skip truly internal events that have no display value.
-        match event_type {
-            "messages_input" | "session_start" | "json_extracted" => continue,
-            _ => {}
-        }
-
-        // Map every session log event type to (source, content, log_level).
-        let (source, content, log_level) = match event_type {
-            // ── Turn lifecycle ──
-            "turn_start" => ("system", format!("Turn {} started", turn.unwrap_or(0)), "info"),
-
-            // ── Model response ──
-            "model_response" => {
-                // Read full content from the turn file (message is a 200-char preview).
-                let full_content = obj.get("file")
-                    .and_then(|f| f.as_str())
-                    .and_then(|f| std::fs::read_to_string(log_dir.join(f)).ok())
-                    .unwrap_or_else(|| message.to_string());
-                let tokens = obj.get("data")
-                    .and_then(|d| d.get("tokens"))
-                    .and_then(|t| t.get("total"))
-                    .and_then(|v| v.as_u64());
-                // Use the persisted source label if present (e.g. "Codex", "Gemini CLI"),
-                // otherwise fall back to the generic "worker" → MODEL.
-                let src = obj.get("data")
-                    .and_then(|d| d.get("source"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("worker");
-                let summary = if full_content.is_empty() {
-                    format!("Model response{}", tokens.map(|t| format!(" ({} tokens)", t)).unwrap_or_default())
-                } else {
-                    format!("{}{}", full_content, tokens.map(|t| format!(" ({} tokens)", t)).unwrap_or_default())
-                };
-                (src, summary, "model")
-            }
-
-            // ── Reasoning ──
-            "reasoning" => {
-                let summary = obj.get("data")
-                    .and_then(|d| d.get("summary"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(message);
-                if summary.is_empty() { continue; }
-                ("worker", format!("Reasoning: {}", summary), "detail")
-            }
-
-            // ── Approval lifecycle ──
-            "approval" => {
-                let decision = obj.get("data")
-                    .and_then(|d| d.get("decision"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let preview = obj.get("data")
-                    .and_then(|d| d.get("preview"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(message);
-                match decision {
-                    "waiting" => ("worker", format!("Approval required: {}", preview), "warn"),
-                    "approved" => ("system", format!("Approved: {}", preview), "info"),
-                    "denied" | "denied-no-approver" => ("system", format!("Denied: {}", preview), "warn"),
-                    "skipped" => ("system", format!("Skipped: {}", preview), "info"),
-                    _ => ("system", message.to_string(), "info"),
-                }
-            }
-
-            // ── Agent I/O ──
-            "agent_input" => continue, // Superseded by agent_started which has the full commands
-            "agent_started" => {
-                // New sessions have pre-formatted previews; old sessions have raw JSON.
-                // Try to detect raw JSON and format it, otherwise use as-is.
-                let display = if message.starts_with('{') {
-                    crate::format_commands_preview(message)
-                } else {
-                    message.to_string()
-                };
-                if display.is_empty() { continue; }
-                ("agent", display, "agent")
-            }
-            "agent_output" => {
-                // Read full content from the turn file (message is a preview).
-                let full_stdout = obj.get("file")
-                    .and_then(|f| f.as_str())
-                    .and_then(|f| std::fs::read_to_string(log_dir.join(f)).ok())
-                    .unwrap_or_else(|| message.to_string());
-                let full_stderr = obj.get("file2")
-                    .and_then(|f| f.as_str())
-                    .and_then(|f| std::fs::read_to_string(log_dir.join(f)).ok())
-                    .unwrap_or_default();
-                let formatted = crate::tui::app::format_agent_output_for_tui(&full_stdout, &full_stderr);
-                if formatted.is_empty() { continue; }
-                let level = if !full_stderr.is_empty() { "warn" } else { "agent" };
-                let src = obj.get("data")
-                    .and_then(|d| d.get("source"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("agent");
-                (src, formatted, level)
-            }
-
-            // ── Voice / presence lifecycle ──
-            "presence_log" => {
-                if message.is_empty() { continue; }
-                ("presence", message.to_string(), level)
-            }
-            "voice_log" => {
-                let text = obj.get("data")
-                    .and_then(|d| d.get("text"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(message);
-                if text.is_empty() { continue; }
-                ("live", text.to_string(), "presence")
-            }
-            "user_transcript" => {
-                let text = obj.get("data")
-                    .and_then(|d| d.get("text"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(message);
-                if text.is_empty() { continue; }
-                ("live", format!("[You] {}", text), "presence")
-            }
-            "presence_connected" => {
-                let provider = obj.get("data")
-                    .and_then(|d| d.get("provider"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                ("live", format!("Live connected ({})", provider), "info")
-            }
-            "presence_disconnected" => {
-                ("live", "Live disconnected".to_string(), "detail")
-            }
-            "presence_checkpoint" => {
-                let summary = obj.get("data")
-                    .and_then(|d| d.get("summary"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                ("live", format!("Checkpoint: {}", summary), "debug")
-            }
-
-            // ── Tool dispatch ──
-            "tool_request" => {
-                let tool = obj.get("data")
-                    .and_then(|d| d.get("tool"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                ("live", format!("Tool request: {}", tool), "debug")
-            }
-            "tool_response" => {
-                let tool = obj.get("data")
-                    .and_then(|d| d.get("tool"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                ("live", format!("Tool response: {}", tool), "debug")
-            }
-
-            // ── Task lifecycle ──
-            "task_complete" | "round_complete" => {
-                ("worker", message.to_string(), "info")
-            }
-            "session_end" | "summary" => {
-                if message.is_empty() { continue; }
-                ("system", message.to_string(), "info")
-            }
-            "interrupted" => {
-                ("system", "Session interrupted".to_string(), "warn")
-            }
-
-            // ── General log levels ──
-            "info" => {
-                // Detect presence vs system from message prefix
-                let source = if message.starts_with("[presence]")
-                    || message.starts_with("[model]")
-                    || message.starts_with("Presence")
-                {
-                    "server"
-                } else {
-                    "system"
-                };
-                // Detect detail-level presence internals
-                let lvl = if message.starts_with("[model] Thinking")
-                    || message.starts_with("[model] Tool call:")
-                {
-                    "detail"
-                } else {
-                    "info"
-                };
-                (source, message.to_string(), lvl)
-            }
-            "debug" => {
-                let source = if message.starts_with("[model]")
-                    || message.starts_with("[ws]")
-                {
-                    "server"
-                } else {
-                    "system"
-                };
-                (source, message.to_string(), "debug")
-            }
-            "warn" => ("system", message.to_string(), "warn"),
-            "error" => ("system", message.to_string(), "error"),
-
-            // ── Typed voice events (new) + backward compat ──
-            "voice_audio" | "voice_frame" => continue, // Skip telemetry in replay
-            "voice_protocol" => {
-                ("live", message.to_string(), "debug")
-            }
-            "voice_usage" => {
-                ("live", message.to_string(), "debug")
-            }
-            "voice_error" => {
-                ("live", message.to_string(), "warn")
-            }
-            // Legacy: old logs still have "voice_diagnostic"
-            "voice_diagnostic" => {
-                let kind = obj
-                    .get("data")
-                    .and_then(|d| d.get("kind"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                match kind {
-                    "audio_send" | "video_send" => continue,
-                    "error" | "gemini_close" => ("live", message.to_string(), "warn"),
-                    _ => ("live", message.to_string(), "debug"),
-                }
-            }
-
-            // ── CU (Computer Use) structured events ──
-            "cu_task_start" => {
-                let task = obj
-                    .get("data")
-                    .and_then(|d| d.get("task"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(message);
-                let provider = obj
-                    .get("data")
-                    .and_then(|d| d.get("provider"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let model = obj
-                    .get("data")
-                    .and_then(|d| d.get("model"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                (
-                    "worker",
-                    format!("CU task: {} ({}:{})", task, provider, model),
-                    "info",
-                )
-            }
-            "cu_turn" => {
-                let data = obj.get("data");
-                let t = data
-                    .and_then(|d| d.get("turn"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let actions = data
-                    .and_then(|d| d.get("actions"))
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default();
-                (
-                    "worker",
-                    format!("CU turn {}: {}", t, actions),
-                    "detail",
-                )
-            }
-            "cu_task_complete" => {
-                let turns = obj
-                    .get("data")
-                    .and_then(|d| d.get("turns"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                (
-                    "worker",
-                    format!("CU complete ({} turns)", turns),
-                    "info",
-                )
-            }
-            "cu_task_error" => {
-                ("worker", format!("CU error: {}", message), "warn")
-            }
-
-            // ── Catch-all ──
-            _ => {
-                if message.is_empty() { continue; }
-                ("system", message.to_string(), level)
-            }
+        let Some(app_event) =
+            crate::session_log::session_log_entry_to_app_event(&entry_json, log_dir)
+        else {
+            continue;
         };
-
-        entries.push(serde_json::json!({
-            "ts": ts,
-            "level": log_level,
-            "source": source,
-            "content": content,
-            "turn": turn,
-        }));
+        let Some(outbound) = crate::event::app_event_to_outbound(&app_event) else {
+            continue;
+        };
+        let Ok(mut value) = serde_json::to_value(&outbound) else {
+            continue;
+        };
+        // Inject the historical timestamp so WASM's handle_event uses it
+        // instead of wallclock when rendering log entries.
+        if let Some(obj) = value.as_object_mut() {
+            let ts = entry_json
+                .get("ts")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            obj.insert("ts".to_string(), serde_json::Value::String(ts));
+        }
+        entries.push(value);
     }
+
     entries
 }
 
@@ -600,7 +389,7 @@ fn get_session_detail(session_id: &str) -> String {
 
     let jsonl_path = session_dir.join("session.jsonl");
     let entries = if let Ok(contents) = std::fs::read_to_string(&jsonl_path) {
-        replay_session_log(&contents, &session_dir)
+        replay_jsonl_to_outbound_entries(&contents, &session_dir)
     } else {
         Vec::new()
     };
@@ -1583,12 +1372,15 @@ pub fn spawn_web_gateway(
 
                     // Replay session log so late-connecting browsers see
                     // historical events (not just real-time from now on).
+                    // Each JSONL entry is converted to an OutboundEvent via
+                    // session_log_entry_to_app_event → app_event_to_outbound
+                    // so replay drives the same rendering path as live.
                     if let Some(ref ctx) = query_ctx {
                         let session_jsonl = ctx.log_dir.join("session.jsonl");
                         if let Ok(contents) = std::fs::read_to_string(&session_jsonl) {
                             let replay = serde_json::json!({
                                 "t": "log_replay",
-                                "entries": replay_session_log(&contents, &ctx.log_dir),
+                                "entries": replay_jsonl_to_outbound_entries(&contents, &ctx.log_dir),
                             });
                             let _ = direct_tx.send(replay.to_string());
                         }
@@ -3771,6 +3563,130 @@ mod tests {
         let config = build_config(None, None, false, Vec::new());
         // Either gemini or openai depending on env, but it shouldn't panic
         assert!(!config.provider.is_empty());
+    }
+
+    #[test]
+    fn test_scan_replay_status_extracts_provider_model_autonomy() {
+        let contents = concat!(
+            r#"{"ts":"10:00:00","event":"session_start","level":"info"}"#,
+            "\n",
+            r#"{"ts":"10:00:01","event":"info","level":"info","message":"Provider: openai"}"#,
+            "\n",
+            r#"{"ts":"10:00:02","event":"info","level":"info","message":"Model: gpt-5"}"#,
+            "\n",
+            r#"{"ts":"10:00:03","event":"info","level":"info","message":"Autonomy: High"}"#,
+            "\n",
+        );
+        let (p, m, a) = scan_replay_status(contents);
+        assert_eq!(p.as_deref(), Some("openai"));
+        assert_eq!(m.as_deref(), Some("gpt-5"));
+        assert_eq!(a.as_deref(), Some("High"));
+    }
+
+    #[test]
+    fn test_scan_replay_status_reads_debug_level_entries() {
+        // Newer sessions write Provider/Model/Autonomy as `l.debug(...)`
+        // so the event_type is "debug", not "info".  scan_replay_status
+        // must pick those up too.
+        let contents = concat!(
+            r#"{"ts":"10:00:00","event":"debug","level":"debug","message":"Provider: anthropic"}"#,
+            "\n",
+            r#"{"ts":"10:00:01","event":"debug","level":"debug","message":"Model: claude-sonnet-4-6"}"#,
+            "\n",
+            r#"{"ts":"10:00:02","event":"debug","level":"debug","message":"Autonomy: Medium"}"#,
+            "\n",
+        );
+        let (p, m, a) = scan_replay_status(contents);
+        assert_eq!(p.as_deref(), Some("anthropic"));
+        assert_eq!(m.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(a.as_deref(), Some("Medium"));
+    }
+
+    #[test]
+    fn test_replay_jsonl_produces_replay_start_marker_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.info("Provider: openai");
+        log.info("Model: gpt-5");
+        log.info("Autonomy: Medium");
+        log.turn_start(1, 0.0, 100_000);
+        log.auto_approved("exec: ls");
+        log.round_complete(1, 3);
+        drop(log);
+
+        let contents =
+            std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let entries = replay_jsonl_to_outbound_entries(&contents, &log_dir);
+
+        // First entry is the replay_start marker.
+        assert_eq!(
+            entries[0].get("event").and_then(|v| v.as_str()),
+            Some("replay_start")
+        );
+        assert_eq!(
+            entries[0].get("provider").and_then(|v| v.as_str()),
+            Some("openai")
+        );
+
+        // Each OutboundEvent entry has its historical `ts` injected.
+        // Find the turn_started entry and verify it carries the original ts.
+        let turn_started = entries
+            .iter()
+            .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("turn_started"))
+            .expect("turn_started should be present");
+        assert!(
+            turn_started.get("ts").is_some(),
+            "ts should be injected into each outbound entry"
+        );
+
+        // auto_approved preview preserved.
+        let auto_approved = entries
+            .iter()
+            .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("auto_approved"))
+            .expect("auto_approved should be present");
+        assert_eq!(
+            auto_approved.get("preview").and_then(|v| v.as_str()),
+            Some("exec: ls")
+        );
+
+        // round_complete fields propagated.
+        let round = entries
+            .iter()
+            .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("round_complete"))
+            .expect("round_complete should be present");
+        assert_eq!(round.get("round").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            round.get("turns_in_round").and_then(|v| v.as_u64()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn test_replay_jsonl_skips_internal_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        log.messages_input(r#"[{"role":"user","content":"hi"}]"#); // -> skip
+        log.agent_input(r#"{"commands":[{"function":"execAsAgent","nonce":1}]}"#); // -> skip
+        drop(log);
+
+        let contents =
+            std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let entries = replay_jsonl_to_outbound_entries(&contents, &log_dir);
+
+        // Entries are: [replay_start, turn_started].  messages_input,
+        // agent_input, and session_start all return None.
+        assert_eq!(entries.len(), 2, "unexpected entries: {:#?}", entries);
+        assert_eq!(
+            entries[0].get("event").and_then(|v| v.as_str()),
+            Some("replay_start")
+        );
+        assert_eq!(
+            entries[1].get("event").and_then(|v| v.as_str()),
+            Some("turn_started")
+        );
     }
 
     #[tokio::test]

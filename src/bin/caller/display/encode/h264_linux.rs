@@ -37,9 +37,12 @@ pub struct FfmpegH264Encoder {
     nal_rx: std::sync::mpsc::Receiver<Nal>,
     /// Handle for the stdout reader thread, joined on drop.
     reader_thread: Option<std::thread::JoinHandle<()>>,
-    /// NAL received during multi-slice drain that belongs to the next frame.
-    /// Consumed at the start of the next `encode()` call.
-    pending_nal: Option<Nal>,
+    /// NALs belonging to the current (incomplete) frame, accumulated across
+    /// encode() calls. ffmpeg is pipelined — output for frame N may arrive
+    /// only after frame N+1 is fed in.
+    pending_frame_nals: Vec<Nal>,
+    /// Timestamp to assign to the next completed frame.
+    pending_frame_pts: u64,
 }
 
 impl FfmpegH264Encoder {
@@ -227,7 +230,8 @@ impl FfmpegH264Encoder {
             frame_size,
             nal_rx,
             reader_thread: Some(reader_thread),
-            pending_nal: None,
+            pending_frame_nals: Vec::new(),
+            pending_frame_pts: 0,
         })
     }
 
@@ -239,6 +243,32 @@ impl FfmpegH264Encoder {
     /// same frame have `first_mb_in_slice > 0`.
     fn is_first_slice(nal: &Nal) -> bool {
         parse_first_mb_in_slice(&nal.data) == 0
+    }
+}
+
+impl FfmpegH264Encoder {
+    /// Build an EncodedPacket from a set of NAL units forming a complete
+    /// access unit (one video frame). Wraps each NAL with an Annex-B
+    /// start code.
+    fn build_packet(nals: &[Nal], pts_ms: u64, duration_ms: u64) -> Option<EncodedPacket> {
+        if nals.is_empty() {
+            return None;
+        }
+        let mut data = Vec::new();
+        let mut is_keyframe = false;
+        for nal in nals {
+            data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            data.extend_from_slice(&nal.data);
+            if nal.nal_type == 5 {
+                is_keyframe = true;
+            }
+        }
+        Some(EncodedPacket {
+            data,
+            pts_ms,
+            duration_ms,
+            is_keyframe,
+        })
     }
 }
 
@@ -262,89 +292,59 @@ impl Encoder for FfmpegH264Encoder {
             stdin
                 .write_all(&i420[..self.frame_size])
                 .map_err(|e| format!("write to ffmpeg: {e}"))?;
+            stdin
+                .flush()
+                .map_err(|e| format!("flush ffmpeg: {e}"))?;
         }
 
-        let pts = self.pts_offset;
+        // Assign pts to THIS input frame. The NALs that come out may
+        // correspond to an earlier input — but with zero-latency tuning
+        // and no B-frames, output should be in display order.
+        let input_pts = self.pts_offset;
         self.pts_offset += duration_ms;
         self.frame_count += 1;
 
-        // Collect NALs from the reader thread until we have a complete
-        // access unit (one video frame).
-        //
-        // Frame boundary detection uses `first_mb_in_slice` from the H264
-        // slice header.  The first slice of every new frame has
-        // `first_mb_in_slice == 0`.  When we already have a slice and
-        // receive another slice with `first_mb_in_slice == 0`, it belongs
-        // to the NEXT frame — we save it as `pending_nal` and emit the
-        // current frame.
-        //
-        // Non-slice NALs (SPS=7, PPS=8, SEI=6) are prefix metadata and
-        // always belong to the upcoming slice's frame.
-        let mut collected: Vec<Nal> = Vec::new();
-        let mut have_slice = false;
+        // Drain whatever NALs are available right now. ffmpeg is pipelined:
+        // it may buffer 1-2 frames before producing output. We accumulate
+        // NALs into `pending_frame_nals` across calls and flush completed
+        // frames when we detect the next access unit boundary (first slice
+        // NAL with first_mb_in_slice == 0).
+        let mut out_packets = Vec::new();
+        let mut have_slice = self
+            .pending_frame_nals
+            .iter()
+            .any(|n| n.nal_type == 1 || n.nal_type == 5);
 
-        // Consume a NAL buffered from the previous frame boundary.
-        if let Some(pending) = self.pending_nal.take() {
-            let is_slice = pending.nal_type == 1 || pending.nal_type == 5;
-            if is_slice {
-                have_slice = true;
-            }
-            collected.push(pending);
-        }
-
-        // Keep reading NALs until we detect the next frame boundary.
         loop {
-            let nal = match self.nal_rx.recv() {
+            let nal = match self.nal_rx.try_recv() {
                 Ok(n) => n,
-                Err(_) => break, // reader thread exited
+                Err(_) => break, // no more NALs right now
             };
             let is_slice = nal.nal_type == 1 || nal.nal_type == 5;
-            if is_slice {
-                if have_slice && Self::is_first_slice(&nal) {
-                    // This slice starts a new frame — save it for next
-                    // encode() call and emit the current frame.
-                    self.pending_nal = Some(nal);
-                    break;
+            if is_slice && have_slice && Self::is_first_slice(&nal) {
+                // New frame starts — flush what we have.
+                if let Some(pkt) = Self::build_packet(
+                    &self.pending_frame_nals,
+                    self.pending_frame_pts,
+                    duration_ms,
+                ) {
+                    out_packets.push(pkt);
                 }
+                self.pending_frame_nals.clear();
+                self.pending_frame_nals.push(nal);
+                self.pending_frame_pts = input_pts;
                 have_slice = true;
-                collected.push(nal);
-            } else if have_slice {
-                // Non-slice after we already have a slice means this is
-                // prefix data (SPS/PPS) for the next frame.
-                self.pending_nal = Some(nal);
-                break;
             } else {
-                // Non-slice before any slice — prefix for this frame.
-                collected.push(nal);
+                if is_slice && !have_slice {
+                    // First slice we've seen in the buffer — stamp pts.
+                    self.pending_frame_pts = input_pts;
+                    have_slice = true;
+                }
+                self.pending_frame_nals.push(nal);
             }
         }
 
-        if collected.is_empty() {
-            // ffmpeg may buffer a few frames before producing output.
-            return Ok(Vec::new());
-        }
-
-        // Bundle all NAL units into a single packet with Annex-B framing.
-        let mut data = Vec::new();
-        let mut is_keyframe = false;
-        for nal in &collected {
-            data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-            data.extend_from_slice(&nal.data);
-            if nal.nal_type == 5 {
-                is_keyframe = true;
-            }
-        }
-
-        if data.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        Ok(vec![EncodedPacket {
-            data,
-            pts_ms: pts,
-            duration_ms,
-            is_keyframe,
-        }])
+        Ok(out_packets)
     }
 
     fn codec_mime(&self) -> &'static str {

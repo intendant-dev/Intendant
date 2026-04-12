@@ -2289,8 +2289,8 @@ html, body {
     <span id="sb-external-agent" style="display:none;font-weight:600;color:var(--peach)"></span>
     <span class="sep">|</span>
     <span class="display-toggle-wrap">
-      <span class="field-label" id="sb-display-label" style="cursor:pointer" onclick="toggleUserDisplay()" title="Your display (d) — grant/revoke agent access to your screen for computer use tasks">your display</span>
-      <span id="sb-display-access" style="cursor:pointer;font-weight:600;color:#f38ba8" onclick="toggleUserDisplay()" title="Your display (d) — grant/revoke agent access to your screen for computer use tasks">off</span>
+      <span class="field-label" id="sb-display-label" style="cursor:pointer" onclick="toggleUserDisplay()" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">your display</span>
+      <span id="sb-display-access" style="cursor:pointer;font-weight:600;color:#f38ba8" onclick="toggleUserDisplay()" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">off</span>
       <div class="display-picker" id="display-picker"></div>
     </span>
     <span class="sep">|</span>
@@ -4541,9 +4541,33 @@ class DisplaySlot {
 
     const normalize = (e) => {
       const rect = vid.getBoundingClientRect();
+      // Account for letterboxing: the video element preserves aspect ratio,
+      // so the actual video content occupies a sub-rectangle inside the
+      // element bounds. Compute that content rect from the video's intrinsic
+      // dimensions, then normalize the cursor relative to it (not the element).
+      const vW = vid.videoWidth || rect.width;
+      const vH = vid.videoHeight || rect.height;
+      const videoAspect = vW / vH;
+      const elAspect = rect.width / rect.height;
+      let contentW, contentH, offsetX, offsetY;
+      if (elAspect > videoAspect) {
+        // Element is wider than video -> pillarbox (black bars left/right)
+        contentH = rect.height;
+        contentW = contentH * videoAspect;
+        offsetX = (rect.width - contentW) / 2;
+        offsetY = 0;
+      } else {
+        // Element is taller than video -> letterbox (black bars top/bottom)
+        contentW = rect.width;
+        contentH = contentW / videoAspect;
+        offsetX = 0;
+        offsetY = (rect.height - contentH) / 2;
+      }
+      const relX = (e.clientX - rect.left - offsetX) / contentW;
+      const relY = (e.clientY - rect.top - offsetY) / contentH;
       return {
-        x: Math.max(0, Math.min((e.clientX - rect.left) / rect.width, 0.9999)),
-        y: Math.max(0, Math.min((e.clientY - rect.top) / rect.height, 0.9999))
+        x: Math.max(0, Math.min(relX, 0.9999)),
+        y: Math.max(0, Math.min(relY, 0.9999))
       };
     };
 
@@ -4672,6 +4696,7 @@ class DisplaySlot {
   }
 
   releaseControl() {
+    const wasInteractive = this.interactive;
     this.interactive = false;
     if (this._heldModifiers) this._heldModifiers.clear();
     const vid = this.videoEl;
@@ -4687,7 +4712,10 @@ class DisplaySlot {
     this.noteInput.value = ''; this.noteInput.style.display = 'none';
     this.takeBtn.style.display = ''; this.releaseBtn.style.display = 'none';
     this.statusEl.textContent = this.connected ? 'Connected (view-only)' : 'Disconnected';
-    if (app) app.release_display(BigInt(this.displayId), note);
+    // Only notify the backend if control was actually taken. Otherwise
+    // display lifecycle events (disconnect, tab-switch thumb relocation)
+    // spuriously send ReleaseDisplay ControlMsgs that the user never asked for.
+    if (wasInteractive && app) app.release_display(BigInt(this.displayId), note);
   }
 
   toggleStreaming() {
@@ -8331,7 +8359,6 @@ function renderSessionDetailEntries(entries, el) {
 // ── Keyboard Shortcuts ──
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
-  if (e.key === 'd') { toggleUserDisplay(); e.preventDefault(); return; }
   if (activeTab === 'activity' && app && app.pending_approval_id() !== null) {
     if (e.key === 'y') { processCommands(app.send_approval('approve')); e.preventDefault(); }
     else if (e.key === 's') { processCommands(app.send_approval('skip')); e.preventDefault(); }

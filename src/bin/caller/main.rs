@@ -12,6 +12,7 @@ mod external_agent;
 mod frames;
 mod frontend;
 mod knowledge;
+mod lan;
 mod live_audio;
 mod live_audio_types;
 mod mcp;
@@ -211,11 +212,11 @@ async fn create_external_agent(
     };
 
     let event_rx = agent.initialize(config).await?;
-    slog(session_log, |l| l.info("External agent initialized"));
+    slog(session_log, |l| l.debug("External agent initialized"));
 
     let thread = agent.start_thread().await?;
     slog(session_log, |l| {
-        l.info(&format!("External agent thread: {}", thread.thread_id))
+        l.debug(&format!("External agent thread: {}", thread.thread_id))
     });
 
     Ok((agent, thread, event_rx))
@@ -292,6 +293,19 @@ async fn drain_external_agent_events(
                     source: config.agent_source.clone(),
                 });
             }
+            external_agent::AgentEvent::Reasoning { text } => {
+                // Surface reasoning via ModelResponse with empty content +
+                // reasoning set.  WASM renders this at "detail" verbosity
+                // (visible in Verbose + Debug, hidden in Normal) via the
+                // existing reasoning_summary path in app_state.rs.
+                config.bus.send(AppEvent::ModelResponse {
+                    turn: stats.turns,
+                    content: String::new(),
+                    usage: provider::TokenUsage::default(),
+                    reasoning: Some(text),
+                    source: config.agent_source.clone(),
+                });
+            }
             external_agent::AgentEvent::ToolStarted {
                 preview,
                 tool_name,
@@ -326,19 +340,28 @@ async fn drain_external_agent_events(
                 });
             }
             external_agent::AgentEvent::ToolCompleted { item_id, status } => {
-                let status_str = match &status {
-                    external_agent::ToolCompletionStatus::Success => "completed",
+                // Success: nothing to emit.  The tool command was already
+                // shown via AgentStarted at start, and any output streamed
+                // via ToolOutputDelta → AgentOutput.  A completion marker
+                // adds noise without new information.
+                //
+                // Failure: emit a warn so the user sees the error.
+                // Cancelled: silent.
+                match &status {
                     external_agent::ToolCompletionStatus::Failed { message } => {
                         slog(config.session_log, |l| {
                             l.warn(&format!("Tool {} failed: {}", item_id, message))
                         });
-                        "failed"
+                        config.bus.send(AppEvent::LogEntry {
+                            level: "warn".to_string(),
+                            source: "worker".to_string(),
+                            content: format!("Tool failed: {}", message),
+                            turn: None,
+                        });
                     }
-                    external_agent::ToolCompletionStatus::Cancelled => "cancelled",
-                };
-                config.bus.send(AppEvent::AutoApproved {
-                    preview: format!("[{}] {}", status_str, item_id),
-                });
+                    external_agent::ToolCompletionStatus::Success
+                    | external_agent::ToolCompletionStatus::Cancelled => {}
+                }
             }
             external_agent::AgentEvent::ApprovalRequest {
                 request_id,
@@ -1507,7 +1530,7 @@ fn encode_screenshot(result_text: &str) -> Option<Vec<conversation::ImageData>> 
 /// 5. On failure → log warning, let commands fail naturally
 ///
 /// Format raw agent JSON into a human-readable preview for the Activity tab.
-fn format_commands_preview(json_str: &str) -> String {
+pub(crate) fn format_commands_preview(json_str: &str) -> String {
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
         if let Some(cmds) = parsed.get("commands").and_then(|v| v.as_array()) {
             let parts: Vec<String> = cmds.iter().filter_map(|cmd| {
@@ -4280,7 +4303,7 @@ async fn run_with_presence(
         }
 
         slog(&session_log, |l| {
-            l.info(&format!(
+            l.debug(&format!(
                 "{}task: {}",
                 if envelope.force_direct { "Direct " } else { "Presence dispatched " },
                 envelope.task
@@ -4301,7 +4324,7 @@ async fn run_with_presence(
         ).await;
         if !attachment_images.is_empty() {
             slog(&session_log, |l| {
-                l.info(&format!(
+                l.debug(&format!(
                     "Task has {} user attachment(s)",
                     attachment_images.len()
                 ))
@@ -4312,7 +4335,7 @@ async fn run_with_presence(
         let mut task_for_agent: Option<String> = None;
 
         slog(&session_log, |l| {
-            l.info(&format!(
+            l.debug(&format!(
                 "CU-first routing: force_direct={}, task={}",
                 envelope.force_direct, &envelope.task[..envelope.task.len().min(60)]
             ))
@@ -4410,7 +4433,7 @@ async fn run_with_presence(
                             continue;
                         }
                     };
-                slog(&session_log, |l| l.info(&format!(
+                slog(&session_log, |l| l.debug(&format!(
                     "Mode: external agent ({}) via presence, thread: {}",
                     backend, thread.thread_id
                 )));
@@ -6239,6 +6262,20 @@ async fn main() -> Result<(), CallerError> {
     // Ensure platform tool directories (Homebrew etc.) are in PATH.
     platform::ensure_tool_paths();
 
+    // Intercept `intendant lan <action>` before the main runtime setup —
+    // the lan subcommand is a pure system-setup path with no project,
+    // no .env, no provider selection.
+    if env::args().nth(1).as_deref() == Some("lan") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        return match lan::run(argv).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+    }
+
     // Load .env: cwd (+ parents) first, then project root, then ~/.config/intendant/
     dotenvy::dotenv().ok();
     let mut project = Project::detect()?;
@@ -6397,8 +6434,8 @@ async fn main() -> Result<(), CallerError> {
     let provider = match provider_result {
         Ok(p) => {
             slog(&session_log, |l| {
-                l.info(&format!("Provider: {}", p.name()));
-                l.info(&format!("Model: {}", p.model()));
+                l.debug(&format!("Provider: {}", p.name()));
+                l.debug(&format!("Model: {}", p.model()));
             });
             Some(p)
         }
@@ -6419,8 +6456,8 @@ async fn main() -> Result<(), CallerError> {
         Err(e) => return Err(e),
     };
     slog(&session_log, |l| {
-        l.info(&format!("Project root: {}", project.root.display()));
-        l.info(&format!("Autonomy: {}", flags.autonomy));
+        l.debug(&format!("Project root: {}", project.root.display()));
+        l.debug(&format!("Autonomy: {}", flags.autonomy));
     });
 
     // Check if running as a sub-agent (headless, no TUI)

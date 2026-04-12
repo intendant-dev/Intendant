@@ -1384,25 +1384,21 @@ impl App {
                 });
             }
             ControlMsg::TakeDisplay { display_id } => {
-                self.log(
-                    LogLevel::Warn,
-                    format!("User has taken manual control of display :{}", display_id),
-                );
-                self.broadcast_control(OutboundEvent::DisplayTaken { display_id });
+                // Emit via pending_derived so the event flows through the bus:
+                //   - session.jsonl gets the display_taken entry (for replay)
+                //   - spawn_outbound_broadcaster emits OutboundEvent::DisplayTaken
+                //     to all WebSocket clients (WASM renders "Display :N in use")
+                //   - handle_event arm logs local-only to the TUI buffer
+                // Calling self.log() + broadcast_control() here would produce
+                // duplicate entries in the browser — one synthetic LogEntry
+                // with "User has taken manual control of display :N" from the
+                // log broadcast, and one from the OutboundEvent rendering.
+                self.pending_derived.push(AppEvent::DisplayTaken { display_id });
             }
             ControlMsg::ReleaseDisplay { display_id, note } => {
-                let msg = format!(
-                    "User released control of display :{}{}",
-                    display_id,
-                    note.as_ref()
-                        .map(|n| format!(". Note: {}", n))
-                        .unwrap_or_default()
-                );
-                self.log(LogLevel::Info, msg);
-                self.broadcast_control(OutboundEvent::DisplayReleased {
-                    display_id,
-                    note,
-                });
+                // Same pattern as TakeDisplay — emit AppEvent via pending_derived
+                // instead of double-broadcasting via self.log() + broadcast_control().
+                self.pending_derived.push(AppEvent::DisplayReleased { display_id, note });
             }
             ControlMsg::GrantUserDisplay { display_id } => {
                 let did = display_id.unwrap_or(0);
@@ -1416,9 +1412,10 @@ impl App {
                     state.user_display_granted = true;
                 }
                 std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                self.log(LogLevel::Warn, format!("User display access granted (display_id: {})", did));
                 self.broadcast_control(OutboundEvent::UserDisplayGranted);
-                // Emit to EventBus so spawn_user_display_listener activates display + recording
+                // Emit to EventBus so spawn_user_display_listener activates display + recording.
+                // The handle_event arm for UserDisplayGranted is the canonical log source —
+                // do NOT call self.log here, that would create a duplicate broadcast.
                 self.pending_derived.push(AppEvent::UserDisplayGranted { display_id: did });
             }
             ControlMsg::ListDisplays => {
@@ -1437,15 +1434,8 @@ impl App {
                     state.user_display_granted = false;
                 }
                 std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
-                let msg = format!(
-                    "User display access revoked (display_id: {}){}",
-                    did,
-                    note.as_ref()
-                        .map(|n| format!(". Note: {}", n))
-                        .unwrap_or_default()
-                );
-                self.log(LogLevel::Warn, msg);
                 self.broadcast_control(OutboundEvent::UserDisplayRevoked { display_id: did, note: note.clone() });
+                // The handle_event arm for UserDisplayRevoked is the canonical log source.
                 self.pending_derived.push(AppEvent::UserDisplayRevoked { display_id: did, note });
             }
             ControlMsg::InvokeSkill {
