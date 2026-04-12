@@ -1416,9 +1416,10 @@ impl App {
                     state.user_display_granted = true;
                 }
                 std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                self.log(LogLevel::Warn, format!("User display access granted (display_id: {})", did));
                 self.broadcast_control(OutboundEvent::UserDisplayGranted);
-                // Emit to EventBus so spawn_user_display_listener activates display + recording
+                // Emit to EventBus so spawn_user_display_listener activates display + recording.
+                // The handle_event arm for UserDisplayGranted is the canonical log source —
+                // do NOT call self.log here, that would create a duplicate broadcast.
                 self.pending_derived.push(AppEvent::UserDisplayGranted { display_id: did });
             }
             ControlMsg::ListDisplays => {
@@ -1437,15 +1438,8 @@ impl App {
                     state.user_display_granted = false;
                 }
                 std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
-                let msg = format!(
-                    "User display access revoked (display_id: {}){}",
-                    did,
-                    note.as_ref()
-                        .map(|n| format!(". Note: {}", n))
-                        .unwrap_or_default()
-                );
-                self.log(LogLevel::Warn, msg);
                 self.broadcast_control(OutboundEvent::UserDisplayRevoked { display_id: did, note: note.clone() });
+                // The handle_event arm for UserDisplayRevoked is the canonical log source.
                 self.pending_derived.push(AppEvent::UserDisplayRevoked { display_id: did, note });
             }
             ControlMsg::InvokeSkill {

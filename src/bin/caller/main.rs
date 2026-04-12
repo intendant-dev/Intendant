@@ -198,11 +198,11 @@ async fn create_external_agent(
     };
 
     let event_rx = agent.initialize(config).await?;
-    slog(session_log, |l| l.info("External agent initialized"));
+    slog(session_log, |l| l.debug("External agent initialized"));
 
     let thread = agent.start_thread().await?;
     slog(session_log, |l| {
-        l.info(&format!("External agent thread: {}", thread.thread_id))
+        l.debug(&format!("External agent thread: {}", thread.thread_id))
     });
 
     Ok((agent, thread, event_rx))
@@ -4267,7 +4267,7 @@ async fn run_with_presence(
         }
 
         slog(&session_log, |l| {
-            l.info(&format!(
+            l.debug(&format!(
                 "{}task: {}",
                 if envelope.force_direct { "Direct " } else { "Presence dispatched " },
                 envelope.task
@@ -4288,7 +4288,7 @@ async fn run_with_presence(
         ).await;
         if !attachment_images.is_empty() {
             slog(&session_log, |l| {
-                l.info(&format!(
+                l.debug(&format!(
                     "Task has {} user attachment(s)",
                     attachment_images.len()
                 ))
@@ -4299,7 +4299,7 @@ async fn run_with_presence(
         let mut task_for_agent: Option<String> = None;
 
         slog(&session_log, |l| {
-            l.info(&format!(
+            l.debug(&format!(
                 "CU-first routing: force_direct={}, task={}",
                 envelope.force_direct, &envelope.task[..envelope.task.len().min(60)]
             ))
@@ -4397,7 +4397,7 @@ async fn run_with_presence(
                             continue;
                         }
                     };
-                slog(&session_log, |l| l.info(&format!(
+                slog(&session_log, |l| l.debug(&format!(
                     "Mode: external agent ({}) via presence, thread: {}",
                     backend, thread.thread_id
                 )));
@@ -6384,8 +6384,8 @@ async fn main() -> Result<(), CallerError> {
     let provider = match provider_result {
         Ok(p) => {
             slog(&session_log, |l| {
-                l.info(&format!("Provider: {}", p.name()));
-                l.info(&format!("Model: {}", p.model()));
+                l.debug(&format!("Provider: {}", p.name()));
+                l.debug(&format!("Model: {}", p.model()));
             });
             Some(p)
         }
@@ -6406,8 +6406,8 @@ async fn main() -> Result<(), CallerError> {
         Err(e) => return Err(e),
     };
     slog(&session_log, |l| {
-        l.info(&format!("Project root: {}", project.root.display()));
-        l.info(&format!("Autonomy: {}", flags.autonomy));
+        l.debug(&format!("Project root: {}", project.root.display()));
+        l.debug(&format!("Autonomy: {}", flags.autonomy));
     });
 
     // Check if running as a sub-agent (headless, no TUI)
