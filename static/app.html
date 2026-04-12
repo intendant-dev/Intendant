@@ -6925,18 +6925,19 @@ async function saveSettings() {
   } catch (e) {
     console.error('Failed to save settings:', e);
   }
+  // External agent is runtime-only (not persisted to config), sent via
+  // WebSocket to the ControlPlane which updates shared state.
+  const agentVal = g('set-external-agent').value || null;
+  if (app) {
+    app.send_server_action({ action: 'set_external_agent', agent: agentVal });
+  }
 }
 
 document.getElementById('settings-save-btn').addEventListener('click', saveSettings);
 document.getElementById('settings-reset-btn').addEventListener('click', () => { settingsLoaded = false; loadSettings(); });
 
-// External agent dropdown — sends a WebSocket control message (deferred, not saved to config)
-document.getElementById('set-external-agent').addEventListener('change', (e) => {
-  const val = e.target.value || null;
-  if (app) {
-    app.send_server_action({ action: 'set_external_agent', agent: val });
-  }
-});
+// External agent dropdown is applied on Save click alongside other settings,
+// not on change — matches the rest of the Settings tab UX.
 
 function updateFramerateWarning() {
   const val = parseInt(document.getElementById('set-recording-framerate').value) || 0;
