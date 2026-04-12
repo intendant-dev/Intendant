@@ -231,14 +231,19 @@ fn replay_session_log(contents: &str, log_dir: &std::path::Path) -> Vec<serde_js
 
             // ── Model response ──
             "model_response" => {
+                // Read full content from the turn file (message is a 200-char preview).
+                let full_content = obj.get("file")
+                    .and_then(|f| f.as_str())
+                    .and_then(|f| std::fs::read_to_string(log_dir.join(f)).ok())
+                    .unwrap_or_else(|| message.to_string());
                 let tokens = obj.get("data")
                     .and_then(|d| d.get("tokens"))
                     .and_then(|t| t.get("total"))
                     .and_then(|v| v.as_u64());
-                let summary = if message.is_empty() {
+                let summary = if full_content.is_empty() {
                     format!("Model response{}", tokens.map(|t| format!(" ({} tokens)", t)).unwrap_or_default())
                 } else {
-                    format!("{}{}", message, tokens.map(|t| format!(" ({} tokens)", t)).unwrap_or_default())
+                    format!("{}{}", full_content, tokens.map(|t| format!(" ({} tokens)", t)).unwrap_or_default())
                 };
                 ("worker", summary, "model")
             }
