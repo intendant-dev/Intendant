@@ -73,6 +73,43 @@ fn slog(log: &SharedSessionLog, f: impl FnOnce(&mut session_log::SessionLog)) {
     }
 }
 
+/// Emit a "[runtime] Task dispatched" log entry from a backend task acceptance
+/// point. Writes to the session log on disk and broadcasts a `LogEntry` event
+/// for external consumers (web dashboard, control socket).
+///
+/// This is the single source of truth for the dispatch log line: it lives in
+/// the backend (where the task is actually accepted for processing) rather
+/// than in any frontend, so the log is consistent across TUI, headless, and
+/// daemon modes regardless of which interface originated the task.
+fn emit_task_dispatched_log(
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+    task: &str,
+    attachment_count: usize,
+) {
+    let suffix = if attachment_count > 0 {
+        format!(
+            " with {} attachment{}",
+            attachment_count,
+            if attachment_count == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
+    };
+    let message = format!(
+        "[runtime] Task dispatched{}: {}",
+        suffix,
+        types::truncate_str(task, 80)
+    );
+    slog(session_log, |l| l.info(&message));
+    bus.send(AppEvent::LogEntry {
+        level: "info".to_string(),
+        source: "system".to_string(),
+        content: message,
+        turn: None,
+    });
+}
+
 /// Resolve external agent backend from an explicit override, falling back to
 /// the project config's `agent.default_backend` setting.
 fn resolve_agent_backend_from_config(
@@ -681,7 +718,15 @@ async fn run_daemon_loop(config: DaemonConfig) {
                         let attachment_images = resolve_frame_ids(
                             &attachments, &config.frame_registry,
                         ).await;
-                        // (TUI already logs the dispatch with task text + attachment count)
+                        // Backend-side dispatch log: emitted once the daemon
+                        // has accepted the task envelope and resolved its
+                        // session resources, just before spawning the agent.
+                        emit_task_dispatched_log(
+                            &config.bus,
+                            &new_session_log,
+                            &new_task,
+                            attachments.len(),
+                        );
 
                         tokio::spawn(async move {
                             let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
@@ -4201,6 +4246,16 @@ async fn run_with_presence(
     let mut persistent_agent_backend: Option<external_agent::AgentBackend> = None;
 
     while let Some(envelope) = task_rx.recv().await {
+        // Backend-side dispatch log: emitted at task acceptance, replacing the
+        // legacy TUI-side log so headless and dashboard-direct tasks both reach
+        // external consumers regardless of which frontend is running.
+        emit_task_dispatched_log(
+            &bus,
+            &session_log,
+            &envelope.task,
+            envelope.attachment_frame_ids.len(),
+        );
+
         // Resume presence from any previous direct-mode pause
         presence_paused.store(0, std::sync::atomic::Ordering::Relaxed);
         // Pause presence for direct-mode tasks — no narration, no hallucinated
@@ -4231,7 +4286,6 @@ async fn run_with_presence(
             &envelope.attachment_frame_ids, &frame_registry
         ).await;
         if !attachment_images.is_empty() {
-            // (TUI already logs the dispatch with task text + attachment count)
             slog(&session_log, |l| {
                 l.info(&format!(
                     "Task has {} user attachment(s)",

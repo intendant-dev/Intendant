@@ -362,9 +362,11 @@ pub enum AppEvent {
         agent: Option<String>,
     },
 
-    /// Log entry emitted by the App for broadcast to external consumers.
-    /// The TUI renders these from its internal deque; external consumers
-    /// (web UI, control socket) receive them via the outbound broadcaster.
+    /// Log entry broadcast to external consumers (web UI, control socket).
+    /// Emitted by the TUI's `log_sourced` for events without their own
+    /// `OutboundEvent` variant, and by backend code (e.g.
+    /// `emit_task_dispatched_log`) so dispatch-style messages reach external
+    /// consumers in headless mode where no TUI is running.
     LogEntry {
         level: String,
         source: String,

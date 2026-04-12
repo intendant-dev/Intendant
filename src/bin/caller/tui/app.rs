@@ -1213,7 +1213,14 @@ impl App {
                 // (main.rs) processes tasks sequentially, and the mpsc channel
                 // (capacity=4) buffers incoming tasks. The TUI tracks phase for
                 // display purposes only, not dispatch authority.
-                let attachment_count = attachments.len();
+                //
+                // Note: the "[runtime] Task dispatched" log is emitted by the
+                // backend at task acceptance time (see `emit_task_dispatched_log`
+                // in main.rs), not here. The TUI is a display layer; it forwards
+                // the envelope and updates local UI state, but the dispatch log
+                // belongs to the code that actually accepts the task for
+                // processing so it works in headless mode and reports the
+                // correct source.
                 let dispatched = if let Some(ref tx) = self.task_tx {
                     let envelope = presence_core::TaskEnvelope {
                         task: task.clone(),
@@ -1234,23 +1241,6 @@ impl App {
                     self.mode = AppMode::Normal;
                     self.current_phase = Phase::Thinking;
                     self.round += 1;
-                    let suffix = if attachment_count > 0 {
-                        format!(" with {} attachment{}",
-                            attachment_count,
-                            if attachment_count == 1 { "" } else { "s" })
-                    } else {
-                        String::new()
-                    };
-                    self.log_sourced(
-                        LogLevel::Info,
-                        format!(
-                            "[runtime] Task dispatched{}: {}",
-                            suffix,
-                            truncate_str(&task, 80)
-                        ),
-                        LogSource::Live,
-                        None,
-                    );
                 } else {
                     self.log(
                         LogLevel::Warn,
