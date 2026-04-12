@@ -3562,6 +3562,111 @@ mod tests {
         assert!(!config.provider.is_empty());
     }
 
+    #[test]
+    fn test_scan_replay_status_extracts_provider_model_autonomy() {
+        let contents = concat!(
+            r#"{"ts":"10:00:00","event":"session_start","level":"info"}"#,
+            "\n",
+            r#"{"ts":"10:00:01","event":"info","level":"info","message":"Provider: openai"}"#,
+            "\n",
+            r#"{"ts":"10:00:02","event":"info","level":"info","message":"Model: gpt-5"}"#,
+            "\n",
+            r#"{"ts":"10:00:03","event":"info","level":"info","message":"Autonomy: High"}"#,
+            "\n",
+        );
+        let (p, m, a) = scan_replay_status(contents);
+        assert_eq!(p.as_deref(), Some("openai"));
+        assert_eq!(m.as_deref(), Some("gpt-5"));
+        assert_eq!(a.as_deref(), Some("High"));
+    }
+
+    #[test]
+    fn test_replay_jsonl_produces_replay_start_marker_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.info("Provider: openai");
+        log.info("Model: gpt-5");
+        log.info("Autonomy: Medium");
+        log.turn_start(1, 0.0, 100_000);
+        log.auto_approved("exec: ls");
+        log.round_complete(1, 3);
+        drop(log);
+
+        let contents =
+            std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let entries = replay_jsonl_to_outbound_entries(&contents, &log_dir);
+
+        // First entry is the replay_start marker.
+        assert_eq!(
+            entries[0].get("event").and_then(|v| v.as_str()),
+            Some("replay_start")
+        );
+        assert_eq!(
+            entries[0].get("provider").and_then(|v| v.as_str()),
+            Some("openai")
+        );
+
+        // Each OutboundEvent entry has its historical `ts` injected.
+        // Find the turn_started entry and verify it carries the original ts.
+        let turn_started = entries
+            .iter()
+            .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("turn_started"))
+            .expect("turn_started should be present");
+        assert!(
+            turn_started.get("ts").is_some(),
+            "ts should be injected into each outbound entry"
+        );
+
+        // auto_approved preview preserved.
+        let auto_approved = entries
+            .iter()
+            .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("auto_approved"))
+            .expect("auto_approved should be present");
+        assert_eq!(
+            auto_approved.get("preview").and_then(|v| v.as_str()),
+            Some("exec: ls")
+        );
+
+        // round_complete fields propagated.
+        let round = entries
+            .iter()
+            .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("round_complete"))
+            .expect("round_complete should be present");
+        assert_eq!(round.get("round").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            round.get("turns_in_round").and_then(|v| v.as_u64()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn test_replay_jsonl_skips_internal_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        log.messages_input(r#"[{"role":"user","content":"hi"}]"#); // -> skip
+        log.agent_input(r#"{"commands":[{"function":"execAsAgent","nonce":1}]}"#); // -> skip
+        drop(log);
+
+        let contents =
+            std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let entries = replay_jsonl_to_outbound_entries(&contents, &log_dir);
+
+        // Entries are: [replay_start, turn_started].  messages_input,
+        // agent_input, and session_start all return None.
+        assert_eq!(entries.len(), 2, "unexpected entries: {:#?}", entries);
+        assert_eq!(
+            entries[0].get("event").and_then(|v| v.as_str()),
+            Some("replay_start")
+        );
+        assert_eq!(
+            entries[1].get("event").and_then(|v| v.as_str()),
+            Some("turn_started")
+        );
+    }
+
     #[tokio::test]
     async fn test_spawn_web_gateway_lifecycle() {
         let bus = EventBus::new();
