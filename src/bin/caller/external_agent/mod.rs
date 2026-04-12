@@ -80,6 +80,12 @@ pub enum AgentEvent {
     MessageDelta { text: String },
     /// Complete agent message.
     Message { text: String },
+    /// The agent's chain-of-thought / reasoning trace.
+    ///
+    /// Codex emits this via `item/completed` with `type: "reasoning"`. The
+    /// text is surfaced at `"detail"` verbosity (visible in Verbose + Debug,
+    /// hidden in Normal) via `AppEvent::ModelResponse` with `reasoning` set.
+    Reasoning { text: String },
     /// A tool/command execution has started.
     ToolStarted {
         item_id: String,

@@ -279,6 +279,19 @@ async fn drain_external_agent_events(
                     source: config.agent_source.clone(),
                 });
             }
+            external_agent::AgentEvent::Reasoning { text } => {
+                // Surface reasoning via ModelResponse with empty content +
+                // reasoning set.  WASM renders this at "detail" verbosity
+                // (visible in Verbose + Debug, hidden in Normal) via the
+                // existing reasoning_summary path in app_state.rs.
+                config.bus.send(AppEvent::ModelResponse {
+                    turn: stats.turns,
+                    content: String::new(),
+                    usage: provider::TokenUsage::default(),
+                    reasoning: Some(text),
+                    source: config.agent_source.clone(),
+                });
+            }
             external_agent::AgentEvent::ToolStarted {
                 preview,
                 tool_name,
@@ -313,19 +326,28 @@ async fn drain_external_agent_events(
                 });
             }
             external_agent::AgentEvent::ToolCompleted { item_id, status } => {
-                let status_str = match &status {
-                    external_agent::ToolCompletionStatus::Success => "completed",
+                // Success: nothing to emit.  The tool command was already
+                // shown via AgentStarted at start, and any output streamed
+                // via ToolOutputDelta → AgentOutput.  A completion marker
+                // adds noise without new information.
+                //
+                // Failure: emit a warn so the user sees the error.
+                // Cancelled: silent.
+                match &status {
                     external_agent::ToolCompletionStatus::Failed { message } => {
                         slog(config.session_log, |l| {
                             l.warn(&format!("Tool {} failed: {}", item_id, message))
                         });
-                        "failed"
+                        config.bus.send(AppEvent::LogEntry {
+                            level: "warn".to_string(),
+                            source: "worker".to_string(),
+                            content: format!("Tool failed: {}", message),
+                            turn: None,
+                        });
                     }
-                    external_agent::ToolCompletionStatus::Cancelled => "cancelled",
-                };
-                config.bus.send(AppEvent::AutoApproved {
-                    preview: format!("[{}] {}", status_str, item_id),
-                });
+                    external_agent::ToolCompletionStatus::Success
+                    | external_agent::ToolCompletionStatus::Cancelled => {}
+                }
             }
             external_agent::AgentEvent::ApprovalRequest {
                 request_id,

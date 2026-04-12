@@ -1384,25 +1384,21 @@ impl App {
                 });
             }
             ControlMsg::TakeDisplay { display_id } => {
-                self.log(
-                    LogLevel::Warn,
-                    format!("User has taken manual control of display :{}", display_id),
-                );
-                self.broadcast_control(OutboundEvent::DisplayTaken { display_id });
+                // Emit via pending_derived so the event flows through the bus:
+                //   - session.jsonl gets the display_taken entry (for replay)
+                //   - spawn_outbound_broadcaster emits OutboundEvent::DisplayTaken
+                //     to all WebSocket clients (WASM renders "Display :N in use")
+                //   - handle_event arm logs local-only to the TUI buffer
+                // Calling self.log() + broadcast_control() here would produce
+                // duplicate entries in the browser — one synthetic LogEntry
+                // with "User has taken manual control of display :N" from the
+                // log broadcast, and one from the OutboundEvent rendering.
+                self.pending_derived.push(AppEvent::DisplayTaken { display_id });
             }
             ControlMsg::ReleaseDisplay { display_id, note } => {
-                let msg = format!(
-                    "User released control of display :{}{}",
-                    display_id,
-                    note.as_ref()
-                        .map(|n| format!(". Note: {}", n))
-                        .unwrap_or_default()
-                );
-                self.log(LogLevel::Info, msg);
-                self.broadcast_control(OutboundEvent::DisplayReleased {
-                    display_id,
-                    note,
-                });
+                // Same pattern as TakeDisplay — emit AppEvent via pending_derived
+                // instead of double-broadcasting via self.log() + broadcast_control().
+                self.pending_derived.push(AppEvent::DisplayReleased { display_id, note });
             }
             ControlMsg::GrantUserDisplay { display_id } => {
                 let did = display_id.unwrap_or(0);

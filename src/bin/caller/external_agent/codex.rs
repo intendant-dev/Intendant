@@ -485,6 +485,39 @@ fn translate_notification(
                 .to_string();
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
+            // Reasoning items: surface the chain-of-thought text via a
+            // dedicated event so it renders at "detail" verbosity (Verbose +
+            // Debug). Skip the ToolCompleted marker — reasoning is not a tool.
+            if item_type == "reasoning" {
+                if let Some(text) = extract_reasoning_text(item) {
+                    if !text.is_empty() {
+                        let _ = event_tx.send(AgentEvent::Reasoning { text });
+                    }
+                }
+                return;
+            }
+
+            // agentMessage items: content arrives via either streaming deltas
+            // (item/agentMessage/delta → Message) or the completed item's
+            // text field. Emit Message on completion if the deltas didn't
+            // already produce one. Skip the ToolCompleted marker — the
+            // final message is not a tool.
+            if item_type == "agentMessage" {
+                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        let _ = event_tx.send(AgentEvent::Message {
+                            text: text.to_string(),
+                        });
+                    }
+                }
+                return;
+            }
+
+            // userMessage items are echoes of the user's own input — ignore.
+            if item_type == "userMessage" {
+                return;
+            }
+
             // Extract command output from commandExecution items
             if item_type == "commandExecution" {
                 if let Some(output) = item.get("aggregatedOutput").and_then(|v| v.as_str()) {
@@ -510,17 +543,6 @@ fn translate_notification(
                         let _ = event_tx.send(AgentEvent::ToolOutputDelta {
                             item_id: item_id.clone(),
                             text,
-                        });
-                    }
-                }
-            }
-
-            // Extract final message text from agentMessage items
-            if item_type == "agentMessage" {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        let _ = event_tx.send(AgentEvent::Message {
-                            text: text.to_string(),
                         });
                     }
                 }
@@ -608,6 +630,48 @@ fn translate_notification(
         other => {
             eprintln!("[codex] unknown notification method: {:?} params: {}", other, serde_json::to_string(params).unwrap_or_default());
         }
+    }
+}
+
+/// Extract the chain-of-thought text from a Codex `reasoning` item.
+///
+/// Codex v2 wraps the OpenAI Responses API reasoning shape, which has
+/// historically varied: `text` (single string), `summary` (array of
+/// `{type: "summary_text", text: "..."}` entries), or `content` (similar
+/// array). Walk all three and concatenate whatever we find.
+fn extract_reasoning_text(item: &serde_json::Value) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(s) = item.get("text").and_then(|v| v.as_str()) {
+        if !s.is_empty() {
+            parts.push(s.to_string());
+        }
+    }
+
+    for key in ["summary", "content"] {
+        if let Some(arr) = item.get(key).and_then(|v| v.as_array()) {
+            for entry in arr {
+                if let Some(s) = entry.as_str() {
+                    if !s.is_empty() {
+                        parts.push(s.to_string());
+                    }
+                } else if let Some(s) = entry.get("text").and_then(|v| v.as_str()) {
+                    if !s.is_empty() {
+                        parts.push(s.to_string());
+                    }
+                }
+            }
+        } else if let Some(s) = item.get(key).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                parts.push(s.to_string());
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
     }
 }
 
@@ -1165,6 +1229,107 @@ mod tests {
             }
             other => panic!("expected ToolCompleted, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn translate_item_completed_reasoning_emits_reasoning_event() {
+        // Codex emits reasoning text via item/completed with type="reasoning".
+        // We must surface the chain-of-thought via AgentEvent::Reasoning
+        // (rendered at "detail" verbosity) instead of the old AutoApproved
+        // noise path. And no ToolCompleted marker — reasoning is not a tool.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "id": "rs_123",
+                "type": "reasoning",
+                "summary": [
+                    {"type": "summary_text", "text": "Step 1: parse the request"},
+                    {"type": "summary_text", "text": "Step 2: decide tool"}
+                ],
+                "status": "completed"
+            }
+        });
+        translate_notification("item/completed", &params, &tx);
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::Reasoning { text } => {
+                assert!(text.contains("Step 1: parse the request"));
+                assert!(text.contains("Step 2: decide tool"));
+            }
+            other => panic!("expected Reasoning, got {:?}", other),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "reasoning should not emit a ToolCompleted marker"
+        );
+    }
+
+    #[test]
+    fn translate_item_completed_reasoning_text_field() {
+        // Fallback path: reasoning item with plain text field.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "id": "rs_456",
+                "type": "reasoning",
+                "text": "raw reasoning trace"
+            }
+        });
+        translate_notification("item/completed", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::Reasoning { text } => assert_eq!(text, "raw reasoning trace"),
+            other => panic!("expected Reasoning, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn translate_item_completed_reasoning_empty_is_silent() {
+        // No text, no summary → no event.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {"id": "rs_789", "type": "reasoning"}
+        });
+        translate_notification("item/completed", &params, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "empty reasoning should emit nothing"
+        );
+    }
+
+    #[test]
+    fn translate_item_completed_agent_message_skips_tool_completed() {
+        // agentMessage items should emit Message with the final text, but
+        // NOT a ToolCompleted marker — they are not tools.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "id": "msg_001",
+                "type": "agentMessage",
+                "text": "Final response text",
+                "status": "completed"
+            }
+        });
+        translate_notification("item/completed", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::Message { text } => assert_eq!(text, "Final response text"),
+            other => panic!("expected Message, got {:?}", other),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "agentMessage should not emit ToolCompleted"
+        );
+    }
+
+    #[test]
+    fn translate_item_completed_user_message_silent() {
+        // userMessage items are echoes of the user's input — emit nothing.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {"id": "u_001", "type": "userMessage", "text": "hello"}
+        });
+        translate_notification("item/completed", &params, &tx);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
