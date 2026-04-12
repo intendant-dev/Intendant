@@ -30,6 +30,7 @@ mod schema_validator;
 mod session_log;
 mod skills;
 mod sub_agent;
+mod terminal;
 mod tool_batch;
 mod tools;
 mod transcription;

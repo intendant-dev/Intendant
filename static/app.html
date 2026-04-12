@@ -1123,10 +1123,130 @@ html, body {
 }
 
 /* ── Terminal Tab ── */
+.terminal-subtabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px 4px 0 4px;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+  flex-shrink: 0;
+}
+.terminal-subtab-btn {
+  padding: 4px 12px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  color: var(--overlay1);
+  cursor: pointer;
+  font-size: 12px;
+  font-family: inherit;
+}
+.terminal-subtab-btn:hover {
+  color: var(--text);
+}
+.terminal-subtab-btn.active {
+  background: var(--base);
+  color: var(--text);
+  border-color: var(--surface1);
+}
+.terminal-subtab-panes {
+  flex: 1;
+  position: relative;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.terminal-subtab-pane {
+  flex: 1;
+  display: none;
+  flex-direction: column;
+  position: relative;
+  min-height: 0;
+}
+.terminal-subtab-pane.active {
+  display: flex;
+}
 .terminal-container {
   flex: 1;
   position: relative;
+  min-height: 0;
+  min-width: 0;
 }
+
+/* ── Shell key bar (mobile + optional desktop) ── */
+.shell-keybar {
+  display: none;
+  flex-shrink: 0;
+  gap: 4px;
+  padding: 6px;
+  background: var(--mantle);
+  border-top: 1px solid var(--surface0);
+  /* Horizontal scroll when buttons don't fit. `max-width: 100%` + `min-width: 0`
+     forces the bar to respect its parent's width instead of stretching with
+     its content, which is what actually triggers overflow on narrow viewports. */
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  user-select: none;
+  -webkit-user-select: none;
+  /* Allow horizontal panning touch gestures even over focus-capturing children. */
+  touch-action: pan-x;
+}
+.shell-keybar.visible {
+  display: flex;
+}
+.shell-keybar::-webkit-scrollbar {
+  height: 3px;
+}
+.shell-keybar::-webkit-scrollbar-thumb {
+  background: var(--surface1);
+  border-radius: 2px;
+}
+.shell-key {
+  flex-shrink: 0;
+  min-width: 36px;
+  height: 32px;
+  padding: 0 8px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: 'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace;
+  font-size: 12px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.shell-key:active {
+  background: var(--surface1);
+}
+.shell-key.sticky.armed {
+  background: var(--blue);
+  color: var(--base);
+  border-color: var(--blue);
+}
+.shell-key.wide { min-width: 48px; }
+
+/* Auto-show the key bar on touch devices (phones, tablets). Desktop users
+   can still toggle it with the button in the Shell sub-tab header. */
+@media (pointer: coarse) {
+  .shell-keybar { display: flex; }
+}
+.keybar-toggle {
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  color: var(--overlay1);
+  cursor: pointer;
+  font-size: 11px;
+  font-family: inherit;
+  margin-left: auto;
+}
+.keybar-toggle:hover { color: var(--text); }
+.keybar-toggle.active { color: var(--blue); border-color: var(--blue); }
 
 /* ── Displays Tab ── */
 .displays-container {
@@ -2442,7 +2562,41 @@ html, body {
 
     <!-- Terminal Tab -->
     <div id="tab-terminal" class="tab-pane">
-      <div class="terminal-container" id="terminal-container"></div>
+      <div class="terminal-subtabs">
+        <button class="terminal-subtab-btn active" data-term-tab="tui">TUI</button>
+        <button class="terminal-subtab-btn" data-term-tab="shell">Shell</button>
+        <button class="keybar-toggle" id="keybar-toggle" title="Show/hide the special-key bar (Esc, Tab, Ctrl, arrows, …)">Keys</button>
+      </div>
+      <div class="terminal-subtab-panes">
+        <div class="terminal-subtab-pane active" id="term-pane-tui">
+          <div class="terminal-container" id="terminal-container"></div>
+        </div>
+        <div class="terminal-subtab-pane" id="term-pane-shell">
+          <div class="terminal-container" id="shell-container"></div>
+          <div class="shell-keybar" id="shell-keybar">
+            <button class="shell-key" data-key="esc">Esc</button>
+            <button class="shell-key" data-key="tab">Tab</button>
+            <button class="shell-key sticky wide" data-sticky="ctrl">Ctrl</button>
+            <button class="shell-key sticky wide" data-sticky="alt">Alt</button>
+            <button class="shell-key" data-key="up" title="Up">&#x2191;</button>
+            <button class="shell-key" data-key="down" title="Down">&#x2193;</button>
+            <button class="shell-key" data-key="left" title="Left">&#x2190;</button>
+            <button class="shell-key" data-key="right" title="Right">&#x2192;</button>
+            <button class="shell-key" data-key="home" title="Home">Home</button>
+            <button class="shell-key" data-key="end" title="End">End</button>
+            <button class="shell-key" data-key="pgup" title="Page Up">PgUp</button>
+            <button class="shell-key" data-key="pgdn" title="Page Down">PgDn</button>
+            <button class="shell-key" data-key="del" title="Delete">Del</button>
+            <button class="shell-key" data-key="pipe">|</button>
+            <button class="shell-key" data-key="slash">/</button>
+            <button class="shell-key" data-key="backslash">\</button>
+            <button class="shell-key" data-key="tilde">~</button>
+            <button class="shell-key" data-key="dash">-</button>
+            <button class="shell-key" data-key="dollar">$</button>
+            <button class="shell-key" data-key="star">*</button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- Displays Tab -->
@@ -3029,6 +3183,47 @@ let fitAddon = null;
 let termInitialized = false;
 let termBuffer = [];
 
+// Standalone shell (lazy) — separate xterm instance in the Terminal tab's
+// "Shell" sub-tab. Keyed by (hostId, terminalId) so the same state shape
+// covers the future multi-host case.
+let shellTerm = null;
+let shellFitAddon = null;
+let shellInitialized = false;
+let shellOpenSent = false;
+const SHELL_HOST_ID = 'local';
+const SHELL_TERMINAL_ID = 'shell-0';
+let activeTermSubtab = 'tui';
+
+// Shell key bar state: sticky modifiers (Ctrl, Alt) that transform the
+// next character typed on the soft keyboard. Cleared after one use.
+const shellModifiers = { ctrl: false, alt: false };
+
+// Lookup table for shell key bar buttons. Keys here map to raw byte
+// sequences sent straight to the PTY. Defined in JS rather than in HTML
+// `data-seq` attributes because HTML attributes don't interpret
+// JavaScript escape sequences — `data-seq="\u001b"` would send the
+// literal 6 characters `\u001b` to the shell, not an ESC byte.
+const SHELL_KEY_SEQS = {
+  esc: '\x1b',
+  tab: '\t',
+  up: '\x1b[A',
+  down: '\x1b[B',
+  left: '\x1b[D',
+  right: '\x1b[C',
+  home: '\x1b[H',
+  end: '\x1b[F',
+  pgup: '\x1b[5~',
+  pgdn: '\x1b[6~',
+  del: '\x1b[3~',
+  pipe: '|',
+  slash: '/',
+  backslash: '\\',
+  tilde: '~',
+  dash: '-',
+  dollar: '$',
+  star: '*',
+};
+
 // Displays
 const displaySlots = new Map();
 
@@ -3428,6 +3623,22 @@ async function main() {
         const s = displaySlots.get(Number(d.display_id));
         if (s) s.handleIceCandidate(d.candidate);
         return;
+      }
+      // Standalone shell — intercept before WASM.
+      if (d.t === 'terminal_output') {
+        if (d.terminal_id === SHELL_TERMINAL_ID && d.host_id === SHELL_HOST_ID) {
+          handleShellOutput(d.data);
+        }
+        return;
+      }
+      if (d.t === 'terminal_exited') {
+        if (d.terminal_id === SHELL_TERMINAL_ID && d.host_id === SHELL_HOST_ID) {
+          handleShellExited(d.status);
+        }
+        return;
+      }
+      if (d.t === 'terminal_opened' || d.t === 'terminal_error') {
+        return; // ack / error; nothing UI-side to do yet
       }
       // Display resize — update stored dimensions and status text
       if (d.t === 'display_resize' || d.event === 'display_resize') {
@@ -4212,6 +4423,35 @@ function handleTermData(base64data) {
   }
 }
 
+// ── Standalone shell output handler ──
+// Called when the server sends {"t":"terminal_output", "data":"<base64>"}
+// for this host/terminal pair.
+function handleShellOutput(base64data) {
+  if (!shellTerm) return;
+  const bytes = Uint8Array.from(atob(base64data), c => c.charCodeAt(0));
+  shellTerm.write(bytes);
+}
+
+function handleShellExited(status) {
+  if (!shellTerm) return;
+  shellTerm.write(`\r\n\x1b[33m[shell exited with status ${status}]\x1b[0m\r\n`);
+  shellOpenSent = false;
+}
+
+// Encode a string as base64 (UTF-8 safe).
+function utf8ToBase64(s) {
+  return btoa(unescape(encodeURIComponent(s)));
+}
+
+// Send a raw WS message object by going through the WASM app's send_raw.
+// Falls back to send_server_action if send_raw isn't available.
+function sendRawMessage(obj) {
+  if (!app) return;
+  const payload = JSON.stringify(obj);
+  if (app.send_raw) { app.send_raw(payload); }
+  else if (app.send_server_action) { app.send_server_action(obj); }
+}
+
 function initTerminal() {
   if (termInitialized) return;
   termInitialized = true;
@@ -4248,7 +4488,7 @@ function initTerminal() {
       }
       termBuffer = [];
       new ResizeObserver(() => {
-        if (fitAddon && activeTab === 'terminal') fitAddon.fit();
+        if (fitAddon && activeTab === 'terminal' && activeTermSubtab === 'tui') fitAddon.fit();
       }).observe(document.getElementById('terminal-container'));
       term.onResize(({ cols, rows }) => app.send_resize(cols, rows));
     };
@@ -4256,6 +4496,237 @@ function initTerminal() {
   };
   document.head.appendChild(script);
 }
+
+// ── Standalone Shell (lazy xterm.js, separate instance from the TUI) ──
+//
+// Uses the same CDN-hosted xterm.js that the TUI loads, so initShell()
+// only needs to wait if the TUI hasn't loaded the script yet. Sends
+// terminal_open / terminal_input / terminal_resize / terminal_close
+// messages to the server; handleShellOutput/handleShellExited receive
+// the reply events.
+function initShell() {
+  if (shellInitialized) return;
+  shellInitialized = true;
+
+  // Ensure xterm.js is loaded (may already be loaded by initTerminal).
+  document.getElementById('xterm-css').removeAttribute('disabled');
+
+  const start = () => {
+    shellTerm = new Terminal({
+      theme: {
+        background: '#1e1e2e', foreground: '#cdd6f4', cursor: '#f5e0dc', cursorAccent: '#1e1e2e',
+        selectionBackground: '#45475a',
+        black: '#45475a', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
+        blue: '#89b4fa', magenta: '#cba6f7', cyan: '#94e2d5', white: '#bac2de',
+        brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
+        brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#cba6f7',
+        brightCyan: '#94e2d5', brightWhite: '#a6adc8',
+      },
+      fontFamily: "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
+      fontSize: 13, allowProposedApi: true,
+      scrollback: 5000,
+    });
+    shellFitAddon = new FitAddon.FitAddon();
+    shellTerm.loadAddon(shellFitAddon);
+    shellTerm.open(document.getElementById('shell-container'));
+    shellFitAddon.fit();
+
+    // Forward every byte the user types straight to the PTY. We use
+    // `onData` (not `onKey`) so sequences like arrow keys, Ctrl+C, and
+    // paste events all come through as the raw bytes xterm decoded.
+    // `applyShellModifiers` transforms the first char when the mobile
+    // key bar has Ctrl/Alt armed, then clears the modifier state.
+    shellTerm.onData((data) => {
+      sendShellBytes(applyShellModifiers(data));
+    });
+
+    shellTerm.onResize(({ cols, rows }) => {
+      sendRawMessage({
+        t: 'terminal_resize',
+        host_id: SHELL_HOST_ID,
+        terminal_id: SHELL_TERMINAL_ID,
+        cols, rows,
+      });
+    });
+
+    new ResizeObserver(() => {
+      if (shellFitAddon && activeTab === 'terminal' && activeTermSubtab === 'shell') {
+        shellFitAddon.fit();
+      }
+    }).observe(document.getElementById('shell-container'));
+
+    // Ask the server to open (or reattach to) the session. The server
+    // replays scrollback automatically on attach.
+    const dims = { cols: shellTerm.cols, rows: shellTerm.rows };
+    sendRawMessage({
+      t: 'terminal_open',
+      host_id: SHELL_HOST_ID,
+      terminal_id: SHELL_TERMINAL_ID,
+      cols: dims.cols, rows: dims.rows,
+    });
+    shellOpenSent = true;
+  };
+
+  // If xterm.js is already loaded (e.g. TUI tab was opened first), start
+  // immediately. Otherwise load it and its fit addon, then start.
+  if (typeof Terminal !== 'undefined' && typeof FitAddon !== 'undefined') {
+    start();
+    return;
+  }
+  const script = document.createElement('script');
+  script.src = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js';
+  script.onload = () => {
+    const fitScript = document.createElement('script');
+    fitScript.src = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js';
+    fitScript.onload = start;
+    document.head.appendChild(fitScript);
+  };
+  document.head.appendChild(script);
+}
+
+function switchTerminalSubtab(name) {
+  if (activeTermSubtab === name) return;
+  activeTermSubtab = name;
+  document.querySelectorAll('.terminal-subtab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.termTab === name);
+  });
+  document.querySelectorAll('.terminal-subtab-pane').forEach(pane => {
+    pane.classList.toggle('active', pane.id === `term-pane-${name}`);
+  });
+  // Key bar toggle is only meaningful on the Shell sub-tab.
+  const toggle = document.getElementById('keybar-toggle');
+  if (toggle) toggle.style.display = (name === 'shell') ? '' : 'none';
+  if (name === 'shell') {
+    if (!shellInitialized) initShell();
+    else if (shellFitAddon) requestAnimationFrame(() => shellFitAddon.fit());
+  } else if (name === 'tui' && fitAddon) {
+    requestAnimationFrame(() => fitAddon.fit());
+  }
+}
+
+// ── Shell key bar ──
+//
+// Sends bytes to the remote PTY via the same terminal_input message the
+// soft keyboard uses, so behavior is identical to typing on a real
+// keyboard. Two flavors of keys:
+//
+// - Fixed sequences (Esc, Tab, arrows, …) — `data-seq` contains the raw
+//   bytes to send. Modifier state is NOT applied to these, because a
+//   single tap on "↑" should send one arrow, not Ctrl+Up by accident.
+//
+// - Sticky modifiers (Ctrl, Alt) — `data-sticky` names the modifier.
+//   Tapping arms it (highlight); the next character the user types on
+//   the soft keyboard is transformed in xterm's onData handler before
+//   being sent. One-shot: the modifier clears after one transform.
+
+function sendShellBytes(bytes) {
+  sendRawMessage({
+    t: 'terminal_input',
+    host_id: SHELL_HOST_ID,
+    terminal_id: SHELL_TERMINAL_ID,
+    data: utf8ToBase64(bytes),
+  });
+}
+
+/// Apply any armed sticky modifiers to `data`, returning the transformed
+/// bytes. Clears the modifier state after applying (one-shot behavior).
+function applyShellModifiers(data) {
+  if (!shellModifiers.ctrl && !shellModifiers.alt) return data;
+  if (data.length !== 1) {
+    // Multi-byte paste or similar — don't try to transform, just clear
+    // modifiers and pass through unchanged.
+    shellModifiers.ctrl = false;
+    shellModifiers.alt = false;
+    updateShellModifierUi();
+    return data;
+  }
+  let out = data;
+  if (shellModifiers.ctrl) {
+    // ASCII control: 'a'→0x01, 'b'→0x02, …, '?'→0x7f. Only transforms
+    // letters and a few symbols; pass anything else through.
+    const code = data.charCodeAt(0);
+    let ctrlCode = null;
+    if (code >= 0x61 && code <= 0x7a) ctrlCode = code - 0x60;         // a–z → ^A..^Z
+    else if (code >= 0x41 && code <= 0x5a) ctrlCode = code - 0x40;    // A–Z → ^A..^Z
+    else if (code === 0x20) ctrlCode = 0;                              // ^Space
+    else if (code >= 0x5b && code <= 0x5f) ctrlCode = code - 0x40;    // [,\,],^,_
+    else if (code === 0x3f) ctrlCode = 0x7f;                           // ^? = DEL
+    if (ctrlCode !== null) out = String.fromCharCode(ctrlCode);
+  }
+  if (shellModifiers.alt) {
+    // Meta/Alt convention: prefix with ESC.
+    out = '\u001b' + out;
+  }
+  shellModifiers.ctrl = false;
+  shellModifiers.alt = false;
+  updateShellModifierUi();
+  return out;
+}
+
+function updateShellModifierUi() {
+  const bar = document.getElementById('shell-keybar');
+  if (!bar) return;
+  bar.querySelectorAll('.shell-key.sticky').forEach(btn => {
+    const name = btn.dataset.sticky;
+    btn.classList.toggle('armed', !!shellModifiers[name]);
+  });
+}
+
+function wireShellKeybar() {
+  const bar = document.getElementById('shell-keybar');
+  if (!bar) return;
+
+  // Use `pointerdown` rather than `click` for two reasons:
+  //  1. It fires immediately on both touch and mouse (no 300 ms tap delay
+  //     on some older mobile browsers).
+  //  2. preventDefault on pointerdown suppresses the focus shift that
+  //     would otherwise dismiss the soft keyboard when tapping a key,
+  //     without suppressing the action (unlike preventDefault on
+  //     touchstart, which also cancels the synthesized click).
+  const handlePress = (e) => {
+    const btn = e.target.closest('.shell-key');
+    if (!btn) return;
+    e.preventDefault();
+
+    const sticky = btn.dataset.sticky;
+    if (sticky) {
+      shellModifiers[sticky] = !shellModifiers[sticky];
+      updateShellModifierUi();
+    } else {
+      const keyName = btn.dataset.key;
+      const seq = keyName ? SHELL_KEY_SEQS[keyName] : null;
+      if (seq != null) {
+        // Fixed-sequence keys ignore modifiers — send raw bytes as-is.
+        sendShellBytes(seq);
+      }
+    }
+
+    // Make sure xterm keeps focus so the soft keyboard stays up.
+    if (shellTerm) shellTerm.focus();
+  };
+  bar.addEventListener('pointerdown', handlePress);
+
+  // Toggle visibility from the header button. The @media (pointer: coarse)
+  // rule forces the bar visible on touch devices regardless of this class.
+  const toggle = document.getElementById('keybar-toggle');
+  if (toggle) {
+    const isCoarse = window.matchMedia('(pointer: coarse)').matches;
+    if (isCoarse) {
+      toggle.classList.add('active');
+    }
+    toggle.addEventListener('click', () => {
+      bar.classList.toggle('visible');
+      toggle.classList.toggle('active', bar.classList.contains('visible'));
+      if (shellFitAddon) requestAnimationFrame(() => shellFitAddon.fit());
+    });
+    // Hide the toggle button when the Shell sub-tab isn't active — we
+    // only want it visible while the user can see the shell.
+    toggle.style.display = (activeTermSubtab === 'shell') ? '' : 'none';
+  }
+}
+// Wire on DOM load so the click handler is live even before the user
+// has ever opened the Terminal tab.
+document.addEventListener('DOMContentLoaded', wireShellKeybar);
 
 // ── Displays (WebRTC — video track + data channels for input) ──
 
@@ -7214,13 +7685,25 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => switchTab(btn.dataset.tab));
 });
 
+// Terminal sub-tab switching (TUI | Shell).
+document.querySelectorAll('.terminal-subtab-btn').forEach(btn => {
+  btn.addEventListener('click', () => switchTerminalSubtab(btn.dataset.termTab));
+});
+
 function switchTab(tabId) {
   activeTab = tabId;
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tabId));
   if (app) processCommands(app.set_active_tab(tabId));
-  if (tabId === 'terminal' && !termInitialized) initTerminal();
-  if (tabId === 'terminal' && term) requestAnimationFrame(() => fitAddon && fitAddon.fit());
+  if (tabId === 'terminal') {
+    if (activeTermSubtab === 'tui') {
+      if (!termInitialized) initTerminal();
+      if (term) requestAnimationFrame(() => fitAddon && fitAddon.fit());
+    } else if (activeTermSubtab === 'shell') {
+      if (!shellInitialized) initShell();
+      if (shellTerm) requestAnimationFrame(() => shellFitAddon && shellFitAddon.fit());
+    }
+  }
   if (tabId === 'activity' || tabId === 'displays') {
     relocateDisplays(tabId);
   }

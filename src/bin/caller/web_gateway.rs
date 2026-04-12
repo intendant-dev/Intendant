@@ -1138,6 +1138,17 @@ pub fn spawn_web_gateway(
     let voice_debug = Arc::new(Mutex::new(VoiceDebugState::default()));
     let active_presence: Arc<Mutex<Option<ActivePresence>>> = Arc::new(Mutex::new(None));
 
+    // Process-wide registry of standalone shell PTY sessions, keyed by
+    // (host_id, terminal_id). Lives as long as the web gateway task and
+    // is cloned into each per-connection handler so WS reconnects reattach
+    // to existing shells. Keyed on host_id even though there's only one
+    // host today so multi-host phase 1 can add siblings without refactor.
+    let terminal_registry: Arc<crate::terminal::TerminalRegistry> = Arc::new(
+        crate::terminal::TerminalRegistry::new(
+            project_root.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))),
+        ),
+    );
+
     // Cache the latest usage_update JSON so late-connecting browsers get it
     // without sending ControlMsg (which would pollute the event log).
     let last_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -1244,6 +1255,7 @@ pub fn spawn_web_gateway(
             let task_tx = task_tx.clone();
             let project_root = project_root.clone();
             let mcp_server = mcp_server.clone();
+            let terminal_registry = terminal_registry.clone();
 
             tokio::spawn(async move {
                 // Snapshot session state at connection time
@@ -1415,6 +1427,7 @@ pub fn spawn_web_gateway(
                     let session_log_inbound = session_log.clone();
                     let session_registry_inbound = session_registry.clone();
                     let task_tx_inbound = task_tx.clone();
+                    let terminal_registry_inbound = terminal_registry.clone();
                     let inbound = tokio::spawn(async move {
                         // Track whether this connection has an active presence model,
                         // so we can auto-send PresenceDisconnected if the WebSocket drops
@@ -2383,6 +2396,102 @@ pub fn spawn_web_gateway(
                                                     }
                                                 }
                                             }
+                                        }
+                                        Some("terminal_open") => {
+                                            // {"t":"terminal_open","host_id":"local","terminal_id":"shell-0","cols":80,"rows":24}
+                                            let host_id = json["host_id"].as_str().unwrap_or("local").to_string();
+                                            let terminal_id = json["terminal_id"].as_str().unwrap_or("shell-0").to_string();
+                                            let cols = json["cols"].as_u64().unwrap_or(80) as u16;
+                                            let rows = json["rows"].as_u64().unwrap_or(24) as u16;
+                                            let key = crate::terminal::TerminalKey { host_id: host_id.clone(), terminal_id: terminal_id.clone() };
+
+                                            match terminal_registry_inbound.open_or_attach(key.clone(), cols, rows).await {
+                                                Ok(session) => {
+                                                    // Spawn a forwarder task that drains the session's
+                                                    // per-listener channel and sends base64-encoded
+                                                    // output to this WS connection.
+                                                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                                                    session.attach(tx);
+
+                                                    let forwarder_tx = direct_tx_inbound.clone();
+                                                    let fwd_host = host_id.clone();
+                                                    let fwd_term = terminal_id.clone();
+                                                    tokio::spawn(async move {
+                                                        use base64::Engine as _;
+                                                        while let Some(event) = rx.recv().await {
+                                                            let msg = match event {
+                                                                crate::terminal::TerminalEvent::Output(bytes) => {
+                                                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                                                    serde_json::json!({
+                                                                        "t": "terminal_output",
+                                                                        "host_id": fwd_host,
+                                                                        "terminal_id": fwd_term,
+                                                                        "data": b64,
+                                                                    })
+                                                                }
+                                                                crate::terminal::TerminalEvent::Exited { status } => {
+                                                                    serde_json::json!({
+                                                                        "t": "terminal_exited",
+                                                                        "host_id": fwd_host,
+                                                                        "terminal_id": fwd_term,
+                                                                        "status": status,
+                                                                    })
+                                                                }
+                                                            };
+                                                            if forwarder_tx.send(msg.to_string()).is_err() {
+                                                                break;
+                                                            }
+                                                        }
+                                                    });
+
+                                                    let ack = serde_json::json!({
+                                                        "t": "terminal_opened",
+                                                        "host_id": host_id,
+                                                        "terminal_id": terminal_id,
+                                                    });
+                                                    let _ = direct_tx_inbound.send(ack.to_string());
+                                                }
+                                                Err(e) => {
+                                                    let err = serde_json::json!({
+                                                        "t": "terminal_error",
+                                                        "host_id": host_id,
+                                                        "terminal_id": terminal_id,
+                                                        "error": e,
+                                                    });
+                                                    let _ = direct_tx_inbound.send(err.to_string());
+                                                }
+                                            }
+                                        }
+                                        Some("terminal_input") => {
+                                            // {"t":"terminal_input","host_id":"local","terminal_id":"shell-0","data":"<base64>"}
+                                            let host_id = json["host_id"].as_str().unwrap_or("local").to_string();
+                                            let terminal_id = json["terminal_id"].as_str().unwrap_or("shell-0").to_string();
+                                            let data_b64 = json["data"].as_str().unwrap_or("");
+                                            use base64::Engine as _;
+                                            if let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                                                let key = crate::terminal::TerminalKey { host_id, terminal_id };
+                                                if let Some(session) = terminal_registry_inbound.get(&key).await {
+                                                    session.write_input(&data);
+                                                }
+                                            }
+                                        }
+                                        Some("terminal_resize") => {
+                                            // {"t":"terminal_resize","host_id":"local","terminal_id":"shell-0","cols":N,"rows":N}
+                                            let host_id = json["host_id"].as_str().unwrap_or("local").to_string();
+                                            let terminal_id = json["terminal_id"].as_str().unwrap_or("shell-0").to_string();
+                                            let cols = json["cols"].as_u64().unwrap_or(80) as u16;
+                                            let rows = json["rows"].as_u64().unwrap_or(24) as u16;
+                                            let key = crate::terminal::TerminalKey { host_id, terminal_id };
+                                            if let Some(session) = terminal_registry_inbound.get(&key).await {
+                                                session.resize(cols, rows);
+                                            }
+                                        }
+                                        Some("terminal_close") => {
+                                            // {"t":"terminal_close","host_id":"local","terminal_id":"shell-0"}
+                                            let host_id = json["host_id"].as_str().unwrap_or("local").to_string();
+                                            let terminal_id = json["terminal_id"].as_str().unwrap_or("shell-0").to_string();
+                                            let key = crate::terminal::TerminalKey { host_id, terminal_id };
+                                            terminal_registry_inbound.close(&key).await;
                                         }
                                         Some("display_input") => {
                                             // Input event (keyboard/mouse) for a display session
