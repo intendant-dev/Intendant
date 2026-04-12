@@ -11,8 +11,8 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::error::CallerError;
 
 use super::{
-    AgentConfig, AgentEvent, AgentThread, ApprovalCategory, ApprovalDecision, ExternalAgent,
-    ToolCompletionStatus,
+    AgentConfig, AgentEvent, AgentImageAttachment, AgentThread, ApprovalCategory,
+    ApprovalDecision, ExternalAgent, ToolCompletionStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -784,15 +784,43 @@ impl ExternalAgent for CodexAgent {
         thread: &AgentThread,
         message: &str,
     ) -> Result<(), CallerError> {
+        self.send_message_with_images(thread, message, &[]).await
+    }
+
+    async fn send_message_with_images(
+        &mut self,
+        thread: &AgentThread,
+        message: &str,
+        images: &[AgentImageAttachment],
+    ) -> Result<(), CallerError> {
         let augmented = if self.web_port.is_some() && !self.prompt_sent {
             self.prompt_sent = true;
             format!("{}{}", message, DISPLAY_TOOLS_PROMPT)
         } else {
             message.to_string()
         };
+        // Codex v2 `UserInput` enum (camelCase): { type: "text" | "localImage" | "image" }.
+        // Prefer `localImage` (file path) when we have one — keeps base64 out of the
+        // JSON-RPC stream. Fall back to `image` with a data URL only if we don't.
+        let mut input: Vec<serde_json::Value> = Vec::with_capacity(images.len() + 1);
+        input.push(serde_json::json!({"type": "text", "text": augmented}));
+        for img in images {
+            if let Some(ref path) = img.local_path {
+                input.push(serde_json::json!({
+                    "type": "localImage",
+                    "path": path.to_string_lossy(),
+                }));
+            } else {
+                let data_url = format!("data:{};base64,{}", img.mime_type, img.base64);
+                input.push(serde_json::json!({
+                    "type": "image",
+                    "url": data_url,
+                }));
+            }
+        }
         let params = serde_json::json!({
             "threadId": thread.thread_id,
-            "input": [{"type": "text", "text": augmented}],
+            "input": input,
         });
         // turn/start is a request — Codex v2 requires an id to start processing
         let _ = self.send_request("turn/start", Some(params)).await?;

@@ -36,6 +36,7 @@ pub fn action_to_control_msg(action: &PresenceAction) -> Option<(ControlMsg, Str
                     direct: if envelope.force_direct { Some(true) } else { None },
                     reference_frame_ids: envelope.reference_frame_ids.clone(),
                     display_target: envelope.display_target.clone(),
+                    attachments: envelope.attachment_frame_ids.clone(),
                 },
                 confirmation,
             ))
@@ -701,6 +702,7 @@ pub async fn handle_tool_query(
                     q.push(crate::event::ContextInjection {
                         text: format!("[Presence] {}", msg),
                         images,
+                        source: crate::event::InjectionSource::User,
                     });
                 }
             }
@@ -1165,6 +1167,7 @@ mod tests {
             context_hints: vec!["check src/main.rs".to_string()],
             reference_frame_ids: vec!["cam0-f00005".to_string()],
             display_target: Some("user_session".to_string()),
+            attachment_frame_ids: vec![],
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let parsed: TaskEnvelope = serde_json::from_str(&json).unwrap();

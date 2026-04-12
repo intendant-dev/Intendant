@@ -564,6 +564,7 @@ async fn run_daemon_loop(config: DaemonConfig) {
                         direct,
                         reference_frame_ids,
                         display_target,
+                        attachments,
                     })) => {
                         eprintln!(
                             "New session{}: {}",
@@ -674,6 +675,22 @@ async fn run_daemon_loop(config: DaemonConfig) {
                             &config.shared_external_agent, &new_project,
                         ).await;
                         let web_port_for_spawn = config.web_port;
+                        // Resolve attachments → image data once, before the spawn.
+                        // The daemon path creates a fresh session per task, so we
+                        // don't have to worry about clobbering pending attachments.
+                        let attachment_images = resolve_frame_ids(
+                            &attachments, &config.frame_registry,
+                        ).await;
+                        if !attachment_images.is_empty() {
+                            config.bus.send(AppEvent::PresenceLog {
+                                message: format!(
+                                    "[runtime] Task dispatched with {} attachment(s)",
+                                    attachment_images.len()
+                                ),
+                                level: None,
+                                turn: None,
+                            });
+                        }
 
                         tokio::spawn(async move {
                             let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
@@ -683,6 +700,7 @@ async fn run_daemon_loop(config: DaemonConfig) {
                                     bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
                                     new_log_dir, follow_up_rx, None,
                                     event::ApprovalRegistry::default(), true, web_port_for_spawn,
+                                    attachment_images.clone(),
                                 ).await
                             } else {
                                 let new_provider = match provider::select_provider() {
@@ -701,6 +719,7 @@ async fn run_daemon_loop(config: DaemonConfig) {
                                         event::ApprovalRegistry::default(),
                                         event::ContextInjectionQueue::default(),
                                         true,
+                                        attachment_images,
                                     ).await
                                 } else {
                                     run_user_mode(
@@ -2587,10 +2606,13 @@ async fn run_agent_loop(
         std::collections::HashSet::new();
     let mut exit_reason = LoopExitReason::TaskComplete;
 
-    // Discard stale context injections from before this task started
-    // (e.g. display take/release events that happened while idle).
+    // Discard stale System injections from before this task started
+    // (e.g. display take/release events that happened while idle), but
+    // PRESERVE User injections — those come from the dashboard's annotation
+    // Send button and may have been queued while the agent was idle. We owe
+    // the user the courtesy of actually delivering what they sent.
     if let Ok(mut q) = context_injection.lock() {
-        q.clear();
+        q.retain(|inj| inj.source == event::InjectionSource::User);
     }
 
     for turn in 1..=SAFETY_CAP {
@@ -4144,6 +4166,7 @@ async fn run_with_presence(
             context_hints: vec![],
             reference_frame_ids: vec![],
             display_target: None,
+            attachment_frame_ids: vec![],
         };
         let _ = fallback_task_tx.send(envelope).await;
     }
@@ -4209,6 +4232,30 @@ async fn run_with_presence(
             &envelope.context_hints, &frame_registry
         ).await;
 
+        // Resolve user-attached frames → images. These come from the dashboard's
+        // "Attach" buttons (annotation toolbar / Video tab) and are appended to
+        // the first user message of the agent conversation, in addition to
+        // anything from `context_hints`.
+        let attachment_images = resolve_frame_ids(
+            &envelope.attachment_frame_ids, &frame_registry
+        ).await;
+        if !attachment_images.is_empty() {
+            bus.send(AppEvent::PresenceLog {
+                message: format!(
+                    "[runtime] Task dispatched with {} attachment(s)",
+                    attachment_images.len()
+                ),
+                level: None,
+                turn: None,
+            });
+            slog(&session_log, |l| {
+                l.info(&format!(
+                    "Task has {} user attachment(s)",
+                    attachment_images.len()
+                ))
+            });
+        }
+
         // ── CU-first routing: all tasks go to fast CU model first ──
         let mut task_for_agent: Option<String> = None;
 
@@ -4228,8 +4275,13 @@ async fn run_with_presence(
                 reference_images = auto_attach_display_frames(&frame_registry).await;
             }
 
+            // Combine context-hint frames with user attachments so the CU
+            // model also sees what the user pointed at when issuing the task.
+            let mut cu_context_images = frame_images.clone();
+            cu_context_images.extend(attachment_images.iter().cloned());
+
             match try_cu_first(
-                &project_root, &reference_images, &frame_images,
+                &project_root, &reference_images, &cu_context_images,
                 &envelope.task, &session_log, &log_dir, &bus, &session_registry,
             ).await {
                 Some(Ok(CuTaskResult::Completed(stats))) => {
@@ -4316,10 +4368,23 @@ async fn run_with_presence(
                 persistent_agent_backend = agent_backend.clone();
             }
 
-            // Send the task as a new turn in the existing thread
+            // Send the task as a new turn in the existing thread, with any
+            // user-attached frames passed as image inputs (Codex `LocalImage`,
+            // Gemini ACP `Image` content block).
             let agent = persistent_agent.as_mut().unwrap();
             let thread = persistent_thread.as_ref().unwrap();
-            if let Err(e) = agent.send_message(thread, &task_text).await {
+            let send_result = if envelope.attachment_frame_ids.is_empty() {
+                agent.send_message(thread, &task_text).await
+            } else {
+                let attachments = resolve_frame_attachments(
+                    &envelope.attachment_frame_ids,
+                    &frame_registry,
+                ).await;
+                agent
+                    .send_message_with_images(thread, &task_text, &attachments)
+                    .await
+            };
+            if let Err(e) = send_result {
                 bus.send(AppEvent::PresenceLog {
                     message: format!("External agent send error: {}", e),
                     level: Some(types::LogLevel::Error), turn: None,
@@ -4425,11 +4490,16 @@ async fn run_with_presence(
                 ));
                 conv.add_assistant("Understood.".to_string());
 
-                // Add task with optional frame images
-                if frame_images.is_empty() {
+                // Add task with optional frame images. Combine context-hint
+                // frames (from `frames:` hints) with user-attached frames
+                // (from the dashboard's "Attach" buttons) — they're both
+                // image content the model should see alongside the task.
+                let mut combined_images = frame_images;
+                combined_images.extend(attachment_images.iter().cloned());
+                if combined_images.is_empty() {
                     conv.add_user(task_text.clone());
                 } else {
-                    conv.add_user_with_images(task_text.clone(), frame_images);
+                    conv.add_user_with_images(task_text.clone(), combined_images);
                 }
 
                 persistent_project = Some(proj);
@@ -4449,12 +4519,14 @@ async fn run_with_presence(
                     });
                 }
 
-                if frame_images.is_empty() {
+                let mut combined_images = frame_images;
+                combined_images.extend(attachment_images.iter().cloned());
+                if combined_images.is_empty() {
                     conv.add_user(format!("[New Task] {}", task_text));
                 } else {
                     conv.add_user_with_images(
                         format!("[New Task] {}", task_text),
-                        frame_images,
+                        combined_images,
                     );
                 }
             }
@@ -4807,6 +4879,7 @@ async fn run_direct_mode(
     approval_registry: event::ApprovalRegistry,
     context_injection: event::ContextInjectionQueue,
     headless: bool,
+    attachment_images: Vec<conversation::ImageData>,
 ) -> Result<LoopStats, CallerError> {
     let role = sub_agent::SubAgentRole::Custom("direct".to_string());
     let system_prompt = if provider.use_tools() {
@@ -4843,7 +4916,12 @@ async fn run_direct_mode(
                     ))
                 });
                 // Append the new task as a continuation message
-                conv.add_user(format!("[Session resumed] Continue with: {}", task));
+                let resume_msg = format!("[Session resumed] Continue with: {}", task);
+                if attachment_images.is_empty() {
+                    conv.add_user(resume_msg);
+                } else {
+                    conv.add_user_with_images(resume_msg, attachment_images.clone());
+                }
                 conv
             }
             Err(e) => {
@@ -4854,15 +4932,26 @@ async fn run_direct_mode(
                     ))
                 });
                 let mut conv = Conversation::new(system_prompt, provider.context_window());
-                setup_fresh_conversation(&mut conv, &project, &task);
+                setup_fresh_conversation_with_attachments(
+                    &mut conv,
+                    &project,
+                    &task,
+                    attachment_images.clone(),
+                );
                 conv
             }
         }
     } else {
         let mut conv = Conversation::new(system_prompt, provider.context_window());
-        setup_fresh_conversation(&mut conv, &project, &task);
+        setup_fresh_conversation_with_attachments(
+            &mut conv,
+            &project,
+            &task,
+            attachment_images.clone(),
+        );
         conv
     };
+    let _ = attachment_images; // moved into setup; declare consumed
 
     // Register MCP tools so providers include them in API requests
     if let Some(ref mgr) = mcp_mgr {
@@ -4910,6 +4999,7 @@ async fn run_external_agent_mode(
     approval_registry: event::ApprovalRegistry,
     headless: bool,
     web_port: Option<u16>,
+    attachment_images: Vec<conversation::ImageData>,
 ) -> Result<LoopStats, CallerError> {
     slog(&session_log, |l| {
         l.info(&format!("Mode: external agent ({})", backend));
@@ -4924,8 +5014,26 @@ async fn run_external_agent_mode(
     let (mut agent, thread, mut event_rx) =
         create_external_agent(&backend, &project, &session_log, web_port).await?;
 
-    agent.send_message(&thread, &task).await?;
-    slog(&session_log, |l| l.info("Initial task sent to external agent"));
+    if attachment_images.is_empty() {
+        agent.send_message(&thread, &task).await?;
+    } else {
+        let attachments: Vec<external_agent::AgentImageAttachment> = attachment_images
+            .iter()
+            .map(external_agent::AgentImageAttachment::from_image_data)
+            .collect();
+        agent
+            .send_message_with_images(&thread, &task, &attachments)
+            .await?;
+        slog(&session_log, |l| {
+            l.info(&format!(
+                "Initial task sent to external agent with {} attachment(s)",
+                attachments.len()
+            ))
+        });
+    }
+    if attachment_images.is_empty() {
+        slog(&session_log, |l| l.info("Initial task sent to external agent"));
+    }
 
     // Event loop
     let mut round = 1usize;
@@ -5066,6 +5174,23 @@ fn setup_fresh_conversation(conv: &mut Conversation, project: &Project, task: &s
     conv.add_user(task.to_string());
 }
 
+/// Set up a fresh conversation with project context, memory, skills, task, and
+/// optional user-attached images.  When images are present, they are added to
+/// the same user message as the task so the model sees them as inline context.
+fn setup_fresh_conversation_with_attachments(
+    conv: &mut Conversation,
+    project: &Project,
+    task: &str,
+    images: Vec<conversation::ImageData>,
+) {
+    setup_fresh_conversation_no_task(conv, project);
+    if images.is_empty() {
+        conv.add_user(task.to_string());
+    } else {
+        conv.add_user_with_images(task.to_string(), images);
+    }
+}
+
 /// Resolve `frames:` context hints into HQ images from the frame registry.
 async fn resolve_frame_hints(
     hints: &[String],
@@ -5119,6 +5244,33 @@ async fn resolve_frame_ids(
         }
     }
     images
+}
+
+/// Resolve frame IDs into `AgentImageAttachment`s for an external agent.
+///
+/// Captures the on-disk path so backends like Codex can pass `LocalImage`
+/// (file reference) instead of inline base64 in JSON-RPC.
+async fn resolve_frame_attachments(
+    frame_ids: &[String],
+    registry: &Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
+) -> Vec<external_agent::AgentImageAttachment> {
+    if frame_ids.is_empty() {
+        return Vec::new();
+    }
+    let mut atts = Vec::new();
+    let reg = registry.read().await;
+    for fid in frame_ids {
+        let Ok(data) = reg.read_hq(fid) else { continue };
+        use base64::Engine;
+        let base64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        let path = reg.path_for(fid);
+        atts.push(external_agent::AgentImageAttachment::from_frame_path(
+            path,
+            base64,
+            "image/jpeg".to_string(),
+        ));
+    }
+    atts
 }
 
 /// Auto-attach the latest display frame(s) from the frame registry.
@@ -6511,6 +6663,7 @@ async fn main() -> Result<(), CallerError> {
                             approval_registry,
                             false,
                             web_port_for_agent,
+                            vec![],
                         )
                         .await
                     } else if use_orchestration {
@@ -6538,6 +6691,7 @@ async fn main() -> Result<(), CallerError> {
                             approval_registry,
                             event::ContextInjectionQueue::default(),
                             false, // not headless — MCP has interactive approval
+                            vec![],
                         )
                         .await
                     };
@@ -6790,17 +6944,24 @@ async fn main() -> Result<(), CallerError> {
             tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
         app.set_task_sender(task_tx.clone());
 
-        // Deferred web gateway spawn — now we have the agent state for tool queries
+        // Deferred web gateway spawn — now we have the agent state for tool queries.
+        // Note: WebQueryCtx is built UNCONDITIONALLY (not gated on presence).
+        // The web dashboard's annotation Send button needs the context_injection
+        // queue regardless of whether the presence layer is enabled, so that
+        // injections still reach the agent loop in --no-presence mode.
+        // When presence is disabled, agent_state is a fresh empty snapshot
+        // (no live updates), but context_injection is still wired through.
         let _web_handle = if let Some(broadcast_tx) = web_broadcast_tx {
-            let query_ctx = presence_agent_state.as_ref().map(|state| {
-                web_gateway::WebQueryCtx {
-                    agent_state: state.clone(),
-                    project_root: project.root.clone(),
-                    log_dir: log_dir.clone(),
-                    knowledge_path: project.memory_path(),
-                    presence_session: Some(presence_session.clone()),
-                    context_injection: Some(app.context_injection.clone()),
-                }
+            let query_ctx_agent_state = presence_agent_state
+                .clone()
+                .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(presence::AgentStateSnapshot::default())));
+            let query_ctx = Some(web_gateway::WebQueryCtx {
+                agent_state: query_ctx_agent_state,
+                project_root: project.root.clone(),
+                log_dir: log_dir.clone(),
+                knowledge_path: project.memory_path(),
+                presence_session: Some(presence_session.clone()),
+                context_injection: Some(app.context_injection.clone()),
             });
             let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
                 if project.config.transcription.enabled {
@@ -7018,6 +7179,7 @@ async fn main() -> Result<(), CallerError> {
                         approval_registry_clone,
                         false, // not headless — TUI handles approval
                         web_port_for_agent,
+                        vec![],
                     )
                     .await
                 } else {
@@ -7047,6 +7209,7 @@ async fn main() -> Result<(), CallerError> {
                             approval_registry_clone,
                             context_injection_clone,
                             false, // not headless — TUI handles approval
+                            vec![],
                         )
                         .await
                     } else {
@@ -7379,6 +7542,7 @@ async fn main() -> Result<(), CallerError> {
                 event::ApprovalRegistry::default(),
                 true, // headless mode
                 web_port_for_agent,
+                vec![],
             )
             .await
         } else {
@@ -7400,6 +7564,7 @@ async fn main() -> Result<(), CallerError> {
                     event::ApprovalRegistry::default(),
                     event::ContextInjectionQueue::default(),
                     true, // headless mode
+                    vec![],
                 )
                 .await
             } else {

@@ -1181,11 +1181,12 @@ impl App {
                     );
                 }
             }
-            ControlMsg::StartTask { task, orchestrate, direct, reference_frame_ids, display_target } => {
+            ControlMsg::StartTask { task, orchestrate, direct, reference_frame_ids, display_target, attachments } => {
                 // Dispatch unconditionally — no phase gating. The task_rx loop
                 // (main.rs) processes tasks sequentially, and the mpsc channel
                 // (capacity=4) buffers incoming tasks. The TUI tracks phase for
                 // display purposes only, not dispatch authority.
+                let attachment_count = attachments.len();
                 let dispatched = if let Some(ref tx) = self.task_tx {
                     let envelope = presence_core::TaskEnvelope {
                         task: task.clone(),
@@ -1193,6 +1194,7 @@ impl App {
                         context_hints: vec![],
                         reference_frame_ids,
                         display_target,
+                        attachment_frame_ids: attachments,
                     };
                     tx.try_send(envelope).is_ok()
                 } else if let Some(ref tx) = self.follow_up_tx {
@@ -1205,7 +1207,23 @@ impl App {
                     self.mode = AppMode::Normal;
                     self.current_phase = Phase::Thinking;
                     self.round += 1;
-                    self.log_sourced(LogLevel::Info, format!("[runtime] Task dispatched: {}", truncate_str(&task, 80)), LogSource::Live, None);
+                    let suffix = if attachment_count > 0 {
+                        format!(" with {} attachment{}",
+                            attachment_count,
+                            if attachment_count == 1 { "" } else { "s" })
+                    } else {
+                        String::new()
+                    };
+                    self.log_sourced(
+                        LogLevel::Info,
+                        format!(
+                            "[runtime] Task dispatched{}: {}",
+                            suffix,
+                            truncate_str(&task, 80)
+                        ),
+                        LogSource::Live,
+                        None,
+                    );
                 } else {
                     self.log(
                         LogLevel::Warn,
@@ -1427,6 +1445,7 @@ impl App {
                             direct: None,
                             reference_frame_ids: vec![],
                             display_target: None,
+                            attachments: vec![],
                         });
                     }
                     Err(e) => {

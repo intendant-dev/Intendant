@@ -1,3 +1,4 @@
+use crate::conversation::ImageData;
 use crate::error::CallerError;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -6,6 +7,41 @@ use tokio::sync::mpsc;
 
 pub mod codex;
 pub mod gemini;
+
+/// One image attachment passed alongside a user message.
+///
+/// Some backends (Codex) prefer file paths to keep base64 out of the JSON-RPC
+/// stream; others (Gemini ACP) embed base64 inline in `ContentBlock::Image`.
+/// We pass both so each backend can pick the form it supports best.
+#[derive(Debug, Clone)]
+pub struct AgentImageAttachment {
+    /// Path on disk where the image is stored (used by Codex `LocalImage`).
+    pub local_path: Option<PathBuf>,
+    /// Base64-encoded image data (used by Gemini ACP `Image` content block).
+    pub base64: String,
+    /// MIME type, e.g. `image/jpeg`.
+    pub mime_type: String,
+}
+
+impl AgentImageAttachment {
+    /// Build from a `conversation::ImageData` (base64 only — no on-disk path).
+    pub fn from_image_data(img: &ImageData) -> Self {
+        Self {
+            local_path: None,
+            base64: img.data.clone(),
+            mime_type: img.media_type.clone(),
+        }
+    }
+
+    /// Build from on-disk frame data, capturing both path and base64.
+    pub fn from_frame_path(path: PathBuf, base64: String, mime_type: String) -> Self {
+        Self {
+            local_path: Some(path),
+            base64,
+            mime_type,
+        }
+    }
+}
 
 /// Identifies which external agent backend is in use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +179,19 @@ pub trait ExternalAgent: Send + Sync {
         thread: &AgentThread,
         message: &str,
     ) -> Result<(), CallerError>;
+
+    /// Send a user message with attached images. Default implementation
+    /// falls back to text-only `send_message`, ignoring attachments — backends
+    /// that support multimodal input should override this.
+    async fn send_message_with_images(
+        &mut self,
+        thread: &AgentThread,
+        message: &str,
+        images: &[AgentImageAttachment],
+    ) -> Result<(), CallerError> {
+        let _ = images;
+        self.send_message(thread, message).await
+    }
 
     /// Respond to an approval request from the agent.
     async fn resolve_approval(

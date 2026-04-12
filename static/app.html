@@ -1634,6 +1634,99 @@ html, body {
   font-weight: 600;
 }
 .ann-save-btn:hover { background: var(--blue); color: var(--base); }
+.ann-attach-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--peach);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--peach);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.ann-attach-btn:hover { background: var(--peach); color: var(--base); }
+.ann-submit-btn:disabled, .clip-toolbar .clip-send-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background: var(--surface0);
+  color: var(--overlay0);
+  border-color: var(--surface2);
+}
+.ann-submit-btn:disabled:hover, .clip-toolbar .clip-send-btn:disabled:hover {
+  opacity: 0.4;
+  background: var(--surface0);
+  border-color: var(--surface2);
+}
+.pending-attachments-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface1);
+  flex-wrap: wrap;
+  font-size: 11px;
+}
+.pending-attachments-bar.hidden { display: none; }
+.pending-attachments-label {
+  color: var(--subtext1);
+  font-weight: 600;
+  font-size: 11px;
+}
+.pending-attachments-count {
+  font-size: 10px;
+  color: var(--overlay0);
+  padding: 1px 6px;
+  border: 1px solid var(--surface1);
+  border-radius: 8px;
+}
+.pending-attachments-count.warn {
+  color: var(--peach);
+  border-color: var(--peach);
+  background: rgba(250, 179, 135, 0.08);
+}
+.pending-attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 6px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 3px;
+  font-family: monospace;
+  font-size: 10px;
+  color: var(--subtext1);
+}
+.pending-attachment-chip .chip-thumb {
+  width: 28px;
+  height: 18px;
+  object-fit: cover;
+  border-radius: 2px;
+  margin-right: 2px;
+}
+.pending-attachment-chip .chip-remove {
+  width: 14px;
+  height: 14px;
+  border: none;
+  background: transparent;
+  color: var(--overlay0);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+}
+.pending-attachment-chip .chip-remove:hover { color: var(--red); }
+.pending-attachments-clear {
+  margin-left: auto;
+  font-size: 10px;
+  padding: 1px 8px;
+  border: 1px solid var(--surface2);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--overlay0);
+  cursor: pointer;
+}
+.pending-attachments-clear:hover { background: var(--red); color: var(--base); border-color: var(--red); }
 .annotation-refs-panel {
   display: flex;
   align-items: center;
@@ -2255,6 +2348,14 @@ html, body {
         </select>
       </div>
 
+      <!-- Pending attachments bar (frames the user has Attached but not yet sent) -->
+      <div class="pending-attachments-bar hidden" id="pending-attachments-bar">
+        <span class="pending-attachments-label">Attachments</span>
+        <span class="pending-attachments-count" id="pending-attachments-count">0</span>
+        <div id="pending-attachments-list" style="display:flex;gap:4px;flex-wrap:wrap"></div>
+        <button class="pending-attachments-clear" id="pending-attachments-clear" title="Remove all attachments">Clear</button>
+      </div>
+
       <!-- Task Input -->
       <div style="display:flex;gap:4px;padding:4px 8px;border-bottom:1px solid var(--surface1);align-items:center">
         <input id="activity-task-input" placeholder="Enter task..." style="flex:1;padding:4px 8px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);font-size:12px" />
@@ -2395,7 +2496,8 @@ html, body {
           <div class="ann-submit">
             <input class="ann-note" id="ann-note" placeholder="Note..." />
             <button class="ann-save-btn" id="ann-save-btn" title="Save annotation to disk">Save</button>
-            <button class="ann-submit-btn" id="ann-submit-btn" title="Save and send to agent">Send</button>
+            <button class="ann-attach-btn" id="ann-attach-btn" title="Queue for the next task (works without an agent)">Attach</button>
+            <button class="ann-submit-btn" id="ann-submit-btn" title="Save and inject into the live presence layer">Send</button>
           </div>
           <span class="ann-result" id="ann-result"></span>
           <button class="ann-close" id="ann-close" title="Exit annotation (Esc)">&times;</button>
@@ -2427,7 +2529,8 @@ html, body {
             <button id="clip-preview-btn" title="Generate preview thumbnails">Preview</button>
             <input class="ann-note" id="clip-note" placeholder="Clip note..." />
             <button class="clip-save-btn" id="clip-save-btn" title="Save clip frames to registry">Save</button>
-            <button class="clip-send-btn" id="clip-send-btn" title="Save and send clip to agent">Send</button>
+            <button class="ann-attach-btn" id="clip-attach-btn" title="Queue clip frames for the next task (works without an agent)">Attach</button>
+            <button class="clip-send-btn" id="clip-send-btn" title="Save and inject into the live presence layer">Send</button>
             <span class="clip-status" id="clip-status"></span>
             <button class="ann-close" id="clip-close" title="Exit clip mode (Esc)">&times;</button>
           </div>
@@ -3296,6 +3399,15 @@ async function main() {
         showAnnotationResult(d.path);
         return;
       }
+      if (d.t === 'annotation_attached') {
+        // Server confirmed the attach landed in the registry. Our local
+        // pending list was already populated optimistically — nothing to do
+        // unless registration failed, in which case the chip would lie.
+        if (d.ok === false) {
+          removePendingAttachment(d.frame_id);
+        }
+        return;
+      }
       if (d.t === 'clip_saved') {
         const el = document.getElementById('clip-status');
         if (el) {
@@ -3379,6 +3491,7 @@ async function main() {
     const isReconnect = voiceHadPriorSession;
     voiceHadPriorSession = false;
     modelConnected = true;
+    if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
     document.getElementById('sb-voice').className = 'voice-dot ok';
     document.getElementById('videoBtn').classList.remove('is-disabled');
     const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
@@ -3433,6 +3546,7 @@ async function main() {
     if (!msg.startsWith('Server')) {
       if (modelConnected) voiceHadPriorSession = true;
       modelConnected = false;
+      if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
       document.getElementById('sb-voice').className = 'voice-dot err';
       if (videoActive) stopVideo();
       document.getElementById('videoBtn').classList.add('is-disabled');
@@ -3450,6 +3564,7 @@ async function main() {
       if (videoActive) stopVideo();
       app.disconnect_voice();
       modelConnected = false;
+      if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
       document.getElementById('sb-voice').className = 'voice-dot err';
       document.getElementById('videoBtn').classList.add('is-disabled');
       connectVoice();
@@ -3506,6 +3621,7 @@ async function main() {
       if (videoActive) stopVideo();
       app.disconnect_voice();
       modelConnected = false;
+      if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
       micActive = false;
       document.getElementById('micBtn').classList.remove('active');
       document.getElementById('videoBtn').classList.add('is-disabled');
@@ -3618,6 +3734,7 @@ async function main() {
         if (videoActive) stopVideo();
         app.disconnect_voice();
         modelConnected = false;
+        if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
         micActive = false;
         document.getElementById('micBtn').classList.remove('active');
         document.getElementById('videoBtn').classList.add('is-disabled');
@@ -4170,6 +4287,7 @@ class DisplaySlot {
         <span class="display-status" id="ds-status-${displayId}">Connecting...</span>
         <input class="release-note" id="ds-note-${displayId}" placeholder="Note (optional)" style="display:none">
         <button class="stream-btn" id="ds-stream-${displayId}" title="Continuously send screenshots of this display to the AI model">&#x1F441; Stream</button>
+        <button class="ann-attach-btn" id="ds-attach-${displayId}" title="Capture current frame and attach to next task">&#x1F4CE; Attach</button>
         <button class="record-btn" id="ds-record-${displayId}" title="Record this display (ffmpeg)">&#x23FA; Record</button>
         <button class="take-control-btn" id="ds-take-${displayId}" title="Take interactive control of this display (keyboard and mouse)">Take Control</button>
         <button class="release-control-btn" id="ds-release-${displayId}" style="display:none" title="Release control and return display to view-only mode">Release</button>
@@ -4186,6 +4304,7 @@ class DisplaySlot {
     this.canvasEl = this.el.querySelector(`#display-canvas-${displayId}`);
     this.recordBtn = this.el.querySelector(`#ds-record-${displayId}`);
     this.deleteRecBtn = this.el.querySelector(`#ds-delete-rec-${displayId}`);
+    this.attachBtn = this.el.querySelector(`#ds-attach-${displayId}`);
     this.recording = false;
 
     // Video element for WebRTC media track
@@ -4202,6 +4321,56 @@ class DisplaySlot {
     this.streamBtn.addEventListener('click', () => this.toggleStreaming());
     this.recordBtn.addEventListener('click', () => this.toggleRecording());
     this.deleteRecBtn.addEventListener('click', () => this.deleteRecording());
+    this.attachBtn.addEventListener('click', () => this.attachCurrentFrame());
+  }
+
+  /// Capture the currently-rendered video frame and queue it as a pending
+  /// attachment. Works whether or not the display is currently streaming —
+  /// just rasterizes whatever the <video> element is showing right now.
+  attachCurrentFrame() {
+    if (!this.connected || !this.videoEl || !this.videoEl.videoWidth) {
+      this.attachBtn.title = 'No frame available yet';
+      setTimeout(() => { this.attachBtn.title = 'Capture current frame and attach to next task'; }, 2000);
+      return;
+    }
+    const sw = this.videoEl.videoWidth;
+    const sh = this.videoEl.videoHeight;
+    // Logical resolution (HQ archive size)
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.round(sw / dpr);
+    const h = Math.round(sh / dpr);
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    c.getContext('2d').drawImage(this.videoEl, 0, 0, w, h);
+    const dataUrl = c.toDataURL('image/jpeg', 0.85);
+    const b64 = dataUrl.split(',')[1];
+    // Use a deterministic frame_id scheme so attachments are distinguishable
+    // from streamed frames in the registry.
+    if (!this._attachCounter) this._attachCounter = 0;
+    this._attachCounter++;
+    const stream = 'display_' + this.displayId + '_attach';
+    const frameId = stream + '-f' + String(this._attachCounter).padStart(5, '0');
+    const payload = {
+      t: 'annotation_attach',
+      frame_id: frameId,
+      stream: stream,
+      data: b64,
+      note: '',
+    };
+    if (app) app.send_server_action(payload);
+    if (typeof addPendingAttachment === 'function') {
+      addPendingAttachment({
+        frameId,
+        stream,
+        note: '',
+        dataUrl,
+      });
+    }
+    // Brief visual confirmation
+    const orig = this.attachBtn.innerHTML;
+    this.attachBtn.innerHTML = '&#x2713; Attached';
+    setTimeout(() => { this.attachBtn.innerHTML = orig; }, 1500);
   }
 
   connect() {
@@ -5696,6 +5865,7 @@ function enterAnnotationMode() {
   annotationCanvas.activate();
   annotationMode = true;
   document.getElementById('annotation-toolbar').classList.remove('hidden');
+  if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
 
   // Re-align canvas when the player wrap resizes (split handle drag)
   if (window._annResizeObserver) window._annResizeObserver.disconnect();
@@ -5716,8 +5886,145 @@ function exitAnnotationMode() {
   document.getElementById('annotation-toolbar').classList.add('hidden');
 }
 
-async function submitAnnotation(inject) {
+// ── Pending attachments (frame IDs queued for the next task) ──
+//
+// Client-side only — not persisted across reloads. Each entry is
+//   { frameId, stream, note, dataUrl }
+// where `dataUrl` is a small data: URL for the chip thumbnail.
+const ATTACHMENT_SOFT_LIMIT = 20;
+const pendingAttachments = [];
+
+function addPendingAttachment(att) {
+  if (!att || !att.frameId) return;
+  // De-dupe by frame ID
+  if (pendingAttachments.some(p => p.frameId === att.frameId)) {
+    renderPendingAttachments();
+    return;
+  }
+  pendingAttachments.push(att);
+  renderPendingAttachments();
+}
+
+function removePendingAttachment(frameId) {
+  const idx = pendingAttachments.findIndex(p => p.frameId === frameId);
+  if (idx >= 0) {
+    pendingAttachments.splice(idx, 1);
+    renderPendingAttachments();
+  }
+}
+
+function clearPendingAttachments() {
+  pendingAttachments.length = 0;
+  renderPendingAttachments();
+}
+
+function renderPendingAttachments() {
+  const bar = document.getElementById('pending-attachments-bar');
+  const list = document.getElementById('pending-attachments-list');
+  const count = document.getElementById('pending-attachments-count');
+  if (!bar || !list || !count) return;
+  if (pendingAttachments.length === 0) {
+    bar.classList.add('hidden');
+    list.innerHTML = '';
+    count.textContent = '0';
+    count.classList.remove('warn');
+    return;
+  }
+  bar.classList.remove('hidden');
+  count.textContent = String(pendingAttachments.length);
+  count.classList.toggle('warn', pendingAttachments.length > ATTACHMENT_SOFT_LIMIT);
+  if (pendingAttachments.length > ATTACHMENT_SOFT_LIMIT) {
+    count.title = `${pendingAttachments.length} attachments — agents may fail with this many`;
+  } else {
+    count.title = `${pendingAttachments.length} pending attachment${pendingAttachments.length === 1 ? '' : 's'}`;
+  }
+  list.innerHTML = '';
+  for (const att of pendingAttachments) {
+    const chip = document.createElement('span');
+    chip.className = 'pending-attachment-chip';
+    chip.title = att.note ? `${att.frameId} — ${att.note}` : att.frameId;
+    if (att.dataUrl) {
+      const img = document.createElement('img');
+      img.className = 'chip-thumb';
+      img.src = att.dataUrl;
+      img.alt = '';
+      chip.appendChild(img);
+    }
+    const label = document.createElement('span');
+    label.textContent = att.frameId.length > 24 ? '…' + att.frameId.slice(-22) : att.frameId;
+    chip.appendChild(label);
+    const x = document.createElement('button');
+    x.className = 'chip-remove';
+    x.title = 'Remove from attachments';
+    x.textContent = '×';
+    x.addEventListener('click', (e) => {
+      e.stopPropagation();
+      removePendingAttachment(att.frameId);
+    });
+    chip.appendChild(x);
+    list.appendChild(chip);
+  }
+}
+
+window.addPendingAttachment = addPendingAttachment;
+window.removePendingAttachment = removePendingAttachment;
+window.clearPendingAttachments = clearPendingAttachments;
+
+// ── Annotation Send button gating ──
+//
+// The Send button injects into the live presence layer. If no presence is
+// connected (no voice model + no server-side text presence), there's nothing
+// to inject into. Disable the button with a tooltip pointing the user at
+// Attach instead.
+function updateAnnotationSendState() {
+  const annSend = document.getElementById('ann-submit-btn');
+  const clipSend = document.getElementById('clip-send-btn');
+  const presenceLive = !!modelConnected;
+  for (const btn of [annSend, clipSend]) {
+    if (!btn) continue;
+    // Don't gate the button while it's repurposed as the annotation "Done"
+    // button during clip annotation drawing — that uses the same id but a
+    // different label and meaning.
+    if (clipAnnotatingRange && btn === annSend) continue;
+    btn.disabled = !presenceLive;
+    if (presenceLive) {
+      btn.title = btn === clipSend
+        ? 'Save and inject into the live presence layer'
+        : 'Save and inject into the live presence layer';
+    } else {
+      btn.title = 'No presence connected — use Attach instead';
+    }
+  }
+}
+window.updateAnnotationSendState = updateAnnotationSendState;
+
+// Wire the bar's Clear button (after DOM is ready)
+document.addEventListener('DOMContentLoaded', () => {
+  const clearBtn = document.getElementById('pending-attachments-clear');
+  if (clearBtn) {
+    clearBtn.addEventListener('click', () => clearPendingAttachments());
+  }
+});
+
+// Hot-wire in case DOMContentLoaded already fired
+{
+  const clearBtn = document.getElementById('pending-attachments-clear');
+  if (clearBtn && !clearBtn._wired) {
+    clearBtn._wired = true;
+    clearBtn.addEventListener('click', () => clearPendingAttachments());
+  }
+}
+
+// Submit an annotation with one of three actions:
+//   'save'   — register in frame registry, don't inject, don't attach
+//   'attach' — register and queue as a pending attachment for the next task
+//   'send'   — register and inject into the live presence layer immediately
+async function submitAnnotation(action) {
   if (!annotationCanvas) return;
+  // Backwards-compat: callers used to pass a bool (inject=true → 'send').
+  if (action === true) action = 'send';
+  if (action === false || action == null) action = 'save';
+
   const note = document.getElementById('ann-note').value.trim();
   const blob = await annotationCanvas.composite();
   if (!blob) return;
@@ -5730,23 +6037,36 @@ async function submitAnnotation(inject) {
 
   annotationCounter++;
   const frameId = `ann-${activeRecordingStream || 'recording'}-${annotationCounter}`;
-  const payload = {
-    t: 'annotation_submit',
-    frame_id: frameId,
-    stream: activeRecordingStream || 'annotation',
-    data: b64,
-    note: note,
-    inject: !!inject,
-  };
-  if (app) {
-    app.send_server_action(payload);
+  const stream = activeRecordingStream || 'annotation';
+
+  if (action === 'attach') {
+    // Attach: register the frame on the server, queue the ID locally.
+    const payload = {
+      t: 'annotation_attach',
+      frame_id: frameId,
+      stream: stream,
+      data: b64,
+      note: note,
+    };
+    if (app) app.send_server_action(payload);
+    addPendingAttachment({ frameId, stream, note, dataUrl: 'data:image/jpeg;base64,' + b64 });
+  } else {
+    // save / send: existing annotation_submit handler. inject=true for 'send'.
+    const payload = {
+      t: 'annotation_submit',
+      frame_id: frameId,
+      stream: stream,
+      data: b64,
+      note: note,
+      inject: action === 'send',
+    };
+    if (app) app.send_server_action(payload);
+    addAnnotationRef(frameId, action === 'send');
   }
+
   document.getElementById('ann-note').value = '';
   annotationCanvas.clear();
   exitAnnotationMode();
-
-  // Track annotation and show result
-  addAnnotationRef(frameId, inject);
 }
 
 const savedAnnotations = [];
@@ -5839,14 +6159,19 @@ document.getElementById('annotation-toolbar').addEventListener('click', (e) => {
 document.getElementById('ann-undo').addEventListener('click', () => { const ac = _activeAnnCanvas(); if (ac) ac.undo(); });
 document.getElementById('ann-redo').addEventListener('click', () => { const ac = _activeAnnCanvas(); if (ac) ac.redo(); });
 document.getElementById('ann-clear').addEventListener('click', () => { const ac = _activeAnnCanvas(); if (ac) ac.clear(); });
-document.getElementById('ann-save-btn').addEventListener('click', () => submitAnnotation(false));
-document.getElementById('ann-submit-btn').addEventListener('click', () => submitAnnotation(true));
+document.getElementById('ann-save-btn').addEventListener('click', () => submitAnnotation('save'));
+document.getElementById('ann-attach-btn').addEventListener('click', () => submitAnnotation('attach'));
+document.getElementById('ann-submit-btn').addEventListener('click', () => {
+  // In clip annotation mode this becomes the "Done" button — handled separately below.
+  if (clipAnnotatingRange) return;
+  submitAnnotation('send');
+});
 document.getElementById('ann-close').addEventListener('click', exitAnnotationMode);
 document.getElementById('rec-annotate-btn').addEventListener('click', enterAnnotationMode);
 
-// Submit on Enter in note field (Send by default)
+// Submit on Enter in note field (Attach by default — works without an agent)
 document.getElementById('ann-note').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); submitAnnotation(true); }
+  if (e.key === 'Enter') { e.preventDefault(); submitAnnotation('attach'); }
   e.stopPropagation(); // Don't let key events bubble to global handlers
 });
 
@@ -5955,6 +6280,7 @@ function enterClipMode() {
   document.getElementById('clip-duration-label').textContent = '';
   document.getElementById('clip-frame-count').textContent = '';
   document.getElementById('clip-keyframe-btn').classList.remove('active');
+  if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
   renderClipMarkers();
   startClipLiveOverlay();
 }
@@ -5977,8 +6303,11 @@ function exitClipMode() {
   _removeClipAnnBanner();
   // Restore annotation toolbar buttons in case clip mode was exited during annotation
   document.getElementById('ann-save-btn').style.display = '';
+  const _attachBtn0 = document.getElementById('ann-attach-btn');
+  if (_attachBtn0) _attachBtn0.style.display = '';
   document.getElementById('ann-submit-btn').textContent = 'Send';
-  document.getElementById('ann-submit-btn').title = 'Save and send to agent';
+  document.getElementById('ann-submit-btn').title = 'Save and inject into the live presence layer';
+  if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
   clearClipMarkers();
   stopClipLiveOverlay();
 }
@@ -6363,8 +6692,13 @@ function beginClipAnnotationDraw() {
   // Show annotation toolbar (reuse existing one, but swap save/send buttons)
   document.getElementById('annotation-toolbar').classList.remove('hidden');
   document.getElementById('ann-save-btn').style.display = 'none';
+  const _attachBtn1 = document.getElementById('ann-attach-btn');
+  if (_attachBtn1) _attachBtn1.style.display = 'none';
   document.getElementById('ann-submit-btn').textContent = 'Done';
   document.getElementById('ann-submit-btn').title = 'Save annotation layer';
+  // In clip annotation mode the Send button is repurposed as "Done" — re-enable
+  // unconditionally so it works even with no presence connected.
+  document.getElementById('ann-submit-btn').disabled = false;
 
   _updateClipAnnBanner(`Annotating ${fmtTime(clipAnnRangeStart)}\u2013${fmtTime(clipAnnRangeEnd)} \u2014 Draw, then click Done`);
 
@@ -6400,8 +6734,11 @@ function finishClipAnnotationLayer() {
   document.getElementById('annotation-toolbar').classList.add('hidden');
   // Restore annotation toolbar buttons
   document.getElementById('ann-save-btn').style.display = '';
+  const _attachBtn2 = document.getElementById('ann-attach-btn');
+  if (_attachBtn2) _attachBtn2.style.display = '';
   document.getElementById('ann-submit-btn').textContent = 'Send';
-  document.getElementById('ann-submit-btn').title = 'Save and send to agent';
+  document.getElementById('ann-submit-btn').title = 'Save and inject into the live presence layer';
+  if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
 
   renderClipMarkers();
   updateClipFrameCount();
@@ -6430,8 +6767,11 @@ function editClipAnnotationLayer(layerId) {
 
   document.getElementById('annotation-toolbar').classList.remove('hidden');
   document.getElementById('ann-save-btn').style.display = 'none';
+  const _attachBtn3 = document.getElementById('ann-attach-btn');
+  if (_attachBtn3) _attachBtn3.style.display = 'none';
   document.getElementById('ann-submit-btn').textContent = 'Done';
   document.getElementById('ann-submit-btn').title = 'Save annotation layer';
+  document.getElementById('ann-submit-btn').disabled = false;
 
   _updateClipAnnBanner(`Editing layer ${fmtTime(layer.startSecs)}\u2013${fmtTime(layer.endSecs)} \u2014 Draw, then click Done`);
 
@@ -6584,7 +6924,14 @@ async function generateClipPreview() {
   }
 }
 
-async function submitClip(inject) {
+// `action` is one of: 'save' | 'attach' | 'send'
+//   save:   register frames, do not inject, do not attach
+//   attach: register frames and queue each frame as a pending attachment
+//   send:   register frames and inject as a Video Clip into the live presence layer
+async function submitClip(action) {
+  if (action === true) action = 'send';
+  if (action === false || action == null) action = 'save';
+
   if (clipInSecs === null || clipOutSecs === null || !recPlayer) return;
   const fps = parseInt(document.getElementById('clip-fps').value);
   const timestamps = computeClipTimestamps(clipInSecs, clipOutSecs, fps, clipKeyframes);
@@ -6604,27 +6951,30 @@ async function submitClip(inject) {
   clipCounter++;
   const clipId = `clip-${activeRecordingStream || 'rec'}-${clipCounter}`;
   const note = document.getElementById('clip-note').value.trim();
+  const inject = action === 'send';
+  const stream = activeRecordingStream || 'recording';
 
   // Send clip_start
   if (app) {
     app.send_server_action({
       t: 'clip_start',
       clip_id: clipId,
-      stream: activeRecordingStream || 'recording',
+      stream: stream,
       in_secs: clipInSecs,
       out_secs: clipOutSecs,
       fps: fps,
       total_frames: timestamps.length,
       note: note,
-      inject: !!inject,
+      inject: inject,
       annotation_layer_count: clipAnnotationLayers.length,
     });
   }
 
-  // Extract and send frames
+  // Extract and send frames. Track frame IDs so 'attach' can queue them.
   const gen = extractClipFrames(recPlayer, clipInSecs, clipOutSecs, fps,
     clipKeyframes, clipAnnotationLayers, 0.92);
   let frameIndex = 0;
+  const sentFrames = []; // { frameId, dataUrl } for 'attach'
 
   for await (const frame of gen) {
     if (clipAbort) break;
@@ -6644,6 +6994,9 @@ async function submitClip(inject) {
         annotated: frame.annotated,
         data: frame.b64,
       });
+    }
+    if (action === 'attach') {
+      sentFrames.push({ frameId, b64: frame.b64 });
     }
     frameIndex++;
 
@@ -6669,9 +7022,21 @@ async function submitClip(inject) {
     });
   }
 
+  // Add to pending attachments (after the server has registered them)
+  if (action === 'attach') {
+    for (const f of sentFrames) {
+      addPendingAttachment({
+        frameId: f.frameId,
+        stream: `clip:${clipId}`,
+        note: note,
+        dataUrl: 'data:image/jpeg;base64,' + f.b64,
+      });
+    }
+  }
+
   progress.classList.add('hidden');
   document.getElementById('clip-note').value = '';
-  const verb = inject ? 'Sent' : 'Saved';
+  const verb = action === 'send' ? 'Sent' : (action === 'attach' ? 'Attached' : 'Saved');
   status.textContent = `${verb} (${frameIndex} frames)`;
   status.style.color = 'var(--green)';
   setTimeout(() => { status.textContent = ''; status.style.color = ''; }, 5000);
@@ -6744,8 +7109,9 @@ window.copyAllClipRefs = function() {
 };
 
 document.getElementById('clip-preview-btn').addEventListener('click', generateClipPreview);
-document.getElementById('clip-save-btn').addEventListener('click', () => submitClip(false));
-document.getElementById('clip-send-btn').addEventListener('click', () => submitClip(true));
+document.getElementById('clip-save-btn').addEventListener('click', () => submitClip('save'));
+document.getElementById('clip-attach-btn').addEventListener('click', () => submitClip('attach'));
+document.getElementById('clip-send-btn').addEventListener('click', () => submitClip('send'));
 
 // ��─ Clip toolbar event wiring ──
 
@@ -6772,7 +7138,7 @@ document.getElementById('clip-clear-range').addEventListener('click', (e) => {
 document.getElementById('clip-fps').addEventListener('change', updateClipFrameCount);
 document.getElementById('clip-cancel-btn').addEventListener('click', () => { clipAbort = true; });
 document.getElementById('clip-note').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); submitClip(true); }
+  if (e.key === 'Enter') { e.preventDefault(); submitClip('attach'); }
   e.stopPropagation();
 });
 
@@ -6792,8 +7158,11 @@ document.getElementById('ann-submit-btn').addEventListener('click', () => {
       document.getElementById('clip-ann-prompt').classList.add('hidden');
       document.getElementById('annotation-toolbar').classList.add('hidden');
       document.getElementById('ann-save-btn').style.display = '';
+      const _attachBtn4 = document.getElementById('ann-attach-btn');
+      if (_attachBtn4) _attachBtn4.style.display = '';
       document.getElementById('ann-submit-btn').textContent = 'Send';
-      document.getElementById('ann-submit-btn').title = 'Save and send to agent';
+      document.getElementById('ann-submit-btn').title = 'Save and inject into the live presence layer';
+      if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
       renderClipMarkers();
       updateClipFrameCount();
     } else {
@@ -7149,14 +7518,27 @@ window.submitActivityTask = function() {
   const text = input.value.trim();
   if (!text) return;
   input.value = '';
+  // Snapshot pending attachments and clear the local queue once they're
+  // committed to a task. Lost on reload — that's expected, the user can
+  // re-attach from the Video tab.
+  const attachments = pendingAttachments.map(a => a.frameId);
   // If a task is running, send as follow-up; otherwise start new task
   if (currentPhase && currentPhase !== 'idle' && currentPhase !== 'done') {
+    // Follow-ups go through presence and don't carry attachments yet —
+    // log so the user knows their attachments will not be auto-included.
+    if (attachments.length > 0) {
+      console.warn('[intendant] Pending attachments dropped: follow-up does not support attachments yet');
+    }
     processCommands(app.send_follow_up(text));
   } else {
     const direct = document.getElementById('direct-mode-toggle')?.checked || false;
     const msg = { action: 'start_task', task: text };
     if (direct) msg.direct = true;
+    if (attachments.length > 0) msg.attachments = attachments;
     app.send_server_action(msg);
+    if (attachments.length > 0) {
+      clearPendingAttachments();
+    }
   }
 };
 
@@ -7168,9 +7550,14 @@ function startNewSession() {
   input.value = '';
   if (app) {
     const direct = document.getElementById('direct-mode-toggle')?.checked || false;
+    const attachments = pendingAttachments.map(a => a.frameId);
     const msg = { action: 'start_task', task: task };
     if (direct) msg.direct = true;
+    if (attachments.length > 0) msg.attachments = attachments;
     app.send_server_action(msg);
+    if (attachments.length > 0) {
+      clearPendingAttachments();
+    }
   }
 }
 

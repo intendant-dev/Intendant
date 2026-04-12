@@ -17,8 +17,8 @@ use agent_client_protocol_schema::{
 use crate::error::CallerError;
 
 use super::{
-    AgentConfig, AgentEvent, AgentThread, ApprovalCategory, ApprovalDecision, ExternalAgent,
-    ToolCompletionStatus,
+    AgentConfig, AgentEvent, AgentImageAttachment, AgentThread, ApprovalCategory,
+    ApprovalDecision, ExternalAgent, ToolCompletionStatus,
 };
 
 // Re-use the same display tools prompt as Codex — the MCP tools are identical.
@@ -817,6 +817,15 @@ impl ExternalAgent for GeminiAgent {
         thread: &AgentThread,
         message: &str,
     ) -> Result<(), CallerError> {
+        self.send_message_with_images(thread, message, &[]).await
+    }
+
+    async fn send_message_with_images(
+        &mut self,
+        thread: &AgentThread,
+        message: &str,
+        images: &[AgentImageAttachment],
+    ) -> Result<(), CallerError> {
         let augmented = if self.web_port.is_some() && !self.prompt_sent {
             self.prompt_sent = true;
             format!("{}{}{}", message, DISPLAY_TOOLS_PROMPT, GEMINI_CU_ADDENDUM)
@@ -824,9 +833,20 @@ impl ExternalAgent for GeminiAgent {
             message.to_string()
         };
 
+        // ACP `session/prompt` accepts an array of `ContentBlock`s.
+        // We use snake_case discriminator (per ACP spec): `text` and `image`.
+        let mut prompt: Vec<serde_json::Value> = Vec::with_capacity(images.len() + 1);
+        prompt.push(serde_json::json!({"type": "text", "text": augmented}));
+        for img in images {
+            prompt.push(serde_json::json!({
+                "type": "image",
+                "data": img.base64,
+                "mimeType": img.mime_type,
+            }));
+        }
         let params = serde_json::json!({
             "sessionId": thread.thread_id,
-            "prompt": [{"type": "text", "text": augmented}],
+            "prompt": prompt,
         });
 
         // session/prompt blocks until the turn completes. We must NOT await it

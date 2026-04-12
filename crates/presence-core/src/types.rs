@@ -82,6 +82,14 @@ pub struct TaskEnvelope {
     /// Use "user_session" for the user's real display, or ":99" etc. for virtual.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_target: Option<String>,
+    /// Frame IDs explicitly attached by the user via the dashboard's "Attach"
+    /// buttons. Resolved against the frame registry and prepended to the first
+    /// user message of the resulting agent conversation.
+    ///
+    /// Distinct from `reference_frame_ids` (which routes to the CU runner) and
+    /// `context_hints` (which are `frames:`-prefixed strings used by presence).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachment_frame_ids: Vec<String>,
 }
 
 /// Filtered events pushed to the presence layer from the agent loop.
@@ -462,6 +470,7 @@ mod tests {
             context_hints: vec!["src/main.rs".to_string()],
             reference_frame_ids: vec!["display:99-f00012".to_string()],
             display_target: Some("user_session".to_string()),
+            attachment_frame_ids: vec!["ann-recording-3".to_string()],
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let back: TaskEnvelope = serde_json::from_str(&json).unwrap();
@@ -470,6 +479,8 @@ mod tests {
         assert_eq!(back.context_hints.len(), 1);
         assert_eq!(back.reference_frame_ids.len(), 1);
         assert_eq!(back.display_target.as_deref(), Some("user_session"));
+        assert_eq!(back.attachment_frame_ids.len(), 1);
+        assert_eq!(back.attachment_frame_ids[0], "ann-recording-3");
     }
 
     #[test]

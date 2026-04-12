@@ -84,6 +84,13 @@ impl FrameRegistry {
         fs::read(&path)
     }
 
+    /// Compute the on-disk HQ path for a frame ID. Does not check for existence.
+    /// Used by external-agent attachment resolvers that need to pass a file path
+    /// (e.g. Codex `LocalImage`) instead of base64 over JSON-RPC.
+    pub fn path_for(&self, frame_id: &str) -> PathBuf {
+        self.frames_dir.join(format!("{}.jpg", frame_id))
+    }
+
     /// Query frames by stream and/or recent count.
     /// Returns metadata for matching frames, most recent last.
     pub fn query(&self, stream: Option<&str>, count: usize) -> Vec<&FrameMeta> {

@@ -13,17 +13,47 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 
+/// Source of a context injection item.
+///
+/// Used by the agent loop to decide which queued injections to discard between
+/// tasks.  System injections (display take/release notifications, etc.) are
+/// purged when a new task starts so they don't pollute the next task's context.
+/// User injections (annotations sent from the web dashboard) are preserved so
+/// the agent always sees them, even if they were queued while idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InjectionSource {
+    /// Originated from a human action (annotation Send button, etc.).
+    User,
+    /// Generated automatically by the runtime (display grants, etc.).
+    System,
+}
+
 /// A context injection item: text with optional images.
 #[derive(Clone)]
 pub struct ContextInjection {
     pub text: String,
     pub images: Vec<crate::conversation::ImageData>,
+    pub source: InjectionSource,
 }
 
 impl ContextInjection {
-    /// Create a text-only injection (no images).
+    /// Create a text-only system injection (no images).
     pub fn text(msg: String) -> Self {
-        Self { text: msg, images: vec![] }
+        Self {
+            text: msg,
+            images: vec![],
+            source: InjectionSource::System,
+        }
+    }
+
+    /// Create a text-only user injection (no images).
+    #[allow(dead_code)]
+    pub fn user_text(msg: String) -> Self {
+        Self {
+            text: msg,
+            images: vec![],
+            source: InjectionSource::User,
+        }
     }
 }
 
@@ -447,6 +477,15 @@ pub enum ControlMsg {
         /// Explicit display target for CU actions (e.g. "user_session", ":99").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_target: Option<String>,
+        /// Frame IDs that the user attached to this task via the dashboard's
+        /// "Attach" buttons (annotation toolbar, Video tab, clip toolbar).
+        ///
+        /// Resolved against the frame registry and prepended as image content
+        /// to the first user message of the agent conversation. Works for both
+        /// the internal agent (`add_user_with_images`) and external agents
+        /// (Codex `LocalImage`, Gemini ACP `ContentBlock::Image`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<String>,
     },
     FollowUp {
         text: String,
@@ -1335,6 +1374,7 @@ mod tests {
                 direct: None,
                 reference_frame_ids: vec![],
                 display_target: None,
+                attachments: vec![],
             },
             ControlMsg::FollowUp {
                 text: "continue working".to_string(),
@@ -1431,15 +1471,43 @@ mod tests {
             direct: None,
             reference_frame_ids: vec!["display_99-f00001".to_string()],
             display_target: Some("user_session".to_string()),
+            attachments: vec!["ann-recording-1".to_string(), "ann-recording-2".to_string()],
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ControlMsg = serde_json::from_str(&json).unwrap();
         match parsed {
-            ControlMsg::StartTask { task, orchestrate, reference_frame_ids, display_target, .. } => {
+            ControlMsg::StartTask { task, orchestrate, reference_frame_ids, display_target, attachments, .. } => {
                 assert_eq!(task, "deploy app");
                 assert_eq!(orchestrate, Some(true));
                 assert_eq!(reference_frame_ids.len(), 1);
                 assert_eq!(display_target.as_deref(), Some("user_session"));
+                assert_eq!(attachments.len(), 2);
+                assert_eq!(attachments[0], "ann-recording-1");
+            }
+            _ => panic!("expected StartTask"),
+        }
+    }
+
+    #[test]
+    fn control_msg_start_task_attachments_default_empty() {
+        let json = r#"{"action":"start_task","task":"do thing"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::StartTask { attachments, .. } => {
+                assert!(attachments.is_empty());
+            }
+            _ => panic!("expected StartTask"),
+        }
+    }
+
+    #[test]
+    fn control_msg_start_task_attachments_parse() {
+        let json = r#"{"action":"start_task","task":"do thing","attachments":["a","b","c"]}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::StartTask { attachments, .. } => {
+                assert_eq!(attachments.len(), 3);
+                assert_eq!(attachments[1], "b");
             }
             _ => panic!("expected StartTask"),
         }

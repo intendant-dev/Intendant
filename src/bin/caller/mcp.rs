@@ -1689,6 +1689,7 @@ async fn handle_control_command_mcp(
                         direct: None,
                         reference_frame_ids: vec![],
                         display_target: None,
+                        attachments: vec![],
                     }));
                     emit_control_result(control_tx, "invoke_skill", true, format!("Skill '{}' dispatched", skill_name), None);
                 }
@@ -2988,6 +2989,7 @@ impl IntendantServer {
                 direct: None,
                 reference_frame_ids: params.reference_frame_ids,
                 display_target: params.display_target,
+                attachments: vec![],
             }));
             return "ok (CU task dispatched)".to_string();
         }

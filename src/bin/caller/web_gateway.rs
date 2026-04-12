@@ -2117,6 +2117,60 @@ pub fn spawn_web_gateway(
                                                 }
                                             }
                                         }
+                                        Some("annotation_attach") => {
+                                            // User clicked "Attach" on an annotation/frame: register
+                                            // the JPEG in the frame registry but DO NOT inject into
+                                            // the agent context. The browser tracks this frame ID as
+                                            // a pending attachment and submits it with the next task.
+                                            //
+                                            // Works regardless of presence/agent state — attachments
+                                            // are independent of any running task.
+                                            let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
+                                            let stream = json["stream"].as_str().unwrap_or("annotation").to_string();
+                                            let note = json["note"].as_str().unwrap_or("").to_string();
+                                            if let Some(data_b64) = json["data"].as_str() {
+                                                use base64::Engine;
+                                                if let Ok(jpeg_bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                                                    let mut saved_path = String::new();
+                                                    let mut registered = false;
+                                                    if let Some(ref registry) = frame_registry_inbound {
+                                                        let meta = presence_core::FrameMeta {
+                                                            frame_id: frame_id.clone(),
+                                                            stream: stream.clone(),
+                                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                                            sent_to_live: false,
+                                                            live_resolution: None,
+                                                            hq_resolution: None,
+                                                            note: if note.is_empty() { None } else { Some(note.clone()) },
+                                                        };
+                                                        let mut reg = registry.write().await;
+                                                        match reg.register(meta, &jpeg_bytes) {
+                                                            Ok(path) => {
+                                                                saved_path = path.display().to_string();
+                                                                registered = true;
+                                                            }
+                                                            Err(e) => eprintln!("annotation_attach frame registry write failed: {}", e),
+                                                        }
+                                                    }
+                                                    let _ = direct_tx_inbound.send(serde_json::json!({
+                                                        "t": "annotation_attached",
+                                                        "frame_id": frame_id,
+                                                        "stream": stream,
+                                                        "path": saved_path,
+                                                        "note": note,
+                                                        "ok": registered,
+                                                    }).to_string());
+                                                    bus_inbound.send(AppEvent::PresenceLog {
+                                                        message: format!(
+                                                            "[annotation] {} attached (pending)",
+                                                            frame_id
+                                                        ),
+                                                        level: Some(LogLevel::Info),
+                                                        turn: None,
+                                                    });
+                                                }
+                                            }
+                                        }
                                         Some("annotation_submit") => {
                                             // User drew annotations on a frame and submitted it with a note.
                                             let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
@@ -2145,6 +2199,7 @@ pub fn spawn_web_gateway(
                                                         }
                                                     }
                                                     // Optionally inject into agent conversation
+                                                    let mut injected_to_queue = false;
                                                     if inject {
                                                         if let Some(ref ctx) = query_ctx_inbound {
                                                             if let Some(ref ciq) = ctx.context_injection {
@@ -2160,23 +2215,36 @@ pub fn spawn_web_gateway(
                                                                             media_type: "image/jpeg".to_string(),
                                                                             data: data_b64.to_string(),
                                                                         }],
+                                                                        source: crate::event::InjectionSource::User,
                                                                     });
+                                                                    injected_to_queue = true;
                                                                 }
                                                             }
                                                         }
                                                     }
-                                                    // Send path back to browser
+                                                    // Send path back to browser. Report whether the injection
+                                                    // actually landed in the queue (not just whether the user
+                                                    // pressed Send), so the UI doesn't lie when no presence is
+                                                    // running.
                                                     let _ = direct_tx_inbound.send(serde_json::json!({
                                                         "t": "annotation_saved",
                                                         "frame_id": frame_id,
                                                         "path": saved_path,
-                                                        "injected": inject,
+                                                        "injected": injected_to_queue,
                                                     }).to_string());
+                                                    let status_label = if inject {
+                                                        if injected_to_queue {
+                                                            " (sent to agent)"
+                                                        } else {
+                                                            " (saved — no agent connected)"
+                                                        }
+                                                    } else {
+                                                        ""
+                                                    };
                                                     bus_inbound.send(AppEvent::PresenceLog {
                                                         message: format!(
                                                             "[annotation] {} on {}{}",
-                                                            frame_id, stream,
-                                                            if inject { " (sent to agent)" } else { "" }
+                                                            frame_id, stream, status_label
                                                         ),
                                                         level: Some(LogLevel::Info),
                                                         turn: None,
@@ -2271,6 +2339,7 @@ pub fn spawn_web_gateway(
                                                                 q.push(crate::event::ContextInjection {
                                                                     text: label,
                                                                     images,
+                                                                    source: crate::event::InjectionSource::User,
                                                                 });
                                                                 injected = true;
                                                             }
