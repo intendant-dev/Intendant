@@ -178,6 +178,12 @@ pub struct WebGatewayConfig {
     /// Empty by default (local-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ice_servers: Vec<crate::display::IceServer>,
+    /// Stable identity label for this daemon. Resolved at startup from
+    /// the `host_label` file in the LAN cert dir (written by `intendant
+    /// lan setup --name …`) or falls back to the system hostname. Used
+    /// by the multi-host dashboard to tag events with their source.
+    #[serde(default)]
+    pub host_label: String,
 }
 
 impl Default for WebGatewayConfig {
@@ -189,6 +195,7 @@ impl Default for WebGatewayConfig {
             output_sample_rate: 24000,
             transcription_enabled: false,
             ice_servers: Vec::new(),
+            host_label: String::new(),
         }
     }
 }
@@ -3540,7 +3547,26 @@ pub fn spawn_web_gateway(
 
 /// Build a `WebGatewayConfig` from the presence config's live fields,
 /// falling back to environment variable detection.
+///
+/// Stamps the resolved host label on the returned config so every path
+/// (including the three call sites in `main.rs`) gets it automatically.
 pub fn build_config(
+    live_provider: Option<&str>,
+    live_model: Option<&str>,
+    transcription_enabled: bool,
+    ice_servers: Vec<crate::display::IceServer>,
+) -> WebGatewayConfig {
+    let mut cfg = build_config_inner(
+        live_provider,
+        live_model,
+        transcription_enabled,
+        ice_servers,
+    );
+    cfg.host_label = crate::lan::resolve_host_label();
+    cfg
+}
+
+fn build_config_inner(
     live_provider: Option<&str>,
     live_model: Option<&str>,
     transcription_enabled: bool,
@@ -3564,6 +3590,7 @@ pub fn build_config(
             output_sample_rate: output_rate,
             transcription_enabled,
             ice_servers,
+            ..Default::default()
         };
     }
 
@@ -3577,6 +3604,7 @@ pub fn build_config(
                 output_sample_rate: 24000,
                 transcription_enabled,
                 ice_servers,
+                ..Default::default()
             };
         }
         return WebGatewayConfig {
@@ -3586,6 +3614,7 @@ pub fn build_config(
             output_sample_rate: 24000,
             transcription_enabled,
             ice_servers,
+            ..Default::default()
         };
     }
 
@@ -3598,6 +3627,7 @@ pub fn build_config(
             output_sample_rate: 24000,
             transcription_enabled,
             ice_servers,
+            ..Default::default()
         }
     } else {
         let mut cfg = WebGatewayConfig::default();

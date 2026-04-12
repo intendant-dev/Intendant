@@ -20,6 +20,40 @@ pub mod nginx_config;
 pub mod state;
 pub mod wizard;
 
+/// Resolve the multi-host `HostId` for this machine.
+///
+/// Checks the platform cert dir's `host_label` file first (written by
+/// `intendant lan setup --name …`), then falls back to the system
+/// hostname. Returns `"local"` only if both fail, so the dashboard
+/// always has *some* label to display.
+///
+/// Callable from `intendant --web` without running any `lan` action,
+/// because the backend's `cert_dir()` is a pure path accessor with no
+/// privileged I/O.
+pub fn resolve_host_label() -> String {
+    let be = backend::select_backend();
+    let cert_dir = be.cert_dir();
+    if let Ok(label) = state::read_host_label(&cert_dir) {
+        if !label.is_empty() {
+            return label;
+        }
+    }
+    // Fallback: system hostname (gethostname, not HOSTNAME env).
+    if let Ok(h) = hostname() {
+        if !h.is_empty() {
+            return h;
+        }
+    }
+    "local".to_string()
+}
+
+/// Read the system hostname via the POSIX `gethostname` call.
+fn hostname() -> Result<String, std::io::Error> {
+    let output = std::process::Command::new("hostname").output()?;
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(s)
+}
+
 #[cfg(target_os = "linux")]
 pub mod backend_linux;
 

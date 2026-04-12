@@ -18,6 +18,8 @@ mod gemini;
 #[cfg(target_arch = "wasm32")]
 mod openai;
 #[cfg(target_arch = "wasm32")]
+mod secondary;
+#[cfg(target_arch = "wasm32")]
 mod server;
 
 /// Provider-agnostic live model usage snapshot.
@@ -63,6 +65,11 @@ fn to_js(val: &impl serde::Serialize) -> JsValue {
 pub struct PresenceWeb {
     callbacks: Rc<Callbacks>,
     server: RefCell<server::ServerConnection>,
+    /// Read-only WebSocket connections to secondary daemons for the
+    /// multi-host dashboard, keyed by the daemon's `host_id` (its
+    /// `host_label` from `/config`). Each connection forwards received
+    /// messages to JS via `on_secondary_event` for host-scoped rendering.
+    secondary_conns: RefCell<std::collections::HashMap<String, secondary::SecondaryConnection>>,
     gemini: RefCell<Option<gemini::GeminiProvider>>,
     openai: Rc<RefCell<Option<openai::OpenAIProvider>>>,
     presence: Rc<RefCell<WasmPresence>>,
@@ -98,6 +105,7 @@ impl PresenceWeb {
         Self {
             callbacks,
             server: RefCell::new(server),
+            secondary_conns: RefCell::new(std::collections::HashMap::new()),
             gemini: RefCell::new(None),
             openai: Rc::new(RefCell::new(None)),
             presence,
@@ -214,6 +222,16 @@ impl PresenceWeb {
     #[wasm_bindgen]
     pub fn set_on_live_usage(&self, f: Function) {
         *self.callbacks.on_live_usage.borrow_mut() = Some(f);
+    }
+
+    #[wasm_bindgen]
+    pub fn set_on_secondary_event(&self, f: Function) {
+        *self.callbacks.on_secondary_event.borrow_mut() = Some(f);
+    }
+
+    #[wasm_bindgen]
+    pub fn set_on_secondary_state(&self, f: Function) {
+        *self.callbacks.on_secondary_state.borrow_mut() = Some(f);
     }
 
     // --- Server connection ---
@@ -365,6 +383,67 @@ impl PresenceWeb {
     #[wasm_bindgen]
     pub fn reconnect_server(&self, url: &str) {
         self.server.borrow_mut().connect(url);
+    }
+
+    // --- Secondary (multi-host) connections ---
+
+    /// Open a read-only WebSocket to a secondary daemon. The `url`
+    /// should be a fully-qualified `wss://` URL (the JS side is
+    /// responsible for converting `https://host:port` to `wss://host:port/ws`).
+    /// `host_id` must be unique across the dashboard — the JS layer
+    /// uses it as a key for routing inbound events to host-scoped DOM
+    /// elements. `label` is the human-readable display name.
+    ///
+    /// Idempotent: calling with an existing host_id replaces the
+    /// previous connection.
+    #[wasm_bindgen]
+    pub fn add_secondary_host(&self, host_id: &str, label: &str, url: &str) {
+        let mut conn = secondary::SecondaryConnection::new(
+            host_id,
+            label,
+            self.callbacks.clone(),
+        );
+        conn.connect(url);
+        self.secondary_conns
+            .borrow_mut()
+            .insert(host_id.to_string(), conn);
+    }
+
+    /// Close and forget a secondary daemon connection.
+    #[wasm_bindgen]
+    pub fn remove_secondary_host(&self, host_id: &str) {
+        if let Some(mut conn) = self.secondary_conns.borrow_mut().remove(host_id) {
+            conn.disconnect();
+        }
+    }
+
+    /// Called from the JS trampoline scheduled by a secondary's onclose
+    /// closure. Re-opens the WebSocket for the given host_id if it's
+    /// still in the registry (user may have removed it meanwhile).
+    #[wasm_bindgen]
+    pub fn reconnect_secondary_host(&self, host_id: &str, url: &str) {
+        if let Some(conn) = self.secondary_conns.borrow_mut().get_mut(host_id) {
+            conn.connect(url);
+        }
+    }
+
+    /// Return the list of currently-registered secondary hosts as a JS
+    /// array of `{host_id, label, url, connected}` objects.
+    #[wasm_bindgen]
+    pub fn list_secondary_hosts(&self) -> JsValue {
+        let conns = self.secondary_conns.borrow();
+        let entries: Vec<serde_json::Value> = conns
+            .values()
+            .map(|c| {
+                serde_json::json!({
+                    "host_id": c.host_id(),
+                    "label": c.label(),
+                    "url": c.url(),
+                    "connected": c.is_connected(),
+                })
+            })
+            .collect();
+        to_js(&entries)
     }
 
     /// Request to become the active voice owner (triggers handover from current active).
