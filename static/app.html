@@ -4541,9 +4541,33 @@ class DisplaySlot {
 
     const normalize = (e) => {
       const rect = vid.getBoundingClientRect();
+      // Account for letterboxing: the video element preserves aspect ratio,
+      // so the actual video content occupies a sub-rectangle inside the
+      // element bounds. Compute that content rect from the video's intrinsic
+      // dimensions, then normalize the cursor relative to it (not the element).
+      const vW = vid.videoWidth || rect.width;
+      const vH = vid.videoHeight || rect.height;
+      const videoAspect = vW / vH;
+      const elAspect = rect.width / rect.height;
+      let contentW, contentH, offsetX, offsetY;
+      if (elAspect > videoAspect) {
+        // Element is wider than video -> pillarbox (black bars left/right)
+        contentH = rect.height;
+        contentW = contentH * videoAspect;
+        offsetX = (rect.width - contentW) / 2;
+        offsetY = 0;
+      } else {
+        // Element is taller than video -> letterbox (black bars top/bottom)
+        contentW = rect.width;
+        contentH = contentW / videoAspect;
+        offsetX = 0;
+        offsetY = (rect.height - contentH) / 2;
+      }
+      const relX = (e.clientX - rect.left - offsetX) / contentW;
+      const relY = (e.clientY - rect.top - offsetY) / contentH;
       return {
-        x: Math.max(0, Math.min((e.clientX - rect.left) / rect.width, 0.9999)),
-        y: Math.max(0, Math.min((e.clientY - rect.top) / rect.height, 0.9999))
+        x: Math.max(0, Math.min(relX, 0.9999)),
+        y: Math.max(0, Math.min(relY, 0.9999))
       };
     };
 
