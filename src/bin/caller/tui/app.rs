@@ -1707,12 +1707,20 @@ impl App {
                         }
                     }
                 }
-                self.log_sourced(
-                    lvl,
-                    message,
-                    LogSource::Presence,
+                // Push directly to log_entries for TUI display. Do NOT call
+                // log_sourced which re-broadcasts as AppEvent::LogEntry —
+                // PresenceLog already has its own path to session log and
+                // web UI (presence_log event).
+                if self.log_entries.len() >= MAX_LOG_ENTRIES {
+                    self.log_entries.pop_front();
+                }
+                self.log_entries.push_back(LogEntry {
+                    ts: chrono::Local::now().format("%H:%M:%S").to_string(),
+                    level: lvl,
+                    content: message,
+                    source: LogSource::Presence,
                     turn,
-                );
+                });
             }
             AppEvent::HumanQuestionDetected { question } => {
                 self.human_question = Some(question.clone());
