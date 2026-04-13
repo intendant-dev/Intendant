@@ -59,20 +59,24 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             *state.external_agent.write().await = parsed.clone();
             // Persist to intendant.toml so the setting survives daemon
             // restarts. Any frontend (dashboard, TUI, MCP) that sends
-            // this control message gets persistence for free — no more
-            // "I picked Codex and it reset on refresh" surprises. We
-            // normalize the stored value to the canonical backend
-            // string (from `to_string()`) so the TOML and in-memory
-            // state always agree.
+            // this control message gets persistence for free. Always
+            // write the canonical SHORT form ("codex" | "claude-code" |
+            // "gemini") — the TOML round-trip must preserve identity,
+            // and from_str_loose needs a form it'll parse back. The
+            // Display form ("Gemini CLI") used to slip through here,
+            // which broke the next daemon startup because from_str_loose
+            // didn't match the spaced lowercase variant.
             if let Some(ref root) = state.project_root {
-                let canonical = parsed.as_ref().map(|b| b.to_string());
+                let canonical = parsed.as_ref().map(|b| b.as_short_str().to_string());
                 if let Err(e) = persist_external_agent(root, canonical.as_deref()) {
                     eprintln!(
                         "[control_plane] failed to persist external_agent to intendant.toml: {e}"
                     );
                 }
             }
-            // Broadcast so frontends can update their status bars.
+            // Broadcast so frontends can update their status bars. The
+            // Display form is intentional here — the dashboard uses it
+            // as human-readable badge text.
             state.bus.send(AppEvent::ExternalAgentChanged {
                 agent: parsed.map(|b| b.to_string()),
             });

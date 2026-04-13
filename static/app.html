@@ -4481,8 +4481,16 @@ function updateStatusBar(d) {
     const el = document.getElementById('sb-external-agent');
     const sep = document.getElementById('sb-agent-sep');
     const lbl = document.getElementById('sb-agent-label');
-    if (d.external_agent) {
-      el.textContent = d.external_agent;
+    // Accept any of the serialization forms we might see on the wire:
+    //   short:      "codex" | "claude-code" | "gemini"
+    //   display:    "Codex" | "Claude Code" | "Gemini CLI"
+    //   serde enum: "gemini_cli" | "claude_code"
+    //   agent.name: "gemini-cli"
+    // Normalize to the canonical short form used by the dropdown
+    // <option value> attributes, then derive a pretty label from that.
+    const shortId = normalizeAgentId(d.external_agent);
+    if (shortId) {
+      el.textContent = prettyAgentName(shortId);
       el.style.display = '';
       sep.style.display = '';
       lbl.style.display = '';
@@ -4491,15 +4499,33 @@ function updateStatusBar(d) {
       sep.style.display = 'none';
       lbl.style.display = 'none';
     }
-    // Sync the Settings dropdown
     const sel = document.getElementById('set-external-agent');
     if (sel) {
-      const v = (d.external_agent || '').toLowerCase();
-      // Map display names (from AgentBackend::Display) to option values
-      const map = { 'codex': 'codex', 'gemini cli': 'gemini', 'claude code': 'claude-code', 'gemini_cli': 'gemini' };
-      sel.value = map[v] !== undefined ? map[v] : '';
+      sel.value = shortId || '';
     }
   }
+}
+
+// Map any agent identifier form to the canonical short string used
+// by the dashboard dropdown options and (now) the TOML field. Returns
+// an empty string for `null`/empty/unknown values.
+function normalizeAgentId(raw) {
+  if (!raw) return '';
+  const v = String(raw).toLowerCase().trim();
+  if (v === 'codex') return 'codex';
+  if (v === 'claude-code' || v === 'claude_code' || v === 'claudecode' ||
+      v === 'cc' || v === 'claude code') return 'claude-code';
+  if (v === 'gemini' || v === 'gemini-cli' || v === 'gemini_cli' ||
+      v === 'gemini cli') return 'gemini';
+  return '';
+}
+
+function prettyAgentName(shortId) {
+  return {
+    'codex': 'Codex',
+    'claude-code': 'Claude Code',
+    'gemini': 'Gemini CLI',
+  }[shortId] || shortId;
 }
 
 function setPhase(phase) {
@@ -8638,19 +8664,21 @@ async function loadSettings() {
     // been called with an external_agent field, and without this
     // branch the status bar badge would stay hidden until the user
     // interacts with the dropdown.
+    //
+    // Route through normalizeAgentId so legacy TOML files written in
+    // the Display form ("Gemini CLI") or serde-enum form ("gemini_cli")
+    // still populate the dropdown correctly — the old code just did
+    // `sel.value = "Gemini CLI"` which didn't match any <option> and
+    // left the dropdown visually blank.
     {
-      const sel = document.getElementById('set-external-agent');
-      // Map the TOML value (e.g. "claude-code", "codex") directly to
-      // the dropdown's `value` attribute which uses the same strings.
-      sel.value = d.external_agent || '';
+      const shortId = normalizeAgentId(d.external_agent);
+      document.getElementById('set-external-agent').value = shortId;
 
       const el = document.getElementById('sb-external-agent');
       const sep = document.getElementById('sb-agent-sep');
       const lbl = document.getElementById('sb-agent-label');
-      if (d.external_agent) {
-        // Prettify: "claude-code" → "Claude Code", "codex" → "Codex".
-        const pretty = { 'codex': 'Codex', 'claude-code': 'Claude Code', 'gemini': 'Gemini CLI' };
-        el.textContent = pretty[d.external_agent] || d.external_agent;
+      if (shortId) {
+        el.textContent = prettyAgentName(shortId);
         el.style.display = '';
         sep.style.display = '';
         lbl.style.display = '';
