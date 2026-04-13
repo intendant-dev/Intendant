@@ -248,6 +248,44 @@ html, body {
 }
 
 /* ── Settings ── */
+.settings-pane-body {
+  padding: 20px;
+  max-width: 640px;
+  overflow-y: auto;
+  flex: 1;
+}
+.settings-save-row {
+  display: flex;
+  gap: 8px;
+  padding: 10px 20px;
+  border-top: 1px solid var(--surface0);
+  background: var(--mantle);
+  flex-shrink: 0;
+}
+.settings-save-row #settings-save-btn {
+  padding: 6px 16px;
+  border: none;
+  border-radius: 4px;
+  background: var(--blue);
+  color: var(--crust);
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 13px;
+}
+.settings-save-row #settings-reset-btn {
+  padding: 6px 16px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+}
+.settings-save-row #settings-status {
+  align-self: center;
+  font-size: 12px;
+  color: var(--green);
+}
 .settings-group {
   border: 1px solid var(--surface1);
   border-radius: 6px;
@@ -1234,7 +1272,8 @@ html, body {
 }
 
 /* ── Terminal Tab ── */
-.terminal-subtabs {
+/* ── Generic sub-tabs (used by Terminal and Settings) ── */
+.subtabs {
   display: flex;
   gap: 4px;
   padding: 4px 4px 0 4px;
@@ -1242,7 +1281,7 @@ html, body {
   border-bottom: 1px solid var(--surface0);
   flex-shrink: 0;
 }
-.terminal-subtab-btn {
+.subtab-btn {
   padding: 4px 12px;
   background: transparent;
   border: 1px solid transparent;
@@ -1253,29 +1292,29 @@ html, body {
   font-size: 12px;
   font-family: inherit;
 }
-.terminal-subtab-btn:hover {
+.subtab-btn:hover {
   color: var(--text);
 }
-.terminal-subtab-btn.active {
+.subtab-btn.active {
   background: var(--base);
   color: var(--text);
   border-color: var(--surface1);
 }
-.terminal-subtab-panes {
+.subtab-panes {
   flex: 1;
   position: relative;
   min-height: 0;
   display: flex;
   flex-direction: column;
 }
-.terminal-subtab-pane {
+.subtab-pane {
   flex: 1;
   display: none;
   flex-direction: column;
   position: relative;
   min-height: 0;
 }
-.terminal-subtab-pane.active {
+.subtab-pane.active {
   display: flex;
 }
 .terminal-container {
@@ -2675,16 +2714,16 @@ html, body {
 
     <!-- Terminal Tab -->
     <div id="tab-terminal" class="tab-pane">
-      <div class="terminal-subtabs">
-        <button class="terminal-subtab-btn active" data-term-tab="tui">TUI</button>
-        <button class="terminal-subtab-btn" data-term-tab="shell">Shell</button>
+      <div class="subtabs">
+        <button class="subtab-btn active" data-term-tab="tui">TUI</button>
+        <button class="subtab-btn" data-term-tab="shell">Shell</button>
         <button class="keybar-toggle" id="keybar-toggle" title="Show/hide the special-key bar (Esc, Tab, Ctrl, arrows, …)">Keys</button>
       </div>
-      <div class="terminal-subtab-panes">
-        <div class="terminal-subtab-pane active" id="term-pane-tui">
+      <div class="subtab-panes">
+        <div class="subtab-pane active" id="term-pane-tui">
           <div class="terminal-container" id="terminal-container"></div>
         </div>
-        <div class="terminal-subtab-pane" id="term-pane-shell">
+        <div class="subtab-pane" id="term-pane-shell">
           <div class="terminal-container" id="shell-container"></div>
           <div class="shell-keybar" id="shell-keybar">
             <button class="shell-key" data-key="esc">Esc</button>
@@ -2908,252 +2947,274 @@ html, body {
 
     <!-- Settings Tab -->
     <div id="tab-settings" class="tab-pane">
-      <div style="padding:20px;max-width:640px;overflow-y:auto;flex:1">
-        <h3 style="margin:0 0 16px;color:var(--text);font-size:16px">Configuration</h3>
-        <p style="color:var(--subtext0);font-size:12px;margin:0 0 16px">
-          Settings are saved to <code style="color:var(--blue)">intendant.toml</code> and take effect on the next task.
-        </p>
+      <div class="subtabs">
+        <button class="subtab-btn active" data-settings-tab="account">Account</button>
+        <button class="subtab-btn" data-settings-tab="agent">Agent</button>
+        <button class="subtab-btn" data-settings-tab="network">Network</button>
+        <button class="subtab-btn" data-settings-tab="debug">Debug</button>
+      </div>
 
-        <!-- API Keys -->
-        <fieldset class="settings-group">
-          <legend>API Keys</legend>
-          <p style="color:var(--subtext0);font-size:12px;margin:0 0 8px">
-            Saved to <code style="color:var(--blue)">~/.config/intendant/.env</code>
-          </p>
-          <div class="settings-row">
-            <label>OpenAI</label>
-            <input type="password" id="settings-key-openai" placeholder="sk-..." autocomplete="off">
-            <span class="key-status" id="key-status-openai"></span>
-          </div>
-          <div class="settings-row">
-            <label>Anthropic</label>
-            <input type="password" id="settings-key-anthropic" placeholder="sk-ant-..." autocomplete="off">
-            <span class="key-status" id="key-status-anthropic"></span>
-          </div>
-          <div class="settings-row">
-            <label>Gemini</label>
-            <input type="password" id="settings-key-gemini" placeholder="AI..." autocomplete="off">
-            <span class="key-status" id="key-status-gemini"></span>
-          </div>
-          <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
-            <button id="settings-save-keys" style="padding:6px 16px;border:none;border-radius:4px;background:var(--blue);color:var(--crust);cursor:pointer;font-weight:600;font-size:13px">Save Keys</button>
-            <span id="settings-keys-status" style="font-size:12px"></span>
-          </div>
-        </fieldset>
+      <div class="subtab-panes">
 
-        <!-- External Agent -->
-        <fieldset class="settings-group">
-          <legend>External Agent</legend>
-          <p style="color:var(--subtext0);font-size:12px;margin:0 0 8px">
-            Route tasks to an external agent backend. Takes effect on the next task.
-          </p>
-          <div class="settings-row">
-            <label>Backend</label>
-            <select id="set-external-agent">
-              <option value="">None (internal agent)</option>
-              <option value="codex">Codex (OpenAI)</option>
-              <option value="claude-code">Claude Code (Anthropic)</option>
-              <option value="gemini">Gemini CLI (Google)</option>
-            </select>
+        <!-- Account pane: API keys + anything else that identifies the user -->
+        <div class="subtab-pane active" id="settings-pane-account">
+          <div class="settings-pane-body">
+            <fieldset class="settings-group">
+              <legend>API Keys</legend>
+              <p style="color:var(--subtext0);font-size:12px;margin:0 0 8px">
+                Saved to <code style="color:var(--blue)">~/.config/intendant/.env</code>
+              </p>
+              <div class="settings-row">
+                <label>OpenAI</label>
+                <input type="password" id="settings-key-openai" placeholder="sk-..." autocomplete="off">
+                <span class="key-status" id="key-status-openai"></span>
+              </div>
+              <div class="settings-row">
+                <label>Anthropic</label>
+                <input type="password" id="settings-key-anthropic" placeholder="sk-ant-..." autocomplete="off">
+                <span class="key-status" id="key-status-anthropic"></span>
+              </div>
+              <div class="settings-row">
+                <label>Gemini</label>
+                <input type="password" id="settings-key-gemini" placeholder="AI..." autocomplete="off">
+                <span class="key-status" id="key-status-gemini"></span>
+              </div>
+              <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
+                <button id="settings-save-keys" style="padding:6px 16px;border:none;border-radius:4px;background:var(--blue);color:var(--crust);cursor:pointer;font-weight:600;font-size:13px">Save Keys</button>
+                <span id="settings-keys-status" style="font-size:12px"></span>
+              </div>
+            </fieldset>
           </div>
-        </fieldset>
-
-        <!-- Daemons (multi-host) -->
-        <fieldset class="settings-group">
-          <legend>Daemons</legend>
-          <p style="color:var(--subtext0);font-size:12px;margin:0 0 10px">
-            Connect to additional intendant daemons on other machines to observe their activity alongside this one. Use <code style="color:var(--blue)">https://</code> (mTLS, required on iOS) or <code style="color:var(--blue)">http://</code> (trusted LAN / same hypervisor). Browser mixed-content rules apply — HTTPS pages can only reach HTTPS secondaries.
-          </p>
-          <div id="daemons-list" class="daemons-list"></div>
-          <div class="daemon-add-row">
-            <input id="daemon-add-url" type="text" placeholder="http://macos-guest:8765 or https://mac-work:8443" autocomplete="off">
-            <input id="daemon-add-label" type="text" placeholder="label (optional)" autocomplete="off">
-            <button id="daemon-add-btn" type="button">Add</button>
-          </div>
-          <span id="daemons-status" class="daemons-status"></span>
-        </fieldset>
-
-        <!-- Computer Use -->
-        <fieldset class="settings-group">
-          <legend>Computer Use</legend>
-          <div class="settings-row">
-            <label>Provider</label>
-            <select id="set-cu-provider">
-              <option value="">Auto (gemini-3-flash-preview)</option>
-              <option value="gemini">Gemini</option>
-              <option value="openai">OpenAI</option>
-              <option value="anthropic">Anthropic</option>
-            </select>
-          </div>
-          <div class="settings-row">
-            <label>Model</label>
-            <select id="set-cu-model">
-              <option value="">Default</option>
-              <optgroup label="Gemini">
-                <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
-                <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
-                <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-              </optgroup>
-              <optgroup label="OpenAI">
-                <option value="gpt-5.4-mini">gpt-5.4-mini</option>
-                <option value="gpt-5.4">gpt-5.4</option>
-                <option value="computer-use-preview">computer-use-preview</option>
-              </optgroup>
-              <optgroup label="Anthropic">
-                <option value="claude-haiku-4-5-20251001">claude-haiku-4-5</option>
-                <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-              </optgroup>
-            </select>
-          </div>
-          <div class="settings-row">
-            <label>Backend</label>
-            <select id="set-cu-backend">
-              <option value="auto">Auto-detect</option>
-              <option value="x11">X11</option>
-              <option value="wayland">Wayland</option>
-              <option value="macos">macOS</option>
-            </select>
-          </div>
-        </fieldset>
-
-        <!-- Presence -->
-        <fieldset class="settings-group">
-          <legend>Presence</legend>
-          <div class="settings-row">
-            <label>Enabled</label>
-            <input id="set-presence-enabled" type="checkbox">
-          </div>
-          <div class="settings-row">
-            <label>Text Provider</label>
-            <select id="set-presence-provider">
-              <option value="">Auto</option>
-              <option value="gemini">Gemini</option>
-              <option value="openai">OpenAI</option>
-              <option value="anthropic">Anthropic</option>
-            </select>
-          </div>
-          <div class="settings-row">
-            <label>Text Model</label>
-            <select id="set-presence-model">
-              <option value="">Default</option>
-              <optgroup label="Gemini">
-                <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
-                <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-                <option value="gemini-2.5-pro">gemini-2.5-pro</option>
-              </optgroup>
-              <optgroup label="OpenAI">
-                <option value="gpt-5.4-mini">gpt-5.4-mini</option>
-                <option value="gpt-5.4">gpt-5.4</option>
-                <option value="gpt-4.1-mini">gpt-4.1-mini</option>
-              </optgroup>
-              <optgroup label="Anthropic">
-                <option value="claude-haiku-4-5-20251001">claude-haiku-4-5</option>
-                <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-                <option value="claude-opus-4-6">claude-opus-4-6</option>
-              </optgroup>
-            </select>
-          </div>
-          <div class="settings-row">
-            <label>Live Provider</label>
-            <select id="set-presence-live-provider">
-              <option value="">Auto</option>
-              <option value="gemini">Gemini</option>
-              <option value="openai">OpenAI</option>
-            </select>
-          </div>
-          <div class="settings-row">
-            <label>Live Model</label>
-            <select id="set-presence-live-model">
-              <option value="">Default</option>
-              <optgroup label="Gemini">
-                <option value="gemini-3.1-flash-live-preview">gemini-3.1-flash-live-preview</option>
-                <option value="gemini-2.5-flash-native-audio-preview-12-2025">gemini-2.5-flash-native-audio</option>
-              </optgroup>
-              <optgroup label="OpenAI">
-                <option value="gpt-realtime-1.5">gpt-realtime-1.5</option>
-                <option value="gpt-realtime">gpt-realtime</option>
-                <option value="gpt-realtime-mini">gpt-realtime-mini</option>
-              </optgroup>
-            </select>
-          </div>
-        </fieldset>
-
-        <!-- Transcription -->
-        <fieldset class="settings-group">
-          <legend>Transcription</legend>
-          <div class="settings-row">
-            <label>Enabled</label>
-            <input id="set-transcription-enabled" type="checkbox">
-          </div>
-          <div class="settings-row">
-            <label>Provider</label>
-            <input id="set-transcription-provider" type="text" placeholder="openai">
-          </div>
-          <div class="settings-row">
-            <label>Model</label>
-            <select id="set-transcription-model">
-              <option value="whisper-1">whisper-1</option>
-              <option value="gpt-4o-transcribe">gpt-4o-transcribe</option>
-              <option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe</option>
-            </select>
-          </div>
-          <div class="settings-row">
-            <label>Endpoint</label>
-            <input id="set-transcription-endpoint" type="text" placeholder="Default (OpenAI)">
-          </div>
-          <div class="settings-row">
-            <label>Language</label>
-            <input id="set-transcription-language" type="text" placeholder="Auto-detect">
-          </div>
-        </fieldset>
-
-        <!-- Recording -->
-        <fieldset class="settings-group">
-          <legend>Recording</legend>
-          <div class="settings-row">
-            <label>Enabled</label>
-            <input id="set-recording-enabled" type="checkbox">
-          </div>
-          <div class="settings-row">
-            <label>Framerate</label>
-            <input id="set-recording-framerate" type="number" min="1" max="60" placeholder="15">
-            <span id="framerate-warning" class="hidden" style="font-size:11px;color:var(--peach);margin-left:4px">screencapture backend caps at 15 fps</span>
-          </div>
-          <div class="settings-row">
-            <label>Quality</label>
-            <select id="set-recording-quality">
-              <option value="low">Low</option>
-              <option value="medium" selected>Medium</option>
-              <option value="high">High</option>
-            </select>
-          </div>
-        </fieldset>
-
-        <!-- Live Audio -->
-        <fieldset class="settings-group">
-          <legend>Live Audio</legend>
-          <div class="settings-row">
-            <label>Enabled</label>
-            <input id="set-live-audio-enabled" type="checkbox">
-          </div>
-          <div class="settings-row">
-            <label>Timeout (s)</label>
-            <input id="set-live-audio-timeout" type="number" min="30" max="3600" placeholder="300">
-          </div>
-        </fieldset>
-
-        <!-- Env var overrides (read-only) -->
-        <div id="settings-env-overrides" class="hidden" style="margin:16px 0;padding:12px;background:var(--mantle);border-radius:6px">
-          <h4 style="margin:0 0 8px;color:var(--peach);font-size:13px">Environment Variable Overrides</h4>
-          <div id="settings-env-list" style="font-size:12px;color:var(--subtext0)"></div>
         </div>
 
-        <!-- Save / Reset -->
-        <div style="display:flex;gap:8px;margin-top:16px">
-          <button id="settings-save-btn" style="padding:8px 20px;border:none;border-radius:4px;background:var(--blue);color:var(--crust);cursor:pointer;font-weight:600;font-size:13px">Save</button>
-          <button id="settings-reset-btn" style="padding:8px 20px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);cursor:pointer;font-size:13px">Reset</button>
-          <span id="settings-status" style="align-self:center;font-size:12px;color:var(--green)"></span>
+        <!-- Agent pane: everything that configures how the agent behaves -->
+        <div class="subtab-pane" id="settings-pane-agent">
+          <div class="settings-pane-body">
+            <p style="color:var(--subtext0);font-size:12px;margin:0 0 16px">
+              Settings are saved to <code style="color:var(--blue)">intendant.toml</code> and take effect on the next task.
+            </p>
+
+            <fieldset class="settings-group">
+              <legend>External Agent</legend>
+              <p style="color:var(--subtext0);font-size:12px;margin:0 0 8px">
+                Route tasks to an external agent backend. Takes effect on the next task.
+              </p>
+              <div class="settings-row">
+                <label>Backend</label>
+                <select id="set-external-agent">
+                  <option value="">None (internal agent)</option>
+                  <option value="codex">Codex (OpenAI)</option>
+                  <option value="claude-code">Claude Code (Anthropic)</option>
+                  <option value="gemini">Gemini CLI (Google)</option>
+                </select>
+              </div>
+            </fieldset>
+
+            <fieldset class="settings-group">
+              <legend>Computer Use</legend>
+              <div class="settings-row">
+                <label>Provider</label>
+                <select id="set-cu-provider">
+                  <option value="">Auto (gemini-3-flash-preview)</option>
+                  <option value="gemini">Gemini</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="anthropic">Anthropic</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label>Model</label>
+                <select id="set-cu-model">
+                  <option value="">Default</option>
+                  <optgroup label="Gemini">
+                    <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
+                    <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
+                    <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                  </optgroup>
+                  <optgroup label="OpenAI">
+                    <option value="gpt-5.4-mini">gpt-5.4-mini</option>
+                    <option value="gpt-5.4">gpt-5.4</option>
+                    <option value="computer-use-preview">computer-use-preview</option>
+                  </optgroup>
+                  <optgroup label="Anthropic">
+                    <option value="claude-haiku-4-5-20251001">claude-haiku-4-5</option>
+                    <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+                  </optgroup>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label>Backend</label>
+                <select id="set-cu-backend">
+                  <option value="auto">Auto-detect</option>
+                  <option value="x11">X11</option>
+                  <option value="wayland">Wayland</option>
+                  <option value="macos">macOS</option>
+                </select>
+              </div>
+            </fieldset>
+
+            <fieldset class="settings-group">
+              <legend>Presence</legend>
+              <div class="settings-row">
+                <label>Enabled</label>
+                <input id="set-presence-enabled" type="checkbox">
+              </div>
+              <div class="settings-row">
+                <label>Text Provider</label>
+                <select id="set-presence-provider">
+                  <option value="">Auto</option>
+                  <option value="gemini">Gemini</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="anthropic">Anthropic</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label>Text Model</label>
+                <select id="set-presence-model">
+                  <option value="">Default</option>
+                  <optgroup label="Gemini">
+                    <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
+                    <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                    <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+                  </optgroup>
+                  <optgroup label="OpenAI">
+                    <option value="gpt-5.4-mini">gpt-5.4-mini</option>
+                    <option value="gpt-5.4">gpt-5.4</option>
+                    <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+                  </optgroup>
+                  <optgroup label="Anthropic">
+                    <option value="claude-haiku-4-5-20251001">claude-haiku-4-5</option>
+                    <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+                    <option value="claude-opus-4-6">claude-opus-4-6</option>
+                  </optgroup>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label>Live Provider</label>
+                <select id="set-presence-live-provider">
+                  <option value="">Auto</option>
+                  <option value="gemini">Gemini</option>
+                  <option value="openai">OpenAI</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label>Live Model</label>
+                <select id="set-presence-live-model">
+                  <option value="">Default</option>
+                  <optgroup label="Gemini">
+                    <option value="gemini-3.1-flash-live-preview">gemini-3.1-flash-live-preview</option>
+                    <option value="gemini-2.5-flash-native-audio-preview-12-2025">gemini-2.5-flash-native-audio</option>
+                  </optgroup>
+                  <optgroup label="OpenAI">
+                    <option value="gpt-realtime-1.5">gpt-realtime-1.5</option>
+                    <option value="gpt-realtime">gpt-realtime</option>
+                    <option value="gpt-realtime-mini">gpt-realtime-mini</option>
+                  </optgroup>
+                </select>
+              </div>
+            </fieldset>
+
+            <fieldset class="settings-group">
+              <legend>Transcription</legend>
+              <div class="settings-row">
+                <label>Enabled</label>
+                <input id="set-transcription-enabled" type="checkbox">
+              </div>
+              <div class="settings-row">
+                <label>Provider</label>
+                <input id="set-transcription-provider" type="text" placeholder="openai">
+              </div>
+              <div class="settings-row">
+                <label>Model</label>
+                <select id="set-transcription-model">
+                  <option value="whisper-1">whisper-1</option>
+                  <option value="gpt-4o-transcribe">gpt-4o-transcribe</option>
+                  <option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label>Endpoint</label>
+                <input id="set-transcription-endpoint" type="text" placeholder="Default (OpenAI)">
+              </div>
+              <div class="settings-row">
+                <label>Language</label>
+                <input id="set-transcription-language" type="text" placeholder="Auto-detect">
+              </div>
+            </fieldset>
+
+            <fieldset class="settings-group">
+              <legend>Recording</legend>
+              <div class="settings-row">
+                <label>Enabled</label>
+                <input id="set-recording-enabled" type="checkbox">
+              </div>
+              <div class="settings-row">
+                <label>Framerate</label>
+                <input id="set-recording-framerate" type="number" min="1" max="60" placeholder="15">
+                <span id="framerate-warning" class="hidden" style="font-size:11px;color:var(--peach);margin-left:4px">screencapture backend caps at 15 fps</span>
+              </div>
+              <div class="settings-row">
+                <label>Quality</label>
+                <select id="set-recording-quality">
+                  <option value="low">Low</option>
+                  <option value="medium" selected>Medium</option>
+                  <option value="high">High</option>
+                </select>
+              </div>
+            </fieldset>
+
+            <fieldset class="settings-group">
+              <legend>Live Audio</legend>
+              <div class="settings-row">
+                <label>Enabled</label>
+                <input id="set-live-audio-enabled" type="checkbox">
+              </div>
+              <div class="settings-row">
+                <label>Timeout (s)</label>
+                <input id="set-live-audio-timeout" type="number" min="30" max="3600" placeholder="300">
+              </div>
+            </fieldset>
+          </div>
         </div>
+
+        <!-- Network pane: anything about how this daemon talks to others -->
+        <div class="subtab-pane" id="settings-pane-network">
+          <div class="settings-pane-body">
+            <fieldset class="settings-group">
+              <legend>Daemons</legend>
+              <p style="color:var(--subtext0);font-size:12px;margin:0 0 10px">
+                Connect to additional intendant daemons on other machines to observe their activity alongside this one. Use <code style="color:var(--blue)">https://</code> (mTLS, required on iOS) or <code style="color:var(--blue)">http://</code> (trusted LAN / same hypervisor). Browser mixed-content rules apply — HTTPS pages can only reach HTTPS secondaries.
+              </p>
+              <div id="daemons-list" class="daemons-list"></div>
+              <div class="daemon-add-row">
+                <input id="daemon-add-url" type="text" placeholder="http://macos-guest:8765 or https://mac-work:8443" autocomplete="off">
+                <input id="daemon-add-label" type="text" placeholder="label (optional)" autocomplete="off">
+                <button id="daemon-add-btn" type="button">Add</button>
+              </div>
+              <span id="daemons-status" class="daemons-status"></span>
+            </fieldset>
+          </div>
+        </div>
+
+        <!-- Debug pane: read-only diagnostics -->
+        <div class="subtab-pane" id="settings-pane-debug">
+          <div class="settings-pane-body">
+            <div id="settings-env-overrides" class="hidden" style="margin:0 0 16px;padding:12px;background:var(--mantle);border-radius:6px">
+              <h4 style="margin:0 0 8px;color:var(--peach);font-size:13px">Environment Variable Overrides</h4>
+              <div id="settings-env-list" style="font-size:12px;color:var(--subtext0)"></div>
+            </div>
+            <p id="debug-empty" style="color:var(--subtext0);font-size:12px">
+              No debug overrides active. Set environment variables before launching <code style="color:var(--blue)">intendant --web</code> to see them here.
+            </p>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Save / Reset — outside subtab-panes so it's always visible. -->
+      <div class="settings-save-row">
+        <button id="settings-save-btn">Save</button>
+        <button id="settings-reset-btn">Reset</button>
+        <span id="settings-status"></span>
       </div>
     </div>
 
@@ -4759,10 +4820,10 @@ function initShell() {
 function switchTerminalSubtab(name) {
   if (activeTermSubtab === name) return;
   activeTermSubtab = name;
-  document.querySelectorAll('.terminal-subtab-btn').forEach(btn => {
+  document.querySelectorAll('#tab-terminal .subtab-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.termTab === name);
   });
-  document.querySelectorAll('.terminal-subtab-pane').forEach(pane => {
+  document.querySelectorAll('#tab-terminal .subtab-pane').forEach(pane => {
     pane.classList.toggle('active', pane.id === `term-pane-${name}`);
   });
   // Key bar toggle is only meaningful on the Shell sub-tab.
@@ -7858,8 +7919,13 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 });
 
 // Terminal sub-tab switching (TUI | Shell).
-document.querySelectorAll('.terminal-subtab-btn').forEach(btn => {
+document.querySelectorAll('#tab-terminal .subtab-btn[data-term-tab]').forEach(btn => {
   btn.addEventListener('click', () => switchTerminalSubtab(btn.dataset.termTab));
+});
+
+// Settings sub-tab switching (Account | Agent | Network | Debug).
+document.querySelectorAll('#tab-settings .subtab-btn[data-settings-tab]').forEach(btn => {
+  btn.addEventListener('click', () => switchSettingsSubtab(btn.dataset.settingsTab));
 });
 
 function switchTab(tabId) {
@@ -7895,6 +7961,62 @@ function switchTab(tabId) {
     // Always re-render so connection states reflect current WASM state.
     renderDaemonsList();
   }
+}
+
+// ── Settings sub-tabs ──
+//
+// The Settings tab is split into four sub-tabs (Account, Agent,
+// Network, Debug). Switching is purely local DOM — no data reload
+// happens when the sub-tab changes, because all settings load in one
+// shot via `loadSettings()` on tab open. The save/reset row lives
+// outside the panes and always persists the full form.
+
+// Remember the last active sub-tab across page reloads so users don't
+// lose their place when the page auto-refreshes.
+const SETTINGS_SUBTAB_KEY = 'intendant_settings_subtab';
+let activeSettingsSubtab =
+  localStorage.getItem(SETTINGS_SUBTAB_KEY) || 'account';
+
+function switchSettingsSubtab(name) {
+  if (activeSettingsSubtab === name) return;
+  activeSettingsSubtab = name;
+  localStorage.setItem(SETTINGS_SUBTAB_KEY, name);
+  document.querySelectorAll('#tab-settings .subtab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.settingsTab === name);
+  });
+  document.querySelectorAll('#tab-settings .subtab-pane').forEach(pane => {
+    pane.classList.toggle('active', pane.id === `settings-pane-${name}`);
+  });
+  updateSettingsSaveRow();
+}
+
+// Apply the remembered sub-tab on initial render, before anything
+// else toggles the default.
+function applyInitialSettingsSubtab() {
+  if (activeSettingsSubtab === 'account') {
+    updateSettingsSaveRow();
+    return;
+  }
+  document.querySelectorAll('#tab-settings .subtab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.settingsTab === activeSettingsSubtab);
+  });
+  document.querySelectorAll('#tab-settings .subtab-pane').forEach(pane => {
+    pane.classList.toggle('active', pane.id === `settings-pane-${activeSettingsSubtab}`);
+  });
+  updateSettingsSaveRow();
+}
+
+// The main Save/Reset row only actually saves the Agent sub-tab's
+// settings (CU, Presence, Transcription, Recording, Live Audio +
+// External Agent). Account has its own "Save Keys" button inside the
+// API Keys fieldset; Network applies each daemon immediately on Add;
+// Debug is read-only. So we hide the global Save row on every
+// sub-tab except Agent to prevent the "I clicked Save and nothing
+// happened" confusion.
+function updateSettingsSaveRow() {
+  const row = document.querySelector('#tab-settings .settings-save-row');
+  if (!row) return;
+  row.style.display = (activeSettingsSubtab === 'agent') ? '' : 'none';
 }
 
 // ── Daemons (multi-host) ──
@@ -8105,6 +8227,8 @@ function initDaemons() {
     registerDaemonWithWasm(d);
   }
   renderDaemonsList();
+  // Apply remembered Settings sub-tab now that the DOM is ready.
+  applyInitialSettingsSubtab();
 
   // Wire the add form.
   document.getElementById('daemon-add-btn').addEventListener('click', addDaemon);
@@ -8175,13 +8299,16 @@ async function loadSettings() {
     document.getElementById('set-live-audio-timeout').value = d.live_audio_timeout_secs || 300;
     const envDiv = document.getElementById('settings-env-list');
     const envWrap = document.getElementById('settings-env-overrides');
+    const debugEmpty = document.getElementById('debug-empty');
     if (d.env_overrides && Object.keys(d.env_overrides).length > 0) {
       envDiv.innerHTML = Object.entries(d.env_overrides)
         .map(([k, v]) => '<div><code style="color:var(--peach)">' + k + '</code> = <code>' + v + '</code></div>')
         .join('');
       envWrap.classList.remove('hidden');
+      if (debugEmpty) debugEmpty.classList.add('hidden');
     } else {
       envWrap.classList.add('hidden');
+      if (debugEmpty) debugEmpty.classList.remove('hidden');
     }
     settingsLoaded = true;
   } catch (e) {
