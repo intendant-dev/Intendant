@@ -1193,6 +1193,13 @@ pub fn spawn_web_gateway(
     // "None (internal agent)" on every page refresh even though the
     // daemon still has the value in memory.
     let last_external_agent_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Cache the latest user_display_granted event. The authoritative
+    // state lives in AutonomyState.user_display_granted on the server,
+    // but the dashboard only learns about it via the broadcast; without
+    // this cache a refreshed browser shows "off" regardless of whether
+    // the user has actually granted access. Cleared on user_display_revoked
+    // so a stale grant doesn't get replayed after the user revokes.
+    let last_user_display_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache display_ready JSON per display_id for late-connecting browsers.
     // Using a HashMap so multiple concurrent display sessions are all replayed.
     let display_ready_cache: Arc<Mutex<HashMap<u32, String>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -1201,6 +1208,7 @@ pub fn spawn_web_gateway(
         let live_usage_cache = last_live_usage_json.clone();
         let status_cache = last_status_json.clone();
         let external_agent_cache = last_external_agent_json.clone();
+        let user_display_cache = last_user_display_json.clone();
         let display_cache = display_ready_cache.clone();
         let mut usage_rx = broadcast_tx.subscribe();
         tokio::spawn(async move {
@@ -1226,6 +1234,19 @@ pub fn spawn_web_gateway(
                                 if let Ok(mut guard) = display_cache.lock() {
                                     guard.remove(&did);
                                 }
+                            }
+                        }
+                        // Cache user_display_granted for replay on reconnect.
+                        // Clear the cache on user_display_revoked so a refreshed
+                        // browser after a revoke doesn't re-enable the badge.
+                        if line.contains("\"event\":\"user_display_granted\"") {
+                            if let Ok(mut guard) = user_display_cache.lock() {
+                                *guard = Some(line.clone());
+                            }
+                        }
+                        if line.contains("\"event\":\"user_display_revoked\"") {
+                            if let Ok(mut guard) = user_display_cache.lock() {
+                                *guard = None;
                             }
                         }
                         if line.contains("\"event\":\"usage_update\"")
@@ -1294,6 +1315,7 @@ pub fn spawn_web_gateway(
             let last_live_usage_json = last_live_usage_json.clone();
             let last_status_json = last_status_json.clone();
             let last_external_agent_json = last_external_agent_json.clone();
+            let last_user_display_json = last_user_display_json.clone();
             let display_ready_cache = display_ready_cache.clone();
             let web_tui_tx = web_tui_tx.clone();
             let task_tx = task_tx.clone();
@@ -1402,6 +1424,17 @@ pub fn spawn_web_gateway(
                     if let Ok(guard) = last_external_agent_json.lock() {
                         if let Some(ref ea_json) = *guard {
                             let _ = direct_tx.send(ea_json.clone());
+                        }
+                    }
+
+                    // Send cached user_display_granted so the "your display"
+                    // status bar toggle reflects the current grant state on
+                    // a refreshed browser. Cache is cleared on revoke so
+                    // a revoked state simply results in nothing being sent
+                    // (the dashboard's HTML default is "off").
+                    if let Ok(guard) = last_user_display_json.lock() {
+                        if let Some(ref ud_json) = *guard {
+                            let _ = direct_tx.send(ud_json.clone());
                         }
                     }
 
