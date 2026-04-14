@@ -4398,7 +4398,9 @@ function renderTurnSeparator(turn) {
 const _logImageStore = new WeakMap();
 
 // Stable hash-to-hue mapping so each host gets its own visually
-// distinct badge color. Same host → same color across reloads.
+// distinct badge color. Saturation is intentionally low so the pills
+// recede as backgrounds next to the log-level colors (info/model/
+// agent/etc.) rather than competing with them for attention.
 function hostBadgeColor(hostId) {
   let hash = 0;
   for (let i = 0; i < hostId.length; i++) {
@@ -4406,7 +4408,7 @@ function hostBadgeColor(hostId) {
     hash |= 0;
   }
   const hue = ((hash % 360) + 360) % 360;
-  return `hsl(${hue}, 55%, 65%)`;
+  return `hsl(${hue}, 32%, 58%)`;
 }
 
 function renderLogEntry(c) {
