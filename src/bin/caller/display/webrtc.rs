@@ -472,47 +472,55 @@ impl WebRtcPeer {
             ));
         }
 
-        // --- ICE-TCP candidates (registry-based demux, ufrag-matched) ------
-        // If the web_gateway provided a `TcpPeerRegistry`, register this
-        // peer's local ufrag with it and emit a `Candidate::host(.., "tcp")`
-        // for every routable interface address pointing at the advertised
-        // TCP port. The registry owns no listener of its own — the web
-        // gateway's HTTP accept loop inspects each incoming TCP connection
-        // and routes STUN-framed traffic to the registry, which in turn
-        // looks up this peer by its local ufrag. That's how multiplexing
-        // on the HTTP port works (Phase 3): the advertised TCP port equals
-        // the HTTP port, and every candidate pair the browser tries flows
-        // through the already-forwarded HTTP port.
+        // --- ICE-TCP candidate (single loopback, tunnel-friendly) ---------
         //
-        // For deployments that set an explicit `[webrtc] tcp_port` in
-        // config, the session spawns a standalone `bind_standalone`
-        // listener on that port backed by the same registry, and the
-        // advertised TCP port is that port instead of the HTTP port. Both
-        // paths converge on the same registry, so the peer side is
-        // identical.
+        // We advertise exactly ONE TCP candidate: `127.0.0.1:<http_port>`.
+        // This looks wrong at first glance — loopback candidates are
+        // traditionally same-host-only — but it's the only addressing
+        // that actually reaches a tunneled server from the browser's
+        // side. In every topology where the browser can't reach the
+        // agent directly (NAT'd VMs, SSH tunnels, corporate firewalls,
+        // port-forward setups), the browser reaches us via *its own*
+        // `localhost:<same_port>` that's been mapped to us by the
+        // tunneling layer. Advertising `127.0.0.1:<port>` means the
+        // browser attempts a TCP connection to its own localhost on the
+        // same port it already uses for the dashboard — which the
+        // tunnel forwards back to us. No interface TCP candidates are
+        // emitted: on a same-LAN non-NAT topology UDP host candidates
+        // already work, so TCP is the fallback that only matters when
+        // UDP can't reach.
+        //
+        // On the server side, we "lie" to str0m about where the
+        // inbound TCP connection arrived: we pass
+        // `destination = 127.0.0.1:<port>` to `handle_input` even
+        // though the kernel-level `local_addr()` is the VM's real
+        // interface IP. str0m matches the lied-about destination to
+        // its one advertised local candidate and forms a clean pair;
+        // the data still flows because the TCP stream is bidirectional
+        // — we own the write half directly, no kernel routing needed.
         let mut peer_registration = None;
         let mut tcp_conn_rx: Option<mpsc::Receiver<AcceptedTcpConnection>> = None;
+        let mut tcp_fake_local: Option<SocketAddr> = None;
         if let (Some(registry), Some(tcp_port)) =
             (tcp_peer_registry.as_ref(), tcp_advertised_port)
         {
             let (registration, rx) = registry.register(local_ufrag.clone());
             peer_registration = Some(registration);
             tcp_conn_rx = Some(rx);
-            for iface_addr in &local_addrs {
-                let cand_addr = SocketAddr::new(*iface_addr, tcp_port);
-                match Candidate::host(cand_addr, "tcp") {
-                    Ok(c) => {
-                        rtc.add_local_candidate(c);
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[display/webrtc] skipping TCP host candidate {cand_addr}: {e}"
-                        );
-                    }
+            let fake_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tcp_port);
+            tcp_fake_local = Some(fake_local);
+            match Candidate::host(fake_local, "tcp") {
+                Ok(c) => {
+                    rtc.add_local_candidate(c);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[display/webrtc] failed to add TCP host candidate {fake_local}: {e}"
+                    );
                 }
             }
             eprintln!(
-                "[display/webrtc] peer {peer_id}: ICE-TCP enabled on port {tcp_port} for ufrag {local_ufrag}"
+                "[display/webrtc] peer {peer_id}: ICE-TCP enabled on {fake_local} for ufrag {local_ufrag}"
             );
         }
 
@@ -536,6 +544,7 @@ impl WebRtcPeer {
             rtc,
             sockets,
             tcp_conn_rx,
+            tcp_fake_local,
             peer_registration,
             encoded_frame_rx,
             command_rx,
@@ -665,6 +674,7 @@ async fn driver(
     mut rtc: Rtc,
     sockets: Vec<Arc<UdpSocket>>,
     mut tcp_conn_rx: Option<mpsc::Receiver<AcceptedTcpConnection>>,
+    tcp_fake_local: Option<SocketAddr>,
     _tcp_registration: Option<PeerRegistration>,
     mut frame_rx: mpsc::Receiver<Arc<EncodedFrame>>,
     mut command_rx: mpsc::Receiver<Command>,
@@ -827,14 +837,31 @@ async fn driver(
                 // address, spawn a reader task that forwards subsequent
                 // frames through the unified inbound channel, and inject the
                 // first-frame we already peeked directly.
+                //
+                // We "lie" to str0m about the destination address: every
+                // inbound TCP frame gets `destination = tcp_fake_local`
+                // (the 127.0.0.1:<http_port> we advertised as our single
+                // TCP candidate), not the actual `stream.local_addr()` —
+                // which on a NAT'd VM is the VM's internal interface IP
+                // that str0m has no candidate for. Matching the fake
+                // destination to the one local candidate we advertised
+                // lets ICE form a valid pair. The underlying TCP stream
+                // is bidirectional so data still flows through the real
+                // kernel socket we own.
                 let AcceptedTcpConnection {
                     remote_addr,
-                    local_addr,
+                    local_addr: real_local,
                     first_frame,
                     stream,
                 } = accepted;
+                let Some(fake_local) = tcp_fake_local else {
+                    eprintln!(
+                        "[display/webrtc] peer {peer_id}: TCP connection from {remote_addr} but no fake local configured, dropping"
+                    );
+                    continue;
+                };
                 eprintln!(
-                    "[display/webrtc] peer {peer_id}: ICE-TCP connection from {remote_addr} → {local_addr}"
+                    "[display/webrtc] peer {peer_id}: ICE-TCP connection from {remote_addr} → {real_local} (str0m sees {fake_local})"
                 );
                 let (read_half, write_half) = stream.into_split();
                 let writer: TcpWriter = Arc::new(AsyncMutex::new(write_half));
@@ -853,7 +880,7 @@ async fn driver(
                                     let pkt = InboundPacket {
                                         proto: Protocol::Tcp,
                                         source: remote_addr,
-                                        destination: local_addr,
+                                        destination: fake_local,
                                         bytes,
                                         received_at: Instant::now(),
                                     };
@@ -888,7 +915,7 @@ async fn driver(
                     Receive {
                         proto: Protocol::Tcp,
                         source: remote_addr,
-                        destination: local_addr,
+                        destination: fake_local,
                         contents,
                     },
                 );
@@ -969,20 +996,21 @@ async fn drain_outputs(
         match rtc.poll_output() {
             Ok(Output::Timeout(t)) => return Ok(t),
             Ok(Output::Transmit(t)) => {
-                // Two routability checks the Linux kernel would otherwise
-                // reject with EINVAL. str0m doesn't know about local
-                // routing constraints — it pairs all candidates of matching
-                // address family — so we filter the obviously-impossible
-                // pairs ourselves to avoid log spam and wasted syscalls:
-                //
-                //   1. Address family mismatch (v4 source, v6 destination).
-                //   2. Loopback ↔ non-loopback: a 127.0.0.1-bound socket
-                //      can't reach a routable IP, and vice versa.
-                if t.source.is_ipv4() != t.destination.is_ipv4() {
-                    continue;
-                }
-                if t.source.ip().is_loopback() != t.destination.ip().is_loopback() {
-                    continue;
+                // Routability filtering only applies to UDP: for UDP we
+                // need the kernel's `sendto` to succeed from our bound
+                // socket, and a loopback-source→routable-destination (or
+                // family mismatch) pair would be rejected with EINVAL
+                // and waste syscalls. For TCP the connection is already
+                // established and we own the stream directly, so we can
+                // write regardless of what the abstract source/destination
+                // addresses would imply at a pure routing layer.
+                if matches!(t.proto, Protocol::Udp) {
+                    if t.source.is_ipv4() != t.destination.is_ipv4() {
+                        continue;
+                    }
+                    if t.source.ip().is_loopback() != t.destination.ip().is_loopback() {
+                        continue;
+                    }
                 }
                 match t.proto {
                     Protocol::Udp => {
