@@ -95,6 +95,18 @@ impl DisplayBackend for WaylandBackend {
             .await
             .map_err(|e| CallerError::Display(format!("create session: {e}")))?;
 
+        // PersistMode::DoNot is forced: joint RemoteDesktop+ScreenCast
+        // sessions can't use restore_token persistence on GNOME
+        // (xdg-desktop-portal-gnome rejects select_sources with
+        // "Remote desktop sessions cannot persist"). Only pure ScreenCast
+        // (view-only) sessions can persist. To skip the approval dialog
+        // on subsequent runs you'd have to split into a persistent
+        // ScreenCast session for video and a separate RemoteDesktop
+        // session (ephemeral) for input injection — which changes the
+        // backend lifecycle meaningfully and still shows the input
+        // dialog on every run. We accept the every-launch dialog for
+        // now and surface it via the DisplayApprovalPending banner so
+        // remote users know to look at the guest desktop.
         remote_desktop
             .select_devices(
                 &session,
@@ -668,3 +680,4 @@ fn run_pipewire_capture(
     // Run until shutdown or error.
     mainloop.run();
 }
+
