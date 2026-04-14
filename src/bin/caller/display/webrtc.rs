@@ -12,6 +12,19 @@
 //! After every input the driver drains `rtc.poll_output()` until it returns
 //! `Output::Timeout`, sending any `Transmit` outputs over the UDP socket and
 //! dispatching `Event` outputs to the input/clipboard handlers.
+//!
+//! ## ICE-TCP multiplexing
+//!
+//! When `IceConfig::tcp_port` is set, the `DisplaySession` creates a shared
+//! `TcpDispatcher` holding a single `TcpListener` on that port. Peers register
+//! their pre-generated local ufrag with the dispatcher at construction time.
+//! The dispatcher accepts incoming connections, parses the first RFC 4571
+//! framed STUN binding request, extracts the USERNAME attribute's local-ufrag
+//! portion, and routes the connection to the matching peer. Each TCP
+//! connection becomes a bidirectional channel with the peer's driver — inbound
+//! frames flow into the same packet channel that UDP uses (tagged with
+//! `Protocol::Tcp`), outbound `Output::Transmit` with `proto == Tcp` is written
+//! to the connection's write-half keyed on the destination address.
 
 use super::clipboard::ClipboardContent;
 use super::{EncodedFrame, IceConfig, InputEvent, PeerId};
@@ -25,9 +38,10 @@ use str0m::channel::ChannelId;
 use str0m::format::Codec;
 use str0m::media::{MediaAdded, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{DatagramRecv, Protocol, Receive};
-use str0m::{Candidate, Event, Input, Output, Rtc, RtcConfig, RtcError};
-use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use str0m::{Candidate, Event, IceCreds, Input, Output, Rtc, RtcConfig, RtcError};
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
 
 /// Bound on the per-peer encoded-frame channel. Frames in excess are dropped
@@ -39,6 +53,273 @@ const COMMAND_CHANNEL: usize = 32;
 
 /// Maximum UDP datagram we'll receive on the per-peer socket.
 const UDP_BUF_LEN: usize = 2000;
+
+/// Maximum RFC 4571 frame we'll accept over ICE-TCP (one STUN/DTLS/RTP packet).
+/// DTLS records and RTP packets are bounded by MTU in practice; we use a
+/// generous ceiling to accommodate jumbo frames without allowing pathological
+/// memory allocation from a malicious peer.
+const TCP_MAX_FRAME_LEN: usize = 65535;
+
+// ---------------------------------------------------------------------------
+// TCP dispatcher: shared listener + peer registry
+// ---------------------------------------------------------------------------
+
+/// Shared ICE-TCP listener + demux. One per `DisplaySession` when
+/// `IceConfig::tcp_port` is set. Peers register their local ufrag at
+/// construction time; the dispatcher accepts connections, parses the first
+/// RFC 4571 STUN frame to extract the ufrag, and hands the connection to
+/// the matching peer.
+pub struct TcpDispatcher {
+    local_port: u16,
+    /// `local_ufrag` → sender that delivers accepted TCP connections to the
+    /// peer's driver task. The peer takes ownership of the connection once
+    /// registered — subsequent frames on that connection aren't sniffed
+    /// again.
+    registry: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<AcceptedTcpConnection>>>>,
+    shutdown: CancellationToken,
+}
+
+/// A TCP connection that has been matched to a peer by its first STUN frame.
+/// Carries the first frame (which the peer still needs to process) alongside
+/// the split stream halves so the peer can read subsequent frames and write
+/// outbound transmits.
+pub struct AcceptedTcpConnection {
+    pub remote_addr: SocketAddr,
+    pub local_addr: SocketAddr,
+    /// The first frame we already read off the wire (needed for STUN ufrag
+    /// matching). The peer's driver must feed this to `rtc.handle_input`.
+    pub first_frame: Vec<u8>,
+    pub stream: TcpStream,
+}
+
+impl TcpDispatcher {
+    /// Bind the listener on `0.0.0.0:port` and start the accept loop.
+    pub async fn bind(port: u16) -> Result<Arc<Self>, CallerError> {
+        let listener = TcpListener::bind(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port,
+        ))
+        .await
+        .map_err(|e| CallerError::WebRtc(format!("bind ICE-TCP listener on :{port}: {e}")))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| CallerError::WebRtc(format!("listener local_addr: {e}")))?;
+        eprintln!("[display/webrtc] ICE-TCP listener bound on {local_addr}");
+
+        let dispatcher = Arc::new(Self {
+            local_port: local_addr.port(),
+            registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            shutdown: CancellationToken::new(),
+        });
+
+        let registry = Arc::clone(&dispatcher.registry);
+        let shutdown = dispatcher.shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok((stream, remote_addr)) => {
+                            let registry = Arc::clone(&registry);
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    handle_new_tcp_connection(stream, remote_addr, registry).await
+                                {
+                                    eprintln!(
+                                        "[display/webrtc] ICE-TCP probe for {remote_addr} failed: {e}"
+                                    );
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("[display/webrtc] ICE-TCP accept failed: {e}");
+                            // Small backoff so we don't spin on a broken listener.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    },
+                }
+            }
+            eprintln!("[display/webrtc] ICE-TCP dispatcher exiting");
+        });
+
+        Ok(dispatcher)
+    }
+
+    pub fn port(&self) -> u16 {
+        self.local_port
+    }
+
+    /// Register a peer's local ufrag and return the receiver side of the
+    /// per-peer connection channel. Drop the returned `PeerRegistration` to
+    /// unregister on peer close.
+    pub fn register(
+        self: &Arc<Self>,
+        local_ufrag: String,
+    ) -> (PeerRegistration, mpsc::Receiver<AcceptedTcpConnection>) {
+        let (tx, rx) = mpsc::channel::<AcceptedTcpConnection>(8);
+        self.registry
+            .lock()
+            .unwrap()
+            .insert(local_ufrag.clone(), tx);
+        (
+            PeerRegistration {
+                registry: Arc::clone(&self.registry),
+                local_ufrag,
+            },
+            rx,
+        )
+    }
+}
+
+/// RAII guard that unregisters a peer's ufrag from the dispatcher on drop.
+pub struct PeerRegistration {
+    registry: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<AcceptedTcpConnection>>>>,
+    local_ufrag: String,
+}
+
+impl Drop for PeerRegistration {
+    fn drop(&mut self) {
+        self.registry.lock().unwrap().remove(&self.local_ufrag);
+    }
+}
+
+/// Accept a new TCP connection: read the first RFC 4571 frame, parse the
+/// STUN USERNAME attribute, extract the local ufrag, route the connection
+/// to the matching peer.
+async fn handle_new_tcp_connection(
+    mut stream: TcpStream,
+    remote_addr: SocketAddr,
+    registry: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<AcceptedTcpConnection>>>>,
+) -> Result<(), String> {
+    let local_addr = stream
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+
+    let first_frame = read_rfc4571_frame(&mut stream)
+        .await
+        .map_err(|e| format!("read first frame: {e}"))?;
+
+    let username = parse_stun_username(&first_frame)
+        .ok_or_else(|| "first frame is not a STUN binding request with USERNAME".to_string())?;
+
+    // USERNAME format for ICE is "remote_ufrag:local_ufrag". The local side
+    // is us; that's what we demux on.
+    let local_ufrag = username
+        .split_once(':')
+        .map(|(_, local)| local.to_string())
+        .ok_or_else(|| format!("bad USERNAME format: {username:?}"))?;
+
+    let tx = {
+        let guard = registry.lock().unwrap();
+        guard.get(&local_ufrag).cloned()
+    };
+    let Some(tx) = tx else {
+        return Err(format!("no peer registered for ufrag {local_ufrag:?}"));
+    };
+
+    let accepted = AcceptedTcpConnection {
+        remote_addr,
+        local_addr,
+        first_frame,
+        stream,
+    };
+    tx.send(accepted)
+        .await
+        .map_err(|_| "peer channel closed before we could hand over the connection".to_string())?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// RFC 4571 framing
+// ---------------------------------------------------------------------------
+
+/// Read one RFC 4571 framed payload from a `tokio::io::AsyncRead`:
+/// 2-byte big-endian length header followed by `length` bytes of payload.
+///
+/// Generic over the read source so we can reuse it for a `TcpStream`
+/// (during dispatcher probe) and an `OwnedReadHalf` (inside the per-peer
+/// reader task after `into_split`).
+async fn read_rfc4571_frame<R>(r: &mut R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut len_buf = [0u8; 2];
+    r.read_exact(&mut len_buf).await?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    if len == 0 || len > TCP_MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("RFC 4571 frame length {len} out of bounds"),
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Write one RFC 4571 framed payload: prepend a 2-byte BE length header,
+/// then the payload bytes.
+async fn write_rfc4571_frame<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    if payload.len() > TCP_MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("RFC 4571 frame too large: {}", payload.len()),
+        ));
+    }
+    let len = payload.len() as u16;
+    w.write_all(&len.to_be_bytes()).await?;
+    w.write_all(payload).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Minimal STUN parser (USERNAME attribute only)
+// ---------------------------------------------------------------------------
+
+/// Parse just enough of a STUN message (RFC 5389) to extract the USERNAME
+/// attribute value (type 0x0006). Returns `None` for non-STUN or malformed
+/// input, or STUN messages without a USERNAME attribute.
+fn parse_stun_username(bytes: &[u8]) -> Option<String> {
+    // Header: 20 bytes
+    //   type (2) | length (2) | magic cookie (4) | transaction id (12)
+    if bytes.len() < 20 {
+        return None;
+    }
+    // Magic cookie must be 0x2112A442 per RFC 5389.
+    if bytes[4..8] != [0x21, 0x12, 0xA4, 0x42] {
+        return None;
+    }
+    let msg_length = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+    let attrs_end = 20usize.checked_add(msg_length)?;
+    if bytes.len() < attrs_end {
+        return None;
+    }
+
+    let mut offset = 20usize;
+    while offset + 4 <= attrs_end {
+        let attr_type = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+        let attr_length = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+        let value_start = offset + 4;
+        let value_end = value_start.checked_add(attr_length)?;
+        if value_end > attrs_end {
+            return None;
+        }
+        if attr_type == 0x0006 {
+            // USERNAME — UTF-8 string per RFC 5389 §15.3.
+            return std::str::from_utf8(&bytes[value_start..value_end])
+                .ok()
+                .map(String::from);
+        }
+        // Advance past value, padded to a 4-byte boundary.
+        let pad = (4 - (attr_length % 4)) % 4;
+        offset = value_end + pad;
+    }
+    None
+}
 
 /// Public handle to a single WebRTC peer.
 ///
@@ -77,15 +358,24 @@ impl WebRtcPeer {
         offer_sdp: &str,
         codec_mime: &str,
         _ice_config: &IceConfig,
+        tcp_dispatcher: Option<Arc<TcpDispatcher>>,
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
         _ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<(Self, String), CallerError> {
+        // --- Pre-generate ICE credentials ----------------------------------
+        // We need to know the local ufrag *before* Rtc::build so we can
+        // register it with the TCP dispatcher, if present.
+        let ice_creds = IceCreds::new();
+        let local_ufrag = ice_creds.ufrag.clone();
+
         // --- Build the Rtc with only the negotiated codec enabled ---------
         // The session-level codec selection has already happened in
         // DisplaySession::handle_offer; we restrict str0m's codec set so
         // negotiation can only resolve to that one codec.
-        let mut config = RtcConfig::new().clear_codecs();
+        let mut config = RtcConfig::new()
+            .clear_codecs()
+            .set_local_ice_credentials(ice_creds);
         config = match codec_mime {
             super::encode::MIME_TYPE_VP8 => config.enable_vp8(true),
             super::encode::MIME_TYPE_H264 => config.enable_h264(true),
@@ -106,13 +396,14 @@ impl WebRtcPeer {
         // interface and emit a host candidate that exactly matches each
         // socket's local address.
         let mut sockets: Vec<Arc<UdpSocket>> = Vec::new();
-        for iface_addr in routable_local_addrs() {
-            let bind_addr = SocketAddr::new(iface_addr, 0);
+        let local_addrs = routable_local_addrs();
+        for iface_addr in &local_addrs {
+            let bind_addr = SocketAddr::new(*iface_addr, 0);
             let socket = match UdpSocket::bind(bind_addr).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!(
-                        "[display/webrtc] skipping bind on {iface_addr}: {e}"
+                        "[display/webrtc] skipping UDP bind on {iface_addr}: {e}"
                     );
                     continue;
                 }
@@ -121,7 +412,7 @@ impl WebRtcPeer {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!(
-                        "[display/webrtc] skipping socket on {iface_addr}: local_addr {e}"
+                        "[display/webrtc] skipping UDP socket on {iface_addr}: local_addr {e}"
                     );
                     continue;
                 }
@@ -132,7 +423,7 @@ impl WebRtcPeer {
                     sockets.push(Arc::new(socket));
                 }
                 Err(e) => {
-                    eprintln!("[display/webrtc] skipping host candidate {local}: {e}");
+                    eprintln!("[display/webrtc] skipping UDP host candidate {local}: {e}");
                 }
             }
         }
@@ -140,6 +431,39 @@ impl WebRtcPeer {
             return Err(CallerError::WebRtc(
                 "no usable local UDP sockets bound".to_string(),
             ));
+        }
+
+        // --- ICE-TCP candidates (shared listener, peer registered by ufrag)
+        // If the session has a TCP dispatcher, add a Candidate::host(..,
+        // "tcp") for every routable interface address pointing at the
+        // dispatcher's port. The dispatcher already holds the TcpListener
+        // on that port; we don't bind again here. On the wire, str0m
+        // emits these as `typ host tcptype passive` candidates and the
+        // browser will actively open a TCP connection to the server's
+        // advertised (ip, port) pair for each one.
+        let mut peer_registration = None;
+        let mut tcp_conn_rx: Option<mpsc::Receiver<AcceptedTcpConnection>> = None;
+        if let Some(ref dispatcher) = tcp_dispatcher {
+            let tcp_port = dispatcher.port();
+            let (registration, rx) = dispatcher.register(local_ufrag.clone());
+            peer_registration = Some(registration);
+            tcp_conn_rx = Some(rx);
+            for iface_addr in &local_addrs {
+                let cand_addr = SocketAddr::new(*iface_addr, tcp_port);
+                match Candidate::host(cand_addr, "tcp") {
+                    Ok(c) => {
+                        rtc.add_local_candidate(c);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[display/webrtc] skipping TCP host candidate {cand_addr}: {e}"
+                        );
+                    }
+                }
+            }
+            eprintln!(
+                "[display/webrtc] peer {peer_id}: ICE-TCP enabled on port {tcp_port} for ufrag {local_ufrag}"
+            );
         }
 
         // --- Parse the offer and produce the answer ----------------------
@@ -161,6 +485,8 @@ impl WebRtcPeer {
             peer_id,
             rtc,
             sockets,
+            tcp_conn_rx,
+            peer_registration,
             encoded_frame_rx,
             command_rx,
             input_handler,
@@ -265,19 +591,31 @@ struct DriverState {
     keyframe_seen: bool,
 }
 
-/// Inbound packet from one of the per-interface forwarder tasks.
+/// Inbound packet from one of the per-interface forwarder tasks or a
+/// TCP connection reader. `proto` tags which transport it arrived on so
+/// the driver can hand it to str0m with the correct metadata.
 struct InboundPacket {
+    proto: Protocol,
     source: SocketAddr,
     destination: SocketAddr,
     bytes: Vec<u8>,
     received_at: Instant,
 }
 
+/// The outbound write-half of a TCP connection. The driver stores one per
+/// connection (keyed by the remote's source address) so it can route
+/// `Output::Transmit { proto: Tcp, destination, .. }` to the right socket.
+/// Writes are serialized through an inner `tokio::Mutex` so concurrent
+/// `write_rfc4571_frame` calls can't interleave frame bytes.
+type TcpWriter = Arc<AsyncMutex<tokio::net::tcp::OwnedWriteHalf>>;
+
 #[allow(clippy::too_many_arguments)]
 async fn driver(
     peer_id: PeerId,
     mut rtc: Rtc,
     sockets: Vec<Arc<UdpSocket>>,
+    mut tcp_conn_rx: Option<mpsc::Receiver<AcceptedTcpConnection>>,
+    _tcp_registration: Option<PeerRegistration>,
     mut frame_rx: mpsc::Receiver<Arc<EncodedFrame>>,
     mut command_rx: mpsc::Receiver<Command>,
     input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
@@ -303,9 +641,17 @@ async fn driver(
         }
     }
 
-    // Spawn one forwarder task per socket. Each forwarder reads packets
+    // Outbound write halves for each active ICE-TCP connection, keyed by the
+    // remote's `SocketAddr` (the transmit.destination str0m emits for TCP).
+    let mut tcp_writers: HashMap<SocketAddr, TcpWriter> = HashMap::new();
+
+    // Spawn one forwarder task per UDP socket. Each forwarder reads packets
     // from its socket and pushes them into the shared inbound channel,
-    // tagged with the socket's local address as the destination.
+    // tagged with the socket's local address as the destination. The
+    // driver keeps its own clone of `inbound_tx` so it can spawn new
+    // readers as TCP connections arrive; it'll drop on driver exit and
+    // — together with the forwarders terminating on shutdown — close the
+    // channel cleanly.
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundPacket>(64);
     let forwarder_shutdown = shutdown.clone();
     let mut forwarder_handles = Vec::new();
@@ -325,6 +671,7 @@ async fn driver(
                     recv = sock.recv_from(&mut buf) => match recv {
                         Ok((n, source)) => {
                             let pkt = InboundPacket {
+                                proto: Protocol::Udp,
                                 source,
                                 destination: local_addr,
                                 bytes: buf[..n].to_vec(),
@@ -345,13 +692,13 @@ async fn driver(
             }
         }));
     }
-    drop(inbound_tx); // we keep one in each forwarder; this prevents driver-side deadlock on close
 
     loop {
         // 1. Drain all outputs until we get a Timeout (the next deadline).
         let timeout_at = match drain_outputs(
             &mut rtc,
             &sockets_by_addr,
+            &mut tcp_writers,
             &mut state,
             &input_handler,
             &clipboard_handler,
@@ -402,7 +749,7 @@ async fn driver(
                 let input = Input::Receive(
                     pkt.received_at,
                     Receive {
-                        proto: Protocol::Udp,
+                        proto: pkt.proto,
                         source: pkt.source,
                         destination: pkt.destination,
                         contents,
@@ -411,6 +758,93 @@ async fn driver(
                 if let Err(e) = rtc.handle_input(input) {
                     eprintln!(
                         "[display/webrtc] peer {peer_id}: handle_input(Receive) failed: {e:?}"
+                    );
+                    shutdown.cancel();
+                    for h in forwarder_handles {
+                        let _ = h.await;
+                    }
+                    return;
+                }
+            }
+            Some(accepted) = async {
+                match tcp_conn_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // New ICE-TCP connection from the dispatcher. Split into read
+                // + write halves, store the write side keyed by the remote
+                // address, spawn a reader task that forwards subsequent
+                // frames through the unified inbound channel, and inject the
+                // first-frame we already peeked directly.
+                let AcceptedTcpConnection {
+                    remote_addr,
+                    local_addr,
+                    first_frame,
+                    stream,
+                } = accepted;
+                eprintln!(
+                    "[display/webrtc] peer {peer_id}: ICE-TCP connection from {remote_addr} → {local_addr}"
+                );
+                let (read_half, write_half) = stream.into_split();
+                let writer: TcpWriter = Arc::new(AsyncMutex::new(write_half));
+                tcp_writers.insert(remote_addr, Arc::clone(&writer));
+
+                // Spawn reader task for subsequent frames on this connection.
+                let reader_tx = inbound_tx.clone();
+                let reader_shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let mut read_half = read_half;
+                    loop {
+                        tokio::select! {
+                            _ = reader_shutdown.cancelled() => break,
+                            frame = read_rfc4571_frame(&mut read_half) => match frame {
+                                Ok(bytes) => {
+                                    let pkt = InboundPacket {
+                                        proto: Protocol::Tcp,
+                                        source: remote_addr,
+                                        destination: local_addr,
+                                        bytes,
+                                        received_at: Instant::now(),
+                                    };
+                                    if reader_tx.send(pkt).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[display/webrtc] ICE-TCP reader for {remote_addr} exiting: {e}"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // Inject the first frame we peeked off the wire so str0m
+                // processes the STUN binding request we used to route.
+                let contents: DatagramRecv = match first_frame.as_slice().try_into() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!(
+                            "[display/webrtc] first ICE-TCP frame from {remote_addr} not a valid datagram: {e:?}"
+                        );
+                        continue;
+                    }
+                };
+                let input = Input::Receive(
+                    Instant::now(),
+                    Receive {
+                        proto: Protocol::Tcp,
+                        source: remote_addr,
+                        destination: local_addr,
+                        contents,
+                    },
+                );
+                if let Err(e) = rtc.handle_input(input) {
+                    eprintln!(
+                        "[display/webrtc] peer {peer_id}: handle_input(first TCP frame) failed: {e:?}"
                     );
                     shutdown.cancel();
                     for h in forwarder_handles {
@@ -473,6 +907,7 @@ enum DriverExit {
 async fn drain_outputs(
     rtc: &mut Rtc,
     sockets_by_addr: &HashMap<SocketAddr, Arc<UdpSocket>>,
+    tcp_writers: &mut HashMap<SocketAddr, TcpWriter>,
     state: &mut DriverState,
     input_handler: &Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: &Arc<dyn Fn(ClipboardContent) + Send + Sync>,
@@ -499,18 +934,50 @@ async fn drain_outputs(
                 if t.source.ip().is_loopback() != t.destination.ip().is_loopback() {
                     continue;
                 }
-                let Some(sock) = sockets_by_addr.get(&t.source) else {
-                    eprintln!(
-                        "[display/webrtc] transmit from unknown source {}, dropping",
-                        t.source
-                    );
-                    continue;
-                };
-                if let Err(e) = sock.send_to(&t.contents, t.destination).await {
-                    eprintln!(
-                        "[display/webrtc] udp send {} → {} failed: {e}",
-                        t.source, t.destination
-                    );
+                match t.proto {
+                    Protocol::Udp => {
+                        let Some(sock) = sockets_by_addr.get(&t.source) else {
+                            eprintln!(
+                                "[display/webrtc] UDP transmit from unknown source {}, dropping",
+                                t.source
+                            );
+                            continue;
+                        };
+                        if let Err(e) = sock.send_to(&t.contents, t.destination).await {
+                            eprintln!(
+                                "[display/webrtc] udp send {} → {} failed: {e}",
+                                t.source, t.destination
+                            );
+                        }
+                    }
+                    Protocol::Tcp => {
+                        // Look up the established TCP connection by remote
+                        // address (str0m's Transmit.destination for TCP is
+                        // the peer we received the connection from). If the
+                        // writer is gone — connection was closed — drop
+                        // the packet silently; str0m will time out the
+                        // candidate pair and try another.
+                        let Some(writer) = tcp_writers.get(&t.destination).cloned() else {
+                            continue;
+                        };
+                        let contents: Vec<u8> = (*t.contents).to_vec();
+                        tokio::spawn(async move {
+                            let mut guard = writer.lock().await;
+                            if let Err(e) = write_rfc4571_frame(&mut *guard, &contents).await {
+                                eprintln!(
+                                    "[display/webrtc] tcp write failed: {e}"
+                                );
+                            }
+                        });
+                    }
+                    _ => {
+                        // SslTcp / Tls — we don't advertise these, so str0m
+                        // shouldn't ever ask us to send via them.
+                        eprintln!(
+                            "[display/webrtc] unexpected transmit proto {:?}, dropping",
+                            t.proto
+                        );
+                    }
                 }
             }
             Ok(Output::Event(event)) => {

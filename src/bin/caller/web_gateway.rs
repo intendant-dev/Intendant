@@ -178,6 +178,13 @@ pub struct WebGatewayConfig {
     /// Empty by default (local-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ice_servers: Vec<crate::display::IceServer>,
+    /// Optional fixed TCP port for ICE-TCP host candidates. Used when the
+    /// agent's UDP host candidates aren't reachable from the browser
+    /// (NAT'd VMs, SSH tunnels, restrictive firewalls). The user exposes
+    /// this port alongside the HTTP port in their tunneling / port-forward
+    /// config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webrtc_tcp_port: Option<u16>,
     /// Stable identity label for this daemon. Resolved at startup from
     /// the `host_label` file in the LAN cert dir (written by `intendant
     /// lan setup --name …`) or falls back to the system hostname. Used
@@ -205,6 +212,7 @@ impl Default for WebGatewayConfig {
             output_sample_rate: 24000,
             transcription_enabled: false,
             ice_servers: Vec::new(),
+            webrtc_tcp_port: None,
             host_label: String::new(),
             version: String::new(),
             git_sha: String::new(),
@@ -1160,6 +1168,7 @@ pub fn spawn_web_gateway(
     // Pre-build ICE config for WebRTC display sessions from the gateway config.
     let ice_config = crate::display::IceConfig {
         ice_servers: config.ice_servers.clone(),
+        tcp_port: config.webrtc_tcp_port,
     };
 
     // Inject content-hash version into WASM/JS URLs for cache-busting.
@@ -3639,14 +3648,15 @@ pub fn build_config(
     live_provider: Option<&str>,
     live_model: Option<&str>,
     transcription_enabled: bool,
-    ice_servers: Vec<crate::display::IceServer>,
+    ice_config: crate::display::IceConfig,
 ) -> WebGatewayConfig {
     let mut cfg = build_config_inner(
         live_provider,
         live_model,
         transcription_enabled,
-        ice_servers,
+        ice_config.ice_servers,
     );
+    cfg.webrtc_tcp_port = ice_config.tcp_port;
     cfg.host_label = crate::lan::resolve_host_label();
     cfg.version = env!("CARGO_PKG_VERSION").to_string();
     cfg.git_sha = env!("INTENDANT_GIT_SHA").to_string();
@@ -3763,21 +3773,21 @@ mod tests {
 
     #[test]
     fn test_build_config_gemini_model() {
-        let config = build_config(None, Some("gemini-2.5-flash-native-audio-preview-12-2025"), false, Vec::new());
+        let config = build_config(None, Some("gemini-2.5-flash-native-audio-preview-12-2025"), false, crate::display::IceConfig::default());
         assert_eq!(config.provider, "gemini");
         assert_eq!(config.input_sample_rate, 16000);
     }
 
     #[test]
     fn test_build_config_openai_model() {
-        let config = build_config(None, Some("gpt-4o-realtime-preview"), false, Vec::new());
+        let config = build_config(None, Some("gpt-4o-realtime-preview"), false, crate::display::IceConfig::default());
         assert_eq!(config.provider, "openai");
         assert_eq!(config.input_sample_rate, 24000);
     }
 
     #[test]
     fn test_build_config_explicit_provider() {
-        let config = build_config(Some("openai"), None, false, Vec::new());
+        let config = build_config(Some("openai"), None, false, crate::display::IceConfig::default());
         assert_eq!(config.provider, "openai");
         assert_eq!(config.model, "gpt-4o-realtime-preview");
     }
@@ -3786,7 +3796,7 @@ mod tests {
     fn test_build_config_no_model() {
         // With no model and no env vars set in a predictable way,
         // this should default to gemini
-        let config = build_config(None, None, false, Vec::new());
+        let config = build_config(None, None, false, crate::display::IceConfig::default());
         // Either gemini or openai depending on env, but it shouldn't panic
         assert!(!config.provider.is_empty());
     }

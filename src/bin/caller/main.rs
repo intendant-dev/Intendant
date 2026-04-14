@@ -6589,7 +6589,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
-                project.config.webrtc.to_ice_config().ice_servers,
+                project.config.webrtc.to_ice_config(),
             );
             let shared_session = Arc::new(tokio::sync::RwLock::new(
                 web_gateway::ActiveSessionState {
@@ -7074,7 +7074,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
-                project.config.webrtc.to_ice_config().ice_servers,
+                project.config.webrtc.to_ice_config(),
             );
             let shared_session = Arc::new(tokio::sync::RwLock::new(
                 web_gateway::ActiveSessionState {
@@ -7468,7 +7468,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
-                project.config.webrtc.to_ice_config().ice_servers,
+                project.config.webrtc.to_ice_config(),
             );
             let shared_session = Arc::new(tokio::sync::RwLock::new(
                 web_gateway::ActiveSessionState {
