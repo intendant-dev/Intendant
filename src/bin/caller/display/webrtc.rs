@@ -61,28 +61,36 @@ const UDP_BUF_LEN: usize = 2000;
 const TCP_MAX_FRAME_LEN: usize = 65535;
 
 // ---------------------------------------------------------------------------
-// TCP dispatcher: shared listener + peer registry
+// TCP peer registry (ufrag → per-peer connection channel)
 // ---------------------------------------------------------------------------
+//
+// `TcpPeerRegistry` is a pure demux registry with no listener of its own. One
+// instance is created at web_gateway startup and shared across all display
+// sessions. The web_gateway's accept loop (which already peeks every
+// incoming TCP connection for HTTP vs. WebSocket) grows a third branch: if
+// the first bytes look like an RFC 4571-framed STUN binding request, read
+// one full frame, then call `route_accepted` to hand the connection to the
+// matching peer. HTTP-on-the-same-port works untouched because the peek is
+// non-destructive and STUN traffic is byte-distinguishable from HTTP
+// methods (no printable ASCII at offset 0) and TLS handshakes (no 0x16 at
+// offset 0).
+//
+// The same registry can also back a standalone TCP listener on a
+// user-configured fixed port (Phase 2 behavior) via `bind_standalone`, for
+// deployments where multiplexing on the HTTP port isn't wanted (e.g. HTTPS
+// terminated by a proxy that doesn't pass through binary frames).
 
-/// Shared ICE-TCP listener + demux. One per `DisplaySession` when
-/// `IceConfig::tcp_port` is set. Peers register their local ufrag at
-/// construction time; the dispatcher accepts connections, parses the first
-/// RFC 4571 STUN frame to extract the ufrag, and hands the connection to
-/// the matching peer.
-pub struct TcpDispatcher {
-    local_port: u16,
-    /// `local_ufrag` → sender that delivers accepted TCP connections to the
-    /// peer's driver task. The peer takes ownership of the connection once
-    /// registered — subsequent frames on that connection aren't sniffed
-    /// again.
-    registry: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<AcceptedTcpConnection>>>>,
-    shutdown: CancellationToken,
+/// Shared peer registry: ufrag → handoff channel. Peers register at
+/// construction time; `route_accepted` looks up the matching peer for an
+/// incoming TCP connection.
+pub struct TcpPeerRegistry {
+    registry: std::sync::Mutex<HashMap<String, mpsc::Sender<AcceptedTcpConnection>>>,
 }
 
 /// A TCP connection that has been matched to a peer by its first STUN frame.
 /// Carries the first frame (which the peer still needs to process) alongside
-/// the split stream halves so the peer can read subsequent frames and write
-/// outbound transmits.
+/// the stream so the peer can read subsequent frames and write outbound
+/// transmits.
 pub struct AcceptedTcpConnection {
     pub remote_addr: SocketAddr,
     pub local_addr: SocketAddr,
@@ -92,61 +100,13 @@ pub struct AcceptedTcpConnection {
     pub stream: TcpStream,
 }
 
-impl TcpDispatcher {
-    /// Bind the listener on `0.0.0.0:port` and start the accept loop.
-    pub async fn bind(port: u16) -> Result<Arc<Self>, CallerError> {
-        let listener = TcpListener::bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            port,
-        ))
-        .await
-        .map_err(|e| CallerError::WebRtc(format!("bind ICE-TCP listener on :{port}: {e}")))?;
-        let local_addr = listener
-            .local_addr()
-            .map_err(|e| CallerError::WebRtc(format!("listener local_addr: {e}")))?;
-        eprintln!("[display/webrtc] ICE-TCP listener bound on {local_addr}");
-
-        let dispatcher = Arc::new(Self {
-            local_port: local_addr.port(),
-            registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            shutdown: CancellationToken::new(),
-        });
-
-        let registry = Arc::clone(&dispatcher.registry);
-        let shutdown = dispatcher.shutdown.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    accepted = listener.accept() => match accepted {
-                        Ok((stream, remote_addr)) => {
-                            let registry = Arc::clone(&registry);
-                            tokio::spawn(async move {
-                                if let Err(e) =
-                                    handle_new_tcp_connection(stream, remote_addr, registry).await
-                                {
-                                    eprintln!(
-                                        "[display/webrtc] ICE-TCP probe for {remote_addr} failed: {e}"
-                                    );
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            eprintln!("[display/webrtc] ICE-TCP accept failed: {e}");
-                            // Small backoff so we don't spin on a broken listener.
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                    },
-                }
-            }
-            eprintln!("[display/webrtc] ICE-TCP dispatcher exiting");
-        });
-
-        Ok(dispatcher)
-    }
-
-    pub fn port(&self) -> u16 {
-        self.local_port
+impl TcpPeerRegistry {
+    /// Create an empty registry. Share the returned `Arc` across every
+    /// caller that needs to register a peer or route a connection.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            registry: std::sync::Mutex::new(HashMap::new()),
+        })
     }
 
     /// Register a peer's local ufrag and return the receiver side of the
@@ -163,70 +123,136 @@ impl TcpDispatcher {
             .insert(local_ufrag.clone(), tx);
         (
             PeerRegistration {
-                registry: Arc::clone(&self.registry),
+                registry: Arc::clone(self),
                 local_ufrag,
             },
             rx,
         )
     }
+
+    /// Route an already-accepted TCP connection plus its peeked first RFC
+    /// 4571 frame to the peer whose local ufrag matches the STUN USERNAME
+    /// in that frame. Called by the web_gateway's accept loop when it
+    /// detects STUN-framed traffic on the HTTP port, and by
+    /// `bind_standalone` if a dedicated TCP listener is configured.
+    pub async fn route_accepted(
+        self: &Arc<Self>,
+        stream: TcpStream,
+        first_frame: Vec<u8>,
+        remote_addr: SocketAddr,
+    ) -> Result<(), String> {
+        let local_addr = stream
+            .local_addr()
+            .map_err(|e| format!("local_addr: {e}"))?;
+
+        let username = parse_stun_username(&first_frame).ok_or_else(|| {
+            "first frame is not a STUN binding request with USERNAME".to_string()
+        })?;
+
+        // USERNAME format for ICE is "remote_ufrag:local_ufrag". The local
+        // side is us; that's what we demux on.
+        let local_ufrag = username
+            .split_once(':')
+            .map(|(_, local)| local.to_string())
+            .ok_or_else(|| format!("bad USERNAME format: {username:?}"))?;
+
+        let tx = {
+            let guard = self.registry.lock().unwrap();
+            guard.get(&local_ufrag).cloned()
+        };
+        let Some(tx) = tx else {
+            return Err(format!("no peer registered for ufrag {local_ufrag:?}"));
+        };
+
+        let accepted = AcceptedTcpConnection {
+            remote_addr,
+            local_addr,
+            first_frame,
+            stream,
+        };
+        tx.send(accepted).await.map_err(|_| {
+            "peer channel closed before we could hand over the connection".to_string()
+        })?;
+        Ok(())
+    }
+
+    /// Spawn a standalone TCP listener on the given port that funnels
+    /// incoming connections through this registry. Used for the Phase 2
+    /// behavior where the user explicitly sets `[webrtc] tcp_port` to pick
+    /// a dedicated port separate from HTTP. When multiplexing on the HTTP
+    /// port (the default), this helper is not used — the web_gateway's
+    /// accept loop calls `route_accepted` directly.
+    pub async fn bind_standalone(
+        self: &Arc<Self>,
+        port: u16,
+    ) -> Result<(), CallerError> {
+        let listener = TcpListener::bind(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port,
+        ))
+        .await
+        .map_err(|e| {
+            CallerError::WebRtc(format!("bind standalone ICE-TCP listener on :{port}: {e}"))
+        })?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| CallerError::WebRtc(format!("listener local_addr: {e}")))?;
+        eprintln!("[display/webrtc] ICE-TCP standalone listener bound on {local_addr}");
+
+        let registry = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, remote_addr)) => {
+                        let registry = Arc::clone(&registry);
+                        tokio::spawn(async move {
+                            match probe_and_route_tcp_connection(stream, remote_addr, registry)
+                                .await
+                            {
+                                Ok(()) => {}
+                                Err(e) => eprintln!(
+                                    "[display/webrtc] ICE-TCP standalone probe for {remote_addr} failed: {e}"
+                                ),
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("[display/webrtc] ICE-TCP standalone accept failed: {e}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
 }
 
-/// RAII guard that unregisters a peer's ufrag from the dispatcher on drop.
+/// RAII guard that unregisters a peer's ufrag from the registry on drop.
 pub struct PeerRegistration {
-    registry: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<AcceptedTcpConnection>>>>,
+    registry: Arc<TcpPeerRegistry>,
     local_ufrag: String,
 }
 
 impl Drop for PeerRegistration {
     fn drop(&mut self) {
-        self.registry.lock().unwrap().remove(&self.local_ufrag);
+        self.registry.registry.lock().unwrap().remove(&self.local_ufrag);
     }
 }
 
-/// Accept a new TCP connection: read the first RFC 4571 frame, parse the
-/// STUN USERNAME attribute, extract the local ufrag, route the connection
-/// to the matching peer.
-async fn handle_new_tcp_connection(
+/// Read the first RFC 4571 frame from a freshly accepted standalone TCP
+/// connection, then hand everything to the registry for ufrag-based
+/// routing. Called from the standalone listener spawned by
+/// `bind_standalone`; the web_gateway path already has the first frame in
+/// hand from its own peek-and-read step and calls `route_accepted` directly.
+async fn probe_and_route_tcp_connection(
     mut stream: TcpStream,
     remote_addr: SocketAddr,
-    registry: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<AcceptedTcpConnection>>>>,
+    registry: Arc<TcpPeerRegistry>,
 ) -> Result<(), String> {
-    let local_addr = stream
-        .local_addr()
-        .map_err(|e| format!("local_addr: {e}"))?;
-
     let first_frame = read_rfc4571_frame(&mut stream)
         .await
         .map_err(|e| format!("read first frame: {e}"))?;
-
-    let username = parse_stun_username(&first_frame)
-        .ok_or_else(|| "first frame is not a STUN binding request with USERNAME".to_string())?;
-
-    // USERNAME format for ICE is "remote_ufrag:local_ufrag". The local side
-    // is us; that's what we demux on.
-    let local_ufrag = username
-        .split_once(':')
-        .map(|(_, local)| local.to_string())
-        .ok_or_else(|| format!("bad USERNAME format: {username:?}"))?;
-
-    let tx = {
-        let guard = registry.lock().unwrap();
-        guard.get(&local_ufrag).cloned()
-    };
-    let Some(tx) = tx else {
-        return Err(format!("no peer registered for ufrag {local_ufrag:?}"));
-    };
-
-    let accepted = AcceptedTcpConnection {
-        remote_addr,
-        local_addr,
-        first_frame,
-        stream,
-    };
-    tx.send(accepted)
-        .await
-        .map_err(|_| "peer channel closed before we could hand over the connection".to_string())?;
-    Ok(())
+    registry.route_accepted(stream, first_frame, remote_addr).await
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +282,18 @@ where
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
     Ok(buf)
+}
+
+/// Public wrapper around `read_rfc4571_frame` for the web gateway's
+/// ICE-TCP detection path. The gateway peeks the first bytes to decide
+/// between HTTP/WS/ICE-TCP, and when it picks ICE-TCP it needs to consume
+/// that first frame from the stream before handing ownership to the
+/// `TcpPeerRegistry`. We don't want to re-export the generic helper
+/// cross-module, so this is a concrete version for `TcpStream`.
+pub async fn read_rfc4571_frame_pub(
+    stream: &mut TcpStream,
+) -> std::io::Result<Vec<u8>> {
+    read_rfc4571_frame(stream).await
 }
 
 /// Write one RFC 4571 framed payload: prepend a 2-byte BE length header,
@@ -358,7 +396,8 @@ impl WebRtcPeer {
         offer_sdp: &str,
         codec_mime: &str,
         _ice_config: &IceConfig,
-        tcp_dispatcher: Option<Arc<TcpDispatcher>>,
+        tcp_peer_registry: Option<Arc<TcpPeerRegistry>>,
+        tcp_advertised_port: Option<u16>,
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
         _ice_tx: mpsc::Sender<(PeerId, String)>,
@@ -433,19 +472,30 @@ impl WebRtcPeer {
             ));
         }
 
-        // --- ICE-TCP candidates (shared listener, peer registered by ufrag)
-        // If the session has a TCP dispatcher, add a Candidate::host(..,
-        // "tcp") for every routable interface address pointing at the
-        // dispatcher's port. The dispatcher already holds the TcpListener
-        // on that port; we don't bind again here. On the wire, str0m
-        // emits these as `typ host tcptype passive` candidates and the
-        // browser will actively open a TCP connection to the server's
-        // advertised (ip, port) pair for each one.
+        // --- ICE-TCP candidates (registry-based demux, ufrag-matched) ------
+        // If the web_gateway provided a `TcpPeerRegistry`, register this
+        // peer's local ufrag with it and emit a `Candidate::host(.., "tcp")`
+        // for every routable interface address pointing at the advertised
+        // TCP port. The registry owns no listener of its own — the web
+        // gateway's HTTP accept loop inspects each incoming TCP connection
+        // and routes STUN-framed traffic to the registry, which in turn
+        // looks up this peer by its local ufrag. That's how multiplexing
+        // on the HTTP port works (Phase 3): the advertised TCP port equals
+        // the HTTP port, and every candidate pair the browser tries flows
+        // through the already-forwarded HTTP port.
+        //
+        // For deployments that set an explicit `[webrtc] tcp_port` in
+        // config, the session spawns a standalone `bind_standalone`
+        // listener on that port backed by the same registry, and the
+        // advertised TCP port is that port instead of the HTTP port. Both
+        // paths converge on the same registry, so the peer side is
+        // identical.
         let mut peer_registration = None;
         let mut tcp_conn_rx: Option<mpsc::Receiver<AcceptedTcpConnection>> = None;
-        if let Some(ref dispatcher) = tcp_dispatcher {
-            let tcp_port = dispatcher.port();
-            let (registration, rx) = dispatcher.register(local_ufrag.clone());
+        if let (Some(registry), Some(tcp_port)) =
+            (tcp_peer_registry.as_ref(), tcp_advertised_port)
+        {
+            let (registration, rx) = registry.register(local_ufrag.clone());
             peer_registration = Some(registration);
             tcp_conn_rx = Some(rx);
             for iface_addr in &local_addrs {

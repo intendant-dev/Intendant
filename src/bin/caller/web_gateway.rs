@@ -1171,6 +1171,37 @@ pub fn spawn_web_gateway(
         tcp_port: config.webrtc_tcp_port,
     };
 
+    // Shared ICE-TCP peer registry + resolved advertised TCP port.
+    //
+    // Phase 3: by default we multiplex ICE-TCP onto the HTTP port itself.
+    // The web gateway's per-connection handler peeks the first bytes of
+    // every accepted TCP connection to decide between HTTP, WebSocket, and
+    // ICE-TCP; STUN-framed traffic is read through to the first RFC 4571
+    // frame and handed to the registry, which looks up the matching peer
+    // by STUN ufrag. The advertised TCP candidate port is the HTTP port
+    // so every ICE-TCP connection arrives via the same port that's
+    // already port-forwarded for the dashboard — end users don't have to
+    // configure anything extra.
+    //
+    // Phase 2 escape hatch: if the user sets `[webrtc] tcp_port` in
+    // `intendant.toml` to a distinct port, the tokio::spawn block below
+    // calls `registry.bind_standalone(port)` to put up a dedicated TCP
+    // listener backed by the same registry, and the advertised TCP port
+    // becomes that port. Useful if HTTPS is terminated upstream by a
+    // proxy that strips binary frames off the HTTP path.
+    let http_port = listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(0);
+    let tcp_peer_registry = crate::display::webrtc::TcpPeerRegistry::new();
+    let explicit_tcp_port = config.webrtc_tcp_port;
+    // Pre-compute the advertised port: if user set an explicit distinct
+    // port, we'll attempt to bind it inside the spawn; if it succeeds we
+    // advertise that; if it fails we fall back to the HTTP port.
+    let standalone_tcp_port =
+        explicit_tcp_port.filter(|p| *p != 0 && *p != http_port);
+    let default_tcp_port = if http_port != 0 { Some(http_port) } else { None };
+
     // Inject content-hash version into WASM/JS URLs for cache-busting.
     let v = asset_version_hash();
     let session_provider = config.provider.clone();
@@ -1303,6 +1334,31 @@ pub fn spawn_web_gateway(
     tokio::spawn(async move {
         let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
 
+        // Resolve the ICE-TCP advertised port. If the user asked for a
+        // standalone listener on a distinct port, try to bind it now; on
+        // success we advertise that port, on failure we fall back to the
+        // HTTP port multiplex.
+        let tcp_advertised_port: Option<u16> = match standalone_tcp_port {
+            Some(explicit) => {
+                match tcp_peer_registry.bind_standalone(explicit).await {
+                    Ok(()) => Some(explicit),
+                    Err(e) => {
+                        eprintln!(
+                            "[web_gateway] ICE-TCP standalone listener on :{explicit} failed: {e}; \
+                             falling back to HTTP-port multiplex"
+                        );
+                        default_tcp_port
+                    }
+                }
+            }
+            None => default_tcp_port,
+        };
+        if let Some(p) = tcp_advertised_port {
+            eprintln!(
+                "[web_gateway] ICE-TCP candidates advertise port {p} (HTTP port: {http_port})"
+            );
+        }
+
         loop {
             let (stream, _peer) = match listener.accept().await {
                 Ok(conn) => conn,
@@ -1313,6 +1369,8 @@ pub fn spawn_web_gateway(
             let broadcast_tx = broadcast_tx.clone();
             let config_json = config_json.clone();
             let ice_config = ice_config.clone();
+            let tcp_peer_registry = Arc::clone(&tcp_peer_registry);
+            let tcp_advertised_port = tcp_advertised_port;
             let shared_session = shared_session.clone();
             let voice_debug = voice_debug.clone();
             let session_provider = session_provider.clone();
@@ -1341,15 +1399,70 @@ pub fn spawn_web_gateway(
                 let recording_registry = session_snap.recording_registry.clone();
                 let session_registry = session_snap.session_registry.clone();
                 drop(session_snap);
-                // Peek at the first bytes to detect WebSocket upgrade.
-                // peek() does not consume the data, so tokio_tungstenite
-                // can still read the full handshake.
+                // Peek at the first bytes to detect (in order):
+                //  1. ICE-TCP STUN-framed traffic (RFC 4571 length prefix
+                //     followed by a STUN message whose magic cookie
+                //     0x2112A442 sits at payload offset 4 = peek offset 6)
+                //  2. WebSocket upgrade (HTTP header containing
+                //     "Upgrade: websocket")
+                //  3. Plain HTTP (everything else)
+                //
+                // `peek()` does not consume the data, so both the
+                // WebSocket handshake and the HTTP parser still get the
+                // full request. Only the ICE-TCP branch actually reads
+                // (and consumes) the first RFC 4571 frame, after which
+                // the rest of the stream is handed to the WebRTC peer's
+                // reader task.
                 let mut buf = [0u8; 2048];
                 let mut stream = stream;
                 let n = match stream.peek(&mut buf).await {
                     Ok(n) if n > 0 => n,
                     _ => return,
                 };
+
+                // ICE-TCP detection: look for a STUN binding request
+                // wrapped in an RFC 4571 2-byte BE length prefix. STUN
+                // binding request type is 0x0001 (first payload byte < 2),
+                // magic cookie is 0x2112A442 at payload offset 4, which
+                // lives at peek offset 6..10 once we account for the
+                // length prefix. A valid HTTP request never starts with
+                // these bytes (method chars are ASCII >= 0x41).
+                let looks_like_stun_tcp = n >= 22
+                    && buf[2] < 2
+                    && buf[6..10] == [0x21, 0x12, 0xA4, 0x42];
+                if looks_like_stun_tcp {
+                    // Consume the first RFC 4571 frame from the stream
+                    // (peek leaves it in the kernel buffer; we have to
+                    // read it through to hand a clean stream to the peer
+                    // reader task).
+                    let first_frame = match crate::display::webrtc::read_rfc4571_frame_pub(
+                        &mut stream,
+                    )
+                    .await
+                    {
+                        Ok(f) => f,
+                        Err(e) => {
+                            eprintln!(
+                                "[web_gateway] ICE-TCP first-frame read failed: {e}"
+                            );
+                            return;
+                        }
+                    };
+                    let remote_addr = match stream.peer_addr() {
+                        Ok(a) => a,
+                        Err(_) => return,
+                    };
+                    if let Err(e) = tcp_peer_registry
+                        .route_accepted(stream, first_frame, remote_addr)
+                        .await
+                    {
+                        eprintln!(
+                            "[web_gateway] ICE-TCP routing for {remote_addr} failed: {e}"
+                        );
+                    }
+                    return;
+                }
+
                 let header_text = String::from_utf8_lossy(&buf[..n]);
                 let is_websocket = header_text
                     .lines()
@@ -2447,7 +2560,14 @@ pub fn spawn_web_gateway(
                                             if let Some(ref sr) = session_registry_inbound {
                                                 if let Some(session) = sr.read().await.get(display_id) {
                                                     let (ice_tx, mut ice_rx) = mpsc::channel::<(crate::display::PeerId, String)>(64);
-                                                    match session.handle_offer(peer_id, &sdp, &ice_config, ice_tx).await {
+                                                    match session.handle_offer(
+                                                        peer_id,
+                                                        &sdp,
+                                                        &ice_config,
+                                                        Some(Arc::clone(&tcp_peer_registry)),
+                                                        tcp_advertised_port,
+                                                        ice_tx,
+                                                    ).await {
                                                         Ok(answer_sdp) => {
                                                             peer_display_ids.push(display_id);
                                                             let answer = serde_json::json!({

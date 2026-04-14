@@ -379,11 +379,6 @@ pub struct DisplaySession {
     clipboard_monitor: Arc<clipboard::ClipboardMonitor>,
     /// Handle for the clipboard forwarding task (remote -> browser).
     clipboard_handle: Mutex<Option<JoinHandle<()>>>,
-    /// Shared ICE-TCP dispatcher. Lazily initialized on the first
-    /// `handle_offer()` if `IceConfig::tcp_port` is set. Lives for the
-    /// lifetime of the session; dropped in `stop()` along with everything
-    /// else.
-    tcp_dispatcher: Mutex<Option<Arc<self::webrtc::TcpDispatcher>>>,
 }
 
 impl DisplaySession {
@@ -407,7 +402,6 @@ impl DisplaySession {
             encoder_event_bus: Mutex::new(None),
             clipboard_monitor: Arc::new(clipboard::ClipboardMonitor::new()),
             clipboard_handle: Mutex::new(None),
-            tcp_dispatcher: Mutex::new(None),
         }
     }
 
@@ -903,11 +897,14 @@ impl DisplaySession {
     ///
     /// Creates a `WebRtcPeer`, subscribes it to the encoder output, adds it to
     /// the peer map, starts clipboard monitoring, and returns the SDP answer.
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_offer(
         &self,
         peer_id: PeerId,
         sdp: &str,
         ice_config: &IceConfig,
+        tcp_peer_registry: Option<Arc<self::webrtc::TcpPeerRegistry>>,
+        tcp_advertised_port: Option<u16>,
         ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<String, CallerError> {
         // Serialize codec selection + encoder startup.
@@ -986,34 +983,13 @@ impl DisplaySession {
                 });
             });
 
-        // Lazy-initialize the shared ICE-TCP dispatcher on the first peer
-        // if the config asked for it. Subsequent peers reuse the same
-        // listener via the dispatcher's ufrag-based demux.
-        let tcp_dispatcher = {
-            let mut slot = self.tcp_dispatcher.lock().await;
-            if slot.is_none() {
-                if let Some(port) = ice_config.tcp_port {
-                    match self::webrtc::TcpDispatcher::bind(port).await {
-                        Ok(d) => {
-                            *slot = Some(d);
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[display/webrtc] ICE-TCP listener bind on :{port} failed: {e}; falling back to UDP only"
-                            );
-                        }
-                    }
-                }
-            }
-            slot.clone()
-        };
-
         let (peer, answer_sdp) = self::webrtc::WebRtcPeer::new(
             peer_id,
             sdp,
             codec_mime,
             ice_config,
-            tcp_dispatcher,
+            tcp_peer_registry,
+            tcp_advertised_port,
             input_handler,
             clipboard_handler,
             ice_tx,
