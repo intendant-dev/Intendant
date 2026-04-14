@@ -65,7 +65,11 @@ pub const BROADCAST_CAPACITY: usize = 256;
 /// observed `PeerStatus` is still `Working`.
 ///
 /// Copy-able so `watch::Receiver::borrow()` is allocation-free.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Serialized via the internally-tagged `state` discriminator so
+/// the `/api/peers` response embeds connection state cleanly in a
+/// flat JSON object for the dashboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum ConnectionState {
     /// Actor task spawned, pre-connect.
     Initializing,

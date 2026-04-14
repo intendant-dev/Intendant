@@ -297,6 +297,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
         (port, handle)

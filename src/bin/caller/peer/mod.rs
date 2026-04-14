@@ -1,10 +1,3 @@
-// The substrate lands before the main.rs wiring that consumes it,
-// so the re-exports below and several constants/types look "unused"
-// to clippy until the integration commits land. The allow is
-// scoped to the peer module tree and will come off once
-// PeerRegistry is wired into main.rs.
-#![allow(dead_code, unused_imports)]
-
 //! Peer agent federation layer.
 //!
 //! Intendant federates with other autonomous agent daemons — other

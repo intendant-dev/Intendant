@@ -77,6 +77,46 @@ fn slog(log: &SharedSessionLog, f: impl FnOnce(&mut session_log::SessionLog)) {
     }
 }
 
+/// Build a peer registry for this daemon and hydrate it from the
+/// `[[peer]]` sections in `intendant.toml`.
+///
+/// Spawns the durable log writer task (appending
+/// `TaggedPeerEvent`s as JSONL to `<log_dir>/peers.jsonl`) and
+/// creates a [`crate::peer::PeerRegistry`] wired to its sender.
+/// Each config entry fires a background `add_peer` task so
+/// slow/unreachable peers don't block daemon startup — the
+/// registry's own reconnect state machine handles those
+/// asynchronously once the card fetch returns.
+///
+/// The returned registry is cheaply cloneable (`Arc`-backed) and
+/// gets passed into `spawn_web_gateway` so the `/api/peers`
+/// handlers can inspect and mutate the same store. The log
+/// writer's join handle is intentionally dropped — the writer
+/// exits cleanly when all its senders go away (peer actors +
+/// registry clones), and we don't currently have an explicit
+/// daemon shutdown path that would await it.
+fn build_and_hydrate_peer_registry(
+    log_dir: &Path,
+    peer_configs: &[project::PeerConfig],
+) -> peer::PeerRegistry {
+    let log_path = log_dir.join("peers.jsonl");
+    let (log_tx, _log_handle) = peer::spawn_peer_log_writer(log_path);
+    let registry = peer::PeerRegistry::new(log_tx);
+    for cfg in peer_configs {
+        let registry_for_task = registry.clone();
+        let card_url = cfg.card_url.clone();
+        tokio::spawn(async move {
+            if let Err(e) = registry_for_task.add_peer(&card_url).await {
+                eprintln!(
+                    "intendant: failed to register peer from intendant.toml \
+                     ({card_url}): {e}"
+                );
+            }
+        });
+    }
+    registry
+}
+
 /// Emit a "[runtime] Task dispatched" log entry from a backend task acceptance
 /// point. Writes to the session log on disk and broadcasts a `LogEntry` event
 /// for external consumers (web dashboard, control socket).
@@ -6611,6 +6651,10 @@ async fn main() -> Result<(), CallerError> {
             let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
                 Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
             )));
+            let peer_registry = build_and_hydrate_peer_registry(
+                &log_dir,
+                &project.config.peers,
+            );
             let handle = web_gateway::spawn_web_gateway(
                 web_listener.take().expect("web listener must exist when use_web"),
                 bus.clone(),
@@ -6622,6 +6666,7 @@ async fn main() -> Result<(), CallerError> {
                 None, // No task_tx in MCP mode
                 Some(project.root.clone()),
                 mcp_http_server,
+                Some(peer_registry),
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -7110,6 +7155,10 @@ async fn main() -> Result<(), CallerError> {
             let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
                 Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
             )));
+            let peer_registry = build_and_hydrate_peer_registry(
+                &log_dir,
+                &project.config.peers,
+            );
             let handle = web_gateway::spawn_web_gateway(
                 web_listener.take().expect("web listener must exist when use_web"),
                 bus.clone(),
@@ -7121,6 +7170,7 @@ async fn main() -> Result<(), CallerError> {
                 task_tx.clone(),
                 Some(project.root.clone()),
                 mcp_http_server,
+                Some(peer_registry),
             );
             app.log(
                 types::LogLevel::Info,
@@ -7506,6 +7556,10 @@ async fn main() -> Result<(), CallerError> {
             let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
                 Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
             )));
+            let peer_registry = build_and_hydrate_peer_registry(
+                &log_dir,
+                &project.config.peers,
+            );
             let _web_handle = web_gateway::spawn_web_gateway(
                 web_listener.take().expect("web listener must exist when use_web"),
                 bus.clone(),
@@ -7517,6 +7571,7 @@ async fn main() -> Result<(), CallerError> {
                 None, // No task_tx in headless mode
                 Some(project.root.clone()),
                 mcp_http_server,
+                Some(peer_registry),
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",
