@@ -399,6 +399,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn connection_state_is_copy_and_equatable() {
@@ -419,5 +420,109 @@ mod tests {
         assert!(COMMANDS_CAPACITY > 0);
         assert!(EVENTS_CAPACITY > 0);
         assert!(BROADCAST_CAPACITY > 0);
+    }
+
+    /// Ensure `disconnect` returns promptly when the actor is in
+    /// reconnect backoff. This is the regression guard for the
+    /// bug where `remove_peer` would block indefinitely if a peer
+    /// went unreachable — the actor was sleeping in the backoff
+    /// phase and not polling the command channel, so
+    /// `PeerCommand::Disconnect` sat queued and `disconnect`
+    /// waited forever for `ConnectionState` to reach `Disconnected`.
+    ///
+    /// The fix: drain commands inside the reconnect sleep via
+    /// `tokio::select!` so Disconnect short-circuits the backoff.
+    /// This test points a transport at a definitely-refused port,
+    /// waits for the actor to transition into `Reconnecting`,
+    /// then calls `disconnect` with a 2-second timeout. If the
+    /// select in the reconnect phase is removed or breaks, the
+    /// test times out.
+    #[tokio::test]
+    async fn disconnect_short_circuits_reconnect_backoff() {
+        use crate::peer::card::{AgentCard, AuthScheme, TransportSpec};
+        use crate::peer::id::{PeerId, PeerKind};
+        use crate::peer::transport::IntendantWsTransport;
+        use tokio::sync::mpsc;
+
+        // Reserve-then-release an ephemeral port to get a TCP port
+        // that's almost certainly refused on the next connect.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let ws_url = format!("ws://127.0.0.1:{port}/ws");
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let initial_card = AgentCard {
+            id: PeerId::new(PeerKind::Intendant, "unreachable"),
+            label: "unreachable".into(),
+            version: "0.0.0".into(),
+            git_sha: None,
+            transports: vec![TransportSpec::IntendantWs {
+                url: ws_url.clone(),
+            }],
+            capabilities: vec![],
+            auth: AuthScheme::None,
+        };
+        let url_for_closure = ws_url.clone();
+        let handle = spawn_peer(
+            initial_card.id.clone(),
+            initial_card,
+            log_tx,
+            move |events_tx| {
+                Box::new(IntendantWsTransport::new(url_for_closure, events_tx))
+            },
+        );
+
+        // Wait until the actor fails the first connect and enters
+        // the reconnect phase. Poll instead of a fixed sleep so the
+        // test is robust against scheduler jitter.
+        let enter_deadline = Instant::now() + Duration::from_secs(3);
+        let entered_reconnect = loop {
+            if matches!(
+                handle.connection_state(),
+                ConnectionState::Reconnecting { .. }
+            ) {
+                break true;
+            }
+            if Instant::now() > enter_deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert!(
+            entered_reconnect,
+            "actor never transitioned to Reconnecting (current state: {:?})",
+            handle.connection_state()
+        );
+
+        // Now call disconnect. Without the fix, this would block
+        // until the backoff sleep elapsed (up to 30s on later
+        // attempts) or forever if the remote stayed down. With the
+        // fix, it should return within the 2-second timeout.
+        let start = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.disconnect(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "disconnect timed out during reconnect backoff"
+        );
+        result.unwrap().expect("disconnect returned Err");
+        let elapsed = start.elapsed();
+        // Tighter cap than the timeout — an overshoot here means
+        // we spent most of the window waiting, which indicates the
+        // select isn't actually short-circuiting.
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "disconnect took {elapsed:?} — expected <1.5s"
+        );
+
+        assert_eq!(
+            handle.connection_state(),
+            ConnectionState::Disconnected,
+            "actor didn't transition to Disconnected"
+        );
     }
 }

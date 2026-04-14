@@ -27,6 +27,7 @@ use crate::peer::event::{PeerEvent, PeerStatus, TaggedPeerEvent};
 use crate::peer::handle::{ConnectionState, PeerCommand};
 use crate::peer::id::PeerId;
 use crate::peer::traits::PeerTransport;
+use crate::peer::PeerError;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -146,12 +147,66 @@ impl PeerActor {
             }
 
             // ---- Reconnect window ----
+            //
+            // During the backoff sleep we also drain the command
+            // channel, for two reasons:
+            //
+            // 1. PeerCommand::Disconnect must short-circuit the
+            //    sleep. Without this, `PeerHandle::disconnect` and
+            //    `PeerRegistry::remove_peer` would block until the
+            //    backoff timer elapsed (up to 30s) — or forever
+            //    across multiple reconnect attempts if the remote
+            //    stays down. The explicit-shutdown path transitions
+            //    connection_state to Disconnected and exits cleanly.
+            //
+            // 2. PeerCommand::Send arriving during reconnect must
+            //    fail fast with NotConnected instead of queueing.
+            //    Queueing means the caller's command would apply to
+            //    the *next* connection once the peer comes back,
+            //    which is almost never what they want — fresh
+            //    sessions have different state, stale commands hit
+            //    wrong contexts, approvals race with newly-arrived
+            //    requests. Fast-failing lets callers decide their
+            //    retry policy explicitly.
             let attempt = backoff.attempt;
             let _ = self
                 .connection_tx
                 .send(ConnectionState::Reconnecting { attempt });
             let delay = backoff.next_delay();
-            tokio::time::sleep(delay).await;
+            let sleep = tokio::time::sleep(delay);
+            tokio::pin!(sleep);
+            let cancelled = loop {
+                tokio::select! {
+                    _ = &mut sleep => break false,
+                    maybe_cmd = self.commands_rx.recv() => {
+                        match maybe_cmd {
+                            Some(PeerCommand::Disconnect) => {
+                                break true;
+                            }
+                            Some(PeerCommand::Send { responder, .. }) => {
+                                let _ = responder.send(Err(PeerError::NotConnected));
+                            }
+                            None => {
+                                // All handles dropped — shut down.
+                                break true;
+                            }
+                        }
+                    }
+                }
+            };
+            if cancelled {
+                let _ = self
+                    .connection_tx
+                    .send(ConnectionState::Disconnecting);
+                let _ = self
+                    .connection_tx
+                    .send(ConnectionState::Disconnected);
+                self.emit_event(PeerEvent::Disconnected {
+                    reason: "disconnected during reconnect".to_string(),
+                })
+                .await;
+                return;
+            }
         }
     }
 
