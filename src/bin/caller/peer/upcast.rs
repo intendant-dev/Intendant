@@ -215,11 +215,19 @@ impl AppEventUpcaster {
     /// logic runs from `AgentStarted` (close previous agent before
     /// this one begins), `DoneSignal`, `TaskComplete`, and `TurnStarted`
     /// (defensive, in case the agent wasn't explicitly closed).
-    fn close_pending_agent(&mut self) -> Option<PeerEvent> {
+    ///
+    /// `outcome` is the outcome to stamp on the emitted
+    /// `ActivityCompleted`. Success for the normal signals
+    /// (DoneSignal, defensive closes from TurnStarted/AgentStarted)
+    /// since in those cases we have no reason to believe the agent
+    /// failed. TaskComplete propagates its own outcome — a failed
+    /// task means the in-flight agent is failing too, so we don't
+    /// want to stamp it Success alongside a failed turn.
+    fn close_pending_agent(&mut self, outcome: ActivityOutcome) -> Option<PeerEvent> {
         self.current_agent_turn.take().map(|turn| {
             PeerEvent::ActivityCompleted {
                 id: ActivityId(format!("agent-{turn}")),
-                outcome: ActivityOutcome::Success,
+                outcome,
             }
         })
     }
@@ -274,7 +282,7 @@ impl AppEventUpcaster {
                 // consistent start/complete pairing instead of
                 // orphaned Started events.
                 let mut out = vec![];
-                if let Some(closed) = self.close_pending_agent() {
+                if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
                 }
                 if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
@@ -351,7 +359,7 @@ impl AppEventUpcaster {
                 // Close the in-flight agent first (if any), then the
                 // turn. Both use the same ids their Started events
                 // used so observers see matching start/complete pairs.
-                if let Some(closed) = self.close_pending_agent() {
+                if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
                 }
                 if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
@@ -395,7 +403,7 @@ impl AppEventUpcaster {
                 // intervening close signal, we don't want to leave an
                 // orphaned Started event on the observer's feed).
                 let mut out = vec![];
-                if let Some(closed) = self.close_pending_agent() {
+                if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
                 }
                 self.current_agent_turn = Some(*turn);
@@ -481,8 +489,11 @@ impl AppEventUpcaster {
                 let mut out = vec![];
                 // Close the in-flight agent and turn with the task's
                 // outcome so the end-of-task state propagates through
-                // the activity lifecycle.
-                if let Some(closed) = self.close_pending_agent() {
+                // the entire activity lifecycle. A failed TaskComplete
+                // must *not* stamp the agent as Success — that would
+                // produce contradictory completions (agent success,
+                // turn failed) in the consumer's feed.
+                if let Some(closed) = self.close_pending_agent(outcome.clone()) {
                     out.push(closed);
                 }
                 if let Some(closed) = self.close_pending_turn(outcome.clone()) {
@@ -938,7 +949,9 @@ impl AppEventUpcaster {
 /// the mechanical half of the drift guard: both upcasters derive
 /// activity ids from the same tracked state so a `Started` event's
 /// id always matches the corresponding `Progress` and `Completed`
-/// events.
+/// events. Same outcome-threading contract on `close_pending_agent`
+/// as well — TaskComplete propagates its failure/cancel outcome
+/// down to any in-flight agent instead of marking it Success.
 pub struct WireEventUpcaster {
     seq: u64,
     current_message_id: Option<MessageId>,
@@ -977,11 +990,16 @@ impl WireEventUpcaster {
         id
     }
 
-    fn close_pending_agent(&mut self) -> Option<PeerEvent> {
+    /// Same contract as `AppEventUpcaster::close_pending_agent` —
+    /// the caller supplies the outcome to stamp on the emitted
+    /// `ActivityCompleted` so a failing task can propagate its
+    /// failure down to the in-flight agent instead of contradicting
+    /// it with Success.
+    fn close_pending_agent(&mut self, outcome: ActivityOutcome) -> Option<PeerEvent> {
         self.current_agent_turn.take().map(|turn| {
             PeerEvent::ActivityCompleted {
                 id: ActivityId(format!("agent-{turn}")),
-                outcome: ActivityOutcome::Success,
+                outcome,
             }
         })
     }
@@ -1005,7 +1023,7 @@ impl WireEventUpcaster {
             // ---- Turn lifecycle ----
             OutboundEvent::TurnStarted { turn, .. } => {
                 let mut out = vec![];
-                if let Some(closed) = self.close_pending_agent() {
+                if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
                 }
                 if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
@@ -1104,7 +1122,7 @@ impl WireEventUpcaster {
             OutboundEvent::DoneSignal { message } => {
                 self.current_message_id = None;
                 let mut out = vec![];
-                if let Some(closed) = self.close_pending_agent() {
+                if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
                 }
                 if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
@@ -1140,7 +1158,7 @@ impl WireEventUpcaster {
             } => {
                 let label = source.clone().unwrap_or_else(|| "agent".to_string());
                 let mut out = vec![];
-                if let Some(closed) = self.close_pending_agent() {
+                if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
                 }
                 self.current_agent_turn = Some(*turn);
@@ -1214,7 +1232,10 @@ impl WireEventUpcaster {
                     },
                 };
                 let mut out = vec![];
-                if let Some(closed) = self.close_pending_agent() {
+                // Propagate the task's outcome to any in-flight
+                // agent so a failed/cancelled task doesn't emit a
+                // contradictory Success on the agent activity.
+                if let Some(closed) = self.close_pending_agent(outcome.clone()) {
                     out.push(closed);
                 }
                 if let Some(closed) = self.close_pending_turn(outcome.clone()) {
@@ -2093,6 +2114,102 @@ mod tests {
             })
             .expect("expected ActivityProgress");
         assert_eq!(progress_id, start_id);
+    }
+
+    /// A failing `TaskComplete` must propagate its failure outcome
+    /// to *both* the in-flight agent and the turn. Before the
+    /// outcome-threading fix, `close_pending_agent` hardcoded
+    /// `ActivityOutcome::Success`, so a failed task emitted a
+    /// Success ActivityCompleted for the agent and a Failed
+    /// ActivityCompleted for the turn — contradictory events in
+    /// the consumer's feed that would render as "the tool
+    /// succeeded but the turn it ran in failed." Verifies both
+    /// upcasters behave consistently on both failure and cancel.
+    #[test]
+    fn task_complete_failure_propagates_to_agent_and_turn() {
+        for (reason, expected) in &[
+            ("failed", "failed"),
+            ("cancelled", "cancelled"),
+        ] {
+            let mut u = AppEventUpcaster::new();
+            // Open turn + agent, then fail.
+            let _ = u.upcast(&AppEvent::TurnStarted {
+                turn: 4,
+                budget_pct: 0.5,
+                remaining: 100,
+            });
+            let _ = u.upcast(&AppEvent::AgentStarted {
+                turn: 4,
+                commands_preview: "risky".into(),
+                source: None,
+            });
+            let out = u.upcast(&AppEvent::TaskComplete {
+                reason: (*reason).to_string(),
+                summary: None,
+            });
+            let completions: Vec<_> = out
+                .iter()
+                .filter_map(|e| match e {
+                    PeerEvent::ActivityCompleted { id, outcome } => {
+                        Some((id.clone(), outcome.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                completions.len(),
+                2,
+                "expected agent + turn completions for reason={reason}, \
+                 got: {completions:?}"
+            );
+            for (id, outcome) in &completions {
+                let outcome_matches = match (*expected, outcome) {
+                    ("failed", ActivityOutcome::Failed { .. }) => true,
+                    ("cancelled", ActivityOutcome::Cancelled) => true,
+                    _ => false,
+                };
+                assert!(
+                    outcome_matches,
+                    "activity {id:?} for reason={reason} should have \
+                     outcome matching {expected}, got {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Same guarantee on the wire upcaster.
+    #[test]
+    fn wire_task_complete_failure_propagates_to_agent_and_turn() {
+        let mut u = WireEventUpcaster::new();
+        let _ = u.upcast(&OutboundEvent::TurnStarted {
+            turn: 4,
+            budget_pct: 0.5,
+        });
+        let _ = u.upcast(&OutboundEvent::AgentStarted {
+            turn: 4,
+            commands_preview: "risky".into(),
+            source: None,
+        });
+        let out = u.upcast(&OutboundEvent::TaskComplete {
+            reason: "failed".to_string(),
+            summary: None,
+        });
+        let completions: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                PeerEvent::ActivityCompleted { id, outcome } => {
+                    Some((id.clone(), outcome.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completions.len(), 2);
+        for (id, outcome) in &completions {
+            assert!(
+                matches!(outcome, ActivityOutcome::Failed { .. }),
+                "wire path: activity {id:?} should be Failed, got {outcome:?}"
+            );
+        }
     }
 
     /// Parity on DoneSignal: given a TurnStarted + DoneSignal
