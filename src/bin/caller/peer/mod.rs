@@ -94,6 +94,7 @@ pub mod card;
 pub mod event;
 pub mod handle;
 pub mod id;
+pub mod registry;
 pub mod traits;
 pub mod transport;
 pub mod upcast;
@@ -111,6 +112,7 @@ pub use handle::{
     EVENTS_CAPACITY,
 };
 pub use id::{PeerId, PeerKind};
+pub use registry::PeerRegistry;
 pub use traits::{
     check_feature, PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures,
 };
