@@ -178,6 +178,20 @@ pub struct AppEventUpcaster {
     /// Deltas that arrive without a prior `TurnStarted` synthesize a
     /// fresh seq-based ID and store it here so follow-up deltas reuse it.
     current_message_id: Option<MessageId>,
+    /// Tracks the turn number of the currently-in-flight model turn
+    /// activity. Set by `TurnStarted`; consumed by `DoneSignal` /
+    /// `TaskComplete` / the next `TurnStarted` to emit a matching
+    /// `ActivityCompleted` with the same id the Started event used.
+    /// Without this, activities start as `turn-{turn}` but complete
+    /// as `done-{seq}` — observers can't correlate start and end.
+    current_turn: Option<usize>,
+    /// Same tracking for in-flight agent (tool call) activities.
+    /// `AgentStarted` carries the turn number; `AgentOutput` and
+    /// the implicit completion (next `AgentStarted`, `DoneSignal`,
+    /// or `TaskComplete`) reuse it so the progress/complete events
+    /// match the started one. Without this, agents start as
+    /// `agent-{turn}` but progress as `agent-latest`.
+    current_agent_turn: Option<usize>,
 }
 
 impl Default for AppEventUpcaster {
@@ -191,7 +205,34 @@ impl AppEventUpcaster {
         Self {
             seq: 0,
             current_message_id: None,
+            current_turn: None,
+            current_agent_turn: None,
         }
+    }
+
+    /// Drain any in-flight agent activity before starting a new one
+    /// or closing out a turn. Shared helper because the same cleanup
+    /// logic runs from `AgentStarted` (close previous agent before
+    /// this one begins), `DoneSignal`, `TaskComplete`, and `TurnStarted`
+    /// (defensive, in case the agent wasn't explicitly closed).
+    fn close_pending_agent(&mut self) -> Option<PeerEvent> {
+        self.current_agent_turn.take().map(|turn| {
+            PeerEvent::ActivityCompleted {
+                id: ActivityId(format!("agent-{turn}")),
+                outcome: ActivityOutcome::Success,
+            }
+        })
+    }
+
+    /// Drain any in-flight turn activity. Called from `DoneSignal`,
+    /// `TaskComplete`, and the next `TurnStarted` (defensive).
+    fn close_pending_turn(&mut self, outcome: ActivityOutcome) -> Option<PeerEvent> {
+        self.current_turn.take().map(|turn| {
+            PeerEvent::ActivityCompleted {
+                id: ActivityId(format!("turn-{turn}")),
+                outcome,
+            }
+        })
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -226,14 +267,30 @@ impl AppEventUpcaster {
 
             // ---- Turn lifecycle ----
             AppEvent::TurnStarted { turn, .. } => {
+                // Defensive cleanup: if a previous turn/agent never
+                // closed explicitly (because the source dropped
+                // DoneSignal, or emitted TurnStarted without a prior
+                // closer), close them here so observers see a
+                // consistent start/complete pairing instead of
+                // orphaned Started events.
+                let mut out = vec![];
+                if let Some(closed) = self.close_pending_agent() {
+                    out.push(closed);
+                }
+                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
+                {
+                    out.push(closed);
+                }
                 // Seed the shared message ID for this turn so subsequent
                 // deltas and the final ModelResponse all line up on it.
                 self.current_message_id = Some(MessageId(format!("msg-turn-{turn}")));
-                vec![PeerEvent::ActivityStarted {
+                self.current_turn = Some(*turn);
+                out.push(PeerEvent::ActivityStarted {
                     id: ActivityId(format!("turn-{turn}")),
                     kind: ActivityKind::ModelTurn,
                     label: format!("turn {turn}"),
-                }]
+                });
+                out
             }
 
             AppEvent::ModelResponseDelta { text } => {
@@ -289,21 +346,28 @@ impl AppEventUpcaster {
             }
 
             AppEvent::DoneSignal { message } => {
-                // We don't know the turn number here (DoneSignal doesn't
-                // carry one) so synthesize an activity id from the
-                // sequence counter. The Activity model accepts this —
-                // the id only needs to be stable across
-                // started/progress/completed for the *same* activity,
-                // and DoneSignal marks the end of a turn whose
-                // ActivityStarted used a turn-based id that we can't
-                // recover here. This is a documented looseness of the
-                // AppEvent → PeerEvent mapping.
                 self.current_message_id = None;
-                let seq = self.next_seq();
-                let mut out = vec![PeerEvent::ActivityCompleted {
-                    id: ActivityId(format!("done-{seq}")),
-                    outcome: ActivityOutcome::Success,
-                }];
+                let mut out = vec![];
+                // Close the in-flight agent first (if any), then the
+                // turn. Both use the same ids their Started events
+                // used so observers see matching start/complete pairs.
+                if let Some(closed) = self.close_pending_agent() {
+                    out.push(closed);
+                }
+                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
+                {
+                    out.push(closed);
+                } else {
+                    // No turn tracked — DoneSignal arrived without a
+                    // prior TurnStarted. Synthesize a completion so
+                    // observers see *something*, but with a seq-based
+                    // id since there's no turn to tie it to.
+                    let seq = self.next_seq();
+                    out.push(PeerEvent::ActivityCompleted {
+                        id: ActivityId(format!("done-{seq}")),
+                        outcome: ActivityOutcome::Success,
+                    });
+                }
                 if let Some(msg) = message {
                     out.push(log_event(LogLevel::Info, "agent", format!("done: {msg}")));
                 }
@@ -326,11 +390,21 @@ impl AppEventUpcaster {
                 source,
             } => {
                 let label = source.clone().unwrap_or_else(|| "agent".to_string());
-                vec![PeerEvent::ActivityStarted {
+                // Close any previous agent activity (defensive: if the
+                // source emitted two AgentStarted events without an
+                // intervening close signal, we don't want to leave an
+                // orphaned Started event on the observer's feed).
+                let mut out = vec![];
+                if let Some(closed) = self.close_pending_agent() {
+                    out.push(closed);
+                }
+                self.current_agent_turn = Some(*turn);
+                out.push(PeerEvent::ActivityStarted {
                     id: ActivityId(format!("agent-{turn}")),
                     kind: ActivityKind::ToolCall,
                     label: format!("{label}: {commands_preview}"),
-                }]
+                });
+                out
             }
 
             AppEvent::AgentOutput {
@@ -340,8 +414,21 @@ impl AppEventUpcaster {
             } => {
                 let mut out = vec![];
                 if !stdout.is_empty() {
+                    // Progress events reuse the id the matching
+                    // AgentStarted used so observers can correlate
+                    // them. If there's no tracked agent turn (output
+                    // arrived without a prior AgentStarted — shouldn't
+                    // happen but shouldn't crash either), fall back
+                    // to a synthetic id so the event isn't dropped.
+                    let id = match self.current_agent_turn {
+                        Some(turn) => ActivityId(format!("agent-{turn}")),
+                        None => {
+                            let seq = self.next_seq();
+                            ActivityId(format!("agent-orphan-{seq}"))
+                        }
+                    };
                     out.push(PeerEvent::ActivityProgress {
-                        id: ActivityId("agent-latest".into()),
+                        id,
                         text: Some(stdout.clone()),
                     });
                 }
@@ -384,7 +471,6 @@ impl AppEventUpcaster {
             )],
 
             AppEvent::TaskComplete { reason, summary } => {
-                let seq = self.next_seq();
                 let outcome = match reason.as_str() {
                     "success" | "done" | "completed" => ActivityOutcome::Success,
                     "cancelled" | "canceled" => ActivityOutcome::Cancelled,
@@ -392,10 +478,27 @@ impl AppEventUpcaster {
                         message: other.to_string(),
                     },
                 };
-                let mut out = vec![PeerEvent::ActivityCompleted {
-                    id: ActivityId(format!("task-{seq}")),
-                    outcome,
-                }];
+                let mut out = vec![];
+                // Close the in-flight agent and turn with the task's
+                // outcome so the end-of-task state propagates through
+                // the activity lifecycle.
+                if let Some(closed) = self.close_pending_agent() {
+                    out.push(closed);
+                }
+                if let Some(closed) = self.close_pending_turn(outcome.clone()) {
+                    out.push(closed);
+                } else {
+                    // No turn in flight — synthesize a task-level
+                    // completion. Happens for direct-mode single-turn
+                    // runs where TaskComplete is the only lifecycle
+                    // signal.
+                    let seq = self.next_seq();
+                    out.push(PeerEvent::ActivityCompleted {
+                        id: ActivityId(format!("task-{seq}")),
+                        outcome,
+                    });
+                }
+                self.current_message_id = None;
                 if let Some(s) = summary {
                     out.push(log_event(LogLevel::Info, "task", s.clone()));
                 }
@@ -828,12 +931,19 @@ impl AppEventUpcaster {
 
 /// Stateful `OutboundEvent` → `PeerEvent` upcaster for wire-format
 /// input (from a peer Intendant's `/ws`).
+///
+/// Mirrors `AppEventUpcaster`'s state machine exactly — the same
+/// `current_message_id` / `current_turn` / `current_agent_turn`
+/// tracking for streaming deltas and activity lifecycle. This is
+/// the mechanical half of the drift guard: both upcasters derive
+/// activity ids from the same tracked state so a `Started` event's
+/// id always matches the corresponding `Progress` and `Completed`
+/// events.
 pub struct WireEventUpcaster {
     seq: u64,
-    /// Streaming message ID, same pattern as `AppEventUpcaster`.
-    /// The wire format preserves streaming delta semantics, so
-    /// we need the same state machine.
     current_message_id: Option<MessageId>,
+    current_turn: Option<usize>,
+    current_agent_turn: Option<usize>,
 }
 
 impl Default for WireEventUpcaster {
@@ -847,6 +957,8 @@ impl WireEventUpcaster {
         Self {
             seq: 0,
             current_message_id: None,
+            current_turn: None,
+            current_agent_turn: None,
         }
     }
 
@@ -865,6 +977,24 @@ impl WireEventUpcaster {
         id
     }
 
+    fn close_pending_agent(&mut self) -> Option<PeerEvent> {
+        self.current_agent_turn.take().map(|turn| {
+            PeerEvent::ActivityCompleted {
+                id: ActivityId(format!("agent-{turn}")),
+                outcome: ActivityOutcome::Success,
+            }
+        })
+    }
+
+    fn close_pending_turn(&mut self, outcome: ActivityOutcome) -> Option<PeerEvent> {
+        self.current_turn.take().map(|turn| {
+            PeerEvent::ActivityCompleted {
+                id: ActivityId(format!("turn-{turn}")),
+                outcome,
+            }
+        })
+    }
+
     /// Map a wire-format [`OutboundEvent`] to zero or more
     /// [`PeerEvent`]s.
     pub fn upcast(&mut self, event: &OutboundEvent) -> Vec<PeerEvent> {
@@ -874,12 +1004,22 @@ impl WireEventUpcaster {
 
             // ---- Turn lifecycle ----
             OutboundEvent::TurnStarted { turn, .. } => {
+                let mut out = vec![];
+                if let Some(closed) = self.close_pending_agent() {
+                    out.push(closed);
+                }
+                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
+                {
+                    out.push(closed);
+                }
                 self.current_message_id = Some(MessageId(format!("msg-turn-{turn}")));
-                vec![PeerEvent::ActivityStarted {
+                self.current_turn = Some(*turn);
+                out.push(PeerEvent::ActivityStarted {
                     id: ActivityId(format!("turn-{turn}")),
                     kind: ActivityKind::ModelTurn,
                     label: format!("turn {turn}"),
-                }]
+                });
+                out
             }
 
             OutboundEvent::ModelResponseDelta { text } => {
@@ -963,11 +1103,20 @@ impl WireEventUpcaster {
 
             OutboundEvent::DoneSignal { message } => {
                 self.current_message_id = None;
-                let seq = self.next_seq();
-                let mut out = vec![PeerEvent::ActivityCompleted {
-                    id: ActivityId(format!("done-{seq}")),
-                    outcome: ActivityOutcome::Success,
-                }];
+                let mut out = vec![];
+                if let Some(closed) = self.close_pending_agent() {
+                    out.push(closed);
+                }
+                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
+                {
+                    out.push(closed);
+                } else {
+                    let seq = self.next_seq();
+                    out.push(PeerEvent::ActivityCompleted {
+                        id: ActivityId(format!("done-{seq}")),
+                        outcome: ActivityOutcome::Success,
+                    });
+                }
                 if let Some(msg) = message {
                     out.push(log_event(LogLevel::Info, "agent", format!("done: {msg}")));
                 }
@@ -990,11 +1139,17 @@ impl WireEventUpcaster {
                 source,
             } => {
                 let label = source.clone().unwrap_or_else(|| "agent".to_string());
-                vec![PeerEvent::ActivityStarted {
+                let mut out = vec![];
+                if let Some(closed) = self.close_pending_agent() {
+                    out.push(closed);
+                }
+                self.current_agent_turn = Some(*turn);
+                out.push(PeerEvent::ActivityStarted {
                     id: ActivityId(format!("agent-{turn}")),
                     kind: ActivityKind::ToolCall,
                     label: format!("{label}: {commands_preview}"),
-                }]
+                });
+                out
             }
 
             OutboundEvent::AgentOutput {
@@ -1004,8 +1159,15 @@ impl WireEventUpcaster {
             } => {
                 let mut out = vec![];
                 if !stdout.is_empty() {
+                    let id = match self.current_agent_turn {
+                        Some(turn) => ActivityId(format!("agent-{turn}")),
+                        None => {
+                            let seq = self.next_seq();
+                            ActivityId(format!("agent-orphan-{seq}"))
+                        }
+                    };
                     out.push(PeerEvent::ActivityProgress {
-                        id: ActivityId("agent-latest".into()),
+                        id,
                         text: Some(stdout.clone()),
                     });
                 }
@@ -1044,7 +1206,6 @@ impl WireEventUpcaster {
             )],
 
             OutboundEvent::TaskComplete { reason, summary } => {
-                let seq = self.next_seq();
                 let outcome = match reason.as_str() {
                     "success" | "done" | "completed" => ActivityOutcome::Success,
                     "cancelled" | "canceled" => ActivityOutcome::Cancelled,
@@ -1052,10 +1213,20 @@ impl WireEventUpcaster {
                         message: other.to_string(),
                     },
                 };
-                let mut out = vec![PeerEvent::ActivityCompleted {
-                    id: ActivityId(format!("task-{seq}")),
-                    outcome,
-                }];
+                let mut out = vec![];
+                if let Some(closed) = self.close_pending_agent() {
+                    out.push(closed);
+                }
+                if let Some(closed) = self.close_pending_turn(outcome.clone()) {
+                    out.push(closed);
+                } else {
+                    let seq = self.next_seq();
+                    out.push(PeerEvent::ActivityCompleted {
+                        id: ActivityId(format!("task-{seq}")),
+                        outcome,
+                    });
+                }
+                self.current_message_id = None;
                 if let Some(s) = summary {
                     out.push(log_event(LogLevel::Info, "task", s.clone()));
                 }
@@ -1754,6 +1925,226 @@ mod tests {
             }
             _ => panic!("expected SessionEnded"),
         }
+    }
+
+    /// ActivityId lifecycle contract: a model turn's Started and
+    /// Completed events must share the same id so observers can
+    /// correlate start→complete. Previously DoneSignal synthesized
+    /// a `done-{seq}` id that had no relation to the TurnStarted's
+    /// `turn-{N}` — two events with no way for the receiver to
+    /// know they belonged to the same activity.
+    #[test]
+    fn model_turn_activity_ids_match_start_to_complete() {
+        let mut u = AppEventUpcaster::new();
+        let started = u.upcast(&AppEvent::TurnStarted {
+            turn: 7,
+            budget_pct: 0.5,
+            remaining: 100,
+        });
+        let start_id = match started.last().unwrap() {
+            PeerEvent::ActivityStarted { id, .. } => id.clone(),
+            _ => panic!("expected ActivityStarted"),
+        };
+        assert_eq!(start_id.0, "turn-7");
+
+        let done = u.upcast(&AppEvent::DoneSignal { message: None });
+        let complete_id = done
+            .iter()
+            .find_map(|e| match e {
+                PeerEvent::ActivityCompleted { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("DoneSignal must emit an ActivityCompleted");
+        assert_eq!(
+            complete_id, start_id,
+            "start and complete events must share the activity id"
+        );
+    }
+
+    /// Agent activity lifecycle: started / progress / completed all
+    /// share the same id so observers can correlate tool output
+    /// with its tool call.
+    #[test]
+    fn agent_activity_ids_match_start_progress_complete() {
+        let mut u = AppEventUpcaster::new();
+        // Open a turn so the agent has a parent context (matches
+        // typical usage; not strictly required).
+        let _ = u.upcast(&AppEvent::TurnStarted {
+            turn: 3,
+            budget_pct: 0.5,
+            remaining: 100,
+        });
+        // Start an agent activity.
+        let started = u.upcast(&AppEvent::AgentStarted {
+            turn: 3,
+            commands_preview: "ls -la".into(),
+            source: None,
+        });
+        let start_id = started
+            .iter()
+            .find_map(|e| match e {
+                PeerEvent::ActivityStarted { id, kind, .. }
+                    if *kind == ActivityKind::ToolCall =>
+                {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .expect("AgentStarted must emit an ActivityStarted(ToolCall)");
+        assert_eq!(start_id.0, "agent-3");
+
+        // Stream some output.
+        let output = u.upcast(&AppEvent::AgentOutput {
+            stdout: "file1\nfile2".into(),
+            stderr: String::new(),
+            source: None,
+        });
+        let progress_id = output
+            .iter()
+            .find_map(|e| match e {
+                PeerEvent::ActivityProgress { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("AgentOutput with stdout must emit an ActivityProgress");
+        assert_eq!(
+            progress_id, start_id,
+            "progress id must match started id"
+        );
+
+        // Close the turn → agent activity should close with the same id.
+        let done = u.upcast(&AppEvent::DoneSignal { message: None });
+        let completed_ids: Vec<_> = done
+            .iter()
+            .filter_map(|e| match e {
+                PeerEvent::ActivityCompleted { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        // Both the agent and the turn should close. The agent
+        // completes first with agent-3, the turn with turn-3.
+        assert!(
+            completed_ids.iter().any(|id| *id == start_id),
+            "DoneSignal must close the agent with its started id. \
+             Got: {completed_ids:?}"
+        );
+    }
+
+    /// Same lifecycle guarantee on the wire upcaster. Parity with
+    /// AppEventUpcaster is enforced mechanically because both
+    /// upcasters derive ids from the same tracked state.
+    #[test]
+    fn wire_model_turn_activity_ids_match_start_to_complete() {
+        let mut u = WireEventUpcaster::new();
+        let started = u.upcast(&OutboundEvent::TurnStarted {
+            turn: 7,
+            budget_pct: 0.5,
+        });
+        let start_id = started
+            .iter()
+            .find_map(|e| match e {
+                PeerEvent::ActivityStarted { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("expected ActivityStarted");
+        assert_eq!(start_id.0, "turn-7");
+
+        let done = u.upcast(&OutboundEvent::DoneSignal { message: None });
+        let complete_id = done
+            .iter()
+            .find_map(|e| match e {
+                PeerEvent::ActivityCompleted { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("DoneSignal must emit ActivityCompleted");
+        assert_eq!(complete_id, start_id);
+    }
+
+    #[test]
+    fn wire_agent_activity_ids_match_start_progress_complete() {
+        let mut u = WireEventUpcaster::new();
+        let _ = u.upcast(&OutboundEvent::TurnStarted {
+            turn: 3,
+            budget_pct: 0.5,
+        });
+        let started = u.upcast(&OutboundEvent::AgentStarted {
+            turn: 3,
+            commands_preview: "ls -la".into(),
+            source: None,
+        });
+        let start_id = started
+            .iter()
+            .find_map(|e| match e {
+                PeerEvent::ActivityStarted { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("expected ActivityStarted");
+        assert_eq!(start_id.0, "agent-3");
+
+        let output = u.upcast(&OutboundEvent::AgentOutput {
+            stdout: "file1".into(),
+            stderr: String::new(),
+            source: None,
+        });
+        let progress_id = output
+            .iter()
+            .find_map(|e| match e {
+                PeerEvent::ActivityProgress { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("expected ActivityProgress");
+        assert_eq!(progress_id, start_id);
+    }
+
+    /// Parity on DoneSignal: given a TurnStarted + DoneSignal
+    /// sequence, the app and wire paths must produce the same
+    /// activity ids. Both upcasters track `current_turn` the same
+    /// way, so this test catches any future drift in how that
+    /// state is used.
+    ///
+    /// Note: we can't use the single-event `assert_parity` helper
+    /// here because DoneSignal's id depends on prior state
+    /// (TurnStarted seeded current_turn). Drive both upcasters
+    /// through the full sequence manually.
+    #[test]
+    fn parity_done_signal_uses_tracked_turn() {
+        let mut app = AppEventUpcaster::new();
+        let mut wire = WireEventUpcaster::new();
+
+        // Seed both with TurnStarted turn=5.
+        let _ = app.upcast(&AppEvent::TurnStarted {
+            turn: 5,
+            budget_pct: 0.5,
+            remaining: 100,
+        });
+        let _ = wire.upcast(&OutboundEvent::TurnStarted {
+            turn: 5,
+            budget_pct: 0.5,
+        });
+
+        // Both see DoneSignal.
+        let app_out = app.upcast(&AppEvent::DoneSignal { message: None });
+        let wire_out = wire.upcast(&OutboundEvent::DoneSignal { message: None });
+
+        let app_completed_ids: Vec<_> = app_out
+            .iter()
+            .filter_map(|e| match e {
+                PeerEvent::ActivityCompleted { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let wire_completed_ids: Vec<_> = wire_out
+            .iter()
+            .filter_map(|e| match e {
+                PeerEvent::ActivityCompleted { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            app_completed_ids, wire_completed_ids,
+            "DoneSignal activity ids must match across paths after \
+             TurnStarted seeded current_turn"
+        );
+        assert!(app_completed_ids.iter().any(|id| id.0 == "turn-5"));
     }
 
     /// `LogEntry` passes through with level/source/message preserved.
