@@ -6,6 +6,23 @@
 //! can do, how to reach it, and how to authenticate against it. Replaces
 //! the host_label/version/git_sha fields of [`crate::web_gateway::WebGatewayConfig`],
 //! which now carries only voice runtime config.
+//!
+//! ## Forward-compat fallback variants
+//!
+//! Every wire-format enum in this module has an `Unknown` variant —
+//! either marked `#[serde(other)]` for internally / adjacently tagged
+//! enums, or handled through a custom `from_wire` helper for plain
+//! unit enums that externally serialize to a bare string. Deserializing
+//! a card that advertises a future transport, capability, or auth
+//! scheme we don't recognize silently produces `Unknown` for that
+//! position rather than failing the whole card parse — the registry
+//! then filters `Unknown` out when picking a transport or auth method.
+//!
+//! Note that `#[serde(other)]` variants cannot be *serialized* (serde
+//! rejects that at runtime). This is fine in practice because we never
+//! round-trip cards that came from the wire: locally constructed cards
+//! never contain `Unknown` variants, and wire-originated cards are
+//! consumed, not re-emitted.
 
 use crate::peer::id::PeerId;
 use serde::{Deserialize, Serialize};
@@ -35,6 +52,8 @@ pub struct AgentCard {
     /// is supported and reachable. A peer may offer several (e.g. an
     /// Intendant daemon will expose its native WebSocket *and* an MCP
     /// server *and*, once shipped, an A2A endpoint, all in one card).
+    /// Unknown transports deserialize as [`TransportSpec::Unknown`]
+    /// so older builds can still pick a known transport from the list.
     pub transports: Vec<TransportSpec>,
 
     /// What this peer can do. The federation coordinator routes work
@@ -46,6 +65,13 @@ pub struct AgentCard {
 }
 
 /// One way to reach a peer.
+///
+/// Serde renames: `A2A` and `OpenClawWs` have explicit `#[serde(rename)]`
+/// attributes because the default kebab-case conversion mangles them
+/// (`a2-a` and `open-claw-ws`) — the canonical spellings are `a2a`
+/// and `openclaw-ws`, matching how their respective ecosystems name
+/// themselves. The `transport_spec_canonical_wire_strings` test is
+/// the invariant guard.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum TransportSpec {
@@ -56,6 +82,7 @@ pub enum TransportSpec {
 
     /// Linux Foundation Agent2Agent — JSON-RPC over HTTPS + SSE.
     /// The standardizing bet for cross-daemon-kind federation.
+    #[serde(rename = "a2a")]
     A2A { url: String },
 
     /// MCP server (any transport variant). Used for peers that expose
@@ -72,19 +99,79 @@ pub enum TransportSpec {
     /// (drive sessions) and/or a `node` (lend capabilities back to the
     /// gateway). One peer entry corresponds to one role; a daemon that
     /// wants both registers two peers with the same underlying URL.
+    #[serde(rename = "openclaw-ws")]
     OpenClawWs { url: String, role: OpenClawRole },
+
+    /// Forward-compat fallback. Unknown transport types on the wire
+    /// deserialize to `Unknown` so the card still parses; the registry
+    /// filters these out when picking a transport. Cannot be
+    /// serialized — do not construct this variant from local code.
+    #[serde(other)]
+    Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+/// MCP wire transport variant — nested inside [`TransportSpec::Mcp`].
+///
+/// Uses custom Serialize/Deserialize impls so unknown values fall
+/// through to [`McpTransportKind::Unknown`] rather than failing the
+/// parent transport parse. (Internally tagged enums can use
+/// `#[serde(other)]`, but this one is externally tagged as a bare
+/// string — no `tag = "..."` attribute — so the custom impls are the
+/// idiomatic way to get forward-compat fallback here.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpTransportKind {
     Stdio,
     Sse,
     StreamableHttp,
+    /// Forward-compat fallback for MCP transport kinds we don't recognize.
+    Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+impl McpTransportKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Sse => "sse",
+            Self::StreamableHttp => "streamable-http",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Self {
+        match s {
+            "stdio" => Self::Stdio,
+            "sse" => Self::Sse,
+            "streamable-http" => Self::StreamableHttp,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl Serialize for McpTransportKind {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for McpTransportKind {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = <String>::deserialize(d)?;
+        Ok(Self::from_wire(&s))
+    }
+}
+
+/// Role Intendant takes when connecting to an OpenClaw Gateway.
+///
+/// Custom Serialize/Deserialize for the same reason as
+/// [`McpTransportKind`] — bare-string external form, no `#[serde(tag)]`,
+/// so we hand-roll the fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenClawRole {
     /// Control-plane client — drive OpenClaw sessions, send chat,
     /// invoke nodes, resolve approvals.
@@ -92,11 +179,56 @@ pub enum OpenClawRole {
     /// Capability host — OpenClaw routes `node.invoke` calls to us so
     /// we can offer screen, voice, computer-use back to the gateway.
     Node,
+    /// Forward-compat fallback for OpenClaw roles we don't recognize.
+    Unknown,
+}
+
+impl OpenClawRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Node => "node",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Self {
+        match s {
+            "operator" => Self::Operator,
+            "node" => Self::Node,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl Serialize for OpenClawRole {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for OpenClawRole {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = <String>::deserialize(d)?;
+        Ok(Self::from_wire(&s))
+    }
 }
 
 /// Capabilities advertised by a peer. The coordinator routes work by
-/// matching required capabilities against this list. `Custom` is the
-/// forward-compat escape hatch for capabilities not yet enumerated.
+/// matching required capabilities against this list.
+///
+/// Note the two escape hatches: `Custom(String)` is for *named*
+/// capabilities the peer wants to advertise explicitly (e.g. a
+/// `"vortex-audio"` capability specific to Intendant's audio stack).
+/// `Unknown` is for capability kinds the peer sends that we don't
+/// recognize at all — forward-compat catch that keeps the card
+/// parseable when a new known-name capability lands in a future version.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "name", rename_all = "kebab-case")]
 pub enum Capability {
@@ -117,8 +249,15 @@ pub enum Capability {
     /// Forwards messages to / from external channels (chat, sms, email,
     /// WhatsApp, Telegram). The OpenClaw category, basically.
     MessageRelay,
-    /// Custom capability — string-tagged for forward compat.
+    /// Named custom capability — string-tagged for explicit extensions.
     Custom(String),
+    /// Forward-compat fallback for capability kinds we don't recognize
+    /// at all. Distinct from `Custom` — `Custom` is a peer explicitly
+    /// saying "here's a named extension"; `Unknown` is us saying "this
+    /// peer advertised something the parser doesn't know yet." Cannot
+    /// be serialized.
+    #[serde(other)]
+    Unknown,
 }
 
 /// How a peer authenticates inbound connections.
@@ -146,6 +285,12 @@ pub enum AuthScheme {
     /// signed by a CA both sides trust. Reuses the `intendant lan` CA
     /// infrastructure when both peers are Intendants on the same LAN.
     MutualTls,
+    /// Forward-compat fallback for auth schemes we don't recognize.
+    /// Connecting to a peer whose auth is `Unknown` fails at connect
+    /// time with a clear error — the card still parses so other
+    /// information in it remains usable. Cannot be serialized.
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(test)]
@@ -204,6 +349,168 @@ mod tests {
             let json = serde_json::to_string(&scheme).unwrap();
             let parsed: AuthScheme = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, scheme);
+        }
+    }
+
+    /// Canonical wire spellings for `TransportSpec` variants. Same
+    /// policy as `peer::id::tests::canonical_wire_strings` — any
+    /// future rename that mangles an acronym will fire this test.
+    #[test]
+    fn transport_spec_canonical_wire_strings() {
+        let cases: &[(TransportSpec, &str)] = &[
+            (
+                TransportSpec::IntendantWs {
+                    url: "wss://x".into(),
+                },
+                "intendant-ws",
+            ),
+            (
+                TransportSpec::A2A {
+                    url: "https://x".into(),
+                },
+                "a2a",
+            ),
+            (
+                TransportSpec::Mcp {
+                    url: "https://x".into(),
+                    transport: McpTransportKind::Stdio,
+                },
+                "mcp",
+            ),
+            (
+                TransportSpec::OpenClawWs {
+                    url: "wss://x".into(),
+                    role: OpenClawRole::Operator,
+                },
+                "openclaw-ws",
+            ),
+        ];
+        for (spec, expected_type) in cases {
+            let json = serde_json::to_string(spec).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                parsed["type"].as_str().unwrap(),
+                *expected_type,
+                "TransportSpec {spec:?}: expected type = {expected_type:?}"
+            );
+        }
+    }
+
+    /// Forward-compat: an agent card that advertises one transport we
+    /// don't recognize alongside one we do must still parse, and the
+    /// known transport must still be usable.
+    #[test]
+    fn card_with_unknown_transport_parses_and_preserves_known() {
+        let json = r#"{
+            "id": "intendant:nicks-mac",
+            "label": "Nick's Mac",
+            "version": "0.42.0",
+            "transports": [
+                { "type": "wasm-runtime", "url": "ws://nicks-mac:9000/wasm", "flavor": "wasi-preview2" },
+                { "type": "intendant-ws", "url": "wss://nicks-mac:8443/ws" }
+            ],
+            "capabilities": [],
+            "auth": { "scheme": "none" }
+        }"#;
+        let card: AgentCard = serde_json::from_str(json).unwrap();
+        assert_eq!(card.transports.len(), 2);
+        assert!(matches!(card.transports[0], TransportSpec::Unknown));
+        assert!(matches!(
+            card.transports[1],
+            TransportSpec::IntendantWs { .. }
+        ));
+    }
+
+    /// Forward-compat: an unknown auth scheme doesn't break the card
+    /// parse — the caller discovers the problem at connect time, not
+    /// at parse time, so other info from the card is still usable.
+    #[test]
+    fn card_with_unknown_auth_parses() {
+        let json = r#"{
+            "id": "intendant:future-peer",
+            "label": "Future Peer",
+            "version": "9.0.0",
+            "transports": [{ "type": "intendant-ws", "url": "wss://x/ws" }],
+            "capabilities": [],
+            "auth": { "scheme": "webauthn-passkey", "rp_id": "future-peer.local" }
+        }"#;
+        let card: AgentCard = serde_json::from_str(json).unwrap();
+        assert!(matches!(card.auth, AuthScheme::Unknown));
+    }
+
+    /// Forward-compat: an unknown capability kind doesn't break the
+    /// card parse — it becomes `Capability::Unknown` and is filtered
+    /// out when matching required capabilities.
+    #[test]
+    fn card_with_unknown_capability_parses() {
+        let json = r#"{
+            "id": "intendant:future-peer",
+            "label": "Future",
+            "version": "9.0.0",
+            "transports": [{ "type": "intendant-ws", "url": "wss://x/ws" }],
+            "capabilities": [
+                { "kind": "display" },
+                { "kind": "holographic-projection" },
+                { "kind": "custom", "name": "vortex-audio" }
+            ],
+            "auth": { "scheme": "none" }
+        }"#;
+        let card: AgentCard = serde_json::from_str(json).unwrap();
+        assert_eq!(card.capabilities.len(), 3);
+        assert!(matches!(card.capabilities[0], Capability::Display));
+        assert!(matches!(card.capabilities[1], Capability::Unknown));
+        assert!(matches!(&card.capabilities[2], Capability::Custom(n) if n == "vortex-audio"));
+    }
+
+    /// Forward-compat: an unknown MCP transport inside a `Mcp` variant
+    /// parses to `McpTransportKind::Unknown`.
+    #[test]
+    fn mcp_unknown_transport_kind_parses() {
+        let json = r#"{ "type": "mcp", "url": "https://x/mcp", "transport": "websocket" }"#;
+        let spec: TransportSpec = serde_json::from_str(json).unwrap();
+        match spec {
+            TransportSpec::Mcp { transport, .. } => {
+                assert_eq!(transport, McpTransportKind::Unknown);
+            }
+            _ => panic!("expected Mcp variant"),
+        }
+    }
+
+    /// Forward-compat: an unknown OpenClaw role falls through to Unknown.
+    #[test]
+    fn openclaw_unknown_role_parses() {
+        let json = r#"{ "type": "openclaw-ws", "url": "ws://x:18789", "role": "supervisor" }"#;
+        let spec: TransportSpec = serde_json::from_str(json).unwrap();
+        match spec {
+            TransportSpec::OpenClawWs { role, .. } => {
+                assert_eq!(role, OpenClawRole::Unknown);
+            }
+            _ => panic!("expected OpenClawWs variant"),
+        }
+    }
+
+    /// Wire-format consistency for the two unit enums with custom
+    /// Serialize/Deserialize impls: their `as_str()` must match what
+    /// serde produces. If this test fires, someone changed one source
+    /// of truth without updating the other.
+    #[test]
+    fn unit_enums_as_str_matches_serde_wire_format() {
+        for k in [
+            McpTransportKind::Stdio,
+            McpTransportKind::Sse,
+            McpTransportKind::StreamableHttp,
+            McpTransportKind::Unknown,
+        ] {
+            let wire = serde_json::to_string(&k).unwrap();
+            assert_eq!(wire, format!("\"{}\"", k.as_str()));
+        }
+        for r in [
+            OpenClawRole::Operator,
+            OpenClawRole::Node,
+            OpenClawRole::Unknown,
+        ] {
+            let wire = serde_json::to_string(&r).unwrap();
+            assert_eq!(wire, format!("\"{}\"", r.as_str()));
         }
     }
 }

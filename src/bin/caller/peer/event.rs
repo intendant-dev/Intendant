@@ -12,6 +12,21 @@
 //! capability state, usage, session, and log. Every category corresponds
 //! to a renderable surface — there is no "miscellaneous" variant and no
 //! `Native(AppEvent)` escape hatch.
+//!
+//! ## Forward-compat fallback variants
+//!
+//! `PeerEvent` itself is constructed in Rust by transport adapters, not
+//! deserialized from raw wire JSON, so it does *not* need an `Unknown`
+//! fallback — any wire event a transport doesn't recognize fails at the
+//! transport-parse layer where the diagnostic is actionable. The inner
+//! content enums (`PeerStatus`, `ActivityKind`, `ActivityOutcome`,
+//! `TaskUpdate`, `MessageContent`, `MessagePart`) *do* get forward-compat
+//! `Unknown` variants, because those fields are parsed out of wire
+//! content and older builds must tolerate new peer-side values without
+//! failing the whole event. `MessageRole`, `LogLevel`, and
+//! `ApprovalDecision` are deliberately kept closed — they map to
+//! ecosystem-wide stable vocabularies (OpenAI/Anthropic roles, RFC 5424
+//! levels, four-way approval) that don't evolve on our timescale.
 
 use crate::peer::card::{AgentCard, Capability};
 use crate::peer::id::PeerId;
@@ -143,13 +158,60 @@ pub enum PeerEvent {
 /// concerns and separate watch channels on the handle. The dashboard
 /// composes both: a peer can be `ConnectionState::Reconnecting` while
 /// its last observed `PeerStatus` was `Working`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// Custom Serialize/Deserialize for forward-compat — unknown status
+/// strings fall through to [`PeerStatus::Unknown`] rather than failing
+/// the parent event parse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerStatus {
     Idle,
     Working,
     NeedsApproval,
     Error,
+    /// Forward-compat fallback for peer-reported statuses we don't
+    /// recognize.
+    Unknown,
+}
+
+impl PeerStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::NeedsApproval => "needs_approval",
+            Self::Error => "error",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Self {
+        match s {
+            "idle" => Self::Idle,
+            "working" => Self::Working,
+            "needs_approval" => Self::NeedsApproval,
+            "error" => Self::Error,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl Serialize for PeerStatus {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerStatus {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = <String>::deserialize(d)?;
+        Ok(Self::from_wire(&s))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -161,8 +223,12 @@ pub struct MessageId(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskId(pub String);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// What kind of activity a peer is doing.
+///
+/// Custom Serialize/Deserialize for forward-compat — a future peer
+/// that starts emitting `"background_reflection"` activities parses
+/// cleanly as [`ActivityKind::Unknown`] on older builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActivityKind {
     /// A model turn (request → streamed response → completion).
     ModelTurn,
@@ -172,8 +238,54 @@ pub enum ActivityKind {
     SubAgent,
     /// A task this peer is executing on behalf of a delegating peer.
     DelegatedTask,
-    /// Custom or transport-specific activity kind.
+    /// Custom or transport-specific activity kind (peer's explicit
+    /// "I'm doing something not in the standard vocabulary" signal).
     Other,
+    /// Forward-compat fallback for activity kinds we don't recognize.
+    Unknown,
+}
+
+impl ActivityKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ModelTurn => "model_turn",
+            Self::ToolCall => "tool_call",
+            Self::SubAgent => "sub_agent",
+            Self::DelegatedTask => "delegated_task",
+            Self::Other => "other",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Self {
+        match s {
+            "model_turn" => Self::ModelTurn,
+            "tool_call" => Self::ToolCall,
+            "sub_agent" => Self::SubAgent,
+            "delegated_task" => Self::DelegatedTask,
+            "other" => Self::Other,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl Serialize for ActivityKind {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityKind {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = <String>::deserialize(d)?;
+        Ok(Self::from_wire(&s))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -185,6 +297,10 @@ pub enum ActivityOutcome {
     /// Activity was paused mid-flight (e.g. waiting on an approval, or
     /// hit a budget cap that requires human resolution).
     Suspended { reason: String },
+    /// Forward-compat fallback for outcomes we don't recognize.
+    /// Cannot be serialized.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -198,8 +314,15 @@ pub enum TaskUpdate {
     Completed { result: serde_json::Value },
     Failed { message: String },
     Cancelled,
+    /// Forward-compat fallback for task update stages we don't
+    /// recognize. Cannot be serialized.
+    #[serde(other)]
+    Unknown,
 }
 
+/// Role of a message in a conversation. Deliberately kept closed —
+/// user/assistant/system/tool is the cross-ecosystem stable vocabulary
+/// (OpenAI, Anthropic, etc.) and won't evolve on our timescale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
@@ -219,6 +342,10 @@ pub enum MessageContent {
     Image { mime_type: String, base64: String },
     /// Multi-part content (mix of text + images + tool calls).
     Parts { parts: Vec<MessagePart> },
+    /// Forward-compat fallback for message content types we don't
+    /// recognize. Cannot be serialized.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -228,6 +355,10 @@ pub enum MessagePart {
     Image { mime_type: String, base64: String },
     ToolCall { name: String, args: serde_json::Value },
     ToolResult { name: String, result: serde_json::Value },
+    /// Forward-compat fallback for message part types we don't
+    /// recognize. Cannot be serialized.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A message to send *to* a peer.
@@ -259,7 +390,8 @@ pub struct ApprovalRequest {
 /// Approval decision. Mirrors `external_agent::ApprovalDecision` by design
 /// — both encode the same four-way user response. Kept separate today to
 /// avoid coupling `peer` to `external_agent`; a follow-up should extract a
-/// shared `crate::approval` module that both consume.
+/// shared `crate::approval` module that both consume. Deliberately closed
+/// — this vocabulary is stable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
@@ -289,6 +421,9 @@ pub struct ModelUsage {
     pub cost_usd: Option<f64>,
 }
 
+/// Log level. Deliberately kept closed — trace/debug/info/warn/error
+/// is the RFC 5424-adjacent stable vocabulary used by every logging
+/// ecosystem. New levels won't appear in peer feeds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogLevel {
@@ -396,5 +531,126 @@ mod tests {
         let parsed: TaggedPeerEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.seq, 42);
         assert_eq!(parsed.peer.as_str(), "intendant:nicks-mac");
+    }
+
+    // ---- Forward-compat tests ----
+
+    /// `PeerStatus` with an unknown string must fall through to
+    /// `Unknown`, not fail the parent event parse.
+    #[test]
+    fn unknown_peer_status_parses() {
+        let evt_json = r#"{"event": "status_changed", "status": "meditating"}"#;
+        let parsed: PeerEvent = serde_json::from_str(evt_json).unwrap();
+        match parsed {
+            PeerEvent::StatusChanged { status } => {
+                assert_eq!(status, PeerStatus::Unknown);
+            }
+            _ => panic!("expected StatusChanged"),
+        }
+    }
+
+    /// `ActivityKind` with an unknown string must fall through to
+    /// `Unknown`.
+    #[test]
+    fn unknown_activity_kind_parses() {
+        let evt_json = r#"{
+            "event": "activity_started",
+            "id": "a1",
+            "kind": "background_reflection",
+            "label": "thinking"
+        }"#;
+        let parsed: PeerEvent = serde_json::from_str(evt_json).unwrap();
+        match parsed {
+            PeerEvent::ActivityStarted { kind, .. } => {
+                assert_eq!(kind, ActivityKind::Unknown);
+            }
+            _ => panic!("expected ActivityStarted"),
+        }
+    }
+
+    /// `ActivityOutcome` with an unknown `status` tag must fall
+    /// through to `Unknown`.
+    #[test]
+    fn unknown_activity_outcome_parses() {
+        let evt_json = r#"{
+            "event": "activity_completed",
+            "id": "a1",
+            "outcome": { "status": "partially_completed", "info": "..." }
+        }"#;
+        let parsed: PeerEvent = serde_json::from_str(evt_json).unwrap();
+        match parsed {
+            PeerEvent::ActivityCompleted { outcome, .. } => {
+                assert!(matches!(outcome, ActivityOutcome::Unknown));
+            }
+            _ => panic!("expected ActivityCompleted"),
+        }
+    }
+
+    /// `TaskUpdate` with an unknown `stage` tag must fall through to
+    /// `Unknown`.
+    #[test]
+    fn unknown_task_update_stage_parses() {
+        let evt_json = r#"{
+            "event": "task_update",
+            "task": "t1",
+            "update": { "stage": "queued_behind_other_task" }
+        }"#;
+        let parsed: PeerEvent = serde_json::from_str(evt_json).unwrap();
+        match parsed {
+            PeerEvent::TaskUpdate { update, .. } => {
+                assert!(matches!(update, TaskUpdate::Unknown));
+            }
+            _ => panic!("expected TaskUpdate"),
+        }
+    }
+
+    /// `MessageContent` with an unknown `type` tag must fall through
+    /// to `Unknown`, preserving the rest of the parent Message.
+    #[test]
+    fn unknown_message_content_parses() {
+        let evt_json = r#"{
+            "event": "message",
+            "id": "m1",
+            "role": "assistant",
+            "content": { "type": "holographic", "data": "..." },
+            "partial": false
+        }"#;
+        let parsed: PeerEvent = serde_json::from_str(evt_json).unwrap();
+        match parsed {
+            PeerEvent::Message { id, role, content, partial } => {
+                assert_eq!(id, MessageId("m1".into()));
+                assert_eq!(role, MessageRole::Assistant);
+                assert!(!partial);
+                assert!(matches!(content, MessageContent::Unknown));
+            }
+            _ => panic!("expected Message"),
+        }
+    }
+
+    /// Wire-format consistency for the custom-Serialize unit enums in
+    /// this module — as_str() must match what serde produces.
+    #[test]
+    fn unit_enums_as_str_matches_serde_wire_format() {
+        for s in [
+            PeerStatus::Idle,
+            PeerStatus::Working,
+            PeerStatus::NeedsApproval,
+            PeerStatus::Error,
+            PeerStatus::Unknown,
+        ] {
+            let wire = serde_json::to_string(&s).unwrap();
+            assert_eq!(wire, format!("\"{}\"", s.as_str()));
+        }
+        for k in [
+            ActivityKind::ModelTurn,
+            ActivityKind::ToolCall,
+            ActivityKind::SubAgent,
+            ActivityKind::DelegatedTask,
+            ActivityKind::Other,
+            ActivityKind::Unknown,
+        ] {
+            let wire = serde_json::to_string(&k).unwrap();
+            assert_eq!(wire, format!("\"{}\"", k.as_str()));
+        }
     }
 }

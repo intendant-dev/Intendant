@@ -14,6 +14,57 @@
 //! supervise a Codex subprocess via its local `external_agent` layer
 //! while being driven from this side as a `peer`.
 //!
+//! ## Wire format forward-compat policy
+//!
+//! Every wire-format enum in this module (anything a peer could send
+//! on the wire and we need to deserialize) must tolerate future
+//! variants without failing the whole parse. The idiom depends on the
+//! enum's serde tagging:
+//!
+//! - **Internally / adjacently tagged enums** (anything with
+//!   `#[serde(tag = "...")]`) get a unit variant `Unknown` marked
+//!   `#[serde(other)]`. Examples: `TransportSpec`, `AuthScheme`,
+//!   `Capability`, `ActivityOutcome`, `TaskUpdate`, `MessageContent`,
+//!   `MessagePart`. Note that `#[serde(other)]` variants cannot be
+//!   *serialized* at runtime (serde rejects that explicitly); in
+//!   practice we never round-trip cards or events that came from the
+//!   wire, so this limitation is acceptable.
+//!
+//! - **Plain unit enums that serialize as a bare string** get
+//!   `#[serde(other)]`-free treatment: custom `Serialize` /
+//!   `Deserialize` impls plus an `as_str` / `from_wire` pair. The
+//!   `from_wire` helper returns the `Unknown` variant for unrecognized
+//!   strings rather than failing. Examples: `PeerKind`,
+//!   `McpTransportKind`, `OpenClawRole`, `PeerStatus`, `ActivityKind`.
+//!   These also all have an `as_str_matches_serde_wire_format`
+//!   invariant test so the string vocabulary stays in exactly one
+//!   place.
+//!
+//! - **Acronym variants** (`A2A`, `OpenClaw`, etc) must use explicit
+//!   `#[serde(rename = "...")]` to the canonical ecosystem spelling.
+//!   serde's `rename_all = "snake_case"` / `"kebab-case"` mangles
+//!   acronyms (`A2A → a2_a`, `OpenClaw → open_claw`) in ways that
+//!   don't match how the projects name themselves. Canonical wire
+//!   string tests (`canonical_wire_strings`,
+//!   `transport_spec_canonical_wire_strings`) are the invariant guard.
+//!
+//! - **Deliberately closed** enums: `MessageRole`, `LogLevel`,
+//!   `ApprovalDecision`. These map to cross-ecosystem stable
+//!   vocabularies (OpenAI/Anthropic roles, RFC 5424 levels, four-way
+//!   approval) that don't evolve on our timescale. Adding a wire
+//!   value not in one of these enums is itself evidence of a bug
+//!   worth failing loud on.
+//!
+//! - **`PeerEvent` itself** is exempt: it's constructed in Rust by
+//!   transport adapters, never deserialized from raw wire JSON, so an
+//!   unknown wire event shape fails at the transport-parse layer
+//!   where the diagnostic is actionable. The inner content enums
+//!   above handle forward-compat for fields within known event
+//!   variants.
+//!
+//! New wire-format enums added to this module must follow this policy
+//! before landing. The tests in each submodule enforce it.
+//!
 //! ## Module layout
 //!
 //! - [`id`]      — `PeerId`, `PeerKind`. Stable opaque identity.

@@ -5,6 +5,18 @@
 //! the registry de-collide peers across daemon types that might otherwise
 //! share a label, and lets readers route by kind without needing the full
 //! `AgentCard` in hand.
+//!
+//! ## Wire format discipline
+//!
+//! `PeerKind` uses **custom** `Serialize` / `Deserialize` impls rather
+//! than `#[derive(..)]` + `#[serde(rename_all = "snake_case")]`. The
+//! derive-based path mangles acronyms — `A2A` becomes `"a2_a"` and
+//! `OpenClaw` becomes `"open_claw"`, neither of which matches the
+//! canonical strings used in documentation and by every external
+//! ecosystem tool. The custom impls delegate to [`PeerKind::as_str`]
+//! for serialize and [`PeerKind::from_wire`] for deserialize, giving
+//! exactly one source of truth for the wire vocabulary. The
+//! `as_str_matches_serde_wire_format` test is the invariant guard.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -48,10 +60,14 @@ impl fmt::Display for PeerId {
 ///
 /// Used by the registry to dispatch to the right transport: an `Intendant`
 /// peer uses the native Intendant WebSocket transport; an `OpenClaw` peer
-/// uses the operator+node Gateway protocol; etc. `Other` is a forward-compat
-/// escape hatch for future agent kinds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// uses the operator+node Gateway protocol; etc.
+///
+/// `Other` is the forward-compat fallback: unknown kind strings on the
+/// wire deserialize to `Other` rather than failing, so a daemon that
+/// advertises `"voice_clone_agent"` in the future still parses cleanly
+/// on older builds (which then can't route work to it, but at least
+/// see it exists).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PeerKind {
     Intendant,
     OpenClaw,
@@ -61,10 +77,15 @@ pub enum PeerKind {
     A2A,
     /// Generic MCP-server-shaped peer.
     Mcp,
+    /// Unknown kind — forward-compat fallback.
     Other,
 }
 
 impl PeerKind {
+    /// Canonical wire string. This is the single source of truth for
+    /// how a `PeerKind` serializes — the custom `Serialize` impl
+    /// delegates here and the `as_str_matches_serde_wire_format` test
+    /// enforces the invariant.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Intendant => "intendant",
@@ -77,6 +98,9 @@ impl PeerKind {
         }
     }
 
+    /// Strict parse — returns `Some` only for known kinds. Use when
+    /// you want to distinguish "unrecognized" from "explicit Other"
+    /// (which [`from_wire`](Self::from_wire) collapses).
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "intendant" => Some(Self::Intendant),
@@ -88,6 +112,32 @@ impl PeerKind {
             "other" => Some(Self::Other),
             _ => None,
         }
+    }
+
+    /// Parse with forward-compat fallback: unrecognized wire strings
+    /// collapse to [`PeerKind::Other`] rather than returning `None`.
+    /// This is what the custom `Deserialize` impl calls.
+    pub fn from_wire(s: &str) -> Self {
+        Self::from_str(s).unwrap_or(Self::Other)
+    }
+}
+
+impl Serialize for PeerKind {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerKind {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = <String>::deserialize(d)?;
+        Ok(Self::from_wire(&s))
     }
 }
 
@@ -126,8 +176,13 @@ mod tests {
         assert_eq!(id.label(), "just-a-label");
     }
 
+    /// Every variant of `PeerKind` must serialize to exactly `as_str()`.
+    /// This test is the forward-compat policy enforcement for this
+    /// module — if anyone reintroduces `#[serde(rename_all = ..)]` on
+    /// this enum, acronyms like A2A will get mangled and this test
+    /// fires.
     #[test]
-    fn kind_serde_round_trip() {
+    fn as_str_matches_serde_wire_format() {
         for k in [
             PeerKind::Intendant,
             PeerKind::OpenClaw,
@@ -137,10 +192,63 @@ mod tests {
             PeerKind::Mcp,
             PeerKind::Other,
         ] {
-            let json = serde_json::to_string(&k).unwrap();
-            let parsed: PeerKind = serde_json::from_str(&json).unwrap();
+            let wire = serde_json::to_value(k).unwrap();
+            let wire_str = wire.as_str().unwrap_or_else(|| {
+                panic!("PeerKind::{k:?} did not serialize to a JSON string: {wire}")
+            });
+            assert_eq!(
+                wire_str,
+                k.as_str(),
+                "PeerKind::{k:?}: as_str() = {:?}, serde wire = {:?}",
+                k.as_str(),
+                wire_str
+            );
+            // Round-trip back through deserialize.
+            let parsed: PeerKind = serde_json::from_str(&wire.to_string()).unwrap();
             assert_eq!(parsed, k);
-            assert_eq!(PeerKind::from_str(k.as_str()), Some(k));
         }
+    }
+
+    /// Canonical spellings we promise to preserve. This is the
+    /// user-facing contract the previous `#[serde(rename_all)]`
+    /// silently violated — `A2A` was serializing as `"a2_a"`.
+    #[test]
+    fn canonical_wire_strings() {
+        let cases: &[(PeerKind, &str)] = &[
+            (PeerKind::Intendant, "intendant"),
+            (PeerKind::OpenClaw, "openclaw"),
+            (PeerKind::Hermes, "hermes"),
+            (PeerKind::Letta, "letta"),
+            (PeerKind::A2A, "a2a"),
+            (PeerKind::Mcp, "mcp"),
+            (PeerKind::Other, "other"),
+        ];
+        for (k, expected) in cases {
+            let json = serde_json::to_string(k).unwrap();
+            assert_eq!(json, format!("\"{expected}\""), "PeerKind::{k:?}");
+        }
+    }
+
+    /// Forward-compat: unknown kind strings deserialize to `Other`,
+    /// not to an error.
+    #[test]
+    fn unknown_kind_falls_through_to_other() {
+        let parsed: PeerKind = serde_json::from_str("\"voice_clone_agent\"").unwrap();
+        assert_eq!(parsed, PeerKind::Other);
+        let parsed: PeerKind = serde_json::from_str("\"some-future-kind\"").unwrap();
+        assert_eq!(parsed, PeerKind::Other);
+    }
+
+    /// PeerId construction uses `as_str()`, so the ID prefix must also
+    /// match the wire format. This catches any future divergence
+    /// between the two.
+    #[test]
+    fn peer_id_prefix_matches_wire_format() {
+        let id = PeerId::new(PeerKind::A2A, "foo");
+        assert_eq!(id.as_str(), "a2a:foo");
+        // And the same id round-trips through serde via the PeerKind
+        // wire format.
+        let kind_wire = serde_json::to_string(&PeerKind::A2A).unwrap();
+        assert_eq!(kind_wire, "\"a2a\"");
     }
 }
