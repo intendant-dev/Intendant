@@ -1648,6 +1648,48 @@ pub fn spawn_web_gateway(
         });
     }
 
+    // Peer registry → dashboard push translator.
+    //
+    // When the registry is wired (the daemon was started with
+    // federation enabled), subscribe to its [`RegistryEvent`] stream
+    // and translate each event into the matching wire-format
+    // [`OutboundEvent`] variant, broadcast over the same channel as
+    // every other dashboard event. The browser's existing primary
+    // WebSocket pipeline picks them up and updates peer rows in-place
+    // without polling `GET /api/peers`.
+    //
+    // Lagged events are skipped on purpose: the dashboard's recovery
+    // path is to re-fetch `/api/peers`, which always returns ground
+    // truth. Closed receiver = registry was dropped, exit cleanly.
+    if let Some(reg) = peer_registry.as_ref() {
+        let mut reg_rx = reg.subscribe();
+        let push_tx = broadcast_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match reg_rx.recv().await {
+                    Ok(event) => {
+                        let outbound = match event {
+                            crate::peer::RegistryEvent::PeerAdded(snap) => {
+                                crate::types::OutboundEvent::PeerAdded { peer: snap }
+                            }
+                            crate::peer::RegistryEvent::PeerRemoved(id) => {
+                                crate::types::OutboundEvent::PeerRemoved {
+                                    id: id.as_str().to_string(),
+                                }
+                            }
+                            crate::peer::RegistryEvent::PeerStateChanged(snap) => {
+                                crate::types::OutboundEvent::PeerStateChanged { peer: snap }
+                            }
+                        };
+                        crate::control::broadcast_event(&push_tx, &outbound);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     let app_html = Arc::new(
         APP_HTML
             .replace(
@@ -4323,23 +4365,15 @@ pub fn build_config(
 // /api/peers helpers
 // ---------------------------------------------------------------------------
 
-/// JSON shape for a single entry in `GET /api/peers`. Flattens the
-/// bits of the peer's Agent Card and live connection state that the
-/// dashboard Daemons panel renders.
-#[derive(Serialize)]
-struct PeerListEntry {
-    id: String,
-    label: String,
-    version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    git_sha: Option<String>,
-    connection_state: crate::peer::ConnectionState,
-    status: crate::peer::PeerStatus,
-}
-
+/// Wrapper for the `GET /api/peers` JSON body.
+///
+/// Each entry is a [`crate::peer::PeerSnapshot`] — the same type the
+/// registry's push events carry. One snapshot type means the dashboard
+/// applies API entries and pushed deltas the same way; no parallel
+/// schemas to drift apart.
 #[derive(Serialize)]
 struct PeerListResponse {
-    peers: Vec<PeerListEntry>,
+    peers: Vec<crate::peer::PeerSnapshot>,
 }
 
 #[derive(Deserialize)]
@@ -4356,23 +4390,14 @@ struct RemovePeerRequest {
 /// snapshot of the registry's handles and reads their current
 /// watch-backed connection/status values. Handles are cloneable so
 /// no lock is held across the serialization.
+///
+/// Each snapshot is built via [`crate::peer::PeerHandle::snapshot`], the
+/// same constructor used by the registry's push event stream. The
+/// dashboard applies an API entry and a pushed snapshot identically.
 fn peers_list_response_body(registry: &crate::peer::PeerRegistry) -> String {
     let handles = registry.list();
-    let entries: Vec<PeerListEntry> = handles
-        .iter()
-        .map(|h| {
-            let card = h.card_snapshot();
-            PeerListEntry {
-                id: h.id().as_str().to_string(),
-                label: card.label.clone(),
-                version: card.version.clone(),
-                git_sha: card.git_sha.clone(),
-                connection_state: h.connection_state(),
-                status: h.status(),
-            }
-        })
-        .collect();
-    serde_json::to_string(&PeerListResponse { peers: entries })
+    let peers: Vec<crate::peer::PeerSnapshot> = handles.iter().map(|h| h.snapshot()).collect();
+    serde_json::to_string(&PeerListResponse { peers })
         .unwrap_or_else(|_| "{\"peers\":[]}".to_string())
 }
 
@@ -5083,6 +5108,24 @@ mod tests {
             peers_arr[0]["version"].as_str().unwrap(),
             env!("CARGO_PKG_VERSION")
         );
+        // The dashboard panel rebuild relies on `ws_url` being
+        // present so the browser can open a secondary WASM
+        // connection without re-fetching the card. Guard against
+        // the field being dropped or renamed.
+        let ws_url = peers_arr[0]["ws_url"]
+            .as_str()
+            .expect("ws_url field must be present in the API response");
+        assert!(
+            ws_url.starts_with("ws://") && ws_url.ends_with("/ws"),
+            "ws_url should be a native Intendant WebSocket URL: {ws_url}"
+        );
+        // The dashboard renders capability badges from this list,
+        // so it must be present and contain the always-on phase 1
+        // capabilities the test peer advertises.
+        let caps = peers_arr[0]["capabilities"]
+            .as_array()
+            .expect("capabilities must be a JSON array");
+        assert!(!caps.is_empty(), "expected at least one capability");
 
         // DELETE /api/peers with the peer_id.
         let del_body = serde_json::json!({"peer_id": peer_id}).to_string();

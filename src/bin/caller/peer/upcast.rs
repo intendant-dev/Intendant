@@ -1031,9 +1031,18 @@ impl WireEventUpcaster {
     pub fn upcast(&mut self, event: &OutboundEvent) -> Vec<PeerEvent> {
         match event {
             // ---- Forward-compat + dropped metric streams ----
+            //
+            // FileChanged is dashboard live file tracking; PeerAdded /
+            // PeerRemoved / PeerStateChanged are registry control-plane
+            // events emitted by the local translator. None of these are
+            // peer-originated activity, so they are intentionally absent
+            // from the peer event vocabulary.
             OutboundEvent::Unknown
             | OutboundEvent::DisplayMetrics { .. }
-            | OutboundEvent::FileChanged { .. } => vec![],
+            | OutboundEvent::FileChanged { .. }
+            | OutboundEvent::PeerAdded { .. }
+            | OutboundEvent::PeerRemoved { .. }
+            | OutboundEvent::PeerStateChanged { .. } => vec![],
 
             // ---- Turn lifecycle ----
             OutboundEvent::TurnStarted { turn, .. } => {
