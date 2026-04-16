@@ -15,16 +15,32 @@
 //!
 //! ## ICE-TCP multiplexing
 //!
-//! When `IceConfig::tcp_port` is set, the `DisplaySession` creates a shared
-//! `TcpDispatcher` holding a single `TcpListener` on that port. Peers register
-//! their pre-generated local ufrag with the dispatcher at construction time.
-//! The dispatcher accepts incoming connections, parses the first RFC 4571
-//! framed STUN binding request, extracts the USERNAME attribute's local-ufrag
-//! portion, and routes the connection to the matching peer. Each TCP
-//! connection becomes a bidirectional channel with the peer's driver — inbound
-//! frames flow into the same packet channel that UDP uses (tagged with
-//! `Protocol::Tcp`), outbound `Output::Transmit` with `proto == Tcp` is written
-//! to the connection's write-half keyed on the destination address.
+//! The web gateway creates one shared `TcpPeerRegistry` at startup and
+//! hands it to every peer via `handle_offer`. Peers pre-generate their
+//! local ICE ufrag (so the registry key is known before the SDP answer
+//! is produced) and register it with the registry at construction time.
+//!
+//! The web gateway's accept loop peeks every incoming TCP connection's
+//! first bytes to tell HTTP vs. WebSocket vs. STUN-framed traffic apart.
+//! STUN-framed traffic is read through one RFC 4571 frame and handed to
+//! the registry, which parses the STUN USERNAME attribute, extracts the
+//! target-ufrag half (per RFC 8445 §7.2.2 the USERNAME is
+//! `<target_ufrag>:<sender_ufrag>`), and forwards the connection to the
+//! matching peer's driver. Each TCP connection becomes a bidirectional
+//! channel: inbound frames flow through the same packet channel UDP
+//! uses (tagged with `Protocol::Tcp`), and outbound `Output::Transmit`
+//! with `proto == Tcp` is written to the connection's write half keyed
+//! on the destination address.
+//!
+//! The advertised TCP candidate's address comes from the browser's
+//! `Host:` HTTP header (parsed by the gateway): whatever non-loopback
+//! IP the browser is already using to reach the dashboard, we advertise
+//! as our ICE-TCP host candidate. Firefox would filter a remote
+//! `127.0.0.1` candidate as an anti-rebinding mitigation, so a user who
+//! accesses the dashboard via `http://localhost:…` through a
+//! loopback-bound port-forward gets no TCP path — they need to access
+//! via the host's LAN IP (or configure their port-forward on all
+//! interfaces). This is documented in the README.
 
 use super::clipboard::ClipboardContent;
 use super::{EncodedFrame, IceConfig, InputEvent, PeerId};
@@ -41,7 +57,7 @@ use str0m::net::{DatagramRecv, Protocol, Receive};
 use str0m::net::TcpType;
 use str0m::{Candidate, Event, IceCreds, Input, Output, Rtc, RtcConfig, RtcError};
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
 
@@ -65,21 +81,16 @@ const TCP_MAX_FRAME_LEN: usize = 65535;
 // TCP peer registry (ufrag → per-peer connection channel)
 // ---------------------------------------------------------------------------
 //
-// `TcpPeerRegistry` is a pure demux registry with no listener of its own. One
-// instance is created at web_gateway startup and shared across all display
-// sessions. The web_gateway's accept loop (which already peeks every
-// incoming TCP connection for HTTP vs. WebSocket) grows a third branch: if
-// the first bytes look like an RFC 4571-framed STUN binding request, read
-// one full frame, then call `route_accepted` to hand the connection to the
-// matching peer. HTTP-on-the-same-port works untouched because the peek is
-// non-destructive and STUN traffic is byte-distinguishable from HTTP
-// methods (no printable ASCII at offset 0) and TLS handshakes (no 0x16 at
-// offset 0).
-//
-// The same registry can also back a standalone TCP listener on a
-// user-configured fixed port (Phase 2 behavior) via `bind_standalone`, for
-// deployments where multiplexing on the HTTP port isn't wanted (e.g. HTTPS
-// terminated by a proxy that doesn't pass through binary frames).
+// `TcpPeerRegistry` is a pure demux registry with no listener of its own.
+// One instance is created at web_gateway startup and shared across all
+// display sessions. The web_gateway's accept loop (which already peeks
+// every incoming TCP connection for HTTP vs. WebSocket) grows a third
+// branch: if the first bytes look like an RFC 4571-framed STUN binding
+// request, read one full frame, then call `route_accepted` to hand the
+// connection to the matching peer. HTTP-on-the-same-port works untouched
+// because the peek is non-destructive and STUN traffic is
+// byte-distinguishable from HTTP methods (no printable ASCII at offset 0)
+// and TLS handshakes (no 0x16 at offset 0).
 
 /// Shared peer registry: ufrag → handoff channel. Peers register at
 /// construction time; `route_accepted` looks up the matching peer for an
@@ -134,8 +145,7 @@ impl TcpPeerRegistry {
     /// Route an already-accepted TCP connection plus its peeked first RFC
     /// 4571 frame to the peer whose local ufrag matches the STUN USERNAME
     /// in that frame. Called by the web_gateway's accept loop when it
-    /// detects STUN-framed traffic on the HTTP port, and by
-    /// `bind_standalone` if a dedicated TCP listener is configured.
+    /// detects STUN-framed traffic on the HTTP port.
     pub async fn route_accepted(
         self: &Arc<Self>,
         stream: TcpStream,
@@ -183,55 +193,6 @@ impl TcpPeerRegistry {
         Ok(())
     }
 
-    /// Spawn a standalone TCP listener on the given port that funnels
-    /// incoming connections through this registry. Used for the Phase 2
-    /// behavior where the user explicitly sets `[webrtc] tcp_port` to pick
-    /// a dedicated port separate from HTTP. When multiplexing on the HTTP
-    /// port (the default), this helper is not used — the web_gateway's
-    /// accept loop calls `route_accepted` directly.
-    pub async fn bind_standalone(
-        self: &Arc<Self>,
-        port: u16,
-    ) -> Result<(), CallerError> {
-        let listener = TcpListener::bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            port,
-        ))
-        .await
-        .map_err(|e| {
-            CallerError::WebRtc(format!("bind standalone ICE-TCP listener on :{port}: {e}"))
-        })?;
-        let local_addr = listener
-            .local_addr()
-            .map_err(|e| CallerError::WebRtc(format!("listener local_addr: {e}")))?;
-        eprintln!("[display/webrtc] ICE-TCP standalone listener bound on {local_addr}");
-
-        let registry = Arc::clone(self);
-        tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, remote_addr)) => {
-                        let registry = Arc::clone(&registry);
-                        tokio::spawn(async move {
-                            match probe_and_route_tcp_connection(stream, remote_addr, registry)
-                                .await
-                            {
-                                Ok(()) => {}
-                                Err(e) => eprintln!(
-                                    "[display/webrtc] ICE-TCP standalone probe for {remote_addr} failed: {e}"
-                                ),
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("[display/webrtc] ICE-TCP standalone accept failed: {e}");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        });
-        Ok(())
-    }
 }
 
 /// RAII guard that unregisters a peer's ufrag from the registry on drop.
@@ -244,22 +205,6 @@ impl Drop for PeerRegistration {
     fn drop(&mut self) {
         self.registry.registry.lock().unwrap().remove(&self.local_ufrag);
     }
-}
-
-/// Read the first RFC 4571 frame from a freshly accepted standalone TCP
-/// connection, then hand everything to the registry for ufrag-based
-/// routing. Called from the standalone listener spawned by
-/// `bind_standalone`; the web_gateway path already has the first frame in
-/// hand from its own peek-and-read step and calls `route_accepted` directly.
-async fn probe_and_route_tcp_connection(
-    mut stream: TcpStream,
-    remote_addr: SocketAddr,
-    registry: Arc<TcpPeerRegistry>,
-) -> Result<(), String> {
-    let first_frame = read_rfc4571_frame(&mut stream)
-        .await
-        .map_err(|e| format!("read first frame: {e}"))?;
-    registry.route_accepted(stream, first_frame, remote_addr).await
 }
 
 // ---------------------------------------------------------------------------
@@ -515,7 +460,7 @@ impl WebRtcPeer {
         // directly, no kernel routing involved.
         let mut peer_registration = None;
         let mut tcp_conn_rx: Option<mpsc::Receiver<AcceptedTcpConnection>> = None;
-        let mut tcp_fake_local: Option<SocketAddr> = None;
+        let mut tcp_advertised: Option<SocketAddr> = None;
         if let (Some(registry), Some(advertised)) = (
             tcp_peer_registry.as_ref(),
             tcp_advertised_addr.filter(|a| !a.ip().is_loopback() && !a.ip().is_unspecified()),
@@ -523,7 +468,7 @@ impl WebRtcPeer {
             let (registration, rx) = registry.register(local_ufrag.clone());
             peer_registration = Some(registration);
             tcp_conn_rx = Some(rx);
-            tcp_fake_local = Some(advertised);
+            tcp_advertised = Some(advertised);
             // RFC 6544 requires TCP ICE candidates to carry a `tcptype`
             // attribute. `Candidate::host(addr, "tcp")` doesn't set it,
             // and browsers drop TCP candidates that lack it. The builder
@@ -584,7 +529,7 @@ impl WebRtcPeer {
             rtc,
             sockets,
             tcp_conn_rx,
-            tcp_fake_local,
+            tcp_advertised,
             peer_registration,
             encoded_frame_rx,
             command_rx,
@@ -714,7 +659,7 @@ async fn driver(
     mut rtc: Rtc,
     sockets: Vec<Arc<UdpSocket>>,
     mut tcp_conn_rx: Option<mpsc::Receiver<AcceptedTcpConnection>>,
-    tcp_fake_local: Option<SocketAddr>,
+    tcp_advertised: Option<SocketAddr>,
     _tcp_registration: Option<PeerRegistration>,
     mut frame_rx: mpsc::Receiver<Arc<EncodedFrame>>,
     mut command_rx: mpsc::Receiver<Command>,
@@ -879,14 +824,14 @@ async fn driver(
                 // first-frame we already peeked directly.
                 //
                 // We "lie" to str0m about the destination address: every
-                // inbound TCP frame gets `destination = tcp_fake_local`
-                // (the 127.0.0.1:<http_port> we advertised as our single
+                // inbound TCP frame gets `destination = tcp_advertised`
+                // (the Host-header-derived IP:port we advertised as our
                 // TCP candidate), not the actual `stream.local_addr()` —
                 // which on a NAT'd VM is the VM's internal interface IP
-                // that str0m has no candidate for. Matching the fake
-                // destination to the one local candidate we advertised
-                // lets ICE form a valid pair. The underlying TCP stream
-                // is bidirectional so data still flows through the real
+                // that str0m has no candidate for. Matching the
+                // advertised destination to the one local candidate lets
+                // ICE form a valid pair. The underlying TCP stream is
+                // bidirectional so data still flows through the real
                 // kernel socket we own.
                 let AcceptedTcpConnection {
                     remote_addr,
@@ -894,7 +839,7 @@ async fn driver(
                     first_frame,
                     stream,
                 } = accepted;
-                let Some(fake_local) = tcp_fake_local else {
+                let Some(fake_local) = tcp_advertised else {
                     eprintln!(
                         "[display/webrtc] peer {peer_id}: TCP connection from {remote_addr} but no fake local configured, dropping"
                     );
@@ -1392,5 +1337,73 @@ mod tests {
         let c = "candidate:1 1 udp 2113937151";
         let resolved = resolve_mdns_in_candidate(c).await.unwrap();
         assert_eq!(resolved, c);
+    }
+
+    // --- STUN parser tests ---
+
+    fn make_stun_binding_request(username: &str) -> Vec<u8> {
+        // Minimal STUN Binding Request with USERNAME attribute.
+        // Header: type 0x0001, length TBD, magic 0x2112A442, txid 12 zeros.
+        let username_bytes = username.as_bytes();
+        let attr_len = username_bytes.len();
+        let padded = (attr_len + 3) & !3;
+        let msg_len = 4 + padded; // attr header (4) + padded value
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0x0001u16.to_be_bytes()); // type
+        buf.extend_from_slice(&(msg_len as u16).to_be_bytes()); // length
+        buf.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]); // magic
+        buf.extend_from_slice(&[0u8; 12]); // transaction ID
+        // USERNAME attribute
+        buf.extend_from_slice(&0x0006u16.to_be_bytes()); // attr type
+        buf.extend_from_slice(&(attr_len as u16).to_be_bytes());
+        buf.extend_from_slice(username_bytes);
+        buf.resize(buf.len() + padded - attr_len, 0); // padding
+        buf
+    }
+
+    #[test]
+    fn stun_username_extracted() {
+        let pkt = make_stun_binding_request("serverufrag:browserufrag");
+        assert_eq!(
+            parse_stun_username(&pkt),
+            Some("serverufrag:browserufrag".to_string())
+        );
+    }
+
+    #[test]
+    fn stun_username_missing() {
+        // STUN packet with no attributes at all
+        let mut pkt = vec![0u8; 20];
+        pkt[0] = 0x00;
+        pkt[1] = 0x01; // Binding Request
+        pkt[2] = 0x00;
+        pkt[3] = 0x00; // length = 0
+        pkt[4..8].copy_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        assert_eq!(parse_stun_username(&pkt), None);
+    }
+
+    #[test]
+    fn stun_not_stun() {
+        // Wrong magic cookie
+        assert_eq!(parse_stun_username(&[0u8; 20]), None);
+    }
+
+    #[test]
+    fn stun_too_short() {
+        assert_eq!(parse_stun_username(&[0u8; 5]), None);
+    }
+
+    #[test]
+    fn ufrag_split_extracts_target_not_sender() {
+        // RFC 8445 §7.2.2: USERNAME = <target_ufrag>:<sender_ufrag>
+        // When routing a browser → server request, the FIRST half is the
+        // server's ufrag (us), the second is the browser's. The original
+        // bug was taking the second half and failing every lookup.
+        let username = "serverABC:browserXYZ";
+        let target = username
+            .split_once(':')
+            .map(|(target, _sender)| target.to_string());
+        assert_eq!(target, Some("serverABC".to_string()));
     }
 }

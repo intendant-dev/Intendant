@@ -82,6 +82,22 @@ username = "user"
 credential = "pass"
 ```
 
+## ICE-TCP for NAT'd / Tunneled Deployments
+
+When the browser can't reach the agent's UDP host candidates — typically because the agent is inside a NAT'd VM (VirtualBox NAT mode, Hyper-V, etc.) with only the dashboard port forwarded — the pipeline falls back to ICE-TCP. The server multiplexes ICE-TCP onto the same HTTP port that serves the dashboard, so no extra port forwarding is needed beyond what the dashboard already requires.
+
+The advertised TCP candidate's IP is derived from the browser's `Host:` HTTP header: whatever non-loopback IP the browser used to load the dashboard is what the server advertises in SDP as its ICE-TCP host candidate. This means:
+
+- **Accessing via a routable IP** (e.g. `http://192.168.1.42:8765`) — video works over ICE-TCP automatically. The browser sees a non-loopback remote candidate and forms a TCP candidate pair.
+- **Accessing via `http://localhost:8765`** — video does **not** work over ICE-TCP. Firefox (and Chrome) filter remote loopback candidates as a security mitigation. The workaround is to bind the port-forward on all interfaces and access via the host's LAN IP instead of localhost.
+
+For VirtualBox NAT users:
+```
+VBoxManage modifyvm <vm> --natpf1 delete intendant
+VBoxManage modifyvm <vm> --natpf1 "intendant,tcp,0.0.0.0,8765,,8765"
+```
+Then access the dashboard at `http://<host-LAN-IP>:8765`. Find the host's LAN IP with `ipconfig` (Windows) or `ip addr` (Linux/macOS).
+
 ## Multi-Monitor Support
 
 Each physical or virtual display gets a stable `display_id` based on its output name or display number. The pipeline supports:

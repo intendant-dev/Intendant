@@ -196,11 +196,6 @@ pub enum InputEvent {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct IceConfig {
     pub ice_servers: Vec<IceServer>,
-    /// Optional fixed TCP port for ICE-TCP host candidates. When set, the
-    /// session binds a single shared TCP listener on this port and routes
-    /// incoming connections to the matching peer by STUN ufrag.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tcp_port: Option<u16>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
