@@ -4352,9 +4352,10 @@ async function main() {
   } catch {}
 
   // Initialize multi-host state now that self-label is resolved and the
-  // WASM app is ready. Opens any previously-configured secondary
-  // daemon connections from localStorage.
-  initDaemons();
+  // WASM app is ready. Hydrates the peer list from the server-side
+  // PeerRegistry via /api/peers (declarative [[peer]] sections from
+  // intendant.toml + any peers added through the dashboard at runtime).
+  await initDaemons();
 
   // Fetch settings once at startup so the status bar badge (external
   // agent) reflects the persisted value without waiting for the user
@@ -8482,24 +8483,6 @@ function restoreClientToggles() {
   // options exist.
 }
 
-function loadDaemonsFromStorage() {
-  try {
-    const raw = localStorage.getItem(DAEMONS_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(d => d && d.host_id && d.url);
-  } catch {
-    return [];
-  }
-}
-
-function saveDaemonsToStorage() {
-  // Strip `connected` before persisting — it's transient runtime state.
-  const clean = daemons.map(({ host_id, label, url }) => ({ host_id, label, url }));
-  localStorage.setItem(DAEMONS_KEY, JSON.stringify(clean));
-}
-
 // Convert a base URL (what the user enters) to a WebSocket URL pointing
 // at the same origin. `https://` → `wss://`, `http://` → `ws://`.
 // Preserves host + port and strips any trailing slash. Returns null
@@ -8509,6 +8492,78 @@ function baseToWsUrl(baseUrl) {
   if (trimmed.startsWith('https://')) return trimmed.replace(/^https:\/\//, 'wss://');
   if (trimmed.startsWith('http://'))  return trimmed.replace(/^http:\/\//,  'ws://');
   return null;
+}
+
+// Reverse of baseToWsUrl: derive the HTTP base from a WS transport
+// URL. Used to construct API/card URLs from the ws_url the server
+// returns in GET /api/peers.
+function wsUrlToBaseUrl(wsUrl) {
+  if (!wsUrl) return null;
+  return wsUrl
+    .replace(/^wss:\/\//, 'https://')
+    .replace(/^ws:\/\//, 'http://')
+    .replace(/\/ws$/, '');
+}
+
+/// Fetch the peer list from /api/peers and update the in-memory
+/// `daemons` array, re-register with WASM for live event streaming,
+/// and re-render the Daemons panel. Single source of truth for
+/// peer state: called from initDaemons(), after addDaemon(), after
+/// removeDaemon(), and on reconnect. No localStorage fallback —
+/// the server-side PeerRegistry owns the peer list now.
+async function refreshPeersFromApi() {
+  try {
+    const resp = await fetch('/api/peers');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (!data.peers || !Array.isArray(data.peers)) return;
+
+    // Build the new daemon entries from the API response. Each
+    // peer entry from the server includes ws_url (from the card's
+    // transport spec) so we can open WASM secondary connections
+    // without re-fetching the card.
+    const newDaemons = data.peers.map(p => ({
+      host_id: p.id,
+      label: p.label,
+      url: wsUrlToBaseUrl(p.ws_url) || '',
+      connected: p.connection_state && p.connection_state.state === 'connected',
+      version: p.version || '',
+      git_sha: p.git_sha || '',
+      ws_url: p.ws_url || '',
+      capabilities: p.capabilities || [],
+      server_connection_state: p.connection_state,
+      server_status: p.status,
+    }));
+
+    // Diff against the current daemons list to figure out which
+    // WASM connections to add, remove, or leave alone. Stable
+    // by host_id so reconnects and re-fetches don't thrash the
+    // existing WS connections.
+    const currentIds = new Set(daemons.map(d => d.host_id));
+    const newIds = new Set(newDaemons.map(d => d.host_id));
+
+    // Remove peers no longer in the server list.
+    for (const d of daemons) {
+      if (!newIds.has(d.host_id)) {
+        if (app && app.remove_secondary_host) app.remove_secondary_host(d.host_id);
+      }
+    }
+
+    // Add peers newly in the server list.
+    for (const d of newDaemons) {
+      if (!currentIds.has(d.host_id) && d.ws_url) {
+        if (app && app.add_secondary_host) app.add_secondary_host(d.host_id, d.label, d.ws_url);
+      }
+    }
+
+    daemons = newDaemons;
+    renderDaemonsList();
+  } catch (e) {
+    // Silently ignore fetch failures — the dashboard still works
+    // from whatever state daemons was in before. The Daemons panel
+    // shows stale data until the next refresh, which is better than
+    // blanking the panel on a transient network blip.
+  }
 }
 
 // Fetch the remote daemon's Agent Card to learn its identity, version,
@@ -8688,74 +8743,73 @@ async function addDaemon() {
 
   setDaemonsStatus('Connecting...', '');
 
-  let card;
+  // POST to /api/peers — the server fetches the card, picks a
+  // supported transport, spawns the peer actor, and returns the
+  // peer_id. The browser doesn't need to fetch the card itself
+  // anymore; the server is the single source of truth.
+  const cardUrl = baseUrl.replace(/\/$/, '') + '/.well-known/agent-card.json';
   try {
-    card = await fetchRemoteAgentCard(baseUrl);
+    const resp = await fetch('/api/peers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ card_url: cardUrl }),
+    });
+    const result = await resp.json();
+    if (!resp.ok) {
+      const hint = baseUrl.startsWith('https://')
+        ? 'Is the mTLS client cert for this daemon installed on this server?'
+        : 'Is the remote daemon running and reachable?';
+      setDaemonsStatus(`Failed to add peer: ${result.error || resp.status}. ${hint}`, 'error');
+      return;
+    }
+    setDaemonsStatus(`Added ${result.peer_id}`, 'ok');
   } catch (e) {
-    const hint = baseUrl.startsWith('https://')
-      ? 'Is the mTLS client cert for this daemon installed in this browser?'
-      : 'Is the remote daemon running and reachable on this network?';
-    setDaemonsStatus(`Could not reach ${baseUrl}: ${e.message}. ${hint}`, 'error');
+    setDaemonsStatus(`Request failed: ${e.message}`, 'error');
     return;
   }
 
-  // Routing key = card.id (stable PeerId, includes kind prefix).
-  // Display = card.label (short human-readable name, can change
-  // across daemon restarts without breaking routing). Uniqueness
-  // check compares the ids, not the labels, so two peers with the
-  // same label stay distinct in the registry.
-  const peerId = card.id;
-  const hostLabel = card.label;
-  if (peerId === selfPeerId || daemons.some(d => d.host_id === peerId)) {
-    setDaemonsStatus(`Daemon '${hostLabel}' is already in the list`, 'error');
-    return;
-  }
-
-  const entry = {
-    host_id: peerId,
-    label: userLabel || hostLabel,
-    url: baseUrl,
-    connected: false,
-    version: card.version || '',
-    git_sha: card.git_sha || '',
-  };
-  daemons.push(entry);
-  saveDaemonsToStorage();
-  registerDaemonWithWasm(entry);
-  renderDaemonsList();
-  setDaemonsStatus(`Added ${hostLabel}`, 'ok');
+  // Refresh the peer list from the server and re-register WASM
+  // connections so the new peer shows up immediately.
+  await refreshPeersFromApi();
   urlInput.value = '';
   labelInput.value = '';
 }
 
-function removeDaemon(hostId) {
-  const i = daemons.findIndex(d => d.host_id === hostId);
-  if (i < 0) return;
-  daemons.splice(i, 1);
-  saveDaemonsToStorage();
+async function removeDaemon(hostId) {
+  // DELETE from the server-side registry. The server drives the
+  // explicit disconnect on the peer's actor (Disconnecting →
+  // Disconnected state machine).
+  try {
+    await fetch('/api/peers', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ peer_id: hostId }),
+    });
+  } catch { /* best-effort */ }
   if (app && app.remove_secondary_host) app.remove_secondary_host(hostId);
-  renderDaemonsList();
+  await refreshPeersFromApi();
   setDaemonsStatus(`Removed ${hostId}`, '');
 }
 
 function registerDaemonWithWasm(entry) {
   if (!app || !app.add_secondary_host) return;
-  const wsUrl = baseToWsUrl(entry.url);
+  // Prefer ws_url from the API response (already a WS URL from
+  // the card's transport spec). Fall back to deriving from the
+  // HTTP base URL for older code paths.
+  const wsUrl = entry.ws_url || baseToWsUrl(entry.url);
   if (!wsUrl) return;
   app.add_secondary_host(entry.host_id, entry.label, wsUrl);
 }
 
-function initDaemons() {
-  daemons = loadDaemonsFromStorage();
-  for (const d of daemons) {
-    d.connected = false;
-    // Clear any stale version info from a previous session so it
-    // gets refreshed on reconnect rather than showing outdated skew.
-    d.version = d.version || '';
-    d.git_sha = d.git_sha || '';
-    registerDaemonWithWasm(d);
-  }
-  renderDaemonsList();
+async function initDaemons() {
+  // Hydrate the peer list from the server-side PeerRegistry via
+  // GET /api/peers. The server already loaded [[peer]] sections
+  // from intendant.toml at startup; peers added through the
+  // dashboard at runtime are also there. No localStorage fallback
+  // — the server is the single source of truth for the peer list
+  // now.
+  await refreshPeersFromApi();
+
   // Apply remembered Settings sub-tab now that the DOM is ready.
   applyInitialSettingsSubtab();
 
@@ -8776,18 +8830,13 @@ function handleSecondaryState(hostId, connected) {
   d.connected = connected;
   renderDaemonsList();
 
-  // On (re)connect, refresh the remote's agent card so the version
-  // string and skew dot reflect what's actually running right now.
-  // Without this, rebuilding the remote daemon fixes skew but the
-  // dashboard still shows yellow until you re-add it manually.
+  // On (re)connect, refresh the peer list from the server so the
+  // version, git SHA, capabilities, and connection_state pick up
+  // whatever the remote is actually running right now. The server's
+  // PeerRegistry already re-fetched the card during its own connect
+  // handshake; we just pull the updated snapshot.
   if (connected && !wasConnected) {
-    fetchRemoteAgentCard(d.url)
-      .then(card => {
-        d.version = card.version || '';
-        d.git_sha = card.git_sha || '';
-        renderDaemonsList();
-      })
-      .catch(() => { /* silently leave old version on failure */ });
+    refreshPeersFromApi();
   }
 }
 

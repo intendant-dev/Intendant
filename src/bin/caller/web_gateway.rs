@@ -4127,7 +4127,10 @@ pub fn build_config(
 
 /// JSON shape for a single entry in `GET /api/peers`. Flattens the
 /// bits of the peer's Agent Card and live connection state that the
-/// dashboard Daemons panel renders.
+/// dashboard Daemons panel renders. Includes the native WS
+/// transport URL so the browser can open a secondary WASM
+/// connection for live event streaming (the `/api/peers` state is
+/// a snapshot; live events still flow through the WASM path).
 #[derive(Serialize)]
 struct PeerListEntry {
     id: String,
@@ -4137,6 +4140,17 @@ struct PeerListEntry {
     git_sha: Option<String>,
     connection_state: crate::peer::ConnectionState,
     status: crate::peer::PeerStatus,
+    /// The native Intendant WebSocket URL from the peer's card, if
+    /// any. The browser uses this to open a secondary WASM
+    /// connection for live event streaming (log entries, status
+    /// badges, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ws_url: Option<String>,
+    /// Human-readable capability names from the peer's card. The
+    /// dashboard renders these as badges so the user can see at a
+    /// glance what each peer can do. Kebab-case strings matching
+    /// the serde representation of `Capability`.
+    capabilities: Vec<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -4164,6 +4178,23 @@ fn peers_list_response_body(registry: &crate::peer::PeerRegistry) -> String {
         .iter()
         .map(|h| {
             let card = h.card_snapshot();
+            // Extract the native WS URL from the first IntendantWs
+            // transport spec so the browser can open a secondary
+            // connection without re-fetching the card.
+            let ws_url = card
+                .transports
+                .iter()
+                .find_map(|t| match t {
+                    crate::peer::TransportSpec::IntendantWs { url } => {
+                        Some(url.clone())
+                    }
+                    _ => None,
+                });
+            let capabilities: Vec<serde_json::Value> = card
+                .capabilities
+                .iter()
+                .filter_map(|c| serde_json::to_value(c).ok())
+                .collect();
             PeerListEntry {
                 id: h.id().as_str().to_string(),
                 label: card.label.clone(),
@@ -4171,6 +4202,8 @@ fn peers_list_response_body(registry: &crate::peer::PeerRegistry) -> String {
                 git_sha: card.git_sha.clone(),
                 connection_state: h.connection_state(),
                 status: h.status(),
+                ws_url,
+                capabilities,
             }
         })
         .collect();
@@ -4885,6 +4918,24 @@ mod tests {
             peers_arr[0]["version"].as_str().unwrap(),
             env!("CARGO_PKG_VERSION")
         );
+        // The dashboard panel rebuild relies on `ws_url` being
+        // present so the browser can open a secondary WASM
+        // connection without re-fetching the card. Guard against
+        // the field being dropped or renamed.
+        let ws_url = peers_arr[0]["ws_url"]
+            .as_str()
+            .expect("ws_url field must be present in the API response");
+        assert!(
+            ws_url.starts_with("ws://") && ws_url.ends_with("/ws"),
+            "ws_url should be a native Intendant WebSocket URL: {ws_url}"
+        );
+        // The dashboard renders capability badges from this list,
+        // so it must be present and contain the always-on phase 1
+        // capabilities the test peer advertises.
+        let caps = peers_arr[0]["capabilities"]
+            .as_array()
+            .expect("capabilities must be a JSON array");
+        assert!(!caps.is_empty(), "expected at least one capability");
 
         // DELETE /api/peers with the peer_id.
         let del_body = serde_json::json!({"peer_id": peer_id}).to_string();
