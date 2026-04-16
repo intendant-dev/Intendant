@@ -114,6 +114,22 @@ pub enum UiCommand {
     SetConnected {
         connected: bool,
     },
+    FileChanged {
+        path: String,
+        kind: String,
+        lines_added: u64,
+        lines_removed: u64,
+    },
+}
+
+// ── File change tracking ──────────────────────────────────────────
+
+/// Tracks a single file change for the Changes sub-tab.
+#[derive(Debug, Clone)]
+pub struct FileChangeEntry {
+    pub kind: String,
+    pub lines_added: u64,
+    pub lines_removed: u64,
 }
 
 // ── Pricing ────────────────────────────────────────────────────────
@@ -337,6 +353,9 @@ pub struct AppState {
 
     // Recordings
     known_recordings: Vec<String>,
+
+    /// Tracks files changed during this session for the Changes sub-tab.
+    pub changed_files: std::collections::HashMap<String, FileChangeEntry>,
 }
 
 impl AppState {
@@ -361,6 +380,7 @@ impl AppState {
             active_tab: "activity".to_string(),
             known_displays: Vec::new(),
             known_recordings: Vec::new(),
+            changed_files: std::collections::HashMap::new(),
         }
     }
 
@@ -978,6 +998,32 @@ impl AppState {
                 let content = msg["content"].as_str().unwrap_or("");
                 let turn = msg["turn"].as_u64();
                 cmds.extend(self.add_log(level, content, turn, source));
+            }
+
+            "file_changed" => {
+                let path = msg["path"].as_str().unwrap_or("").to_string();
+                let kind = msg["kind"].as_str().unwrap_or("modified").to_string();
+                let added = msg["lines_added"].as_u64().unwrap_or(0);
+                let removed = msg["lines_removed"].as_u64().unwrap_or(0);
+
+                self.changed_files.insert(path.clone(), FileChangeEntry {
+                    kind: kind.clone(),
+                    lines_added: added,
+                    lines_removed: removed,
+                });
+
+                cmds.extend(self.add_log("detail",
+                    &format!("{} {} (+{}/-{})",
+                        match kind.as_str() { "created" => "+", "deleted" => "-", _ => "*" },
+                        path, added, removed),
+                    None, "fs"));
+
+                cmds.push(UiCommand::FileChanged {
+                    path,
+                    kind,
+                    lines_added: added,
+                    lines_removed: removed,
+                });
             }
 
             _ => {
@@ -1824,5 +1870,30 @@ mod tests {
         assert_eq!(s.autonomy, "High");
         assert_eq!(s.phase, "orchestrating");
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "orchestrating")));
+    }
+
+    #[test]
+    fn handle_event_file_changed() {
+        let mut s = AppState::new();
+        let msg = json!({"event": "file_changed", "path": "src/main.rs", "kind": "modified", "lines_added": 5, "lines_removed": 2});
+        let cmds = s.handle_message(&msg);
+        assert!(s.changed_files.contains_key("src/main.rs"));
+        let entry = &s.changed_files["src/main.rs"];
+        assert_eq!(entry.kind, "modified");
+        assert_eq!(entry.lines_added, 5);
+        assert_eq!(entry.lines_removed, 2);
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::FileChanged { .. })));
+    }
+
+    #[test]
+    fn handle_event_file_changed_on_replay() {
+        let mut s = AppState::new();
+        let entries = vec![
+            json!({"event": "replay_start", "provider": "p", "model": "m", "autonomy": "Medium"}),
+            json!({"event": "file_changed", "path": "src/lib.rs", "kind": "created", "lines_added": 10, "lines_removed": 0, "ts": "01:00:00"}),
+        ];
+        let cmds = s.handle_log_replay(&entries);
+        assert!(s.changed_files.contains_key("src/lib.rs"));
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::FileChanged { .. })));
     }
 }
