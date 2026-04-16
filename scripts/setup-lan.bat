@@ -143,8 +143,13 @@ function Find-VBoxManage {
 function Add-PortForwarding {
     if ($script:IsVBoxNat) {
         # VirtualBox NAT: configure rules directly via VBoxManage.
-        # Bind to all interfaces (empty host IP) so phones on the LAN
-        # can reach the guest without netsh portproxy (which would loop).
+        # Bind to 0.0.0.0 explicitly so browsers on the LAN can reach
+        # the guest *and* so the browser's Host: header contains a real
+        # IP (not "localhost"). This matters for WebRTC ICE-TCP: Firefox
+        # filters remote 127.0.0.1 candidates, so if the user accesses
+        # via localhost the video stream can't establish a TCP path.
+        # With 0.0.0.0 binding the user accesses via the host's LAN IP
+        # and the dashboard advertises that IP as the ICE-TCP candidate.
         $vbm = Find-VBoxManage
         if (-not $vbm) { Die "VBoxManage not found -- is VirtualBox installed?" }
         $rules = @(
@@ -154,7 +159,7 @@ function Add-PortForwarding {
         foreach ($r in $rules) {
             & $vbm controlvm $script:VmName natpf1 delete $r.Name 2>$null | Out-Null
             Info "VBox NAT: 0.0.0.0:$($r.HP) -> guest:$($r.GP)"
-            & $vbm controlvm $script:VmName natpf1 "$($r.Name),tcp,,$($r.HP),,$($r.GP)"
+            & $vbm controlvm $script:VmName natpf1 "$($r.Name),tcp,0.0.0.0,$($r.HP),,$($r.GP)"
         }
     } else {
         # WSL/Hyper-V/Bridged: use netsh portproxy

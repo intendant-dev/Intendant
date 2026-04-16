@@ -187,13 +187,6 @@ pub struct WebGatewayConfig {
     /// Empty by default (local-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ice_servers: Vec<crate::display::IceServer>,
-    /// Optional fixed TCP port for ICE-TCP host candidates. Used when the
-    /// agent's UDP host candidates aren't reachable from the browser
-    /// (NAT'd VMs, SSH tunnels, restrictive firewalls). The user exposes
-    /// this port alongside the HTTP port in their tunneling / port-forward
-    /// config.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub webrtc_tcp_port: Option<u16>,
 }
 
 impl Default for WebGatewayConfig {
@@ -205,7 +198,6 @@ impl Default for WebGatewayConfig {
             output_sample_rate: 24000,
             transcription_enabled: false,
             ice_servers: Vec::new(),
-            webrtc_tcp_port: None,
         }
     }
 }
@@ -1339,39 +1331,30 @@ pub fn spawn_web_gateway(
     // Pre-build ICE config for WebRTC display sessions from the gateway config.
     let ice_config = crate::display::IceConfig {
         ice_servers: config.ice_servers.clone(),
-        tcp_port: config.webrtc_tcp_port,
     };
 
-    // Shared ICE-TCP peer registry + resolved advertised TCP port.
+    // Shared ICE-TCP peer registry + advertised TCP port.
     //
-    // Phase 3: by default we multiplex ICE-TCP onto the HTTP port itself.
-    // The web gateway's per-connection handler peeks the first bytes of
-    // every accepted TCP connection to decide between HTTP, WebSocket, and
-    // ICE-TCP; STUN-framed traffic is read through to the first RFC 4571
-    // frame and handed to the registry, which looks up the matching peer
-    // by STUN ufrag. The advertised TCP candidate port is the HTTP port
-    // so every ICE-TCP connection arrives via the same port that's
-    // already port-forwarded for the dashboard — end users don't have to
-    // configure anything extra.
-    //
-    // Phase 2 escape hatch: if the user sets `[webrtc] tcp_port` in
-    // `intendant.toml` to a distinct port, the tokio::spawn block below
-    // calls `registry.bind_standalone(port)` to put up a dedicated TCP
-    // listener backed by the same registry, and the advertised TCP port
-    // becomes that port. Useful if HTTPS is terminated upstream by a
-    // proxy that strips binary frames off the HTTP path.
+    // We multiplex ICE-TCP onto the HTTP listener port: the per-connection
+    // accept handler (later in this function) peeks every accepted TCP
+    // connection's first bytes to tell HTTP vs. WebSocket vs. STUN-framed
+    // traffic apart. STUN traffic is read through one RFC 4571 frame and
+    // handed to this registry, which demuxes to the matching peer by the
+    // STUN USERNAME's local-ufrag half. The advertised TCP candidate port
+    // is the HTTP port itself, so ICE-TCP flows through the exact same
+    // tunnel/port-forward that already carries the dashboard — users
+    // don't configure anything extra beyond what the dashboard already
+    // requires.
     let http_port = listener
         .local_addr()
         .map(|a| a.port())
         .unwrap_or(0);
     let tcp_peer_registry = crate::display::webrtc::TcpPeerRegistry::new();
-    let explicit_tcp_port = config.webrtc_tcp_port;
-    // Pre-compute the advertised port: if user set an explicit distinct
-    // port, we'll attempt to bind it inside the spawn; if it succeeds we
-    // advertise that; if it fails we fall back to the HTTP port.
-    let standalone_tcp_port =
-        explicit_tcp_port.filter(|p| *p != 0 && *p != http_port);
-    let default_tcp_port = if http_port != 0 { Some(http_port) } else { None };
+    let tcp_advertised_port: Option<u16> = if http_port != 0 {
+        Some(http_port)
+    } else {
+        None
+    };
 
     // Inject content-hash version into WASM/JS URLs for cache-busting.
     let v = asset_version_hash();
@@ -1505,29 +1488,8 @@ pub fn spawn_web_gateway(
     tokio::spawn(async move {
         let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
 
-        // Resolve the ICE-TCP advertised port. If the user asked for a
-        // standalone listener on a distinct port, try to bind it now; on
-        // success we advertise that port, on failure we fall back to the
-        // HTTP port multiplex.
-        let tcp_advertised_port: Option<u16> = match standalone_tcp_port {
-            Some(explicit) => {
-                match tcp_peer_registry.bind_standalone(explicit).await {
-                    Ok(()) => Some(explicit),
-                    Err(e) => {
-                        eprintln!(
-                            "[web_gateway] ICE-TCP standalone listener on :{explicit} failed: {e}; \
-                             falling back to HTTP-port multiplex"
-                        );
-                        default_tcp_port
-                    }
-                }
-            }
-            None => default_tcp_port,
-        };
         if let Some(p) = tcp_advertised_port {
-            eprintln!(
-                "[web_gateway] ICE-TCP candidates advertise port {p} (HTTP port: {http_port})"
-            );
+            eprintln!("[web_gateway] ICE-TCP candidates advertise port {p}");
         }
 
         loop {
@@ -4045,14 +4007,12 @@ pub fn build_config(
     transcription_enabled: bool,
     ice_config: crate::display::IceConfig,
 ) -> WebGatewayConfig {
-    let mut cfg = build_config_inner(
+    build_config_inner(
         live_provider,
         live_model,
         transcription_enabled,
         ice_config.ice_servers,
-    );
-    cfg.webrtc_tcp_port = ice_config.tcp_port;
-    cfg
+    )
 }
 
 /// Resolve the WebSocket URL to advertise in the Agent Card for

@@ -45,7 +45,7 @@ pub struct McpServerConfig {
     pub env: std::collections::HashMap<String, String>,
 }
 
-/// WebRTC configuration: ICE servers for STUN/TURN, optional TCP port.
+/// WebRTC configuration: ICE servers for STUN/TURN.
 /// Configured via `[webrtc]` in intendant.toml.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WebRtcConfig {
@@ -53,16 +53,6 @@ pub struct WebRtcConfig {
     /// Empty by default (local-only, no STUN/TURN).
     #[serde(default)]
     pub ice_servers: Vec<WebRtcIceServerConfig>,
-    /// Optional fixed TCP port for ICE-TCP host candidates. When set, the
-    /// server binds a shared TCP listener on this port and advertises it
-    /// as an additional host candidate alongside UDP. Meant for deployments
-    /// where the agent's UDP host candidates aren't reachable from the
-    /// browser (NAT'd VMs with port forwarding, SSH tunnels, corporate
-    /// firewalls). The user must expose this port alongside the HTTP port
-    /// (e.g. a second VirtualBox port-forward rule, or a second
-    /// `LocalForward` line in `~/.ssh/config`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tcp_port: Option<u16>,
 }
 
 /// A single ICE server entry in intendant.toml `[webrtc]` configuration.
@@ -88,7 +78,6 @@ impl WebRtcConfig {
                     credential: s.credential.clone(),
                 })
                 .collect(),
-            tcp_port: self.tcp_port,
         }
     }
 }
