@@ -9565,30 +9565,20 @@ window.submitActivityTask = function() {
   const text = input.value.trim();
   if (!text) return;
   input.value = '';
-  // Snapshot pending attachments and clear the local queue once they're
-  // committed to a task. Lost on reload — that's expected, the user can
-  // re-attach from the Video tab.
+  // Unified submit: always send `start_task` regardless of current phase.
+  // The backend dispatcher routes appropriately (presence-mediated vs direct,
+  // task_tx vs follow_up_tx) based on mode and the `direct` flag. The old
+  // phase-based fork between start_task / follow_up was a TUI-centric
+  // artifact — all agents (native, Codex, Claude Code, Gemini CLI) treat
+  // subsequent messages as new turns in the existing conversation.
   const attachments = pendingAttachments.map(a => a.frameId);
   const direct = document.getElementById('direct-mode-toggle')?.checked || false;
-  // If a task is running, send as follow-up; otherwise start new task
-  if (currentPhase && currentPhase !== 'idle' && currentPhase !== 'done') {
-    // Follow-ups don't carry attachments yet — log so the user knows
-    // their attachments will not be auto-included.
-    if (attachments.length > 0) {
-      console.warn('[intendant] Pending attachments dropped: follow-up does not support attachments yet');
-    }
-    // Pass the direct-mode bit so a checked toggle routes the follow-up
-    // straight to the agent (bypassing presence), mirroring direct
-    // start_task behavior.
-    processCommands(app.send_follow_up(text, direct));
-  } else {
-    const msg = { action: 'start_task', task: text };
-    if (direct) msg.direct = true;
-    if (attachments.length > 0) msg.attachments = attachments;
-    app.send_server_action(msg);
-    if (attachments.length > 0) {
-      clearPendingAttachments();
-    }
+  const msg = { action: 'start_task', task: text };
+  if (direct) msg.direct = true;
+  if (attachments.length > 0) msg.attachments = attachments;
+  app.send_server_action(msg);
+  if (attachments.length > 0) {
+    clearPendingAttachments();
   }
 };
 
@@ -10405,7 +10395,12 @@ window.sendFollowUp = function() {
   const text = input.value.trim();
   if (!text || !app) return;
   const direct = document.getElementById('direct-mode-toggle')?.checked || false;
-  processCommands(app.send_follow_up(text, direct));
+  // Unified submit: always send `start_task` regardless of phase (see note
+  // on submitActivityTask above). The backend dispatcher routes based on
+  // mode and the `direct` flag.
+  const msg = { action: 'start_task', task: text };
+  if (direct) msg.direct = true;
+  app.send_server_action(msg);
   input.value = '';
 };
 

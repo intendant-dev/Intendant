@@ -34,6 +34,7 @@ mod schema_validator;
 mod session_log;
 mod skills;
 mod sub_agent;
+mod task_dispatch;
 mod terminal;
 mod tool_batch;
 mod tools;
@@ -7059,9 +7060,10 @@ async fn main() -> Result<(), CallerError> {
 
         // Create follow-up channel for multi-round support.
         // When there is no initial task, the follow-up channel also delivers
-        // the very first task from the input panel.
-        let (follow_up_tx, mut follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
-        app.set_follow_up_sender(follow_up_tx);
+        // the very first task from the input panel. Owned by the task
+        // dispatcher (spawned below), not the TUI — the TUI emits
+        // ControlCommand on the bus, the dispatcher routes.
+        let (follow_up_tx, mut follow_up_rx) = tokio::sync::mpsc::channel::<String>(4);
 
         // If no task was provided, start in follow-up mode so the user sees
         // the input panel immediately.
@@ -7078,11 +7080,12 @@ async fn main() -> Result<(), CallerError> {
         }
 
         // If presence is active, create channels for user ↔ presence communication
-        // and the shared agent state snapshot.
-        let (presence_user_rx, presence_event_rx_for_task, presence_agent_state) = if use_presence {
+        // and the shared agent state snapshot. The presence_tx sender is owned by
+        // the task dispatcher (spawned below), which routes non-direct user text
+        // through the presence LLM.
+        let (presence_user_rx, presence_event_rx_for_task, presence_agent_state, presence_tx_for_dispatch) = if use_presence {
             let (presence_tx, presence_user_rx) =
                 tokio::sync::mpsc::channel::<String>(4);
-            app.set_presence_sender(presence_tx);
 
             // Create presence event channel: TUI forwards filtered events here
             let (presence_event_tx, presence_event_rx) =
@@ -7099,9 +7102,9 @@ async fn main() -> Result<(), CallerError> {
             if task.is_some() {
                 app.current_phase = types::Phase::Thinking;
             }
-            (Some(presence_user_rx), Some(presence_event_rx), Some(agent_state))
+            (Some(presence_user_rx), Some(presence_event_rx), Some(agent_state), Some(presence_tx))
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         // Create the shared PresenceSession for event replay and checkpoints
@@ -7117,20 +7120,28 @@ async fn main() -> Result<(), CallerError> {
         // Task dispatch channel: browser tool calls / dashboard StartTask →
         // presence task loop (CU-first routing). Only created when presence
         // is enabled, because the channel is consumed by `run_with_presence`.
-        // In non-presence mode, leaving `task_tx` unset on the TUI app makes
-        // the `StartTask` / direct-`FollowUp` handlers fall through to
-        // `follow_up_tx`, which is actually consumed by
-        // `run_external_agent_mode` / `run_direct_mode`. Creating the channel
-        // unconditionally would orphan `task_rx` and silently drop every
-        // dashboard-dispatched task after the first round completes.
+        // The sender is owned by the dispatcher (spawned below) and by the
+        // presence layer (its own `submit_task` tool). In non-presence mode,
+        // leaving `task_tx` as None makes the dispatcher route to
+        // `follow_up_tx` instead, which is consumed by
+        // `run_external_agent_mode` / `run_direct_mode`.
         let (task_tx, task_rx) = if use_presence {
             let (tx, rx) =
                 tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
-            app.set_task_sender(tx.clone());
             (Some(tx), Some(rx))
         } else {
             (None, None)
         };
+
+        // Spawn the backend task dispatcher. It listens on the bus for
+        // ControlCommand(StartTask | FollowUp) and routes to the appropriate
+        // channel. Replaces the routing logic that used to live in the TUI.
+        let _dispatcher_handle = task_dispatch::Dispatcher {
+            presence_tx: presence_tx_for_dispatch,
+            task_tx: task_tx.clone(),
+            follow_up_tx: Some(follow_up_tx.clone()),
+        }
+        .spawn(bus.clone());
 
         // Deferred web gateway spawn — now we have the agent state for tool queries.
         // Note: WebQueryCtx is built UNCONDITIONALLY (not gated on presence).
@@ -7191,6 +7202,9 @@ async fn main() -> Result<(), CallerError> {
             let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
                 Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
             )));
+            // Browser-voice SubmitTask actions go via the EventBus → dispatcher
+            // path (task_tx=None triggers the fallback at web_gateway.rs),
+            // keeping a single routing authority.
             let handle = web_gateway::spawn_web_gateway(
                 web_listener.take().expect("web listener must exist when use_web"),
                 bus.clone(),
@@ -7199,7 +7213,7 @@ async fn main() -> Result<(), CallerError> {
                 shared_session,
                 transcriber,
                 web_tui_tx.clone(),
-                task_tx.clone(),
+                None,
                 Some(project.root.clone()),
                 mcp_http_server,
             );
