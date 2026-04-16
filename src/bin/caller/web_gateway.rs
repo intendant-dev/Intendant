@@ -1313,6 +1313,7 @@ pub fn spawn_web_gateway(
     task_tx: Option<tokio::sync::mpsc::Sender<presence_core::TaskEnvelope>>,
     project_root: Option<std::path::PathBuf>,
     mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    peer_registry: Option<crate::peer::PeerRegistry>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -1502,6 +1503,7 @@ pub fn spawn_web_gateway(
             let broadcast_tx = broadcast_tx.clone();
             let config_json = config_json.clone();
             let agent_card_json = agent_card_json.clone();
+            let peer_registry = peer_registry.clone();
             let ice_config = ice_config.clone();
             let tcp_peer_registry = Arc::clone(&tcp_peer_registry);
             let tcp_advertised_port = tcp_advertised_port;
@@ -3826,6 +3828,108 @@ pub fn spawn_web_gateway(
                             body.len(), body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.contains(" /api/peers") {
+                        // Peer registry CRUD. Dispatch on method:
+                        // GET → list, POST → add, DELETE → remove.
+                        // When no registry is wired in (test call
+                        // sites that pass None), every request
+                        // returns 503 so the dashboard can render
+                        // "peers unavailable" instead of the empty
+                        // list that a working-but-empty registry
+                        // would produce.
+                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                        let (status, body) = match peer_registry.as_ref() {
+                            None => (
+                                503,
+                                serde_json::json!({
+                                    "error": "peer registry not configured"
+                                })
+                                .to_string(),
+                            ),
+                            Some(registry) if request_line.starts_with("GET") => {
+                                (200, peers_list_response_body(registry))
+                            }
+                            Some(registry)
+                                if request_line.starts_with("POST")
+                                    || request_line.starts_with("DELETE") =>
+                            {
+                                // Read the JSON body using the same
+                                // peek-then-stream pattern /api/settings
+                                // uses.
+                                let content_length: usize = header_text
+                                    .lines()
+                                    .find(|l| {
+                                        l.to_lowercase()
+                                            .starts_with("content-length:")
+                                    })
+                                    .and_then(|l| l.split(':').nth(1))
+                                    .and_then(|v| v.trim().parse().ok())
+                                    .unwrap_or(0);
+                                let peeked_body = header_text
+                                    .split("\r\n\r\n")
+                                    .nth(1)
+                                    .unwrap_or("");
+                                let body_owned;
+                                let body_text =
+                                    if peeked_body.len() >= content_length {
+                                        &peeked_body[..content_length]
+                                    } else {
+                                        let remaining = content_length
+                                            .saturating_sub(peeked_body.len());
+                                        let mut full = peeked_body.to_string();
+                                        if remaining > 0 {
+                                            let mut rest = vec![0u8; remaining];
+                                            if stream
+                                                .read_exact(&mut rest)
+                                                .await
+                                                .is_ok()
+                                            {
+                                                full.push_str(
+                                                    &String::from_utf8_lossy(&rest),
+                                                );
+                                            }
+                                        }
+                                        body_owned = full;
+                                        &body_owned
+                                    };
+                                if request_line.starts_with("POST") {
+                                    peers_add(registry, body_text).await
+                                } else {
+                                    peers_remove(registry, body_text).await
+                                }
+                            }
+                            Some(_) => (
+                                405,
+                                serde_json::json!({
+                                    "error": "method not allowed"
+                                })
+                                .to_string(),
+                            ),
+                        };
+                        let reason = match status {
+                            200 => "OK",
+                            400 => "Bad Request",
+                            404 => "Not Found",
+                            405 => "Method Not Allowed",
+                            500 => "Internal Server Error",
+                            502 => "Bad Gateway",
+                            503 => "Service Unavailable",
+                            _ => "Error",
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status} {reason}\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
+                             Access-Control-Allow-Headers: Content-Type\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {body}",
+                            body.len(),
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/api/sessions") {
                         // Session listing endpoint. CORS `*` so the
                         // multi-host Stats tab can fetch sibling
@@ -4015,6 +4119,121 @@ pub fn build_config(
         transcription_enabled,
         ice_config.ice_servers,
     )
+}
+
+// ---------------------------------------------------------------------------
+// /api/peers helpers
+// ---------------------------------------------------------------------------
+
+/// JSON shape for a single entry in `GET /api/peers`. Flattens the
+/// bits of the peer's Agent Card and live connection state that the
+/// dashboard Daemons panel renders.
+#[derive(Serialize)]
+struct PeerListEntry {
+    id: String,
+    label: String,
+    version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_sha: Option<String>,
+    connection_state: crate::peer::ConnectionState,
+    status: crate::peer::PeerStatus,
+}
+
+#[derive(Serialize)]
+struct PeerListResponse {
+    peers: Vec<PeerListEntry>,
+}
+
+#[derive(Deserialize)]
+struct AddPeerRequest {
+    card_url: String,
+}
+
+#[derive(Deserialize)]
+struct RemovePeerRequest {
+    peer_id: String,
+}
+
+/// Build the JSON body for `GET /api/peers`. Cheap — takes a
+/// snapshot of the registry's handles and reads their current
+/// watch-backed connection/status values. Handles are cloneable so
+/// no lock is held across the serialization.
+fn peers_list_response_body(registry: &crate::peer::PeerRegistry) -> String {
+    let handles = registry.list();
+    let entries: Vec<PeerListEntry> = handles
+        .iter()
+        .map(|h| {
+            let card = h.card_snapshot();
+            PeerListEntry {
+                id: h.id().as_str().to_string(),
+                label: card.label.clone(),
+                version: card.version.clone(),
+                git_sha: card.git_sha.clone(),
+                connection_state: h.connection_state(),
+                status: h.status(),
+            }
+        })
+        .collect();
+    serde_json::to_string(&PeerListResponse { peers: entries })
+        .unwrap_or_else(|_| "{\"peers\":[]}".to_string())
+}
+
+/// Handle a `POST /api/peers` body: parse, call
+/// `PeerRegistry::add_peer`, return `(status_code, body_json)`.
+async fn peers_add(
+    registry: &crate::peer::PeerRegistry,
+    body_text: &str,
+) -> (u16, String) {
+    let req: AddPeerRequest = match serde_json::from_str(body_text) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")})
+                    .to_string(),
+            );
+        }
+    };
+    match registry.add_peer(&req.card_url).await {
+        Ok(peer_id) => (
+            200,
+            serde_json::json!({"peer_id": peer_id.as_str()}).to_string(),
+        ),
+        Err(e) => (
+            502,
+            serde_json::json!({"error": e.to_string()}).to_string(),
+        ),
+    }
+}
+
+/// Handle a `DELETE /api/peers` body: parse, call
+/// `PeerRegistry::remove_peer`, return `(status_code, body_json)`.
+async fn peers_remove(
+    registry: &crate::peer::PeerRegistry,
+    body_text: &str,
+) -> (u16, String) {
+    let req: RemovePeerRequest = match serde_json::from_str(body_text) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")})
+                    .to_string(),
+            );
+        }
+    };
+    let id = crate::peer::PeerId(req.peer_id);
+    match registry.remove_peer(&id).await {
+        Ok(()) => (200, serde_json::json!({"ok": true}).to_string()),
+        Err(crate::peer::PeerError::NotFound(_)) => (
+            404,
+            serde_json::json!({"error": "peer not found"}).to_string(),
+        ),
+        Err(e) => (
+            500,
+            serde_json::json!({"error": e.to_string()}).to_string(),
+        ),
+    }
 }
 
 /// Resolve the WebSocket URL to advertise in the Agent Card for
@@ -4429,7 +4648,7 @@ mod tests {
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
 
         // Give it a moment to start
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -4448,7 +4667,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -4491,7 +4710,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx.clone(), config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx.clone(), config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -4533,6 +4752,202 @@ mod tests {
         handle.abort();
     }
 
+    // ---- /api/peers endpoint tests ----
+
+    /// Spawn a test gateway with the given peer registry option and
+    /// return (port, gateway handle). Condensed helper to keep the
+    /// /api/peers tests below compact.
+    async fn spawn_test_gateway_with_registry(
+        peer_registry: Option<crate::peer::PeerRegistry>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            WebGatewayConfig::default(),
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            peer_registry,
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        (port, handle)
+    }
+
+    /// Fire a raw HTTP request and read the response. Small helper
+    /// because the /api/peers tests all make a handful of these.
+    async fn http_request(port: u16, request: &str) -> String {
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response),
+        )
+        .await;
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// `GET /api/peers` returns 503 when the web gateway was spawned
+    /// without a peer registry. This lets the dashboard distinguish
+    /// "peers not configured" from "no peers yet" and render
+    /// differently.
+    #[tokio::test]
+    async fn test_api_peers_returns_503_without_registry() {
+        let (port, handle) = spawn_test_gateway_with_registry(None).await;
+        let resp = http_request(port, "GET /api/peers HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(resp.contains("503"), "expected 503, got: {resp}");
+        assert!(resp.contains("peer registry not configured"));
+        handle.abort();
+    }
+
+    /// `GET /api/peers` on a registry with no peers returns
+    /// `{"peers":[]}`. Baseline for the list endpoint shape.
+    #[tokio::test]
+    async fn test_api_peers_list_empty_registry() {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
+        let resp = http_request(port, "GET /api/peers HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(resp.contains("200 OK"));
+        // Split body from headers.
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert_eq!(body.trim(), r#"{"peers":[]}"#);
+        handle.abort();
+    }
+
+    /// End-to-end: spawn a "target" gateway (gateway A) and a
+    /// "dashboard" gateway (gateway B) with a peer registry. POST
+    /// A's card URL to B's /api/peers. Assert the peer is added,
+    /// GET /api/peers shows it, DELETE removes it. This exercises
+    /// the full path from HTTP request through PeerRegistry,
+    /// IntendantWsTransport, the Agent Card fetch, WebSocket
+    /// connect, and event drain.
+    #[tokio::test]
+    async fn test_api_peers_add_list_remove_end_to_end() {
+        // Gateway A: the target peer this dashboard will federate with.
+        let (target_port, target_handle) =
+            spawn_test_gateway_with_registry(None).await;
+
+        // Gateway B: the dashboard, with its own peer registry.
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(64);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let (dash_port, dash_handle) =
+            spawn_test_gateway_with_registry(Some(registry)).await;
+
+        // POST A's Agent Card URL to B's /api/peers.
+        let card_url = format!(
+            "http://127.0.0.1:{target_port}/.well-known/agent-card.json"
+        );
+        let body = serde_json::json!({"card_url": card_url}).to_string();
+        let req = format!(
+            "POST /api/peers HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(dash_port, &req).await;
+        assert!(resp.contains("200 OK"), "add failed: {resp}");
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        let peer_id = parsed["peer_id"]
+            .as_str()
+            .expect("peer_id missing")
+            .to_string();
+        assert!(peer_id.starts_with("intendant:"));
+
+        // GET /api/peers should now show the added peer.
+        let list_resp = http_request(
+            dash_port,
+            "GET /api/peers HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(list_resp.contains("200 OK"));
+        let list_body = list_resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let list: serde_json::Value = serde_json::from_str(list_body).unwrap();
+        let peers_arr = list["peers"].as_array().unwrap();
+        assert_eq!(peers_arr.len(), 1);
+        assert_eq!(peers_arr[0]["id"].as_str().unwrap(), peer_id);
+        // The "id" field should match the peer_id returned from POST.
+        // The "version" should be the local build's version.
+        assert_eq!(
+            peers_arr[0]["version"].as_str().unwrap(),
+            env!("CARGO_PKG_VERSION")
+        );
+
+        // DELETE /api/peers with the peer_id.
+        let del_body = serde_json::json!({"peer_id": peer_id}).to_string();
+        let del_req = format!(
+            "DELETE /api/peers HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            del_body.len(),
+            del_body
+        );
+        let del_resp = http_request(dash_port, &del_req).await;
+        assert!(del_resp.contains("200 OK"), "delete failed: {del_resp}");
+
+        // GET should now be empty.
+        let empty_resp = http_request(
+            dash_port,
+            "GET /api/peers HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        let empty_body = empty_resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert_eq!(empty_body.trim(), r#"{"peers":[]}"#);
+
+        target_handle.abort();
+        dash_handle.abort();
+    }
+
+    /// `POST /api/peers` with an invalid body returns 400 with a
+    /// diagnostic error message.
+    #[tokio::test]
+    async fn test_api_peers_post_invalid_body() {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
+
+        let body = "not json";
+        let req = format!(
+            "POST /api/peers HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(port, &req).await;
+        assert!(resp.contains("400"), "expected 400, got: {resp}");
+        handle.abort();
+    }
+
+    /// `DELETE /api/peers` for an unknown peer id returns 404.
+    #[tokio::test]
+    async fn test_api_peers_delete_unknown_returns_404() {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
+
+        let body = r#"{"peer_id":"intendant:ghost"}"#;
+        let req = format!(
+            "DELETE /api/peers HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(port, &req).await;
+        assert!(resp.contains("404"), "expected 404, got: {resp}");
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_http_serves_html() {
         let bus = EventBus::new();
@@ -4542,7 +4957,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Plain HTTP GET
@@ -4586,7 +5001,7 @@ mod tests {
             ice_servers: Vec::new(),
             ..Default::default()
         };
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // GET /config
@@ -4631,7 +5046,7 @@ mod tests {
             broadcast_tx,
             WebGatewayConfig::default(),
             ActiveSessionState::empty(),
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -4699,7 +5114,7 @@ mod tests {
             broadcast_tx,
             WebGatewayConfig::default(),
             ActiveSessionState::empty(),
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -4806,7 +5221,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -4861,7 +5276,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -4919,7 +5334,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None)
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None)
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -4978,7 +5393,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None)
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None)
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -5047,7 +5462,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None)
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None)
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -5122,7 +5537,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -5171,7 +5586,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -5224,7 +5639,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // POST /session without any API key env var set
@@ -5259,7 +5674,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
@@ -5296,7 +5711,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -5351,7 +5766,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -5420,7 +5835,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -5517,7 +5932,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -5589,7 +6004,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);

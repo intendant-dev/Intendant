@@ -1,10 +1,3 @@
-// The substrate lands before the main.rs wiring that consumes it,
-// so the re-exports below and several constants/types look "unused"
-// to clippy until the integration commits land. The allow is
-// scoped to the peer module tree and will come off once
-// PeerRegistry is wired into main.rs.
-#![allow(dead_code, unused_imports)]
-
 //! Peer agent federation layer.
 //!
 //! Intendant federates with other autonomous agent daemons — other
@@ -96,9 +89,11 @@
 
 mod actor;
 pub mod card;
+pub mod coordinator;
 pub mod event;
 pub mod handle;
 pub mod id;
+pub mod log_writer;
 pub mod registry;
 pub mod traits;
 pub mod transport;
@@ -116,7 +111,9 @@ pub use handle::{
     spawn_peer, ConnectionState, PeerHandle, BROADCAST_CAPACITY, COMMANDS_CAPACITY,
     EVENTS_CAPACITY,
 };
+pub use coordinator::{Coordinator, CoordinatorError, RoutedTask, TaskRequest};
 pub use id::{PeerId, PeerKind};
+pub use log_writer::{spawn_peer_log_writer, LOG_CHANNEL_CAPACITY};
 pub use registry::PeerRegistry;
 pub use traits::{
     check_feature, PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures,
