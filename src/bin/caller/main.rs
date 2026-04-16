@@ -11,6 +11,7 @@ mod display;
 mod error;
 mod event;
 mod external_agent;
+mod file_watcher;
 mod frames;
 mod frontend;
 mod knowledge;
@@ -6658,6 +6659,20 @@ async fn main() -> Result<(), CallerError> {
             session_log.clone(),
         );
 
+        // File watcher: observes project directory for changes, emits FileChanged events.
+        let _watcher_handle = {
+            let snapshot_dir = log_dir.join("file_snapshots");
+            match file_watcher::FileWatcher::new(
+                project.root.clone(), snapshot_dir, bus.clone(),
+            ) {
+                Ok(watcher) => Some(watcher.start()),
+                Err(e) => {
+                    eprintln!("[file_watcher] Failed to start: {}", e);
+                    None
+                }
+            }
+        };
+
         // Web gateway (WebSocket)
         let _web_handle = if use_web {
             let broadcast_tx = outbound_tx.clone();
@@ -6679,6 +6694,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.transcription.enabled,
                 project.config.webrtc.to_ice_config(),
             );
+            let snapshot_dir = log_dir.join("file_snapshots");
             let shared_session = Arc::new(tokio::sync::RwLock::new(
                 web_gateway::ActiveSessionState {
                     query_ctx: None,
@@ -6686,6 +6702,8 @@ async fn main() -> Result<(), CallerError> {
                     session_log: Some(session_log.clone()),
                     recording_registry: Some(recording_registry.clone()),
                     session_registry: Some(session_registry.clone()),
+                    snapshot_dir: Some(snapshot_dir.clone()),
+                    project_root_for_changes: Some(project.root.clone()),
                 },
             ));
             let mut mcp_http_state = mcp::McpAppState::new(
@@ -7060,6 +7078,20 @@ async fn main() -> Result<(), CallerError> {
             session_log.clone(),
         );
 
+        // File watcher: observes project directory for changes, emits FileChanged events.
+        let _watcher_handle = {
+            let snapshot_dir = log_dir.join("file_snapshots");
+            match file_watcher::FileWatcher::new(
+                project.root.clone(), snapshot_dir, bus.clone(),
+            ) {
+                Ok(watcher) => Some(watcher.start()),
+                Err(e) => {
+                    eprintln!("[file_watcher] Failed to start: {}", e);
+                    None
+                }
+            }
+        };
+
         if let Some(ref t) = task {
             app.log(types::LogLevel::Info, format!("Task: {}", t));
         }
@@ -7182,6 +7214,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.transcription.enabled,
                 project.config.webrtc.to_ice_config(),
             );
+            let snapshot_dir = log_dir.join("file_snapshots");
             let shared_session = Arc::new(tokio::sync::RwLock::new(
                 web_gateway::ActiveSessionState {
                     query_ctx,
@@ -7189,6 +7222,8 @@ async fn main() -> Result<(), CallerError> {
                     session_log: Some(session_log.clone()),
                     recording_registry: Some(recording_registry.clone()),
                     session_registry: Some(session_registry.clone()),
+                    snapshot_dir: Some(snapshot_dir.clone()),
+                    project_root_for_changes: Some(project.root.clone()),
                 },
             ));
             // Create MCP server for HTTP transport (display/CU tools for external agents)
@@ -7550,6 +7585,20 @@ async fn main() -> Result<(), CallerError> {
             session_log.clone(),
         );
 
+        // File watcher: observes project directory for changes, emits FileChanged events.
+        let _watcher_handle = {
+            let snapshot_dir = log_dir.join("file_snapshots");
+            match file_watcher::FileWatcher::new(
+                project.root.clone(), snapshot_dir, bus.clone(),
+            ) {
+                Ok(watcher) => Some(watcher.start()),
+                Err(e) => {
+                    eprintln!("[file_watcher] Failed to start: {}", e);
+                    None
+                }
+            }
+        };
+
         // JSON stdout subscriber: prints OutboundEvents as JSONL to stdout
         if flags.json_output {
             let mut json_rx = outbound_tx.subscribe();
@@ -7584,6 +7633,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.transcription.enabled,
                 project.config.webrtc.to_ice_config(),
             );
+            let snapshot_dir = log_dir.join("file_snapshots");
             let shared_session = Arc::new(tokio::sync::RwLock::new(
                 web_gateway::ActiveSessionState {
                     query_ctx: None,
@@ -7591,6 +7641,8 @@ async fn main() -> Result<(), CallerError> {
                     session_log: Some(session_log.clone()),
                     recording_registry: Some(recording_registry.clone()),
                     session_registry: Some(session_registry.clone()),
+                    snapshot_dir: Some(snapshot_dir.clone()),
+                    project_root_for_changes: Some(project.root.clone()),
                 },
             ));
             let mut mcp_http_state = mcp::McpAppState::new(

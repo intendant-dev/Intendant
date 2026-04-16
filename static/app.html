@@ -1411,6 +1411,86 @@ html, body {
 .subtab-pane.active {
   display: flex;
 }
+
+/* ── Changes sub-tab ── */
+.changes-container {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.changes-sidebar {
+  width: 260px;
+  min-width: 200px;
+  border-right: 1px solid var(--surface1);
+  overflow-y: auto;
+  padding: 4px 0;
+}
+.changes-file-entry {
+  display: flex;
+  align-items: center;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  gap: 6px;
+}
+.changes-file-entry:hover { background: var(--surface0); }
+.changes-file-entry.active { background: var(--surface1); }
+.changes-file-entry .kind-badge {
+  font-size: 10px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-weight: 600;
+  min-width: 14px;
+  text-align: center;
+}
+.kind-badge.created { color: var(--green); border: 1px solid var(--green); }
+.kind-badge.modified { color: var(--yellow); border: 1px solid var(--yellow); }
+.kind-badge.deleted { color: var(--red); border: 1px solid var(--red); }
+.changes-stats {
+  color: var(--subtext0);
+  font-size: 10px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+.changes-diff-viewer {
+  flex: 1;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 12px;
+}
+.changes-diff-header {
+  font-weight: 600;
+  padding: 4px 0 8px;
+  border-bottom: 1px solid var(--surface0);
+  margin-bottom: 8px;
+  color: var(--text);
+}
+.changes-diff-content {
+  white-space: pre;
+  line-height: 1.5;
+}
+.diff-line-add { color: var(--green); background: rgba(166,227,161,0.08); display: block; }
+.diff-line-del { color: var(--red); background: rgba(243,139,168,0.08); display: block; }
+.diff-line-hunk { color: var(--blue); display: block; font-weight: 600; }
+.diff-line-ctx { display: block; }
+.changes-empty {
+  color: var(--overlay0);
+  text-align: center;
+  padding: 40px;
+  font-size: 13px;
+}
+#badge-changes {
+  font-size: 10px;
+  background: var(--blue);
+  color: var(--base);
+  border-radius: 8px;
+  padding: 1px 5px;
+  margin-left: 4px;
+}
+
 .terminal-container {
   flex: 1;
   position: relative;
@@ -2743,83 +2823,104 @@ html, body {
 
     <!-- Activity Tab -->
     <div id="tab-activity" class="tab-pane active">
-      <div class="activity-toolbar">
-        <div class="phase-banner phase-idle" id="phase-banner">
-          <span class="spinner" id="phase-spinner"></span>
-          <span class="phase-text" id="phase-text">Idle</span>
-        </div>
-        <select class="verbosity-select" id="verbosity-select" title="Log verbosity">
-          <option value="normal" selected>Normal</option>
-          <option value="verbose">Verbose</option>
-          <option value="debug">Debug</option>
-        </select>
-        <select class="host-filter-select" id="host-filter-select" title="Filter activity by source host" style="display:none">
-          <option value="">All hosts</option>
-        </select>
+      <div class="subtabs" id="activity-subtabs">
+        <button class="subtab-btn active" data-activity-tab="log">Log</button>
+        <button class="subtab-btn" data-activity-tab="changes">
+          Changes <span class="badge" id="badge-changes" style="display:none"></span>
+        </button>
       </div>
+      <div class="subtab-panes">
+        <div class="subtab-pane active" id="activity-log-pane">
+          <div class="activity-toolbar">
+            <div class="phase-banner phase-idle" id="phase-banner">
+              <span class="spinner" id="phase-spinner"></span>
+              <span class="phase-text" id="phase-text">Idle</span>
+            </div>
+            <select class="verbosity-select" id="verbosity-select" title="Log verbosity">
+              <option value="normal" selected>Normal</option>
+              <option value="verbose">Verbose</option>
+              <option value="debug">Debug</option>
+            </select>
+            <select class="host-filter-select" id="host-filter-select" title="Filter activity by source host" style="display:none">
+              <option value="">All hosts</option>
+            </select>
+          </div>
 
-      <!-- Pending attachments bar (frames the user has Attached but not yet sent) -->
-      <div class="pending-attachments-bar hidden" id="pending-attachments-bar">
-        <span class="pending-attachments-label">Attachments</span>
-        <span class="pending-attachments-count" id="pending-attachments-count">0</span>
-        <div id="pending-attachments-list" style="display:flex;gap:4px;flex-wrap:wrap"></div>
-        <button class="pending-attachments-clear" id="pending-attachments-clear" title="Remove all attachments">Clear</button>
-      </div>
+          <!-- Pending attachments bar (frames the user has Attached but not yet sent) -->
+          <div class="pending-attachments-bar hidden" id="pending-attachments-bar">
+            <span class="pending-attachments-label">Attachments</span>
+            <span class="pending-attachments-count" id="pending-attachments-count">0</span>
+            <div id="pending-attachments-list" style="display:flex;gap:4px;flex-wrap:wrap"></div>
+            <button class="pending-attachments-clear" id="pending-attachments-clear" title="Remove all attachments">Clear</button>
+          </div>
 
-      <!-- Task Input -->
-      <div style="display:flex;gap:4px;padding:4px 8px;border-bottom:1px solid var(--surface1);align-items:center">
-        <input id="activity-task-input" placeholder="Enter task..." style="flex:1;padding:4px 8px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);font-size:12px" />
-        <label style="display:flex;align-items:center;gap:3px;font-size:11px;color:var(--overlay0);cursor:pointer;white-space:nowrap" title="Skip the presence AI and send the task straight to the worker agent (internal or external). Use this for testing, automation, or when you don't need conversational mediation."><input type="checkbox" id="direct-mode-toggle" style="margin:0;accent-color:var(--blue)" />Direct</label>
-        <button onclick="submitActivityTask()" style="padding:4px 12px;border:1px solid var(--green);border-radius:4px;background:transparent;color:var(--green);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">Send</button>
-      </div>
+          <!-- Task Input -->
+          <div style="display:flex;gap:4px;padding:4px 8px;border-bottom:1px solid var(--surface1);align-items:center">
+            <input id="activity-task-input" placeholder="Enter task..." style="flex:1;padding:4px 8px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);font-size:12px" />
+            <label style="display:flex;align-items:center;gap:3px;font-size:11px;color:var(--overlay0);cursor:pointer;white-space:nowrap" title="Skip the presence AI and send the task straight to the worker agent (internal or external). Use this for testing, automation, or when you don't need conversational mediation."><input type="checkbox" id="direct-mode-toggle" style="margin:0;accent-color:var(--blue)" />Direct</label>
+            <button onclick="submitActivityTask()" style="padding:4px 12px;border:1px solid var(--green);border-radius:4px;background:transparent;color:var(--green);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">Send</button>
+          </div>
 
-      <!-- Display Strip (shown when displays are active) -->
-      <div class="activity-display-strip hidden" id="activity-display-strip">
-        <div class="activity-display-header">
-          <span>Displays (<span id="strip-count">0</span>)</span>
-          <button class="strip-toggle-btn" id="strip-toggle" title="Expand displays">&#x25BE;</button>
-        </div>
-        <div class="activity-display-row" id="activity-display-row"></div>
-      </div>
-      <div class="activity-split-handle hidden" id="activity-split-handle"></div>
+          <!-- Display Strip (shown when displays are active) -->
+          <div class="activity-display-strip hidden" id="activity-display-strip">
+            <div class="activity-display-header">
+              <span>Displays (<span id="strip-count">0</span>)</span>
+              <button class="strip-toggle-btn" id="strip-toggle" title="Expand displays">&#x25BE;</button>
+            </div>
+            <div class="activity-display-row" id="activity-display-row"></div>
+          </div>
+          <div class="activity-split-handle hidden" id="activity-split-handle"></div>
 
-      <div class="log-stream" id="log-stream"></div>
-      <button class="scroll-bottom-btn" id="scroll-bottom" title="Scroll to bottom">&#x2193;</button>
+          <div class="log-stream" id="log-stream"></div>
+          <button class="scroll-bottom-btn" id="scroll-bottom" title="Scroll to bottom">&#x2193;</button>
 
-      <!-- Approval Panel -->
-      <div class="bottom-panel" id="approval-panel">
-        <div class="panel-header">Approval Required</div>
-        <div class="panel-body">
-          <div class="approval-command" id="approval-command"></div>
-          <div class="approval-category" id="approval-category"></div>
-          <div class="approval-actions">
-            <button class="approve" onclick="sendApproval('approve')">Approve (y)</button>
-            <button onclick="sendApproval('skip')">Skip (s)</button>
-            <button onclick="sendApproval('approve_all')">Approve All (a)</button>
-            <button class="deny" onclick="sendApproval('deny')">Deny (n)</button>
+          <!-- Approval Panel -->
+          <div class="bottom-panel" id="approval-panel">
+            <div class="panel-header">Approval Required</div>
+            <div class="panel-body">
+              <div class="approval-command" id="approval-command"></div>
+              <div class="approval-category" id="approval-category"></div>
+              <div class="approval-actions">
+                <button class="approve" onclick="sendApproval('approve')">Approve (y)</button>
+                <button onclick="sendApproval('skip')">Skip (s)</button>
+                <button onclick="sendApproval('approve_all')">Approve All (a)</button>
+                <button class="deny" onclick="sendApproval('deny')">Deny (n)</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- AskHuman Panel -->
+          <div class="bottom-panel" id="human-panel">
+            <div class="panel-header">Question</div>
+            <div class="panel-body">
+              <div class="input-question" id="human-question"></div>
+              <div class="input-area">
+                <textarea id="human-input" rows="2" placeholder="Type your response..."></textarea>
+                <button onclick="sendHumanResponse()">Send</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Follow-up Panel -->
+          <div class="bottom-panel" id="followup-panel">
+            <div class="panel-header">Follow Up</div>
+            <div class="panel-body">
+              <div class="input-area">
+                <textarea id="followup-input" rows="2" placeholder="Type follow-up message..."></textarea>
+                <button onclick="sendFollowUp()">Send</button>
+              </div>
+            </div>
           </div>
         </div>
-      </div>
-
-      <!-- AskHuman Panel -->
-      <div class="bottom-panel" id="human-panel">
-        <div class="panel-header">Question</div>
-        <div class="panel-body">
-          <div class="input-question" id="human-question"></div>
-          <div class="input-area">
-            <textarea id="human-input" rows="2" placeholder="Type your response..."></textarea>
-            <button onclick="sendHumanResponse()">Send</button>
-          </div>
-        </div>
-      </div>
-
-      <!-- Follow-up Panel -->
-      <div class="bottom-panel" id="followup-panel">
-        <div class="panel-header">Follow Up</div>
-        <div class="panel-body">
-          <div class="input-area">
-            <textarea id="followup-input" rows="2" placeholder="Type follow-up message..."></textarea>
-            <button onclick="sendFollowUp()">Send</button>
+        <div class="subtab-pane" id="activity-changes-pane">
+          <div class="changes-container">
+            <div class="changes-sidebar" id="changes-file-list">
+              <div class="changes-empty">No file changes yet</div>
+            </div>
+            <div class="changes-diff-viewer" id="changes-diff-viewer">
+              <div class="changes-diff-header" id="changes-diff-header">Select a file to view changes</div>
+              <pre class="changes-diff-content" id="changes-diff-content"></pre>
+            </div>
           </div>
         </div>
       </div>
@@ -4517,11 +4618,85 @@ function processCommands(cmds) {
       case 'set_connected':
         document.getElementById('sb-conn').className = c.connected ? 'conn-dot ok' : 'conn-dot err';
         break;
+      case 'file_changed':
+        onFileChanged(c.path, c.kind, c.lines_added, c.lines_removed);
+        break;
     }
   }
 }
 
 // ── DOM Helpers ──
+
+// ── Changes sub-tab ──
+
+const changedFiles = new Map(); // path -> {kind, lines_added, lines_removed}
+let activeChangesFile = null;
+
+function onFileChanged(path, kind, linesAdded, linesRemoved) {
+  changedFiles.set(path, { kind, lines_added: linesAdded, lines_removed: linesRemoved });
+  renderChangesFileList();
+  // Show badge if not on Changes sub-tab
+  const activeBtn = document.querySelector('#activity-subtabs .subtab-btn.active');
+  if (!activeBtn || activeBtn.dataset.activityTab !== 'changes') {
+    const badge = document.getElementById('badge-changes');
+    if (badge) { badge.textContent = changedFiles.size; badge.style.display = ''; }
+  }
+}
+
+function renderChangesFileList() {
+  const container = document.getElementById('changes-file-list');
+  if (!container) return;
+  if (changedFiles.size === 0) {
+    container.innerHTML = '<div class="changes-empty">No file changes yet</div>';
+    return;
+  }
+  const sorted = [...changedFiles.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  container.innerHTML = sorted.map(([path, info]) => {
+    const active = path === activeChangesFile ? ' active' : '';
+    const initial = info.kind === 'created' ? 'A' : info.kind === 'deleted' ? 'D' : 'M';
+    const badge = `<span class="kind-badge ${info.kind}">${initial}</span>`;
+    const stats = `<span class="changes-stats">+${info.lines_added} \u2212${info.lines_removed}</span>`;
+    const parts = path.split('/');
+    const name = parts.pop();
+    const dir = parts.length > 0 ? parts.join('/') + '/' : '';
+    return `<div class="changes-file-entry${active}" onclick="selectChangesFile('${path.replace(/'/g, "\\'")}')">`
+      + `${badge}<span style="color:var(--overlay0);font-size:11px">${escapeHtml(dir)}</span>${escapeHtml(name)}${stats}</div>`;
+  }).join('');
+}
+
+async function selectChangesFile(path) {
+  activeChangesFile = path;
+  renderChangesFileList();
+  const header = document.getElementById('changes-diff-header');
+  const content = document.getElementById('changes-diff-content');
+  if (!header || !content) return;
+  header.textContent = path;
+  content.textContent = 'Loading...';
+  try {
+    const resp = await fetch(`/api/session/current/changes/${encodeURIComponent(path)}`);
+    if (!resp.ok) throw new Error(resp.statusText);
+    const data = await resp.json();
+    content.innerHTML = renderDiffLines(data.diff || '');
+  } catch (e) {
+    content.textContent = `Error: ${e.message}`;
+  }
+}
+window.selectChangesFile = selectChangesFile;
+
+function renderDiffLines(diffText) {
+  if (!diffText) return '<span class="changes-empty">No changes</span>';
+  return diffText.split('\n').map(line => {
+    if (line.startsWith('+++') || line.startsWith('---'))
+      return `<span class="diff-line-ctx">${escapeHtml(line)}</span>`;
+    if (line.startsWith('+'))
+      return `<span class="diff-line-add">${escapeHtml(line)}</span>`;
+    if (line.startsWith('-'))
+      return `<span class="diff-line-del">${escapeHtml(line)}</span>`;
+    if (line.startsWith('@@'))
+      return `<span class="diff-line-hunk">${escapeHtml(line)}</span>`;
+    return `<span class="diff-line-ctx">${escapeHtml(line)}</span>`;
+  }).join('');
+}
 
 function clearLogs() {
   document.getElementById('log-stream').innerHTML = '';
@@ -8245,6 +8420,11 @@ document.querySelectorAll('#tab-settings .subtab-btn[data-settings-tab]').forEac
   btn.addEventListener('click', () => routeTo('settings', btn.dataset.settingsTab));
 });
 
+// Activity sub-tab switching (Log | Changes).
+document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').forEach(btn => {
+  btn.addEventListener('click', () => routeTo('activity', btn.dataset.activityTab));
+});
+
 // ── Hash-based router ──
 //
 // URL is the source of truth for which tab + sub-tab is active:
@@ -8266,6 +8446,7 @@ document.querySelectorAll('#tab-settings .subtab-btn[data-settings-tab]').forEac
 // (verbosity, direct-mode, host filter, sessions filters).
 
 const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'sessions', 'settings'];
+const VALID_ACTIVITY_SUBTABS = ['log', 'changes'];
 const VALID_TERM_SUBTABS = ['tui', 'shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
 
@@ -8274,6 +8455,9 @@ function parseRoute() {
   if (!raw) return { tab: 'activity', subtab: null };
   const [tab, subtab] = raw.split('/');
   if (!VALID_TABS.includes(tab)) return { tab: 'activity', subtab: null };
+  if (tab === 'activity' && subtab && !VALID_ACTIVITY_SUBTABS.includes(subtab)) {
+    return { tab, subtab: null };
+  }
   if (tab === 'terminal' && subtab && !VALID_TERM_SUBTABS.includes(subtab)) {
     return { tab, subtab: null };
   }
@@ -8297,7 +8481,9 @@ function routeTo(tab, subtab) {
   if (tab !== activeTab) {
     switchTab(tab);
   }
-  if (tab === 'terminal' && subtab) {
+  if (tab === 'activity' && subtab) {
+    switchActivitySubtab(subtab);
+  } else if (tab === 'terminal' && subtab) {
     switchTerminalSubtab(subtab);
   } else if (tab === 'settings' && subtab) {
     switchSettingsSubtab(subtab);
@@ -8319,7 +8505,9 @@ function applyCurrentRoute() {
   if (tab !== activeTab) {
     switchTab(tab);
   }
-  if (tab === 'terminal' && subtab) {
+  if (tab === 'activity' && subtab) {
+    switchActivitySubtab(subtab);
+  } else if (tab === 'terminal' && subtab) {
     switchTerminalSubtab(subtab);
   } else if (tab === 'settings' && subtab) {
     switchSettingsSubtab(subtab);
@@ -8374,6 +8562,22 @@ function switchTab(tabId) {
 
 // Remember the last active sub-tab across page reloads so users don't
 // lose their place when the page auto-refreshes.
+let activeActivitySubtab = 'log';
+
+function switchActivitySubtab(name) {
+  if (activeActivitySubtab === name) return;
+  activeActivitySubtab = name;
+  document.querySelectorAll('#activity-subtabs .subtab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.activityTab === name);
+  });
+  document.getElementById('activity-log-pane').classList.toggle('active', name === 'log');
+  document.getElementById('activity-changes-pane').classList.toggle('active', name === 'changes');
+  if (name === 'changes') {
+    const badge = document.getElementById('badge-changes');
+    if (badge) { badge.style.display = 'none'; badge.textContent = ''; }
+  }
+}
+
 const SETTINGS_SUBTAB_KEY = 'intendant_settings_subtab';
 let activeSettingsSubtab =
   localStorage.getItem(SETTINGS_SUBTAB_KEY) || 'account';
