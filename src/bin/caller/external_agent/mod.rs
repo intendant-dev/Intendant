@@ -105,6 +105,13 @@ pub enum AgentEvent {
     /// text is surfaced at `"detail"` verbosity (visible in Verbose + Debug,
     /// hidden in Normal) via `AppEvent::ModelResponse` with `reasoning` set.
     Reasoning { text: String },
+    /// The agent's execution plan (task decomposition with status).
+    ///
+    /// Each entry is `(content, priority, status)` as plain strings so that
+    /// the external-agent module doesn't leak ACP schema types.
+    PlanUpdate {
+        entries: Vec<(String, String, String)>,
+    },
     /// A tool/command execution has started.
     ToolStarted {
         item_id: String,

@@ -690,8 +690,36 @@ fn translate_session_update(update: &SessionUpdate) -> Vec<AgentEvent> {
                 }
             }
         }
+        SessionUpdate::Plan(plan) => {
+            let entries: Vec<(String, String, String)> = plan
+                .entries
+                .iter()
+                .map(|e| {
+                    let priority = format!("{:?}", e.priority).to_lowercase();
+                    let status = format!("{:?}", e.status).to_lowercase();
+                    (e.content.clone(), priority, status)
+                })
+                .collect();
+            if !entries.is_empty() {
+                events.push(AgentEvent::PlanUpdate { entries });
+            }
+        }
+        SessionUpdate::AvailableCommandsUpdate(update) => {
+            eprintln!(
+                "[gemini] available commands: {}",
+                update
+                    .available_commands
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        SessionUpdate::CurrentModeUpdate(update) => {
+            eprintln!("[gemini] mode changed: {}", update.current_mode_id.0);
+        }
         _ => {
-            // Plan, AvailableCommandsUpdate, CurrentModeUpdate, etc. — not mapped
+            // ConfigOptionUpdate, SessionInfoUpdate, UserMessageChunk — not mapped
         }
     }
 
@@ -1127,6 +1155,29 @@ mod tests {
         match &events[0] {
             AgentEvent::Reasoning { text } => assert_eq!(text, "Step 1: analyze the page layout"),
             _ => panic!("expected Reasoning, got {:?}", events[0]),
+        }
+    }
+
+    #[test]
+    fn translate_plan_update() {
+        use agent_client_protocol_schema::{Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus};
+        let plan = Plan::new(vec![
+            PlanEntry::new("Search for AI agents", PlanEntryPriority::High, PlanEntryStatus::Completed),
+            PlanEntry::new("Summarize findings", PlanEntryPriority::Medium, PlanEntryStatus::InProgress),
+            PlanEntry::new("Create presentation", PlanEntryPriority::Medium, PlanEntryStatus::Pending),
+        ]);
+        let update = SessionUpdate::Plan(plan);
+        let events = translate_session_update(&update);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::PlanUpdate { entries } => {
+                assert_eq!(entries.len(), 3);
+                assert_eq!(entries[0].0, "Search for AI agents");
+                assert_eq!(entries[0].2, "completed");
+                assert_eq!(entries[1].2, "inprogress");
+                assert_eq!(entries[2].2, "pending");
+            }
+            _ => panic!("expected PlanUpdate, got {:?}", events[0]),
         }
     }
 

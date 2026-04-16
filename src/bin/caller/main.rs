@@ -310,6 +310,24 @@ async fn drain_external_agent_events(
                     source: config.agent_source.clone(),
                 });
             }
+            external_agent::AgentEvent::PlanUpdate { entries } => {
+                let mut md = String::from("**Plan**\n");
+                for (content, _priority, status) in &entries {
+                    let marker = match status.as_str() {
+                        "completed" => "[x]",
+                        "inprogress" => "[-]",
+                        _ => "[ ]",
+                    };
+                    md.push_str(&format!("- {} {}\n", marker, content));
+                }
+                config.bus.send(AppEvent::ModelResponse {
+                    turn: stats.turns,
+                    content: md,
+                    usage: provider::TokenUsage::default(),
+                    reasoning: None,
+                    source: config.agent_source.clone(),
+                });
+            }
             external_agent::AgentEvent::ToolStarted {
                 preview,
                 tool_name,
