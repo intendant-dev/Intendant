@@ -513,13 +513,6 @@ pub struct App {
     // Multi-round follow-up
     pub round: usize,
     pub follow_up_textarea: Option<tui_textarea::TextArea<'static>>,
-    pub follow_up_tx: Option<tokio::sync::mpsc::Sender<String>>,
-    /// When presence layer is active, follow-up input goes here instead.
-    pub presence_tx: Option<tokio::sync::mpsc::Sender<String>>,
-    /// Direct task dispatch channel — bypasses server-side presence entirely.
-    /// Used by StartTask (from browser live model, control socket, MCP) so
-    /// tasks don't get re-processed by the server-side presence model.
-    pub task_tx: Option<tokio::sync::mpsc::Sender<presence_core::TaskEnvelope>>,
 
     // Vision display info (shown in status bar when active)
     pub display_info: Option<String>,
@@ -605,9 +598,6 @@ impl App {
             streaming_buffer: String::new(),
             round: 1,
             follow_up_textarea: None,
-            follow_up_tx: None,
-            presence_tx: None,
-            task_tx: None,
             display_info: None,
             presence_provider_name: None,
             presence_model_name: None,
@@ -630,18 +620,6 @@ impl App {
             voice_transcript_buffer: String::new(),
             voice_transcript_idle_ticks: 0,
         }
-    }
-
-    pub fn set_follow_up_sender(&mut self, tx: tokio::sync::mpsc::Sender<String>) {
-        self.follow_up_tx = Some(tx);
-    }
-
-    pub fn set_presence_sender(&mut self, tx: tokio::sync::mpsc::Sender<String>) {
-        self.presence_tx = Some(tx);
-    }
-
-    pub fn set_task_sender(&mut self, tx: tokio::sync::mpsc::Sender<presence_core::TaskEnvelope>) {
-        self.task_tx = Some(tx);
     }
 
     pub fn set_presence_event_sender(
@@ -1006,9 +984,9 @@ impl App {
     fn handle_follow_up_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('q') => {
-                // Quit: drop the sender so recv() returns None
+                // Quit the TUI. The dispatcher/agent loops shut down via
+                // their own lifecycle (process exit / bus close).
                 self.follow_up_textarea = None;
-                self.follow_up_tx = None;
                 self.mode = AppMode::Normal;
                 self.current_phase = Phase::Done;
                 self.should_quit = true;
@@ -1022,7 +1000,9 @@ impl App {
                 true
             }
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                // Submit the follow-up
+                // Submit the follow-up by emitting a ControlCommand on the bus.
+                // The backend dispatcher (task_dispatch::Dispatcher) routes to
+                // presence_tx / task_tx / follow_up_tx based on availability.
                 if let Some(ref textarea) = self.follow_up_textarea {
                     let text = textarea.lines().join("\n");
                     if text.trim().is_empty() {
@@ -1034,12 +1014,9 @@ impl App {
                         return true;
                     }
 
-                    // Route through presence layer if active, else direct follow-up
-                    if let Some(ref tx) = self.presence_tx {
-                        let _ = tx.try_send(text.clone());
-                    } else if let Some(ref tx) = self.follow_up_tx {
-                        let _ = tx.try_send(text.clone());
-                    }
+                    self.pending_derived.push(AppEvent::ControlCommand(
+                        ControlMsg::FollowUp { text: text.clone(), direct: None },
+                    ));
                     self.log(LogLevel::Info, format!("Follow-up: {}", truncate_str(&text, 80)));
                 }
                 self.follow_up_textarea = None;
@@ -1208,49 +1185,20 @@ impl App {
                     );
                 }
             }
-            ControlMsg::StartTask { task, orchestrate, direct, reference_frame_ids, display_target, attachments } => {
-                // Dispatch unconditionally — no phase gating. The task_rx loop
-                // (main.rs) processes tasks sequentially, and the mpsc channel
-                // (capacity=4) buffers incoming tasks. The TUI tracks phase for
-                // display purposes only, not dispatch authority.
+            ControlMsg::StartTask { .. } => {
+                // Routing is handled by the backend `task_dispatch::Dispatcher`,
+                // which subscribes to this same ControlCommand on the bus. The
+                // TUI is a display layer only — it observes dispatched tasks
+                // here to update its own state (clear the follow-up textarea,
+                // switch to Thinking phase, increment round counter).
                 //
-                // Note: the "[runtime] Task dispatched" log is emitted by the
-                // backend at task acceptance time (see `emit_task_dispatched_log`
-                // in main.rs), not here. The TUI is a display layer; it forwards
-                // the envelope and updates local UI state, but the dispatch log
-                // belongs to the code that actually accepts the task for
-                // processing so it works in headless mode and reports the
-                // correct source.
-                let dispatched = if let Some(ref tx) = self.task_tx {
-                    let envelope = presence_core::TaskEnvelope {
-                        task: task.clone(),
-                        force_direct: direct.unwrap_or(false) || orchestrate == Some(false),
-                        context_hints: vec![],
-                        reference_frame_ids,
-                        display_target,
-                        attachment_frame_ids: attachments,
-                    };
-                    tx.try_send(envelope).is_ok()
-                } else if let Some(ref tx) = self.follow_up_tx {
-                    tx.try_send(task.clone()).is_ok()
-                } else {
-                    false
-                };
-                if dispatched {
-                    self.follow_up_textarea = None;
-                    self.mode = AppMode::Normal;
-                    self.current_phase = Phase::Thinking;
-                    self.round += 1;
-                } else {
-                    self.log(
-                        LogLevel::Warn,
-                        format!(
-                            "start_task: dispatch failed (task_tx: {}, follow_up_tx: {})",
-                            self.task_tx.is_some(),
-                            self.follow_up_tx.is_some(),
-                        ),
-                    );
-                }
+                // The "[runtime] Task dispatched" log is emitted by the backend
+                // at task acceptance time (see `emit_task_dispatched_log` in
+                // main.rs), not here.
+                self.follow_up_textarea = None;
+                self.mode = AppMode::Normal;
+                self.current_phase = Phase::Thinking;
+                self.round += 1;
             }
             ControlMsg::ScheduleControllerRestart { .. }
             | ControlMsg::ControllerTurnComplete { .. }
@@ -1266,55 +1214,17 @@ impl App {
                 );
             }
             ControlMsg::FollowUp { text, direct } => {
-                // Accept follow-ups when waiting for follow-up or task is done,
-                // regardless of AppMode (user may have pressed Esc to browse logs).
+                // Routing handled by `task_dispatch::Dispatcher`. The TUI
+                // observes the ControlCommand for display purposes only.
                 if self.current_phase == Phase::WaitingFollowUp
                     || self.current_phase == Phase::Done
                 {
-                    // Routing:
-                    //   direct=true + task_tx available → build a force_direct
-                    //     TaskEnvelope and push it through task_tx, bypassing
-                    //     presence entirely. Mirrors how a `direct: true`
-                    //     StartTask is dispatched. This is the only way a
-                    //     user can issue a follow-up that skips presence
-                    //     narration on a running daemon.
-                    //   direct=false/None → existing behaviour: route through
-                    //     presence_tx if presence is active, else follow_up_tx.
-                    let is_direct = direct.unwrap_or(false);
-                    let routed = if is_direct {
-                        if let Some(ref tx) = self.task_tx {
-                            let envelope = presence_core::TaskEnvelope {
-                                task: text.clone(),
-                                force_direct: true,
-                                context_hints: vec![],
-                                reference_frame_ids: vec![],
-                                display_target: None,
-                                attachment_frame_ids: vec![],
-                            };
-                            tx.try_send(envelope).is_ok()
-                        } else if let Some(ref tx) = self.follow_up_tx {
-                            // No task channel (non-presence mode) — follow_up_tx
-                            // feeds run_direct_mode / run_external_agent_mode
-                            // directly, which is inherently "direct" anyway.
-                            tx.try_send(text.clone()).is_ok()
-                        } else {
-                            false
-                        }
-                    } else if let Some(ref tx) = self.presence_tx {
-                        tx.try_send(text.clone()).is_ok()
-                    } else if let Some(ref tx) = self.follow_up_tx {
-                        tx.try_send(text.clone()).is_ok()
-                    } else {
-                        false
-                    };
-                    if routed {
-                        self.follow_up_textarea = None;
-                        self.mode = AppMode::Normal;
-                        self.current_phase = Phase::Thinking;
-                        self.round += 1;
-                        let tag = if is_direct { " (direct)" } else { "" };
-                        self.log(LogLevel::Info, format!("Follow-up{} via control socket: {}", tag, truncate_str(&text, 80)));
-                    }
+                    self.follow_up_textarea = None;
+                    self.mode = AppMode::Normal;
+                    self.current_phase = Phase::Thinking;
+                    self.round += 1;
+                    let tag = if direct.unwrap_or(false) { " (direct)" } else { "" };
+                    self.log(LogLevel::Info, format!("Follow-up{}: {}", tag, truncate_str(&text, 80)));
                 }
             }
             ControlMsg::QueryDetail { scope, target } => {
@@ -1702,10 +1612,10 @@ impl App {
                     );
                 }
                 // Create a follow-up textarea so the user can submit follow-ups
-                // after task completion (press f to reopen).
-                if self.follow_up_textarea.is_none()
-                    && (self.follow_up_tx.is_some() || self.presence_tx.is_some())
-                {
+                // after task completion (press f to reopen). In TUI mode the
+                // dispatcher is always running, so no channel-availability
+                // check is needed.
+                if self.follow_up_textarea.is_none() {
                     let mut textarea = tui_textarea::TextArea::default();
                     textarea.set_cursor_line_style(ratatui::style::Style::default());
                     self.follow_up_textarea = Some(textarea);
