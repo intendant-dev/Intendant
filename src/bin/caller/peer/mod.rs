@@ -89,6 +89,7 @@
 
 mod actor;
 pub mod card;
+pub mod coordinator;
 pub mod event;
 pub mod handle;
 pub mod id;
@@ -110,6 +111,7 @@ pub use handle::{
     spawn_peer, ConnectionState, PeerHandle, BROADCAST_CAPACITY, COMMANDS_CAPACITY,
     EVENTS_CAPACITY,
 };
+pub use coordinator::{Coordinator, CoordinatorError, RoutedTask, TaskRequest};
 pub use id::{PeerId, PeerKind};
 pub use log_writer::{spawn_peer_log_writer, LOG_CHANNEL_CAPACITY};
 pub use registry::PeerRegistry;
