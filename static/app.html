@@ -1548,6 +1548,257 @@ html, body {
   margin-left: 4px;
 }
 
+/* ── Timeline (history) strip in the Changes sub-tab ── */
+.changes-timeline {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--surface1);
+  background: var(--mantle);
+}
+.timeline-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.timeline-title {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text);
+}
+.timeline-controls {
+  display: flex;
+  gap: 4px;
+}
+.timeline-btn {
+  background: var(--surface0);
+  color: var(--text);
+  border: 1px solid var(--surface1);
+  border-radius: 3px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.timeline-btn:hover:not(:disabled) {
+  background: var(--surface1);
+}
+.timeline-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.timeline-rounds {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  padding: 4px 0;
+}
+.timeline-round {
+  flex-shrink: 0;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  border: 1px solid var(--surface1);
+  background: var(--surface0);
+  color: var(--subtext1);
+  min-width: 60px;
+  text-align: center;
+}
+.timeline-round:hover {
+  border-color: var(--blue);
+  color: var(--text);
+}
+.timeline-round.current {
+  background: var(--blue);
+  color: var(--base);
+  border-color: var(--blue);
+  font-weight: 600;
+}
+.timeline-round.future {
+  opacity: 0.6;
+}
+.timeline-round .round-id {
+  display: block;
+  font-weight: 600;
+}
+.timeline-round .round-files {
+  display: block;
+  font-size: 9px;
+  color: var(--overlay1);
+}
+.timeline-round.current .round-files {
+  color: var(--base);
+  opacity: 0.7;
+}
+#timeline-abandoned {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--subtext0);
+}
+#timeline-abandoned summary {
+  cursor: pointer;
+  padding: 2px 0;
+}
+.abandoned-branch {
+  padding: 4px 8px;
+  margin: 2px 0;
+  background: var(--surface0);
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* ── Control sub-tab ── */
+.control-pane-body {
+  padding: 16px 20px;
+  max-width: 640px;
+  overflow-y: auto;
+  flex: 1;
+  position: relative;
+}
+.control-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: var(--subtext1);
+}
+.control-backend-badge {
+  padding: 2px 8px;
+  background: var(--surface1);
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+}
+.control-applies-note {
+  flex: 1;
+  text-align: right;
+  color: var(--overlay1);
+  font-style: italic;
+  font-size: 11px;
+}
+.control-applies-note.pending {
+  color: var(--yellow);
+  font-weight: 600;
+  font-style: normal;
+}
+.control-group {
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin-bottom: 12px;
+}
+.control-group legend {
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.control-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0;
+}
+.control-row label {
+  min-width: 120px;
+  font-size: 13px;
+  color: var(--subtext1);
+}
+.control-row input[type="text"],
+.control-row select {
+  flex: 1;
+  padding: 4px 8px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  color: var(--text);
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+.control-row input[type="text"]:focus,
+.control-row select:focus {
+  outline: 1px solid var(--blue);
+}
+.control-row .control-current {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--overlay1);
+  min-width: 80px;
+  text-align: right;
+}
+.control-hint {
+  font-size: 11px;
+  color: var(--overlay1);
+  padding: 2px 0 0 132px;
+  line-height: 1.5;
+}
+.control-hint strong {
+  color: var(--subtext1);
+  font-weight: 600;
+}
+.control-disabled-overlay {
+  color: var(--overlay0);
+  text-align: center;
+  padding: 40px;
+  font-size: 13px;
+}
+.control-actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 4px;
+}
+.control-action-btn {
+  padding: 4px 10px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  color: var(--text);
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 80ms, border 80ms;
+}
+.control-action-btn:hover:not(:disabled) {
+  background: var(--surface1);
+  border-color: var(--blue);
+}
+.control-action-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.control-action-btn.pending {
+  opacity: 0.6;
+  cursor: progress;
+}
+.control-toast {
+  position: absolute;
+  bottom: 16px;
+  right: 16px;
+  padding: 8px 14px;
+  background: var(--surface1);
+  border-left: 3px solid var(--blue);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  max-width: 420px;
+  z-index: 200;
+  animation: control-toast-in 140ms ease-out;
+}
+.control-toast.error { border-left-color: var(--red); }
+.control-toast.success { border-left-color: var(--green); }
+@keyframes control-toast-in {
+  from { transform: translateX(12px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
 .terminal-container {
   flex: 1;
   position: relative;
@@ -2963,6 +3214,20 @@ html, body {
                at the top of this pane. No separate follow-up panel needed. -->
         </div>
         <div class="subtab-pane" id="activity-changes-pane">
+          <div class="changes-timeline" id="changes-timeline" style="display:none">
+            <div class="timeline-header">
+              <span class="timeline-title">History</span>
+              <div class="timeline-controls">
+                <button id="redo-btn" class="timeline-btn" onclick="doRedo()" title="Redo the last rollback" disabled>&#x21bb; Redo</button>
+                <button id="prune-btn" class="timeline-btn" onclick="doPrune()" title="Prune abandoned branches">&#x1f5d1; Prune</button>
+              </div>
+            </div>
+            <div class="timeline-rounds" id="timeline-rounds"></div>
+            <details id="timeline-abandoned" style="display:none">
+              <summary>Abandoned branches (<span id="abandoned-count">0</span>)</summary>
+              <div id="abandoned-list"></div>
+            </details>
+          </div>
           <div class="changes-container">
             <div class="changes-sidebar" id="changes-file-list">
               <div class="changes-empty">No file changes yet</div>
@@ -4409,6 +4674,9 @@ async function main() {
     }
     if (msg && msg.conversation_context) storedConversationCtx = msg.conversation_context;
     if (modelConnected) app.inject_pending_approval_if_any();
+    // Bootstrap/reconnect: populate the timeline from whatever the
+    // server has now so users coming in mid-session see it immediately.
+    if (typeof refreshHistory === 'function') refreshHistory();
   });
 
   app.set_on_server_event((evt) => {
@@ -4670,6 +4938,17 @@ function processCommands(cmds) {
       case 'file_changed':
         onFileChanged(c.path, c.kind, c.lines_added, c.lines_removed);
         break;
+      case 'history_changed':
+        // Session history changed (snapshot / rollback / redo / prune).
+        // Re-fetch the authoritative timeline and re-render the strip.
+        refreshHistory();
+        break;
+      case 'codex_config_changed':
+        applyCodexConfigChanged(c);
+        break;
+      case 'codex_thread_action_result':
+        handleCodexThreadActionResult(c);
+        break;
       // Peer registry push events. The peer payload is a `PeerSnapshot`
       // (same shape `refreshPeersFromApi` builds entries from), so we
       // funnel through the shared upsert/remove helpers — one code path
@@ -4738,6 +5017,501 @@ async function selectChangesFile(path) {
   }
 }
 window.selectChangesFile = selectChangesFile;
+
+// ── Timeline (rollback / redo / prune) ──
+//
+// Backend exposes the session's round-level history at
+// `GET /api/session/current/history` and lets the user rewind /
+// fast-forward / drop abandoned branches via POST endpoints. The UI is
+// intentionally thin: we refetch-and-render on every change rather than
+// trying to reconstruct the timeline from event deltas, so the server
+// remains the single source of truth.
+//
+// Lifecycle:
+// - WASM raises `UiCommand::HistoryChanged` in response to
+//   snapshot_created / rolled_back / redone / history_pruned events.
+// - processCommands -> refreshHistory() -> fetch + renderTimeline.
+// - On initial Changes-tab open we also call refreshHistory() so a
+//   session resumed mid-flight shows its existing timeline immediately.
+
+let historyCache = null;
+
+async function refreshHistory() {
+  try {
+    const r = await fetch('/api/session/current/history');
+    if (!r.ok) {
+      // Older sessions or sessions without history support return 404.
+      // Hide the timeline rather than showing a confusing error.
+      historyCache = null;
+      const wrap = document.getElementById('changes-timeline');
+      if (wrap) wrap.style.display = 'none';
+      return;
+    }
+    historyCache = await r.json();
+    renderTimeline();
+  } catch (e) {
+    // Network error — stay silent; the WS event for the next mutation
+    // will re-trigger us and the user can still navigate the UI.
+    historyCache = null;
+  }
+}
+window.refreshHistory = refreshHistory;
+
+function renderTimeline() {
+  const wrap = document.getElementById('changes-timeline');
+  if (!wrap) return;
+  if (!historyCache) {
+    wrap.style.display = 'none';
+    return;
+  }
+  const rounds = Array.isArray(historyCache.rounds) ? historyCache.rounds : [];
+  if (rounds.length === 0) {
+    wrap.style.display = 'none';
+    return;
+  }
+  wrap.style.display = '';
+  const current = historyCache.current_head_id;
+  const currentIdx = rounds.findIndex(r => r.id === current);
+  const container = document.getElementById('timeline-rounds');
+  if (container) {
+    container.innerHTML = rounds.map((r, i) => {
+      const cls = i === currentIdx ? 'current'
+                  : (currentIdx >= 0 && i > currentIdx) ? 'future'
+                  : '';
+      const filesN = Array.isArray(r.files_changed) ? r.files_changed.length : 0;
+      const summary = (r.summary || '').toString();
+      const tipSummary = summary.length > 80 ? summary.slice(0, 80) + '...' : summary;
+      const sumPart = tipSummary ? ` \u2014 ${tipSummary}` : '';
+      const tip = `Round ${r.id}${sumPart} \u2014 ${filesN} file${filesN === 1 ? '' : 's'} changed`;
+      return `<div class="timeline-round ${cls}" title="${escapeHtml(tip)}" onclick="doRollback(${r.id})">`
+        + `<span class="round-id">#${r.id}</span>`
+        + `<span class="round-files">${filesN} file${filesN === 1 ? '' : 's'}</span>`
+        + `</div>`;
+    }).join('');
+  }
+
+  // Redo is only meaningful after a rollback — current_head must exist
+  // and not be the last recorded round.
+  const redoBtn = document.getElementById('redo-btn');
+  if (redoBtn) {
+    redoBtn.disabled = currentIdx < 0 || currentIdx >= rounds.length - 1;
+  }
+
+  // Abandoned branches (rolled-back rounds that later drifted from
+  // current HEAD). Collapsed by default so the main strip stays compact.
+  const abandoned = Array.isArray(historyCache.abandoned_branches)
+    ? historyCache.abandoned_branches
+    : [];
+  const det = document.getElementById('timeline-abandoned');
+  if (det) {
+    if (abandoned.length === 0) {
+      det.style.display = 'none';
+    } else {
+      det.style.display = '';
+      const countEl = document.getElementById('abandoned-count');
+      if (countEl) countEl.textContent = String(abandoned.length);
+      const listEl = document.getElementById('abandoned-list');
+      if (listEl) {
+        listEl.innerHTML = abandoned.map((b, i) => {
+          const n = Array.isArray(b.rounds) ? b.rounds.length : 0;
+          const from = b.branched_from_id != null ? `#${b.branched_from_id}` : '?';
+          return `<div class="abandoned-branch">`
+            + `<span>Branch ${i + 1}: ${n} round${n === 1 ? '' : 's'} from ${escapeHtml(from)}</span>`
+            + `</div>`;
+        }).join('');
+      }
+    }
+  }
+}
+
+async function doRollback(roundId) {
+  if (!Number.isFinite(roundId)) return;
+  const msg = `Roll back to round #${roundId}?\n\nFiles will be reverted to the snapshot at the end of that round. `
+    + `Later rounds are preserved and can be restored via Redo or from Abandoned branches.`;
+  if (!confirm(msg)) return;
+  try {
+    const r = await fetch('/api/session/current/rollback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ round_id: roundId }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      alert(`Rollback failed: ${err.error || r.statusText}`);
+      return;
+    }
+    // The `rolled_back` WS event will trigger refreshHistory().
+  } catch (e) {
+    alert(`Rollback error: ${e.message || e}`);
+  }
+}
+window.doRollback = doRollback;
+
+async function doRedo() {
+  try {
+    const r = await fetch('/api/session/current/redo', { method: 'POST' });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      alert(`Redo failed: ${err.error || r.statusText}`);
+    }
+  } catch (e) {
+    alert(`Redo error: ${e.message || e}`);
+  }
+}
+window.doRedo = doRedo;
+
+async function doPrune() {
+  if (!confirm('Prune all abandoned branches?\n\nThis frees disk space but cannot be undone.')) return;
+  try {
+    const r = await fetch('/api/session/current/prune', { method: 'POST' });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      alert(`Prune failed: ${err.error || r.statusText}`);
+      return;
+    }
+    // History event will redraw; the console line is a belt-and-suspenders
+    // confirmation so curious users can verify the server response shape.
+    const data = await r.json().catch(() => ({}));
+    if (typeof data.bytes_freed === 'number') {
+      const mb = (data.bytes_freed / 1024 / 1024).toFixed(1);
+      console.log(`Pruned ${data.branches_removed || 0} branches, ${mb} MB freed`);
+    }
+  } catch (e) {
+    alert(`Prune error: ${e.message || e}`);
+  }
+}
+window.doPrune = doPrune;
+
+// ── Control sub-tab ──
+//
+// Reads the live Codex runtime config from `/api/settings` and dispatches
+// `SetCodex*` control messages on change. The backend's control plane
+// persists to `intendant.toml` and broadcasts `CodexConfigChanged` back to
+// all connected dashboards, so two browsers stay in sync.
+
+let controlCodexConfig = {
+  sandbox: null,
+  approval_policy: null,
+  model: null,
+  reasoning_effort: '',
+  web_search: false,
+  network_access: false,
+  writable_roots: [],
+};
+let controlCurrentBackend = null;
+let controlBackendActive = false;
+const controlAppliesBaseText = 'changes apply on next task';
+
+async function refreshControlPane() {
+  try {
+    const resp = await fetch('/api/settings');
+    if (!resp.ok) throw new Error(resp.statusText);
+    const d = await resp.json();
+    controlCurrentBackend = normalizeAgentId(d.external_agent);
+    controlCodexConfig = {
+      sandbox: d.codex_sandbox || 'workspace-write',
+      approval_policy: d.codex_approval_policy || 'on-request',
+      model: d.codex_model || '',
+      reasoning_effort: d.codex_reasoning_effort || '',
+      web_search: !!d.codex_web_search,
+      network_access: !!d.codex_network_access,
+      writable_roots: Array.isArray(d.codex_writable_roots) ? d.codex_writable_roots : [],
+    };
+    renderControlPane();
+  } catch (e) {
+    console.warn('Failed to load control-pane config:', e);
+  }
+}
+
+function renderControlPane() {
+  const badge = document.getElementById('control-backend-badge');
+  const section = document.getElementById('control-codex-section');
+  const emptyMsg = document.getElementById('control-no-backend');
+  const isCodex = controlCurrentBackend === 'codex';
+  if (badge) badge.textContent = controlCurrentBackend || 'none';
+  if (section) section.style.display = isCodex ? '' : 'none';
+  if (emptyMsg) emptyMsg.style.display = isCodex ? 'none' : '';
+  if (!isCodex) return;
+  const $ = id => document.getElementById(id);
+  const sandboxSel = $('control-codex-sandbox');
+  const approvalSel = $('control-codex-approval');
+  const modelInp = $('control-codex-model');
+  const reasoningSel = $('control-codex-reasoning');
+  const webSearch = $('control-codex-web-search');
+  const webSearchStatus = $('control-codex-web-search-status');
+  const networkCb = $('control-codex-network');
+  const networkStatus = $('control-codex-network-status');
+  const networkRow = $('control-codex-network-row');
+  const networkHint = $('control-codex-network-hint');
+  const rootsTA = $('control-codex-writable-roots');
+  if (sandboxSel) sandboxSel.value = controlCodexConfig.sandbox;
+  if (approvalSel) approvalSel.value = controlCodexConfig.approval_policy;
+  if (modelInp) modelInp.value = controlCodexConfig.model || '';
+  if (reasoningSel) reasoningSel.value = controlCodexConfig.reasoning_effort || '';
+  if (webSearch) webSearch.checked = !!controlCodexConfig.web_search;
+  if (webSearchStatus) webSearchStatus.textContent = controlCodexConfig.web_search ? 'on' : 'off';
+  if (networkCb) networkCb.checked = !!controlCodexConfig.network_access;
+  if (networkStatus) networkStatus.textContent = controlCodexConfig.network_access ? 'on' : 'off';
+  // Network access only matters inside workspace-write. Grey out + annotate
+  // otherwise so the toggle doesn't look like it's silently doing nothing.
+  const netApplies = controlCodexConfig.sandbox === 'workspace-write';
+  if (networkCb) networkCb.disabled = !netApplies;
+  if (networkRow) networkRow.style.opacity = netApplies ? '' : '0.55';
+  if (networkHint) {
+    networkHint.style.color = netApplies ? '' : 'var(--overlay0)';
+  }
+  if (rootsTA) rootsTA.value = (controlCodexConfig.writable_roots || []).join('\n');
+  updateControlAppliesNote();
+}
+
+function updateControlAppliesNote() {
+  const note = document.getElementById('control-applies-note');
+  if (!note) return;
+  if (controlBackendActive) {
+    note.textContent = 'task running — changes apply on next task';
+    note.classList.add('pending');
+  } else {
+    note.textContent = controlAppliesBaseText;
+    note.classList.remove('pending');
+  }
+}
+
+function dispatchControlMsg(payload) {
+  if (app && app.send_server_action) {
+    app.send_server_action(payload);
+  } else {
+    console.warn('control pane: no app connection, dropped', payload);
+  }
+}
+
+function onControlSandboxChange(ev) {
+  const mode = ev.target.value;
+  if (mode === controlCodexConfig.sandbox) return;
+  controlCodexConfig.sandbox = mode;
+  dispatchControlMsg({ action: 'set_codex_sandbox', mode });
+}
+
+function onControlApprovalChange(ev) {
+  const policy = ev.target.value;
+  if (policy === controlCodexConfig.approval_policy) return;
+  controlCodexConfig.approval_policy = policy;
+  dispatchControlMsg({ action: 'set_codex_approval_policy', policy });
+}
+
+function onControlModelCommit(ev) {
+  const model = ev.target.value.trim();
+  const current = (controlCodexConfig.model || '').trim();
+  if (model === current) return;
+  controlCodexConfig.model = model;
+  dispatchControlMsg({ action: 'set_codex_model', model: model || null });
+}
+
+function onControlReasoningChange(ev) {
+  const effort = ev.target.value;
+  if (effort === (controlCodexConfig.reasoning_effort || '')) return;
+  controlCodexConfig.reasoning_effort = effort;
+  dispatchControlMsg({ action: 'set_codex_reasoning_effort', effort: effort || null });
+}
+
+function onControlWebSearchChange(ev) {
+  const enabled = ev.target.checked;
+  controlCodexConfig.web_search = enabled;
+  const s = document.getElementById('control-codex-web-search-status');
+  if (s) s.textContent = enabled ? 'on' : 'off';
+  dispatchControlMsg({ action: 'set_codex_web_search', enabled });
+}
+
+function onControlNetworkChange(ev) {
+  const enabled = ev.target.checked;
+  controlCodexConfig.network_access = enabled;
+  const s = document.getElementById('control-codex-network-status');
+  if (s) s.textContent = enabled ? 'on' : 'off';
+  dispatchControlMsg({ action: 'set_codex_network_access', enabled });
+}
+
+function onControlWritableRootsCommit(ev) {
+  const raw = ev.target.value || '';
+  const roots = raw
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 0);
+  // Cheap dedupe-preserving-order so local state matches what the server will
+  // normalize to; avoids a no-op reassign on the CodexConfigChanged reply.
+  const deduped = [];
+  for (const r of roots) if (!deduped.includes(r)) deduped.push(r);
+  const current = controlCodexConfig.writable_roots || [];
+  if (
+    deduped.length === current.length &&
+    deduped.every((v, i) => v === current[i])
+  ) {
+    return;
+  }
+  controlCodexConfig.writable_roots = deduped;
+  dispatchControlMsg({ action: 'set_codex_writable_roots', roots: deduped });
+}
+
+// Apply a CodexConfigChanged event from the server, keeping the pane in
+// sync with toggles from other browsers (and our own server-confirmed write).
+function applyCodexConfigChanged(evt) {
+  if (evt.sandbox) controlCodexConfig.sandbox = evt.sandbox;
+  if (evt.approval_policy) controlCodexConfig.approval_policy = evt.approval_policy;
+  if (evt.model !== undefined && evt.model !== null) {
+    controlCodexConfig.model = evt.model;
+  } else if (evt.model_cleared) {
+    controlCodexConfig.model = '';
+  }
+  if (evt.reasoning_effort !== undefined && evt.reasoning_effort !== null) {
+    controlCodexConfig.reasoning_effort = evt.reasoning_effort;
+  } else if (evt.reasoning_effort_cleared) {
+    controlCodexConfig.reasoning_effort = '';
+  }
+  if (typeof evt.web_search === 'boolean') controlCodexConfig.web_search = evt.web_search;
+  if (typeof evt.network_access === 'boolean') controlCodexConfig.network_access = evt.network_access;
+  if (Array.isArray(evt.writable_roots)) controlCodexConfig.writable_roots = evt.writable_roots;
+  // Sandbox change may flip the network-access row's enabled state — full
+  // re-render is the simplest way to keep disabled-styling in sync.
+  renderControlPane();
+}
+
+// Track in-flight action dispatches so the UI can grey buttons out until a
+// matching CodexThreadActionResult arrives (or a short timeout elapses).
+const controlPendingActions = new Map(); // op -> { timeoutHandle, btnEl }
+
+function dispatchCodexThreadAction(op, params) {
+  dispatchControlMsg({ action: 'codex_thread_action', op, params: params || {} });
+}
+
+function showControlToast(kind, text) {
+  const body = document.querySelector('#activity-control-pane .control-pane-body');
+  if (!body) return;
+  const existing = body.querySelector('.control-toast');
+  if (existing) existing.remove();
+  const toast = document.createElement('div');
+  toast.className = 'control-toast ' + (kind === 'error' ? 'error' : 'success');
+  toast.textContent = text;
+  body.appendChild(toast);
+  setTimeout(() => {
+    if (toast.parentNode) toast.remove();
+  }, 4500);
+}
+
+function markActionPending(op) {
+  const btn = document.querySelector(`.control-action-btn[data-codex-action="${op}"]`);
+  if (btn) btn.classList.add('pending');
+  // Safety: if no result arrives in 10s, release the button ourselves.
+  const timeoutHandle = setTimeout(() => {
+    controlPendingActions.delete(op);
+    if (btn) btn.classList.remove('pending');
+  }, 10000);
+  controlPendingActions.set(op, { timeoutHandle, btnEl: btn });
+}
+
+function releaseActionPending(op) {
+  const entry = controlPendingActions.get(op);
+  if (!entry) return;
+  clearTimeout(entry.timeoutHandle);
+  if (entry.btnEl) entry.btnEl.classList.remove('pending');
+  controlPendingActions.delete(op);
+}
+
+function handleCodexThreadActionResult(evt) {
+  releaseActionPending(evt.action);
+  showControlToast(
+    evt.success ? 'success' : 'error',
+    evt.success
+      ? `/${evt.action}: ${evt.message}`
+      : `/${evt.action} failed: ${evt.message}`
+  );
+}
+
+function onControlActionBtnClick(ev) {
+  const btn = ev.currentTarget;
+  if (btn.classList.contains('pending') || btn.disabled) return;
+  const op = btn.dataset.codexAction;
+  if (!op) return;
+  let params = {};
+  // Prompt for the one action that needs a name (/fork) and the one that
+  // takes a free-form prompt (/review). Plain confirms keep the UI light —
+  // a dedicated modal can come later if someone wants better UX.
+  if (btn.dataset.promptName) {
+    const name = window.prompt('Fork name (leave empty for auto):', '');
+    if (name === null) return; // user cancelled
+    if (name.trim()) params.name = name.trim();
+  } else if (btn.dataset.promptReview) {
+    const prompt = window.prompt(
+      'Review prompt (leave empty to review current changes with Codex defaults):',
+      ''
+    );
+    if (prompt === null) return;
+    if (prompt.trim()) params.prompt = prompt.trim();
+  } else if (btn.dataset.turns) {
+    const n = parseInt(btn.dataset.turns, 10);
+    if (!isNaN(n) && n > 0) params.turns = n;
+  }
+  // Init is a task dispatch, not an RPC: send as a regular task instead so
+  // the agent loop picks it up and AGENTS.md flows through the normal
+  // approval path. The backend dispatcher also accepts /init and will
+  // return an error if it doesn't recognise it.
+  if (op === 'init') {
+    const task = 'Create or update AGENTS.md at the project root with a concise project description, directory structure, important commands, and coding conventions. Base it on the existing repository files.';
+    if (app && app.send_server_action) {
+      app.send_server_action({ action: 'start_task', task, direct: true });
+      showControlToast('success', '/init: dispatched AGENTS.md task');
+    }
+    return;
+  }
+  markActionPending(op);
+  dispatchCodexThreadAction(op, params);
+}
+
+function wireControlPaneListeners() {
+  const $ = id => document.getElementById(id);
+  const sandboxSel = $('control-codex-sandbox');
+  const approvalSel = $('control-codex-approval');
+  const modelInp = $('control-codex-model');
+  const reasoningSel = $('control-codex-reasoning');
+  const webSearch = $('control-codex-web-search');
+  const networkCb = $('control-codex-network');
+  const rootsTA = $('control-codex-writable-roots');
+  if (sandboxSel) sandboxSel.addEventListener('change', onControlSandboxChange);
+  if (approvalSel) approvalSel.addEventListener('change', onControlApprovalChange);
+  if (reasoningSel) reasoningSel.addEventListener('change', onControlReasoningChange);
+  if (webSearch) webSearch.addEventListener('change', onControlWebSearchChange);
+  if (networkCb) networkCb.addEventListener('change', onControlNetworkChange);
+  // Commit text inputs on blur or Enter so every keystroke doesn't ping the server.
+  if (modelInp) {
+    modelInp.addEventListener('change', onControlModelCommit);
+    modelInp.addEventListener('blur', onControlModelCommit);
+    modelInp.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        onControlModelCommit(ev);
+      }
+    });
+  }
+  if (rootsTA) {
+    rootsTA.addEventListener('change', onControlWritableRootsCommit);
+    rootsTA.addEventListener('blur', onControlWritableRootsCommit);
+    // Commit on Ctrl/Cmd+Enter; plain Enter is newline (textarea).
+    rootsTA.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
+        ev.preventDefault();
+        onControlWritableRootsCommit(ev);
+      }
+    });
+  }
+  document.querySelectorAll('.control-action-btn[data-codex-action]').forEach(btn => {
+    btn.addEventListener('click', onControlActionBtnClick);
+  });
+}
+
+// Wire up once at DOM ready. switchActivitySubtab('control') will
+// refreshControlPane() to populate values on first open.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', wireControlPaneListeners);
+} else {
+  wireControlPaneListeners();
+}
 
 function renderDiffLines(diffText) {
   if (!diffText) return '<span class="changes-empty">No changes</span>';
@@ -8638,6 +9412,10 @@ function switchActivitySubtab(name) {
   if (name === 'changes') {
     const badge = document.getElementById('badge-changes');
     if (badge) { badge.style.display = 'none'; badge.textContent = ''; }
+    // Populate the timeline on first view in case the user opened the
+    // Changes tab after a session had already racked up history
+    // (refreshHistory is a no-op when the endpoint 404s).
+    if (typeof refreshHistory === 'function') refreshHistory();
   }
 }
 
@@ -9768,6 +10546,11 @@ function renderDiskUsage(sessions) {
 function onSessionStarted(sessionId, task) {
   document.getElementById('sb-session').textContent = sessionId ? sessionId.slice(0, 8) : '';
   switchTab('activity');
+  // New session: clear any stale timeline and let the first
+  // `snapshot_created` event populate it, or populate from the current
+  // server state if the session already has rounds recorded (reconnect
+  // during an in-flight task).
+  if (typeof refreshHistory === 'function') refreshHistory();
 }
 
 function onSessionEnded(sessionId, reason) {

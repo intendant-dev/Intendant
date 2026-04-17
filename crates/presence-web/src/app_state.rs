@@ -135,6 +135,10 @@ pub enum UiCommand {
     PeerStateChanged {
         peer: serde_json::Value,
     },
+    /// Session history changed (snapshot_created / rolled_back / redone /
+    /// history_pruned). The JS layer re-fetches `/api/session/current/history`
+    /// and re-renders the Timeline UI in the Changes sub-tab.
+    HistoryChanged,
 }
 
 // ── File change tracking ──────────────────────────────────────────
@@ -1055,6 +1059,65 @@ impl AppState {
                 });
             }
 
+            // ---- Session history events (rollback / redo / prune) ----
+            //
+            // The authoritative timeline lives on the server. These events
+            // are just a signal that it changed — the JS layer re-fetches
+            // `/api/session/current/history` and re-renders the Timeline UI.
+            // We also surface short log entries at `detail` verbosity so
+            // users can trace rollback/redo chronologically in the Activity
+            // log.
+            "snapshot_created" => {
+                let id = msg["round_id"].as_u64().unwrap_or(0);
+                cmds.push(UiCommand::HistoryChanged);
+                cmds.extend(self.add_log(
+                    "detail",
+                    &format!("Snapshot created (round {})", id),
+                    None,
+                    "fs",
+                ));
+            }
+            "rolled_back" => {
+                let from = msg["from_id"].as_u64().unwrap_or(0);
+                let to = msg["to_id"].as_u64().unwrap_or(0);
+                let n = msg["files_reverted"].as_u64().unwrap_or(0);
+                cmds.push(UiCommand::HistoryChanged);
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!(
+                        "Rolled back from round {} to round {} ({} files reverted)",
+                        from, to, n
+                    ),
+                    None,
+                    "fs",
+                ));
+            }
+            "redone" => {
+                let to = msg["to_id"].as_u64().unwrap_or(0);
+                cmds.push(UiCommand::HistoryChanged);
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Redone to round {}", to),
+                    None,
+                    "fs",
+                ));
+            }
+            "history_pruned" => {
+                let removed = msg["branches_removed"].as_u64().unwrap_or(0);
+                let bytes = msg["bytes_freed"].as_u64().unwrap_or(0);
+                let mb = bytes as f64 / (1024.0 * 1024.0);
+                cmds.push(UiCommand::HistoryChanged);
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!(
+                        "History pruned: {} branches removed, {:.1} MB freed",
+                        removed, mb
+                    ),
+                    None,
+                    "fs",
+                ));
+            }
+
             // ---- Peer registry push events ----
             //
             // Forwarded as opaque JSON: the WASM layer doesn't interpret
@@ -1947,6 +2010,81 @@ mod tests {
         let cmds = s.handle_log_replay(&entries);
         assert!(s.changed_files.contains_key("src/lib.rs"));
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::FileChanged { .. })));
+    }
+
+    #[test]
+    fn handle_event_snapshot_created_emits_history_changed() {
+        let mut s = AppState::new();
+        s.verbosity = "verbose".to_string();
+        let msg = json!({"event": "snapshot_created", "round_id": 3});
+        let cmds = s.handle_message(&msg);
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::HistoryChanged)));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, .. } if content.contains("round 3")
+        )));
+    }
+
+    #[test]
+    fn handle_event_rolled_back_emits_history_changed() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "rolled_back",
+            "from_id": 5,
+            "to_id": 2,
+            "files_reverted": 7
+        });
+        let cmds = s.handle_message(&msg);
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::HistoryChanged)));
+        let saw_log = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, level, .. }
+                if level == "info"
+                    && content.contains("Rolled back")
+                    && content.contains("round 5")
+                    && content.contains("round 2")
+                    && content.contains("7 files")
+        ));
+        assert!(saw_log, "expected rollback log entry, got {:?}", cmds);
+    }
+
+    #[test]
+    fn handle_event_redone_emits_history_changed() {
+        let mut s = AppState::new();
+        let msg = json!({"event": "redone", "to_id": 4});
+        let cmds = s.handle_message(&msg);
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::HistoryChanged)));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, .. }
+                if content.contains("Redone") && content.contains("round 4")
+        )));
+    }
+
+    #[test]
+    fn handle_event_history_pruned_emits_history_changed() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "history_pruned",
+            "branches_removed": 3,
+            "bytes_freed": 2097152
+        });
+        let cmds = s.handle_message(&msg);
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::HistoryChanged)));
+        // 2 MiB exactly = "2.0 MB" formatted.
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, .. }
+                if content.contains("3 branches")
+                    && content.contains("2.0 MB")
+        )));
+    }
+
+    #[test]
+    fn history_changed_serializes_as_snake_case_cmd() {
+        let cmd = UiCommand::HistoryChanged;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"cmd\":\"history_changed\""), "got: {}", json);
     }
 
     #[test]
