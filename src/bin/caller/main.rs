@@ -4466,6 +4466,28 @@ All relative paths and commands execute from this directory.",
     result
 }
 
+/// RAII guard that increments the presence-pause ref-count on construction
+/// and decrements it on drop. Lets a direct-mode task pause server-side
+/// narration for its own duration without clobbering pause contributions
+/// from other sources (e.g. browser voice's PresenceConnected ref-count).
+struct PresencePauseGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PresencePauseGuard {
+    fn new(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for PresencePauseGuard {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Run with the presence layer mediating between user and agent loop.
 ///
 /// The presence layer runs in its own background task, handling user input
@@ -4495,106 +4517,159 @@ async fn run_with_presence(
     shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     web_port: Option<u16>,
 ) -> Result<LoopStats, CallerError> {
-    // 1. Create presence provider (small/fast model)
-    let presence_provider = provider::select_presence_provider(
+    // 1. Try to create presence provider. Degrade to silent mode on failure so
+    //    an external-agent-only run (e.g. codex with no API keys configured)
+    //    still starts. The main task loop below doesn't depend on the presence
+    //    LLM — it only needs `task_rx` alive.
+    let presence_provider_opt = match provider::select_presence_provider(
         project.config.presence.provider.as_deref(),
         project.config.presence.model.as_deref(),
-    )?;
-    bus.send(AppEvent::PresenceUsageUpdate {
-        total_tokens: 0,
-        context_window: project.config.presence.context_window,
-        usage_pct: 0.0,
-        provider: presence_provider.name().to_string(),
-        model: presence_provider.model().to_string(),
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        cached_tokens: 0,
-    });
+    ) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            bus.send(AppEvent::PresenceLog {
+                message: format!(
+                    "Presence LLM unavailable ({}). Running without narration — \
+                     dashboard chat and tasks will dispatch directly to the worker.",
+                    e
+                ),
+                level: Some(types::LogLevel::Warn),
+                turn: None,
+            });
+            None
+        }
+    };
 
-    // 2. Resolve presence system prompt (independent of sub-agent role system)
-    let presence_prompt = prompts::resolve_presence_prompt(Some(&project.root));
-
-    // 3. task_tx/task_rx are now created by the caller and passed in.
     let fallback_task_tx = task_tx.clone();
 
-    // 4. Create presence layer
-    let context_window = project.config.presence.context_window;
-    let mut presence = presence::PresenceLayer::new(
-        presence_provider,
-        presence_prompt,
-        context_window,
-        bus.clone(),
-        task_tx,
-        presence_event_rx,
-        agent_state.clone(),
-        project.memory_path(),
-        log_dir.clone(),
-        project.root.clone(),
-        presence_paused.clone(),
-        context_injection.clone(),
-    );
+    if let Some(presence_provider) = presence_provider_opt {
+        bus.send(AppEvent::PresenceUsageUpdate {
+            total_tokens: 0,
+            context_window: project.config.presence.context_window,
+            usage_pct: 0.0,
+            provider: presence_provider.name().to_string(),
+            model: presence_provider.model().to_string(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+        });
 
-    // 6. Send initial task to presence (if provided), with a timeout so a
-    //    slow or misconfigured presence provider doesn't freeze the TUI.
-    let mut presence_failed_task: Option<String> = None;
-    if let Some(ref task_str) = task {
-        let input = format!("The user wants: {}", task_str);
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(30),
-            presence.process_user_input(&input),
-        )
-        .await
-        {
-            Ok(Ok(response)) if !response.is_empty() => {
-                let _ = response_tx.send(response).await;
+        let presence_prompt = prompts::resolve_presence_prompt(Some(&project.root));
+        let context_window = project.config.presence.context_window;
+        let mut presence = presence::PresenceLayer::new(
+            presence_provider,
+            presence_prompt,
+            context_window,
+            bus.clone(),
+            task_tx,
+            presence_event_rx,
+            agent_state.clone(),
+            project.memory_path(),
+            log_dir.clone(),
+            project.root.clone(),
+            presence_paused.clone(),
+            context_injection.clone(),
+        );
+
+        // Send initial task to presence (if provided), with a timeout so a
+        // slow or misconfigured presence provider doesn't freeze the TUI.
+        let mut presence_failed_task: Option<String> = None;
+        if let Some(ref task_str) = task {
+            let input = format!("The user wants: {}", task_str);
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(30),
+                presence.process_user_input(&input),
+            )
+            .await
+            {
+                Ok(Ok(response)) if !response.is_empty() => {
+                    let _ = response_tx.send(response).await;
+                }
+                Ok(Err(e)) => {
+                    bus.send(AppEvent::PresenceLog {
+                        message: format!(
+                            "Presence provider error: {}. Use --no-presence or --direct to bypass. \
+                             Submitting task directly.",
+                            e
+                        ),
+                        level: Some(types::LogLevel::Warn),
+                        turn: None,
+                    });
+                    presence_failed_task = Some(task_str.clone());
+                }
+                Err(_) => {
+                    bus.send(AppEvent::PresenceLog {
+                        message: "Presence provider timed out (30s). Use --no-presence or --direct to bypass. \
+                             Submitting task directly."
+                            .to_string(),
+                        level: Some(types::LogLevel::Warn),
+                        turn: None,
+                    });
+                    presence_failed_task = Some(task_str.clone());
+                }
+                _ => {}
             }
-            Ok(Err(e)) => {
-                bus.send(AppEvent::PresenceLog {
-                    message: format!(
-                        "Presence provider error: {}. Use --no-presence or --direct to bypass. \
-                         Submitting task directly.",
-                        e
-                    ),
-                    level: Some(types::LogLevel::Warn),
-                    turn: None,
-                });
-                presence_failed_task = Some(task_str.clone());
-            }
-            Err(_) => {
-                bus.send(AppEvent::PresenceLog {
-                    message: "Presence provider timed out (30s). Use --no-presence or --direct to bypass. \
-                         Submitting task directly."
-                        .to_string(),
-                    level: Some(types::LogLevel::Warn),
-                    turn: None,
-                });
-                presence_failed_task = Some(task_str.clone());
-            }
-            _ => {}
         }
-    }
 
-    // If presence failed on the initial task, inject the task directly into
-    // the task channel so the agent loop still runs.
-    if let Some(failed_task) = presence_failed_task {
-        let envelope = presence::TaskEnvelope {
-            task: failed_task,
-            force_direct: true,
-            context_hints: vec![],
-            reference_frame_ids: vec![],
-            display_target: None,
-            attachment_frame_ids: vec![],
-        };
-        let _ = fallback_task_tx.send(envelope).await;
-    }
-    drop(fallback_task_tx);
+        if let Some(failed_task) = presence_failed_task {
+            let envelope = presence::TaskEnvelope {
+                task: failed_task,
+                force_direct: true,
+                context_hints: vec![],
+                reference_frame_ids: vec![],
+                display_target: None,
+                attachment_frame_ids: vec![],
+            };
+            let _ = fallback_task_tx.send(envelope).await;
+        }
+        drop(fallback_task_tx);
 
-    // 7. Spawn presence.run() as a background task for user input + event narration.
-    //    This loop handles both user messages and agent events, forwarding
-    //    responses to the TUI via response_tx.
-    let _presence_handle = tokio::spawn(async move {
-        presence.run(user_rx, response_tx).await;
-    });
+        // Spawn presence.run() for user input + event narration.
+        let _presence_handle = tokio::spawn(async move {
+            presence.run(user_rx, response_tx).await;
+        });
+    } else {
+        // Silent mode: no presence LLM. Inject the initial task directly and
+        // forward subsequent user text from the dashboard chat into task_tx
+        // as force_direct envelopes. presence_event_rx and response_tx are
+        // dropped at scope exit — no consumer for them without a PresenceLayer.
+        let _ = presence_event_rx;
+        let _ = response_tx;
+        let _ = agent_state;
+        let _ = context_injection;
+
+        if let Some(task_str) = task.as_ref() {
+            let envelope = presence::TaskEnvelope {
+                task: task_str.clone(),
+                force_direct: true,
+                context_hints: vec![],
+                reference_frame_ids: vec![],
+                display_target: None,
+                attachment_frame_ids: vec![],
+            };
+            let _ = fallback_task_tx.send(envelope).await;
+        }
+        // Keep task_tx alive for the forwarder below; drop the extra clone.
+        drop(fallback_task_tx);
+
+        let forwarder_tx = task_tx;
+        let mut user_rx = user_rx;
+        tokio::spawn(async move {
+            while let Some(text) = user_rx.recv().await {
+                let envelope = presence::TaskEnvelope {
+                    task: text,
+                    force_direct: true,
+                    context_hints: vec![],
+                    reference_frame_ids: vec![],
+                    display_target: None,
+                    attachment_frame_ids: vec![],
+                };
+                if forwarder_tx.send(envelope).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     // 8. Persistent server conversation across all presence tasks.
     //    First task initializes the conversation; subsequent tasks inject new
@@ -4637,14 +4712,17 @@ async fn run_with_presence(
             envelope.attachment_frame_ids.len(),
         );
 
-        // Resume presence from any previous direct-mode pause
-        presence_paused.store(0, std::sync::atomic::Ordering::Relaxed);
-        // Pause presence for direct-mode tasks — no narration, no hallucinated
-        // side-tasks, no 400 errors from Gemini. Presence is for human interaction;
-        // programmatic clients (WebSocket with direct:true) don't need it.
-        if envelope.force_direct {
-            presence_paused.store(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        // Pause server-side presence narration for direct-mode tasks — no
+        // narration, no hallucinated side-tasks, no 400 errors from Gemini.
+        // Programmatic clients (WebSocket with direct:true) don't need it.
+        // Uses fetch_add/fetch_sub so it composes with browser voice's
+        // ref-count (PresenceConnected += 1, PresenceDisconnected -= 1) —
+        // each pause source is one independent reason to mute narration.
+        let _direct_pause = if envelope.force_direct {
+            Some(PresencePauseGuard::new(presence_paused.clone()))
+        } else {
+            None
+        };
 
         slog(&session_log, |l| {
             l.debug(&format!(
