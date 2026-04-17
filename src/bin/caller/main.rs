@@ -7496,15 +7496,18 @@ async fn main() -> Result<(), CallerError> {
         );
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let _watcher_handle = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(
                 project.root.clone(), snapshot_dir, bus.clone(),
             ) {
-                Ok(watcher) => Some(watcher.start()),
+                Ok(watcher) => {
+                    let (fw, wh, rh) = watcher.start_shared();
+                    (Some(fw), Some(wh), Some(rh))
+                }
                 Err(e) => {
                     eprintln!("[file_watcher] Failed to start: {}", e);
-                    None
+                    (None, None, None)
                 }
             }
         };
@@ -7540,6 +7543,7 @@ async fn main() -> Result<(), CallerError> {
                     session_registry: Some(session_registry.clone()),
                     snapshot_dir: Some(snapshot_dir.clone()),
                     project_root_for_changes: Some(project.root.clone()),
+                    file_watcher: shared_file_watcher.clone(),
                 },
             ));
             let mut mcp_http_state = mcp::McpAppState::new(
@@ -7915,15 +7919,18 @@ async fn main() -> Result<(), CallerError> {
         );
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let _watcher_handle = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(
                 project.root.clone(), snapshot_dir, bus.clone(),
             ) {
-                Ok(watcher) => Some(watcher.start()),
+                Ok(watcher) => {
+                    let (fw, wh, rh) = watcher.start_shared();
+                    (Some(fw), Some(wh), Some(rh))
+                }
                 Err(e) => {
                     eprintln!("[file_watcher] Failed to start: {}", e);
-                    None
+                    (None, None, None)
                 }
             }
         };
@@ -8070,6 +8077,7 @@ async fn main() -> Result<(), CallerError> {
                     session_registry: Some(session_registry.clone()),
                     snapshot_dir: Some(snapshot_dir.clone()),
                     project_root_for_changes: Some(project.root.clone()),
+                    file_watcher: shared_file_watcher.clone(),
                 },
             ));
             // Create MCP server for HTTP transport (display/CU tools for external agents)
@@ -8470,15 +8478,18 @@ async fn main() -> Result<(), CallerError> {
         );
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let _watcher_handle = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(
                 project.root.clone(), snapshot_dir, bus.clone(),
             ) {
-                Ok(watcher) => Some(watcher.start()),
+                Ok(watcher) => {
+                    let (fw, wh, rh) = watcher.start_shared();
+                    (Some(fw), Some(wh), Some(rh))
+                }
                 Err(e) => {
                     eprintln!("[file_watcher] Failed to start: {}", e);
-                    None
+                    (None, None, None)
                 }
             }
         };
@@ -8527,6 +8538,7 @@ async fn main() -> Result<(), CallerError> {
                     session_registry: Some(session_registry.clone()),
                     snapshot_dir: Some(snapshot_dir.clone()),
                     project_root_for_changes: Some(project.root.clone()),
+                    file_watcher: shared_file_watcher.clone(),
                 },
             ));
             let mut mcp_http_state = mcp::McpAppState::new(

@@ -1595,6 +1595,108 @@ html, body {
   margin-left: 4px;
 }
 
+/* ── Timeline (history) strip in the Changes sub-tab ── */
+.changes-timeline {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--surface1);
+  background: var(--mantle);
+}
+.timeline-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.timeline-title {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text);
+}
+.timeline-controls {
+  display: flex;
+  gap: 4px;
+}
+.timeline-btn {
+  background: var(--surface0);
+  color: var(--text);
+  border: 1px solid var(--surface1);
+  border-radius: 3px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.timeline-btn:hover:not(:disabled) {
+  background: var(--surface1);
+}
+.timeline-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.timeline-rounds {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  padding: 4px 0;
+}
+.timeline-round {
+  flex-shrink: 0;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  border: 1px solid var(--surface1);
+  background: var(--surface0);
+  color: var(--subtext1);
+  min-width: 60px;
+  text-align: center;
+}
+.timeline-round:hover {
+  border-color: var(--blue);
+  color: var(--text);
+}
+.timeline-round.current {
+  background: var(--blue);
+  color: var(--base);
+  border-color: var(--blue);
+  font-weight: 600;
+}
+.timeline-round.future {
+  opacity: 0.6;
+}
+.timeline-round .round-id {
+  display: block;
+  font-weight: 600;
+}
+.timeline-round .round-files {
+  display: block;
+  font-size: 9px;
+  color: var(--overlay1);
+}
+.timeline-round.current .round-files {
+  color: var(--base);
+  opacity: 0.7;
+}
+#timeline-abandoned {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--subtext0);
+}
+#timeline-abandoned summary {
+  cursor: pointer;
+  padding: 2px 0;
+}
+.abandoned-branch {
+  padding: 4px 8px;
+  margin: 2px 0;
+  background: var(--surface0);
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
 /* ── Control sub-tab ── */
 .control-pane-body {
   padding: 16px 20px;
@@ -3156,18 +3258,24 @@ html, body {
             </div>
           </div>
 
-          <!-- Follow-up Panel -->
-          <div class="bottom-panel" id="followup-panel">
-            <div class="panel-header">Follow Up</div>
-            <div class="panel-body">
-              <div class="input-area">
-                <textarea id="followup-input" rows="2" placeholder="Type follow-up message..."></textarea>
-                <button onclick="sendFollowUp()">Send</button>
-              </div>
-            </div>
-          </div>
+          <!-- Follow-up is handled by the always-visible activity-task-input
+               at the top of this pane. No separate follow-up panel needed. -->
         </div>
         <div class="subtab-pane" id="activity-changes-pane">
+          <div class="changes-timeline" id="changes-timeline" style="display:none">
+            <div class="timeline-header">
+              <span class="timeline-title">History</span>
+              <div class="timeline-controls">
+                <button id="redo-btn" class="timeline-btn" onclick="doRedo()" title="Redo the last rollback" disabled>&#x21bb; Redo</button>
+                <button id="prune-btn" class="timeline-btn" onclick="doPrune()" title="Prune abandoned branches">&#x1f5d1; Prune</button>
+              </div>
+            </div>
+            <div class="timeline-rounds" id="timeline-rounds"></div>
+            <details id="timeline-abandoned" style="display:none">
+              <summary>Abandoned branches (<span id="abandoned-count">0</span>)</summary>
+              <div id="abandoned-list"></div>
+            </details>
+          </div>
           <div class="changes-container">
             <div class="changes-sidebar" id="changes-file-list">
               <div class="changes-empty">No file changes yet</div>
@@ -4808,6 +4916,9 @@ async function main() {
     }
     if (msg && msg.conversation_context) storedConversationCtx = msg.conversation_context;
     if (modelConnected) app.inject_pending_approval_if_any();
+    // Bootstrap/reconnect: populate the timeline from whatever the
+    // server has now so users coming in mid-session see it immediately.
+    if (typeof refreshHistory === 'function') refreshHistory();
   });
 
   app.set_on_server_event((evt) => {
@@ -5041,8 +5152,6 @@ function processCommands(cmds) {
       case 'hide_approval': hidePanel('approval-panel'); break;
       case 'show_human_input': showHumanInput(c.question); break;
       case 'hide_human_input': hidePanel('human-panel'); break;
-      case 'show_follow_up': showPanel('followup-panel'); break;
-      case 'hide_follow_up': hidePanel('followup-panel'); break;
       case 'hide_all_panels': hideAllPanels(); break;
       case 'update_usage':
         // Cache the payload under the self host so the Stats host
@@ -5070,6 +5179,11 @@ function processCommands(cmds) {
         break;
       case 'file_changed':
         onFileChanged(c.path, c.kind, c.lines_added, c.lines_removed);
+        break;
+      case 'history_changed':
+        // Session history changed (snapshot / rollback / redo / prune).
+        // Re-fetch the authoritative timeline and re-render the strip.
+        refreshHistory();
         break;
       case 'codex_config_changed':
         applyCodexConfigChanged(c);
@@ -5151,6 +5265,170 @@ async function selectChangesFile(path) {
   }
 }
 window.selectChangesFile = selectChangesFile;
+
+// ── Timeline (rollback / redo / prune) ──
+//
+// Backend exposes the session's round-level history at
+// `GET /api/session/current/history` and lets the user rewind /
+// fast-forward / drop abandoned branches via POST endpoints. The UI is
+// intentionally thin: we refetch-and-render on every change rather than
+// trying to reconstruct the timeline from event deltas, so the server
+// remains the single source of truth.
+//
+// Lifecycle:
+// - WASM raises `UiCommand::HistoryChanged` in response to
+//   snapshot_created / rolled_back / redone / history_pruned events.
+// - processCommands -> refreshHistory() -> fetch + renderTimeline.
+// - On initial Changes-tab open we also call refreshHistory() so a
+//   session resumed mid-flight shows its existing timeline immediately.
+
+let historyCache = null;
+
+async function refreshHistory() {
+  try {
+    const r = await fetch('/api/session/current/history');
+    if (!r.ok) {
+      // Older sessions or sessions without history support return 404.
+      // Hide the timeline rather than showing a confusing error.
+      historyCache = null;
+      const wrap = document.getElementById('changes-timeline');
+      if (wrap) wrap.style.display = 'none';
+      return;
+    }
+    historyCache = await r.json();
+    renderTimeline();
+  } catch (e) {
+    // Network error — stay silent; the WS event for the next mutation
+    // will re-trigger us and the user can still navigate the UI.
+    historyCache = null;
+  }
+}
+window.refreshHistory = refreshHistory;
+
+function renderTimeline() {
+  const wrap = document.getElementById('changes-timeline');
+  if (!wrap) return;
+  if (!historyCache) {
+    wrap.style.display = 'none';
+    return;
+  }
+  const rounds = Array.isArray(historyCache.rounds) ? historyCache.rounds : [];
+  if (rounds.length === 0) {
+    wrap.style.display = 'none';
+    return;
+  }
+  wrap.style.display = '';
+  const current = historyCache.current_head_id;
+  const currentIdx = rounds.findIndex(r => r.id === current);
+  const container = document.getElementById('timeline-rounds');
+  if (container) {
+    container.innerHTML = rounds.map((r, i) => {
+      const cls = i === currentIdx ? 'current'
+                  : (currentIdx >= 0 && i > currentIdx) ? 'future'
+                  : '';
+      const filesN = Array.isArray(r.files_changed) ? r.files_changed.length : 0;
+      const summary = (r.summary || '').toString();
+      const tipSummary = summary.length > 80 ? summary.slice(0, 80) + '...' : summary;
+      const sumPart = tipSummary ? ` \u2014 ${tipSummary}` : '';
+      const tip = `Round ${r.id}${sumPart} \u2014 ${filesN} file${filesN === 1 ? '' : 's'} changed`;
+      return `<div class="timeline-round ${cls}" title="${escapeHtml(tip)}" onclick="doRollback(${r.id})">`
+        + `<span class="round-id">#${r.id}</span>`
+        + `<span class="round-files">${filesN} file${filesN === 1 ? '' : 's'}</span>`
+        + `</div>`;
+    }).join('');
+  }
+
+  // Redo is only meaningful after a rollback — current_head must exist
+  // and not be the last recorded round.
+  const redoBtn = document.getElementById('redo-btn');
+  if (redoBtn) {
+    redoBtn.disabled = currentIdx < 0 || currentIdx >= rounds.length - 1;
+  }
+
+  // Abandoned branches (rolled-back rounds that later drifted from
+  // current HEAD). Collapsed by default so the main strip stays compact.
+  const abandoned = Array.isArray(historyCache.abandoned_branches)
+    ? historyCache.abandoned_branches
+    : [];
+  const det = document.getElementById('timeline-abandoned');
+  if (det) {
+    if (abandoned.length === 0) {
+      det.style.display = 'none';
+    } else {
+      det.style.display = '';
+      const countEl = document.getElementById('abandoned-count');
+      if (countEl) countEl.textContent = String(abandoned.length);
+      const listEl = document.getElementById('abandoned-list');
+      if (listEl) {
+        listEl.innerHTML = abandoned.map((b, i) => {
+          const n = Array.isArray(b.rounds) ? b.rounds.length : 0;
+          const from = b.branched_from_id != null ? `#${b.branched_from_id}` : '?';
+          return `<div class="abandoned-branch">`
+            + `<span>Branch ${i + 1}: ${n} round${n === 1 ? '' : 's'} from ${escapeHtml(from)}</span>`
+            + `</div>`;
+        }).join('');
+      }
+    }
+  }
+}
+
+async function doRollback(roundId) {
+  if (!Number.isFinite(roundId)) return;
+  const msg = `Roll back to round #${roundId}?\n\nFiles will be reverted to the snapshot at the end of that round. `
+    + `Later rounds are preserved and can be restored via Redo or from Abandoned branches.`;
+  if (!confirm(msg)) return;
+  try {
+    const r = await fetch('/api/session/current/rollback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ round_id: roundId }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      alert(`Rollback failed: ${err.error || r.statusText}`);
+      return;
+    }
+    // The `rolled_back` WS event will trigger refreshHistory().
+  } catch (e) {
+    alert(`Rollback error: ${e.message || e}`);
+  }
+}
+window.doRollback = doRollback;
+
+async function doRedo() {
+  try {
+    const r = await fetch('/api/session/current/redo', { method: 'POST' });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      alert(`Redo failed: ${err.error || r.statusText}`);
+    }
+  } catch (e) {
+    alert(`Redo error: ${e.message || e}`);
+  }
+}
+window.doRedo = doRedo;
+
+async function doPrune() {
+  if (!confirm('Prune all abandoned branches?\n\nThis frees disk space but cannot be undone.')) return;
+  try {
+    const r = await fetch('/api/session/current/prune', { method: 'POST' });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      alert(`Prune failed: ${err.error || r.statusText}`);
+      return;
+    }
+    // History event will redraw; the console line is a belt-and-suspenders
+    // confirmation so curious users can verify the server response shape.
+    const data = await r.json().catch(() => ({}));
+    if (typeof data.bytes_freed === 'number') {
+      const mb = (data.bytes_freed / 1024 / 1024).toFixed(1);
+      console.log(`Pruned ${data.branches_removed || 0} branches, ${mb} MB freed`);
+    }
+  } catch (e) {
+    alert(`Prune error: ${e.message || e}`);
+  }
+}
+window.doPrune = doPrune;
 
 // ── Control sub-tab ──
 //
@@ -9597,6 +9875,10 @@ function switchActivitySubtab(name) {
   if (name === 'changes') {
     const badge = document.getElementById('badge-changes');
     if (badge) { badge.style.display = 'none'; badge.textContent = ''; }
+    // Populate the timeline on first view in case the user opened the
+    // Changes tab after a session had already racked up history
+    // (refreshHistory is a no-op when the endpoint 404s).
+    if (typeof refreshHistory === 'function') refreshHistory();
   }
   if (name === 'control') {
     refreshControlPane();
@@ -10730,6 +11012,11 @@ function renderDiskUsage(sessions) {
 function onSessionStarted(sessionId, task) {
   document.getElementById('sb-session').textContent = sessionId ? sessionId.slice(0, 8) : '';
   switchTab('activity');
+  // New session: clear any stale timeline and let the first
+  // `snapshot_created` event populate it, or populate from the current
+  // server state if the session already has rounds recorded (reconnect
+  // during an in-flight task).
+  if (typeof refreshHistory === 'function') refreshHistory();
 }
 
 function onSessionEnded(sessionId, reason) {
@@ -11570,19 +11857,6 @@ window.sendHumanResponse = function() {
   processCommands(app.send_human_response(text));
   input.value = '';
 };
-window.sendFollowUp = function() {
-  const input = document.getElementById('followup-input');
-  const text = input.value.trim();
-  if (!text || !app) return;
-  const direct = document.getElementById('direct-mode-toggle')?.checked || false;
-  // Unified submit: always send `start_task` regardless of phase (see note
-  // on submitActivityTask above). The backend dispatcher routes based on
-  // mode and the `direct` flag.
-  const msg = { action: 'start_task', task: text };
-  if (direct) msg.direct = true;
-  app.send_server_action(msg);
-  input.value = '';
-};
 
 // Request interruption of the current agent turn. Disables the button and
 // flips the label to "Interrupting..." until the phase leaves `interrupting`
@@ -11781,14 +12055,11 @@ document.addEventListener('keydown', (e) => {
 });
 
 // Enter to submit
-document.querySelectorAll('#human-input, #followup-input').forEach(ta => {
-  ta.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      if (ta.id === 'human-input') window.sendHumanResponse();
-      else window.sendFollowUp();
-    }
-  });
+document.querySelector('#human-input')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    window.sendHumanResponse();
+  }
 });
 document.getElementById('activity-task-input')?.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); submitActivityTask(); }

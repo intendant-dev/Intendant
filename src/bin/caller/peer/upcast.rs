@@ -274,7 +274,11 @@ impl AppEventUpcaster {
             | AppEvent::DisplayMetrics { .. }
             | AppEvent::CodexThreadActionRequested { .. }
             | AppEvent::GeminiThreadActionRequested { .. }
-            | AppEvent::FileChanged { .. } => vec![],
+            | AppEvent::FileChanged { .. }
+            | AppEvent::SnapshotCreated { .. }
+            | AppEvent::RolledBack { .. }
+            | AppEvent::Redone { .. }
+            | AppEvent::HistoryPruned { .. } => vec![],
 
             AppEvent::CodexThreadActionResult { action, success, message } => vec![log_event(
                 if *success { LogLevel::Info } else { LogLevel::Warn },
@@ -1155,6 +1159,10 @@ impl WireEventUpcaster {
             OutboundEvent::Unknown
             | OutboundEvent::DisplayMetrics { .. }
             | OutboundEvent::FileChanged { .. }
+            | OutboundEvent::SnapshotCreated { .. }
+            | OutboundEvent::RolledBack { .. }
+            | OutboundEvent::Redone { .. }
+            | OutboundEvent::HistoryPruned { .. }
             | OutboundEvent::PeerAdded { .. }
             | OutboundEvent::PeerRemoved { .. }
             | OutboundEvent::PeerStateChanged { .. } => vec![],

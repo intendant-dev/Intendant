@@ -477,6 +477,27 @@ pub enum AppEvent {
         lines_removed: u32,
     },
 
+    // ---- File snapshot history (per-round) ----
+    /// A new per-round snapshot was recorded.
+    SnapshotCreated {
+        round_id: u64,
+    },
+    /// The project tree was rolled back to a prior round.
+    RolledBack {
+        from_id: u64,
+        to_id: u64,
+        files_reverted: u32,
+    },
+    /// `current_head_id` advanced forward along the linear history.
+    Redone {
+        to_id: u64,
+    },
+    /// Abandoned branches were pruned and orphaned blobs GC'd.
+    HistoryPruned {
+        branches_removed: u32,
+        bytes_freed: u64,
+    },
+
     // TUI internal
     Tick,
     #[allow(dead_code)]
@@ -1150,6 +1171,23 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 lines_removed: *lines_removed,
             })
         }
+        AppEvent::SnapshotCreated { round_id } => {
+            Some(OutboundEvent::SnapshotCreated { round_id: *round_id })
+        }
+        AppEvent::RolledBack { from_id, to_id, files_reverted } => {
+            Some(OutboundEvent::RolledBack {
+                from_id: *from_id,
+                to_id: *to_id,
+                files_reverted: *files_reverted,
+            })
+        }
+        AppEvent::Redone { to_id } => Some(OutboundEvent::Redone { to_id: *to_id }),
+        AppEvent::HistoryPruned { branches_removed, bytes_freed } => {
+            Some(OutboundEvent::HistoryPruned {
+                branches_removed: *branches_removed,
+                bytes_freed: *bytes_freed,
+            })
+        }
         // Terminal-only / internal events — not broadcast to external consumers
         AppEvent::Key(_)
         | AppEvent::Resize(_, _)
@@ -1397,6 +1435,18 @@ fn write_event_to_session_log(
                 .and_then(|v| v.as_str().map(String::from))
                 .unwrap_or_else(|| "modified".to_string());
             log.info(&format!("file_{}: {} (+{}/-{})", kind_str, path, lines_added, lines_removed));
+        }
+        AppEvent::SnapshotCreated { round_id } => {
+            log.snapshot_created(*round_id);
+        }
+        AppEvent::RolledBack { from_id, to_id, files_reverted } => {
+            log.rolled_back(*from_id, *to_id, *files_reverted);
+        }
+        AppEvent::Redone { to_id } => {
+            log.redone(*to_id);
+        }
+        AppEvent::HistoryPruned { branches_removed, bytes_freed } => {
+            log.history_pruned(*branches_removed, *bytes_freed);
         }
 
         // ---- Events already logged inline by the agent loop or web_gateway ----

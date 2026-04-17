@@ -2144,7 +2144,11 @@ impl App {
             | AppEvent::GeminiConfigChanged { .. }
             | AppEvent::GeminiThreadActionRequested { .. }
             | AppEvent::GeminiThreadActionResult { .. }
-            | AppEvent::FileChanged { .. } => {
+            | AppEvent::FileChanged { .. }
+            | AppEvent::SnapshotCreated { .. }
+            | AppEvent::RolledBack { .. }
+            | AppEvent::Redone { .. }
+            | AppEvent::HistoryPruned { .. } => {
                 // Derived events — just pass through to outbound broadcaster.
                 // App doesn't need to handle its own output.
             }
