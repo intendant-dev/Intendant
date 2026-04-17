@@ -2959,16 +2959,8 @@ html, body {
             </div>
           </div>
 
-          <!-- Follow-up Panel -->
-          <div class="bottom-panel" id="followup-panel">
-            <div class="panel-header">Follow Up</div>
-            <div class="panel-body">
-              <div class="input-area">
-                <textarea id="followup-input" rows="2" placeholder="Type follow-up message..."></textarea>
-                <button onclick="sendFollowUp()">Send</button>
-              </div>
-            </div>
-          </div>
+          <!-- Follow-up is handled by the always-visible activity-task-input
+               at the top of this pane. No separate follow-up panel needed. -->
         </div>
         <div class="subtab-pane" id="activity-changes-pane">
           <div class="changes-container">
@@ -4650,8 +4642,6 @@ function processCommands(cmds) {
       case 'hide_approval': hidePanel('approval-panel'); break;
       case 'show_human_input': showHumanInput(c.question); break;
       case 'hide_human_input': hidePanel('human-panel'); break;
-      case 'show_follow_up': showPanel('followup-panel'); break;
-      case 'hide_follow_up': hidePanel('followup-panel'); break;
       case 'hide_all_panels': hideAllPanels(); break;
       case 'update_usage':
         // Cache the payload under the self host so the Stats host
@@ -10618,19 +10608,6 @@ window.sendHumanResponse = function() {
   processCommands(app.send_human_response(text));
   input.value = '';
 };
-window.sendFollowUp = function() {
-  const input = document.getElementById('followup-input');
-  const text = input.value.trim();
-  if (!text || !app) return;
-  const direct = document.getElementById('direct-mode-toggle')?.checked || false;
-  // Unified submit: always send `start_task` regardless of phase (see note
-  // on submitActivityTask above). The backend dispatcher routes based on
-  // mode and the `direct` flag.
-  const msg = { action: 'start_task', task: text };
-  if (direct) msg.direct = true;
-  app.send_server_action(msg);
-  input.value = '';
-};
 
 // Request interruption of the current agent turn. Disables the button and
 // flips the label to "Interrupting..." until the phase leaves `interrupting`
@@ -10820,14 +10797,11 @@ document.addEventListener('keydown', (e) => {
 });
 
 // Enter to submit
-document.querySelectorAll('#human-input, #followup-input').forEach(ta => {
-  ta.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      if (ta.id === 'human-input') window.sendHumanResponse();
-      else window.sendFollowUp();
-    }
-  });
+document.querySelector('#human-input')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    window.sendHumanResponse();
+  }
 });
 document.getElementById('activity-task-input')?.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); submitActivityTask(); }

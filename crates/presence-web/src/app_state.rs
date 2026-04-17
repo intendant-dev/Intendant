@@ -60,8 +60,6 @@ pub enum UiCommand {
         question: String,
     },
     HideHumanInput,
-    ShowFollowUp,
-    HideFollowUp,
     HideAllPanels,
     UpdateUsage {
         main_json: Option<String>,
@@ -543,12 +541,6 @@ impl AppState {
             }
         }
 
-        // Follow-up panel for idle/done/interrupted phases
-        let np = phase.replace('_', "");
-        if np == "waitingfollowup" || np == "idle" || np == "done" || np == "interrupted" {
-            cmds.push(UiCommand::ShowFollowUp);
-        }
-
         cmds
     }
 
@@ -804,7 +796,6 @@ impl AppState {
                     _ => format!("Task complete: {}", reason),
                 };
                 cmds.extend(self.add_log("info", &text, None, "worker"));
-                cmds.push(UiCommand::ShowFollowUp);
             }
 
             "interrupt_requested" => {
@@ -827,7 +818,6 @@ impl AppState {
                     None,
                     "system",
                 ));
-                cmds.push(UiCommand::ShowFollowUp);
             }
 
             "round_complete" => {
@@ -837,7 +827,6 @@ impl AppState {
 
                 cmds.push(UiCommand::SetPhase { phase: "idle".into() });
                 cmds.extend(self.add_log("info", &format!("Round {} complete ({} turns)", round, turns), None, "system"));
-                cmds.push(UiCommand::ShowFollowUp);
             }
 
             "status" => {
@@ -1469,7 +1458,6 @@ mod tests {
         let cmds = s.handle_message(&msg);
         assert_eq!(s.phase, "done");
         assert!(s.pending_approval_id.is_none());
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::ShowFollowUp)));
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::HideAllPanels)));
     }
 
@@ -1764,7 +1752,7 @@ mod tests {
         let msg = json!({"event": "round_complete", "round": 2, "turns_in_round": 5});
         let cmds = s.handle_message(&msg);
         assert_eq!(s.phase, "idle");
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::ShowFollowUp)));
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "idle")));
     }
 
     #[test]
@@ -1988,7 +1976,6 @@ mod tests {
             UiCommand::AddLogEntry { content, level, .. }
                 if content == "Agent interrupted: test" && level == "warn"
         )));
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::ShowFollowUp)));
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::HideAllPanels)));
     }
 
@@ -2006,15 +1993,14 @@ mod tests {
     }
 
     #[test]
-    fn handle_state_snapshot_interrupted_shows_follow_up() {
+    fn handle_state_snapshot_interrupted_sets_phase() {
         let mut s = AppState::new();
         let msg = json!({
             "t": "state_snapshot",
             "state": { "turn": 2, "budget_pct": 10.0, "phase": "interrupted" },
         });
-        let cmds = s.handle_message(&msg);
+        let _cmds = s.handle_message(&msg);
         assert_eq!(s.phase, "interrupted");
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::ShowFollowUp)));
     }
 
     #[test]
