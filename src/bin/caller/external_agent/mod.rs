@@ -259,6 +259,21 @@ pub trait ExternalAgent: Send + Sync {
         ))
     }
 
+    /// Dispatch a backend-specific thread action (Codex: compact, fork,
+    /// rollback, review, memory-reset; other backends currently reject).
+    /// Returns a short human-readable status message on success.
+    async fn thread_action(
+        &mut self,
+        op: &str,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
+        let _ = params;
+        Err(CallerError::ExternalAgent(format!(
+            "thread action /{} not supported by this backend",
+            op
+        )))
+    }
+
     /// Shut down the agent process.
     async fn shutdown(&mut self) -> Result<(), CallerError>;
 }

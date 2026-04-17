@@ -228,6 +228,15 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 ..Default::default()
             }));
         }
+        ControlMsg::CodexThreadAction { op, params } => {
+            // Republish as an AppEvent so the daemon-side watcher (which
+            // owns the persistent Codex agent) can pick it up and run the
+            // RPC. We don't own the agent here, so we only translate.
+            state.bus.send(AppEvent::CodexThreadActionRequested {
+                action: op.clone(),
+                params: params.clone(),
+            });
+        }
         ControlMsg::SetCodexWritableRoots { roots } => {
             let normalized = normalize_writable_roots(roots);
             {
@@ -640,6 +649,51 @@ mod tests {
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch { enabled: false }));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!codex_config.read().await.web_search);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_thread_action_rebroadcasts_as_requested_event() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        // Subscribe BEFORE spawning so we don't miss the broadcast.
+        let mut rx = bus.subscribe();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config,
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+            op: "compact".to_string(),
+            params: serde_json::json!({"extra": "data"}),
+        }));
+
+        // Drain up to a handful of events looking for the broadcast.
+        let mut found = false;
+        for _ in 0..20 {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(AppEvent::CodexThreadActionRequested { action, params })) => {
+                    assert_eq!(action, "compact");
+                    assert_eq!(params["extra"], "data");
+                    found = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(found, "expected CodexThreadActionRequested on bus");
 
         handle.abort();
     }

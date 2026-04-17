@@ -1224,6 +1224,16 @@ impl App {
                     format!("Codex writable roots → {} (applies on next task)", summary),
                 );
             }
+            ControlMsg::CodexThreadAction { ref op, .. } => {
+                // The daemon-side watcher logs the result; here we just
+                // acknowledge that the user triggered the action so the TUI
+                // log bar reflects it immediately (the result may take a
+                // few hundred ms depending on the RPC).
+                self.log(
+                    LogLevel::Info,
+                    format!("Codex thread action: {}", op),
+                );
+            }
             ControlMsg::SetVerbosity { level } => {
                 let new_verbosity = match level.to_lowercase().as_str() {
                     "quiet" => Some(Verbosity::Quiet),
@@ -2056,6 +2066,8 @@ impl App {
             | AppEvent::DisplayMetrics { .. } | AppEvent::DisplayResize { .. }
             | AppEvent::ExternalAgentChanged { .. }
             | AppEvent::CodexConfigChanged { .. }
+            | AppEvent::CodexThreadActionRequested { .. }
+            | AppEvent::CodexThreadActionResult { .. }
             | AppEvent::FileChanged { .. } => {
                 // Derived events — just pass through to outbound broadcaster.
                 // App doesn't need to handle its own output.
