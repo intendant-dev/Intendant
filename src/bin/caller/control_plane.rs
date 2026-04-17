@@ -18,13 +18,18 @@ use crate::external_agent;
 /// control plane. The daemon loop re-reads this at the start of every task;
 /// the control plane writes here (and to `intendant.toml`) when a frontend
 /// dispatches `SetCodex*` messages. Changes to any field take effect on the
-/// NEXT task — an existing Codex thread keeps the sandbox/policy/model it
-/// was spawned with because Codex locks those at `thread/start`.
+/// NEXT task — an existing Codex thread keeps these values for the rest of
+/// its life because Codex locks sandbox / approval / model / tool config at
+/// `thread/start`.
 #[derive(Debug, Clone)]
 pub struct CodexRuntimeConfig {
     pub sandbox: String,
     pub approval_policy: String,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub web_search: bool,
+    pub network_access: bool,
+    pub writable_roots: Vec<String>,
 }
 
 pub type SharedCodexConfig = Arc<RwLock<CodexRuntimeConfig>>;
@@ -112,12 +117,9 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(AppEvent::CodexConfigChanged {
-                sandbox: Some(normalized),
-                approval_policy: None,
-                model: None,
-                model_cleared: false,
-            });
+            state.bus.send(codex_config_changed_event(
+                CodexConfigDelta { sandbox: Some(normalized), ..Default::default() },
+            ));
         }
         ControlMsg::SetCodexApprovalPolicy { policy } => {
             let normalized = crate::project::normalize_approval_policy(policy);
@@ -134,12 +136,9 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(AppEvent::CodexConfigChanged {
-                sandbox: None,
-                approval_policy: Some(normalized),
-                model: None,
-                model_cleared: false,
-            });
+            state.bus.send(codex_config_changed_event(
+                CodexConfigDelta { approval_policy: Some(normalized), ..Default::default() },
+            ));
         }
         ControlMsg::SetCodexModel { model } => {
             // Treat empty/whitespace string as "clear the override" — matches
@@ -162,14 +161,140 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(AppEvent::CodexConfigChanged {
-                sandbox: None,
-                approval_policy: None,
-                model: normalized.clone(),
-                model_cleared: normalized.is_none(),
-            });
+            let cleared = normalized.is_none();
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                model: normalized,
+                model_cleared: cleared,
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetCodexReasoningEffort { effort } => {
+            let normalized = crate::project::normalize_reasoning_effort(effort.as_deref());
+            {
+                let mut guard = state.codex_config.write().await;
+                guard.reasoning_effort = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_codex_field(root, |cfg| {
+                    cfg.reasoning_effort = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist codex.reasoning_effort to intendant.toml: {e}"
+                    );
+                }
+            }
+            let cleared = normalized.is_none();
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                reasoning_effort: normalized,
+                reasoning_effort_cleared: cleared,
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetCodexWebSearch { enabled } => {
+            {
+                let mut guard = state.codex_config.write().await;
+                guard.web_search = *enabled;
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_codex_field(root, |cfg| {
+                    cfg.web_search = *enabled;
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist codex.web_search to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                web_search: Some(*enabled),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetCodexNetworkAccess { enabled } => {
+            {
+                let mut guard = state.codex_config.write().await;
+                guard.network_access = *enabled;
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_codex_field(root, |cfg| {
+                    cfg.network_access = *enabled;
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist codex.network_access to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                network_access: Some(*enabled),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetCodexWritableRoots { roots } => {
+            let normalized = normalize_writable_roots(roots);
+            {
+                let mut guard = state.codex_config.write().await;
+                guard.writable_roots = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_codex_field(root, |cfg| {
+                    cfg.writable_roots = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist codex.writable_roots to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                writable_roots: Some(normalized),
+                ..Default::default()
+            }));
         }
         _ => {} // Other control messages don't update shared state
+    }
+}
+
+/// Drop blank entries and duplicates (case-preserving but order-preserving)
+/// so the persisted TOML + the broadcast event both reflect a clean list.
+fn normalize_writable_roots(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let s = trimmed.to_string();
+        if !out.iter().any(|existing| existing == &s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Delta describing which Codex config fields changed. Everything defaults
+/// to "unchanged" so callers can populate only the field they touched.
+#[derive(Debug, Default)]
+struct CodexConfigDelta {
+    sandbox: Option<String>,
+    approval_policy: Option<String>,
+    model: Option<String>,
+    model_cleared: bool,
+    reasoning_effort: Option<String>,
+    reasoning_effort_cleared: bool,
+    web_search: Option<bool>,
+    network_access: Option<bool>,
+    writable_roots: Option<Vec<String>>,
+}
+
+fn codex_config_changed_event(delta: CodexConfigDelta) -> AppEvent {
+    AppEvent::CodexConfigChanged {
+        sandbox: delta.sandbox,
+        approval_policy: delta.approval_policy,
+        model: delta.model,
+        model_cleared: delta.model_cleared,
+        reasoning_effort: delta.reasoning_effort,
+        reasoning_effort_cleared: delta.reasoning_effort_cleared,
+        web_search: delta.web_search,
+        network_access: delta.network_access,
+        writable_roots: delta.writable_roots,
     }
 }
 
@@ -212,6 +337,10 @@ mod tests {
             sandbox: "workspace-write".to_string(),
             approval_policy: "on-request".to_string(),
             model: None,
+            reasoning_effort: None,
+            web_search: false,
+            network_access: false,
+            writable_roots: Vec::new(),
         }))
     }
 
@@ -444,6 +573,107 @@ mod tests {
         }));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(codex_config.read().await.model, None);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_codex_reasoning_effort_normalizes_and_clears() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config: codex_config.clone(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexReasoningEffort {
+            effort: Some("high".to_string()),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.reasoning_effort.as_deref(), Some("high"));
+
+        // Unknown value → cleared (normalized to None, don't silently pass garbage to Codex).
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexReasoningEffort {
+            effort: Some("ultra-galaxy".to_string()),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.reasoning_effort, None);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_codex_web_search_and_network_access_toggle() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config: codex_config.clone(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch { enabled: true }));
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexNetworkAccess { enabled: true }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let g = codex_config.read().await;
+        assert!(g.web_search);
+        assert!(g.network_access);
+        drop(g);
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch { enabled: false }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!codex_config.read().await.web_search);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_codex_writable_roots_normalizes_blank_and_dupes() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config: codex_config.clone(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWritableRoots {
+            roots: vec![
+                "/tmp/a".into(),
+                "  ".into(),
+                "/tmp/a".into(),
+                "/tmp/b".into(),
+                "".into(),
+            ],
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let got = codex_config.read().await.writable_roots.clone();
+        assert_eq!(got, vec!["/tmp/a".to_string(), "/tmp/b".to_string()]);
 
         handle.abort();
     }

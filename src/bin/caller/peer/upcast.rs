@@ -875,6 +875,11 @@ impl AppEventUpcaster {
                 approval_policy,
                 model,
                 model_cleared,
+                reasoning_effort,
+                reasoning_effort_cleared,
+                web_search,
+                network_access,
+                writable_roots,
             } => {
                 let mut parts: Vec<String> = Vec::new();
                 if let Some(v) = sandbox {
@@ -887,6 +892,20 @@ impl AppEventUpcaster {
                     parts.push(format!("model={v}"));
                 } else if *model_cleared {
                     parts.push("model=<default>".to_string());
+                }
+                if let Some(v) = reasoning_effort {
+                    parts.push(format!("reasoning_effort={v}"));
+                } else if *reasoning_effort_cleared {
+                    parts.push("reasoning_effort=<default>".to_string());
+                }
+                if let Some(v) = web_search {
+                    parts.push(format!("web_search={v}"));
+                }
+                if let Some(v) = network_access {
+                    parts.push(format!("network_access={v}"));
+                }
+                if let Some(v) = writable_roots {
+                    parts.push(format!("writable_roots=[{} path(s)]", v.len()));
                 }
                 if parts.is_empty() {
                     vec![]
@@ -1608,6 +1627,11 @@ impl WireEventUpcaster {
                 approval_policy,
                 model,
                 model_cleared,
+                reasoning_effort,
+                reasoning_effort_cleared,
+                web_search,
+                network_access,
+                writable_roots,
             } => {
                 let mut parts: Vec<String> = Vec::new();
                 if let Some(v) = sandbox {
@@ -1620,6 +1644,20 @@ impl WireEventUpcaster {
                     parts.push(format!("model={v}"));
                 } else if *model_cleared {
                     parts.push("model=<default>".to_string());
+                }
+                if let Some(v) = reasoning_effort {
+                    parts.push(format!("reasoning_effort={v}"));
+                } else if *reasoning_effort_cleared {
+                    parts.push("reasoning_effort=<default>".to_string());
+                }
+                if let Some(v) = web_search {
+                    parts.push(format!("web_search={v}"));
+                }
+                if let Some(v) = network_access {
+                    parts.push(format!("network_access={v}"));
+                }
+                if let Some(v) = writable_roots {
+                    parts.push(format!("writable_roots=[{} path(s)]", v.len()));
                 }
                 if parts.is_empty() {
                     vec![]

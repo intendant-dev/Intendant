@@ -1185,6 +1185,45 @@ impl App {
                     format!("Codex model → {} (applies on next task)", label),
                 );
             }
+            ControlMsg::SetCodexReasoningEffort { ref effort } => {
+                let label = effort
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("<default>");
+                self.log(
+                    LogLevel::Info,
+                    format!("Codex reasoning effort → {} (applies on next task)", label),
+                );
+            }
+            ControlMsg::SetCodexWebSearch { enabled } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Codex web_search tool → {} (applies on next task)",
+                        if enabled { "enabled" } else { "disabled" }
+                    ),
+                );
+            }
+            ControlMsg::SetCodexNetworkAccess { enabled } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Codex workspace-write network access → {} (applies on next task)",
+                        if enabled { "enabled" } else { "disabled" }
+                    ),
+                );
+            }
+            ControlMsg::SetCodexWritableRoots { ref roots } => {
+                let summary = if roots.is_empty() {
+                    "<project root only>".to_string()
+                } else {
+                    format!("{} extra path(s)", roots.len())
+                };
+                self.log(
+                    LogLevel::Info,
+                    format!("Codex writable roots → {} (applies on next task)", summary),
+                );
+            }
             ControlMsg::SetVerbosity { level } => {
                 let new_verbosity = match level.to_lowercase().as_str() {
                     "quiet" => Some(Verbosity::Quiet),

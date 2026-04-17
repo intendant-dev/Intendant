@@ -230,6 +230,16 @@ pub enum OutboundEvent {
         /// to model" (which omits the field entirely).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         model_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        reasoning_effort_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        web_search: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        network_access: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        writable_roots: Option<Vec<String>>,
     },
     Usage {
         main: crate::frontend::ModelUsageSnapshot,

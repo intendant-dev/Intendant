@@ -138,9 +138,9 @@ pub enum UiCommand {
         peer: serde_json::Value,
     },
     /// Codex runtime config changed. Fields not included were not changed.
-    /// `model_cleared` distinguishes "no change to model" (model=None,
-    /// model_cleared=false) from "model override removed" (model=None,
-    /// model_cleared=true) so the Control sub-tab can zero the input.
+    /// The `_cleared` booleans distinguish "no change" (field None, bool
+    /// false) from "override removed" (field None, bool true) so the
+    /// Control sub-tab can zero the corresponding input.
     CodexConfigChanged {
         #[serde(skip_serializing_if = "Option::is_none")]
         sandbox: Option<String>,
@@ -150,6 +150,16 @@ pub enum UiCommand {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         model_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        reasoning_effort_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        web_search: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        network_access: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        writable_roots: Option<Vec<String>>,
     },
 }
 
@@ -896,11 +906,29 @@ impl AppState {
                     .get("model_cleared")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let reasoning_effort = msg
+                    .get("reasoning_effort")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let reasoning_effort_cleared = msg
+                    .get("reasoning_effort_cleared")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let web_search = msg.get("web_search").and_then(|v| v.as_bool());
+                let network_access = msg.get("network_access").and_then(|v| v.as_bool());
+                let writable_roots = msg.get("writable_roots").and_then(|v| v.as_array()).map(
+                    |arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+                );
                 cmds.push(UiCommand::CodexConfigChanged {
                     sandbox,
                     approval_policy,
                     model,
                     model_cleared,
+                    reasoning_effort,
+                    reasoning_effort_cleared,
+                    web_search,
+                    network_access,
+                    writable_roots,
                 });
             }
 
@@ -1513,17 +1541,31 @@ mod tests {
             "event": "codex_config_changed",
             "sandbox": "danger-full-access",
             "approval_policy": "never",
-            "model": "gpt-5"
+            "model": "gpt-5",
+            "reasoning_effort": "high",
+            "web_search": true,
+            "network_access": true,
+            "writable_roots": ["/tmp/extra"]
         });
         let cmds = s.handle_message(&msg);
         let matched = cmds.iter().any(|c| matches!(
             c,
             UiCommand::CodexConfigChanged {
-                sandbox: Some(s),
+                sandbox: Some(sand),
                 approval_policy: Some(p),
                 model: Some(m),
                 model_cleared: false,
-            } if s == "danger-full-access" && p == "never" && m == "gpt-5"
+                reasoning_effort: Some(re),
+                reasoning_effort_cleared: false,
+                web_search: Some(true),
+                network_access: Some(true),
+                writable_roots: Some(roots),
+            } if sand == "danger-full-access"
+                && p == "never"
+                && m == "gpt-5"
+                && re == "high"
+                && roots.len() == 1
+                && roots[0] == "/tmp/extra"
         ));
         assert!(matched, "expected full CodexConfigChanged command, got {:?}", cmds);
     }
@@ -1543,9 +1585,55 @@ mod tests {
                 approval_policy: None,
                 model: None,
                 model_cleared: true,
+                reasoning_effort: None,
+                reasoning_effort_cleared: false,
+                web_search: None,
+                network_access: None,
+                writable_roots: None,
             }
         ));
         assert!(matched, "expected model-cleared CodexConfigChanged, got {:?}", cmds);
+    }
+
+    #[test]
+    fn handle_codex_config_changed_reasoning_cleared() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "codex_config_changed",
+            "reasoning_effort_cleared": true
+        });
+        let cmds = s.handle_message(&msg);
+        let matched = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::CodexConfigChanged {
+                reasoning_effort: None,
+                reasoning_effort_cleared: true,
+                ..
+            }
+        ));
+        assert!(matched, "expected reasoning-cleared CodexConfigChanged, got {:?}", cmds);
+    }
+
+    #[test]
+    fn handle_codex_config_changed_toggles_only() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "codex_config_changed",
+            "web_search": false,
+            "network_access": true
+        });
+        let cmds = s.handle_message(&msg);
+        let matched = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::CodexConfigChanged {
+                web_search: Some(false),
+                network_access: Some(true),
+                sandbox: None,
+                approval_policy: None,
+                ..
+            }
+        ));
+        assert!(matched, "expected toggles-only CodexConfigChanged, got {:?}", cmds);
     }
 
     #[test]
