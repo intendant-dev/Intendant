@@ -272,7 +272,18 @@ impl AppEventUpcaster {
             | AppEvent::Tick
             | AppEvent::ControlCommand(_)
             | AppEvent::DisplayMetrics { .. }
+            | AppEvent::CodexThreadActionRequested { .. }
             | AppEvent::FileChanged { .. } => vec![],
+
+            AppEvent::CodexThreadActionResult { action, success, message } => vec![log_event(
+                if *success { LogLevel::Info } else { LogLevel::Warn },
+                "codex-action",
+                if *success {
+                    format!("/{}: {}", action, message)
+                } else {
+                    format!("/{}: FAILED — {}", action, message)
+                },
+            )],
 
             // ---- Turn lifecycle ----
             AppEvent::TurnStarted { turn, .. } => {
@@ -1091,6 +1102,16 @@ impl WireEventUpcaster {
             | OutboundEvent::PeerAdded { .. }
             | OutboundEvent::PeerRemoved { .. }
             | OutboundEvent::PeerStateChanged { .. } => vec![],
+
+            OutboundEvent::CodexThreadActionResult { action, success, message } => vec![log_event(
+                if *success { LogLevel::Info } else { LogLevel::Warn },
+                "codex-action",
+                if *success {
+                    format!("/{}: {}", action, message)
+                } else {
+                    format!("/{}: FAILED — {}", action, message)
+                },
+            )],
 
             // ---- Turn lifecycle ----
             OutboundEvent::TurnStarted { turn, .. } => {

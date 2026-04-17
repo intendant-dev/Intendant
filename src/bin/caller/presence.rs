@@ -926,6 +926,8 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::LogEntry { .. }
         | AppEvent::ExternalAgentChanged { .. }
         | AppEvent::CodexConfigChanged { .. }
+        | AppEvent::CodexThreadActionRequested { .. }
+        | AppEvent::CodexThreadActionResult { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::Key(_)
         | AppEvent::Resize(_, _)

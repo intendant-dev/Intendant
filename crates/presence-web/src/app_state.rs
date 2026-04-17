@@ -137,6 +137,14 @@ pub enum UiCommand {
     PeerStateChanged {
         peer: serde_json::Value,
     },
+    /// A Codex thread action (/compact, /fork, /undo, /review, /init,
+    /// /memory-reset, /new) finished. `success` + `message` drive a
+    /// dashboard toast and the Activity log entry.
+    CodexThreadActionResult {
+        action: String,
+        success: bool,
+        message: String,
+    },
     /// Codex runtime config changed. Fields not included were not changed.
     /// The `_cleared` booleans distinguish "no change" (field None, bool
     /// false) from "override removed" (field None, bool true) so the
@@ -895,6 +903,37 @@ impl AppState {
                 });
             }
 
+            "codex_thread_action_result" => {
+                let action = msg
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let success = msg
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let message = msg
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                cmds.push(UiCommand::CodexThreadActionResult {
+                    action: action.clone(),
+                    success,
+                    message: message.clone(),
+                });
+                // Also surface in the Activity log so users have a record
+                // beyond the transient toast.
+                let level = if success { "info" } else { "warn" };
+                let line = if success {
+                    format!("Codex /{}: {}", action, message)
+                } else {
+                    format!("Codex /{}: FAILED — {}", action, message)
+                };
+                cmds.extend(self.add_log(level, &line, None, "server"));
+            }
+
             "codex_config_changed" => {
                 let sandbox = msg.get("sandbox").and_then(|v| v.as_str()).map(String::from);
                 let approval_policy = msg
@@ -1532,6 +1571,70 @@ mod tests {
         assert!(s.pending_approval_id.is_none());
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::ShowFollowUp)));
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::HideAllPanels)));
+    }
+
+    #[test]
+    fn handle_codex_thread_action_result_success() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "codex_thread_action_result",
+            "action": "compact",
+            "success": true,
+            "message": "conversation compaction started"
+        });
+        let cmds = s.handle_message(&msg);
+        let mut saw_result = false;
+        let mut saw_log = false;
+        for c in &cmds {
+            match c {
+                UiCommand::CodexThreadActionResult { action, success: true, message } => {
+                    assert_eq!(action, "compact");
+                    assert!(message.contains("compaction"));
+                    saw_result = true;
+                }
+                UiCommand::AddLogEntry { content, level, .. } => {
+                    if content.contains("/compact") {
+                        assert_eq!(level, "info");
+                        saw_log = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_result, "expected CodexThreadActionResult command");
+        assert!(saw_log, "expected Activity log entry");
+    }
+
+    #[test]
+    fn handle_codex_thread_action_result_failure_surfaces_as_warn() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "codex_thread_action_result",
+            "action": "fork",
+            "success": false,
+            "message": "no active Codex thread"
+        });
+        let cmds = s.handle_message(&msg);
+        let mut saw_result = false;
+        let mut saw_log = false;
+        for c in &cmds {
+            match c {
+                UiCommand::CodexThreadActionResult { action, success: false, message } => {
+                    assert_eq!(action, "fork");
+                    assert!(message.contains("no active"));
+                    saw_result = true;
+                }
+                UiCommand::AddLogEntry { content, level, .. } => {
+                    if content.contains("/fork") && content.contains("FAILED") {
+                        assert_eq!(level, "warn");
+                        saw_log = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_result, "expected CodexThreadActionResult (failure)");
+        assert!(saw_log, "expected warn Activity log entry");
     }
 
     #[test]

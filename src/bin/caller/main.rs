@@ -4893,7 +4893,80 @@ async fn run_with_presence(
     // and build a fresh one. Only meaningful when the backend is Codex.
     let mut persistent_codex_config: Option<control_plane::CodexRuntimeConfig> = None;
 
-    while let Some(envelope) = task_rx.recv().await {
+    // Side channel for thread actions (Codex slash commands) dispatched from
+    // the dashboard / MCP between tasks. We subscribe to the bus here (not
+    // just inside the drain) so actions still fire when the loop is idle,
+    // waiting for the next task.
+    let mut outer_bus_rx = bus.subscribe();
+
+    // Outer loop: either a task envelope arrives (run the agent), a thread
+    // action arrives (invoke it on the persistent agent), or the task
+    // channel closes (exit cleanly).
+    enum OuterSignal {
+        Task(presence::TaskEnvelope),
+        ThreadAction {
+            op: String,
+            params: serde_json::Value,
+        },
+        Done,
+    }
+
+    loop {
+        let signal = tokio::select! {
+            biased;
+            env = task_rx.recv() => match env {
+                Some(e) => OuterSignal::Task(e),
+                None => OuterSignal::Done,
+            },
+            msg = outer_bus_rx.recv() => match msg {
+                Ok(AppEvent::CodexThreadActionRequested { action, params }) => {
+                    OuterSignal::ThreadAction { op: action, params }
+                }
+                // Any other bus event: skip, keep selecting. Lagged /
+                // Closed also fall through — task_rx close is the
+                // authoritative "we're done" signal.
+                _ => continue,
+            },
+        };
+        let envelope = match signal {
+            OuterSignal::Task(e) => e,
+            OuterSignal::Done => break,
+            OuterSignal::ThreadAction { op, params } => {
+                // `/new` is a daemon-side operation (not a Codex RPC): clear
+                // the persistent agent so the next task creates a fresh
+                // thread. Handled here — not inside dispatch_thread_action
+                // — because the Box<dyn ExternalAgent> lives in this loop.
+                let result = if op == "new" {
+                    persistent_agent = None;
+                    persistent_thread = None;
+                    persistent_event_rx = None;
+                    persistent_codex_config = None;
+                    Ok("agent torn down; next task will start a fresh thread".to_string())
+                } else if let Some(ref mut agent) = persistent_agent {
+                    agent.thread_action(&op, &params).await.map_err(|e| e.to_string())
+                } else {
+                    Err("no active agent — start a task first".to_string())
+                };
+                let (success, message) = match result {
+                    Ok(msg) => (true, msg),
+                    Err(e) => (false, e),
+                };
+                slog(&session_log, |l| {
+                    l.info(&format!(
+                        "Codex thread action /{}: {} — {}",
+                        op,
+                        if success { "ok" } else { "FAILED" },
+                        message
+                    ))
+                });
+                bus.send(AppEvent::CodexThreadActionResult {
+                    action: op,
+                    success,
+                    message,
+                });
+                continue;
+            }
+        };
         // Backend-side dispatch log: emitted at task acceptance, replacing the
         // legacy TUI-side log so headless and dashboard-direct tasks both reach
         // external consumers regardless of which frontend is running.

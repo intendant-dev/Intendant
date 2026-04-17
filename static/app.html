@@ -1554,6 +1554,7 @@ html, body {
   max-width: 640px;
   overflow-y: auto;
   flex: 1;
+  position: relative;
 }
 .control-header {
   display: flex;
@@ -1645,6 +1646,55 @@ html, body {
   text-align: center;
   padding: 40px;
   font-size: 13px;
+}
+.control-actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 4px;
+}
+.control-action-btn {
+  padding: 4px 10px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  color: var(--text);
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 80ms, border 80ms;
+}
+.control-action-btn:hover:not(:disabled) {
+  background: var(--surface1);
+  border-color: var(--blue);
+}
+.control-action-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.control-action-btn.pending {
+  opacity: 0.6;
+  cursor: progress;
+}
+.control-toast {
+  position: absolute;
+  bottom: 16px;
+  right: 16px;
+  padding: 8px 14px;
+  background: var(--surface1);
+  border-left: 3px solid var(--blue);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  max-width: 420px;
+  z-index: 200;
+  animation: control-toast-in 140ms ease-out;
+}
+.control-toast.error { border-left-color: var(--red); }
+.control-toast.success { border-left-color: var(--green); }
+@keyframes control-toast-in {
+  from { transform: translateX(12px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
 }
 
 .terminal-container {
@@ -3089,6 +3139,21 @@ html, body {
               <span class="control-applies-note" id="control-applies-note">changes apply on next task</span>
             </div>
             <div id="control-codex-section">
+              <fieldset class="control-group">
+                <legend>Thread actions</legend>
+                <div class="control-actions-row">
+                  <button class="control-action-btn" data-codex-action="new" title="Tear down the Codex thread so the next task starts fresh (/new)">New thread</button>
+                  <button class="control-action-btn" data-codex-action="compact" title="Compact conversation history to free context (/compact)">Compact</button>
+                  <button class="control-action-btn" data-codex-action="undo" data-turns="1" title="Roll back the last turn (/undo)">Undo</button>
+                  <button class="control-action-btn" data-codex-action="fork" data-prompt-name="1" title="Fork the current thread into a new branch (/fork)">Fork…</button>
+                  <button class="control-action-btn" data-codex-action="review" data-prompt-review="1" title="Review pending changes (/review)">Review…</button>
+                  <button class="control-action-btn" data-codex-action="init" title="Create an AGENTS.md for this project (/init)">Init AGENTS.md</button>
+                  <button class="control-action-btn" data-codex-action="memory-reset" title="Reset Codex's thread memory (/memory reset)">Reset memory</button>
+                </div>
+                <div class="control-hint">
+                  Actions dispatch to the live Codex thread. <strong>New thread</strong> is the only one that takes effect without an active task — the rest require an already-running Codex session (start any task first). Errors surface as a toast + Activity log entry.
+                </div>
+              </fieldset>
               <fieldset class="control-group">
                 <legend>Sandbox</legend>
                 <div class="control-row">
@@ -4876,6 +4941,9 @@ function processCommands(cmds) {
       case 'codex_config_changed':
         applyCodexConfigChanged(c);
         break;
+      case 'codex_thread_action_result':
+        handleCodexThreadActionResult(c);
+        break;
       // Peer registry push events. The peer payload is a `PeerSnapshot`
       // (same shape `refreshPeersFromApi` builds entries from), so we
       // funnel through the shared upsert/remove helpers — one code path
@@ -5136,6 +5204,97 @@ function applyCodexConfigChanged(evt) {
   renderControlPane();
 }
 
+// Track in-flight action dispatches so the UI can grey buttons out until a
+// matching CodexThreadActionResult arrives (or a short timeout elapses).
+const controlPendingActions = new Map(); // op -> { timeoutHandle, btnEl }
+
+function dispatchCodexThreadAction(op, params) {
+  dispatchControlMsg({ action: 'codex_thread_action', op, params: params || {} });
+}
+
+function showControlToast(kind, text) {
+  const body = document.querySelector('#activity-control-pane .control-pane-body');
+  if (!body) return;
+  const existing = body.querySelector('.control-toast');
+  if (existing) existing.remove();
+  const toast = document.createElement('div');
+  toast.className = 'control-toast ' + (kind === 'error' ? 'error' : 'success');
+  toast.textContent = text;
+  body.appendChild(toast);
+  setTimeout(() => {
+    if (toast.parentNode) toast.remove();
+  }, 4500);
+}
+
+function markActionPending(op) {
+  const btn = document.querySelector(`.control-action-btn[data-codex-action="${op}"]`);
+  if (btn) btn.classList.add('pending');
+  // Safety: if no result arrives in 10s, release the button ourselves.
+  const timeoutHandle = setTimeout(() => {
+    controlPendingActions.delete(op);
+    if (btn) btn.classList.remove('pending');
+  }, 10000);
+  controlPendingActions.set(op, { timeoutHandle, btnEl: btn });
+}
+
+function releaseActionPending(op) {
+  const entry = controlPendingActions.get(op);
+  if (!entry) return;
+  clearTimeout(entry.timeoutHandle);
+  if (entry.btnEl) entry.btnEl.classList.remove('pending');
+  controlPendingActions.delete(op);
+}
+
+function handleCodexThreadActionResult(evt) {
+  releaseActionPending(evt.action);
+  showControlToast(
+    evt.success ? 'success' : 'error',
+    evt.success
+      ? `/${evt.action}: ${evt.message}`
+      : `/${evt.action} failed: ${evt.message}`
+  );
+}
+
+function onControlActionBtnClick(ev) {
+  const btn = ev.currentTarget;
+  if (btn.classList.contains('pending') || btn.disabled) return;
+  const op = btn.dataset.codexAction;
+  if (!op) return;
+  let params = {};
+  // Prompt for the one action that needs a name (/fork) and the one that
+  // takes a free-form prompt (/review). Plain confirms keep the UI light —
+  // a dedicated modal can come later if someone wants better UX.
+  if (btn.dataset.promptName) {
+    const name = window.prompt('Fork name (leave empty for auto):', '');
+    if (name === null) return; // user cancelled
+    if (name.trim()) params.name = name.trim();
+  } else if (btn.dataset.promptReview) {
+    const prompt = window.prompt(
+      'Review prompt (leave empty to review current changes with Codex defaults):',
+      ''
+    );
+    if (prompt === null) return;
+    if (prompt.trim()) params.prompt = prompt.trim();
+  } else if (btn.dataset.turns) {
+    const n = parseInt(btn.dataset.turns, 10);
+    if (!isNaN(n) && n > 0) params.turns = n;
+  }
+  // Init is a task dispatch, not an RPC: send as a regular task instead so
+  // the agent loop picks it up and AGENTS.md flows through the normal
+  // approval path. The backend dispatcher also accepts /init and will
+  // return an error if it doesn't recognise it.
+  if (op === 'init') {
+    const task = 'Create or update AGENTS.md at the project root with a concise project description, directory structure, important commands, and coding conventions. Base it on the existing repository files.';
+    if (app && app.send_server_action) {
+      app.send_server_action({ action: 'start_task', task, direct: true });
+      showControlToast('success', '/init: dispatched AGENTS.md task');
+    }
+    return;
+  }
+  markActionPending(op);
+  dispatchCodexThreadAction(op, params);
+}
+
 function wireControlPaneListeners() {
   const $ = id => document.getElementById(id);
   const sandboxSel = $('control-codex-sandbox');
@@ -5172,6 +5331,9 @@ function wireControlPaneListeners() {
       }
     });
   }
+  document.querySelectorAll('.control-action-btn[data-codex-action]').forEach(btn => {
+    btn.addEventListener('click', onControlActionBtnClick);
+  });
 }
 
 // Wire up once at DOM ready. switchActivitySubtab('control') will

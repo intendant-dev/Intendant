@@ -218,6 +218,14 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
     },
+    /// Delivered to browsers when a Codex thread-level action finishes
+    /// (compact, fork, rollback, review, init, memory-reset). `success`
+    /// + `message` are surfaced as a dashboard toast and logged.
+    CodexThreadActionResult {
+        action: String,
+        success: bool,
+        message: String,
+    },
     CodexConfigChanged {
         #[serde(skip_serializing_if = "Option::is_none")]
         sandbox: Option<String>,

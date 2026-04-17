@@ -379,6 +379,26 @@ pub enum AppEvent {
         agent: Option<String>,
     },
 
+    /// Emitted by the control plane when a `ControlMsg::CodexThreadAction`
+    /// arrives, so the daemon-side action watcher (which owns the
+    /// persistent agent) can pick it up. Carries the dispatched action and
+    /// its params — one-way, no ack on this variant. The watcher emits a
+    /// `CodexThreadActionResult` after the agent call returns.
+    CodexThreadActionRequested {
+        action: String,
+        params: serde_json::Value,
+    },
+
+    /// Emitted by the daemon-side action watcher after a CodexThreadAction
+    /// has been executed (or failed). `success=true` → message is an
+    /// informational status line; `success=false` → message is the error
+    /// surfaced to the caller. Dashboard consumes to flash a toast.
+    CodexThreadActionResult {
+        action: String,
+        success: bool,
+        message: String,
+    },
+
     /// Emitted when one or more fields of the Codex runtime configuration
     /// change. Fields not included in the event are unchanged from the
     /// previous state. Broadcast by the control plane; consumed by the
@@ -513,6 +533,24 @@ pub enum ControlMsg {
     SetCodexWritableRoots {
         #[serde(default)]
         roots: Vec<String>,
+    },
+    /// Invoke one of Codex's thread-level actions against the persistent
+    /// agent. Mirrors the raw-codex slash-command surface: `/new`, `/compact`,
+    /// `/fork`, `/undo`, `/review`, `/init`, `/memory-reset`. Applies
+    /// immediately (not "next task") because Codex's app-server accepts
+    /// these as mid-session RPCs.
+    ///
+    /// `params` is a free-form JSON object whose shape depends on `op`:
+    /// `/fork` accepts `{"name": "..."}`, `/undo` accepts `{"turns": N}`,
+    /// `/review` accepts `{"prompt": "..."}`, the rest ignore it. Callers
+    /// that don't need params may omit the field entirely.
+    ///
+    /// The variant's field is named `op` (not `action`) because ControlMsg's
+    /// serde tag is already `action`, and nested fields can't share the tag.
+    CodexThreadAction {
+        op: String,
+        #[serde(default)]
+        params: serde_json::Value,
     },
     SetVerbosity {
         level: String,
@@ -905,6 +943,18 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::ExternalAgentChanged { agent } => Some(OutboundEvent::ExternalAgentChanged {
             agent: agent.clone(),
         }),
+        AppEvent::CodexThreadActionResult {
+            action,
+            success,
+            message,
+        } => Some(OutboundEvent::CodexThreadActionResult {
+            action: action.clone(),
+            success: *success,
+            message: message.clone(),
+        }),
+        // The "requested" half is server-internal (daemon action watcher
+        // consumes it directly); browsers don't need it.
+        AppEvent::CodexThreadActionRequested { .. } => None,
         AppEvent::CodexConfigChanged {
             sandbox,
             approval_policy,

@@ -1191,6 +1191,19 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::CodexThreadAction { op, .. } => {
+            // The actual RPC round-trip happens on the daemon-side action
+            // watcher. Acknowledge dispatch here; the result will surface
+            // as a CodexThreadActionResult event on the MCP event stream.
+            emit_control_result(
+                control_tx,
+                "codex_thread_action",
+                true,
+                format!("Codex thread action dispatched: /{}", op),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::SetVerbosity { level } => {
             let parsed = match level.to_lowercase().as_str() {
                 "quiet" => Some(Verbosity::Quiet),
@@ -1905,7 +1918,7 @@ pub fn spawn_event_listener(
                 match event {
                     AppEvent::Key(_) => {} // MCP doesn't handle key events
                     AppEvent::Resize(_, _) => {}
-                    AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::ExternalAgentChanged { .. } | AppEvent::CodexConfigChanged { .. } => {} // Derived events — handled by outbound broadcaster
+                    AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::ExternalAgentChanged { .. } | AppEvent::CodexConfigChanged { .. } | AppEvent::CodexThreadActionRequested { .. } | AppEvent::CodexThreadActionResult { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::Tick => {
                         // Detect stuck phases — warn every 30s after 120s
                         if matches!(
