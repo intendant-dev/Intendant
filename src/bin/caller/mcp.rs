@@ -2210,7 +2210,11 @@ pub fn spawn_event_listener(
                         s.push_log(LogLevel::Info, format!("Live audio '{}': {}{}", id, status, q_note));
                     }
                     AppEvent::DisplayMetrics { .. }
-                    | AppEvent::FileChanged { .. } => {
+                    | AppEvent::FileChanged { .. }
+                    | AppEvent::SnapshotCreated { .. }
+                    | AppEvent::RolledBack { .. }
+                    | AppEvent::Redone { .. }
+                    | AppEvent::HistoryPruned { .. } => {
                         // Broadcast-only — handled by outbound event converter.
                     }
                     AppEvent::DisplayCaptureLost { display_id, ref reason } => {

@@ -272,7 +272,11 @@ impl AppEventUpcaster {
             | AppEvent::Tick
             | AppEvent::ControlCommand(_)
             | AppEvent::DisplayMetrics { .. }
-            | AppEvent::FileChanged { .. } => vec![],
+            | AppEvent::FileChanged { .. }
+            | AppEvent::SnapshotCreated { .. }
+            | AppEvent::RolledBack { .. }
+            | AppEvent::Redone { .. }
+            | AppEvent::HistoryPruned { .. } => vec![],
 
             // ---- Turn lifecycle ----
             AppEvent::TurnStarted { turn, .. } => {
@@ -1040,6 +1044,10 @@ impl WireEventUpcaster {
             OutboundEvent::Unknown
             | OutboundEvent::DisplayMetrics { .. }
             | OutboundEvent::FileChanged { .. }
+            | OutboundEvent::SnapshotCreated { .. }
+            | OutboundEvent::RolledBack { .. }
+            | OutboundEvent::Redone { .. }
+            | OutboundEvent::HistoryPruned { .. }
             | OutboundEvent::PeerAdded { .. }
             | OutboundEvent::PeerRemoved { .. }
             | OutboundEvent::PeerStateChanged { .. } => vec![],

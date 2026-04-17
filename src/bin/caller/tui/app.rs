@@ -2001,7 +2001,11 @@ impl App {
             | AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::LiveUsageUpdate { .. }
             | AppEvent::DisplayMetrics { .. } | AppEvent::DisplayResize { .. }
             | AppEvent::ExternalAgentChanged { .. }
-            | AppEvent::FileChanged { .. } => {
+            | AppEvent::FileChanged { .. }
+            | AppEvent::SnapshotCreated { .. }
+            | AppEvent::RolledBack { .. }
+            | AppEvent::Redone { .. }
+            | AppEvent::HistoryPruned { .. } => {
                 // Derived events — just pass through to outbound broadcaster.
                 // App doesn't need to handle its own output.
             }

@@ -128,6 +128,11 @@ pub struct ActiveSessionState {
     pub session_registry: Option<crate::display::SharedSessionRegistry>,
     pub snapshot_dir: Option<PathBuf>,
     pub project_root_for_changes: Option<PathBuf>,
+    /// Shared handle to the live `FileWatcher`, used to serve the per-round
+    /// history endpoints (GET history, POST rollback/redo/prune). The same
+    /// mutex guards snapshot creation so concurrent rollback from the web
+    /// gateway and snapshot-on-round-complete can't race.
+    pub file_watcher: Option<crate::file_watcher::SharedFileWatcher>,
 }
 
 impl ActiveSessionState {
@@ -140,6 +145,7 @@ impl ActiveSessionState {
             session_registry: None,
             snapshot_dir: None,
             project_root_for_changes: None,
+            file_watcher: None,
         }))
     }
 }
@@ -1036,6 +1042,187 @@ fn handle_changes_file_diff(
     .to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Per-round file snapshot history endpoints
+// ---------------------------------------------------------------------------
+
+/// Read the full POST body (honoring Content-Length). Returns the peeked
+/// prefix if the headers already carried the entire payload; otherwise reads
+/// the remainder from the stream.
+async fn read_post_body(
+    header_text: &str,
+    stream: &mut tokio::net::TcpStream,
+) -> String {
+    use tokio::io::AsyncReadExt;
+    let content_length: usize = header_text
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+    if peeked_body.len() >= content_length {
+        return peeked_body[..content_length].to_string();
+    }
+    let mut full = peeked_body.to_string();
+    let remaining = content_length.saturating_sub(peeked_body.len());
+    if remaining > 0 {
+        let mut rest = vec![0u8; remaining];
+        if stream.read_exact(&mut rest).await.is_ok() {
+            full.push_str(&String::from_utf8_lossy(&rest));
+        }
+    }
+    full
+}
+
+/// Check whether it is safe to mutate the project tree (rollback/redo) right
+/// now. Returns `Ok(())` if idle, or an `(status_code, body_json)` pair to
+/// send back as-is.
+fn ensure_idle(
+    agent_state: Option<&Arc<Mutex<AgentStateSnapshot>>>,
+) -> Result<(), (&'static str, String)> {
+    if let Some(state) = agent_state {
+        let phase = state
+            .lock()
+            .map(|g| g.phase.clone())
+            .unwrap_or_default();
+        if !presence::is_agent_idle(&phase) {
+            let body = serde_json::json!({
+                "error": "agent is busy, stop the turn before rolling back",
+                "phase": phase,
+            })
+            .to_string();
+            return Err(("409 Conflict", body));
+        }
+    }
+    Ok(())
+}
+
+/// GET /api/session/current/history — returns serialized `History` JSON.
+async fn handle_history_get(
+    file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
+) -> (&'static str, String) {
+    let Some(fw) = file_watcher else {
+        return (
+            "503 Service Unavailable",
+            serde_json::json!({"error": "file watcher not active"}).to_string(),
+        );
+    };
+    let w = fw.lock().await;
+    let body = serde_json::to_string(w.history())
+        .unwrap_or_else(|_| "{}".to_string());
+    ("200 OK", body)
+}
+
+/// POST /api/session/current/rollback — body: `{"round_id": N}`.
+async fn handle_history_rollback(
+    body_text: &str,
+    file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
+    agent_state: Option<&Arc<Mutex<AgentStateSnapshot>>>,
+) -> (&'static str, String) {
+    let Some(fw) = file_watcher else {
+        return (
+            "503 Service Unavailable",
+            serde_json::json!({"error": "file watcher not active"}).to_string(),
+        );
+    };
+    if let Err((status, body)) = ensure_idle(agent_state) {
+        return (status, body);
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(body_text) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": format!("invalid body: {}", e)}).to_string(),
+            );
+        }
+    };
+    let round_id = match parsed.get("round_id").and_then(|v| v.as_u64()) {
+        Some(id) => id,
+        None => {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": "missing round_id"}).to_string(),
+            );
+        }
+    };
+    let mut w = fw.lock().await;
+    match w.rollback(round_id) {
+        Ok(res) => (
+            "200 OK",
+            serde_json::json!({
+                "to_round_id": res.to_round_id,
+                "files_reverted": res.files_reverted,
+            })
+            .to_string(),
+        ),
+        Err(e) => (
+            "400 Bad Request",
+            serde_json::json!({"error": e.to_string()}).to_string(),
+        ),
+    }
+}
+
+/// POST /api/session/current/redo — no body. Advances `current_head_id`.
+async fn handle_history_redo(
+    file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
+    agent_state: Option<&Arc<Mutex<AgentStateSnapshot>>>,
+) -> (&'static str, String) {
+    let Some(fw) = file_watcher else {
+        return (
+            "503 Service Unavailable",
+            serde_json::json!({"error": "file watcher not active"}).to_string(),
+        );
+    };
+    if let Err((status, body)) = ensure_idle(agent_state) {
+        return (status, body);
+    }
+    let mut w = fw.lock().await;
+    match w.redo() {
+        Ok(res) => (
+            "200 OK",
+            serde_json::json!({
+                "to_round_id": res.to_round_id,
+                "files_reverted": res.files_reverted,
+            })
+            .to_string(),
+        ),
+        Err(e) => (
+            "400 Bad Request",
+            serde_json::json!({"error": e.to_string()}).to_string(),
+        ),
+    }
+}
+
+/// POST /api/session/current/prune — drop abandoned branches and GC orphaned
+/// content-addressed blobs.
+async fn handle_history_prune(
+    file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
+) -> (&'static str, String) {
+    let Some(fw) = file_watcher else {
+        return (
+            "503 Service Unavailable",
+            serde_json::json!({"error": "file watcher not active"}).to_string(),
+        );
+    };
+    let mut w = fw.lock().await;
+    match w.prune_abandoned() {
+        Ok(res) => (
+            "200 OK",
+            serde_json::json!({
+                "branches_removed": res.branches_removed,
+                "bytes_freed": res.bytes_freed,
+            })
+            .to_string(),
+        ),
+        Err(e) => (
+            "500 Internal Server Error",
+            serde_json::json!({"error": e.to_string()}).to_string(),
+        ),
+    }
+}
+
 /// Delete session data: entire session, media, recordings, frames, or turns.
 /// Returns a JSON result with `ok` and `bytes_freed`.
 fn delete_session_data(session_id: &str, target: &str) -> String {
@@ -1752,6 +1939,7 @@ pub fn spawn_web_gateway(
                 let session_registry = session_snap.session_registry.clone();
                 let snapshot_dir = session_snap.snapshot_dir.clone();
                 let project_root_for_changes = session_snap.project_root_for_changes.clone();
+                let file_watcher = session_snap.file_watcher.clone();
                 drop(session_snap);
                 // Peek at the first bytes to detect (in order):
                 //  1. ICE-TCP STUN-framed traffic (RFC 4571 length prefix
@@ -3733,6 +3921,86 @@ pub fn spawn_web_gateway(
                              \r\n\
                              {}",
                             body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET") && request_line.contains("/api/session/current/history") {
+                        // GET /api/session/current/history — serialized History.
+                        use tokio::io::AsyncWriteExt;
+                        let (status, body) = handle_history_get(file_watcher.as_ref()).await;
+                        let response = format!(
+                            "HTTP/1.1 {}\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            status, body.len(), body,
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST") && request_line.contains("/api/session/current/rollback") {
+                        // POST /api/session/current/rollback body: {"round_id": N}
+                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let agent_state = query_ctx
+                            .as_ref()
+                            .map(|ctx| ctx.agent_state.clone());
+                        let (status, body) = handle_history_rollback(
+                            &body_text,
+                            file_watcher.as_ref(),
+                            agent_state.as_ref(),
+                        ).await;
+                        let response = format!(
+                            "HTTP/1.1 {}\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            status, body.len(), body,
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST") && request_line.contains("/api/session/current/redo") {
+                        // POST /api/session/current/redo — no body required.
+                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                        let _ = read_post_body(&header_text, &mut stream).await;
+                        let agent_state = query_ctx
+                            .as_ref()
+                            .map(|ctx| ctx.agent_state.clone());
+                        let (status, body) = handle_history_redo(
+                            file_watcher.as_ref(),
+                            agent_state.as_ref(),
+                        ).await;
+                        let response = format!(
+                            "HTTP/1.1 {}\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            status, body.len(), body,
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST") && request_line.contains("/api/session/current/prune") {
+                        // POST /api/session/current/prune — no body required.
+                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                        let _ = read_post_body(&header_text, &mut stream).await;
+                        let (status, body) = handle_history_prune(file_watcher.as_ref()).await;
+                        let response = format!(
+                            "HTTP/1.1 {}\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            status, body.len(), body,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/api/session/") {

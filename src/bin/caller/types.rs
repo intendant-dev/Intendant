@@ -351,6 +351,25 @@ pub enum OutboundEvent {
         lines_added: u32,
         lines_removed: u32,
     },
+    /// A new per-round file snapshot was recorded.
+    SnapshotCreated {
+        round_id: u64,
+    },
+    /// Project tree was rolled back to a prior round.
+    RolledBack {
+        from_id: u64,
+        to_id: u64,
+        files_reverted: u32,
+    },
+    /// `current_head_id` advanced forward along the linear history.
+    Redone {
+        to_id: u64,
+    },
+    /// Abandoned branches were pruned and orphaned blobs GC'd.
+    HistoryPruned {
+        branches_removed: u32,
+        bytes_freed: u64,
+    },
     InterruptRequested,
     Interrupted {
         reason: String,

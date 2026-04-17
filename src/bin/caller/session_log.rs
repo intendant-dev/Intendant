@@ -1148,6 +1148,75 @@ impl SessionLog {
         });
     }
 
+    /// Log creation of a per-round file snapshot.
+    pub fn snapshot_created(&mut self, round_id: u64) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "snapshot_created".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Snapshot {} created", round_id)),
+            data: Some(serde_json::json!({ "round_id": round_id })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log a rollback to a prior round.
+    pub fn rolled_back(&mut self, from_id: u64, to_id: u64, files_reverted: u32) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "rolled_back".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Rolled back from round {} to {} ({} files reverted)",
+                from_id, to_id, files_reverted
+            )),
+            data: Some(serde_json::json!({
+                "from_id": from_id,
+                "to_id": to_id,
+                "files_reverted": files_reverted,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log a redo along the linear history.
+    pub fn redone(&mut self, to_id: u64) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "redone".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Redone to round {}", to_id)),
+            data: Some(serde_json::json!({ "to_id": to_id })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log a pruning of abandoned branches + orphaned objects.
+    pub fn history_pruned(&mut self, branches_removed: u32, bytes_freed: u64) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "history_pruned".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Pruned {} branch(es), freed {} bytes",
+                branches_removed, bytes_freed
+            )),
+            data: Some(serde_json::json!({
+                "branches_removed": branches_removed,
+                "bytes_freed": bytes_freed,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log display ready.
     pub fn display_ready(
         &mut self,
