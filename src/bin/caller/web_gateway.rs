@@ -1147,6 +1147,14 @@ pub struct SettingsPayload {
     pub codex_approval_policy: String,
     #[serde(default)]
     pub codex_model: Option<String>,
+    #[serde(default)]
+    pub codex_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub codex_web_search: bool,
+    #[serde(default)]
+    pub codex_network_access: bool,
+    #[serde(default)]
+    pub codex_writable_roots: Vec<String>,
     // Env var overrides (read-only, shown in UI)
     #[serde(default)]
     pub env_overrides: std::collections::HashMap<String, String>,
@@ -1193,6 +1201,12 @@ fn settings_payload_from_config(
             &config.agent.codex.approval_policy,
         ),
         codex_model: config.agent.codex.model.clone(),
+        codex_reasoning_effort: crate::project::normalize_reasoning_effort(
+            config.agent.codex.reasoning_effort.as_deref(),
+        ),
+        codex_web_search: config.agent.codex.web_search,
+        codex_network_access: config.agent.codex.network_access,
+        codex_writable_roots: config.agent.codex.writable_roots.clone(),
         env_overrides,
     }
 }

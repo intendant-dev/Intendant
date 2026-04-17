@@ -1138,6 +1138,59 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::SetCodexReasoningEffort { effort } => {
+            let label = effort
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("<default>");
+            emit_control_result(
+                control_tx,
+                "set_codex_reasoning_effort",
+                true,
+                format!("Codex reasoning effort set to {} (applies on next task)", label),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetCodexWebSearch { enabled } => {
+            emit_control_result(
+                control_tx,
+                "set_codex_web_search",
+                true,
+                format!(
+                    "Codex web_search tool {} (applies on next task)",
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetCodexNetworkAccess { enabled } => {
+            emit_control_result(
+                control_tx,
+                "set_codex_network_access",
+                true,
+                format!(
+                    "Codex workspace-write network {} (applies on next task)",
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetCodexWritableRoots { roots } => {
+            emit_control_result(
+                control_tx,
+                "set_codex_writable_roots",
+                true,
+                format!(
+                    "Codex writable roots set to {} path(s) (applies on next task)",
+                    roots.len()
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::SetVerbosity { level } => {
             let parsed = match level.to_lowercase().as_str() {
                 "quiet" => Some(Verbosity::Quiet),

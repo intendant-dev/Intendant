@@ -177,12 +177,21 @@ fn resolve_agent_backend_from_config(
 /// derive `PartialEq` because it's a public API surface and we don't want to
 /// commit to field-by-field equality semantics for external callers; inside
 /// the daemon loop we just need to detect drift across tasks, so we compare
-/// the three Codex-locked fields explicitly.
+/// the Codex-locked fields explicitly. Any change here that affects the
+/// spawned Codex thread (sandbox, approvals, model, reasoning effort, tool
+/// set, sandbox permissions) has to force a rebuild because Codex latches
+/// those at `thread/start`.
 fn codex_runtime_config_equal(
     a: &control_plane::CodexRuntimeConfig,
     b: &control_plane::CodexRuntimeConfig,
 ) -> bool {
-    a.sandbox == b.sandbox && a.approval_policy == b.approval_policy && a.model == b.model
+    a.sandbox == b.sandbox
+        && a.approval_policy == b.approval_policy
+        && a.model == b.model
+        && a.reasoning_effort == b.reasoning_effort
+        && a.web_search == b.web_search
+        && a.network_access == b.network_access
+        && a.writable_roots == b.writable_roots
 }
 
 /// Extract file paths from a unified-diff header. Reads `+++ b/<path>` lines
@@ -259,18 +268,31 @@ async fn create_external_agent(
         AgentBackend::Codex => {
             let cfg = &project.config.agent.codex;
             let sandbox_mode = project::normalize_sandbox_mode(&cfg.sandbox);
-            let agent = Box::new(external_agent::codex::CodexAgent::new(
+            let reasoning_effort =
+                project::normalize_reasoning_effort(cfg.reasoning_effort.as_deref());
+            let opts = external_agent::codex::CodexAgentOptions {
+                reasoning_effort: reasoning_effort.clone(),
+                web_search: cfg.web_search,
+                network_access: cfg.network_access,
+                writable_roots: cfg.writable_roots.clone(),
+            };
+            let agent = Box::new(external_agent::codex::CodexAgent::with_options(
                 cfg.command.clone(),
                 cfg.model.clone(),
                 cfg.approval_policy.clone(),
                 sandbox_mode.clone(),
                 web_port,
+                opts,
             ));
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
                 approval_policy: cfg.approval_policy.clone(),
                 sandbox: sandbox_mode,
+                reasoning_effort,
+                web_search: cfg.web_search,
+                network_access: cfg.network_access,
+                writable_roots: cfg.writable_roots.clone(),
                 web_port,
             };
             (agent, config)
@@ -287,6 +309,10 @@ async fn create_external_agent(
                 working_dir: project.root.clone(),
                 approval_policy: String::new(),
                 sandbox: String::new(),
+                reasoning_effort: None,
+                web_search: false,
+                network_access: false,
+                writable_roots: Vec::new(),
                 web_port,
             };
             (agent, config)
@@ -305,6 +331,10 @@ async fn create_external_agent(
                 working_dir: project.root.clone(),
                 approval_policy: cfg.permission_mode.clone(),
                 sandbox: String::new(),
+                reasoning_effort: None,
+                web_search: false,
+                network_access: false,
+                writable_roots: Vec::new(),
                 web_port,
             };
             (agent, config)
@@ -5033,10 +5063,14 @@ async fn run_with_presence(
                 // `from_root`, and `shared_codex_config` is always the
                 // authoritative "what the user just chose" source.
                 if matches!(backend, external_agent::AgentBackend::Codex) {
-                    proj.config.agent.codex.sandbox = current_codex_config.sandbox.clone();
-                    proj.config.agent.codex.approval_policy =
-                        current_codex_config.approval_policy.clone();
-                    proj.config.agent.codex.model = current_codex_config.model.clone();
+                    let cx = &mut proj.config.agent.codex;
+                    cx.sandbox = current_codex_config.sandbox.clone();
+                    cx.approval_policy = current_codex_config.approval_policy.clone();
+                    cx.model = current_codex_config.model.clone();
+                    cx.reasoning_effort = current_codex_config.reasoning_effort.clone();
+                    cx.web_search = current_codex_config.web_search;
+                    cx.network_access = current_codex_config.network_access;
+                    cx.writable_roots = current_codex_config.writable_roots.clone();
                 }
                 let (agent, thread, event_rx) =
                     match create_external_agent(backend, &proj, &session_log, web_port).await {
@@ -7927,6 +7961,12 @@ async fn main() -> Result<(), CallerError> {
                 sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
                 approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
                 model: cfg.model.clone(),
+                reasoning_effort: project::normalize_reasoning_effort(
+                    cfg.reasoning_effort.as_deref(),
+                ),
+                web_search: cfg.web_search,
+                network_access: cfg.network_access,
+                writable_roots: cfg.writable_roots.clone(),
             }))
         };
         let _control_plane_handle = control_plane::spawn(
@@ -8440,6 +8480,12 @@ async fn main() -> Result<(), CallerError> {
                 sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
                 approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
                 model: cfg.model.clone(),
+                reasoning_effort: project::normalize_reasoning_effort(
+                    cfg.reasoning_effort.as_deref(),
+                ),
+                web_search: cfg.web_search,
+                network_access: cfg.network_access,
+                writable_roots: cfg.writable_roots.clone(),
             }))
         };
         let _control_plane_handle = control_plane::spawn(

@@ -134,6 +134,25 @@ pub struct CodexConfig {
     /// Sandbox mode within Codex.
     #[serde(default = "default_codex_sandbox")]
     pub sandbox: String,
+    /// Reasoning effort passed to Codex for reasoning-capable models.
+    /// Codex's `-c model_reasoning_effort=...` — accepted values:
+    /// `"minimal" | "low" | "medium" | "high" | "xhigh"`. Empty = Codex default.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// Whether to enable the Responses API `web_search` tool for this
+    /// session. Maps to `codex --search` / `-c tool_suggest.web_search=true`.
+    #[serde(default)]
+    pub web_search: bool,
+    /// Allow outbound network inside the `workspace-write` sandbox. Maps to
+    /// `-c sandbox_workspace_write.network_access=true`. Ignored when
+    /// sandbox is `read-only` or `danger-full-access`.
+    #[serde(default)]
+    pub network_access: bool,
+    /// Extra writable roots beyond the project root. Each entry is passed
+    /// as `--add-dir <PATH>` to Codex. Absolute paths only; relative paths
+    /// are resolved against the project root at dispatch time.
+    #[serde(default)]
+    pub writable_roots: Vec<String>,
 }
 
 fn default_codex_command() -> String {
@@ -157,6 +176,14 @@ pub const CODEX_SANDBOX_MODES: &[&str] = &["read-only", "workspace-write", "dang
 /// Matches `codex --ask-for-approval <POLICY>`.
 /// `"on-failure"` is deprecated upstream so we leave it out of the UI set.
 pub const CODEX_APPROVAL_POLICIES: &[&str] = &["untrusted", "on-request", "never"];
+
+/// Valid Codex reasoning-effort values, in the order we present them.
+/// `""` is a sentinel for "use the model's default" so the UI can offer
+/// "default" as a menu choice without introducing a separate Option<String>
+/// juggling layer. All other values map straight to
+/// `-c model_reasoning_effort=...`.
+pub const CODEX_REASONING_EFFORTS: &[&str] =
+    &["", "minimal", "low", "medium", "high", "xhigh"];
 
 /// Normalize a user-supplied sandbox value to one of `CODEX_SANDBOX_MODES`.
 /// Unknown or empty values fall back to the safest real policy
@@ -182,6 +209,21 @@ pub fn normalize_approval_policy(input: &str) -> String {
     }
 }
 
+/// Normalize a user-supplied reasoning effort. Empty / unknown values map
+/// to `None` (use the model default). Known values map to `Some(value)`
+/// so the caller can drop the key entirely when Codex should pick.
+pub fn normalize_reasoning_effort(input: Option<&str>) -> Option<String> {
+    let s = input.map(|v| v.trim()).unwrap_or("");
+    if s.is_empty() {
+        return None;
+    }
+    if CODEX_REASONING_EFFORTS.iter().any(|e| !e.is_empty() && *e == s) {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
 impl Default for CodexConfig {
     fn default() -> Self {
         Self {
@@ -189,6 +231,10 @@ impl Default for CodexConfig {
             model: None,
             approval_policy: default_codex_approval_policy(),
             sandbox: default_codex_sandbox(),
+            reasoning_effort: None,
+            web_search: false,
+            network_access: false,
+            writable_roots: Vec::new(),
         }
     }
 }

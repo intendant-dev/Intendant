@@ -178,6 +178,17 @@ pub struct AgentConfig {
     /// `"danger-full-access"`. Ignored by backends that don't model a
     /// sandbox (pass `String::new()` for those).
     pub sandbox: String,
+    /// Codex reasoning-effort override (`low|medium|high|...`). Codex-only;
+    /// other backends ignore.
+    pub reasoning_effort: Option<String>,
+    /// Enable Codex's `web_search` Responses tool. Codex-only.
+    pub web_search: bool,
+    /// Allow outbound network in Codex's `workspace-write` sandbox.
+    /// Codex-only; ignored by other sandbox modes and other backends.
+    pub network_access: bool,
+    /// Extra writable roots for Codex's sandbox. Codex-only; other backends
+    /// ignore.
+    pub writable_roots: Vec<String>,
     /// Web gateway port for MCP-over-HTTP config generation.
     pub web_port: Option<u16>,
 }

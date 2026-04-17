@@ -380,20 +380,24 @@ pub enum AppEvent {
     },
 
     /// Emitted when one or more fields of the Codex runtime configuration
-    /// change (sandbox mode, approval policy, model override). Fields not
-    /// included in the event are unchanged from the previous state.
-    /// Broadcast by the control plane; consumed by the dashboard's
-    /// Control sub-tab to refresh its displayed values.
+    /// change. Fields not included in the event are unchanged from the
+    /// previous state. Broadcast by the control plane; consumed by the
+    /// dashboard's Control sub-tab to refresh its displayed values.
     ///
-    /// `model_cleared` distinguishes "unchanged" (None, false) from
-    /// "explicitly set to empty / use Codex default" (None, true) —
-    /// `Option<Option<String>>` would have been cleaner but doesn't
-    /// round-trip through our JSON serialisation as obviously.
+    /// The `_cleared` booleans distinguish "unchanged" (field None, bool
+    /// false) from "explicitly set to empty / use Codex default" (field
+    /// None, bool true). `Option<Option<_>>` would be cleaner in Rust
+    /// but doesn't round-trip through our JSON as obviously.
     CodexConfigChanged {
         sandbox: Option<String>,
         approval_policy: Option<String>,
         model: Option<String>,
         model_cleared: bool,
+        reasoning_effort: Option<String>,
+        reasoning_effort_cleared: bool,
+        web_search: Option<bool>,
+        network_access: Option<bool>,
+        writable_roots: Option<Vec<String>>,
     },
 
     /// Log entry broadcast to external consumers (web UI, control socket).
@@ -483,6 +487,32 @@ pub enum ControlMsg {
     SetCodexModel {
         #[serde(default)]
         model: Option<String>,
+    },
+    /// Set Codex reasoning effort. `None` or missing = use the model's
+    /// default. Values match `-c model_reasoning_effort=...`. Applies to
+    /// the NEXT task.
+    SetCodexReasoningEffort {
+        #[serde(default)]
+        effort: Option<String>,
+    },
+    /// Toggle the Responses API `web_search` tool for Codex.
+    /// Maps to `codex --search`. Applies to the NEXT task.
+    SetCodexWebSearch {
+        enabled: bool,
+    },
+    /// Toggle outbound network access inside the `workspace-write` sandbox.
+    /// Maps to `-c sandbox_workspace_write.network_access=true|false`.
+    /// Ignored by `read-only` and `danger-full-access`. Applies to the
+    /// NEXT task.
+    SetCodexNetworkAccess {
+        enabled: bool,
+    },
+    /// Replace the list of extra writable roots (paths beyond the project
+    /// root that Codex's sandbox may also write to). Maps to `--add-dir`.
+    /// Applies to the NEXT task.
+    SetCodexWritableRoots {
+        #[serde(default)]
+        roots: Vec<String>,
     },
     SetVerbosity {
         level: String,
@@ -880,11 +910,21 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             approval_policy,
             model,
             model_cleared,
+            reasoning_effort,
+            reasoning_effort_cleared,
+            web_search,
+            network_access,
+            writable_roots,
         } => Some(OutboundEvent::CodexConfigChanged {
             sandbox: sandbox.clone(),
             approval_policy: approval_policy.clone(),
             model: model.clone(),
             model_cleared: *model_cleared,
+            reasoning_effort: reasoning_effort.clone(),
+            reasoning_effort_cleared: *reasoning_effort_cleared,
+            web_search: *web_search,
+            network_access: *network_access,
+            writable_roots: writable_roots.clone(),
         }),
         AppEvent::LogEntry {
             level,

@@ -3124,6 +3124,49 @@ html, body {
                   <input type="text" id="control-codex-model" placeholder="e.g. gpt-5 (leave empty for Codex default)">
                 </div>
                 <div class="control-hint">Sent as <code>model</code> in <code>thread/start</code>. Empty = let Codex pick its configured default.</div>
+                <div class="control-row">
+                  <label for="control-codex-reasoning">Reasoning effort</label>
+                  <select id="control-codex-reasoning">
+                    <option value="">(default)</option>
+                    <option value="minimal">minimal</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                    <option value="xhigh">xhigh</option>
+                  </select>
+                </div>
+                <div class="control-hint">Maps to <code>-c&nbsp;model_reasoning_effort=...</code>. Only meaningful for reasoning-capable models; ignored otherwise.</div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Tools</legend>
+                <div class="control-row">
+                  <label for="control-codex-web-search">Web search</label>
+                  <input type="checkbox" id="control-codex-web-search">
+                  <span class="control-current" id="control-codex-web-search-status">off</span>
+                </div>
+                <div class="control-hint">
+                  Enables the Responses API <code>web_search</code> tool (matches <code>codex --search</code>). No per-call approval.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Sandbox permissions</legend>
+                <div class="control-row" id="control-codex-network-row">
+                  <label for="control-codex-network">Network inside sandbox</label>
+                  <input type="checkbox" id="control-codex-network">
+                  <span class="control-current" id="control-codex-network-status">off</span>
+                </div>
+                <div class="control-hint" id="control-codex-network-hint">
+                  Only applies when sandbox is <strong>workspace-write</strong>. Maps to
+                  <code>sandbox_workspace_write.network_access</code>. Middle ground between the default and danger-full-access when a task needs outbound HTTP but no listener binds.
+                </div>
+                <div class="control-row">
+                  <label for="control-codex-writable-roots">Extra writable paths</label>
+                  <textarea id="control-codex-writable-roots" rows="3" placeholder="/absolute/path/one&#10;/absolute/path/two" style="flex:1;padding:4px 8px;background:var(--surface0);border:1px solid var(--surface1);color:var(--text);border-radius:4px;font-size:12px;font-family:var(--font-mono);resize:vertical"></textarea>
+                </div>
+                <div class="control-hint">
+                  One absolute path per line. Each becomes an entry in
+                  <code>sandbox_workspace_write.writable_roots</code> (equivalent to <code>--add-dir</code>). Blank lines and duplicates are dropped. Press <kbd>Enter</kbd>-out or click away to save.
+                </div>
               </fieldset>
             </div>
             <div id="control-no-backend" class="control-disabled-overlay" style="display:none">
@@ -4909,7 +4952,15 @@ window.selectChangesFile = selectChangesFile;
 // persists to `intendant.toml` and broadcasts `CodexConfigChanged` back to
 // all connected dashboards, so two browsers stay in sync.
 
-let controlCodexConfig = { sandbox: null, approval_policy: null, model: null };
+let controlCodexConfig = {
+  sandbox: null,
+  approval_policy: null,
+  model: null,
+  reasoning_effort: '',
+  web_search: false,
+  network_access: false,
+  writable_roots: [],
+};
 let controlCurrentBackend = null;
 let controlBackendActive = false;
 const controlAppliesBaseText = 'changes apply on next task';
@@ -4924,6 +4975,10 @@ async function refreshControlPane() {
       sandbox: d.codex_sandbox || 'workspace-write',
       approval_policy: d.codex_approval_policy || 'on-request',
       model: d.codex_model || '',
+      reasoning_effort: d.codex_reasoning_effort || '',
+      web_search: !!d.codex_web_search,
+      network_access: !!d.codex_network_access,
+      writable_roots: Array.isArray(d.codex_writable_roots) ? d.codex_writable_roots : [],
     };
     renderControlPane();
   } catch (e) {
@@ -4940,12 +4995,35 @@ function renderControlPane() {
   if (section) section.style.display = isCodex ? '' : 'none';
   if (emptyMsg) emptyMsg.style.display = isCodex ? 'none' : '';
   if (!isCodex) return;
-  const sandboxSel = document.getElementById('control-codex-sandbox');
-  const approvalSel = document.getElementById('control-codex-approval');
-  const modelInp = document.getElementById('control-codex-model');
+  const $ = id => document.getElementById(id);
+  const sandboxSel = $('control-codex-sandbox');
+  const approvalSel = $('control-codex-approval');
+  const modelInp = $('control-codex-model');
+  const reasoningSel = $('control-codex-reasoning');
+  const webSearch = $('control-codex-web-search');
+  const webSearchStatus = $('control-codex-web-search-status');
+  const networkCb = $('control-codex-network');
+  const networkStatus = $('control-codex-network-status');
+  const networkRow = $('control-codex-network-row');
+  const networkHint = $('control-codex-network-hint');
+  const rootsTA = $('control-codex-writable-roots');
   if (sandboxSel) sandboxSel.value = controlCodexConfig.sandbox;
   if (approvalSel) approvalSel.value = controlCodexConfig.approval_policy;
   if (modelInp) modelInp.value = controlCodexConfig.model || '';
+  if (reasoningSel) reasoningSel.value = controlCodexConfig.reasoning_effort || '';
+  if (webSearch) webSearch.checked = !!controlCodexConfig.web_search;
+  if (webSearchStatus) webSearchStatus.textContent = controlCodexConfig.web_search ? 'on' : 'off';
+  if (networkCb) networkCb.checked = !!controlCodexConfig.network_access;
+  if (networkStatus) networkStatus.textContent = controlCodexConfig.network_access ? 'on' : 'off';
+  // Network access only matters inside workspace-write. Grey out + annotate
+  // otherwise so the toggle doesn't look like it's silently doing nothing.
+  const netApplies = controlCodexConfig.sandbox === 'workspace-write';
+  if (networkCb) networkCb.disabled = !netApplies;
+  if (networkRow) networkRow.style.opacity = netApplies ? '' : '0.55';
+  if (networkHint) {
+    networkHint.style.color = netApplies ? '' : 'var(--overlay0)';
+  }
+  if (rootsTA) rootsTA.value = (controlCodexConfig.writable_roots || []).join('\n');
   updateControlAppliesNote();
 }
 
@@ -4991,6 +5069,50 @@ function onControlModelCommit(ev) {
   dispatchControlMsg({ action: 'set_codex_model', model: model || null });
 }
 
+function onControlReasoningChange(ev) {
+  const effort = ev.target.value;
+  if (effort === (controlCodexConfig.reasoning_effort || '')) return;
+  controlCodexConfig.reasoning_effort = effort;
+  dispatchControlMsg({ action: 'set_codex_reasoning_effort', effort: effort || null });
+}
+
+function onControlWebSearchChange(ev) {
+  const enabled = ev.target.checked;
+  controlCodexConfig.web_search = enabled;
+  const s = document.getElementById('control-codex-web-search-status');
+  if (s) s.textContent = enabled ? 'on' : 'off';
+  dispatchControlMsg({ action: 'set_codex_web_search', enabled });
+}
+
+function onControlNetworkChange(ev) {
+  const enabled = ev.target.checked;
+  controlCodexConfig.network_access = enabled;
+  const s = document.getElementById('control-codex-network-status');
+  if (s) s.textContent = enabled ? 'on' : 'off';
+  dispatchControlMsg({ action: 'set_codex_network_access', enabled });
+}
+
+function onControlWritableRootsCommit(ev) {
+  const raw = ev.target.value || '';
+  const roots = raw
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 0);
+  // Cheap dedupe-preserving-order so local state matches what the server will
+  // normalize to; avoids a no-op reassign on the CodexConfigChanged reply.
+  const deduped = [];
+  for (const r of roots) if (!deduped.includes(r)) deduped.push(r);
+  const current = controlCodexConfig.writable_roots || [];
+  if (
+    deduped.length === current.length &&
+    deduped.every((v, i) => v === current[i])
+  ) {
+    return;
+  }
+  controlCodexConfig.writable_roots = deduped;
+  dispatchControlMsg({ action: 'set_codex_writable_roots', roots: deduped });
+}
+
 // Apply a CodexConfigChanged event from the server, keeping the pane in
 // sync with toggles from other browsers (and our own server-confirmed write).
 function applyCodexConfigChanged(evt) {
@@ -5001,23 +5123,34 @@ function applyCodexConfigChanged(evt) {
   } else if (evt.model_cleared) {
     controlCodexConfig.model = '';
   }
-  const sandboxSel = document.getElementById('control-codex-sandbox');
-  const approvalSel = document.getElementById('control-codex-approval');
-  const modelInp = document.getElementById('control-codex-model');
-  if (sandboxSel && evt.sandbox) sandboxSel.value = evt.sandbox;
-  if (approvalSel && evt.approval_policy) approvalSel.value = evt.approval_policy;
-  if (modelInp && (evt.model !== undefined || evt.model_cleared)) {
-    modelInp.value = controlCodexConfig.model || '';
+  if (evt.reasoning_effort !== undefined && evt.reasoning_effort !== null) {
+    controlCodexConfig.reasoning_effort = evt.reasoning_effort;
+  } else if (evt.reasoning_effort_cleared) {
+    controlCodexConfig.reasoning_effort = '';
   }
+  if (typeof evt.web_search === 'boolean') controlCodexConfig.web_search = evt.web_search;
+  if (typeof evt.network_access === 'boolean') controlCodexConfig.network_access = evt.network_access;
+  if (Array.isArray(evt.writable_roots)) controlCodexConfig.writable_roots = evt.writable_roots;
+  // Sandbox change may flip the network-access row's enabled state — full
+  // re-render is the simplest way to keep disabled-styling in sync.
+  renderControlPane();
 }
 
 function wireControlPaneListeners() {
-  const sandboxSel = document.getElementById('control-codex-sandbox');
-  const approvalSel = document.getElementById('control-codex-approval');
-  const modelInp = document.getElementById('control-codex-model');
+  const $ = id => document.getElementById(id);
+  const sandboxSel = $('control-codex-sandbox');
+  const approvalSel = $('control-codex-approval');
+  const modelInp = $('control-codex-model');
+  const reasoningSel = $('control-codex-reasoning');
+  const webSearch = $('control-codex-web-search');
+  const networkCb = $('control-codex-network');
+  const rootsTA = $('control-codex-writable-roots');
   if (sandboxSel) sandboxSel.addEventListener('change', onControlSandboxChange);
   if (approvalSel) approvalSel.addEventListener('change', onControlApprovalChange);
-  // Commit model on blur or Enter so every keystroke doesn't ping the server.
+  if (reasoningSel) reasoningSel.addEventListener('change', onControlReasoningChange);
+  if (webSearch) webSearch.addEventListener('change', onControlWebSearchChange);
+  if (networkCb) networkCb.addEventListener('change', onControlNetworkChange);
+  // Commit text inputs on blur or Enter so every keystroke doesn't ping the server.
   if (modelInp) {
     modelInp.addEventListener('change', onControlModelCommit);
     modelInp.addEventListener('blur', onControlModelCommit);
@@ -5025,6 +5158,17 @@ function wireControlPaneListeners() {
       if (ev.key === 'Enter') {
         ev.preventDefault();
         onControlModelCommit(ev);
+      }
+    });
+  }
+  if (rootsTA) {
+    rootsTA.addEventListener('change', onControlWritableRootsCommit);
+    rootsTA.addEventListener('blur', onControlWritableRootsCommit);
+    // Commit on Ctrl/Cmd+Enter; plain Enter is newline (textarea).
+    rootsTA.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
+        ev.preventDefault();
+        onControlWritableRootsCommit(ev);
       }
     });
   }

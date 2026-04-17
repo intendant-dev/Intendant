@@ -169,6 +169,15 @@ pub struct CodexAgent {
     /// Sandbox mode sent verbatim to Codex `thread/start`. One of
     /// `"read-only"`, `"workspace-write"`, `"danger-full-access"`.
     sandbox: String,
+    /// Reasoning effort override (Responses API). `None` = Codex default.
+    reasoning_effort: Option<String>,
+    /// Enable Responses API `web_search` tool. Maps to `codex --search`.
+    web_search: bool,
+    /// Enable outbound network inside the `workspace-write` sandbox. Ignored
+    /// by other sandbox modes.
+    network_access: bool,
+    /// Extra writable roots beyond the project. Absolute paths.
+    writable_roots: Vec<String>,
     web_port: Option<u16>,
     prompt_sent: bool,
     /// Working directory where .codex/config.toml was written (for cleanup).
@@ -190,6 +199,18 @@ pub struct CodexAgent {
     active_turn_id: Arc<Mutex<Option<String>>>,
 }
 
+/// Knobs that vary per-session and feed into Codex `thread/start` or the
+/// process spawn. Accepts sensible defaults so tests and callers that only
+/// care about the common fields (command/model/approval/sandbox) can use
+/// `..CodexAgentOptions::default()`.
+#[derive(Debug, Clone, Default)]
+pub struct CodexAgentOptions {
+    pub reasoning_effort: Option<String>,
+    pub web_search: bool,
+    pub network_access: bool,
+    pub writable_roots: Vec<String>,
+}
+
 impl CodexAgent {
     pub fn new(
         command: String,
@@ -198,11 +219,33 @@ impl CodexAgent {
         sandbox: String,
         web_port: Option<u16>,
     ) -> Self {
+        Self::with_options(
+            command,
+            model,
+            approval_policy,
+            sandbox,
+            web_port,
+            CodexAgentOptions::default(),
+        )
+    }
+
+    pub fn with_options(
+        command: String,
+        model: Option<String>,
+        approval_policy: String,
+        sandbox: String,
+        web_port: Option<u16>,
+        opts: CodexAgentOptions,
+    ) -> Self {
         Self {
             command,
             model,
             approval_policy,
             sandbox,
+            reasoning_effort: opts.reasoning_effort,
+            web_search: opts.web_search,
+            network_access: opts.network_access,
+            writable_roots: opts.writable_roots,
             web_port,
             prompt_sent: false,
             config_working_dir: None,
@@ -833,6 +876,10 @@ impl ExternalAgent for CodexAgent {
         self.model = config.model.or_else(|| self.model.clone());
         self.approval_policy = config.approval_policy.clone();
         self.sandbox = config.sandbox;
+        self.reasoning_effort = config.reasoning_effort;
+        self.web_search = config.web_search;
+        self.network_access = config.network_access;
+        self.writable_roots = config.writable_roots;
 
         // Write .codex/config.toml for MCP-over-HTTP access to Intendant.
         // Backup any existing config and restore on shutdown.
@@ -868,14 +915,49 @@ impl ExternalAgent for CodexAgent {
             }
         }
 
-        // Pass MCP server config via -c flag so Codex connects to intendant's MCP
+        // Pass MCP server config via -c flag so Codex connects to intendant's MCP.
+        // Any additional knobs the user toggled in the Control tab (web search,
+        // network access inside workspace-write, extra writable roots) are
+        // appended here as `-c key=value` overrides so Codex's app-server picks
+        // them up exactly as if they had been written to `~/.codex/config.toml`
+        // before launch.
         let mcp_url = format!("http://localhost:{}/mcp", self.web_port.unwrap_or(8765));
+        let mut args: Vec<String> = vec![
+            "app-server".to_string(),
+            "-c".to_string(),
+            "mcp_servers.intendant.type=\"http\"".to_string(),
+            "-c".to_string(),
+            format!("mcp_servers.intendant.url=\"{}\"", mcp_url),
+        ];
+        if self.web_search {
+            args.push("-c".to_string());
+            args.push("tools.web_search=true".to_string());
+        }
+        if let Some(ref effort) = self.reasoning_effort {
+            // TOML-quote the value explicitly; `-c` parses the RHS as TOML.
+            args.push("-c".to_string());
+            args.push(format!("model_reasoning_effort=\"{}\"", effort));
+        }
+        if self.network_access && self.sandbox == "workspace-write" {
+            args.push("-c".to_string());
+            args.push("sandbox_workspace_write.network_access=true".to_string());
+        }
+        if !self.writable_roots.is_empty() {
+            // TOML array of strings. Quote and escape each path so whitespace
+            // and backslashes don't break the parse.
+            let quoted: Vec<String> = self
+                .writable_roots
+                .iter()
+                .map(|p| format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "\\\"")))
+                .collect();
+            args.push("-c".to_string());
+            args.push(format!(
+                "sandbox_workspace_write.writable_roots=[{}]",
+                quoted.join(", ")
+            ));
+        }
         let mut child = Command::new(&self.command)
-            .args([
-                "app-server",
-                "-c", &format!("mcp_servers.intendant.type=\"http\""),
-                "-c", &format!("mcp_servers.intendant.url=\"{}\"", mcp_url),
-            ])
+            .args(&args)
             .current_dir(&config.working_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
