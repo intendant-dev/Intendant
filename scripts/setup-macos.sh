@@ -302,7 +302,9 @@ disable_screen_lock() {
     defaults write com.apple.screensaver askForPassword -int 0
     defaults -currentHost write com.apple.screensaver idleTime -int 0
     ok "screensaver password prompt and idle timer disabled (per-user)"
-    echo "      for full no-sleep, also run:"
+    ok "settings apply on next screensaver activation — to apply immediately,"
+    ok "run: killall cfprefsd"
+    echo "      for full no-sleep (admin), also run:"
     echo "         sudo pmset displaysleep 0 sleep 0"
 }
 

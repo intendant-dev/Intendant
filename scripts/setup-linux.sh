@@ -430,6 +430,8 @@ disable_screen_lock() {
 
     if (( applied > 0 )); then
         ok "screen lock + idle blank: $applied keys set"
+        ok "settings apply on next login — to apply immediately, log out and"
+        ok "back in or restart the relevant locker (light-locker, xscreensaver, ...)"
     else
         warn "could not set any screen-lock keys"
         warn "no supported desktop detected (GNOME / MATE / Cinnamon / XFCE / KDE)"
