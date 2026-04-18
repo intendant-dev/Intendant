@@ -287,57 +287,153 @@ detect_display() {
 
 # ── Screen lock / idle blank ──────────────────────────────────────────────
 
-# Disable GNOME screen lock and idle blank for the user session.
+# Recover the user's session DBUS bus when invoked over SSH.
+#
+# Without DBUS_SESSION_BUS_ADDRESS in our environment, gsettings/xfconf
+# silently fall through to an in-memory backend and writes don't persist.
+# Walks running session processes for the user and steals the bus address
+# from one of their environments.
+ensure_dbus_session() {
+    if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+        return 0
+    fi
+    if ! has_cmd pgrep; then
+        return 0
+    fi
+    local proc session_pid bus
+    for proc in gnome-session xfce4-session mate-session cinnamon-session-cinnamon \
+                cinnamon-session plasmashell lxsession xsession; do
+        session_pid=$(pgrep -u "$USER" -x "$proc" 2>/dev/null | head -1 || true)
+        if [[ -n "$session_pid" ]] && [[ -r "/proc/$session_pid/environ" ]]; then
+            bus=$(tr '\0' '\n' < "/proc/$session_pid/environ" \
+                | grep '^DBUS_SESSION_BUS_ADDRESS=' \
+                | head -1 | cut -d= -f2-)
+            if [[ -n "$bus" ]]; then
+                export DBUS_SESSION_BUS_ADDRESS="$bus"
+                return 0
+            fi
+        fi
+    done
+}
+
+# Disable screen lock and idle blank across as many desktops as we can
+# detect (GNOME, MATE, Cinnamon, XFCE, KDE Plasma, plus light-locker on
+# XFCE-style setups).
 #
 # An intendant VM operates the desktop autonomously; a lock screen is
 # pure friction:
 #   - Wayland: the screencast portal *revokes* the PipeWire stream when
 #     the session locks (security — the lock-screen contents shouldn't
 #     leak to whoever held the share grant). Re-grant required.
-#   - X11: the lock screen is just a root-window overlay, so XShm capture
-#     keeps running but only ever sees the dimmed black overlay.
+#   - X11: the lock screen is a root-window overlay; XShm capture keeps
+#     running but only ever sees the dimmed black overlay.
 #
-# Idempotent: every command is `gsettings set ...` which overwrites and
-# never errors on no-change. Re-running this function is a no-op.
+# Idempotent: every command overwrites a single key and never errors on
+# no-change. Settings for desktops not installed on this system simply
+# don't apply (the relevant binary or schema is missing) and are skipped.
 disable_screen_lock() {
     echo ""
-    info "disabling GNOME screen lock + idle blank..."
+    info "disabling screen lock + idle blank across detected desktops..."
 
-    if ! has_cmd gsettings; then
-        warn "gsettings not found — skipping (non-GNOME desktop?)"
-        warn "if you use a different desktop, disable screen lock manually"
-        return
+    ensure_dbus_session
+
+    local applied=0
+    local entry parts
+
+    # ── gsettings: GNOME / MATE / Cinnamon / light-locker ──────────────
+    #
+    # Each entry is "schema key value" — word-split intentionally when
+    # passed to gsettings. All values here are single tokens.
+    if has_cmd gsettings; then
+        local gsettings_entries=(
+            # GNOME
+            "org.gnome.desktop.screensaver lock-enabled false"
+            "org.gnome.desktop.screensaver idle-activation-enabled false"
+            "org.gnome.desktop.session idle-delay 0"
+            "org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type nothing"
+            "org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type nothing"
+            # MATE
+            "org.mate.screensaver lock-enabled false"
+            "org.mate.screensaver idle-activation-enabled false"
+            "org.mate.session idle-delay 0"
+            "org.mate.power-manager sleep-display-ac 0"
+            "org.mate.power-manager sleep-display-battery 0"
+            "org.mate.power-manager sleep-computer-ac 0"
+            "org.mate.power-manager sleep-computer-battery 0"
+            # Cinnamon
+            "org.cinnamon.desktop.screensaver lock-enabled false"
+            "org.cinnamon.desktop.screensaver idle-activation-enabled false"
+            "org.cinnamon.desktop.session idle-delay 0"
+            "org.cinnamon.settings-daemon.plugins.power sleep-inactive-ac-type nothing"
+            "org.cinnamon.settings-daemon.plugins.power sleep-inactive-battery-type nothing"
+            # light-locker (XFCE / LXDE / others)
+            "apps.light-locker lock-after-screensaver 0"
+            "apps.light-locker lock-on-suspend false"
+            "apps.light-locker lock-on-lid false"
+            "apps.light-locker late-locking false"
+        )
+        for entry in "${gsettings_entries[@]}"; do
+            # shellcheck disable=SC2086
+            if gsettings set $entry 2>/dev/null; then
+                applied=$(( applied + 1 ))
+            fi
+        done
     fi
 
-    # When this script is run over SSH, DBUS_SESSION_BUS_ADDRESS isn't
-    # inherited from the graphical session and gsettings would silently
-    # use the in-memory backend (no persistence). Recover the bus from a
-    # running gnome-session process for the same user, if there is one.
-    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
-        local session_pid bus
-        session_pid=$(pgrep -u "$USER" -x gnome-session 2>/dev/null | head -1 || true)
-        if [[ -n "$session_pid" ]] && [[ -r "/proc/$session_pid/environ" ]]; then
-            bus=$(tr '\0' '\n' < "/proc/$session_pid/environ" \
-                | grep '^DBUS_SESSION_BUS_ADDRESS=' \
-                | head -1 | cut -d= -f2-)
-            [[ -n "$bus" ]] && export DBUS_SESSION_BUS_ADDRESS="$bus"
+    # ── xfconf-query: XFCE power manager + screensaver ──────────────────
+    #
+    # Each entry is "channel property type value". -n creates the property
+    # if missing; -t sets its type so the write succeeds even on a fresh
+    # config without an existing entry.
+    if has_cmd xfconf-query; then
+        local xfconf_entries=(
+            "xfce4-power-manager /xfce4-power-manager/blank-on-ac int 0"
+            "xfce4-power-manager /xfce4-power-manager/blank-on-battery int 0"
+            "xfce4-power-manager /xfce4-power-manager/dpms-enabled bool false"
+            "xfce4-power-manager /xfce4-power-manager/inactivity-on-ac int 0"
+            "xfce4-power-manager /xfce4-power-manager/inactivity-on-battery int 0"
+            "xfce4-power-manager /xfce4-power-manager/lock-screen-suspend-hibernate bool false"
+            "xfce4-screensaver /saver/enabled bool false"
+            "xfce4-screensaver /lock/enabled bool false"
+        )
+        for entry in "${xfconf_entries[@]}"; do
+            # shellcheck disable=SC2086
+            set -- $entry
+            if xfconf-query -c "$1" -p "$2" -n -t "$3" -s "$4" 2>/dev/null; then
+                applied=$(( applied + 1 ))
+            fi
+        done
+    fi
+
+    # ── KDE Plasma: kwriteconfig ────────────────────────────────────────
+    #
+    # Plasma 6 uses kwriteconfig6, Plasma 5 uses kwriteconfig5. Try
+    # whichever is available. Edits ~/.config/kscreenlockerrc directly so
+    # this works without a running session — kscreenlocker picks up the
+    # change on next idle-timer evaluation.
+    local kw=""
+    if has_cmd kwriteconfig6; then
+        kw=kwriteconfig6
+    elif has_cmd kwriteconfig5; then
+        kw=kwriteconfig5
+    fi
+    if [[ -n "$kw" ]]; then
+        if "$kw" --file kscreenlockerrc --group Daemon --key Autolock \
+                --type bool false 2>/dev/null; then
+            applied=$(( applied + 1 ))
+        fi
+        if "$kw" --file kscreenlockerrc --group Daemon --key LockOnResume \
+                --type bool false 2>/dev/null; then
+            applied=$(( applied + 1 ))
         fi
     fi
 
-    local failed=0
-    gsettings set org.gnome.desktop.screensaver lock-enabled false 2>/dev/null || ((failed++))
-    gsettings set org.gnome.desktop.screensaver idle-activation-enabled false 2>/dev/null || ((failed++))
-    gsettings set org.gnome.desktop.session idle-delay 0 2>/dev/null || ((failed++))
-    gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing' 2>/dev/null || ((failed++))
-    gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing' 2>/dev/null || ((failed++))
-
-    if (( failed == 0 )); then
-        ok "screen lock + idle blank disabled (5/5 keys)"
-    elif (( failed < 5 )); then
-        ok "screen lock partially disabled ($((5 - failed))/5 keys — older GNOME?)"
+    if (( applied > 0 )); then
+        ok "screen lock + idle blank: $applied keys set"
     else
         warn "could not set any screen-lock keys"
-        warn "if installing over SSH, run this script from a GNOME terminal instead"
+        warn "no supported desktop detected (GNOME / MATE / Cinnamon / XFCE / KDE)"
+        warn "if installing over SSH, re-run from a desktop terminal so DBUS is available"
     fi
 }
 
