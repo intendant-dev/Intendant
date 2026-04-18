@@ -475,6 +475,78 @@ html, body {
   padding: 1px 5px;
   border-radius: 3px;
 }
+/* Per-peer controls panel — revealed by clicking the row's `▾` expand
+   button. Wraps the existing single-line .daemon-row in a column so the
+   controls slot sits beneath without disturbing the row layout. */
+.daemon-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.daemon-row .expand-btn {
+  padding: 1px 6px;
+  border: 1px solid var(--surface2);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--subtext0);
+  cursor: pointer;
+  font-size: 11px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  flex-shrink: 0;
+}
+.daemon-row .expand-btn:hover,
+.daemon-row .expand-btn.expanded {
+  color: var(--peach);
+  border-color: var(--peach);
+}
+.daemon-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  margin-left: 18px; /* indent so the panel visually attaches to the row */
+  background: var(--mantle);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  font-size: 12px;
+}
+.daemon-msg-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.daemon-msg-row input {
+  flex: 1;
+  padding: 4px 8px;
+  background: var(--base);
+  border: 1px solid var(--surface2);
+  border-radius: 3px;
+  color: var(--text);
+  font-size: 12px;
+}
+.daemon-msg-row input:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+.daemon-msg-row button {
+  padding: 4px 12px;
+  background: var(--blue);
+  color: var(--base);
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.daemon-msg-row button:hover { background: var(--sapphire); }
+.daemon-msg-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+.daemon-msg-status {
+  font-size: 11px;
+  color: var(--subtext0);
+  min-height: 14px; /* reserve space so the panel doesn't jump on first send */
+}
+.daemon-msg-status.error { color: var(--red); }
+.daemon-msg-status.ok { color: var(--green); }
 .daemon-add-row {
   display: flex;
   gap: 8px;
@@ -4250,6 +4322,13 @@ let activeStatsHost = '';
 // implicit and always rendered first in the UI.
 const DAEMONS_KEY = 'intendant_daemons';
 let daemons = [];
+
+// Tracks which peer rows have their per-peer controls panel expanded.
+// Lives outside renderDaemonsList because the list re-renders on every
+// push event (PeerAdded / PeerRemoved / PeerStateChanged) and the
+// expand state needs to survive those re-renders — otherwise the panel
+// collapses every time a peer's status updates, which is broken UX.
+const expandedDaemons = new Set();
 
 // (Storage key constants are declared earlier, above activeHostFilter,
 // to avoid a temporal-dead-zone reference error.)
@@ -10070,6 +10149,9 @@ function removeDaemonById(id) {
   if (app && app.remove_secondary_host) {
     app.remove_secondary_host(id);
   }
+  // Drop the expanded-state record so it doesn't get reapplied
+  // against a row that no longer exists.
+  expandedDaemons.delete(id);
   renderDaemonsList();
 }
 
@@ -10157,6 +10239,45 @@ function renderDaemonsList() {
   el.querySelectorAll('.daemon-row .remove-btn').forEach(btn => {
     btn.addEventListener('click', () => removeDaemon(btn.dataset.hostId));
   });
+
+  // Wire per-peer expand toggles. The list re-renders on every push
+  // event, so the expansion state lives in `expandedDaemons` (a Set
+  // outside this function) and is reapplied after each render below.
+  el.querySelectorAll('.daemon-row .expand-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const hostId = btn.dataset.hostId;
+      const expanding = !expandedDaemons.has(hostId);
+      if (expanding) expandedDaemons.add(hostId);
+      else expandedDaemons.delete(hostId);
+      applyDaemonExpandedState(hostId, expanding);
+      if (expanding) {
+        const input = document.querySelector(
+          `.daemon-msg-input[data-host-id="${CSS.escape(hostId)}"]`
+        );
+        if (input) input.focus();
+      }
+    });
+  });
+
+  // Wire per-peer message send: button click + Enter in the input
+  // both call sendPeerMessage with the row's host_id.
+  el.querySelectorAll('.daemon-msg-send').forEach(btn => {
+    btn.addEventListener('click', () => sendPeerMessage(btn.dataset.hostId));
+  });
+  el.querySelectorAll('.daemon-msg-input').forEach(input => {
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        sendPeerMessage(input.dataset.hostId);
+      }
+    });
+  });
+
+  // Reapply expansion state for any rows that were open before this
+  // re-render (e.g. user expanded a peer's controls, then a push
+  // event triggered re-render). Without this the panel collapses on
+  // every state change, which would feel broken.
+  expandedDaemons.forEach(hostId => applyDaemonExpandedState(hostId, true));
 
   // Toggle host-badge visibility in the Activity tab. Single-host
   // setups stay visually clean; multi-host setups see the badges.
@@ -10308,18 +10429,118 @@ function renderDaemonRow(d, isSelf) {
   const statePill = isSelf ? '' : renderStatePill(d.server_connection_state);
   const statusChip = isSelf ? '' : renderStatusChip(d.server_status);
   const capBadges = renderCapBadges(d.capabilities);
+  // Per-peer outbound op controls. Skipped for self — federation ops
+  // address other peers, never the daemon hosting the dashboard. The
+  // expand toggle starts collapsed; expandedDaemons re-expands rows
+  // that were already open before a re-render.
+  const expandBtn = isSelf
+    ? ''
+    : `<button class="expand-btn" data-host-id="${escapeHtml(d.host_id)}" title="Show peer controls">▾</button>`;
+  const peerLabel = escapeHtml(d.label || d.host_id);
+  const controlsPanel = isSelf
+    ? ''
+    : `<div class="daemon-controls" id="daemon-controls-${escapeHtml(d.host_id)}" style="display:none">
+         <div class="daemon-msg-row">
+           <input class="daemon-msg-input" type="text" placeholder="Send a message to ${peerLabel}…" data-host-id="${escapeHtml(d.host_id)}">
+           <button class="daemon-msg-send" data-host-id="${escapeHtml(d.host_id)}">Send</button>
+         </div>
+         <div class="daemon-msg-status" data-host-id="${escapeHtml(d.host_id)}"></div>
+       </div>`;
   return `
-    <div class="daemon-row${isSelf ? ' self' : ''}">
-      <span class="conn-dot ${dotClass}" title="${escapeHtml(dotTitle)}"></span>
-      <span class="label">${escapeHtml(d.label || d.host_id)}${selfMark}</span>
-      ${statePill}
-      ${statusChip}
-      <span class="url" title="${escapeHtml(d.url)}">${escapeHtml(d.url)}</span>
-      ${capBadges}
-      <span class="version" title="version · git SHA">${versionText}</span>
-      ${removeBtn}
+    <div class="daemon-entry${isSelf ? ' self' : ''}">
+      <div class="daemon-row${isSelf ? ' self' : ''}">
+        <span class="conn-dot ${dotClass}" title="${escapeHtml(dotTitle)}"></span>
+        <span class="label">${peerLabel}${selfMark}</span>
+        ${statePill}
+        ${statusChip}
+        <span class="url" title="${escapeHtml(d.url)}">${escapeHtml(d.url)}</span>
+        ${capBadges}
+        <span class="version" title="version · git SHA">${versionText}</span>
+        ${expandBtn}
+        ${removeBtn}
+      </div>
+      ${controlsPanel}
     </div>
   `;
+}
+
+// Sync the visual state of a peer's expand toggle + controls panel
+// to `expanded`. Used both by the click handler (when the user
+// toggles) and at the end of renderDaemonsList (to reapply state
+// across re-renders).
+function applyDaemonExpandedState(hostId, expanded) {
+  const target = document.getElementById(`daemon-controls-${hostId}`);
+  if (target) target.style.display = expanded ? 'flex' : 'none';
+  const btn = document.querySelector(
+    `.expand-btn[data-host-id="${CSS.escape(hostId)}"]`
+  );
+  if (btn) {
+    btn.classList.toggle('expanded', expanded);
+    btn.textContent = expanded ? '▴' : '▾';
+    btn.title = expanded ? 'Hide peer controls' : 'Show peer controls';
+  }
+}
+
+// POST a message to a peer via /api/peers/{id}/message and surface
+// the result in the row's status line. The peer id is embedded in
+// the URL path verbatim — colons are valid path chars per RFC 3986
+// and the server-side parser splits on the literal `:` to recover
+// the kind prefix; URL-encoding `:` as `%3A` would break the lookup
+// because the registry keys on the un-encoded id.
+async function sendPeerMessage(hostId) {
+  if (!hostId) return;
+  const input = document.querySelector(
+    `.daemon-msg-input[data-host-id="${CSS.escape(hostId)}"]`
+  );
+  const sendBtn = document.querySelector(
+    `.daemon-msg-send[data-host-id="${CSS.escape(hostId)}"]`
+  );
+  const statusEl = document.querySelector(
+    `.daemon-msg-status[data-host-id="${CSS.escape(hostId)}"]`
+  );
+  if (!input || !sendBtn) return;
+
+  const text = input.value.trim();
+  if (!text) {
+    if (statusEl) {
+      statusEl.textContent = 'Message is empty.';
+      statusEl.className = 'daemon-msg-status error';
+    }
+    return;
+  }
+
+  sendBtn.disabled = true;
+  if (statusEl) {
+    statusEl.textContent = 'Sending…';
+    statusEl.className = 'daemon-msg-status';
+  }
+  try {
+    const resp = await fetch(`/api/peers/${hostId}/message`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      if (statusEl) {
+        statusEl.textContent = `Failed: ${result.error || `HTTP ${resp.status}`}`;
+        statusEl.className = 'daemon-msg-status error';
+      }
+    } else {
+      if (statusEl) {
+        statusEl.textContent = `Sent (id ${result.message_id || '?'}).`;
+        statusEl.className = 'daemon-msg-status ok';
+      }
+      input.value = '';
+    }
+  } catch (e) {
+    if (statusEl) {
+      statusEl.textContent = `Error: ${e.message}`;
+      statusEl.className = 'daemon-msg-status error';
+    }
+  } finally {
+    sendBtn.disabled = false;
+  }
 }
 
 function escapeHtml(s) {
