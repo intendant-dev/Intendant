@@ -1131,25 +1131,114 @@ fn spawn_encoder_thread(
                 return;
             }
         };
+
+        // Watchdog: detect silent encoders that accept input but produce
+        // nothing on the wire (e.g. h264_vaapi on hosts where virtio-gpu
+        // video acceleration is broken — vaInitialize "succeeds" but no
+        // NALs ever come out of stdout). After this many consecutive input
+        // frames with no encoded packet, swap to a known-good fallback.
+        // 30 frames ≈ 1s at 30fps, well above the normal 1-2 frame
+        // pipeline depth for any healthy encoder.
+        const WATCHDOG_THRESHOLD: u64 = 30;
+        let mut frames_since_last_output: u64 = 0;
+        let mut watchdog_swap_done = false;
+
         while let Ok((i420, arrived)) = i420_rx.recv() {
             if shutdown.is_cancelled() {
                 break;
             }
-            if let Ok(packets) = encoder.encode(&i420, duration_ms) {
-                let latency_us = arrived.elapsed().as_micros() as u64;
-                for pkt in packets {
-                    counters.encode_frames.fetch_add(1, Ordering::Relaxed);
-                    counters
-                        .encode_latency_us_sum
-                        .fetch_add(latency_us, Ordering::Relaxed);
-                    let ef = Arc::new(pkt.into_encoded_frame());
-                    if efr_tx.blocking_send(ef).is_err() {
-                        return;
+
+            let produced = match encoder.encode(&i420, duration_ms) {
+                Ok(packets) => {
+                    let n = packets.len();
+                    let latency_us = arrived.elapsed().as_micros() as u64;
+                    for pkt in packets {
+                        counters.encode_frames.fetch_add(1, Ordering::Relaxed);
+                        counters
+                            .encode_latency_us_sum
+                            .fetch_add(latency_us, Ordering::Relaxed);
+                        let ef = Arc::new(pkt.into_encoded_frame());
+                        if efr_tx.blocking_send(ef).is_err() {
+                            return;
+                        }
+                    }
+                    n
+                }
+                Err(e) => {
+                    eprintln!("[display/encoder] encode error: {}", e);
+                    0
+                }
+            };
+
+            if produced > 0 {
+                frames_since_last_output = 0;
+            } else {
+                frames_since_last_output += 1;
+                if !watchdog_swap_done && frames_since_last_output >= WATCHDOG_THRESHOLD {
+                    watchdog_swap_done = true;
+                    eprintln!(
+                        "[display/encoder] watchdog: {} consecutive input frames produced no output",
+                        frames_since_last_output,
+                    );
+                    if let Some(new_enc) = try_h264_fallback(codec_mime, width, height) {
+                        eprintln!(
+                            "[display/encoder] watchdog: swapped encoder to libx264 fallback",
+                        );
+                        encoder = new_enc;
+                        frames_since_last_output = 0;
+                    } else {
+                        eprintln!(
+                            "[display/encoder] watchdog: no fallback available, encoder stays",
+                        );
                     }
                 }
             }
         }
     });
+}
+
+/// Attempt a watchdog-triggered swap to the libx264 software H.264 encoder.
+///
+/// Returns `Some(encoder)` only when:
+/// - the codec is H.264 (no fallback strategy for VP8 — libvpx doesn't
+///   exhibit this silent-failure pattern), and
+/// - VA-API hasn't already been banned (if it has, the current encoder
+///   is already libx264 and there's nothing better to swap to), and
+/// - the new encoder spawns cleanly.
+///
+/// On non-Linux targets there's no VA-API path to ban, so this is a no-op.
+#[cfg(target_os = "linux")]
+fn try_h264_fallback(
+    codec_mime: &'static str,
+    width: u32,
+    height: u32,
+) -> Option<Box<dyn encode::Encoder>> {
+    if codec_mime != encode::MIME_TYPE_H264 {
+        return None;
+    }
+    if encode::h264_linux::is_vaapi_banned() {
+        return None;
+    }
+    encode::h264_linux::ban_vaapi();
+    match encode::select_codec_for_mime(codec_mime, width, height, 2000) {
+        Ok((enc, _)) => Some(enc),
+        Err(e) => {
+            eprintln!(
+                "[display/encoder] watchdog: libx264 fallback creation failed: {}",
+                e,
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_h264_fallback(
+    _codec_mime: &'static str,
+    _width: u32,
+    _height: u32,
+) -> Option<Box<dyn encode::Encoder>> {
+    None
 }
 
 // ---------------------------------------------------------------------------

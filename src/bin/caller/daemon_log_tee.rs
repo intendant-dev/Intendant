@@ -77,6 +77,13 @@ fn tee_fd(target_fd: RawFd, file_fd: RawFd) -> io::Result<()> {
 
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        // Per-tee accumulator for the in-progress (newline-less) tail of
+        // the file-side output. We pass bytes through to the original
+        // terminal as-is (preserving ANSI codes and partial-line writes
+        // that interactive output relies on), but for the daemon.log file
+        // we line-buffer and prepend a wallclock timestamp to each line so
+        // tester-submitted bundles are temporally analyzable later.
+        let mut line_buf: Vec<u8> = Vec::with_capacity(1024);
         loop {
             let n =
                 unsafe { libc::read(pipe_read, buf.as_mut_ptr() as *mut _, buf.len()) };
@@ -84,10 +91,26 @@ fn tee_fd(target_fd: RawFd, file_fd: RawFd) -> io::Result<()> {
                 break;
             }
             let len = n as usize;
+            let chunk = &buf[..len];
+
+            // Pass-through to original terminal — unchanged, no buffering.
             unsafe {
-                let _ = libc::write(orig_fd, buf.as_ptr() as *const _, len);
-                let _ = libc::write(file_fd, buf.as_ptr() as *const _, len);
+                let _ = libc::write(orig_fd, chunk.as_ptr() as *const _, len);
             }
+
+            // Line-buffer for the file with a per-line timestamp prefix.
+            for &b in chunk {
+                line_buf.push(b);
+                if b == b'\n' {
+                    write_timestamped_line(file_fd, &line_buf);
+                    line_buf.clear();
+                }
+            }
+        }
+        // Flush any final partial line that lacked a trailing newline.
+        if !line_buf.is_empty() {
+            line_buf.push(b'\n');
+            write_timestamped_line(file_fd, &line_buf);
         }
         unsafe {
             libc::close(pipe_read);
@@ -95,4 +118,23 @@ fn tee_fd(target_fd: RawFd, file_fd: RawFd) -> io::Result<()> {
     });
 
     Ok(())
+}
+
+/// Atomically write `[timestamp] line` to `file_fd`.
+///
+/// The timestamp + line are concatenated into a single buffer and written
+/// in one `write(2)` call. Linux guarantees write atomicity for buffers up
+/// to PIPE_BUF (4096) on pipes; for regular files atomicity is not
+/// formally guaranteed but Linux's filesystem layer in practice does not
+/// interleave sub-call writes from different threads. Lines longer than
+/// the buffer fall back to a single best-effort write.
+#[cfg(unix)]
+fn write_timestamped_line(file_fd: RawFd, line: &[u8]) {
+    let ts = chrono::Local::now().format("%H:%M:%S%.3f ").to_string();
+    let mut out = Vec::with_capacity(ts.len() + line.len());
+    out.extend_from_slice(ts.as_bytes());
+    out.extend_from_slice(line);
+    unsafe {
+        let _ = libc::write(file_fd, out.as_ptr() as *const _, out.len());
+    }
 }

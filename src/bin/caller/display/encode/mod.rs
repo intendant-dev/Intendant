@@ -308,8 +308,10 @@ fn create_h264_encoder(
     bitrate_kbps: u32,
 ) -> Result<(Box<dyn Encoder>, CodecChoice), String> {
     let enc = h264_linux::FfmpegH264Encoder::new(width, height, bitrate_kbps)?;
+    // The specific backend (h264_vaapi vs libx264) is logged by
+    // FfmpegH264Encoder::new itself — don't lie about it here.
     eprintln!(
-        "[display/encoder] Using H264 (ffmpeg VA-API) for {}x{}",
+        "[display/encoder] Using H264 (ffmpeg) for {}x{}",
         width, height,
     );
     Ok((Box::new(enc), CodecChoice::H264))

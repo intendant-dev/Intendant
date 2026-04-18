@@ -9,6 +9,26 @@
 use super::{EncodedPacket, Encoder};
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Process-wide ban on `h264_vaapi` after the runtime watchdog observes a
+/// silent failure (encoder accepts input but produces no output for many
+/// frames). On hosts where VA-API "succeeds" at init but then produces
+/// nothing — common in VMs where virtio-gpu video acceleration is broken
+/// (e.g. UTM on Apple silicon) — the watchdog flips this once and every
+/// subsequent `FfmpegH264Encoder::new` call goes straight to libx264.
+/// One-way: never cleared, so we don't keep retrying a known-broken path.
+static VAAPI_BANNED: AtomicBool = AtomicBool::new(false);
+
+/// Mark `h264_vaapi` as broken on this host for the rest of the process.
+pub fn ban_vaapi() {
+    VAAPI_BANNED.store(true, Ordering::SeqCst);
+}
+
+/// Whether the watchdog has banned `h264_vaapi` for this process.
+pub fn is_vaapi_banned() -> bool {
+    VAAPI_BANNED.load(Ordering::Relaxed)
+}
 
 /// A complete NAL unit extracted by the reader thread.
 struct Nal {
@@ -60,6 +80,17 @@ impl FfmpegH264Encoder {
 
         if ffmpeg_check.is_err() {
             return Err("ffmpeg not found in PATH".to_string());
+        }
+
+        // Skip VA-API if the runtime watchdog already banned it on this
+        // host. Avoids re-spawning a known-broken encoder on each peer
+        // reconnect or display re-grant within the same process.
+        if is_vaapi_banned() {
+            let enc = Self::spawn_x264(width, height, bitrate_kbps)?;
+            eprintln!(
+                "[display/h264_linux] using libx264 (VA-API banned this session)",
+            );
+            return Ok(enc);
         }
 
         // Try VA-API first.
