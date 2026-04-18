@@ -453,6 +453,21 @@ pub enum OutboundEvent {
     PeerStateChanged {
         peer: crate::peer::PeerSnapshot,
     },
+    /// A peer-emitted [`crate::peer::PeerEvent`] forwarded by the
+    /// local registry's translator. Lets the dashboard subscribe to
+    /// per-peer activity (logs, model output, approval requests,
+    /// etc.) through the same primary `/ws` stream as registry
+    /// state events — eliminating the need for per-secondary
+    /// WebSocket plumbing in the browser once the UI side migrates.
+    ///
+    /// The inner field is named `payload` (not `event`) because
+    /// `OutboundEvent`'s serde tag is also `"event"`, and a struct
+    /// field with the same name would collide with the variant
+    /// discriminator at the same JSON nesting level.
+    PeerEventForwarded {
+        peer_id: String,
+        payload: crate::peer::PeerEvent,
+    },
     /// Forward-compat fallback for wire events we don't recognize.
     /// Produced only by the deserializer; never constructed locally.
     /// Cannot be serialized.

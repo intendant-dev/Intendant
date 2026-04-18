@@ -32,7 +32,7 @@
 //! cleanly with `PeerError::CardFetch`.
 
 use crate::peer::card::{AgentCard, TransportSpec};
-use crate::peer::event::TaggedPeerEvent;
+use crate::peer::event::{PeerEvent, TaggedPeerEvent};
 use crate::peer::handle::{spawn_peer, PeerHandle, PeerSnapshot};
 use crate::peer::id::PeerId;
 use crate::peer::transport::IntendantWsTransport;
@@ -77,6 +77,20 @@ pub enum RegistryEvent {
     /// A peer's connection state, status, or card changed. Carries a
     /// fresh snapshot reflecting the new values.
     PeerStateChanged(PeerSnapshot),
+    /// A peer-emitted [`PeerEvent`] forwarded from the per-peer
+    /// transport's broadcast. Lets the dashboard subscribe to
+    /// per-peer activity (logs, model output, approval requests,
+    /// etc.) through the same registry channel as add/remove/state-
+    /// change events instead of opening a separate WebSocket per
+    /// peer from the browser.
+    ///
+    /// This is the server-side leg of the per-peer event stream
+    /// migration: the local primary daemon already has the peer's
+    /// PeerEvent stream via `PeerHandle::subscribe`, so reflecting
+    /// those events out to dashboard clients through the existing
+    /// push pipe is cheap and removes the browser's per-secondary
+    /// WebSocket plumbing once the UI side migrates.
+    PeerEventForwarded { peer: PeerId, event: PeerEvent },
 }
 
 /// Server-side peer registry.
@@ -192,7 +206,8 @@ impl PeerRegistry {
             .inner
             .events
             .send(RegistryEvent::PeerAdded(handle.snapshot()));
-        spawn_state_observer(handle, self.inner.events.clone());
+        spawn_state_observer(handle.clone(), self.inner.events.clone());
+        spawn_event_forwarder(handle, self.inner.events.clone());
 
         Ok(peer_id)
     }
@@ -259,6 +274,47 @@ fn spawn_state_observer(
                 break;
             }
             let _ = events.send(RegistryEvent::PeerStateChanged(handle.snapshot()));
+        }
+    });
+}
+
+/// Spawn the per-peer event forwarder task. Subscribes to the peer's
+/// [`PeerEvent`] broadcast (via `PeerHandle::subscribe`) and republishes
+/// each event as [`RegistryEvent::PeerEventForwarded`] tagged with the
+/// peer's id, so the registry's single broadcast carries both
+/// membership/state events *and* per-peer activity events.
+///
+/// Lossy on the input side: if the dashboard fan-out lags behind a
+/// chatty peer (e.g. streaming model deltas), the per-peer broadcast's
+/// `Lagged` error is logged at debug and the forwarder skips ahead.
+/// This is intentional — durable per-peer events land on the session
+/// log via the registry's [`TaggedPeerEvent`] log sink, so the dashboard
+/// can drop intermediate frames safely.
+///
+/// Exits cleanly when the per-peer actor's broadcast sender drops
+/// (`RecvError::Closed`), same lifetime model as `spawn_state_observer`.
+fn spawn_event_forwarder(
+    handle: PeerHandle,
+    events: broadcast::Sender<RegistryEvent>,
+) {
+    tokio::spawn(async move {
+        let peer_id = handle.id().clone();
+        let mut peer_events = handle.subscribe();
+        loop {
+            match peer_events.recv().await {
+                Ok(event) => {
+                    let _ = events.send(RegistryEvent::PeerEventForwarded {
+                        peer: peer_id.clone(),
+                        event,
+                    });
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Slow consumers fall behind. Skip the missed
+                    // window and keep streaming the current event.
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
         }
     });
 }
@@ -615,6 +671,52 @@ mod tests {
         assert!(
             saw_state_changed,
             "did not observe a PeerStateChanged event within 3s"
+        );
+
+        reg.remove_peer(&id).await.unwrap();
+        gateway.abort();
+    }
+
+    /// Per-peer events emitted by a peer's transport (PeerEvent::Connected,
+    /// ActivityStarted, Log, ApprovalRequested, etc.) are forwarded as
+    /// `RegistryEvent::PeerEventForwarded` tagged with the originating
+    /// peer's id. Verifies the spawn_event_forwarder path end-to-end —
+    /// when the IntendantWsTransport completes its handshake with the
+    /// target gateway, the actor emits PeerEvent::Connected, the per-peer
+    /// broadcast surfaces it, and the forwarder republishes it through
+    /// the registry's channel.
+    #[tokio::test]
+    async fn peer_events_are_forwarded() {
+        let (port, gateway) = spawn_test_peer().await;
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let reg = PeerRegistry::new(log_tx);
+        let mut events = reg.subscribe();
+
+        let ws_url = format!("ws://127.0.0.1:{port}/ws");
+        let card = fake_card("forward-test", &ws_url);
+        let id = reg.add_peer_with_card(card).await.unwrap();
+
+        // Drain everything until we see a PeerEventForwarded with a
+        // matching peer id, or time out. The target gateway is idle
+        // so the only PeerEvent we can rely on is the Connected one
+        // emitted by the actor after its first successful handshake.
+        let mut saw_forwarded = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            let evt = tokio::time::timeout(Duration::from_millis(200), events.recv()).await;
+            match evt {
+                Ok(Ok(RegistryEvent::PeerEventForwarded { peer, .. })) => {
+                    assert_eq!(peer, id);
+                    saw_forwarded = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue, // PeerAdded / PeerStateChanged
+                _ => break,
+            }
+        }
+        assert!(
+            saw_forwarded,
+            "did not observe a PeerEventForwarded event within 3s"
         );
 
         reg.remove_peer(&id).await.unwrap();

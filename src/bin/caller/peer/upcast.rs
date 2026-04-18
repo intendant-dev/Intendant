@@ -1151,11 +1151,19 @@ impl WireEventUpcaster {
         match event {
             // ---- Forward-compat + dropped metric streams ----
             //
-            // FileChanged is dashboard live file tracking; PeerAdded /
-            // PeerRemoved / PeerStateChanged are registry control-plane
-            // events emitted by the local translator. None of these are
-            // peer-originated activity, so they are intentionally absent
-            // from the peer event vocabulary.
+            // FileChanged / Snapshot* / RolledBack / Redone / HistoryPruned
+            // are dashboard local-state events. PeerAdded / PeerRemoved /
+            // PeerStateChanged / PeerEventForwarded are registry control-
+            // plane events emitted by the local translator.
+            //
+            // PeerEventForwarded specifically wraps a PeerEvent that came
+            // from another peer's stream — re-upcasting it would falsely
+            // attribute that activity to the local pipeline. Drop it here
+            // and let the dashboard route the inner payload to the right
+            // per-peer view directly.
+            //
+            // None of these are peer-originated activity *to this side*,
+            // so they're intentionally absent from the peer event vocabulary.
             OutboundEvent::Unknown
             | OutboundEvent::DisplayMetrics { .. }
             | OutboundEvent::FileChanged { .. }
@@ -1165,7 +1173,8 @@ impl WireEventUpcaster {
             | OutboundEvent::HistoryPruned { .. }
             | OutboundEvent::PeerAdded { .. }
             | OutboundEvent::PeerRemoved { .. }
-            | OutboundEvent::PeerStateChanged { .. } => vec![],
+            | OutboundEvent::PeerStateChanged { .. }
+            | OutboundEvent::PeerEventForwarded { .. } => vec![],
 
             OutboundEvent::CodexThreadActionResult { action, success, message } => vec![log_event(
                 if *success { LogLevel::Info } else { LogLevel::Warn },

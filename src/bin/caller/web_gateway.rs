@@ -1916,6 +1916,15 @@ pub fn spawn_web_gateway(
                             crate::peer::RegistryEvent::PeerStateChanged(snap) => {
                                 crate::types::OutboundEvent::PeerStateChanged { peer: snap }
                             }
+                            crate::peer::RegistryEvent::PeerEventForwarded {
+                                peer,
+                                event,
+                            } => {
+                                crate::types::OutboundEvent::PeerEventForwarded {
+                                    peer_id: peer.as_str().to_string(),
+                                    payload: event,
+                                }
+                            }
                         };
                         crate::control::broadcast_event(&push_tx, &outbound);
                     }
