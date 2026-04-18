@@ -4386,15 +4386,40 @@ pub fn spawn_web_gateway(
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains(" /api/peers") {
-                        // Peer registry CRUD. Dispatch on method:
-                        // GET → list, POST → add, DELETE → remove.
-                        // When no registry is wired in (test call
-                        // sites that pass None), every request
-                        // returns 503 so the dashboard can render
-                        // "peers unavailable" instead of the empty
-                        // list that a working-but-empty registry
-                        // would produce.
+                        // Peer registry endpoints. Dispatch:
+                        //   GET    /api/peers                  → list
+                        //   POST   /api/peers                  → add
+                        //   DELETE /api/peers                  → remove
+                        //   POST   /api/peers/{id}/message     → send message
+                        //   POST   /api/peers/{id}/task        → delegate task
+                        //   POST   /api/peers/{id}/approval    → resolve approval
+                        //
+                        // When no registry is wired in (test call sites
+                        // that pass None), every request returns 503 so
+                        // the dashboard can render "peers unavailable"
+                        // instead of the empty list that a working-but-
+                        // empty registry would produce.
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+
+                        // Extract subpath after `/api/peers`. The list/
+                        // add/remove ops have an empty subpath; per-peer
+                        // ops have `/{id}/{op}`. Extract the *path*
+                        // token from the request line first (the second
+                        // whitespace-separated word) — splitting on
+                        // `/api/peers` directly would walk into the
+                        // ` HTTP/1.1` suffix and mistake `HTTP` and `1.1`
+                        // for path segments.
+                        let path = request_line
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("");
+                        let subpath = path
+                            .strip_prefix("/api/peers")
+                            .unwrap_or("")
+                            .trim_start_matches('/');
+                        let segments: Vec<&str> =
+                            subpath.split('/').filter(|s| !s.is_empty()).collect();
+
                         let (status, body) = match peer_registry.as_ref() {
                             None => (
                                 503,
@@ -4403,56 +4428,59 @@ pub fn spawn_web_gateway(
                                 })
                                 .to_string(),
                             ),
-                            Some(registry) if request_line.starts_with("GET") => {
+                            Some(registry)
+                                if segments.is_empty()
+                                    && request_line.starts_with("GET") =>
+                            {
                                 (200, peers_list_response_body(registry))
                             }
                             Some(registry)
-                                if request_line.starts_with("POST")
-                                    || request_line.starts_with("DELETE") =>
+                                if segments.is_empty()
+                                    && (request_line.starts_with("POST")
+                                        || request_line.starts_with("DELETE")) =>
                             {
-                                // Read the JSON body using the same
-                                // peek-then-stream pattern /api/settings
-                                // uses.
-                                let content_length: usize = header_text
-                                    .lines()
-                                    .find(|l| {
-                                        l.to_lowercase()
-                                            .starts_with("content-length:")
-                                    })
-                                    .and_then(|l| l.split(':').nth(1))
-                                    .and_then(|v| v.trim().parse().ok())
-                                    .unwrap_or(0);
-                                let peeked_body = header_text
-                                    .split("\r\n\r\n")
-                                    .nth(1)
-                                    .unwrap_or("");
-                                let body_owned;
-                                let body_text =
-                                    if peeked_body.len() >= content_length {
-                                        &peeked_body[..content_length]
-                                    } else {
-                                        let remaining = content_length
-                                            .saturating_sub(peeked_body.len());
-                                        let mut full = peeked_body.to_string();
-                                        if remaining > 0 {
-                                            let mut rest = vec![0u8; remaining];
-                                            if stream
-                                                .read_exact(&mut rest)
-                                                .await
-                                                .is_ok()
-                                            {
-                                                full.push_str(
-                                                    &String::from_utf8_lossy(&rest),
-                                                );
-                                            }
-                                        }
-                                        body_owned = full;
-                                        &body_owned
-                                    };
+                                let body_text = read_request_body(
+                                    &mut stream,
+                                    &header_text,
+                                )
+                                .await;
                                 if request_line.starts_with("POST") {
-                                    peers_add(registry, body_text).await
+                                    peers_add(registry, &body_text).await
                                 } else {
-                                    peers_remove(registry, body_text).await
+                                    peers_remove(registry, &body_text).await
+                                }
+                            }
+                            Some(registry)
+                                if segments.len() == 2
+                                    && request_line.starts_with("POST") =>
+                            {
+                                let id = segments[0];
+                                let op = segments[1];
+                                let body_text = read_request_body(
+                                    &mut stream,
+                                    &header_text,
+                                )
+                                .await;
+                                match op {
+                                    "message" => {
+                                        peers_send_message(registry, id, &body_text).await
+                                    }
+                                    "task" => {
+                                        peers_delegate_task(registry, id, &body_text).await
+                                    }
+                                    "approval" => {
+                                        peers_resolve_approval(registry, id, &body_text)
+                                            .await
+                                    }
+                                    other => (
+                                        404,
+                                        serde_json::json!({
+                                            "error": format!(
+                                                "unknown peer op: {other}"
+                                            )
+                                        })
+                                        .to_string(),
+                                    ),
                                 }
                             }
                             Some(_) => (
@@ -4773,6 +4801,255 @@ async fn peers_remove(
             500,
             serde_json::json!({"error": e.to_string()}).to_string(),
         ),
+    }
+}
+
+/// Read the body of an HTTP request from `stream`, given the already-
+/// peeked `header_text` (which may include a partial body in its
+/// trailing portion after the `\r\n\r\n` delimiter). Returns the body
+/// as an owned `String`.
+///
+/// Reads exactly `Content-Length` bytes total — the prefix already
+/// in `header_text` plus any remainder still in the socket. Returns
+/// an empty string when no `Content-Length` header is present.
+///
+/// Factored out of the original inline body-reading block in the
+/// `/api/peers` handler so the per-peer outbound op handlers below
+/// can share it without duplicating the peek-then-stream pattern.
+async fn read_request_body(
+    stream: &mut tokio::net::TcpStream,
+    header_text: &str,
+) -> String {
+    use tokio::io::AsyncReadExt;
+    let content_length: usize = header_text
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    if content_length == 0 {
+        return String::new();
+    }
+    let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+    if peeked_body.len() >= content_length {
+        return peeked_body[..content_length].to_string();
+    }
+    let remaining = content_length.saturating_sub(peeked_body.len());
+    let mut full = peeked_body.to_string();
+    let mut rest = vec![0u8; remaining];
+    if stream.read_exact(&mut rest).await.is_ok() {
+        full.push_str(&String::from_utf8_lossy(&rest));
+    }
+    full
+}
+
+// ---------------------------------------------------------------------------
+// Per-peer outbound op handlers
+// ---------------------------------------------------------------------------
+//
+// These three endpoints let the dashboard drive the read-write peer
+// transport directly. Each maps a JSON body to the matching
+// [`crate::peer::PeerHandle`] method:
+//
+//   POST /api/peers/{id}/message  →  PeerHandle::send_message
+//   POST /api/peers/{id}/task     →  PeerHandle::delegate_task
+//   POST /api/peers/{id}/approval →  PeerHandle::resolve_approval
+//
+// Error model (uniform across the three):
+//
+//   400  bad JSON / missing required field
+//   404  peer not in registry
+//   405  peer's transport doesn't support this op (UnsupportedCapability)
+//   502  transport-level failure (NotConnected, Transport, Auth, …)
+//   500  catch-all for unexpected errors
+//
+// Status codes pick a meaningful HTTP semantic per [`PeerError`] variant
+// rather than collapsing everything to 502 — the dashboard renders a
+// different message for "wrong peer kind" vs "peer is offline".
+
+/// Shared body for `POST /api/peers/{id}/message`.
+///
+/// Two equivalent shapes accepted:
+///
+/// 1. Shorthand: `{"text": "hello"}` — implicit user role + Text content.
+/// 2. Full:     `{"role": "user", "content": {"type": "text", "text": "hello"}, "session": null}`.
+///
+/// The `content` field, when present, wins over `text`. Either `text`
+/// or `content` is required; everything else is optional.
+#[derive(Deserialize)]
+struct SendMessageRequest {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    role: Option<crate::peer::MessageRole>,
+    #[serde(default)]
+    content: Option<crate::peer::MessageContent>,
+    #[serde(default)]
+    session: Option<String>,
+}
+
+impl SendMessageRequest {
+    fn into_message(self) -> Result<crate::peer::PeerMessage, String> {
+        let role = self.role.unwrap_or(crate::peer::MessageRole::User);
+        let content = match (self.content, self.text) {
+            (Some(c), _) => c,
+            (None, Some(t)) => crate::peer::MessageContent::Text { text: t },
+            (None, None) => {
+                return Err("either 'text' or 'content' is required".to_string());
+            }
+        };
+        Ok(crate::peer::PeerMessage {
+            session: self.session,
+            role,
+            content,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct DelegateTaskRequest {
+    instructions: String,
+    #[serde(default)]
+    context: serde_json::Value,
+    #[serde(default)]
+    client_correlation_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResolveApprovalRequest {
+    request_id: String,
+    decision: crate::peer::ApprovalDecision,
+}
+
+/// Convert a [`crate::peer::PeerError`] into the matching HTTP status +
+/// JSON error body. Used by all three per-peer op handlers.
+fn peer_error_response(err: crate::peer::PeerError) -> (u16, String) {
+    use crate::peer::PeerError;
+    let status = match &err {
+        PeerError::NotFound(_) => 404,
+        PeerError::UnsupportedCapability(_) => 405,
+        PeerError::NotConnected
+        | PeerError::Transport(_)
+        | PeerError::Auth(_)
+        | PeerError::CardFetch(_)
+        | PeerError::Rejected { .. } => 502,
+        _ => 500,
+    };
+    (
+        status,
+        serde_json::json!({"error": err.to_string()}).to_string(),
+    )
+}
+
+/// Look up a peer by id; return 404 + body when absent.
+fn peer_handle_or_404(
+    registry: &crate::peer::PeerRegistry,
+    id: &str,
+) -> Result<crate::peer::PeerHandle, (u16, String)> {
+    let peer_id = crate::peer::PeerId(id.to_string());
+    registry.get(&peer_id).ok_or_else(|| {
+        (
+            404,
+            serde_json::json!({"error": format!("peer not found: {id}")}).to_string(),
+        )
+    })
+}
+
+/// Handle `POST /api/peers/{id}/message`.
+async fn peers_send_message(
+    registry: &crate::peer::PeerRegistry,
+    id: &str,
+    body_text: &str,
+) -> (u16, String) {
+    let req: SendMessageRequest = match serde_json::from_str(body_text) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")})
+                    .to_string(),
+            );
+        }
+    };
+    let msg = match req.into_message() {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": e}).to_string(),
+            );
+        }
+    };
+    let handle = match peer_handle_or_404(registry, id) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    match handle.send_message(msg).await {
+        Ok(message_id) => (
+            200,
+            serde_json::json!({"message_id": message_id.0}).to_string(),
+        ),
+        Err(e) => peer_error_response(e),
+    }
+}
+
+/// Handle `POST /api/peers/{id}/task`.
+async fn peers_delegate_task(
+    registry: &crate::peer::PeerRegistry,
+    id: &str,
+    body_text: &str,
+) -> (u16, String) {
+    let req: DelegateTaskRequest = match serde_json::from_str(body_text) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")})
+                    .to_string(),
+            );
+        }
+    };
+    let task = crate::peer::PeerTask {
+        instructions: req.instructions,
+        context: req.context,
+        client_correlation_id: req.client_correlation_id,
+    };
+    let handle = match peer_handle_or_404(registry, id) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    match handle.delegate_task(task).await {
+        Ok(task_id) => (
+            200,
+            serde_json::json!({"task_id": task_id.0}).to_string(),
+        ),
+        Err(e) => peer_error_response(e),
+    }
+}
+
+/// Handle `POST /api/peers/{id}/approval`.
+async fn peers_resolve_approval(
+    registry: &crate::peer::PeerRegistry,
+    id: &str,
+    body_text: &str,
+) -> (u16, String) {
+    let req: ResolveApprovalRequest = match serde_json::from_str(body_text) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")})
+                    .to_string(),
+            );
+        }
+    };
+    let handle = match peer_handle_or_404(registry, id) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    match handle.resolve_approval(&req.request_id, req.decision).await {
+        Ok(()) => (200, serde_json::json!({"ok": true}).to_string()),
+        Err(e) => peer_error_response(e),
     }
 }
 
@@ -5503,6 +5780,298 @@ mod tests {
         );
         let resp = http_request(port, &req).await;
         assert!(resp.contains("404"), "expected 404, got: {resp}");
+        handle.abort();
+    }
+
+    // -----------------------------------------------------------------
+    // Per-peer outbound op endpoints — `/api/peers/{id}/{op}`
+    // -----------------------------------------------------------------
+
+    /// Poll the registry until the peer transitions to
+    /// `ConnectionState::Connected`, or `timeout` elapses. Returns
+    /// whether the peer connected in time. Used by the routing tests
+    /// below to avoid sending ops at a peer whose transport is still
+    /// in handshake (which would bounce off as `NotConnected` → 502
+    /// and obscure the actual code path under test).
+    async fn wait_for_connected(
+        registry: &crate::peer::PeerRegistry,
+        peer_id: &crate::peer::PeerId,
+        timeout: tokio::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if let Some(h) = registry.get(peer_id) {
+                if h.is_connected() {
+                    return true;
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// Boilerplate: spawn target gateway A, register it as a peer on
+    /// dashboard gateway B via HTTP, wait for the transport to connect,
+    /// return everything the per-peer op tests need: the dashboard's
+    /// port (where ops are POSTed) plus the peer id (the path
+    /// parameter for every op endpoint) plus all four task handles to
+    /// abort at end of test. Cuts ~30 lines of setup per test.
+    async fn setup_peer_op_test() -> (
+        u16,
+        String,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        // Gateway A: the target peer this dashboard will federate with.
+        let (target_port, target_handle) =
+            spawn_test_gateway_with_registry(None).await;
+
+        // Gateway B: the dashboard, with its own peer registry.
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(64);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let registry_for_wait = registry.clone();
+        let (dash_port, dash_handle) =
+            spawn_test_gateway_with_registry(Some(registry)).await;
+
+        // POST A's Agent Card URL to B's /api/peers.
+        let card_url = format!(
+            "http://127.0.0.1:{target_port}/.well-known/agent-card.json"
+        );
+        let body = serde_json::json!({"card_url": card_url}).to_string();
+        let req = format!(
+            "POST /api/peers HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(dash_port, &req).await;
+        assert!(resp.contains("200 OK"), "register failed: {resp}");
+        let resp_body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(resp_body).unwrap();
+        let peer_id = parsed["peer_id"].as_str().unwrap().to_string();
+
+        // Wait for the IntendantWsTransport to finish its handshake so
+        // the op ack distinguishes "handler+routing works" from
+        // "transport not ready yet".
+        let pid = crate::peer::PeerId(peer_id.clone());
+        assert!(
+            wait_for_connected(
+                &registry_for_wait,
+                &pid,
+                tokio::time::Duration::from_secs(3),
+            )
+            .await,
+            "peer never reached Connected"
+        );
+
+        (dash_port, peer_id, target_handle, dash_handle)
+    }
+
+    /// `POST /api/peers/{id}/message` with a `{text}` shorthand body
+    /// returns 200 + a `message_id`. Verifies the path-parameter
+    /// routing, the JSON shorthand parsing, and the dispatch into
+    /// `PeerHandle::send_message`. The wire-level encoding (this
+    /// becomes a `ControlMsg::FollowUp` over the WebSocket) is covered
+    /// by `peer::transport::intendant::tests::send_message_writes_followup_control_msg`.
+    #[tokio::test]
+    async fn test_api_peers_send_message_text_shorthand_returns_200() {
+        let (dash_port, peer_id, target_handle, dash_handle) =
+            setup_peer_op_test().await;
+
+        let body = serde_json::json!({"text": "hello peer"}).to_string();
+        let req = format!(
+            "POST /api/peers/{peer_id}/message HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(dash_port, &req).await;
+        assert!(resp.contains("200 OK"), "send_message failed: {resp}");
+        let resp_body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(resp_body).unwrap();
+        assert!(
+            parsed["message_id"].as_str().is_some(),
+            "expected message_id in response: {resp_body}"
+        );
+
+        target_handle.abort();
+        dash_handle.abort();
+    }
+
+    /// `POST /api/peers/{id}/message` with a full `{role, content,
+    /// session}` body works the same. Verifies the full-control shape
+    /// path through `SendMessageRequest::into_message` (where `content`
+    /// wins over `text` when both are present).
+    #[tokio::test]
+    async fn test_api_peers_send_message_full_shape_returns_200() {
+        let (dash_port, peer_id, target_handle, dash_handle) =
+            setup_peer_op_test().await;
+
+        let body = serde_json::json!({
+            "role": "user",
+            "content": {"type": "text", "text": "hello"},
+        })
+        .to_string();
+        let req = format!(
+            "POST /api/peers/{peer_id}/message HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(dash_port, &req).await;
+        assert!(resp.contains("200 OK"), "send_message failed: {resp}");
+
+        target_handle.abort();
+        dash_handle.abort();
+    }
+
+    /// `POST /api/peers/{id}/task` with `{instructions}` returns 200 +
+    /// `task_id`. Wire-level encoding covered by
+    /// `peer::transport::intendant::tests::delegate_task_writes_start_task_control_msg`.
+    #[tokio::test]
+    async fn test_api_peers_delegate_task_returns_200() {
+        let (dash_port, peer_id, target_handle, dash_handle) =
+            setup_peer_op_test().await;
+
+        let body = serde_json::json!({
+            "instructions": "do the thing",
+        })
+        .to_string();
+        let req = format!(
+            "POST /api/peers/{peer_id}/task HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(dash_port, &req).await;
+        assert!(resp.contains("200 OK"), "delegate_task failed: {resp}");
+        let resp_body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(resp_body).unwrap();
+        assert!(
+            parsed["task_id"].as_str().is_some(),
+            "expected task_id in response: {resp_body}"
+        );
+
+        target_handle.abort();
+        dash_handle.abort();
+    }
+
+    /// `POST /api/peers/{id}/approval` with `{request_id, decision}`
+    /// returns 200. Wire-level encoding covered by
+    /// `peer::transport::intendant::tests::resolve_approval_maps_each_decision_to_its_control_msg`.
+    #[tokio::test]
+    async fn test_api_peers_resolve_approval_returns_200() {
+        let (dash_port, peer_id, target_handle, dash_handle) =
+            setup_peer_op_test().await;
+
+        let body = serde_json::json!({
+            "request_id": "42",
+            "decision": "accept",
+        })
+        .to_string();
+        let req = format!(
+            "POST /api/peers/{peer_id}/approval HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(dash_port, &req).await;
+        assert!(resp.contains("200 OK"), "resolve_approval failed: {resp}");
+
+        target_handle.abort();
+        dash_handle.abort();
+    }
+
+    /// `POST /api/peers/{unknown}/message` returns 404 with a
+    /// diagnostic body. Doesn't require setup — exercises only the
+    /// peer lookup path before any transport interaction.
+    #[tokio::test]
+    async fn test_api_peers_op_unknown_peer_returns_404() {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
+
+        let body = serde_json::json!({"text": "hi"}).to_string();
+        let req = format!(
+            "POST /api/peers/intendant:ghost/message HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(port, &req).await;
+        assert!(resp.contains("404"), "expected 404, got: {resp}");
+        let resp_body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(
+            resp_body.contains("intendant:ghost"),
+            "404 body should mention the missing id: {resp_body}"
+        );
+        handle.abort();
+    }
+
+    /// `POST /api/peers/{id}/message` with malformed JSON returns 400.
+    #[tokio::test]
+    async fn test_api_peers_send_message_invalid_body_returns_400() {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
+
+        let body = "not json";
+        let req = format!(
+            "POST /api/peers/intendant:any/message HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(port, &req).await;
+        assert!(resp.contains("400"), "expected 400, got: {resp}");
+        handle.abort();
+    }
+
+    /// `POST /api/peers/{id}/message` with neither `text` nor
+    /// `content` returns 400. Verifies the `into_message` validation
+    /// rejects empty bodies before the peer lookup runs.
+    #[tokio::test]
+    async fn test_api_peers_send_message_requires_text_or_content() {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
+
+        let body = serde_json::json!({"session": "scratch"}).to_string();
+        let req = format!(
+            "POST /api/peers/intendant:any/message HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(port, &req).await;
+        assert!(resp.contains("400"), "expected 400, got: {resp}");
+        let resp_body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(
+            resp_body.contains("text") && resp_body.contains("content"),
+            "error body should mention the missing fields: {resp_body}"
+        );
+        handle.abort();
+    }
+
+    /// Unknown sub-op (e.g. `/api/peers/{id}/bogus`) returns 404 with
+    /// a diagnostic body. Guards the dispatch arm that distinguishes
+    /// "supported op" from "unrecognized verb".
+    #[tokio::test]
+    async fn test_api_peers_unknown_op_returns_404() {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
+
+        let body = "{}";
+        let req = format!(
+            "POST /api/peers/intendant:any/bogus HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(port, &req).await;
+        assert!(resp.contains("404"), "expected 404, got: {resp}");
+        let resp_body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(
+            resp_body.contains("bogus"),
+            "404 body should name the unknown op: {resp_body}"
+        );
         handle.abort();
     }
 
