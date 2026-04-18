@@ -285,6 +285,62 @@ detect_display() {
     fi
 }
 
+# ── Screen lock / idle blank ──────────────────────────────────────────────
+
+# Disable GNOME screen lock and idle blank for the user session.
+#
+# An intendant VM operates the desktop autonomously; a lock screen is
+# pure friction:
+#   - Wayland: the screencast portal *revokes* the PipeWire stream when
+#     the session locks (security — the lock-screen contents shouldn't
+#     leak to whoever held the share grant). Re-grant required.
+#   - X11: the lock screen is just a root-window overlay, so XShm capture
+#     keeps running but only ever sees the dimmed black overlay.
+#
+# Idempotent: every command is `gsettings set ...` which overwrites and
+# never errors on no-change. Re-running this function is a no-op.
+disable_screen_lock() {
+    echo ""
+    info "disabling GNOME screen lock + idle blank..."
+
+    if ! has_cmd gsettings; then
+        warn "gsettings not found — skipping (non-GNOME desktop?)"
+        warn "if you use a different desktop, disable screen lock manually"
+        return
+    fi
+
+    # When this script is run over SSH, DBUS_SESSION_BUS_ADDRESS isn't
+    # inherited from the graphical session and gsettings would silently
+    # use the in-memory backend (no persistence). Recover the bus from a
+    # running gnome-session process for the same user, if there is one.
+    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+        local session_pid bus
+        session_pid=$(pgrep -u "$USER" -x gnome-session 2>/dev/null | head -1 || true)
+        if [[ -n "$session_pid" ]] && [[ -r "/proc/$session_pid/environ" ]]; then
+            bus=$(tr '\0' '\n' < "/proc/$session_pid/environ" \
+                | grep '^DBUS_SESSION_BUS_ADDRESS=' \
+                | head -1 | cut -d= -f2-)
+            [[ -n "$bus" ]] && export DBUS_SESSION_BUS_ADDRESS="$bus"
+        fi
+    fi
+
+    local failed=0
+    gsettings set org.gnome.desktop.screensaver lock-enabled false 2>/dev/null || ((failed++))
+    gsettings set org.gnome.desktop.screensaver idle-activation-enabled false 2>/dev/null || ((failed++))
+    gsettings set org.gnome.desktop.session idle-delay 0 2>/dev/null || ((failed++))
+    gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing' 2>/dev/null || ((failed++))
+    gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing' 2>/dev/null || ((failed++))
+
+    if (( failed == 0 )); then
+        ok "screen lock + idle blank disabled (5/5 keys)"
+    elif (( failed < 5 )); then
+        ok "screen lock partially disabled ($((5 - failed))/5 keys — older GNOME?)"
+    else
+        warn "could not set any screen-lock keys"
+        warn "if installing over SSH, run this script from a GNOME terminal instead"
+    fi
+}
+
 # ── .env template ─────────────────────────────────────────────────────────
 
 check_dotenv() {
@@ -461,7 +517,10 @@ run_install() {
     # Phase 6: display detection
     detect_display
 
-    # Phase 7: build
+    # Phase 7: disable screen lock so the agent isn't interrupted
+    disable_screen_lock
+
+    # Phase 8: build
     if $SKIP_BUILD; then
         echo ""
         info "skipping build (--no-build)"

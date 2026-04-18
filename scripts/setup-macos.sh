@@ -285,6 +285,27 @@ set_vortex_defaults() {
     fi
 }
 
+# Disable the per-user screensaver auto-activation and password prompt.
+#
+# An intendant host operates the desktop autonomously; a screensaver
+# locking the screen would interrupt the agent and (on Wayland-style
+# secure capture APIs) revoke screen-share grants. macOS's
+# ScreenCaptureKit is more forgiving than the Wayland portal, but the
+# screensaver still hides the desktop content from the captured stream.
+#
+# Idempotent: `defaults write` overwrites and never errors on no-change.
+# Per-user only — system display/system sleep changes need `sudo pmset`
+# and are left to the user (they affect the whole machine).
+disable_screen_lock() {
+    echo ""
+    info "disabling per-user screensaver auto-activation..."
+    defaults write com.apple.screensaver askForPassword -int 0
+    defaults -currentHost write com.apple.screensaver idleTime -int 0
+    ok "screensaver password prompt and idle timer disabled (per-user)"
+    echo "      for full no-sleep, also run:"
+    echo "         sudo pmset displaysleep 0 sleep 0"
+}
+
 install_blackhole() {
     local need_2ch=false need_16ch=false
 
@@ -386,14 +407,17 @@ run_install() {
     # Phase 5: Set audio defaults
     set_vortex_defaults
 
-    # Phase 6: App bundle
+    # Phase 6: Disable screensaver so the agent isn't interrupted
+    disable_screen_lock
+
+    # Phase 7: App bundle
     echo ""
     info "building macOS app bundle..."
     if [ -f scripts/bundle-macos.sh ]; then
         bash scripts/bundle-macos.sh
     fi
 
-    # Phase 6: Final status
+    # Phase 8: Final status
     echo ""
     echo "════════════════════════════════════════════════════════"
     echo "  Setup complete!"
