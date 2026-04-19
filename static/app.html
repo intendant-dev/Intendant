@@ -5344,7 +5344,10 @@ function processCommands(cmds) {
       // funnel through the shared upsert/remove helpers — one code path
       // applies API entries and pushed deltas identically.
       case 'peer_added': upsertDaemonFromSnapshot(c.peer); break;
-      case 'peer_state_changed': upsertDaemonFromSnapshot(c.peer); break;
+      // peer_state_changed must NOT insert an unknown id — see
+      // updateDaemonSnapshot for why (race with remove_peer's
+      // trailing observer events).
+      case 'peer_state_changed': updateDaemonSnapshot(c.peer); break;
       case 'peer_removed': removeDaemonById(c.id); break;
       // Per-peer event stream (phase B of the secondary migration).
       // Each command carries `host_id` as a typed field so we route
@@ -10218,6 +10221,12 @@ function snapshotToDaemonEntry(p) {
 // matching entry, or insert a new one. New entries also open a WASM
 // secondary connection so per-peer live events flow without waiting
 // for the next /api/peers refresh.
+//
+// Used for `peer_added` events. For `peer_state_changed` use
+// `updateDaemonSnapshot` instead — that variant must not insert
+// unknown ids, since the per-peer state observer can race a remove
+// and emit a trailing PeerStateChanged after the registry has already
+// dropped the peer (and after the browser has already removed the row).
 function upsertDaemonFromSnapshot(snap) {
   if (!snap || !snap.id) return;
   const entry = snapshotToDaemonEntry(snap);
@@ -10230,6 +10239,18 @@ function upsertDaemonFromSnapshot(snap) {
       app.add_secondary_host(entry.host_id, entry.label, entry.ws_url);
     }
   }
+  renderDaemonsList();
+}
+
+// Update an existing daemon entry from a pushed PeerSnapshot. Unknown
+// ids are ignored — they're stale state pushes from a removed peer's
+// observer racing the disconnect, and inserting them would resurrect
+// the row the user just dismissed.
+function updateDaemonSnapshot(snap) {
+  if (!snap || !snap.id) return;
+  const idx = daemons.findIndex(d => d.host_id === snap.id);
+  if (idx < 0) return;
+  daemons[idx] = snapshotToDaemonEntry(snap);
   renderDaemonsList();
 }
 
@@ -10674,9 +10695,16 @@ async function resolvePeerApproval(hostId, approvalId, decision) {
   if (!hostId || !approvalId || !decision) return;
   // Disable all buttons in the row to prevent double-click while
   // the POST is in flight. Re-enable on failure so the user can retry.
-  const row = document.querySelector(
-    `#daemon-controls-${hostId} .daemon-approval-row[data-approval-id="${CSS.escape(approvalId)}"]`
-  );
+  //
+  // Look up the panel via getElementById (the id field permits
+  // colons, e.g. `daemon-controls-intendant:alpha`) and then scope
+  // the data-attribute query to the panel — embedding the id in a
+  // CSS selector would parse the colon as a pseudo-class prefix and
+  // throw a SyntaxError before the fetch() ever fires.
+  const panel = document.getElementById(`daemon-controls-${hostId}`);
+  const row = panel
+    ? panel.querySelector(`.daemon-approval-row[data-approval-id="${CSS.escape(approvalId)}"]`)
+    : null;
   if (row) row.querySelectorAll('button').forEach(b => b.disabled = true);
   try {
     const resp = await fetch(`/api/peers/${hostId}/approval`, {
@@ -10929,16 +10957,14 @@ function handleSecondaryEvent(hostId, msg) {
     if (!c || !c.cmd) continue;
     switch (c.cmd) {
       case 'add_log_entry':
-        // Tag with the source host so the Activity badge and filter
-        // see it as belonging to the secondary.
-        //
-        // TODO (phase B cleanup): the new push path emits PeerLog
-        // commands that already carry host_id and produce equivalent
-        // log entries. Once we stop opening WASM secondary connections,
-        // this case (and the entire handleSecondaryEvent function) can
-        // go away.
-        c.host_id = hostId;
-        renderLogEntry(c);
+        // Suppressed: the new push path (PeerEventForwarded → PeerLog)
+        // is authoritative for per-peer log entries since phase B.
+        // Rendering here too would double every remote log line —
+        // once via the push path's PeerLog command in processCommands,
+        // once via this secondary-path branch. Suppress here; full
+        // removal of the secondary connection comes in the phase B+
+        // cleanup once Stats per-peer also migrates off the secondary
+        // path.
         break;
       case 'add_turn_separator':
         renderTurnSeparator(c.turn);
