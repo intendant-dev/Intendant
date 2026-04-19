@@ -1457,6 +1457,31 @@ impl AppState {
                     "fs",
                 ));
             }
+            // Conversation-side rollback. Fired in addition to (or instead
+            // of) `rolled_back` when the user asked to revert the agent's
+            // memory. The backend distinguishes two methods: "truncated"
+            // means the provider supports in-place truncation; "session-
+            // reset" means we had to scrap the whole session (Claude Code,
+            // Gemini) — surface the heavier warning for that case.
+            "conversation_rolled_back" => {
+                let round_id = msg["round_id"].as_str().unwrap_or("").to_string();
+                let turns_removed = msg["turns_removed"].as_u64().unwrap_or(0);
+                let backend = msg["backend"].as_str().unwrap_or("").to_string();
+                let method = msg["method"].as_str().unwrap_or("truncated").to_string();
+                let summary = if method == "session-reset" {
+                    format!(
+                        "Session reset for {} ({} turns lost)",
+                        backend, turns_removed
+                    )
+                } else {
+                    format!("Conversation rolled back ({} turns removed)", turns_removed)
+                };
+                // round_id is kept in the message for future use (e.g.
+                // correlating with the timeline); we don't currently need
+                // it for the log text itself.
+                let _ = round_id;
+                cmds.extend(self.add_log("warn", &summary, None, "system"));
+            }
             "redone" => {
                 let to = msg["to_id"].as_u64().unwrap_or(0);
                 cmds.push(UiCommand::HistoryChanged);
@@ -1482,7 +1507,6 @@ impl AppState {
                     "fs",
                 ));
             }
-
             // ---- Peer registry push events ----
             //
             // Forwarded as opaque JSON: the WASM layer doesn't interpret
@@ -2951,6 +2975,69 @@ mod tests {
     }
 
     #[test]
+    fn handle_event_conversation_rolled_back_truncated_logs_warn() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "conversation_rolled_back",
+            "round_id": "round-abcdef12",
+            "turns_removed": 3,
+            "backend": "openai",
+            "method": "truncated"
+        });
+        let cmds = s.handle_message(&msg);
+        let saw_log = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, level, .. }
+                if level == "warn"
+                    && content.contains("Conversation rolled back")
+                    && content.contains("3 turns")
+        ));
+        assert!(saw_log, "expected warn log for truncated rollback, got {:?}", cmds);
+    }
+
+    #[test]
+    fn handle_event_conversation_rolled_back_session_reset_mentions_backend() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "conversation_rolled_back",
+            "round_id": "round-abcdef12",
+            "turns_removed": 7,
+            "backend": "claude-code",
+            "method": "session-reset"
+        });
+        let cmds = s.handle_message(&msg);
+        let saw_log = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, level, .. }
+                if level == "warn"
+                    && content.contains("Session reset")
+                    && content.contains("claude-code")
+                    && content.contains("7 turns")
+        ));
+        assert!(saw_log, "expected session-reset warn log, got {:?}", cmds);
+    }
+
+    #[test]
+    fn handle_event_conversation_rolled_back_defaults_method_to_truncated() {
+        // When the backend omits `method` the UI should still produce a
+        // sensible log — we default to the truncated phrasing.
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "conversation_rolled_back",
+            "round_id": "r1",
+            "turns_removed": 1,
+            "backend": "openai"
+        });
+        let cmds = s.handle_message(&msg);
+        let saw_log = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, level, .. }
+                if level == "warn" && content.contains("Conversation rolled back")
+        ));
+        assert!(saw_log, "expected default-method warn log, got {:?}", cmds);
+    }
+
+    #[test]
     fn handle_event_redone_emits_history_changed() {
         let mut s = AppState::new();
         let msg = json!({"event": "redone", "to_id": 4});
@@ -2987,6 +3074,21 @@ mod tests {
         let cmd = UiCommand::HistoryChanged;
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"cmd\":\"history_changed\""), "got: {}", json);
+    }
+
+    #[test]
+    fn handle_event_conversation_rolled_back_does_not_refetch() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "conversation_rolled_back",
+            "round_id": "round-7",
+            "turns_removed": 4,
+            "backend": "native",
+            "method": "truncated",
+        });
+        let cmds = s.handle_message(&msg);
+        // No HistoryChanged — the file timeline isn't affected.
+        assert!(!cmds.iter().any(|c| matches!(c, UiCommand::HistoryChanged)));
     }
 
     #[test]
