@@ -19,18 +19,6 @@ export class PresenceWeb {
      * Get the active voice provider name (e.g. "gemini", "openai", or "").
      */
     active_voice_provider(): string;
-    /**
-     * Open a read-only WebSocket to a secondary daemon. The `url`
-     * should be a fully-qualified `wss://` URL (the JS side is
-     * responsible for converting `https://host:port` to `wss://host:port/ws`).
-     * `host_id` must be unique across the dashboard — the JS layer
-     * uses it as a key for routing inbound events to host-scoped DOM
-     * elements. `label` is the human-readable display name.
-     *
-     * Idempotent: calling with an existing host_id replaces the
-     * previous connection.
-     */
-    add_secondary_host(host_id: string, label: string, url: string): void;
     connect_server(url: string): void;
     connect_voice(provider: string, token: string, model?: string | null, input_sample_rate?: number | null): void;
     disconnect_voice(): void;
@@ -58,19 +46,6 @@ export class PresenceWeb {
      */
     handle_live_usage(usage: any): any;
     /**
-     * Route a raw server message from a secondary daemon through that
-     * secondary's dashboard state machine. Reuses the same formatting
-     * path as the primary (command_result extraction, agent_output
-     * parsing, screenshot decoding, level filtering) so secondary log
-     * entries look identical to the primary's — no parallel translator
-     * to drift out of sync.
-     *
-     * Returns `UiCommand[]` as a JS array. The JS side filters these
-     * to the log-entry subset, tags them with the host_id for badge
-     * rendering, and routes to the DOM.
-     */
-    handle_secondary_message(host_id: string, msg: any): any;
-    /**
      * Handle a server event by injecting system text into the voice model.
      * Returns true if a message was sent to the voice model.
      */
@@ -97,32 +72,17 @@ export class PresenceWeb {
      * Returns true if a message was sent.
      */
     inject_pending_approval_if_any(): boolean;
-    /**
-     * Return the list of currently-registered secondary hosts as a JS
-     * array of `{host_id, label, url, connected}` objects.
-     */
-    list_secondary_hosts(): any;
     constructor();
     /**
      * Get pending approval ID (for keyboard shortcut routing).
      */
     pending_approval_id(): any;
     phase(): string;
-    /**
-     * Called from the JS trampoline scheduled by a secondary's onclose
-     * closure. Re-opens the WebSocket for the given host_id if it's
-     * still in the registry (user may have removed it meanwhile).
-     */
-    reconnect_secondary_host(host_id: string, url: string): void;
     reconnect_server(url: string): void;
     /**
      * Release control of a display.
      */
     release_display(display_id: bigint, note?: string | null): void;
-    /**
-     * Close and forget a secondary daemon connection.
-     */
-    remove_secondary_host(host_id: string): void;
     /**
      * Revoke agent access to the user's session display (primary / id 0).
      */
@@ -239,8 +199,6 @@ export class PresenceWeb {
     set_on_inject_voice_text_passive(f: Function): void;
     set_on_live_usage(f: Function): void;
     set_on_raw_message(f: Function): void;
-    set_on_secondary_event(f: Function): void;
-    set_on_secondary_state(f: Function): void;
     set_on_server_event(f: Function): void;
     set_on_server_state(f: Function): void;
     set_on_session_changed(f: Function): void;
@@ -261,10 +219,6 @@ export class PresenceWeb {
     set_state(state: any): void;
     /**
      * Change log verbosity and return commands to re-filter.
-     * Also propagates the change to every secondary host's AppState
-     * so their historical log filtering stays in sync — otherwise a
-     * verbosity change on the primary would leave secondaries showing
-     * the old set of entries.
      */
     set_verbosity(level: string): any;
     /**
@@ -348,7 +302,6 @@ export interface InitOutput {
     readonly __wbg_presenceweb_free: (a: number, b: number) => void;
     readonly presenceweb_active_voice_model: (a: number) => [number, number];
     readonly presenceweb_active_voice_provider: (a: number) => [number, number];
-    readonly presenceweb_add_secondary_host: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly presenceweb_connect_server: (a: number, b: number, c: number) => void;
     readonly presenceweb_connect_voice: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly presenceweb_disconnect_voice: (a: number) => void;
@@ -359,20 +312,16 @@ export interface InitOutput {
     readonly presenceweb_grant_user_display: (a: number) => void;
     readonly presenceweb_grant_user_display_with_id: (a: number, b: number) => void;
     readonly presenceweb_handle_live_usage: (a: number, b: any) => any;
-    readonly presenceweb_handle_secondary_message: (a: number, b: number, c: number, d: any) => any;
     readonly presenceweb_handle_server_event: (a: number, b: any) => number;
     readonly presenceweb_handle_server_message: (a: number, b: any) => any;
     readonly presenceweb_handle_voice_tool_call: (a: number, b: any) => any;
     readonly presenceweb_has_pending_approval: (a: number) => number;
     readonly presenceweb_inject_pending_approval_if_any: (a: number) => number;
-    readonly presenceweb_list_secondary_hosts: (a: number) => any;
     readonly presenceweb_new: () => number;
     readonly presenceweb_pending_approval_id: (a: number) => any;
     readonly presenceweb_phase: (a: number) => [number, number];
-    readonly presenceweb_reconnect_secondary_host: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly presenceweb_reconnect_server: (a: number, b: number, c: number) => void;
     readonly presenceweb_release_display: (a: number, b: bigint, c: number, d: number) => void;
-    readonly presenceweb_remove_secondary_host: (a: number, b: number, c: number) => void;
     readonly presenceweb_revoke_user_display: (a: number) => void;
     readonly presenceweb_revoke_user_display_with_id: (a: number, b: number) => void;
     readonly presenceweb_send_approval: (a: number, b: number, c: number) => any;
@@ -408,8 +357,6 @@ export interface InitOutput {
     readonly presenceweb_set_on_inject_voice_text_passive: (a: number, b: any) => void;
     readonly presenceweb_set_on_live_usage: (a: number, b: any) => void;
     readonly presenceweb_set_on_raw_message: (a: number, b: any) => void;
-    readonly presenceweb_set_on_secondary_event: (a: number, b: any) => void;
-    readonly presenceweb_set_on_secondary_state: (a: number, b: any) => void;
     readonly presenceweb_set_on_server_event: (a: number, b: any) => void;
     readonly presenceweb_set_on_server_state: (a: number, b: any) => void;
     readonly presenceweb_set_on_session_changed: (a: number, b: any) => void;

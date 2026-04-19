@@ -56,14 +56,6 @@ pub struct Callbacks {
     pub on_raw_message: RefCell<Option<Function>>,
     /// Live model token usage update (provider-agnostic normalized struct).
     pub on_live_usage: RefCell<Option<Function>>,
-    /// Multi-host: raw message received from a secondary daemon. Called
-    /// with (host_id: string, msg: JsValue). The JS side routes these
-    /// to host-scoped DOM elements (Activity log with a badge, Stats
-    /// cards, etc.) without touching primary-host state.
-    pub on_secondary_event: RefCell<Option<Function>>,
-    /// Multi-host: secondary daemon connection state changed. Called
-    /// with (host_id: string, connected: bool).
-    pub on_secondary_state: RefCell<Option<Function>>,
 }
 
 impl Callbacks {
@@ -203,22 +195,6 @@ impl Callbacks {
     pub fn invoke_live_usage(&self, usage: &JsValue) {
         if let Some(ref f) = *self.on_live_usage.borrow() {
             let _ = f.call1(&JsValue::NULL, usage);
-        }
-    }
-
-    pub fn invoke_secondary_event(&self, host_id: &str, msg: &JsValue) {
-        if let Some(ref f) = *self.on_secondary_event.borrow() {
-            let _ = f.call2(&JsValue::NULL, &JsValue::from_str(host_id), msg);
-        }
-    }
-
-    pub fn invoke_secondary_state(&self, host_id: &str, connected: bool) {
-        if let Some(ref f) = *self.on_secondary_state.borrow() {
-            let _ = f.call2(
-                &JsValue::NULL,
-                &JsValue::from_str(host_id),
-                &JsValue::from_bool(connected),
-            );
         }
     }
 }

@@ -18,8 +18,6 @@ mod gemini;
 #[cfg(target_arch = "wasm32")]
 mod openai;
 #[cfg(target_arch = "wasm32")]
-mod secondary;
-#[cfg(target_arch = "wasm32")]
 mod server;
 
 /// Provider-agnostic live model usage snapshot.
@@ -65,22 +63,6 @@ fn to_js(val: &impl serde::Serialize) -> JsValue {
 pub struct PresenceWeb {
     callbacks: Rc<Callbacks>,
     server: RefCell<server::ServerConnection>,
-    /// Read-only WebSocket connections to secondary daemons for the
-    /// multi-host dashboard, keyed by the daemon's `host_id`. JS
-    /// derives the host_id from the remote's Agent Card (fetched from
-    /// `/.well-known/agent-card.json`) and passes it in via
-    /// `add_secondary_host`. Each connection forwards received
-    /// messages to JS via `on_secondary_event` for host-scoped
-    /// rendering.
-    secondary_conns: RefCell<std::collections::HashMap<String, secondary::SecondaryConnection>>,
-    /// Per-host dashboard state for each secondary. Events from
-    /// secondaries are fed through their matching `AppState::handle_message`
-    /// so they get the same formatting (command_result extraction,
-    /// screenshot decoding, log level filtering) as the primary — no
-    /// duplicated event parsing on the JS side. Verbosity changes on
-    /// the primary are propagated to all secondary states so filters
-    /// stay in sync.
-    secondary_states: RefCell<std::collections::HashMap<String, app_state::AppState>>,
     gemini: RefCell<Option<gemini::GeminiProvider>>,
     openai: Rc<RefCell<Option<openai::OpenAIProvider>>>,
     presence: Rc<RefCell<WasmPresence>>,
@@ -116,8 +98,6 @@ impl PresenceWeb {
         Self {
             callbacks,
             server: RefCell::new(server),
-            secondary_conns: RefCell::new(std::collections::HashMap::new()),
-            secondary_states: RefCell::new(std::collections::HashMap::new()),
             gemini: RefCell::new(None),
             openai: Rc::new(RefCell::new(None)),
             presence,
@@ -234,16 +214,6 @@ impl PresenceWeb {
     #[wasm_bindgen]
     pub fn set_on_live_usage(&self, f: Function) {
         *self.callbacks.on_live_usage.borrow_mut() = Some(f);
-    }
-
-    #[wasm_bindgen]
-    pub fn set_on_secondary_event(&self, f: Function) {
-        *self.callbacks.on_secondary_event.borrow_mut() = Some(f);
-    }
-
-    #[wasm_bindgen]
-    pub fn set_on_secondary_state(&self, f: Function) {
-        *self.callbacks.on_secondary_state.borrow_mut() = Some(f);
     }
 
     // --- Server connection ---
@@ -395,98 +365,6 @@ impl PresenceWeb {
     #[wasm_bindgen]
     pub fn reconnect_server(&self, url: &str) {
         self.server.borrow_mut().connect(url);
-    }
-
-    // --- Secondary (multi-host) connections ---
-
-    /// Open a read-only WebSocket to a secondary daemon. The `url`
-    /// should be a fully-qualified `wss://` URL (the JS side is
-    /// responsible for converting `https://host:port` to `wss://host:port/ws`).
-    /// `host_id` must be unique across the dashboard — the JS layer
-    /// uses it as a key for routing inbound events to host-scoped DOM
-    /// elements. `label` is the human-readable display name.
-    ///
-    /// Idempotent: calling with an existing host_id replaces the
-    /// previous connection.
-    #[wasm_bindgen]
-    pub fn add_secondary_host(&self, host_id: &str, label: &str, url: &str) {
-        let mut conn = secondary::SecondaryConnection::new(
-            host_id,
-            label,
-            self.callbacks.clone(),
-        );
-        conn.connect(url);
-        self.secondary_conns
-            .borrow_mut()
-            .insert(host_id.to_string(), conn);
-        // Spin up a fresh AppState for this host. Log buffer, turn,
-        // phase, etc. are host-local so events feed cleanly without
-        // contaminating the primary's state.
-        self.secondary_states
-            .borrow_mut()
-            .entry(host_id.to_string())
-            .or_insert_with(app_state::AppState::new);
-    }
-
-    /// Close and forget a secondary daemon connection.
-    #[wasm_bindgen]
-    pub fn remove_secondary_host(&self, host_id: &str) {
-        if let Some(mut conn) = self.secondary_conns.borrow_mut().remove(host_id) {
-            conn.disconnect();
-        }
-        self.secondary_states.borrow_mut().remove(host_id);
-    }
-
-    /// Route a raw server message from a secondary daemon through that
-    /// secondary's dashboard state machine. Reuses the same formatting
-    /// path as the primary (command_result extraction, agent_output
-    /// parsing, screenshot decoding, level filtering) so secondary log
-    /// entries look identical to the primary's — no parallel translator
-    /// to drift out of sync.
-    ///
-    /// Returns `UiCommand[]` as a JS array. The JS side filters these
-    /// to the log-entry subset, tags them with the host_id for badge
-    /// rendering, and routes to the DOM.
-    #[wasm_bindgen]
-    pub fn handle_secondary_message(&self, host_id: &str, msg: JsValue) -> JsValue {
-        let Ok(val) = serde_wasm_bindgen::from_value::<serde_json::Value>(msg) else {
-            return JsValue::NULL;
-        };
-        let mut states = self.secondary_states.borrow_mut();
-        let state = states
-            .entry(host_id.to_string())
-            .or_insert_with(app_state::AppState::new);
-        let cmds = state.handle_message(&val);
-        to_js(&cmds)
-    }
-
-    /// Called from the JS trampoline scheduled by a secondary's onclose
-    /// closure. Re-opens the WebSocket for the given host_id if it's
-    /// still in the registry (user may have removed it meanwhile).
-    #[wasm_bindgen]
-    pub fn reconnect_secondary_host(&self, host_id: &str, url: &str) {
-        if let Some(conn) = self.secondary_conns.borrow_mut().get_mut(host_id) {
-            conn.connect(url);
-        }
-    }
-
-    /// Return the list of currently-registered secondary hosts as a JS
-    /// array of `{host_id, label, url, connected}` objects.
-    #[wasm_bindgen]
-    pub fn list_secondary_hosts(&self) -> JsValue {
-        let conns = self.secondary_conns.borrow();
-        let entries: Vec<serde_json::Value> = conns
-            .values()
-            .map(|c| {
-                serde_json::json!({
-                    "host_id": c.host_id(),
-                    "label": c.label(),
-                    "url": c.url(),
-                    "connected": c.is_connected(),
-                })
-            })
-            .collect();
-        to_js(&entries)
     }
 
     /// Request to become the active voice owner (triggers handover from current active).
@@ -1055,21 +933,9 @@ impl PresenceWeb {
     }
 
     /// Change log verbosity and return commands to re-filter.
-    /// Also propagates the change to every secondary host's AppState
-    /// so their historical log filtering stays in sync — otherwise a
-    /// verbosity change on the primary would leave secondaries showing
-    /// the old set of entries.
     #[wasm_bindgen]
     pub fn set_verbosity(&self, level: &str) -> JsValue {
         let cmds = self.dashboard.borrow_mut().set_verbosity(level);
-        for state in self.secondary_states.borrow_mut().values_mut() {
-            // Discard secondary UiCommands here — the JS layer hasn't
-            // rendered the full secondary history per-host (we only
-            // render streaming entries), so there's nothing for the
-            // returned commands to target. The verbosity update still
-            // matters for future incoming events on that state.
-            let _ = state.set_verbosity(level);
-        }
         to_js(&cmds)
     }
 

@@ -4436,10 +4436,12 @@ let activeStatsHost = '';
 
 // Multi-host: list of configured secondary daemons. Each entry:
 //   { host_id, label, url, connected }
-// Stored in localStorage under DAEMONS_KEY. Registered with the WASM
-// app via `app.add_secondary_host(host_id, label, wss_url)`. The self
-// host (the daemon serving app.html) is not stored here — it's
-// implicit and always rendered first in the UI.
+// Hydrated from `GET /api/peers` — the server-side PeerRegistry is
+// the single source of truth. Per-peer events flow through the
+// primary `/ws` push pipeline tagged with `host_id`; the browser
+// no longer opens its own WebSocket per secondary. The self host
+// (the daemon serving app.html) isn't in this list — it's implicit
+// and always rendered first in the UI.
 const DAEMONS_KEY = 'intendant_daemons';
 let daemons = [];
 
@@ -5046,15 +5048,6 @@ async function main() {
     if (cmds) processCommands(cmds);
   });
 
-  // Multi-host: callbacks for secondary daemon connections. Settings
-  // panel registers each secondary via `app.add_secondary_host(...)`.
-  app.set_on_secondary_state((hostId, connected) => {
-    handleSecondaryState(hostId, connected);
-  });
-  app.set_on_secondary_event((hostId, msg) => {
-    handleSecondaryEvent(hostId, msg);
-  });
-
   app.set_on_error((msg) => {
     if (!msg.startsWith('Server')) {
       if (modelConnected) voiceHadPriorSession = true;
@@ -5432,18 +5425,19 @@ function processCommands(cmds) {
           content: c.content,
         });
         break;
-      case 'peer_usage':
-        // The snapshot is a UsageSnapshot from PeerEvent::Usage —
-        // not in the same shape as UiCommand::UpdateUsage, so we
-        // can't drop it into hostStatsCache directly. For now,
-        // cache the raw snapshot under the host id; a future Stats
-        // tab pass will consume the lean shape directly.
-        hostStatsCache.set(c.host_id, { _peerSnapshot: c.snapshot });
-        if (activeStatsHost === c.host_id) {
-          // No live render yet — Stats tab still expects the legacy
-          // UpdateUsage shape. Tracked as a follow-up.
-        }
+      case 'peer_usage': {
+        // Translate the lean PeerEvent::Usage snapshot into the
+        // legacy UpdateUsage shape that the Stats tab's existing
+        // renderer (renderUsageTab) consumes. Same cache + render
+        // call as the secondary path used to do, but sourced from
+        // the push pipeline. This is what closes out phase B by
+        // making Stats per-peer work without the WASM secondary
+        // connection.
+        const fakeUsage = peerSnapshotToUpdateUsage(c.snapshot);
+        hostStatsCache.set(c.host_id, fakeUsage);
+        if (activeStatsHost === c.host_id) renderUsageTab(fakeUsage);
         break;
+      }
       case 'peer_approval_requested':
         addPendingApproval(c.host_id, c.id, c.command, c.category);
         break;
@@ -10274,6 +10268,59 @@ function wsUrlToBaseUrl(wsUrl) {
 /// the server-side PeerRegistry owns the peer list now.
 // Build a local daemon entry from a server-side `PeerSnapshot`. The
 // snapshot shape is the same whether it arrives via `GET /api/peers`
+// Translate the lean PeerEvent::Usage snapshot into the legacy
+// UpdateUsage shape that renderUsageTab expects.
+//
+// The PeerEvent vocabulary deliberately omits some fields that the
+// local Stats renderer relies on (notably `context_window`, which a
+// peer's UsageSnapshot doesn't carry). For those we substitute a
+// generous placeholder so the percentage bar renders without
+// dividing by zero — token counts and per-model breakdown stay
+// accurate, only the bar's pct is approximate. When better fidelity
+// is needed for a peer, that peer's own dashboard is the
+// authoritative source.
+const PEER_USAGE_PLACEHOLDER_CONTEXT = 200000;
+function peerSnapshotToUpdateUsage(snap) {
+  if (!snap || typeof snap !== 'object') snap = {};
+  const tokensIn = snap.tokens_in || 0;
+  const tokensOut = snap.tokens_out || 0;
+  const cached = snap.tokens_cached || 0;
+  const tokensUsed = tokensIn + tokensOut;
+  const firstModel = (Array.isArray(snap.by_model) && snap.by_model[0]) || {};
+  const mainData = {
+    provider: firstModel.provider || 'peer',
+    model: firstModel.model || '?',
+    prompt_tokens: tokensIn,
+    completion_tokens: tokensOut,
+    cached_tokens: cached,
+    tokens_used: tokensUsed,
+    context_window: PEER_USAGE_PLACEHOLDER_CONTEXT,
+    usage_pct: (tokensUsed / PEER_USAGE_PLACEHOLDER_CONTEXT) * 100,
+  };
+  let costJson = null;
+  if (snap.cost_usd != null) {
+    costJson = JSON.stringify({
+      lines: [
+        {
+          label: `${mainData.provider} / ${mainData.model}`,
+          cost: snap.cost_usd,
+          input_cost: 0,
+          output_cost: 0,
+        },
+      ],
+      total: snap.cost_usd,
+    });
+  }
+  return {
+    cmd: 'update_usage',
+    main_json: JSON.stringify(mainData),
+    presence_json: null,
+    live_json: null,
+    cost_json: costJson,
+    history_json: null,
+  };
+}
+
 // (full list) or via a pushed `peer_added` / `peer_state_changed`
 // event, so this is the single construction point for both surfaces.
 function snapshotToDaemonEntry(p) {
@@ -10309,9 +10356,6 @@ function upsertDaemonFromSnapshot(snap) {
     daemons[idx] = entry;
   } else {
     daemons.push(entry);
-    if (entry.ws_url && app && app.add_secondary_host) {
-      app.add_secondary_host(entry.host_id, entry.label, entry.ws_url);
-    }
   }
   renderDaemonsList();
 }
@@ -10336,9 +10380,6 @@ function removeDaemonById(id) {
   const idx = daemons.findIndex(d => d.host_id === id);
   if (idx < 0) return;
   daemons.splice(idx, 1);
-  if (app && app.remove_secondary_host) {
-    app.remove_secondary_host(id);
-  }
   // Drop the expanded-state record so it doesn't get reapplied
   // against a row that no longer exists. Same for any pending
   // approvals — once the peer is gone there's nothing to resolve.
@@ -10359,27 +10400,9 @@ async function refreshPeersFromApi() {
     // the push-event path stay identical.
     const newDaemons = data.peers.map(snapshotToDaemonEntry);
 
-    // Diff against the current daemons list to figure out which
-    // WASM connections to add, remove, or leave alone. Stable
-    // by host_id so reconnects and re-fetches don't thrash the
-    // existing WS connections.
-    const currentIds = new Set(daemons.map(d => d.host_id));
-    const newIds = new Set(newDaemons.map(d => d.host_id));
-
-    // Remove peers no longer in the server list.
-    for (const d of daemons) {
-      if (!newIds.has(d.host_id)) {
-        if (app && app.remove_secondary_host) app.remove_secondary_host(d.host_id);
-      }
-    }
-
-    // Add peers newly in the server list.
-    for (const d of newDaemons) {
-      if (!currentIds.has(d.host_id) && d.ws_url) {
-        if (app && app.add_secondary_host) app.add_secondary_host(d.host_id, d.label, d.ws_url);
-      }
-    }
-
+    // The local snapshot replaces the previous one wholesale —
+    // no per-peer add/remove plumbing to maintain anymore now that
+    // per-peer events come through the primary /ws push pipeline.
     daemons = newDaemons;
     renderDaemonsList();
   } catch (e) {
@@ -10961,19 +10984,8 @@ async function removeDaemon(hostId) {
       body: JSON.stringify({ peer_id: hostId }),
     });
   } catch { /* best-effort */ }
-  if (app && app.remove_secondary_host) app.remove_secondary_host(hostId);
   await refreshPeersFromApi();
   setDaemonsStatus(`Removed ${hostId}`, '');
-}
-
-function registerDaemonWithWasm(entry) {
-  if (!app || !app.add_secondary_host) return;
-  // Prefer ws_url from the API response (already a WS URL from
-  // the card's transport spec). Fall back to deriving from the
-  // HTTP base URL for older code paths.
-  const wsUrl = entry.ws_url || baseToWsUrl(entry.url);
-  if (!wsUrl) return;
-  app.add_secondary_host(entry.host_id, entry.label, wsUrl);
 }
 
 async function initDaemons() {
@@ -10996,78 +11008,6 @@ async function initDaemons() {
   document.getElementById('daemon-add-label').addEventListener('keydown', e => {
     if (e.key === 'Enter') addDaemon();
   });
-}
-
-function handleSecondaryState(hostId, connected) {
-  const d = daemons.find(e => e.host_id === hostId);
-  if (!d) return;
-  const wasConnected = d.connected;
-  d.connected = connected;
-  renderDaemonsList();
-
-  // On (re)connect, refresh the peer list from the server so the
-  // version, git SHA, capabilities, and connection_state pick up
-  // whatever the remote is actually running right now. The server's
-  // PeerRegistry already re-fetched the card during its own connect
-  // handshake; we just pull the updated snapshot.
-  if (connected && !wasConnected) {
-    refreshPeersFromApi();
-  }
-}
-
-// Route a secondary-daemon event through its per-host AppState on the
-// Rust/WASM side so it gets the same formatting path as the primary
-// (command_result extraction, agent_output parsing, screenshot
-// decoding, verbosity filtering). Returned UiCommands are filtered
-// to the log-rendering subset and tagged with the host_id before
-// being rendered — side-effects of other command types (status bar,
-// approvals, usage, display lifecycle) would stomp the primary's own
-// state and are deliberately dropped.
-function handleSecondaryEvent(hostId, msg) {
-  if (!app || !app.handle_secondary_message) return;
-  let cmds = app.handle_secondary_message(hostId, msg);
-  if (!cmds || !Array.isArray(cmds)) return;
-  for (const c of cmds) {
-    if (!c || !c.cmd) continue;
-    switch (c.cmd) {
-      case 'add_log_entry':
-        // Suppressed: the new push path (PeerEventForwarded → PeerLog)
-        // is authoritative for per-peer log entries since phase B.
-        // Rendering here too would double every remote log line —
-        // once via the push path's PeerLog command in processCommands,
-        // once via this secondary-path branch. Suppress here; full
-        // removal of the secondary connection comes in the phase B+
-        // cleanup once Stats per-peer also migrates off the secondary
-        // path.
-        break;
-      case 'add_turn_separator':
-        renderTurnSeparator(c.turn);
-        break;
-      case 'update_usage':
-        // Cache under the secondary's host_id so the Stats host picker
-        // can render it. Live-render only if the picker is currently
-        // showing this host — otherwise it'd stomp whatever the user
-        // is viewing.
-        hostStatsCache.set(hostId, c);
-        if (activeStatsHost === hostId) renderUsageTab(c);
-        break;
-      // show_approval / hide_approval / approval_resolved (raw):
-      // intentionally dropped here. Per-peer approvals now arrive
-      // through the new push path as PeerApprovalRequested /
-      // PeerApprovalResolved UiCommands handled in processCommands.
-      // Keeping the secondary path emitting them too would
-      // double-render.
-      case 'clear_logs':
-        // Explicitly ignored: clearing the whole stream when a
-        // secondary resets would delete primary history too.
-        break;
-      default:
-        // Everything else (status_bar, displays, recordings,
-        // phase, badges, terminal data) is intentionally dropped —
-        // those tabs are primary-scoped in phase 1.
-        break;
-    }
-  }
 }
 
 // ── Activity host filter ──
@@ -11132,10 +11072,11 @@ function applyHostFilter() {
 // ── Stats host picker ──
 //
 // Dropdown at the top of the Stats tab switches between the primary's
-// usage/cost/history view and each configured secondary's. Payloads
-// are captured from `update_usage` commands as they flow in (primary
-// via processCommands, secondaries via handleSecondaryEvent) so switching
-// is instant from cache.
+// usage/cost/history view and each configured peer's. Payloads are
+// captured from `update_usage` commands (primary) and `peer_usage`
+// commands translated through `peerSnapshotToUpdateUsage` (peers)
+// as they flow in via processCommands, so switching is instant from
+// cache.
 
 function isStatsShowingSelf() {
   return !activeStatsHost || activeStatsHost === selfPeerId;

@@ -51,29 +51,6 @@ export class PresenceWeb {
         }
     }
     /**
-     * Open a read-only WebSocket to a secondary daemon. The `url`
-     * should be a fully-qualified `wss://` URL (the JS side is
-     * responsible for converting `https://host:port` to `wss://host:port/ws`).
-     * `host_id` must be unique across the dashboard — the JS layer
-     * uses it as a key for routing inbound events to host-scoped DOM
-     * elements. `label` is the human-readable display name.
-     *
-     * Idempotent: calling with an existing host_id replaces the
-     * previous connection.
-     * @param {string} host_id
-     * @param {string} label
-     * @param {string} url
-     */
-    add_secondary_host(host_id, label, url) {
-        const ptr0 = passStringToWasm0(host_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(label, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
-        const ptr2 = passStringToWasm0(url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len2 = WASM_VECTOR_LEN;
-        wasm.presenceweb_add_secondary_host(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
-    }
-    /**
      * @param {string} url
      */
     connect_server(url) {
@@ -165,27 +142,6 @@ export class PresenceWeb {
         return ret;
     }
     /**
-     * Route a raw server message from a secondary daemon through that
-     * secondary's dashboard state machine. Reuses the same formatting
-     * path as the primary (command_result extraction, agent_output
-     * parsing, screenshot decoding, level filtering) so secondary log
-     * entries look identical to the primary's — no parallel translator
-     * to drift out of sync.
-     *
-     * Returns `UiCommand[]` as a JS array. The JS side filters these
-     * to the log-entry subset, tags them with the host_id for badge
-     * rendering, and routes to the DOM.
-     * @param {string} host_id
-     * @param {any} msg
-     * @returns {any}
-     */
-    handle_secondary_message(host_id, msg) {
-        const ptr0 = passStringToWasm0(host_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.presenceweb_handle_secondary_message(this.__wbg_ptr, ptr0, len0, msg);
-        return ret;
-    }
-    /**
      * Handle a server event by injecting system text into the voice model.
      * Returns true if a message was sent to the voice model.
      * @param {any} evt
@@ -237,15 +193,6 @@ export class PresenceWeb {
         const ret = wasm.presenceweb_inject_pending_approval_if_any(this.__wbg_ptr);
         return ret !== 0;
     }
-    /**
-     * Return the list of currently-registered secondary hosts as a JS
-     * array of `{host_id, label, url, connected}` objects.
-     * @returns {any}
-     */
-    list_secondary_hosts() {
-        const ret = wasm.presenceweb_list_secondary_hosts(this.__wbg_ptr);
-        return ret;
-    }
     constructor() {
         const ret = wasm.presenceweb_new();
         this.__wbg_ptr = ret >>> 0;
@@ -276,20 +223,6 @@ export class PresenceWeb {
         }
     }
     /**
-     * Called from the JS trampoline scheduled by a secondary's onclose
-     * closure. Re-opens the WebSocket for the given host_id if it's
-     * still in the registry (user may have removed it meanwhile).
-     * @param {string} host_id
-     * @param {string} url
-     */
-    reconnect_secondary_host(host_id, url) {
-        const ptr0 = passStringToWasm0(host_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
-        wasm.presenceweb_reconnect_secondary_host(this.__wbg_ptr, ptr0, len0, ptr1, len1);
-    }
-    /**
      * @param {string} url
      */
     reconnect_server(url) {
@@ -306,15 +239,6 @@ export class PresenceWeb {
         var ptr0 = isLikeNone(note) ? 0 : passStringToWasm0(note, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         var len0 = WASM_VECTOR_LEN;
         wasm.presenceweb_release_display(this.__wbg_ptr, display_id, ptr0, len0);
-    }
-    /**
-     * Close and forget a secondary daemon connection.
-     * @param {string} host_id
-     */
-    remove_secondary_host(host_id) {
-        const ptr0 = passStringToWasm0(host_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        wasm.presenceweb_remove_secondary_host(this.__wbg_ptr, ptr0, len0);
     }
     /**
      * Revoke agent access to the user's session display (primary / id 0).
@@ -646,18 +570,6 @@ export class PresenceWeb {
     /**
      * @param {Function} f
      */
-    set_on_secondary_event(f) {
-        wasm.presenceweb_set_on_secondary_event(this.__wbg_ptr, f);
-    }
-    /**
-     * @param {Function} f
-     */
-    set_on_secondary_state(f) {
-        wasm.presenceweb_set_on_secondary_state(this.__wbg_ptr, f);
-    }
-    /**
-     * @param {Function} f
-     */
     set_on_server_event(f) {
         wasm.presenceweb_set_on_server_event(this.__wbg_ptr, f);
     }
@@ -743,10 +655,6 @@ export class PresenceWeb {
     }
     /**
      * Change log verbosity and return commands to re-filter.
-     * Also propagates the change to every secondary host's AppState
-     * so their historical log filtering stays in sync — otherwise a
-     * verbosity change on the primary would leave secondaries showing
-     * the old set of entries.
      * @param {string} level
      * @returns {any}
      */
@@ -1242,17 +1150,17 @@ function __wbg_get_imports() {
             console.warn(arg0);
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 100, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 101, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 108, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 109, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h4473cb2a2a923a88, wasm_bindgen__convert__closures_____invoke__h5670f985d4d92ec7);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 100, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 101, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 108, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 109, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h4473cb2a2a923a88, wasm_bindgen__convert__closures_____invoke__h5670f985d4d92ec7);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 100, function: Function { arguments: [], shim_idx: 103, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 108, function: Function { arguments: [], shim_idx: 111, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h4473cb2a2a923a88, wasm_bindgen__convert__closures_____invoke__h5974ec181d3c6728);
             return ret;
         },
