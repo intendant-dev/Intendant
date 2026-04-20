@@ -207,7 +207,27 @@ pub enum WebRtcSignal {
     /// Browser-side SDP offer. The browser is the offerer (mirrors
     /// the local browser→daemon WebRTC flow); peer creates a
     /// `WebRtcPeer` in response and emits an `Answer`.
-    Offer { sdp: String },
+    ///
+    /// `advertise_tcp_via_url` is the browser's view of how to reach
+    /// this peer's HTTP port — supplied by the dashboard as the URL
+    /// the operator typed into "Add Peer" (stored as `d.ws_url` on
+    /// the local daemon row). The peer derives its ICE-TCP host
+    /// candidate address from this URL and registers against its own
+    /// `TcpPeerRegistry` multiplex so the browser can form a TCP
+    /// pair through whatever tunnel / port-forward / Tailscale path
+    /// the operator already set up for the dashboard. `None` means
+    /// UDP-only direct paths — the 3a baseline when the field was
+    /// absent on the wire.
+    ///
+    /// Backward-compatible wire addition: `#[serde(default)]` so
+    /// older daemons that don't set the field deserialize to `None`
+    /// and fall through to the UDP-only path; `skip_serializing_if`
+    /// so local code that sends `None` doesn't bloat the wire frame.
+    Offer {
+        sdp: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        advertise_tcp_via_url: Option<String>,
+    },
     /// Peer-side SDP answer in response to an offer.
     Answer { sdp: String },
     /// Trickled ICE candidate. Either direction. The wire format is
@@ -720,6 +740,60 @@ mod tests {
         ] {
             let wire = serde_json::to_string(&k).unwrap();
             assert_eq!(wire, format!("\"{}\"", k.as_str()));
+        }
+    }
+
+    /// WebRtcSignal::Offer with `advertise_tcp_via_url = Some(...)`
+    /// round-trips through serde with the URL preserved.
+    #[test]
+    fn webrtc_offer_round_trips_with_tcp_via_url() {
+        let sig = WebRtcSignal::Offer {
+            sdp: "v=0\r\n".into(),
+            advertise_tcp_via_url: Some("ws://localhost:8766/ws".into()),
+        };
+        let json = serde_json::to_string(&sig).unwrap();
+        assert!(
+            json.contains("advertise_tcp_via_url"),
+            "field should be on wire when Some: {json}"
+        );
+        let parsed: WebRtcSignal = serde_json::from_str(&json).unwrap();
+        match parsed {
+            WebRtcSignal::Offer { advertise_tcp_via_url, .. } => {
+                assert_eq!(advertise_tcp_via_url.as_deref(), Some("ws://localhost:8766/ws"));
+            }
+            other => panic!("expected Offer, got {other:?}"),
+        }
+    }
+
+    /// When the URL hint is `None`, the field is skipped on the wire
+    /// (`skip_serializing_if`) so older peers / minimal clients that
+    /// predate 3a.2 don't see an unexpected null.
+    #[test]
+    fn webrtc_offer_skips_tcp_via_url_when_none() {
+        let sig = WebRtcSignal::Offer {
+            sdp: "v=0\r\n".into(),
+            advertise_tcp_via_url: None,
+        };
+        let json = serde_json::to_string(&sig).unwrap();
+        assert!(
+            !json.contains("advertise_tcp_via_url"),
+            "field should be omitted when None: {json}"
+        );
+    }
+
+    /// Deserializing an offer from a pre-3a.2 producer (no
+    /// `advertise_tcp_via_url` field at all) succeeds and parses the
+    /// URL as `None` — backward-compatible wire addition.
+    #[test]
+    fn webrtc_offer_deserializes_without_tcp_via_url() {
+        let json = r#"{"kind":"offer","sdp":"v=0\r\n"}"#;
+        let parsed: WebRtcSignal = serde_json::from_str(json).unwrap();
+        match parsed {
+            WebRtcSignal::Offer { advertise_tcp_via_url, sdp } => {
+                assert_eq!(advertise_tcp_via_url, None);
+                assert_eq!(sdp, "v=0\r\n");
+            }
+            other => panic!("expected Offer, got {other:?}"),
         }
     }
 }

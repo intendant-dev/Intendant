@@ -3716,6 +3716,7 @@ pub fn spawn_web_gateway(
                                                         signal,
                                                         session_registry_inbound.as_ref(),
                                                         &ice_config,
+                                                        Arc::clone(&tcp_peer_registry),
                                                         direct_tx_inbound.clone(),
                                                     ).await;
                                                 }
@@ -5821,6 +5822,47 @@ async fn peers_webrtc_signal(
     }
 }
 
+/// Parse a WebSocket / HTTP URL and resolve it to a [`SocketAddr`].
+///
+/// Used to convert the browser's view of a peer's HTTP port (the
+/// `advertise_tcp_via_url` hint in a federated
+/// [`crate::peer::WebRtcSignal::Offer`]) into the concrete address
+/// the peer advertises in its ICE-TCP candidate.
+///
+/// Accepts `ws://` / `wss://` / `http://` / `https://` schemes (all
+/// produce the same authority shape). The host can be an IPv4
+/// literal, a bracketed IPv6 literal, or a hostname — hostnames are
+/// resolved via [`tokio::net::lookup_host`] and the first returned
+/// address is used. The port must be explicit; there's no default-
+/// port fallback, because we can't know what the peer's HTTP
+/// listener bound to without being told.
+///
+/// Returns `None` on any parse or resolution failure. Callers treat
+/// that as "no TCP candidate, UDP-only path" — the same behavior as
+/// slice 3a's pre-3a.2 baseline.
+async fn resolve_url_to_socket_addr(
+    url: &str,
+) -> Option<std::net::SocketAddr> {
+    let rest = url
+        .strip_prefix("wss://")
+        .or_else(|| url.strip_prefix("ws://"))
+        .or_else(|| url.strip_prefix("https://"))
+        .or_else(|| url.strip_prefix("http://"))?;
+    // Strip any path / query that follows the authority. Authority
+    // for an IPv6 literal is `[::1]:8766`, which contains neither
+    // `/` nor `?` inside the brackets, so split-on-first is safe.
+    let authority = rest.split(|c| c == '/' || c == '?').next()?;
+    // Fast path for `ipv4:port` or `[ipv6]:port`: parse directly.
+    if let Ok(addr) = authority.parse::<std::net::SocketAddr>() {
+        return Some(addr);
+    }
+    // Hostname:port — needs DNS. `lookup_host` accepts `host:port`
+    // and returns the resolved SocketAddrs in OS-chosen order; first
+    // is the winner (matches what the kernel would pick for a
+    // regular connect()).
+    tokio::net::lookup_host(authority).await.ok()?.next()
+}
+
 /// Handle a federation-driven WebRTC signal arriving on this peer's
 /// WebSocket inside a [`crate::event::ControlMsg::WebRtcSignal`].
 ///
@@ -5836,12 +5878,18 @@ async fn peers_webrtc_signal(
 ///   the offer-sender). Logged and ignored.
 /// - `Unknown` → forward-compat fallback. Ignored.
 ///
-/// Slice 3a passes `None` for both `tcp_peer_registry` and
-/// `tcp_advertised_addr`: federation media is browser-to-peer direct,
-/// not browser-to-primary, so the peer doesn't share the primary's
-/// ICE-TCP multiplex and has no `Host`-header view of the connecting
-/// browser. UDP host candidates only. Slice 3b adds primary-as-relay
-/// for the no-direct-path case.
+/// Slice 3a.2 threads the browser's view of the peer's HTTP port
+/// through as the ICE-TCP candidate the peer advertises, multiplexed
+/// onto its own `TcpPeerRegistry` (same mechanism as the local
+/// browser↔daemon display path). When the Offer carries an
+/// `advertise_tcp_via_url`, the peer advertises both its UDP host
+/// candidates and a TCP candidate at the resolved address — which
+/// enables federation WebRTC through any tunnel / port-forward /
+/// Tailscale path the operator has already made reachable from the
+/// browser. Without the hint (or when the URL can't be resolved),
+/// the peer falls back to UDP host candidates only — the 3a baseline.
+/// Slice 3b layers primary-as-media-relay on top for the browser-
+/// cannot-reach-peer-at-all case.
 ///
 /// `session_id` is round-tripped verbatim into the response so the
 /// browser's per-(peer, session_id) `RTCPeerConnection` map can match
@@ -5855,6 +5903,7 @@ async fn handle_federated_webrtc_signal(
     signal: crate::peer::WebRtcSignal,
     session_registry: Option<&Arc<tokio::sync::RwLock<crate::display::SessionRegistry>>>,
     ice_config: &crate::display::IceConfig,
+    tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
     direct_tx: tokio::sync::mpsc::UnboundedSender<String>,
 ) {
     let registry = match session_registry {
@@ -5890,11 +5939,32 @@ async fn handle_federated_webrtc_signal(
     };
 
     match signal {
-        crate::peer::WebRtcSignal::Offer { sdp } => {
+        crate::peer::WebRtcSignal::Offer {
+            sdp,
+            advertise_tcp_via_url,
+        } => {
+            // Resolve the browser-supplied URL hint to a SocketAddr.
+            // Unreachable hostnames / malformed URLs / missing hint
+            // all collapse to `None` → UDP-only host candidates, same
+            // behavior as pre-3a.2. Wrapped in a single lookup so we
+            // don't block handle_offer on DNS per-session.
+            let tcp_advertised_addr = match advertise_tcp_via_url {
+                Some(url) if !url.is_empty() => {
+                    resolve_url_to_socket_addr(&url).await
+                }
+                _ => None,
+            };
             let (ice_tx, mut ice_rx) =
                 tokio::sync::mpsc::channel::<(crate::display::PeerId, String)>(64);
             let answer_result = session
-                .handle_offer(peer_id, &sdp, ice_config, None, None, ice_tx)
+                .handle_offer(
+                    peer_id,
+                    &sdp,
+                    ice_config,
+                    Some(tcp_peer_registry.clone()),
+                    tcp_advertised_addr,
+                    ice_tx,
+                )
                 .await;
             match answer_result {
                 Ok(answer_sdp) => {
@@ -6732,6 +6802,83 @@ mod tests {
             "ipv6 literal must be bracketed: {}",
             urls[0]
         );
+    }
+
+    // -----------------------------------------------------------------
+    // resolve_url_to_socket_addr (slice 3a.2 — URL hint parsing)
+    // -----------------------------------------------------------------
+
+    /// Directly-parseable `ipv4:port` authorities are returned
+    /// without any DNS round-trip.
+    #[tokio::test]
+    async fn resolve_url_parses_ipv4_literal_url() {
+        let addr = resolve_url_to_socket_addr("ws://127.0.0.1:8766/ws")
+            .await
+            .expect("parses");
+        assert_eq!(addr.to_string(), "127.0.0.1:8766");
+    }
+
+    /// Bracketed IPv6 literals round-trip through the parser; the
+    /// `/ws` path suffix is stripped before the SocketAddr parse.
+    #[tokio::test]
+    async fn resolve_url_parses_ipv6_literal_url() {
+        let addr = resolve_url_to_socket_addr("wss://[::1]:8443/ws")
+            .await
+            .expect("parses");
+        assert_eq!(addr.port(), 8443);
+        assert!(addr.is_ipv6(), "expected IPv6, got {addr}");
+    }
+
+    /// `http://` and `https://` are accepted alongside the WebSocket
+    /// schemes so the same URL form works whether the operator types
+    /// the dashboard URL or the /ws URL.
+    #[tokio::test]
+    async fn resolve_url_accepts_http_and_https_schemes() {
+        let a = resolve_url_to_socket_addr("http://127.0.0.1:8000/")
+            .await
+            .expect("http parses");
+        assert_eq!(a.port(), 8000);
+        let b = resolve_url_to_socket_addr("https://127.0.0.1:8443")
+            .await
+            .expect("https parses");
+        assert_eq!(b.port(), 8443);
+    }
+
+    /// Hostnames route through `tokio::net::lookup_host`. `localhost`
+    /// is the one name we can rely on across every test environment.
+    #[tokio::test]
+    async fn resolve_url_resolves_localhost_via_dns() {
+        let addr = resolve_url_to_socket_addr("ws://localhost:8766/ws")
+            .await
+            .expect("resolves");
+        assert_eq!(addr.port(), 8766);
+        assert!(
+            addr.ip().is_loopback(),
+            "localhost must resolve to a loopback address: {addr}"
+        );
+    }
+
+    /// URLs with a path + query string strip cleanly: the authority
+    /// is everything up to the first `/` or `?`.
+    #[tokio::test]
+    async fn resolve_url_strips_path_and_query() {
+        let a = resolve_url_to_socket_addr("ws://127.0.0.1:8766/ws/path?foo=bar")
+            .await
+            .expect("parses");
+        assert_eq!(a.to_string(), "127.0.0.1:8766");
+    }
+
+    /// Unknown schemes, missing ports, and unresolvable hostnames
+    /// all return `None` — caller falls back to UDP-only path.
+    #[tokio::test]
+    async fn resolve_url_returns_none_on_malformed_inputs() {
+        // Unknown scheme
+        assert!(resolve_url_to_socket_addr("foo://127.0.0.1:8766").await.is_none());
+        // Empty authority
+        assert!(resolve_url_to_socket_addr("ws:///path").await.is_none());
+        // No port (authority parses as IP but not SocketAddr; lookup_host
+        // rejects a bare host with no port).
+        assert!(resolve_url_to_socket_addr("ws://127.0.0.1/ws").await.is_none());
     }
 
     /// Operator overrides come first in the merged list (preference

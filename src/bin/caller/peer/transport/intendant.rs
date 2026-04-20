@@ -789,6 +789,7 @@ mod tests {
                 session_id: crate::peer::WebRtcSessionId("sess-uuid".into()),
                 signal: crate::peer::WebRtcSignal::Offer {
                     sdp: "v=0\r\nm=video".into(),
+                    advertise_tcp_via_url: None,
                 },
             })
             .await

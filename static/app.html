@@ -11154,7 +11154,8 @@ function renderDaemonsList() {
   el.querySelectorAll('.daemon-display-view').forEach(btn => {
     btn.addEventListener('click', () => {
       const displayId = parseInt(btn.dataset.displayId || '0', 10);
-      openPeerDisplay(btn.dataset.hostId, displayId).catch(err => {
+      const wsUrl = btn.dataset.wsUrl || '';
+      openPeerDisplay(btn.dataset.hostId, displayId, wsUrl).catch(err => {
         console.error('openPeerDisplay failed:', err);
       });
     });
@@ -11336,8 +11337,16 @@ function renderDaemonRow(d, isSelf) {
   // Capability-gated "View display" button — only peers whose card
   // advertises Capability::Display get the affordance. Slice 3a opens
   // display_id 0 by default; multi-display picker is a follow-up.
+  //
+  // `data-ws-url` carries the URL the browser would use to reach the
+  // peer's HTTP port — passed as `advertise_tcp_via_url` in the Offer
+  // so the peer can advertise an ICE-TCP candidate the browser can
+  // actually dial (slice 3a.2). `d.ws_url` is the peer's first
+  // IntendantWs transport after via-override / auto-detect merge;
+  // when the browser is co-located with the primary, that URL
+  // resolves the same way on both sides.
   const viewDisplayBtn = !isSelf && peerCanShareDisplay(d)
-    ? `<button class="daemon-display-view" data-host-id="${escapeHtml(d.host_id)}" data-display-id="0" title="Open this peer's display via WebRTC (browser↔peer direct, primary signals only)">View display</button>`
+    ? `<button class="daemon-display-view" data-host-id="${escapeHtml(d.host_id)}" data-display-id="0" data-ws-url="${escapeHtml(d.ws_url || '')}" title="Open this peer's display via WebRTC (browser↔peer direct, primary signals only)">View display</button>`
     : '';
   const controlsPanel = isSelf
     ? ''
@@ -11616,10 +11625,15 @@ function peerCanShareDisplay(d) {
 }
 
 class PeerDisplayConnection {
-  constructor(hostId, displayId, sessionId) {
+  constructor(hostId, displayId, sessionId, advertiseTcpViaUrl) {
     this.hostId = hostId;
     this.displayId = displayId;
     this.sessionId = sessionId;
+    // URL the browser uses to reach the peer's HTTP port. Included
+    // in the Offer signal as `advertise_tcp_via_url` so the peer can
+    // advertise a matching ICE-TCP candidate (slice 3a.2). Empty
+    // string → UDP-only path (3a baseline).
+    this.advertiseTcpViaUrl = advertiseTcpViaUrl || '';
     this.pc = null;
     this.stream = null;
     this._pendingCandidates = [];
@@ -11708,10 +11722,19 @@ class PeerDisplayConnection {
     try {
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
-      await this._sendSignal({
+      const offerSignal = {
         kind: 'offer',
         sdp: this.pc.localDescription.sdp,
-      });
+      };
+      // Only attach the URL hint when we actually have one. The
+      // server's serde setup uses `skip_serializing_if = None` on
+      // the field, but on the browser side we enforce the same
+      // invariant here so the wire frame stays minimal and older
+      // peers don't see an unexpected field.
+      if (this.advertiseTcpViaUrl) {
+        offerSignal.advertise_tcp_via_url = this.advertiseTcpViaUrl;
+      }
+      await this._sendSignal(offerSignal);
       this.setStatus('Offer sent, awaiting answer…', '');
     } catch (err) {
       this.setStatus(`Offer failed: ${err.message}`, 'error');
@@ -11782,13 +11805,22 @@ class PeerDisplayConnection {
   }
 }
 
-async function openPeerDisplay(hostId, displayId) {
+async function openPeerDisplay(hostId, displayId, advertiseTcpViaUrl) {
   // One session per host in slice 3a — close any previous before
   // opening a fresh one. Avoids accumulating stale RTCPeerConnections
   // when the user clicks "View display" repeatedly.
   await closePeerDisplaysForHost(hostId);
   const sessionId = generateSessionId();
-  const conn = new PeerDisplayConnection(hostId, displayId, sessionId);
+  // Fall back to the daemon-list lookup when the caller didn't
+  // supply the URL explicitly (e.g., future programmatic callers).
+  // The button click handler always passes d.ws_url when the peer
+  // has one, so this fallback is belt-and-suspenders.
+  let effectiveUrl = advertiseTcpViaUrl || '';
+  if (!effectiveUrl) {
+    const d = daemons.find(x => x.host_id === hostId);
+    if (d && d.ws_url) effectiveUrl = d.ws_url;
+  }
+  const conn = new PeerDisplayConnection(hostId, displayId, sessionId, effectiveUrl);
   peerDisplayConnections.set(conn.sessionKey(), conn);
   conn.attachToDom();
   await conn.connect();
