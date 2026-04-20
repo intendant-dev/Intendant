@@ -5457,6 +5457,20 @@ struct AddPeerRequest {
     /// continue to work.
     #[serde(default)]
     via_urls: Vec<String>,
+    /// Optional outbound bearer token sent to this peer (the
+    /// `[[peer]] bearer_token` equivalent for dashboard-added
+    /// peers). When set, sent on the agent-card fetch and the
+    /// WebSocket upgrade. Required when the peer's card declares
+    /// `auth.application = Some(Bearer)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bearer_token: Option<String>,
+    /// Optional operator-supplied pinned cert fingerprints. When
+    /// non-empty, REPLACES whatever the peer's card declares for
+    /// `auth.transport` — eliminates the TOFU window when the
+    /// operator got the fingerprint out-of-band. Same wire format
+    /// as the card's: lowercase hex with optional `:` separators.
+    #[serde(default)]
+    pinned_fingerprints: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -5496,7 +5510,12 @@ async fn peers_add(
         }
     };
     match registry
-        .add_peer_with_via(&req.card_url, req.via_urls)
+        .add_peer_with_credentials(
+            &req.card_url,
+            req.via_urls,
+            req.bearer_token,
+            req.pinned_fingerprints,
+        )
         .await
     {
         Ok(peer_id) => (

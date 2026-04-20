@@ -173,16 +173,40 @@ impl PeerRegistry {
         self.add_peer_with_via_and_auth(card_url, via_urls, None).await
     }
 
+    /// Wrapper over [`add_peer_with_credentials`] that doesn't pass
+    /// pinned-fingerprint overrides. Kept for the existing call sites
+    /// that don't need the override; new code should use
+    /// `add_peer_with_credentials` directly.
+    pub async fn add_peer_with_via_and_auth(
+        &self,
+        card_url: &str,
+        via_urls: Vec<String>,
+        bearer_token: Option<String>,
+    ) -> Result<PeerId, PeerError> {
+        self.add_peer_with_credentials(card_url, via_urls, bearer_token, Vec::new())
+            .await
+    }
+
     /// Full add-peer entry point: card_url + optional via override +
-    /// optional outbound bearer token. The token is sent on the
-    /// initial card fetch (via `fetch_card`) and stored on the
-    /// per-peer transport for subsequent requests.
+    /// optional outbound bearer token + optional operator-side pinned
+    /// fingerprint override. The token is sent on the initial card
+    /// fetch (via `fetch_card`) and stored on the per-peer transport
+    /// for subsequent requests.
     ///
     /// When `via_urls` is non-empty, the fetched card's `transports`
     /// field is replaced with one [`TransportSpec::IntendantWs`] per
     /// supplied URL, in the given preference order — the operator
     /// is asserting "reach this peer at these URLs, ignore what its
     /// card advertised."
+    ///
+    /// When `override_pinned_fingerprints` is non-empty, the fetched
+    /// card's `auth.transport` is REPLACED with a fresh
+    /// `PinnedMutualTls { server_cert_fingerprints: override... }`.
+    /// Eliminates the TOFU window from card-driven pinning: the
+    /// operator distrusts the card's auth claim and pins against
+    /// fingerprints they got out-of-band. Empty list (the default)
+    /// preserves the card's auth.transport unchanged — that's the
+    /// "trust the card" path covered by follow-up B's auto-advertise.
     ///
     /// Use cases for `via_urls`:
     /// - Connecting daemon knows about a port-forward / proxy / named
@@ -198,15 +222,23 @@ impl PeerRegistry {
     /// matching credential in `[[peer]] bearer_token` in
     /// intendant.toml.
     ///
+    /// Use case for `override_pinned_fingerprints`: the peer's card
+    /// declares some fingerprint set (or none), and the operator
+    /// wants to substitute their own out-of-band-trusted fingerprint
+    /// list. Replaces the entire `auth.transport` field with
+    /// `PinnedMutualTls { server_cert_fingerprints: override }`.
+    ///
     /// The card's identity (`id`, `label`, `version`, `capabilities`,
-    /// `auth`) is preserved — only `transports` is overridden. The
-    /// peer is still uniquely identified by `card.id`, so duplicate
+    /// `auth.application`) is preserved — only `transports` and
+    /// (conditionally) `auth.transport` are overridden. The peer is
+    /// still uniquely identified by `card.id`, so duplicate
     /// registration still rejects with the same error.
-    pub async fn add_peer_with_via_and_auth(
+    pub async fn add_peer_with_credentials(
         &self,
         card_url: &str,
         via_urls: Vec<String>,
         bearer_token: Option<String>,
+        override_pinned_fingerprints: Vec<String>,
     ) -> Result<PeerId, PeerError> {
         let mut card = fetch_card(card_url, bearer_token.as_deref()).await?;
         if !via_urls.is_empty() {
@@ -214,6 +246,11 @@ impl PeerRegistry {
                 .into_iter()
                 .map(|url| TransportSpec::IntendantWs { url })
                 .collect();
+        }
+        if !override_pinned_fingerprints.is_empty() {
+            card.auth.transport = crate::peer::card::TransportAuth::PinnedMutualTls {
+                server_cert_fingerprints: override_pinned_fingerprints,
+            };
         }
         self.add_peer_with_card_and_auth(card, bearer_token).await
     }
@@ -1096,6 +1133,114 @@ mod tests {
         assert_eq!(urls, vec![&via_urls[0], &via_urls[1]]);
 
         reg.remove_peer(&peer_id).await.unwrap();
+        gateway.abort();
+    }
+
+    /// `add_peer_with_credentials` with non-empty
+    /// `override_pinned_fingerprints` REPLACES the card's
+    /// `auth.transport` with `PinnedMutualTls` containing the
+    /// operator-supplied fingerprints. Eliminates the TOFU window
+    /// when the operator got the fingerprint out-of-band.
+    #[tokio::test]
+    async fn add_peer_with_credentials_pinned_override_replaces_card_auth() {
+        use crate::peer::card::TransportAuth;
+        let (port, gateway) = spawn_test_peer().await;
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let reg = PeerRegistry::new(log_tx);
+
+        let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
+        // Operator-supplied override — must end up in the stored card's
+        // auth.transport regardless of what the fetched card claimed.
+        let override_pinned = vec![
+            "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff".to_string(),
+        ];
+        let peer_id = reg
+            .add_peer_with_credentials(
+                &card_url,
+                Vec::new(),
+                None,
+                override_pinned.clone(),
+            )
+            .await
+            .expect("add_peer_with_credentials with valid override succeeds");
+
+        let handle = reg.get(&peer_id).expect("peer is in registry");
+        let card = handle.card_snapshot();
+        match &card.auth.transport {
+            TransportAuth::PinnedMutualTls {
+                server_cert_fingerprints,
+            } => {
+                assert_eq!(server_cert_fingerprints, &override_pinned);
+            }
+            other => panic!("expected PinnedMutualTls override, got {other:?}"),
+        }
+        // Application-layer auth from the original card is preserved
+        // (override only touches transport, not application).
+        assert!(
+            card.auth.application.is_none(),
+            "application auth preserved (None in test fixture)"
+        );
+
+        reg.remove_peer(&peer_id).await.unwrap();
+        gateway.abort();
+    }
+
+    /// `add_peer_with_credentials` with empty `override_pinned_fingerprints`
+    /// preserves the card's `auth.transport` exactly. The empty case is
+    /// the no-op default — operator hasn't configured pinning, trust the
+    /// card's claim.
+    #[tokio::test]
+    async fn add_peer_with_credentials_empty_override_preserves_card_auth() {
+        let (port, gateway) = spawn_test_peer().await;
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let reg = PeerRegistry::new(log_tx);
+
+        let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
+        let peer_id = reg
+            .add_peer_with_credentials(&card_url, Vec::new(), None, Vec::new())
+            .await
+            .expect("empty override succeeds");
+
+        let handle = reg.get(&peer_id).expect("peer is in registry");
+        let card = handle.card_snapshot();
+        // Test gateway advertises None auth by default; preserved.
+        assert_eq!(
+            card.auth,
+            crate::peer::card::AuthRequirements::none(),
+            "card auth preserved unchanged"
+        );
+
+        reg.remove_peer(&peer_id).await.unwrap();
+        gateway.abort();
+    }
+
+    /// `add_peer_with_credentials` with malformed override
+    /// fingerprint fails at registry-add time with `PeerError::Auth`
+    /// (because `add_peer_with_card_and_auth` parses every pinned
+    /// fingerprint via `parse_card_pinned_fingerprints` and that's
+    /// where the format error surfaces).
+    #[tokio::test]
+    async fn add_peer_with_credentials_rejects_malformed_override() {
+        let (port, gateway) = spawn_test_peer().await;
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let reg = PeerRegistry::new(log_tx);
+
+        let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
+        let result = reg
+            .add_peer_with_credentials(
+                &card_url,
+                Vec::new(),
+                None,
+                vec!["not-a-fingerprint".into()],
+            )
+            .await;
+        match result {
+            Err(PeerError::Auth(msg)) => {
+                assert!(msg.contains("invalid pinned fingerprint"), "msg: {msg}");
+            }
+            other => panic!("expected PeerError::Auth, got {other:?}"),
+        }
+        assert!(reg.is_empty());
         gateway.abort();
     }
 

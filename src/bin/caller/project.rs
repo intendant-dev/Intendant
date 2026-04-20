@@ -509,6 +509,34 @@ pub struct PeerConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
+    /// Operator-supplied pinned SHA-256 cert fingerprints. When
+    /// non-empty, REPLACES whatever the peer's own card declares for
+    /// `auth.transport` — eliminates the TOFU window for operators
+    /// who got the fingerprint out-of-band (a side channel they
+    /// trust more than the card itself, e.g. printed on the peer
+    /// machine, sent over Signal, distributed via configuration
+    /// management).
+    ///
+    /// Empty (the default) means "trust whatever the card claims" —
+    /// follow-up B's auto-advertise feature on the peer side then
+    /// pre-populates the card with the right fingerprint, which
+    /// covers most cases. Override here is the explicit "I don't
+    /// trust the card's claim, pin against this exact set instead."
+    ///
+    /// Format: same as the card's wire form — lowercase hex with
+    /// optional `:` separators (OpenSSL-style). Parse failures
+    /// surface as a `PeerError::Auth` at peer-registration time.
+    ///
+    /// Example:
+    /// ```toml
+    /// [[peer]]
+    /// card_url = "https://wan-peer.example.com/.well-known/agent-card.json"
+    /// pinned_fingerprints = [
+    ///   "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+    /// ]
+    /// ```
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_fingerprints: Vec<String>,
 }
 
 /// Recording configuration in intendant.toml.
@@ -731,11 +759,15 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                     card_url: "http://a.local/.well-known/agent-card.json".into(),
                     label: Some("A".into()),
                     bearer_token: None,
+                    pinned_fingerprints: Vec::new(),
                 },
                 PeerConfig {
                     card_url: "http://b.local/.well-known/agent-card.json".into(),
                     label: None,
                     bearer_token: Some("secret-for-b".into()),
+                    pinned_fingerprints: vec![
+                        "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+                    ],
                 },
             ],
             ..ProjectConfig::default()
@@ -749,6 +781,14 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
         assert_eq!(parsed.peers[1].card_url, original.peers[1].card_url);
         assert!(parsed.peers[1].label.is_none());
         assert_eq!(parsed.peers[1].bearer_token, original.peers[1].bearer_token);
+        assert_eq!(
+            parsed.peers[1].pinned_fingerprints,
+            original.peers[1].pinned_fingerprints
+        );
+        assert!(
+            parsed.peers[0].pinned_fingerprints.is_empty(),
+            "empty pinning preserved across round-trip"
+        );
     }
 
     #[test]

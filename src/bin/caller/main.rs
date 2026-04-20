@@ -135,13 +135,22 @@ fn build_and_hydrate_peer_registry(
         let registry_for_task = registry.clone();
         let card_url = cfg.card_url.clone();
         let bearer_token = cfg.bearer_token.clone();
+        let pinned_fingerprints = cfg.pinned_fingerprints.clone();
         tokio::spawn(async move {
             // Vec::new() for via_urls (could be threaded through
             // PeerConfig later if config-driven via overrides become
             // a need; per-peer dashboard adds already use the via_urls
-            // field on AddPeerRequest).
+            // field on AddPeerRequest). pinned_fingerprints, when
+            // non-empty, replaces the card's auth.transport with
+            // PinnedMutualTls — operator distrusts the card's claim
+            // and pins against fingerprints they got out-of-band.
             if let Err(e) = registry_for_task
-                .add_peer_with_via_and_auth(&card_url, Vec::new(), bearer_token)
+                .add_peer_with_credentials(
+                    &card_url,
+                    Vec::new(),
+                    bearer_token,
+                    pinned_fingerprints,
+                )
                 .await
             {
                 eprintln!(
