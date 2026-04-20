@@ -1,17 +1,48 @@
 #!/bin/bash
 # Build intendant as a native macOS desktop app.
 #
-# Creates Intendant.app with a Swift wrapper that:
-#   1. Launches intendant --web as a child process
-#   2. Opens a native window with WKWebView loading the dashboard
-#   3. Gets proper TCC permissions (Screen Recording, Accessibility)
-#   4. Child processes (ffmpeg, screencapture, cliclick) inherit permissions
+# **On macOS this is the required build path for anything that uses
+# display capture, input injection, microphone, or camera.** Running
+# `cargo build --release` and launching `target/release/intendant`
+# directly produces an ad-hoc-signed binary; macOS TCC refuses to
+# grant Screen Recording / Accessibility / Microphone / Camera to
+# ad-hoc binaries (and silently re-invalidates any grant on the next
+# rebuild because the cdhash changes), so features gated on those
+# capabilities just fail with opaque "permission denied" errors at
+# runtime. This script solves that by:
+#
+#   1. Compiling the Rust binaries (intendant + intendant-runtime).
+#   2. Compiling a small Swift wrapper (macos-app/main.swift) that
+#      hosts a WKWebView loading the dashboard and spawns the Rust
+#      daemon as a child — so TCC grants to the .app flow through
+#      to the daemon and its subprocesses (ffmpeg, screencapture,
+#      cliclick, etc.) via inheritance.
+#   3. Code-signing with a stable local identity stored in
+#      ~/.intendant/signing.keychain-db. A cert-based Designated
+#      Requirement survives rebuilds, so a one-time TCC grant keeps
+#      working across `./scripts/bundle-macos.sh` re-runs. (Ad-hoc
+#      signing would re-prompt every rebuild.)
+#   4. Installing the bundle to /Applications/Intendant.app and
+#      refreshing LaunchServices. This is the only location a few
+#      pieces of the stack (Claude Code's computer-use MCP, Dock
+#      quick-launch, Spotlight, `open -b com.intendant.app`)
+#      consistently recognise as "installed". Set `INSTALL_APP=0`
+#      to skip this step (build-only, for CI-ish runs).
+#
+# Headless Linux builds that don't need any TCC-gated capability
+# can continue using plain `cargo build --release`; this script is
+# macOS-specific.
 #
 # Usage:
-#   ./scripts/bundle-macos.sh          # Release build
-#   ./scripts/bundle-macos.sh debug    # Debug build
+#   ./scripts/bundle-macos.sh          # Release build + install
+#   ./scripts/bundle-macos.sh debug    # Debug build + install
+#   INSTALL_APP=0 ./scripts/bundle-macos.sh   # Build only
 #
-# Output: target/Intendant.app
+# Output:
+#   target/Intendant.app           (always — staged build)
+#   /Applications/Intendant.app    (when INSTALL_APP=1, the default)
+#
+# Launch after: `open -b com.intendant.app`
 
 set -euo pipefail
 
