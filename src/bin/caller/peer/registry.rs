@@ -159,8 +159,63 @@ impl PeerRegistry {
     /// [`PeerError::Rejected`] — idempotent re-registration is a
     /// follow-up concern.
     pub async fn add_peer(&self, card_url: &str) -> Result<PeerId, PeerError> {
-        let card = fetch_card(card_url).await?;
-        self.add_peer_with_card(card).await
+        self.add_peer_with_via_and_auth(card_url, Vec::new(), None).await
+    }
+
+    /// Variant of [`add_peer`] that lets the connecting operator
+    /// override the card's transport URLs at peer-add time. See
+    /// [`add_peer_with_via_and_auth`] for the auth-aware variant.
+    pub async fn add_peer_with_via(
+        &self,
+        card_url: &str,
+        via_urls: Vec<String>,
+    ) -> Result<PeerId, PeerError> {
+        self.add_peer_with_via_and_auth(card_url, via_urls, None).await
+    }
+
+    /// Full add-peer entry point: card_url + optional via override +
+    /// optional outbound bearer token. The token is sent on the
+    /// initial card fetch (via `fetch_card`) and stored on the
+    /// per-peer transport for subsequent requests.
+    ///
+    /// When `via_urls` is non-empty, the fetched card's `transports`
+    /// field is replaced with one [`TransportSpec::IntendantWs`] per
+    /// supplied URL, in the given preference order — the operator
+    /// is asserting "reach this peer at these URLs, ignore what its
+    /// card advertised."
+    ///
+    /// Use cases for `via_urls`:
+    /// - Connecting daemon knows about a port-forward / proxy / named
+    ///   tunnel that the advertising peer's card doesn't list.
+    /// - Connecting daemon is on a Tailscale tailnet that the
+    ///   advertising peer is also on, but the peer's card only lists
+    ///   its LAN URL because that's what its `--advertise-url` set up.
+    /// - Operator wants to force a specific path for testing.
+    ///
+    /// Use case for `bearer_token`: the peer requires application-
+    /// layer auth (its card advertises
+    /// `auth.application = Some(Bearer)`) and the operator has the
+    /// matching credential in `[[peer]] bearer_token` in
+    /// intendant.toml.
+    ///
+    /// The card's identity (`id`, `label`, `version`, `capabilities`,
+    /// `auth`) is preserved — only `transports` is overridden. The
+    /// peer is still uniquely identified by `card.id`, so duplicate
+    /// registration still rejects with the same error.
+    pub async fn add_peer_with_via_and_auth(
+        &self,
+        card_url: &str,
+        via_urls: Vec<String>,
+        bearer_token: Option<String>,
+    ) -> Result<PeerId, PeerError> {
+        let mut card = fetch_card(card_url, bearer_token.as_deref()).await?;
+        if !via_urls.is_empty() {
+            card.transports = via_urls
+                .into_iter()
+                .map(|url| TransportSpec::IntendantWs { url })
+                .collect();
+        }
+        self.add_peer_with_card_and_auth(card, bearer_token).await
     }
 
     /// Variant of [`add_peer`] that accepts a pre-fetched or
@@ -171,6 +226,19 @@ impl PeerRegistry {
     /// - Loopback registration (registering the local daemon as a
     ///   "peer" of itself, for dashboard symmetry)
     pub async fn add_peer_with_card(&self, card: AgentCard) -> Result<PeerId, PeerError> {
+        self.add_peer_with_card_and_auth(card, None).await
+    }
+
+    /// Auth-aware variant of [`add_peer_with_card`] — stores the
+    /// outbound bearer token on each per-peer transport so it's
+    /// sent on subsequent connects (currently the agent-card HTTP
+    /// fetch; `/ws` enforcement lands with the dashboard auth
+    /// slice).
+    pub async fn add_peer_with_card_and_auth(
+        &self,
+        card: AgentCard,
+        bearer_token: Option<String>,
+    ) -> Result<PeerId, PeerError> {
         if self.inner.peers.read().unwrap().contains_key(&card.id) {
             return Err(PeerError::Rejected {
                 code: "already_registered".into(),
@@ -178,18 +246,31 @@ impl PeerRegistry {
             });
         }
 
-        let spec = pick_supported_transport(&card.transports).ok_or_else(|| {
-            PeerError::CardFetch(format!(
+        // Filter the card's transports to the ones this build can speak,
+        // preserving the card's preference order. The first one whose
+        // `connect()` succeeds wins (handled by `MultiTransport`).
+        let supported_specs = pick_supported_transports(&card.transports);
+        if supported_specs.is_empty() {
+            return Err(PeerError::CardFetch(format!(
                 "peer {} advertises no transport this build supports: {:?}",
                 card.id, card.transports
-            ))
-        })?;
+            )));
+        }
 
         let peer_id = card.id.clone();
         let log_sink = self.inner.log_sink.clone();
 
-        let handle = spawn_peer(peer_id.clone(), card, log_sink, |events_tx| {
-            build_transport(&spec, events_tx)
+        let handle = spawn_peer(peer_id.clone(), card, log_sink, move |events_tx| {
+            // Build one concrete transport per supported spec (each
+            // gets its own clone of `events_tx` and `bearer_token`)
+            // and wrap them in a `MultiTransport` that probes them
+            // in order on connect.
+            let candidates: Vec<Box<dyn crate::peer::traits::PeerTransport>> =
+                supported_specs
+                    .iter()
+                    .map(|spec| build_transport(spec, events_tx.clone(), bearer_token.clone()))
+                    .collect();
+            Box::new(crate::peer::transport::MultiTransport::new(candidates))
         });
 
         self.inner
@@ -333,7 +414,8 @@ fn spawn_event_forwarder(
     });
 }
 
-/// Fetch an Agent Card from the given URL via HTTP GET.
+/// Fetch an Agent Card from the given URL via HTTP GET, optionally
+/// sending `Authorization: Bearer <token>`.
 ///
 /// Separate from [`IntendantWsTransport::fetch_agent_card`] because
 /// the transport fetches as part of its own connect handshake (off
@@ -341,13 +423,19 @@ fn spawn_event_forwarder(
 /// (as provided by a user adding a peer). Small duplication; kept
 /// here so the registry doesn't depend on a specific transport
 /// implementation for its discovery step.
-async fn fetch_card(card_url: &str) -> Result<AgentCard, PeerError> {
+async fn fetch_card(
+    card_url: &str,
+    bearer_token: Option<&str>,
+) -> Result<AgentCard, PeerError> {
     let client = reqwest::Client::builder()
         .timeout(CARD_FETCH_TIMEOUT)
         .build()
         .map_err(|e| PeerError::CardFetch(format!("build http client: {e}")))?;
-    let response = client
-        .get(card_url)
+    let mut request = client.get(card_url);
+    if let Some(token) = bearer_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| PeerError::CardFetch(format!("GET {card_url}: {e}")))?;
@@ -363,15 +451,24 @@ async fn fetch_card(card_url: &str) -> Result<AgentCard, PeerError> {
         .map_err(|e| PeerError::CardFetch(format!("parse {card_url}: {e}")))
 }
 
-/// Walk the card's transports list and pick the first variant
-/// this build supports. Phase 1: only `IntendantWs`. Unknown
-/// variants (from forward-compat fallback) and unimplemented
-/// variants are skipped.
-fn pick_supported_transport(transports: &[TransportSpec]) -> Option<TransportSpec> {
+/// Filter the card's transports list to the variants this build
+/// supports, preserving the card's original preference order.
+/// Unknown variants (from forward-compat fallback) and unimplemented
+/// variants are skipped. Returns an empty `Vec` when the card
+/// advertises only transports we don't speak — the caller treats
+/// that as a hard failure.
+///
+/// Phase 1: only `IntendantWs`. As A2A / OpenClaw / MCP transports
+/// land, add their match arms here so cards advertising mixed
+/// transport lists (e.g. an Intendant peer that also exposes A2A)
+/// produce a multi-element supported set the connecting daemon can
+/// probe through.
+fn pick_supported_transports(transports: &[TransportSpec]) -> Vec<TransportSpec> {
     transports
         .iter()
-        .find(|spec| matches!(spec, TransportSpec::IntendantWs { .. }))
+        .filter(|spec| matches!(spec, TransportSpec::IntendantWs { .. }))
         .cloned()
+        .collect()
 }
 
 /// Build a concrete transport from a selected spec. Factored out
@@ -379,13 +476,16 @@ fn pick_supported_transport(transports: &[TransportSpec]) -> Option<TransportSpe
 fn build_transport(
     spec: &TransportSpec,
     events_tx: mpsc::Sender<crate::peer::event::PeerEvent>,
+    bearer_token: Option<String>,
 ) -> Box<dyn crate::peer::traits::PeerTransport> {
     match spec {
-        TransportSpec::IntendantWs { url } => {
-            Box::new(IntendantWsTransport::new(url.clone(), events_tx))
-        }
+        TransportSpec::IntendantWs { url } => Box::new(IntendantWsTransport::with_bearer(
+            url.clone(),
+            events_tx,
+            bearer_token,
+        )),
         other => {
-            // Should be unreachable: `pick_supported_transport`
+            // Should be unreachable: `pick_supported_transports`
             // filters to variants this function knows. If we get
             // here it means somebody added a transport kind to
             // the selector without the matching constructor arm —
@@ -398,7 +498,7 @@ fn build_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::card::{AuthScheme, Capability};
+    use crate::peer::card::{AuthRequirements, Capability};
     use crate::peer::id::PeerKind;
     use crate::web_gateway::{spawn_web_gateway, ActiveSessionState, WebGatewayConfig};
     use crate::event::EventBus;
@@ -427,6 +527,8 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
+            None,
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
         (port, handle)
@@ -444,7 +546,7 @@ mod tests {
                 url: ws_url.to_string(),
             }],
             capabilities: vec![Capability::ComputerUse, Capability::Knowledge],
-            auth: AuthScheme::None,
+            auth: AuthRequirements::none(),
         }
     }
 
@@ -527,7 +629,7 @@ mod tests {
                 url: "https://future/a2a".into(),
             }],
             capabilities: vec![],
-            auth: AuthScheme::None,
+            auth: AuthRequirements::none(),
         };
 
         match reg.add_peer_with_card(card).await {
@@ -825,11 +927,127 @@ mod tests {
         gateway.abort();
     }
 
-    /// `pick_supported_transport` skips variants this build
-    /// doesn't support, including the `Unknown` forward-compat
-    /// fallback and future transport kinds like A2A.
+    /// `add_peer_with_via` overrides the card's transports with the
+    /// operator-supplied URLs. The card's identity (id, label,
+    /// capabilities, auth) is preserved — only `transports` changes.
+    /// This is the connecting-side knob for cases where the operator
+    /// knows the topology better than the advertising peer's card
+    /// does (port-forwards, proxies, named tunnels).
+    #[tokio::test]
+    async fn add_peer_with_via_replaces_card_transports() {
+        let (port, gateway) = spawn_test_peer().await;
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let reg = PeerRegistry::new(log_tx);
+
+        let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
+        let via_urls = vec!["ws://override.example:9999/ws".to_string()];
+        let peer_id = reg
+            .add_peer_with_via(&card_url, via_urls.clone())
+            .await
+            .expect("add_peer_with_via succeeds even when via target isn't reachable — connect happens async");
+
+        let handle = reg.get(&peer_id).expect("peer is in registry");
+        let card = handle.card_snapshot();
+
+        // Transports replaced with the via URLs verbatim.
+        assert_eq!(card.transports.len(), 1);
+        match &card.transports[0] {
+            TransportSpec::IntendantWs { url } => {
+                assert_eq!(url, "ws://override.example:9999/ws");
+            }
+            other => panic!("expected IntendantWs, got {other:?}"),
+        }
+
+        // Identity preserved — id from the original card, label
+        // present (exact value depends on the test host's
+        // `resolve_host_label`, so just assert non-empty).
+        assert_eq!(card.id, peer_id);
+        assert!(!card.label.is_empty(), "label preserved from card");
+
+        reg.remove_peer(&peer_id).await.unwrap();
+        gateway.abort();
+    }
+
+    /// Empty `via_urls` is the no-op case — `add_peer_with_via` falls
+    /// through to the default fetch-and-store behavior, leaving the
+    /// card's transports untouched. This is what `add_peer` itself
+    /// calls under the hood.
+    #[tokio::test]
+    async fn add_peer_with_via_empty_preserves_card_transports() {
+        let (port, gateway) = spawn_test_peer().await;
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let reg = PeerRegistry::new(log_tx);
+
+        let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
+        let peer_id = reg
+            .add_peer_with_via(&card_url, Vec::new())
+            .await
+            .expect("add_peer_with_via with empty via succeeds");
+
+        let handle = reg.get(&peer_id).expect("peer is in registry");
+        let card = handle.card_snapshot();
+
+        // The card's original transports survive — at least one entry
+        // and at least one is IntendantWs (the gateway's auto-detected
+        // advertise list).
+        assert!(!card.transports.is_empty(), "card has transports");
+        assert!(
+            card.transports
+                .iter()
+                .any(|t| matches!(t, TransportSpec::IntendantWs { .. })),
+            "at least one IntendantWs transport survived: {:?}",
+            card.transports
+        );
+
+        reg.remove_peer(&peer_id).await.unwrap();
+        gateway.abort();
+    }
+
+    /// Multiple via URLs all become `IntendantWs` entries in the card
+    /// in the supplied preference order. `MultiTransport` then probes
+    /// them top-down on connect (covered by separate MultiTransport
+    /// tests in `peer/transport/multi.rs`).
+    #[tokio::test]
+    async fn add_peer_with_via_multiple_urls_preserve_order() {
+        let (port, gateway) = spawn_test_peer().await;
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let reg = PeerRegistry::new(log_tx);
+
+        let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
+        let via_urls = vec![
+            "ws://primary.example:9001/ws".to_string(),
+            "ws://fallback.example:9002/ws".to_string(),
+        ];
+        let peer_id = reg
+            .add_peer_with_via(&card_url, via_urls.clone())
+            .await
+            .expect("add_peer_with_via succeeds");
+
+        let handle = reg.get(&peer_id).expect("peer is in registry");
+        let card = handle.card_snapshot();
+
+        assert_eq!(card.transports.len(), 2);
+        let urls: Vec<&String> = card
+            .transports
+            .iter()
+            .filter_map(|t| match t {
+                TransportSpec::IntendantWs { url } => Some(url),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(urls, vec![&via_urls[0], &via_urls[1]]);
+
+        reg.remove_peer(&peer_id).await.unwrap();
+        gateway.abort();
+    }
+
+    /// `pick_supported_transports` skips variants this build doesn't
+    /// support, including the `Unknown` forward-compat fallback and
+    /// future transport kinds like A2A. Preference order from the
+    /// card is preserved in the returned Vec — first-supported wins
+    /// in `MultiTransport::connect`.
     #[test]
-    fn pick_supported_transport_filters_unsupported() {
+    fn pick_supported_transports_filters_unsupported() {
         let transports = vec![
             TransportSpec::Unknown,
             TransportSpec::A2A {
@@ -839,19 +1057,52 @@ mod tests {
                 url: "ws://x/ws".into(),
             },
         ];
-        let picked = pick_supported_transport(&transports).unwrap();
-        assert!(matches!(picked, TransportSpec::IntendantWs { .. }));
+        let picked = pick_supported_transports(&transports);
+        assert_eq!(picked.len(), 1);
+        assert!(matches!(picked[0], TransportSpec::IntendantWs { .. }));
     }
 
-    /// Returns None when no supported variant is in the list.
+    /// `pick_supported_transports` preserves card preference order.
+    /// A card listing two `IntendantWs` URLs (e.g. LAN preferred,
+    /// Tailscale fallback) yields a Vec in the same order, which
+    /// `MultiTransport` then probes top-down.
     #[test]
-    fn pick_supported_transport_returns_none_when_empty() {
+    fn pick_supported_transports_preserves_preference_order() {
+        let transports = vec![
+            TransportSpec::IntendantWs {
+                url: "ws://lan/ws".into(),
+            },
+            TransportSpec::A2A {
+                url: "https://x".into(),
+            },
+            TransportSpec::IntendantWs {
+                url: "ws://tail/ws".into(),
+            },
+        ];
+        let picked = pick_supported_transports(&transports);
+        assert_eq!(picked.len(), 2);
+        match (&picked[0], &picked[1]) {
+            (
+                TransportSpec::IntendantWs { url: a },
+                TransportSpec::IntendantWs { url: b },
+            ) => {
+                assert_eq!(a, "ws://lan/ws");
+                assert_eq!(b, "ws://tail/ws");
+            }
+            _ => panic!("expected two IntendantWs variants in card order"),
+        }
+    }
+
+    /// Returns an empty Vec when no supported variant is in the list.
+    /// The caller (`add_peer_with_card`) treats empty as a hard error.
+    #[test]
+    fn pick_supported_transports_returns_empty_when_no_supported() {
         let transports = vec![
             TransportSpec::Unknown,
             TransportSpec::A2A {
                 url: "https://x".into(),
             },
         ];
-        assert!(pick_supported_transport(&transports).is_none());
+        assert!(pick_supported_transports(&transports).is_empty());
     }
 }

@@ -36,31 +36,36 @@ impl AgentCard {
     /// `label` should come from [`crate::lan::resolve_host_label`],
     /// `version` from `env!("CARGO_PKG_VERSION")`, and `git_sha` from
     /// `env!("INTENDANT_GIT_SHA")` (wrapped in `Some` — it's a
-    /// build-time constant in Intendant). `transport_url` is the URL
-    /// peers should connect to for the native Intendant WebSocket
-    /// transport (e.g. `ws://127.0.0.1:8765/ws`). `capabilities` is
-    /// the set of services this daemon actually exposes at runtime —
-    /// compute it from feature flags and configured subsystems, not
-    /// as a static maximum.
+    /// build-time constant in Intendant). `transports` is the list of
+    /// addresses peers should try in preference order (highest-pref
+    /// first); each will become a `TransportSpec` in the card. The
+    /// list comes from `web_gateway::resolve_advertise_urls`, which
+    /// merges operator overrides (`--advertise-url`, `[server.advertise]`)
+    /// with the auto-detected listener URL. `capabilities` is the set
+    /// of services this daemon actually exposes at runtime — compute
+    /// it from feature flags and configured subsystems, not as a
+    /// static maximum.
     ///
-    /// Auth defaults to [`AuthScheme::None`] (trust-the-network) unless
-    /// the caller opts into a stricter scheme; the LAN mTLS case is
-    /// handled at the nginx proxy layer above the gateway and doesn't
-    /// need a runtime flag here yet.
+    /// Auth defaults to [`AuthRequirements::none`] (trust-the-network)
+    /// unless the caller opts into a stricter combination; the LAN
+    /// mTLS case is handled at the nginx proxy layer above the
+    /// gateway and is selected by the operator passing
+    /// [`AuthRequirements::mutual_tls`] (or `mutual_tls_and_bearer`
+    /// for WAN exposure).
     pub fn local_intendant(
         label: String,
         version: String,
         git_sha: Option<String>,
-        transport_url: String,
+        transports: Vec<TransportSpec>,
         capabilities: Vec<Capability>,
-        auth: AuthScheme,
+        auth: AuthRequirements,
     ) -> Self {
         Self {
             id: PeerId::new(crate::peer::id::PeerKind::Intendant, &label),
             label,
             version,
             git_sha,
-            transports: vec![TransportSpec::IntendantWs { url: transport_url }],
+            transports,
             capabilities,
             auth,
         }
@@ -100,8 +105,11 @@ pub struct AgentCard {
     /// by matching required capabilities against this list.
     pub capabilities: Vec<Capability>,
 
-    /// How to authenticate against this peer.
-    pub auth: AuthScheme,
+    /// What this peer requires of inbound connections — wire-layer
+    /// (TLS) plus optional application-layer (per-request token /
+    /// signature). Connecting peers consult this to decide what
+    /// credentials to send.
+    pub auth: AuthRequirements,
 }
 
 /// One way to reach a peer.
@@ -334,35 +342,142 @@ impl Capability {
     }
 }
 
-/// How a peer authenticates inbound connections.
+/// What a peer requires of inbound connections.
 ///
-/// Each transport understands the `AuthScheme`s relevant to it. The
-/// federation coordinator does not need to interpret them — it forwards
-/// the scheme + any local credentials to the transport at connect time.
+/// Layered: a [`TransportAuth`] requirement at the wire layer (TLS-
+/// level, satisfied during handshake) plus an optional
+/// [`ApplicationAuth`] requirement at the request layer (HTTP/WS-
+/// level, satisfied per request). Defense in depth — a WAN-exposed
+/// daemon should typically advertise both, so a TLS compromise
+/// alone doesn't grant access. For trusted-LAN federation, `transport
+/// = MutualTls` with no application requirement is fine; for fully
+/// trusted networks (loopback, tailnet, hypervisor-private) `none()`
+/// is the right default.
+///
+/// Construct via the [`AuthRequirements::none`], [`AuthRequirements::mutual_tls`],
+/// [`AuthRequirements::bearer`], [`AuthRequirements::mutual_tls_and_bearer`]
+/// helpers in the common cases — direct field access is for the
+/// less common combinations.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthRequirements {
+    /// Wire-layer (TLS) requirement. Verified during the connection
+    /// handshake before any HTTP/WS frames flow.
+    pub transport: TransportAuth,
+    /// Per-request (HTTP/WS) requirement. Verified by the gateway
+    /// after the connection is established, before serving each
+    /// request. `None` means "no application-layer auth, transport
+    /// is sufficient."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application: Option<ApplicationAuth>,
+}
+
+impl AuthRequirements {
+    /// No auth at any layer. Trust the network (loopback, tailnet,
+    /// trusted LAN behind a firewall). Default for phase-1
+    /// federation between Intendants on a trusted LAN.
+    pub fn none() -> Self {
+        Self {
+            transport: TransportAuth::None,
+            application: None,
+        }
+    }
+
+    /// mTLS-only — TLS handshake authenticates the peer via a client
+    /// cert. No application-layer requirement. Right for trusted-LAN
+    /// federation behind the existing `intendant lan setup` nginx
+    /// proxy. Inadequate alone for WAN exposure; pair with
+    /// [`AuthRequirements::mutual_tls_and_bearer`] for that.
+    pub fn mutual_tls() -> Self {
+        Self {
+            transport: TransportAuth::MutualTls,
+            application: None,
+        }
+    }
+
+    /// Application-layer bearer token only, no transport
+    /// requirement. Use over already-secured transports like a
+    /// Tailscale tailnet (where the WireGuard layer authenticates
+    /// peers and bearer adds a per-app secret on top).
+    pub fn bearer(hint: Option<String>) -> Self {
+        Self {
+            transport: TransportAuth::None,
+            application: Some(ApplicationAuth::Bearer {
+                hint,
+                rotation_url: None,
+            }),
+        }
+    }
+
+    /// Defense-in-depth combo for WAN exposure: mTLS at the wire
+    /// layer plus bearer-per-request at the application layer. Even
+    /// if one CVE breaks TLS verification, requests still need a
+    /// valid bearer to reach the daemon's handler.
+    pub fn mutual_tls_and_bearer(hint: Option<String>) -> Self {
+        Self {
+            transport: TransportAuth::MutualTls,
+            application: Some(ApplicationAuth::Bearer {
+                hint,
+                rotation_url: None,
+            }),
+        }
+    }
+}
+
+/// Wire-layer authentication requirement.
+///
+/// Static set in this slice — `PinnedMutualTls` (mTLS plus pinning
+/// the server cert's SHA-256 fingerprint) is the next candidate
+/// addition but ships in its own slice along with the custom
+/// rustls verifier that enforces it. Adding the variant without
+/// enforcement would be security false-advertising.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "scheme", rename_all = "kebab-case")]
-pub enum AuthScheme {
-    /// No authentication. Trust on the network layer (LAN, Tailscale,
-    /// Unix socket). Default for phase-1 multi-host between Intendants
-    /// on a trusted LAN.
+pub enum TransportAuth {
+    /// Trust the wire (loopback, tailnet, mTLS-terminated proxy).
     None,
-    /// Static bearer token in `Authorization: Bearer <token>` header.
-    /// `hint` is an optional human-readable credential reference like
-    /// `"intendant.toml [peer.foo] token"` so the registry can locate
-    /// the actual secret without leaking it into the card.
-    Bearer { hint: Option<String> },
-    /// Device keypair challenge/response, OpenClaw-style. The `nonce_url`
-    /// is where the challenge is fetched; clients sign it with a per-device
-    /// key registered via a pairing flow.
-    DeviceKeypair { nonce_url: String },
-    /// mTLS — the TLS layer authenticates the peer via a client cert
-    /// signed by a CA both sides trust. Reuses the `intendant lan` CA
-    /// infrastructure when both peers are Intendants on the same LAN.
+    /// mTLS — TLS handshake authenticates the peer via a client
+    /// cert signed by a CA both sides trust. Reuses the
+    /// `intendant lan` CA infrastructure when both peers are
+    /// Intendants on the same LAN.
     MutualTls,
-    /// Forward-compat fallback for auth schemes we don't recognize.
-    /// Connecting to a peer whose auth is `Unknown` fails at connect
-    /// time with a clear error — the card still parses so other
-    /// information in it remains usable. Cannot be serialized.
+    /// Forward-compat fallback for transport schemes the parser
+    /// doesn't recognize (e.g. a future `PinnedMutualTls`). Cards
+    /// still parse; the registry rejects connection attempts
+    /// against `Unknown` auth at connect time with a clear error.
+    /// Cannot be serialized.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Application-layer authentication requirement, satisfied per
+/// request rather than per connection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "scheme", rename_all = "kebab-case")]
+pub enum ApplicationAuth {
+    /// Static bearer token in `Authorization: Bearer <token>` header.
+    /// `hint` is an optional human-readable credential reference
+    /// (`"intendant.toml [peer.foo] bearer_token"`, `"env:..."`,
+    /// etc.) so the registry can locate the actual secret without
+    /// leaking it into the card. `rotation_url` is reserved for
+    /// future automatic token rotation — clients fetch a new token
+    /// from this URL before the current one expires; unused in
+    /// this slice but the field is in place so adding rotation
+    /// later is non-breaking.
+    Bearer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rotation_url: Option<String>,
+    },
+    /// Device keypair challenge/response, OpenClaw-style. The
+    /// `nonce_url` is where the challenge is fetched; clients sign
+    /// it with a per-device key registered via a pairing flow.
+    /// Defined for forward-compat with OpenClaw integration; not
+    /// implemented in this slice.
+    DeviceKeypair { nonce_url: String },
+    /// Forward-compat fallback. Cards still parse; the registry
+    /// rejects connection attempts against `Unknown` auth at
+    /// connect time with a clear error. Cannot be serialized.
     #[serde(other)]
     Unknown,
 }
@@ -394,7 +509,7 @@ mod tests {
                 Capability::ComputerUse,
                 Capability::Custom("vortex-audio".to_string()),
             ],
-            auth: AuthScheme::MutualTls,
+            auth: AuthRequirements::mutual_tls(),
         };
         let json = serde_json::to_string(&card).unwrap();
         let parsed: AgentCard = serde_json::from_str(&json).unwrap();
@@ -408,21 +523,32 @@ mod tests {
     }
 
     #[test]
-    fn auth_scheme_serde_round_trip() {
-        for scheme in [
-            AuthScheme::None,
-            AuthScheme::Bearer { hint: None },
-            AuthScheme::Bearer {
-                hint: Some("env:INTENDANT_PEER_TOKEN".to_string()),
+    fn auth_requirements_serde_round_trip() {
+        for req in [
+            AuthRequirements::none(),
+            AuthRequirements::mutual_tls(),
+            AuthRequirements::bearer(None),
+            AuthRequirements::bearer(Some("env:INTENDANT_PEER_TOKEN".to_string())),
+            AuthRequirements::mutual_tls_and_bearer(Some(
+                "intendant.toml [peer.foo] bearer_token".to_string(),
+            )),
+            AuthRequirements {
+                transport: TransportAuth::None,
+                application: Some(ApplicationAuth::DeviceKeypair {
+                    nonce_url: "https://example.test/auth/nonce".to_string(),
+                }),
             },
-            AuthScheme::DeviceKeypair {
-                nonce_url: "https://example.test/auth/nonce".to_string(),
+            AuthRequirements {
+                transport: TransportAuth::None,
+                application: Some(ApplicationAuth::Bearer {
+                    hint: Some("env:TOKEN".into()),
+                    rotation_url: Some("https://example.test/auth/rotate".into()),
+                }),
             },
-            AuthScheme::MutualTls,
         ] {
-            let json = serde_json::to_string(&scheme).unwrap();
-            let parsed: AuthScheme = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed, scheme);
+            let json = serde_json::to_string(&req).unwrap();
+            let parsed: AuthRequirements = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, req);
         }
     }
 
@@ -484,7 +610,7 @@ mod tests {
                 { "type": "intendant-ws", "url": "wss://nicks-mac:8443/ws" }
             ],
             "capabilities": [],
-            "auth": { "scheme": "none" }
+            "auth": { "transport": { "scheme": "none" } }
         }"#;
         let card: AgentCard = serde_json::from_str(json).unwrap();
         assert_eq!(card.transports.len(), 2);
@@ -495,21 +621,46 @@ mod tests {
         ));
     }
 
-    /// Forward-compat: an unknown auth scheme doesn't break the card
-    /// parse — the caller discovers the problem at connect time, not
-    /// at parse time, so other info from the card is still usable.
+    /// Forward-compat: an unknown transport auth scheme doesn't break
+    /// the card parse — the caller discovers the problem at connect
+    /// time, not at parse time, so other info from the card is still
+    /// usable.
     #[test]
-    fn card_with_unknown_auth_parses() {
+    fn card_with_unknown_transport_auth_parses() {
         let json = r#"{
             "id": "intendant:future-peer",
             "label": "Future Peer",
             "version": "9.0.0",
             "transports": [{ "type": "intendant-ws", "url": "wss://x/ws" }],
             "capabilities": [],
-            "auth": { "scheme": "webauthn-passkey", "rp_id": "future-peer.local" }
+            "auth": { "transport": { "scheme": "pinned-mutual-tls", "fingerprints": ["..."] } }
         }"#;
         let card: AgentCard = serde_json::from_str(json).unwrap();
-        assert!(matches!(card.auth, AuthScheme::Unknown));
+        assert!(matches!(card.auth.transport, TransportAuth::Unknown));
+        assert!(card.auth.application.is_none());
+    }
+
+    /// Same forward-compat for an unknown application auth scheme.
+    /// Card parses; connecting peer rejects at connect time.
+    #[test]
+    fn card_with_unknown_application_auth_parses() {
+        let json = r#"{
+            "id": "intendant:future-peer",
+            "label": "Future Peer",
+            "version": "9.0.0",
+            "transports": [{ "type": "intendant-ws", "url": "wss://x/ws" }],
+            "capabilities": [],
+            "auth": {
+                "transport": { "scheme": "mutual-tls" },
+                "application": { "scheme": "webauthn-passkey", "rp_id": "future-peer.local" }
+            }
+        }"#;
+        let card: AgentCard = serde_json::from_str(json).unwrap();
+        assert!(matches!(card.auth.transport, TransportAuth::MutualTls));
+        assert!(matches!(
+            card.auth.application,
+            Some(ApplicationAuth::Unknown)
+        ));
     }
 
     /// Forward-compat: an unknown capability kind doesn't break the
@@ -527,7 +678,7 @@ mod tests {
                 { "kind": "holographic-projection" },
                 { "kind": "custom", "name": "vortex-audio" }
             ],
-            "auth": { "scheme": "none" }
+            "auth": { "transport": { "scheme": "none" } }
         }"#;
         let card: AgentCard = serde_json::from_str(json).unwrap();
         assert_eq!(card.capabilities.len(), 3);

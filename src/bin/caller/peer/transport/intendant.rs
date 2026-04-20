@@ -97,6 +97,17 @@ pub struct IntendantWsTransport {
     ws_write: Option<WsSink>,
     reader_handle: Option<JoinHandle<()>>,
     card: Option<AgentCard>,
+    /// Outbound bearer token (operator-supplied per peer via
+    /// `[[peer]] bearer_token` in intendant.toml). Sent as
+    /// `Authorization: Bearer <token>` on the agent-card HTTP fetch
+    /// during `connect`. Currently NOT applied to the WebSocket
+    /// upgrade itself — the dashboard browser cannot easily send
+    /// arbitrary headers on `WebSocket` opens, and adding bearer
+    /// enforcement to `/ws` without a parallel dashboard auth path
+    /// would break the dashboard. Slice 2d (dashboard auth) lights
+    /// up `/ws` enforcement using `?token=` query-param + header
+    /// fallback, at which point this token is sent there too.
+    bearer_token: Option<String>,
     /// Monotonic counter for synthetic `MessageId`/`TaskId` values
     /// returned from `send`. Intendant's `/ws` control plane is
     /// fire-and-forget — no wire-level id echoes back — so the
@@ -109,12 +120,23 @@ pub struct IntendantWsTransport {
 
 impl IntendantWsTransport {
     pub fn new(url: String, events_tx: mpsc::Sender<PeerEvent>) -> Self {
+        Self::with_bearer(url, events_tx, None)
+    }
+
+    /// Variant of [`new`] that wires an outbound bearer token.
+    /// Sent on the agent-card HTTP fetch during `connect`.
+    pub fn with_bearer(
+        url: String,
+        events_tx: mpsc::Sender<PeerEvent>,
+        bearer_token: Option<String>,
+    ) -> Self {
         Self {
             spec: TransportSpec::IntendantWs { url },
             events_tx,
             ws_write: None,
             reader_handle: None,
             card: None,
+            bearer_token,
             out_seq: AtomicU64::new(0),
         }
     }
@@ -147,7 +169,14 @@ impl IntendantWsTransport {
     }
 
     /// Fetch the peer's Agent Card via HTTP GET on the derived HTTP
-    /// base + `/.well-known/agent-card.json`.
+    /// base + `/.well-known/agent-card.json`. Sends the configured
+    /// bearer token in `Authorization: Bearer <token>` so peers that
+    /// gate their REST surface still serve their card to authorized
+    /// connectors. (`/.well-known/agent-card.json` itself is exempt
+    /// from bearer enforcement on the server side because it's the
+    /// discovery endpoint, but sending the token costs nothing and
+    /// covers the case where an operator opts to enforce on every
+    /// path.)
     async fn fetch_agent_card(&self) -> Result<AgentCard, PeerError> {
         let ws_url = self.ws_url()?.to_string();
         let http_base = super::ws_url_to_http_base(&ws_url);
@@ -158,8 +187,12 @@ impl IntendantWsTransport {
             .build()
             .map_err(|e| PeerError::CardFetch(format!("build http client: {e}")))?;
 
-        let response = client
-            .get(&card_url)
+        let mut request = client.get(&card_url);
+        if let Some(token) = &self.bearer_token {
+            request = request.bearer_auth(token);
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| PeerError::CardFetch(format!("GET {card_url}: {e}")))?;
@@ -460,6 +493,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            Vec::new(),
             None,
         );
         tokio::time::sleep(Duration::from_millis(150)).await;

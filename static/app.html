@@ -608,6 +608,17 @@ html, body {
   gap: 8px;
   margin-top: 10px;
 }
+/* Secondary add row — visible but visually subordinate. Used for the
+   optional Via URL(s) field, which is a power-user knob most users
+   never need. The reduced top margin keeps it visually attached to
+   the primary URL row instead of looking like a separate concern. */
+.daemon-add-row-via {
+  margin-top: 4px;
+}
+.daemon-add-row-via input {
+  font-size: 11px;
+  color: var(--subtext0);
+}
 .daemon-add-row input {
   flex: 1;
   padding: 6px 10px;
@@ -3533,8 +3544,9 @@ html, body {
     <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
     <input id="activity-task-input" class="global-task-input" placeholder="Enter task..." />
     <!-- File upload: hidden input triggered by the Attach button. `multiple`
-         lets the user pick several at once; we fire one POST /api/upload
-         per file so progress is independent per attachment. -->
+         lets the user pick several at once; we fire one POST per file
+         (to /api/session/current/uploads) so progress is independent per
+         attachment. -->
     <input type="file" id="upload-file-input" multiple style="display:none" />
     <select id="upload-destination" class="global-upload-dest" title="Where uploaded files land. Workspace puts them under the project's workspace_files/ for the agent to reference across turns; Task drops them in the session's uploads/ and cleans up on session end.">
       <option value="workspace" selected>Workspace</option>
@@ -4376,6 +4388,9 @@ html, body {
                 <input id="daemon-add-url" type="text" placeholder="http://macos-guest:8765 or https://mac-work:8443" autocomplete="off">
                 <input id="daemon-add-label" type="text" placeholder="label (optional)" autocomplete="off">
                 <button id="daemon-add-btn" type="button">Add</button>
+              </div>
+              <div class="daemon-add-row daemon-add-row-via">
+                <input id="daemon-add-via" type="text" placeholder="via URL(s), e.g. ws://192.168.1.42:8766/ws — override card's transports (optional)" autocomplete="off">
               </div>
               <span id="daemons-status" class="daemons-status"></span>
             </fieldset>
@@ -9025,8 +9040,9 @@ function clearPendingAttachments() {
 // ── File upload ───────────────────────────────────────────────────────
 //
 // Flow: user clicks Attach (or drops files on the task input) → we stream
-// each file to POST /api/upload → the server replies with an
-// UploadDescriptor, broadcasts UploadReady to all connected browsers →
+// each file to POST /api/session/current/uploads → the server replies
+// with an UploadDescriptor, broadcasts UploadReady to all connected
+// browsers →
 // every browser's `onUploadReady` drops a chip into pendingAttachments.
 // Submitting a task maps the chip's `frameId` (of the form "upload:<id>")
 // directly into the `attachments` array — the server's `resolve_attachments`
@@ -9053,7 +9069,7 @@ async function uploadOneFile(file, destination) {
   const mime = file.type || 'application/octet-stream';
   const q = `destination=${encodeURIComponent(destination)}&name=${encodeURIComponent(file.name || 'upload.bin')}`;
   try {
-    const resp = await fetch(`/api/upload?${q}`, {
+    const resp = await fetch(`/api/session/current/uploads?${q}`, {
       method: 'POST',
       headers: { 'Content-Type': mime },
       body: file,
@@ -9106,7 +9122,9 @@ function onUploadReady(descriptor) {
   const frameId = `upload:${descriptor.id}`;
   // Thumbnail for images, a paperclip + name label for files.
   const isImage = typeof descriptor.mime === 'string' && descriptor.mime.startsWith('image/');
-  const dataUrl = isImage ? `/api/uploads/${encodeURIComponent(descriptor.id)}/raw` : null;
+  const dataUrl = isImage
+    ? `/api/session/current/uploads/${encodeURIComponent(descriptor.id)}/raw`
+    : null;
   addPendingAttachment({
     frameId,
     stream: 'upload',
@@ -11400,8 +11418,14 @@ function setDaemonsStatus(msg, kind) {
 async function addDaemon() {
   const urlInput = document.getElementById('daemon-add-url');
   const labelInput = document.getElementById('daemon-add-label');
+  const viaInput = document.getElementById('daemon-add-via');
   const baseUrl = urlInput.value.trim();
   const userLabel = labelInput.value.trim();
+  // Per-peer connecting-side override: replaces the card's transports
+  // when non-empty. Useful when this daemon knows about a path the
+  // advertising peer's card doesn't list (port-forwards, proxies,
+  // named tunnels, Tailscale tailnet on this side only).
+  const viaUrls = parseTokenList(viaInput ? viaInput.value : '');
 
   if (!baseUrl) { setDaemonsStatus('URL is required', 'error'); return; }
   if (!/^https?:\/\//.test(baseUrl)) {
@@ -11427,11 +11451,16 @@ async function addDaemon() {
   // peer_id. The browser doesn't need to fetch the card itself
   // anymore; the server is the single source of truth.
   const cardUrl = baseUrl.replace(/\/$/, '') + '/.well-known/agent-card.json';
+  // Body always carries via_urls (possibly empty). Server-side serde
+  // `#[default]` makes the field optional on the wire so older clients
+  // continue to work without it.
+  const body = { card_url: cardUrl };
+  if (viaUrls.length > 0) body.via_urls = viaUrls;
   try {
     const resp = await fetch('/api/peers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ card_url: cardUrl }),
+      body: JSON.stringify(body),
     });
     const result = await resp.json();
     if (!resp.ok) {
@@ -11452,6 +11481,7 @@ async function addDaemon() {
   await refreshPeersFromApi();
   urlInput.value = '';
   labelInput.value = '';
+  if (viaInput) viaInput.value = '';
 }
 
 async function removeDaemon(hostId) {
@@ -11469,10 +11499,11 @@ async function removeDaemon(hostId) {
   setDaemonsStatus(`Removed ${hostId}`, '');
 }
 
-// Parse a capability list string ("display, computer-use, custom:foo")
-// into the array form the coordinator endpoints expect. Whitespace and
-// commas are both separators; empty entries are dropped.
-function parseCapabilityList(text) {
+// Parse a comma-or-whitespace separated token list. Used by the
+// Coordinator forms (capability lists like "display, computer-use,
+// custom:foo") and by the Add Peer form (via URL list). Empty entries
+// are dropped; surrounding whitespace is trimmed.
+function parseTokenList(text) {
   return String(text || '')
     .split(/[\s,]+/)
     .map(s => s.trim())
@@ -11489,7 +11520,7 @@ async function findEligiblePeers() {
   const out = document.getElementById('coord-eligible-result');
   if (!input || !out) return;
 
-  const caps = parseCapabilityList(input.value);
+  const caps = parseTokenList(input.value);
   if (caps.length === 0) {
     out.textContent = 'Enter at least one capability.';
     out.className = 'coord-result error';
@@ -11545,7 +11576,7 @@ async function routeTask() {
   const out = document.getElementById('coord-route-result');
   if (!capsInput || !instrInput || !out) return;
 
-  const caps = parseCapabilityList(capsInput.value);
+  const caps = parseTokenList(capsInput.value);
   const instructions = instrInput.value.trim();
   if (caps.length === 0) {
     out.textContent = 'Enter at least one required capability.';
@@ -11620,6 +11651,13 @@ async function initDaemons() {
   document.getElementById('daemon-add-label').addEventListener('keydown', e => {
     if (e.key === 'Enter') addDaemon();
   });
+  // Optional via URL row — Enter from this field also fires Add.
+  const viaEl = document.getElementById('daemon-add-via');
+  if (viaEl) {
+    viaEl.addEventListener('keydown', e => {
+      if (e.key === 'Enter') addDaemon();
+    });
+  }
 
   // Wire the Coordinator panel. Sibling of the daemon-add wiring above:
   // both belong to the Network settings pane and are wired here so the
