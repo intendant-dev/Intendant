@@ -97,17 +97,10 @@ pub struct IntendantWsTransport {
     ws_write: Option<WsSink>,
     reader_handle: Option<JoinHandle<()>>,
     card: Option<AgentCard>,
-    /// Outbound bearer token (operator-supplied per peer via
-    /// `[[peer]] bearer_token` in intendant.toml). Sent as
-    /// `Authorization: Bearer <token>` on the agent-card HTTP fetch
-    /// during `connect`. Currently NOT applied to the WebSocket
-    /// upgrade itself — the dashboard browser cannot easily send
-    /// arbitrary headers on `WebSocket` opens, and adding bearer
-    /// enforcement to `/ws` without a parallel dashboard auth path
-    /// would break the dashboard. Slice 2d (dashboard auth) lights
-    /// up `/ws` enforcement using `?token=` query-param + header
-    /// fallback, at which point this token is sent there too.
-    bearer_token: Option<String>,
+    /// Per-peer auth credentials (bearer token + pinned cert
+    /// fingerprints). Sourced from operator config (bearer) and the
+    /// peer's Agent Card (pinning). See [`TransportCredentials`].
+    creds: TransportCredentials,
     /// Monotonic counter for synthetic `MessageId`/`TaskId` values
     /// returned from `send`. Intendant's `/ws` control plane is
     /// fire-and-forget — no wire-level id echoes back — so the
@@ -118,17 +111,40 @@ pub struct IntendantWsTransport {
     out_seq: AtomicU64,
 }
 
+/// Per-peer auth credentials carried by [`IntendantWsTransport`].
+/// Bundled into a struct rather than additional constructor args
+/// so future additions (per-peer client cert, per-peer signing
+/// key, etc.) extend cleanly.
+#[derive(Clone, Debug, Default)]
+pub struct TransportCredentials {
+    /// Outbound bearer token sent as `Authorization: Bearer <token>`
+    /// on both the agent-card HTTP fetch and the WebSocket upgrade.
+    /// `None` means no bearer enforcement on the peer side; matches
+    /// `[server.auth] bearer_token` on the peer when set.
+    pub bearer_token: Option<String>,
+    /// Pre-parsed SHA-256 fingerprints of acceptable server certs.
+    /// When non-empty, the WebSocket connect and agent-card fetch
+    /// both go through a custom rustls verifier (see
+    /// [`crate::peer::transport::pinning`]) that requires the
+    /// presented cert to match one of these. When empty, default
+    /// system / native-roots TLS verification applies (no pinning).
+    /// Sourced from the peer's `auth.transport = PinnedMutualTls`
+    /// at registry-add time; the registry parses string fingerprints
+    /// from the card and passes the bytes here.
+    pub pinned_fingerprints: Vec<crate::peer::transport::pinning::Fingerprint>,
+}
+
 impl IntendantWsTransport {
     pub fn new(url: String, events_tx: mpsc::Sender<PeerEvent>) -> Self {
-        Self::with_bearer(url, events_tx, None)
+        Self::with_credentials(url, events_tx, TransportCredentials::default())
     }
 
-    /// Variant of [`new`] that wires an outbound bearer token.
-    /// Sent on the agent-card HTTP fetch during `connect`.
-    pub fn with_bearer(
+    /// Construct with explicit credentials (bearer token + pinned
+    /// cert fingerprints).
+    pub fn with_credentials(
         url: String,
         events_tx: mpsc::Sender<PeerEvent>,
-        bearer_token: Option<String>,
+        creds: TransportCredentials,
     ) -> Self {
         Self {
             spec: TransportSpec::IntendantWs { url },
@@ -136,9 +152,28 @@ impl IntendantWsTransport {
             ws_write: None,
             reader_handle: None,
             card: None,
-            bearer_token,
+            creds,
             out_seq: AtomicU64::new(0),
         }
+    }
+
+    /// Convenience constructor that wires a bearer token without
+    /// pinning. Common case for operators who use mTLS at the
+    /// proxy layer (no app-level pinning) plus a bearer token for
+    /// app-layer auth.
+    pub fn with_bearer(
+        url: String,
+        events_tx: mpsc::Sender<PeerEvent>,
+        bearer_token: Option<String>,
+    ) -> Self {
+        Self::with_credentials(
+            url,
+            events_tx,
+            TransportCredentials {
+                bearer_token,
+                pinned_fingerprints: Vec::new(),
+            },
+        )
     }
 
     fn next_out_seq(&self) -> u64 {
@@ -177,18 +212,31 @@ impl IntendantWsTransport {
     /// discovery endpoint, but sending the token costs nothing and
     /// covers the case where an operator opts to enforce on every
     /// path.)
+    ///
+    /// When the peer's `auth.transport` is `PinnedMutualTls`, this
+    /// reqwest client is built with a custom rustls config that
+    /// pins the server cert's SHA-256 fingerprint via
+    /// [`pinned_client_config`] — same verifier the WebSocket
+    /// connect path uses, so HTTP and WS share the trust decision.
     async fn fetch_agent_card(&self) -> Result<AgentCard, PeerError> {
         let ws_url = self.ws_url()?.to_string();
         let http_base = super::ws_url_to_http_base(&ws_url);
         let card_url = format!("{http_base}/.well-known/agent-card.json");
 
-        let client = reqwest::Client::builder()
-            .timeout(CARD_FETCH_TIMEOUT)
+        let mut client_builder = reqwest::Client::builder().timeout(CARD_FETCH_TIMEOUT);
+        if !self.creds.pinned_fingerprints.is_empty() {
+            let verifier = super::pinning::PinnedFingerprintVerifier::new(
+                self.creds.pinned_fingerprints.clone(),
+            );
+            let config = super::pinning::pinned_client_config(verifier);
+            client_builder = client_builder.use_preconfigured_tls(config);
+        }
+        let client = client_builder
             .build()
             .map_err(|e| PeerError::CardFetch(format!("build http client: {e}")))?;
 
         let mut request = client.get(&card_url);
-        if let Some(token) = &self.bearer_token {
+        if let Some(token) = &self.creds.bearer_token {
             request = request.bearer_auth(token);
         }
 
@@ -212,14 +260,26 @@ impl IntendantWsTransport {
 
     /// Open the WebSocket, split into read/write halves, spawn the
     /// drain task on the read half, return the write half for
-    /// storage on the transport. When a bearer token is configured,
-    /// it's sent in the `Authorization: Bearer <token>` header on the
-    /// upgrade request — server-side `verify_bearer_for_ws` checks
-    /// this *before* completing the handshake. (The dashboard
-    /// browser path uses `?token=...` on the URL instead because it
-    /// can't natively set headers on `WebSocket` opens.)
+    /// storage on the transport.
+    ///
+    /// When credentials specify a bearer token, it goes in the
+    /// `Authorization: Bearer <token>` header on the upgrade —
+    /// server-side `verify_bearer_for_ws` checks this *before*
+    /// completing the handshake. (The dashboard browser path uses
+    /// `?token=...` on the URL because it can't natively set headers
+    /// on `WebSocket` opens.)
+    ///
+    /// When credentials specify pinned fingerprints, the connect
+    /// goes through `connect_async_tls_with_config` with a custom
+    /// rustls Connector whose verifier requires the server cert's
+    /// SHA-256 fingerprint to match one of the pinned values. For
+    /// `ws://` URLs (no TLS layer at all), the connector is
+    /// irrelevant — pinning silently doesn't apply, which is the
+    /// correct behavior for operators using `ws://` for trusted-LAN
+    /// connections.
     async fn open_ws(&self) -> Result<(WsSink, JoinHandle<()>), PeerError> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::Connector;
 
         let ws_url = self.ws_url()?.to_string();
 
@@ -236,7 +296,7 @@ impl IntendantWsTransport {
                 PeerError::Transport(format!("build ws request {ws_url}: {e}"))
             })?;
 
-        if let Some(token) = &self.bearer_token {
+        if let Some(token) = &self.creds.bearer_token {
             let value = format!("Bearer {token}").parse().map_err(|e| {
                 PeerError::Transport(format!(
                     "bearer token contains characters not valid in an HTTP header: {e}"
@@ -245,9 +305,22 @@ impl IntendantWsTransport {
             request.headers_mut().insert("Authorization", value);
         }
 
-        let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| PeerError::Transport(format!("ws connect {ws_url}: {e}")))?;
+        let connector: Option<Connector> =
+            if !self.creds.pinned_fingerprints.is_empty() {
+                let verifier = super::pinning::PinnedFingerprintVerifier::new(
+                    self.creds.pinned_fingerprints.clone(),
+                );
+                let config = super::pinning::pinned_client_config(verifier);
+                Some(Connector::Rustls(std::sync::Arc::new(config)))
+            } else {
+                None
+            };
+
+        let (ws_stream, _response) = tokio_tungstenite::connect_async_tls_with_config(
+            request, None, false, connector,
+        )
+        .await
+        .map_err(|e| PeerError::Transport(format!("ws connect {ws_url}: {e}")))?;
 
         let (write, read) = ws_stream.split();
         let events_tx = self.events_tx.clone();

@@ -424,12 +424,6 @@ impl AuthRequirements {
 }
 
 /// Wire-layer authentication requirement.
-///
-/// Static set in this slice — `PinnedMutualTls` (mTLS plus pinning
-/// the server cert's SHA-256 fingerprint) is the next candidate
-/// addition but ships in its own slice along with the custom
-/// rustls verifier that enforces it. Adding the variant without
-/// enforcement would be security false-advertising.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "scheme", rename_all = "kebab-case")]
 pub enum TransportAuth {
@@ -440,11 +434,33 @@ pub enum TransportAuth {
     /// `intendant lan` CA infrastructure when both peers are
     /// Intendants on the same LAN.
     MutualTls,
+    /// Cert pinning — the connecting peer requires the server cert
+    /// to match one of the listed SHA-256 fingerprints exactly,
+    /// regardless of whether a CA in the system trust store also
+    /// signed it. Defense in depth on top of (or instead of) mTLS:
+    /// even if the CA is compromised or a wildcard cert leaks,
+    /// attacker still can't pose as a specific pinned peer.
+    ///
+    /// `server_cert_fingerprints` is a list of SHA-256 fingerprints
+    /// in lowercase hex (with optional `:` separators stripped before
+    /// comparison — both `aabbcc...` and `aa:bb:cc:...` are
+    /// accepted). The presented end-entity cert's DER is hashed and
+    /// matched against every entry; a single hit accepts.
+    ///
+    /// Enforced via a custom `rustls::ServerCertVerifier` plumbed
+    /// into both the WebSocket connect path and the agent-card HTTP
+    /// fetch. See `peer::transport::pinning` for the verifier impl.
+    #[serde(rename = "pinned-mutual-tls")]
+    PinnedMutualTls {
+        /// SHA-256 fingerprints of acceptable server certs (lowercase
+        /// hex, optional `:` separators). Empty list rejects every
+        /// connection — operator must supply at least one fingerprint.
+        server_cert_fingerprints: Vec<String>,
+    },
     /// Forward-compat fallback for transport schemes the parser
-    /// doesn't recognize (e.g. a future `PinnedMutualTls`). Cards
-    /// still parse; the registry rejects connection attempts
-    /// against `Unknown` auth at connect time with a clear error.
-    /// Cannot be serialized.
+    /// doesn't recognize. Cards still parse; the registry rejects
+    /// connection attempts against `Unknown` auth at connect time
+    /// with a clear error. Cannot be serialized.
     #[serde(other)]
     Unknown,
 }
@@ -627,17 +643,55 @@ mod tests {
     /// usable.
     #[test]
     fn card_with_unknown_transport_auth_parses() {
+        // `quantum-handshake` is a fictional future scheme this build
+        // doesn't recognize. The forward-compat policy: card still
+        // parses, connecting peer rejects at connect time. Updated
+        // away from the previous example (`pinned-mutual-tls`) once
+        // that variant landed in slice 2e — using a known scheme name
+        // here would now exercise required-field parsing instead of
+        // forward-compat fallback.
         let json = r#"{
             "id": "intendant:future-peer",
             "label": "Future Peer",
             "version": "9.0.0",
             "transports": [{ "type": "intendant-ws", "url": "wss://x/ws" }],
             "capabilities": [],
-            "auth": { "transport": { "scheme": "pinned-mutual-tls", "fingerprints": ["..."] } }
+            "auth": { "transport": { "scheme": "quantum-handshake", "qubits": 256 } }
         }"#;
         let card: AgentCard = serde_json::from_str(json).unwrap();
         assert!(matches!(card.auth.transport, TransportAuth::Unknown));
         assert!(card.auth.application.is_none());
+    }
+
+    /// `PinnedMutualTls` parses cleanly with its `server_cert_fingerprints`
+    /// list. Round-trip preserves the structure.
+    #[test]
+    fn card_with_pinned_mutual_tls_parses() {
+        let json = r#"{
+            "id": "intendant:pinned-peer",
+            "label": "Pinned Peer",
+            "version": "0.1.0",
+            "transports": [{ "type": "intendant-ws", "url": "wss://pinned.example/ws" }],
+            "capabilities": [],
+            "auth": {
+                "transport": {
+                    "scheme": "pinned-mutual-tls",
+                    "server_cert_fingerprints": [
+                        "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+                    ]
+                }
+            }
+        }"#;
+        let card: AgentCard = serde_json::from_str(json).unwrap();
+        match &card.auth.transport {
+            TransportAuth::PinnedMutualTls {
+                server_cert_fingerprints,
+            } => {
+                assert_eq!(server_cert_fingerprints.len(), 1);
+                assert!(server_cert_fingerprints[0].starts_with("aabb"));
+            }
+            other => panic!("expected PinnedMutualTls, got {other:?}"),
+        }
     }
 
     /// Same forward-compat for an unknown application auth scheme.

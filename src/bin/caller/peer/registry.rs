@@ -231,9 +231,18 @@ impl PeerRegistry {
 
     /// Auth-aware variant of [`add_peer_with_card`] — stores the
     /// outbound bearer token on each per-peer transport so it's
-    /// sent on subsequent connects (currently the agent-card HTTP
-    /// fetch; `/ws` enforcement lands with the dashboard auth
-    /// slice).
+    /// sent on subsequent connects (the agent-card HTTP fetch and
+    /// the WebSocket upgrade), and parses pinned fingerprints from
+    /// the card's `auth.transport = PinnedMutualTls` for use by the
+    /// custom rustls verifier on subsequent TLS connects.
+    ///
+    /// Pinning fingerprints come *from the card* (TOFU-style) — the
+    /// initial card fetch in `fetch_card` happens with default trust,
+    /// and once we have the card we use its declared fingerprints
+    /// for every subsequent connect. The card itself is the trust
+    /// assertion. Operator-side override (out-of-band fingerprint
+    /// supplied via `[[peer]]` config) is a follow-up that goes
+    /// through this same path.
     pub async fn add_peer_with_card_and_auth(
         &self,
         card: AgentCard,
@@ -257,18 +266,38 @@ impl PeerRegistry {
             )));
         }
 
+        // Parse pinned fingerprints once, surface parse errors at
+        // registry-add time rather than at first connect. Empty
+        // fingerprint list (when the card doesn't require pinning)
+        // is the no-op case — transports treat empty as "default
+        // TLS verification."
+        let pinned_fingerprints = parse_card_pinned_fingerprints(&card.auth.transport)
+            .map_err(|e| {
+                PeerError::Auth(format!(
+                    "peer {} card has invalid pinned fingerprint: {e}",
+                    card.id
+                ))
+            })?;
+
         let peer_id = card.id.clone();
         let log_sink = self.inner.log_sink.clone();
 
         let handle = spawn_peer(peer_id.clone(), card, log_sink, move |events_tx| {
             // Build one concrete transport per supported spec (each
-            // gets its own clone of `events_tx` and `bearer_token`)
-            // and wrap them in a `MultiTransport` that probes them
-            // in order on connect.
+            // gets its own clone of `events_tx`, `bearer_token`, and
+            // `pinned_fingerprints`) and wrap them in a
+            // `MultiTransport` that probes them in order on connect.
             let candidates: Vec<Box<dyn crate::peer::traits::PeerTransport>> =
                 supported_specs
                     .iter()
-                    .map(|spec| build_transport(spec, events_tx.clone(), bearer_token.clone()))
+                    .map(|spec| {
+                        build_transport(
+                            spec,
+                            events_tx.clone(),
+                            bearer_token.clone(),
+                            pinned_fingerprints.clone(),
+                        )
+                    })
                     .collect();
             Box::new(crate::peer::transport::MultiTransport::new(candidates))
         });
@@ -477,12 +506,16 @@ fn build_transport(
     spec: &TransportSpec,
     events_tx: mpsc::Sender<crate::peer::event::PeerEvent>,
     bearer_token: Option<String>,
+    pinned_fingerprints: Vec<crate::peer::transport::pinning::Fingerprint>,
 ) -> Box<dyn crate::peer::traits::PeerTransport> {
     match spec {
-        TransportSpec::IntendantWs { url } => Box::new(IntendantWsTransport::with_bearer(
+        TransportSpec::IntendantWs { url } => Box::new(IntendantWsTransport::with_credentials(
             url.clone(),
             events_tx,
-            bearer_token,
+            crate::peer::transport::intendant::TransportCredentials {
+                bearer_token,
+                pinned_fingerprints,
+            },
         )),
         other => {
             // Should be unreachable: `pick_supported_transports`
@@ -492,6 +525,31 @@ fn build_transport(
             // crash loudly rather than silently failing the spawn.
             panic!("unsupported transport spec reached build_transport: {other:?}")
         }
+    }
+}
+
+/// Parse pinned fingerprints from a card's `TransportAuth`.
+/// Returns an empty Vec when the card doesn't require pinning
+/// (None / MutualTls / Unknown), or a Vec of pre-parsed fingerprints
+/// when the card requires `PinnedMutualTls`. Parse errors are
+/// returned so the registry surfaces them at peer-add time rather
+/// than at first connect.
+fn parse_card_pinned_fingerprints(
+    transport_auth: &crate::peer::card::TransportAuth,
+) -> Result<Vec<crate::peer::transport::pinning::Fingerprint>, String> {
+    use crate::peer::card::TransportAuth;
+    match transport_auth {
+        TransportAuth::PinnedMutualTls {
+            server_cert_fingerprints,
+        } => {
+            let mut out = Vec::with_capacity(server_cert_fingerprints.len());
+            for s in server_cert_fingerprints {
+                let fp = crate::peer::transport::pinning::parse_fingerprint(s)?;
+                out.push(fp);
+            }
+            Ok(out)
+        }
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -1039,6 +1097,111 @@ mod tests {
 
         reg.remove_peer(&peer_id).await.unwrap();
         gateway.abort();
+    }
+
+    /// `parse_card_pinned_fingerprints` returns an empty Vec when the
+    /// card's `auth.transport` doesn't require pinning. None /
+    /// MutualTls / Unknown all skip the pinning path — the transport
+    /// then uses default TLS verification.
+    #[test]
+    fn parse_card_pinned_fingerprints_empty_for_non_pinned_variants() {
+        use crate::peer::card::TransportAuth;
+        assert!(parse_card_pinned_fingerprints(&TransportAuth::None)
+            .unwrap()
+            .is_empty());
+        assert!(parse_card_pinned_fingerprints(&TransportAuth::MutualTls)
+            .unwrap()
+            .is_empty());
+        assert!(parse_card_pinned_fingerprints(&TransportAuth::Unknown)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// `parse_card_pinned_fingerprints` parses every fingerprint
+    /// from a `PinnedMutualTls` transport-auth into pre-validated
+    /// bytes. Caller (registry) doesn't have to handle parse errors
+    /// at connect time.
+    #[test]
+    fn parse_card_pinned_fingerprints_parses_pinned_variant() {
+        use crate::peer::card::TransportAuth;
+        let auth = TransportAuth::PinnedMutualTls {
+            server_cert_fingerprints: vec![
+                "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+                "11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00".into(),
+            ],
+        };
+        let fps = parse_card_pinned_fingerprints(&auth).unwrap();
+        assert_eq!(fps.len(), 2);
+        assert_eq!(fps[0][0], 0xaa);
+        assert_eq!(fps[1][0], 0x11);
+    }
+
+    /// Bad fingerprint in the card surfaces as a parse error — the
+    /// registry caller wraps this into `PeerError::Auth` so the
+    /// add-peer path fails cleanly at registration rather than
+    /// silently dropping the pinning requirement.
+    #[test]
+    fn parse_card_pinned_fingerprints_reports_bad_entry() {
+        use crate::peer::card::TransportAuth;
+        let auth = TransportAuth::PinnedMutualTls {
+            server_cert_fingerprints: vec!["definitely-not-a-fingerprint".into()],
+        };
+        let err = parse_card_pinned_fingerprints(&auth).unwrap_err();
+        assert!(err.contains("64 hex chars") || err.contains("non-hex"));
+    }
+
+    /// End-to-end: add_peer_with_card_and_auth on a card whose
+    /// `auth.transport = PinnedMutualTls` with a malformed
+    /// fingerprint fails with `PeerError::Auth` and includes the
+    /// peer id for diagnostic context.
+    #[tokio::test]
+    async fn add_peer_with_pinned_card_rejects_malformed_fingerprint() {
+        use crate::peer::card::{AuthRequirements, TransportAuth};
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let reg = PeerRegistry::new(log_tx);
+        let mut card = fake_card("bad-pin", "ws://x/ws");
+        card.auth = AuthRequirements {
+            transport: TransportAuth::PinnedMutualTls {
+                server_cert_fingerprints: vec!["zzz-not-hex".into()],
+            },
+            application: None,
+        };
+        let result = reg.add_peer_with_card_and_auth(card, None).await;
+        match result {
+            Err(PeerError::Auth(msg)) => {
+                assert!(msg.contains("intendant:bad-pin"), "msg: {msg}");
+                assert!(msg.contains("invalid pinned fingerprint"), "msg: {msg}");
+            }
+            other => panic!("expected PeerError::Auth, got {other:?}"),
+        }
+        assert!(reg.is_empty(), "failed registration should not store the peer");
+    }
+
+    /// End-to-end: a well-formed pinned card registers cleanly.
+    /// The transport's pinning kicks in at connect time (which uses
+    /// http:// in tests, so pinning is silently inactive — the
+    /// success here just proves the parse + register path doesn't
+    /// reject a valid PinnedMutualTls card).
+    #[tokio::test]
+    async fn add_peer_with_pinned_card_accepts_valid_fingerprint() {
+        use crate::peer::card::{AuthRequirements, TransportAuth};
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let reg = PeerRegistry::new(log_tx);
+        let mut card = fake_card("good-pin", "ws://x/ws");
+        card.auth = AuthRequirements {
+            transport: TransportAuth::PinnedMutualTls {
+                server_cert_fingerprints: vec![
+                    "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+                ],
+            },
+            application: None,
+        };
+        let peer_id = reg
+            .add_peer_with_card_and_auth(card, None)
+            .await
+            .expect("valid pinned card should register");
+        assert_eq!(peer_id.label(), "good-pin");
+        reg.remove_peer(&peer_id).await.unwrap();
     }
 
     /// `pick_supported_transports` skips variants this build doesn't

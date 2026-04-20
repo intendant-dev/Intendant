@@ -17,9 +17,14 @@
 
 pub mod intendant;
 pub mod multi;
+pub mod pinning;
 
 pub use intendant::IntendantWsTransport;
 pub use multi::MultiTransport;
+pub use pinning::{
+    fingerprint_of_der, format_fingerprint, parse_fingerprint, pinned_client_config,
+    Fingerprint, PinnedFingerprintVerifier,
+};
 
 /// Derive the HTTP(S) base URL for Agent Card discovery from a
 /// native Intendant WebSocket URL. `ws://` becomes `http://`,
