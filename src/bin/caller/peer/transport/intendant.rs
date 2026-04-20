@@ -212,10 +212,40 @@ impl IntendantWsTransport {
 
     /// Open the WebSocket, split into read/write halves, spawn the
     /// drain task on the read half, return the write half for
-    /// storage on the transport.
+    /// storage on the transport. When a bearer token is configured,
+    /// it's sent in the `Authorization: Bearer <token>` header on the
+    /// upgrade request — server-side `verify_bearer_for_ws` checks
+    /// this *before* completing the handshake. (The dashboard
+    /// browser path uses `?token=...` on the URL instead because it
+    /// can't natively set headers on `WebSocket` opens.)
     async fn open_ws(&self) -> Result<(WsSink, JoinHandle<()>), PeerError> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
         let ws_url = self.ws_url()?.to_string();
-        let (ws_stream, _response) = tokio_tungstenite::connect_async(&ws_url)
+
+        // Start from a URL-derived request so tungstenite fills in
+        // the standard WS handshake headers (Sec-WebSocket-Key,
+        // Upgrade, Connection, Sec-WebSocket-Version, Host). Then
+        // splice in our Authorization header. Manually building the
+        // request from scratch would mean re-deriving those WS
+        // headers ourselves, which is fragile and pointless.
+        let mut request = ws_url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| {
+                PeerError::Transport(format!("build ws request {ws_url}: {e}"))
+            })?;
+
+        if let Some(token) = &self.bearer_token {
+            let value = format!("Bearer {token}").parse().map_err(|e| {
+                PeerError::Transport(format!(
+                    "bearer token contains characters not valid in an HTTP header: {e}"
+                ))
+            })?;
+            request.headers_mut().insert("Authorization", value);
+        }
+
+        let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
             .await
             .map_err(|e| PeerError::Transport(format!("ws connect {ws_url}: {e}")))?;
 

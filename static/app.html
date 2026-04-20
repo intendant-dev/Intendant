@@ -4384,6 +4384,19 @@ html, body {
                 <div id="coord-route-result" class="coord-result"></div>
               </div>
             </fieldset>
+
+            <fieldset class="settings-group">
+              <legend>Federation auth</legend>
+              <p style="color:var(--subtext0);font-size:12px;margin:0 0 10px">
+                When this dashboard's primary daemon enforces application-layer auth (<code style="color:var(--blue)">[server.auth] bearer_token</code> in intendant.toml), the same token must be set here so federation REST calls and the <code style="color:var(--blue)">/ws</code> WebSocket carry it. Stored locally in this browser only — never sent to any peer except via the standard <code style="color:var(--blue)">Authorization: Bearer</code> header (REST) and <code style="color:var(--blue)">?token=</code> URL parameter (<code style="color:var(--blue)">/ws</code> upgrade, since browsers can't set headers on WebSocket opens).
+              </p>
+              <div class="daemon-add-row">
+                <input id="federation-token-input" type="password" placeholder="(no token configured)" autocomplete="off">
+                <button id="federation-token-save" type="button">Save</button>
+                <button id="federation-token-clear" type="button">Clear</button>
+              </div>
+              <span id="federation-token-status" class="daemons-status"></span>
+            </fieldset>
           </div>
         </div>
 
@@ -4568,15 +4581,83 @@ html, body {
 
 import init, { PresenceWeb } from '/wasm-web/presence_web.js';
 
+// ── Federation auth ──
+//
+// When the daemon's `[server.auth] bearer_token` is set, federation
+// REST endpoints (/api/peers*, /api/coordinator/*, /api/sessions) and
+// /ws all require the matching token. The dashboard stores the
+// operator-supplied token in localStorage (set via Settings → Network
+// → Federation auth) and:
+//
+//   - includes it in `Authorization: Bearer <token>` on federation
+//     fetch() calls via `authedFetch()`
+//   - appends it as `?token=<token>` on the /ws URL via `buildWsUrl()`,
+//     since browser `WebSocket` opens can't natively set headers
+//
+// When unset (the common case for trusted-LAN deployments without
+// bearer configured), all paths sail through with no Authorization
+// header and no `?token=` query — the daemon's `verify_bearer_*`
+// helpers treat None as "no enforcement."
+const FEDERATION_TOKEN_KEY = 'intendantFederationBearerToken';
+
+function getFederationToken() {
+  try {
+    return localStorage.getItem(FEDERATION_TOKEN_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function setFederationToken(token) {
+  try {
+    if (token && token.trim()) {
+      localStorage.setItem(FEDERATION_TOKEN_KEY, token.trim());
+    } else {
+      localStorage.removeItem(FEDERATION_TOKEN_KEY);
+    }
+  } catch {
+    /* localStorage unavailable (private mode etc.); silently degrade */
+  }
+}
+
+// Fetch wrapper that adds `Authorization: Bearer <token>` when a
+// federation token is configured. Use for federation REST endpoints;
+// discovery (/.well-known/...) and dashboard bootstrap (/config) use
+// plain `fetch` since they're intentionally exempt from auth.
+async function authedFetch(url, opts) {
+  opts = opts || {};
+  const token = getFederationToken();
+  if (token) {
+    opts = {
+      ...opts,
+      headers: { ...(opts.headers || {}), Authorization: `Bearer ${token}` },
+    };
+  }
+  return fetch(url, opts);
+}
+
 // When running in the macOS app bundle, the page is served from a custom
 // scheme (intendant://) for secure-context access to getUserMedia. WebSocket
 // connections bypass the scheme handler and need the real backend address.
+//
+// Token: appends `?token=<token>` when a federation token is stored,
+// so the daemon's `verify_bearer_for_ws` accepts the upgrade. Daemon-
+// to-daemon connections (IntendantWsTransport) use the Authorization
+// header instead; the server checks both.
 function buildWsUrl(path) {
+  let url;
   if (window.__intendantPort) {
-    return 'ws://127.0.0.1:' + window.__intendantPort + (path || '');
+    url = 'ws://127.0.0.1:' + window.__intendantPort + (path || '');
+  } else {
+    const p = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    url = p + '//' + location.host + (path || '');
   }
-  const p = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return p + '//' + location.host + (path || '');
+  const token = getFederationToken();
+  if (token) {
+    const sep = url.includes('?') ? '&' : '?';
+    url += sep + 'token=' + encodeURIComponent(token);
+  }
+  return url;
 }
 
 // ── Constants (rendering only — all logic in WASM) ──
@@ -10696,7 +10777,7 @@ function removeDaemonById(id) {
 
 async function refreshPeersFromApi() {
   try {
-    const resp = await fetch('/api/peers');
+    const resp = await authedFetch('/api/peers');
     if (!resp.ok) return;
     const data = await resp.json();
     if (!data.peers || !Array.isArray(data.peers)) return;
@@ -11110,7 +11191,7 @@ async function resolvePeerApproval(hostId, approvalId, decision) {
     : null;
   if (row) row.querySelectorAll('button').forEach(b => b.disabled = true);
   try {
-    const resp = await fetch(`/api/peers/${hostId}/approval`, {
+    const resp = await authedFetch(`/api/peers/${hostId}/approval`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ request_id: approvalId, decision }),
@@ -11174,7 +11255,7 @@ async function submitPeerInput(hostId, kind) {
     ? JSON.stringify({ instructions: text })
     : JSON.stringify({ text });
   try {
-    const resp = await fetch(url, {
+    const resp = await authedFetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body,
@@ -11264,7 +11345,7 @@ async function addDaemon() {
   const body = { card_url: cardUrl };
   if (viaUrls.length > 0) body.via_urls = viaUrls;
   try {
-    const resp = await fetch('/api/peers', {
+    const resp = await authedFetch('/api/peers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -11296,7 +11377,7 @@ async function removeDaemon(hostId) {
   // explicit disconnect on the peer's actor (Disconnecting →
   // Disconnected state machine).
   try {
-    await fetch('/api/peers', {
+    await authedFetch('/api/peers', {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ peer_id: hostId }),
@@ -11339,7 +11420,7 @@ async function findEligiblePeers() {
   out.className = 'coord-result';
   const query = caps.map(c => `capability=${encodeURIComponent(c)}`).join('&');
   try {
-    const resp = await fetch(`/api/peers/eligible?${query}`);
+    const resp = await authedFetch(`/api/peers/eligible?${query}`);
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       const msg = result.error || `HTTP ${resp.status}`;
@@ -11400,7 +11481,7 @@ async function routeTask() {
   out.textContent = 'Routing…';
   out.className = 'coord-result';
   try {
-    const resp = await fetch('/api/coordinator/route', {
+    const resp = await authedFetch('/api/coordinator/route', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -11463,6 +11544,51 @@ async function initDaemons() {
   if (viaEl) {
     viaEl.addEventListener('keydown', e => {
       if (e.key === 'Enter') addDaemon();
+    });
+  }
+
+  // Wire the Federation auth panel. The token is stored in
+  // localStorage; this UI is the only place it's set/cleared. The
+  // input is type=password so it's masked at rest; we never display
+  // the actual token (only a placeholder noting whether one's set).
+  // Changing the token requires a reload to reconnect /ws — the
+  // active WebSocket connection still carries the old URL.
+  const fedInput = document.getElementById('federation-token-input');
+  const fedSave = document.getElementById('federation-token-save');
+  const fedClear = document.getElementById('federation-token-clear');
+  const fedStatus = document.getElementById('federation-token-status');
+  if (fedInput && fedSave && fedClear) {
+    if (getFederationToken()) {
+      fedInput.placeholder = '(token set — type to replace)';
+    }
+    fedSave.addEventListener('click', () => {
+      const v = fedInput.value.trim();
+      if (!v) {
+        if (fedStatus) {
+          fedStatus.textContent = 'Token cannot be empty (use Clear to remove).';
+          fedStatus.className = 'daemons-status error';
+        }
+        return;
+      }
+      setFederationToken(v);
+      fedInput.value = '';
+      fedInput.placeholder = '(token set — type to replace)';
+      if (fedStatus) {
+        fedStatus.textContent = 'Saved. Reload the dashboard to reconnect /ws with the new token.';
+        fedStatus.className = 'daemons-status ok';
+      }
+    });
+    fedClear.addEventListener('click', () => {
+      setFederationToken('');
+      fedInput.value = '';
+      fedInput.placeholder = '(no token configured)';
+      if (fedStatus) {
+        fedStatus.textContent = 'Cleared. Reload the dashboard to reconnect /ws unauthenticated.';
+        fedStatus.className = 'daemons-status';
+      }
+    });
+    fedInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter') fedSave.click();
     });
   }
 
@@ -12213,7 +12339,7 @@ function loadSessions() {
   const aggEl = document.getElementById('sessions-aggregate');
   listEl.innerHTML = '<div class="empty-state">Loading sessions...</div>';
 
-  fetch('/api/sessions')
+  authedFetch('/api/sessions')
     .then(r => r.json())
     .then(sessions => {
       sessionsLoaded = true;

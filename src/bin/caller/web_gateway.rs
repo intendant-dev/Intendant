@@ -2216,6 +2216,28 @@ pub fn spawn_web_gateway(
                     extract_host_header_ip(&header_text);
 
                 if is_websocket {
+                    // Bearer enforcement on /ws — dual-mode (Authorization
+                    // header from daemons, ?token= query param from
+                    // browsers). Reject with a plain HTTP 401 *before*
+                    // the WebSocket handshake so the rejected client
+                    // never sees a successful upgrade.
+                    if let Err((status, body)) =
+                        verify_bearer_for_ws(&header_text, inbound_bearer_token.as_deref())
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let response = format!(
+                            "HTTP/1.1 {status} Unauthorized\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             WWW-Authenticate: Bearer\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {body}",
+                            body.len(),
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        return;
+                    }
                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
                         Ok(ws) => ws,
                         Err(_) => return,
@@ -5519,6 +5541,73 @@ fn is_federation_path(request_line: &str) -> bool {
         || request_line.contains(" /api/sessions")
 }
 
+/// Extract a token from the `?token=...` query parameter of an HTTP
+/// request line. Used by the WebSocket upgrade auth path because the
+/// browser cannot set arbitrary headers on `WebSocket` opens — the
+/// dashboard appends `?token=...` to the /ws URL instead.
+///
+/// `request_line` is the first line of the HTTP request, e.g.
+/// `"GET /ws?token=abc HTTP/1.1"`. Returns the extracted token if
+/// present, `None` if there's no `?token=` parameter.
+pub(crate) fn extract_token_query_param(request_line: &str) -> Option<String> {
+    let path_and_query = request_line.split_whitespace().nth(1)?;
+    let query = path_and_query.split_once('?')?.1;
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("token=") {
+            // No URL-decoding: bearer tokens are typically URL-safe
+            // (hex / base64-url). If a token contains characters that
+            // require encoding, the operator can either pick a
+            // different token or send via Authorization header (which
+            // doesn't have the URL-encoding constraint).
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// Verify a WebSocket upgrade request carries the expected bearer
+/// token. Browser WebSocket clients cannot natively set custom
+/// headers on `WebSocket` opens, so this accepts the token in EITHER
+/// an `Authorization: Bearer <token>` header (sent by
+/// `IntendantWsTransport` from the daemon side) OR a `?token=...`
+/// URL query parameter (sent by the browser dashboard). The dual
+/// path is the standard pragmatic workaround for the browser
+/// limitation.
+///
+/// Returns `Ok(())` when no token is required (no
+/// `inbound_bearer_token` configured) or when the request presents
+/// the matching token via either method. Returns `Err((401, body))`
+/// otherwise — the caller writes a plain HTTP 401 response *before*
+/// the WebSocket handshake and returns, so the rejected client never
+/// sees a successful upgrade.
+pub(crate) fn verify_bearer_for_ws(
+    header_text: &str,
+    expected_token: Option<&str>,
+) -> Result<(), (u16, String)> {
+    let Some(expected) = expected_token else {
+        return Ok(());
+    };
+
+    // Try the Authorization header first (cheaper and the daemon-to-
+    // daemon path uses it). On miss, fall back to the URL query.
+    if verify_bearer_token(header_text, Some(expected)).is_ok() {
+        return Ok(());
+    }
+
+    let request_line = header_text.lines().next().unwrap_or("");
+    if extract_token_query_param(request_line).as_deref() == Some(expected) {
+        return Ok(());
+    }
+
+    Err((
+        401,
+        serde_json::json!({
+            "error": "missing or invalid bearer token (Authorization header or ?token=)"
+        })
+        .to_string(),
+    ))
+}
+
 /// Verify a federation HTTP request carries the expected bearer
 /// token in the `Authorization` header. Header name lookup is
 /// case-insensitive per the HTTP spec; the `Bearer` scheme prefix
@@ -6515,6 +6604,190 @@ mod tests {
             "config should serve unauthenticated, got: {resp}"
         );
         assert!(!resp.contains("401"));
+        handle.abort();
+    }
+
+    // -----------------------------------------------------------------
+    // /ws bearer enforcement (slice 2d)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn extract_token_query_param_finds_token() {
+        assert_eq!(
+            extract_token_query_param("GET /ws?token=abc HTTP/1.1"),
+            Some("abc".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_token_query_param_finds_token_among_others() {
+        assert_eq!(
+            extract_token_query_param("GET /ws?other=x&token=abc&more=y HTTP/1.1"),
+            Some("abc".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_token_query_param_returns_none_when_absent() {
+        assert_eq!(extract_token_query_param("GET /ws HTTP/1.1"), None);
+        assert_eq!(
+            extract_token_query_param("GET /ws?other=x HTTP/1.1"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_token_query_param_handles_no_request_line() {
+        assert_eq!(extract_token_query_param(""), None);
+    }
+
+    #[test]
+    fn verify_bearer_for_ws_passes_when_no_token_configured() {
+        let header = "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n";
+        assert!(verify_bearer_for_ws(header, None).is_ok());
+    }
+
+    #[test]
+    fn verify_bearer_for_ws_accepts_authorization_header() {
+        let header =
+            "GET /ws HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer right\r\n\r\n";
+        assert!(verify_bearer_for_ws(header, Some("right")).is_ok());
+    }
+
+    #[test]
+    fn verify_bearer_for_ws_accepts_token_query_param() {
+        // The dashboard browser path: no Authorization header (browsers
+        // can't easily set headers on WebSocket opens), token rides on
+        // the URL.
+        let header = "GET /ws?token=right HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert!(verify_bearer_for_ws(header, Some("right")).is_ok());
+    }
+
+    #[test]
+    fn verify_bearer_for_ws_rejects_when_neither_present() {
+        let header = "GET /ws HTTP/1.1\r\nHost: x\r\n\r\n";
+        let err = verify_bearer_for_ws(header, Some("right")).unwrap_err();
+        assert_eq!(err.0, 401);
+    }
+
+    #[test]
+    fn verify_bearer_for_ws_rejects_wrong_query_token() {
+        let header = "GET /ws?token=wrong HTTP/1.1\r\nHost: x\r\n\r\n";
+        let err = verify_bearer_for_ws(header, Some("right")).unwrap_err();
+        assert_eq!(err.0, 401);
+    }
+
+    /// Header AND query both present — header wins (matches first).
+    /// Mismatched header with matching query: header check fails, query
+    /// check passes, overall accepted. Documents the fallback behavior.
+    #[test]
+    fn verify_bearer_for_ws_header_wrong_falls_back_to_query() {
+        let header = "GET /ws?token=right HTTP/1.1\r\n\
+                      Host: x\r\n\
+                      Authorization: Bearer wrong\r\n\r\n";
+        assert!(verify_bearer_for_ws(header, Some("right")).is_ok());
+    }
+
+    /// Real /ws upgrade through `spawn_test_gateway_with_auth`:
+    /// connecting without a token gets a plain HTTP 401 *before* the
+    /// WebSocket handshake completes — the dashboard sees a 401 page,
+    /// not a successful upgrade then immediate close.
+    #[tokio::test]
+    async fn test_ws_upgrade_rejects_missing_bearer() {
+        let (port, handle) =
+            spawn_test_gateway_with_auth(None, Some("ws-token".into())).await;
+        let resp = http_request(
+            port,
+            "GET /ws HTTP/1.1\r\n\
+             Host: x\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGVzdA==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("401"), "expected 401, got: {resp}");
+        assert!(
+            resp.contains("WWW-Authenticate: Bearer"),
+            "WWW-Authenticate signals scheme"
+        );
+        // Critically, the upgrade did NOT complete.
+        assert!(
+            !resp.contains("101 Switching Protocols"),
+            "must reject before WS handshake completes"
+        );
+        handle.abort();
+    }
+
+    /// /ws with a matching Authorization header completes the upgrade
+    /// (101 Switching Protocols). This is the daemon-to-daemon path
+    /// that IntendantWsTransport uses.
+    #[tokio::test]
+    async fn test_ws_upgrade_accepts_matching_authorization_header() {
+        let (port, handle) =
+            spawn_test_gateway_with_auth(None, Some("ws-token".into())).await;
+        let resp = http_request(
+            port,
+            "GET /ws HTTP/1.1\r\n\
+             Host: x\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGVzdA==\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Authorization: Bearer ws-token\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.contains("101 Switching Protocols"),
+            "expected upgrade success, got: {resp}"
+        );
+        assert!(!resp.contains("401"));
+        handle.abort();
+    }
+
+    /// /ws with `?token=` query parameter completes the upgrade. This
+    /// is the dashboard-browser path (browsers can't set arbitrary
+    /// headers on `WebSocket` opens, so the token rides on the URL).
+    #[tokio::test]
+    async fn test_ws_upgrade_accepts_matching_query_token() {
+        let (port, handle) =
+            spawn_test_gateway_with_auth(None, Some("ws-token".into())).await;
+        let resp = http_request(
+            port,
+            "GET /ws?token=ws-token HTTP/1.1\r\n\
+             Host: x\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGVzdA==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.contains("101 Switching Protocols"),
+            "expected upgrade success, got: {resp}"
+        );
+        handle.abort();
+    }
+
+    /// /ws with no token still works when the gateway has no bearer
+    /// configured (the common case for trusted-LAN deployments).
+    #[tokio::test]
+    async fn test_ws_upgrade_accepts_when_no_bearer_configured() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, None).await;
+        let resp = http_request(
+            port,
+            "GET /ws HTTP/1.1\r\n\
+             Host: x\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGVzdA==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.contains("101 Switching Protocols"),
+            "expected upgrade success, got: {resp}"
+        );
         handle.abort();
     }
 
