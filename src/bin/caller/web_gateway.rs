@@ -6508,11 +6508,18 @@ fn format_ws_url(host: &str, port: u16) -> String {
 /// and cloned into each per-connection handler, matching the pattern
 /// used for `/config`.
 ///
-/// Capabilities are intentionally conservative in phase 1:
-/// `ComputerUse` and `Knowledge` are always-on subsystems; the
-/// display/voice/phone/recording capabilities are gated on runtime
-/// configuration that isn't plumbed through here yet. Those become
-/// additive as each subsystem teaches itself to advertise.
+/// Capabilities:
+/// - `ComputerUse`, `Knowledge`, `Display` are always-on subsystems
+///   compiled into every build and always able to service a federation
+///   request (for `Display`, that's `DisplaySession::handle_offer`
+///   against whatever the local dashboard has activated — returns
+///   "no such display" if nothing is active, which is the correct
+///   semantics for a peer trying to view a display the operator
+///   hasn't opened yet).
+/// - `Voice` / `Phone` / `Recording` are gated on runtime configuration
+///   that isn't plumbed through here yet. Those become additive as
+///   each subsystem teaches itself to advertise, likely via dynamic
+///   `PeerEvent::CapabilityEngaged` once slice 3a.2 lands.
 ///
 /// `advertise_urls` is the preference-ordered list of WebSocket URLs
 /// peers should try when dialing this daemon. Each becomes a
@@ -6543,7 +6550,11 @@ pub fn build_local_agent_card(
         env!("CARGO_PKG_VERSION").to_string(),
         Some(env!("INTENDANT_GIT_SHA").to_string()),
         transports,
-        vec![Capability::ComputerUse, Capability::Knowledge],
+        vec![
+            Capability::ComputerUse,
+            Capability::Knowledge,
+            Capability::Display,
+        ],
         auth,
     )
 }
@@ -8098,10 +8109,13 @@ mod tests {
         assert_eq!(peers.len(), 1, "expected one matching peer");
         assert_eq!(peers[0]["id"].as_str().unwrap(), peer_id);
 
-        // Misses: the fixture doesn't advertise Display.
+        // Misses: the fixture doesn't advertise Voice (build_local_agent_card
+        // advertises ComputerUse + Knowledge + Display; Voice / Phone /
+        // Recording are gated on runtime configuration that isn't plumbed
+        // through yet).
         let resp = http_request(
             dash_port,
-            "GET /api/peers/eligible?capability=display HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /api/peers/eligible?capability=voice HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .await;
         assert!(resp.contains("200 OK"), "expected 200, got: {resp}");
@@ -8159,9 +8173,14 @@ mod tests {
         let (dash_port, peer_id, target_handle, dash_handle) =
             setup_peer_op_test().await;
 
+        // Voice is the "gated, not-advertised-by-default" capability
+        // that the stock build_local_agent_card fixture doesn't claim
+        // — so routing by it hits no-route and surfaces the considered
+        // list. Display moved to always-on in the 3a.1 fix, so it can
+        // no longer serve as the deliberately-unsatisfied capability.
         let body = serde_json::json!({
-            "required_capabilities": ["display"],
-            "task": {"instructions": "needs a display"},
+            "required_capabilities": ["voice"],
+            "task": {"instructions": "needs voice"},
         })
         .to_string();
         let req = format!(
