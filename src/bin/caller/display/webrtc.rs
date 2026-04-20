@@ -46,7 +46,7 @@ use super::clipboard::ClipboardContent;
 use super::{EncodedFrame, IceConfig, InputEvent, PeerId};
 use crate::error::CallerError;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use str0m::change::SdpOffer;
@@ -387,7 +387,9 @@ impl WebRtcPeer {
         // interface and emit a host candidate that exactly matches each
         // socket's local address.
         let mut sockets: Vec<Arc<UdpSocket>> = Vec::new();
-        let local_addrs = routable_local_addrs();
+        // WebRTC needs loopback so a browser on the same machine can
+        // pair against the daemon's host candidates.
+        let local_addrs = crate::lan::routable_local_addrs(true);
         for iface_addr in &local_addrs {
             let bind_addr = SocketAddr::new(*iface_addr, 0);
             let socket = match UdpSocket::bind(bind_addr).await {
@@ -1231,67 +1233,10 @@ fn serialize_clipboard(content: &ClipboardContent) -> String {
     }
 }
 
-/// Enumerate routable local IP addresses to advertise as host candidates.
-///
-/// Includes loopback so localhost connections work. Excludes link-local v6.
-fn routable_local_addrs() -> Vec<IpAddr> {
-    let mut out = Vec::new();
-    // Always include loopback for same-machine connections.
-    out.push(IpAddr::V4(Ipv4Addr::LOCALHOST));
-
-    // Walk interfaces via getifaddrs. We use the libc dep that's already in
-    // the tree.
-    #[cfg(unix)]
-    {
-        use std::ffi::CStr;
-        unsafe {
-            let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-            if libc::getifaddrs(&mut ifap) == 0 && !ifap.is_null() {
-                let mut cur = ifap;
-                while !cur.is_null() {
-                    let ifa = &*cur;
-                    if !ifa.ifa_addr.is_null() {
-                        let family = (*ifa.ifa_addr).sa_family as i32;
-                        let name = if ifa.ifa_name.is_null() {
-                            String::new()
-                        } else {
-                            CStr::from_ptr(ifa.ifa_name)
-                                .to_string_lossy()
-                                .into_owned()
-                        };
-                        if family == libc::AF_INET {
-                            let sin = ifa.ifa_addr as *const libc::sockaddr_in;
-                            let octets = (*sin).sin_addr.s_addr.to_ne_bytes();
-                            let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
-                            if !ip.is_loopback() && !ip.is_unspecified() {
-                                out.push(IpAddr::V4(ip));
-                            }
-                        } else if family == libc::AF_INET6 {
-                            let sin6 = ifa.ifa_addr as *const libc::sockaddr_in6;
-                            let segs = (*sin6).sin6_addr.s6_addr;
-                            let ip = std::net::Ipv6Addr::from(segs);
-                            // Skip link-local (fe80::/10) and loopback.
-                            if !ip.is_loopback() && !ip.is_unspecified() && !is_link_local_v6(&ip)
-                            {
-                                out.push(IpAddr::V6(ip));
-                            }
-                        }
-                        let _ = name; // currently unused; kept for future filtering
-                    }
-                    cur = (*cur).ifa_next;
-                }
-                libc::freeifaddrs(ifap);
-            }
-        }
-    }
-    out
-}
-
-#[cfg(unix)]
-fn is_link_local_v6(ip: &std::net::Ipv6Addr) -> bool {
-    let segs = ip.segments();
-    (segs[0] & 0xffc0) == 0xfe80
-}
+// `routable_local_addrs` and `is_link_local_v6` moved to `crate::lan`
+// so the federation advertise side can share them — same set of
+// "addresses we can be reached at" applies to both WebRTC host
+// candidates and Agent Card transport URLs.
 
 /// If a remote ICE candidate's connection-address is an mDNS `.local`
 /// hostname, resolve it to a literal IP via the system resolver and return

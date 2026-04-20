@@ -5449,56 +5449,109 @@ async fn coordinator_route(
 /// Resolve the list of WebSocket URLs to advertise in the Agent
 /// Card for this daemon, in preference order.
 ///
-/// Resolution rules, in order:
+/// **Additive auto-detection.** Mirrors WebRTC's host-candidate
+/// gathering pattern: the daemon enumerates its own routable
+/// interfaces via [`crate::lan::routable_local_addrs`] and emits one
+/// URL per address by default, so the operator doesn't need to type
+/// their own LAN IP into `--advertise-url`. The operator's overrides
+/// (CLI `--advertise-url` or `[server.advertise]` in intendant.toml)
+/// are *prepended* — they win on preference order, but the auto-
+/// detected entries still ride along as fallbacks. The connecting
+/// peer's `MultiTransport::connect` walks the merged list top-down
+/// and picks the first that succeeds.
 ///
-/// 1. If `overrides` is non-empty, use it verbatim (operator wins).
-///    This covers every topology the daemon can't auto-detect:
-///    NAT'd VMs reachable via a host port-forward, Tailscale tailnet
-///    URLs, named tunnels, mTLS proxy URLs, dual-stack IPv4+IPv6,
-///    etc. The operator who configures `--advertise-url` (CLI) or
-///    `[server.advertise]` (intendant.toml) knows how peers reach
-///    them better than we can guess.
+/// ## Bind-address rules
 ///
-/// 2. Otherwise, return a single auto-detected URL derived from the
-///    listener's bind address:
-///    - Wildcard bind (`0.0.0.0` / `::`) → substitute the resolved
-///      host label ([`crate::lan::resolve_host_label`]). Best-effort
-///      mDNS resolution on a trusted LAN; fragile when the local
-///      hostname isn't unique or doesn't propagate (the case that
-///      motivates the override path above).
-///    - Specific bind address → used as-is. We trust the operator
-///      who picked a non-wildcard bind knew why.
+/// - **Specific bind** (e.g. `192.168.1.42:8765`): only that one IP
+///   is auto-detected. The operator narrowed the listener for a
+///   reason; we don't second-guess by also enumerating other
+///   interfaces.
+/// - **Wildcard bind** (`0.0.0.0` / `::`): every routable interface
+///   becomes one URL. Loopback is excluded — advertising loopback to
+///   remote peers is useless. If the operator wants to expose
+///   loopback (e.g. for self-peering tests), they can pass it via
+///   `--advertise-url`.
 ///
-/// 3. If `local_addr` is `None` (shouldn't happen in practice; the
-///    listener is always bound by the time spawn is called), fall
-///    back to `ws://localhost:0/ws` rather than panicking. The card
-///    is still valid; the URL just won't work until the next daemon
-///    restart.
+/// ## Fallbacks (in order, when auto-detection finds nothing)
+///
+/// 1. Resolved host label ([`crate::lan::resolve_host_label`]) —
+///    works on a trusted LAN with mDNS, fragile elsewhere. Last-
+///    ditch best-effort.
+/// 2. `ws://localhost:0/ws` if there's no listener at all
+///    (shouldn't happen in practice; the listener is always bound by
+///    the time spawn is called). Card stays valid; URL won't work.
+///
+/// Dedup: exact-string match. If the operator's override happens to
+/// match an auto-detected URL, only the operator's copy is kept.
 pub(crate) fn resolve_advertise_urls(
     local_addr: Option<std::net::SocketAddr>,
     overrides: &[String],
 ) -> Vec<String> {
-    if !overrides.is_empty() {
-        return overrides.to_vec();
-    }
-    use std::net::IpAddr;
-    let (host, port) = match local_addr {
-        Some(addr) => {
-            let port = addr.port();
-            match addr.ip() {
-                IpAddr::V4(v4) if v4.is_unspecified() => {
-                    (crate::lan::resolve_host_label(), port)
-                }
-                IpAddr::V6(v6) if v6.is_unspecified() => {
-                    (crate::lan::resolve_host_label(), port)
-                }
-                IpAddr::V6(v6) => (format!("[{v6}]"), port),
-                ip => (ip.to_string(), port),
-            }
+    let port = local_addr.map(|a| a.port()).unwrap_or(0);
+
+    // Auto-detect. Operator overrides come first; auto entries append.
+    let auto = auto_detect_advertise_urls(local_addr, port);
+
+    let mut out: Vec<String> = Vec::with_capacity(overrides.len() + auto.len());
+    for url in overrides {
+        if !out.contains(url) {
+            out.push(url.clone());
         }
-        None => ("localhost".to_string(), 0),
-    };
-    vec![format!("ws://{host}:{port}/ws")]
+    }
+    for url in auto {
+        if !out.contains(&url) {
+            out.push(url);
+        }
+    }
+
+    if out.is_empty() {
+        // No bind, no overrides, no interfaces. Card stays valid;
+        // URL just won't work until the next daemon restart.
+        out.push("ws://localhost:0/ws".to_string());
+    }
+    out
+}
+
+/// Build the auto-detected URL list from the listener bind address.
+/// See [`resolve_advertise_urls`] for the full resolution rules.
+fn auto_detect_advertise_urls(
+    local_addr: Option<std::net::SocketAddr>,
+    port: u16,
+) -> Vec<String> {
+    use std::net::IpAddr;
+    let Some(addr) = local_addr else { return Vec::new() };
+
+    // Specific bind: that one IP wins, no enumeration.
+    match addr.ip() {
+        IpAddr::V4(v4) if !v4.is_unspecified() => {
+            return vec![format_ws_url(&v4.to_string(), port)];
+        }
+        IpAddr::V6(v6) if !v6.is_unspecified() => {
+            return vec![format_ws_url(&format!("[{v6}]"), port)];
+        }
+        _ => {}
+    }
+
+    // Wildcard bind: enumerate every non-loopback routable interface.
+    let mut urls: Vec<String> = crate::lan::routable_local_addrs(false)
+        .into_iter()
+        .map(|ip| match ip {
+            IpAddr::V6(v6) => format_ws_url(&format!("[{v6}]"), port),
+            ip => format_ws_url(&ip.to_string(), port),
+        })
+        .collect();
+
+    // No interfaces found (unusual — host with no networking?). Fall
+    // back to the resolved host label so the card carries *something*
+    // dialable on a trusted LAN with mDNS.
+    if urls.is_empty() {
+        urls.push(format_ws_url(&crate::lan::resolve_host_label(), port));
+    }
+    urls
+}
+
+fn format_ws_url(host: &str, port: u16) -> String {
+    format!("ws://{host}:{port}/ws")
 }
 
 /// Assemble the [`crate::peer::AgentCard`] for this daemon from live
@@ -5636,51 +5689,64 @@ mod tests {
         );
     }
 
-    /// A wildcard bind (0.0.0.0) is replaced with the resolved host
-    /// label, because 0.0.0.0 isn't a dialable address from a
-    /// remote peer. This is the guard against the production case
-    /// where main.rs binds to 0.0.0.0:8765 and the previous
-    /// implementation was handing out `ws://0.0.0.0:8765/ws` in the
-    /// Agent Card — an unusable URL that the transport-url-is-the-
-    /// listener-addr assumption let slip through localhost-only
-    /// tests.
+    /// Wildcard bind (0.0.0.0) gets replaced with one URL per routable
+    /// interface (auto-detection), never the literal wildcard. This
+    /// is the guard against the production case where main.rs binds
+    /// to 0.0.0.0:8765 and an earlier implementation was handing out
+    /// `ws://0.0.0.0:8765/ws` in the Agent Card — an unusable URL
+    /// that the transport-url-is-the-listener-addr assumption let
+    /// slip through localhost-only tests.
+    ///
+    /// The exact set of interfaces is environment-dependent so we
+    /// can't pin specific addresses; we only assert that no entry is
+    /// the wildcard literal and the port is preserved everywhere.
     #[test]
-    fn advertise_url_replaces_ipv4_wildcard_with_host_label() {
+    fn advertise_url_replaces_ipv4_wildcard_with_interface_urls() {
         use std::net::{Ipv4Addr, SocketAddr};
         let wildcard = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 8765);
         let urls = resolve_advertise_urls(Some(wildcard), &[]);
-        assert_eq!(urls.len(), 1, "auto-detect produces exactly one URL");
-        let url = &urls[0];
         assert!(
-            !url.contains("0.0.0.0"),
-            "wildcard must be replaced: got {url}"
+            !urls.is_empty(),
+            "auto-detect should produce at least one URL"
         );
-        assert!(url.starts_with("ws://"), "scheme preserved: {url}");
-        assert!(url.ends_with(":8765/ws"), "port preserved: {url}");
-        let host = url
-            .strip_prefix("ws://")
-            .and_then(|rest| rest.strip_suffix(":8765/ws"))
-            .expect("url has expected prefix/suffix");
-        assert!(
-            !host.is_empty(),
-            "host must resolve to something non-empty: {url}"
-        );
+        for url in &urls {
+            assert!(
+                !url.contains("0.0.0.0"),
+                "wildcard must not appear in any auto-detected URL: {url}"
+            );
+            assert!(url.starts_with("ws://"), "scheme preserved: {url}");
+            assert!(url.ends_with(":8765/ws"), "port preserved: {url}");
+            let host = url
+                .strip_prefix("ws://")
+                .and_then(|rest| rest.strip_suffix(":8765/ws"))
+                .expect("url has expected prefix/suffix");
+            assert!(
+                !host.is_empty(),
+                "host must resolve to something non-empty: {url}"
+            );
+        }
     }
 
     /// Same guard for IPv6 wildcards (::), which have the same
-    /// unreachability problem as 0.0.0.0.
+    /// unreachability problem as 0.0.0.0. Auto-detected v6 entries
+    /// are bracketed per RFC 3986; we don't pin which interfaces are
+    /// found because that's environment-dependent.
     #[test]
-    fn advertise_url_replaces_ipv6_wildcard_with_host_label() {
+    fn advertise_url_replaces_ipv6_wildcard_with_interface_urls() {
         use std::net::{Ipv6Addr, SocketAddr};
         let wildcard = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 8765);
         let urls = resolve_advertise_urls(Some(wildcard), &[]);
-        assert_eq!(urls.len(), 1);
-        let url = &urls[0];
         assert!(
-            !url.contains("::"),
-            "ipv6 wildcard must be replaced: got {url}"
+            !urls.is_empty(),
+            "wildcard v6 bind should still produce some auto-detected URLs"
         );
-        assert!(url.ends_with(":8765/ws"));
+        for url in &urls {
+            assert!(
+                !url.contains("[::]"),
+                "ipv6 wildcard must not appear in any auto-detected URL: {url}"
+            );
+            assert!(url.ends_with(":8765/ws"), "port preserved: {url}");
+        }
     }
 
     /// IPv6 specific addresses are bracketed in the URL per RFC 3986
@@ -5699,33 +5765,96 @@ mod tests {
         );
     }
 
-    /// Operator-supplied overrides (CLI `--advertise-url` or
-    /// `[server.advertise]` in intendant.toml) replace the auto-
-    /// detected URL entirely, in the order given. The bind address
-    /// is ignored when overrides are present — the operator is
-    /// asserting "this is what peers should use" regardless of
-    /// what the daemon's own listener thinks.
+    /// Operator overrides come first in the merged list (preference
+    /// order), but auto-detected entries are appended as fallbacks.
+    /// The connecting peer's `MultiTransport::connect` walks the list
+    /// top-down and uses the first that succeeds, so overrides win on
+    /// preference while auto entries provide redundancy.
     #[test]
-    fn advertise_overrides_replace_auto_detection_in_order() {
+    fn advertise_overrides_prepend_to_auto_detected() {
         use std::net::{Ipv4Addr, SocketAddr};
-        let bind = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 8765);
+        // Specific bind so we can assert exactly one auto-detected entry
+        // (wildcard bind would enumerate every host interface — non-
+        // deterministic in CI). Specific-bind also covers the
+        // intentionally-narrowed-listener case.
+        let bind = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8765);
         let overrides = vec![
             "ws://192.168.1.42:8765/ws".to_string(),
             "wss://laptop.tail-abcd.ts.net:8443/ws".to_string(),
         ];
         let urls = resolve_advertise_urls(Some(bind), &overrides);
-        assert_eq!(urls, overrides, "overrides should pass through verbatim");
+        // Overrides come first, auto-detected entry appended.
+        assert_eq!(urls.len(), 3, "got: {urls:?}");
+        assert_eq!(urls[0], "ws://192.168.1.42:8765/ws");
+        assert_eq!(urls[1], "wss://laptop.tail-abcd.ts.net:8443/ws");
+        assert_eq!(urls[2], "ws://127.0.0.1:8765/ws");
     }
 
-    /// An empty overrides list falls back to auto-detection (the
-    /// historical behavior). The CliFlags helper passes `&[]` when
-    /// neither `--advertise-url` nor `[server.advertise]` is set.
+    /// An empty overrides list relies entirely on auto-detection.
+    /// With a specific bind the result is exactly that one URL.
     #[test]
-    fn empty_overrides_fall_back_to_auto_detect() {
+    fn empty_overrides_use_only_auto_detected_url() {
         use std::net::{Ipv4Addr, SocketAddr};
         let lan = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
         let urls = resolve_advertise_urls(Some(lan), &[]);
         assert_eq!(urls, vec!["ws://192.168.1.42:8765/ws".to_string()]);
+    }
+
+    /// Dedup: an operator URL that happens to match an auto-detected
+    /// entry is kept exactly once (in operator position, since
+    /// overrides are processed first). Avoids advertising the same
+    /// URL twice when the operator types out their LAN IP that the
+    /// daemon would have auto-detected anyway.
+    #[test]
+    fn advertise_dedupes_overrides_matching_auto_detected() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let lan = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
+        let overrides = vec!["ws://192.168.1.42:8765/ws".to_string()];
+        let urls = resolve_advertise_urls(Some(lan), &overrides);
+        assert_eq!(urls.len(), 1, "duplicate suppressed: {urls:?}");
+        assert_eq!(urls[0], "ws://192.168.1.42:8765/ws");
+    }
+
+    /// A wildcard bind enumerates every routable non-loopback
+    /// interface. We can't pin exact addresses (CI hosts vary) but
+    /// can assert: (a) at least one URL is produced, (b) loopback is
+    /// excluded (advertising loopback to remote peers is useless),
+    /// (c) the port matches the bind port.
+    #[test]
+    fn advertise_wildcard_bind_enumerates_interfaces_excluding_loopback() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let wildcard = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 8765);
+        let urls = resolve_advertise_urls(Some(wildcard), &[]);
+        assert!(
+            !urls.is_empty(),
+            "expected at least one auto-detected URL, got: {urls:?}"
+        );
+        for url in &urls {
+            assert!(
+                !url.contains("127.0.0.1"),
+                "loopback must not appear in auto-detected federation URLs: {url}"
+            );
+            assert!(
+                !url.contains("0.0.0.0"),
+                "wildcard must not appear in auto-detected URLs: {url}"
+            );
+            assert!(url.ends_with(":8765/ws"), "port preserved: {url}");
+        }
+    }
+
+    /// When operator wants to override completely (e.g. for security
+    /// reasons — only advertise the Tailscale URL even though the
+    /// daemon binds wildcard), they bind to a specific interface
+    /// instead of wildcard. Specific bind narrows auto-detection to
+    /// just that interface, so combined with operator override the
+    /// effective list is `[override..., that_one_interface]`.
+    #[test]
+    fn specific_bind_narrows_auto_detection_to_one_interface() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let lan_only = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
+        let urls = resolve_advertise_urls(Some(lan_only), &[]);
+        assert_eq!(urls.len(), 1, "specific bind = exactly one auto entry");
+        assert_eq!(urls[0], "ws://192.168.1.42:8765/ws");
     }
 
     #[test]
