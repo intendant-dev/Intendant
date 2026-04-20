@@ -2328,6 +2328,7 @@ pub fn spawn_event_listener(
                     AppEvent::RoundComplete {
                         round,
                         turns_in_round,
+                        ..
                     } => {
                         s.round = round;
                         s.set_phase(Phase::WaitingFollowUp);
@@ -2428,7 +2429,9 @@ pub fn spawn_event_listener(
                     | AppEvent::SnapshotCreated { .. }
                     | AppEvent::RolledBack { .. }
                     | AppEvent::Redone { .. }
-                    | AppEvent::HistoryPruned { .. } => {
+                    | AppEvent::HistoryPruned { .. }
+                    | AppEvent::ConversationRollbackRequested { .. }
+                    | AppEvent::ConversationRolledBack { .. } => {
                         // Broadcast-only — handled by outbound event converter.
                     }
                     AppEvent::DisplayCaptureLost { display_id, ref reason } => {

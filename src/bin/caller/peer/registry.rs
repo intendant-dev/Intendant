@@ -293,13 +293,27 @@ fn spawn_state_observer(
 ///
 /// Exits cleanly when the per-peer actor's broadcast sender drops
 /// (`RecvError::Closed`), same lifetime model as `spawn_state_observer`.
+///
+/// Critical: we extract `peer_id` and `peer_events` *before* spawning,
+/// so the closure captures only those — not the `PeerHandle` itself.
+/// `PeerHandle` holds a clone of the peer's broadcast `Sender` inside
+/// `PeerHandleInner`; if the spawn closure captured the handle, that
+/// clone would keep the channel alive and `peer_events.recv()` would
+/// never see `Closed` even after the peer actor exits and the registry
+/// drops its handle. The result would be one stuck task per peer-add
+/// over the lifetime of the registry.
 fn spawn_event_forwarder(
     handle: PeerHandle,
     events: broadcast::Sender<RegistryEvent>,
 ) {
+    let peer_id = handle.id().clone();
+    let mut peer_events = handle.subscribe();
+    // Drop the handle before the spawn so its inner broadcast Sender
+    // refcount is released. The Receiver we just took stays valid
+    // independently — broadcast Receivers can outlive every Sender,
+    // they just see `Closed` once all Senders drop.
+    drop(handle);
     tokio::spawn(async move {
-        let peer_id = handle.id().clone();
-        let mut peer_events = handle.subscribe();
         loop {
             match peer_events.recv().await {
                 Ok(event) => {
@@ -720,6 +734,62 @@ mod tests {
         );
 
         reg.remove_peer(&id).await.unwrap();
+        gateway.abort();
+    }
+
+    /// Regression guard for a leak in `spawn_event_forwarder`: an
+    /// earlier version captured the full `PeerHandle` in the spawn
+    /// closure, which kept the per-peer broadcast `Sender` alive
+    /// inside `PeerHandleInner`. The forwarder's `peer_events.recv()`
+    /// then never saw `RecvError::Closed` after the actor exited and
+    /// the registry dropped its handle — one stuck task per peer-add
+    /// over the registry's lifetime.
+    ///
+    /// Verifies the fix by subscribing to the peer's broadcast
+    /// independently, removing the peer, and asserting the receiver
+    /// observes `Closed` within a reasonable deadline. If the
+    /// forwarder were still holding a Sender, our independent
+    /// receiver would never see Closed and the timeout would fire.
+    #[tokio::test]
+    async fn event_forwarder_releases_handle_after_remove() {
+        let (port, gateway) = spawn_test_peer().await;
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let reg = PeerRegistry::new(log_tx);
+
+        let ws_url = format!("ws://127.0.0.1:{port}/ws");
+        let card = fake_card("leak-test", &ws_url);
+        let id = reg.add_peer_with_card(card).await.unwrap();
+
+        // Subscribe to the peer's broadcast directly, then drop our
+        // handle so we don't ourselves keep a Sender alive. The
+        // registry still holds one, plus the actor holds one.
+        let handle = reg.get(&id).expect("peer in registry");
+        let mut peer_events = handle.subscribe();
+        drop(handle);
+
+        // Removing the peer drops the registry's handle and signals
+        // the actor to disconnect. After the actor's run() exits
+        // (dropping its events_out_tx) and any forwarder task
+        // releases its handle, our independent receiver should see
+        // RecvError::Closed.
+        reg.remove_peer(&id).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match peer_events.recv().await {
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "broadcast did not close within 3s after remove — \
+             spawn_event_forwarder is leaking the PeerHandle"
+        );
+
         gateway.abort();
     }
 

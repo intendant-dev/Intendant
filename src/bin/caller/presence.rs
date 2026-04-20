@@ -850,6 +850,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         AppEvent::RoundComplete {
             round,
             turns_in_round,
+            ..
         } => Some(PresenceEvent::RoundComplete {
             round: *round,
             turns_in_round: *turns_in_round,
@@ -958,6 +959,8 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::RolledBack { .. }
         | AppEvent::Redone { .. }
         | AppEvent::HistoryPruned { .. }
+        | AppEvent::ConversationRollbackRequested { .. }
+        | AppEvent::ConversationRolledBack { .. }
         // Mid-turn steering telemetry is UI-facing — presence doesn't
         // narrate these (the worker's next model response will reflect
         // the effect of the steer, which we already surface).
@@ -1273,6 +1276,7 @@ mod tests {
         let event = AppEvent::RoundComplete {
             round: 1,
             turns_in_round: 5,
+            native_message_count: None,
         };
         assert!(filter_event(&event, &mut last_phase).is_some());
 
@@ -1308,6 +1312,7 @@ mod tests {
         let event = AppEvent::RoundComplete {
             round: 1,
             turns_in_round: 5,
+            native_message_count: None,
         };
         assert!(filter_event(&event, &mut last_phase).is_some());
     }

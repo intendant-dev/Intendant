@@ -641,6 +641,92 @@ html, body {
 }
 .daemons-status.error { color: var(--red); }
 .daemons-status.ok { color: var(--green); }
+/* Coordinator panel — sibling of the Daemons panel. Two stacked
+   sub-sections: "Find eligible peers" (GET /api/peers/eligible) and
+   "Route a task" (POST /api/coordinator/route). Looks like a
+   per-peer .daemon-controls panel but lives at the panel level
+   rather than inside a daemon entry, since routing is global. */
+.coord-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: var(--mantle);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+}
+.coord-section-label {
+  font-size: 11px;
+  color: var(--subtext0);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 2px;
+}
+.coord-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.coord-row input {
+  flex: 1;
+  padding: 4px 8px;
+  background: var(--base);
+  border: 1px solid var(--surface2);
+  border-radius: 3px;
+  color: var(--text);
+  font-size: 12px;
+  min-width: 0;
+}
+.coord-row input:focus { outline: none; border-color: var(--blue); }
+.coord-row button {
+  padding: 4px 12px;
+  background: var(--blue);
+  color: var(--base);
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.coord-row button:hover { background: var(--sapphire); }
+.coord-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+.coord-textarea {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--base);
+  border: 1px solid var(--surface2);
+  border-radius: 3px;
+  color: var(--text);
+  font-size: 12px;
+  font-family: inherit;
+  resize: vertical;
+  box-sizing: border-box;
+}
+.coord-textarea:focus { outline: none; border-color: var(--blue); }
+.coord-route-hint {
+  flex: 1;
+  font-size: 11px;
+  color: var(--overlay1);
+}
+.coord-result {
+  font-size: 11px;
+  color: var(--subtext0);
+  min-height: 14px;
+}
+.coord-result.error { color: var(--red); }
+.coord-result.ok { color: var(--green); }
+.coord-result .coord-peer {
+  display: block;
+  padding: 3px 0;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}
+.coord-result .coord-peer-id { color: var(--text); }
+.coord-result .coord-considered {
+  color: var(--overlay1);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  margin-left: 8px;
+}
 .settings-row input[type="password"] {
   flex: 1;
   padding: 6px 10px;
@@ -1910,6 +1996,68 @@ html, body {
   align-items: center;
   justify-content: space-between;
 }
+
+/* ── Rollback modal ──
+   Local modal pattern for rollback confirmation with files/conversation
+   checkboxes. Uses Catppuccin Mocha theme variables so it follows the
+   rest of the dashboard. Escape key closes it (see global keydown handler). */
+.modal-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 1000;
+}
+.modal-dialog {
+  background: var(--base);
+  border: 1px solid var(--surface1);
+  border-radius: 8px;
+  padding: 24px;
+  min-width: 420px;
+  max-width: 560px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+}
+.modal-dialog h3 {
+  margin: 0 0 12px;
+  color: var(--text);
+}
+.modal-description { color: var(--subtext0); margin-bottom: 12px; }
+.modal-checkbox {
+  display: block;
+  padding: 10px 8px;
+  border: 1px solid var(--surface0);
+  border-radius: 4px;
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+.modal-checkbox:hover { background: var(--surface0); }
+.modal-checkbox input { margin-right: 8px; vertical-align: middle; }
+.modal-checkbox span { color: var(--text); font-weight: 600; }
+.modal-checkbox small { display: block; color: var(--subtext0); margin-left: 24px; margin-top: 4px; }
+.modal-warning {
+  background: var(--surface0);
+  color: var(--yellow);
+  border-left: 3px solid var(--yellow);
+  padding: 8px 12px;
+  margin: 12px 0;
+  font-size: 12px;
+  border-radius: 2px;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+.modal-cancel, .modal-confirm {
+  padding: 6px 16px;
+  border-radius: 4px;
+  border: none;
+  cursor: pointer;
+  font-weight: 600;
+}
+.modal-cancel { background: var(--surface1); color: var(--text); }
+.modal-confirm { background: var(--red); color: var(--base); }
+.modal-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ── Control sub-tab ── */
 .control-pane-body {
@@ -4231,6 +4379,35 @@ html, body {
               </div>
               <span id="daemons-status" class="daemons-status"></span>
             </fieldset>
+
+            <fieldset class="settings-group">
+              <legend>Coordinator</legend>
+              <p style="color:var(--subtext0);font-size:12px;margin:0 0 10px">
+                Capability-based discovery and task routing across all connected peers. Capabilities are kebab-case (<code style="color:var(--blue)">display</code>, <code style="color:var(--blue)">computer-use</code>, <code style="color:var(--blue)">task-delegation</code>, …) plus <code style="color:var(--blue)">custom:&lt;name&gt;</code>. Separate multiple with commas or spaces.
+              </p>
+
+              <div class="coord-section">
+                <div class="coord-section-label">Find eligible peers</div>
+                <div class="coord-row">
+                  <input id="coord-eligible-caps" type="text" placeholder="display, computer-use" autocomplete="off">
+                  <button id="coord-eligible-btn" type="button">Find</button>
+                </div>
+                <div id="coord-eligible-result" class="coord-result"></div>
+              </div>
+
+              <div class="coord-section">
+                <div class="coord-section-label">Route a task</div>
+                <div class="coord-row">
+                  <input id="coord-route-caps" type="text" placeholder="display, computer-use" autocomplete="off">
+                </div>
+                <textarea id="coord-route-instructions" class="coord-textarea" placeholder="Instructions for the chosen peer…" rows="3"></textarea>
+                <div class="coord-row">
+                  <button id="coord-route-btn" type="button">Route</button>
+                  <span class="coord-route-hint">Routes to the lexicographically-first peer that satisfies all required capabilities. Cmd/Ctrl+Enter in the textarea also fires.</span>
+                </div>
+                <div id="coord-route-result" class="coord-result"></div>
+              </div>
+            </fieldset>
           </div>
         </div>
 
@@ -4280,6 +4457,34 @@ html, body {
   <div class="video-preview-info">
     <span class="frame-id" id="videoFrameId">--</span>
     <span id="videoFps">0 fps</span>
+  </div>
+</div>
+
+<!-- Rollback confirmation modal.
+     Opened by the timeline strip (Changes sub-tab) with two checkboxes
+     so the user can pick whether to revert files, the conversation, or
+     both. Wired up in the Timeline section below. -->
+<div id="rollback-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog">
+    <h3>Roll back to round <span id="rollback-round-label"></span></h3>
+    <p class="modal-description">
+      Choose what to revert:
+    </p>
+    <label class="modal-checkbox">
+      <input type="checkbox" id="rollback-files" checked>
+      <span>Revert files</span>
+      <small>Restore all changed files to their state at this round</small>
+    </label>
+    <label class="modal-checkbox">
+      <input type="checkbox" id="rollback-conversation">
+      <span>Revert conversation</span>
+      <small>Truncate the agent's memory to this round. For Claude Code and Gemini, this resets the session (loses all context).</small>
+    </label>
+    <div class="modal-warning" id="rollback-warning" style="display:none"></div>
+    <div class="modal-actions">
+      <button class="modal-cancel" onclick="closeRollbackModal()">Cancel</button>
+      <button class="modal-confirm" id="rollback-confirm-btn" onclick="confirmRollback()">Roll back</button>
+    </div>
   </div>
 </div>
 
@@ -4474,10 +4679,12 @@ let activeStatsHost = '';
 
 // Multi-host: list of configured secondary daemons. Each entry:
 //   { host_id, label, url, connected }
-// Stored in localStorage under DAEMONS_KEY. Registered with the WASM
-// app via `app.add_secondary_host(host_id, label, wss_url)`. The self
-// host (the daemon serving app.html) is not stored here — it's
-// implicit and always rendered first in the UI.
+// Hydrated from `GET /api/peers` — the server-side PeerRegistry is
+// the single source of truth. Per-peer events flow through the
+// primary `/ws` push pipeline tagged with `host_id`; the browser
+// no longer opens its own WebSocket per secondary. The self host
+// (the daemon serving app.html) isn't in this list — it's implicit
+// and always rendered first in the UI.
 const DAEMONS_KEY = 'intendant_daemons';
 let daemons = [];
 
@@ -5084,15 +5291,6 @@ async function main() {
     if (cmds) processCommands(cmds);
   });
 
-  // Multi-host: callbacks for secondary daemon connections. Settings
-  // panel registers each secondary via `app.add_secondary_host(...)`.
-  app.set_on_secondary_state((hostId, connected) => {
-    handleSecondaryState(hostId, connected);
-  });
-  app.set_on_secondary_event((hostId, msg) => {
-    handleSecondaryEvent(hostId, msg);
-  });
-
   app.set_on_error((msg) => {
     if (!msg.startsWith('Server')) {
       if (modelConnected) voiceHadPriorSession = true;
@@ -5452,12 +5650,48 @@ function processCommands(cmds) {
       // funnel through the shared upsert/remove helpers — one code path
       // applies API entries and pushed deltas identically.
       case 'peer_added': upsertDaemonFromSnapshot(c.peer); break;
-      case 'peer_state_changed': upsertDaemonFromSnapshot(c.peer); break;
+      // peer_state_changed must NOT insert an unknown id — see
+      // updateDaemonSnapshot for why (race with remove_peer's
+      // trailing observer events).
+      case 'peer_state_changed': updateDaemonSnapshot(c.peer); break;
       case 'peer_removed': removeDaemonById(c.id); break;
       // Mid-turn steer lifecycle: pending (just sent), queued (backend
       // couldn't deliver mid-turn), delivered (agent got it).
       case 'steer_status_update':
         onSteerStatusUpdate(c.id, c.text, c.status, c.reason);
+        break;
+      // Per-peer event stream (phase B of the secondary migration).
+      // Each command carries `host_id` as a typed field so we route
+      // straight to the per-peer surfaces without the legacy
+      // `c.host_id = hostId` mutation hack from the secondary path.
+      case 'peer_log':
+        renderLogEntry({
+          cmd: 'add_log_entry',
+          host_id: c.host_id,
+          ts: c.ts,
+          level: c.level,
+          source: c.source,
+          content: c.content,
+        });
+        break;
+      case 'peer_usage': {
+        // Translate the lean PeerEvent::Usage snapshot into the
+        // legacy UpdateUsage shape that the Stats tab's existing
+        // renderer (renderUsageTab) consumes. Same cache + render
+        // call as the secondary path used to do, but sourced from
+        // the push pipeline. This is what closes out phase B by
+        // making Stats per-peer work without the WASM secondary
+        // connection.
+        const fakeUsage = peerSnapshotToUpdateUsage(c.snapshot);
+        hostStatsCache.set(c.host_id, fakeUsage);
+        if (activeStatsHost === c.host_id) renderUsageTab(fakeUsage);
+        break;
+      }
+      case 'peer_approval_requested':
+        addPendingApproval(c.host_id, c.id, c.command, c.category);
+        break;
+      case 'peer_approval_resolved':
+        removePendingApproval(c.host_id, c.id);
         break;
     }
   }
@@ -5627,28 +5861,115 @@ function renderTimeline() {
   }
 }
 
-async function doRollback(roundId) {
+// Clicking a round in the timeline strip routes here, which opens the
+// rollback modal rather than immediately POSTing. The modal lets the user
+// pick whether to revert files, the conversation, or both — the actual
+// request is built and sent in confirmRollback() below.
+let pendingRollbackRoundId = null;
+
+function doRollback(roundId) {
   if (!Number.isFinite(roundId)) return;
-  const msg = `Roll back to round #${roundId}?\n\nFiles will be reverted to the snapshot at the end of that round. `
-    + `Later rounds are preserved and can be restored via Redo or from Abandoned branches.`;
-  if (!confirm(msg)) return;
-  try {
-    const r = await fetch('/api/session/current/rollback', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ round_id: roundId }),
-    });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      alert(`Rollback failed: ${err.error || r.statusText}`);
-      return;
-    }
-    // The `rolled_back` WS event will trigger refreshHistory().
-  } catch (e) {
-    alert(`Rollback error: ${e.message || e}`);
-  }
+  openRollbackModal(roundId, `#${roundId}`);
 }
 window.doRollback = doRollback;
+
+function openRollbackModal(roundId, roundLabel) {
+  pendingRollbackRoundId = roundId;
+  const labelEl = document.getElementById('rollback-round-label');
+  if (labelEl) {
+    // Accept either a pre-formatted label or fall back to a short id.
+    const fallback = typeof roundId === 'string' ? roundId.substring(0, 8) : String(roundId);
+    labelEl.textContent = roundLabel || fallback;
+  }
+  const filesBox = document.getElementById('rollback-files');
+  const convBox = document.getElementById('rollback-conversation');
+  if (filesBox) filesBox.checked = true;
+  if (convBox) convBox.checked = false;
+  updateRollbackWarning();
+  const modal = document.getElementById('rollback-modal');
+  if (modal) modal.style.display = 'flex';
+}
+window.openRollbackModal = openRollbackModal;
+
+function closeRollbackModal() {
+  pendingRollbackRoundId = null;
+  const modal = document.getElementById('rollback-modal');
+  if (modal) modal.style.display = 'none';
+}
+window.closeRollbackModal = closeRollbackModal;
+
+function updateRollbackWarning() {
+  const filesEl = document.getElementById('rollback-files');
+  const convEl = document.getElementById('rollback-conversation');
+  const warn = document.getElementById('rollback-warning');
+  const btn = document.getElementById('rollback-confirm-btn');
+  if (!filesEl || !convEl || !warn || !btn) return;
+  const files = filesEl.checked;
+  const conv = convEl.checked;
+  if (!files && !conv) {
+    warn.textContent = 'Select at least one option to roll back.';
+    warn.style.display = '';
+    btn.disabled = true;
+  } else if (conv && !files) {
+    warn.innerHTML = '\u26A0 Reverting conversation without files: the agent will forget what it did, but the file changes remain. Agent may hallucinate about code state.';
+    warn.style.display = '';
+    btn.disabled = false;
+  } else if (files && !conv) {
+    warn.innerHTML = '\u26A0 Reverting files without conversation: the agent thinks changes are still applied but they\'re gone. May cause confusion on next turn.';
+    warn.style.display = '';
+    btn.disabled = false;
+  } else {
+    warn.style.display = 'none';
+    btn.disabled = false;
+  }
+}
+window.updateRollbackWarning = updateRollbackWarning;
+
+// Wire the live warning/disable logic to the checkboxes. The elements live
+// in the static modal markup above, so we can bind once at script load.
+{
+  const filesEl = document.getElementById('rollback-files');
+  const convEl = document.getElementById('rollback-conversation');
+  if (filesEl) filesEl.addEventListener('change', updateRollbackWarning);
+  if (convEl) convEl.addEventListener('change', updateRollbackWarning);
+}
+
+async function confirmRollback() {
+  if (pendingRollbackRoundId === null || pendingRollbackRoundId === undefined) return;
+  const roundId = pendingRollbackRoundId;
+  const revertFiles = document.getElementById('rollback-files').checked;
+  const revertConv = document.getElementById('rollback-conversation').checked;
+  closeRollbackModal();
+  try {
+    const resp = await fetch('/api/session/current/rollback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        round_id: roundId,
+        revert_files: revertFiles,
+        revert_conversation: revertConv,
+      }),
+    });
+    if (!resp.ok) {
+      // Prefer the structured {error} shape the server already uses for
+      // this endpoint; fall back to raw text for unexpected error bodies.
+      let errMsg = resp.statusText;
+      try {
+        const j = await resp.clone().json();
+        if (j && j.error) errMsg = j.error;
+      } catch (_) {
+        const t = await resp.text().catch(() => '');
+        if (t) errMsg = t;
+      }
+      alert(`Rollback failed: ${errMsg}`);
+    }
+    // Success: backend emits `rolled_back` / `conversation_rolled_back`
+    // events, the WASM layer raises HistoryChanged, and the UI refreshes.
+  } catch (e) {
+    alert(`Rollback failed: ${e.message || e}`);
+  }
+}
+window.confirmRollback = confirmRollback;
 
 async function doRedo() {
   try {
@@ -10428,6 +10749,59 @@ function wsUrlToBaseUrl(wsUrl) {
 /// the server-side PeerRegistry owns the peer list now.
 // Build a local daemon entry from a server-side `PeerSnapshot`. The
 // snapshot shape is the same whether it arrives via `GET /api/peers`
+// Translate the lean PeerEvent::Usage snapshot into the legacy
+// UpdateUsage shape that renderUsageTab expects.
+//
+// The PeerEvent vocabulary deliberately omits some fields that the
+// local Stats renderer relies on (notably `context_window`, which a
+// peer's UsageSnapshot doesn't carry). For those we substitute a
+// generous placeholder so the percentage bar renders without
+// dividing by zero — token counts and per-model breakdown stay
+// accurate, only the bar's pct is approximate. When better fidelity
+// is needed for a peer, that peer's own dashboard is the
+// authoritative source.
+const PEER_USAGE_PLACEHOLDER_CONTEXT = 200000;
+function peerSnapshotToUpdateUsage(snap) {
+  if (!snap || typeof snap !== 'object') snap = {};
+  const tokensIn = snap.tokens_in || 0;
+  const tokensOut = snap.tokens_out || 0;
+  const cached = snap.tokens_cached || 0;
+  const tokensUsed = tokensIn + tokensOut;
+  const firstModel = (Array.isArray(snap.by_model) && snap.by_model[0]) || {};
+  const mainData = {
+    provider: firstModel.provider || 'peer',
+    model: firstModel.model || '?',
+    prompt_tokens: tokensIn,
+    completion_tokens: tokensOut,
+    cached_tokens: cached,
+    tokens_used: tokensUsed,
+    context_window: PEER_USAGE_PLACEHOLDER_CONTEXT,
+    usage_pct: (tokensUsed / PEER_USAGE_PLACEHOLDER_CONTEXT) * 100,
+  };
+  let costJson = null;
+  if (snap.cost_usd != null) {
+    costJson = JSON.stringify({
+      lines: [
+        {
+          label: `${mainData.provider} / ${mainData.model}`,
+          cost: snap.cost_usd,
+          input_cost: 0,
+          output_cost: 0,
+        },
+      ],
+      total: snap.cost_usd,
+    });
+  }
+  return {
+    cmd: 'update_usage',
+    main_json: JSON.stringify(mainData),
+    presence_json: null,
+    live_json: null,
+    cost_json: costJson,
+    history_json: null,
+  };
+}
+
 // (full list) or via a pushed `peer_added` / `peer_state_changed`
 // event, so this is the single construction point for both surfaces.
 function snapshotToDaemonEntry(p) {
@@ -10449,6 +10823,12 @@ function snapshotToDaemonEntry(p) {
 // matching entry, or insert a new one. New entries also open a WASM
 // secondary connection so per-peer live events flow without waiting
 // for the next /api/peers refresh.
+//
+// Used for `peer_added` events. For `peer_state_changed` use
+// `updateDaemonSnapshot` instead — that variant must not insert
+// unknown ids, since the per-peer state observer can race a remove
+// and emit a trailing PeerStateChanged after the registry has already
+// dropped the peer (and after the browser has already removed the row).
 function upsertDaemonFromSnapshot(snap) {
   if (!snap || !snap.id) return;
   const entry = snapshotToDaemonEntry(snap);
@@ -10457,10 +10837,19 @@ function upsertDaemonFromSnapshot(snap) {
     daemons[idx] = entry;
   } else {
     daemons.push(entry);
-    if (entry.ws_url && app && app.add_secondary_host) {
-      app.add_secondary_host(entry.host_id, entry.label, entry.ws_url);
-    }
   }
+  renderDaemonsList();
+}
+
+// Update an existing daemon entry from a pushed PeerSnapshot. Unknown
+// ids are ignored — they're stale state pushes from a removed peer's
+// observer racing the disconnect, and inserting them would resurrect
+// the row the user just dismissed.
+function updateDaemonSnapshot(snap) {
+  if (!snap || !snap.id) return;
+  const idx = daemons.findIndex(d => d.host_id === snap.id);
+  if (idx < 0) return;
+  daemons[idx] = snapshotToDaemonEntry(snap);
   renderDaemonsList();
 }
 
@@ -10472,9 +10861,6 @@ function removeDaemonById(id) {
   const idx = daemons.findIndex(d => d.host_id === id);
   if (idx < 0) return;
   daemons.splice(idx, 1);
-  if (app && app.remove_secondary_host) {
-    app.remove_secondary_host(id);
-  }
   // Drop the expanded-state record so it doesn't get reapplied
   // against a row that no longer exists. Same for any pending
   // approvals — once the peer is gone there's nothing to resolve.
@@ -10495,27 +10881,9 @@ async function refreshPeersFromApi() {
     // the push-event path stay identical.
     const newDaemons = data.peers.map(snapshotToDaemonEntry);
 
-    // Diff against the current daemons list to figure out which
-    // WASM connections to add, remove, or leave alone. Stable
-    // by host_id so reconnects and re-fetches don't thrash the
-    // existing WS connections.
-    const currentIds = new Set(daemons.map(d => d.host_id));
-    const newIds = new Set(newDaemons.map(d => d.host_id));
-
-    // Remove peers no longer in the server list.
-    for (const d of daemons) {
-      if (!newIds.has(d.host_id)) {
-        if (app && app.remove_secondary_host) app.remove_secondary_host(d.host_id);
-      }
-    }
-
-    // Add peers newly in the server list.
-    for (const d of newDaemons) {
-      if (!currentIds.has(d.host_id) && d.ws_url) {
-        if (app && app.add_secondary_host) app.add_secondary_host(d.host_id, d.label, d.ws_url);
-      }
-    }
-
+    // The local snapshot replaces the previous one wholesale —
+    // no per-peer add/remove plumbing to maintain anymore now that
+    // per-peer events come through the primary /ws push pipeline.
     daemons = newDaemons;
     renderDaemonsList();
   } catch (e) {
@@ -10905,9 +11273,16 @@ async function resolvePeerApproval(hostId, approvalId, decision) {
   if (!hostId || !approvalId || !decision) return;
   // Disable all buttons in the row to prevent double-click while
   // the POST is in flight. Re-enable on failure so the user can retry.
-  const row = document.querySelector(
-    `#daemon-controls-${hostId} .daemon-approval-row[data-approval-id="${CSS.escape(approvalId)}"]`
-  );
+  //
+  // Look up the panel via getElementById (the id field permits
+  // colons, e.g. `daemon-controls-intendant:alpha`) and then scope
+  // the data-attribute query to the panel — embedding the id in a
+  // CSS selector would parse the colon as a pseudo-class prefix and
+  // throw a SyntaxError before the fetch() ever fires.
+  const panel = document.getElementById(`daemon-controls-${hostId}`);
+  const row = panel
+    ? panel.querySelector(`.daemon-approval-row[data-approval-id="${CSS.escape(approvalId)}"]`)
+    : null;
   if (row) row.querySelectorAll('button').forEach(b => b.disabled = true);
   try {
     const resp = await fetch(`/api/peers/${hostId}/approval`, {
@@ -11090,19 +11465,139 @@ async function removeDaemon(hostId) {
       body: JSON.stringify({ peer_id: hostId }),
     });
   } catch { /* best-effort */ }
-  if (app && app.remove_secondary_host) app.remove_secondary_host(hostId);
   await refreshPeersFromApi();
   setDaemonsStatus(`Removed ${hostId}`, '');
 }
 
-function registerDaemonWithWasm(entry) {
-  if (!app || !app.add_secondary_host) return;
-  // Prefer ws_url from the API response (already a WS URL from
-  // the card's transport spec). Fall back to deriving from the
-  // HTTP base URL for older code paths.
-  const wsUrl = entry.ws_url || baseToWsUrl(entry.url);
-  if (!wsUrl) return;
-  app.add_secondary_host(entry.host_id, entry.label, wsUrl);
+// Parse a capability list string ("display, computer-use, custom:foo")
+// into the array form the coordinator endpoints expect. Whitespace and
+// commas are both separators; empty entries are dropped.
+function parseCapabilityList(text) {
+  return String(text || '')
+    .split(/[\s,]+/)
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+}
+
+// Find the connected peers that satisfy all listed capabilities.
+// GET /api/peers/eligible?capability=display&capability=computer-use
+// returns {peers: [PeerSnapshot]} on 200; 400 on missing/unknown
+// capability with {error, hint?}.
+async function findEligiblePeers() {
+  const input = document.getElementById('coord-eligible-caps');
+  const btn = document.getElementById('coord-eligible-btn');
+  const out = document.getElementById('coord-eligible-result');
+  if (!input || !out) return;
+
+  const caps = parseCapabilityList(input.value);
+  if (caps.length === 0) {
+    out.textContent = 'Enter at least one capability.';
+    out.className = 'coord-result error';
+    return;
+  }
+
+  btn.disabled = true;
+  out.textContent = 'Searching…';
+  out.className = 'coord-result';
+  const query = caps.map(c => `capability=${encodeURIComponent(c)}`).join('&');
+  try {
+    const resp = await fetch(`/api/peers/eligible?${query}`);
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const msg = result.error || `HTTP ${resp.status}`;
+      const hint = result.hint ? ` (${result.hint})` : '';
+      out.textContent = `Failed: ${msg}${hint}`;
+      out.className = 'coord-result error';
+      return;
+    }
+    const peers = Array.isArray(result.peers) ? result.peers : [];
+    if (peers.length === 0) {
+      out.textContent = `No connected peer satisfies: ${caps.join(', ')}.`;
+      out.className = 'coord-result';
+      return;
+    }
+    out.className = 'coord-result ok';
+    out.innerHTML =
+      `<div>Found ${peers.length} eligible peer${peers.length === 1 ? '' : 's'}:</div>` +
+      peers
+        .map(p => {
+          const id = escapeHtml(p.host_id || p.id || '');
+          const label = escapeHtml(p.label || p.host_id || p.id || '');
+          return `<span class="coord-peer"><span class="coord-peer-id">${label}</span> <span class="coord-considered">${id}</span></span>`;
+        })
+        .join('');
+  } catch (e) {
+    out.textContent = `Error: ${e.message}`;
+    out.className = 'coord-result error';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Delegate a task to whichever connected peer satisfies all required
+// capabilities. POST /api/coordinator/route returns {peer_id, task_id}
+// on 200; 404 on no-route with {error, considered: [peer_id]}; 502 on
+// delegation failure with {error, peer_id}.
+async function routeTask() {
+  const capsInput = document.getElementById('coord-route-caps');
+  const instrInput = document.getElementById('coord-route-instructions');
+  const btn = document.getElementById('coord-route-btn');
+  const out = document.getElementById('coord-route-result');
+  if (!capsInput || !instrInput || !out) return;
+
+  const caps = parseCapabilityList(capsInput.value);
+  const instructions = instrInput.value.trim();
+  if (caps.length === 0) {
+    out.textContent = 'Enter at least one required capability.';
+    out.className = 'coord-result error';
+    return;
+  }
+  if (!instructions) {
+    out.textContent = 'Enter task instructions.';
+    out.className = 'coord-result error';
+    return;
+  }
+
+  btn.disabled = true;
+  out.textContent = 'Routing…';
+  out.className = 'coord-result';
+  try {
+    const resp = await fetch('/api/coordinator/route', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        required_capabilities: caps,
+        task: { instructions },
+      }),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+      out.className = 'coord-result ok';
+      out.innerHTML =
+        `Routed to <span class="coord-peer-id">${escapeHtml(result.peer_id || '?')}</span> ` +
+        `(task id <span class="coord-peer-id">${escapeHtml(result.task_id || '?')}</span>).`;
+      instrInput.value = '';
+    } else if (resp.status === 404 && Array.isArray(result.considered)) {
+      out.className = 'coord-result error';
+      const considered = result.considered;
+      out.innerHTML =
+        `No connected peer satisfies all required capabilities.` +
+        (considered.length === 0
+          ? ` (No peers connected.)`
+          : `<div>Considered:${considered
+              .map(p => `<span class="coord-considered">${escapeHtml(p)}</span>`)
+              .join('')}</div>`);
+    } else {
+      const msg = result.error || `HTTP ${resp.status}`;
+      out.textContent = `Failed: ${msg}`;
+      out.className = 'coord-result error';
+    }
+  } catch (e) {
+    out.textContent = `Error: ${e.message}`;
+    out.className = 'coord-result error';
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function initDaemons() {
@@ -11125,92 +11620,27 @@ async function initDaemons() {
   document.getElementById('daemon-add-label').addEventListener('keydown', e => {
     if (e.key === 'Enter') addDaemon();
   });
-}
 
-function handleSecondaryState(hostId, connected) {
-  const d = daemons.find(e => e.host_id === hostId);
-  if (!d) return;
-  const wasConnected = d.connected;
-  d.connected = connected;
-  renderDaemonsList();
-
-  // On (re)connect, refresh the peer list from the server so the
-  // version, git SHA, capabilities, and connection_state pick up
-  // whatever the remote is actually running right now. The server's
-  // PeerRegistry already re-fetched the card during its own connect
-  // handshake; we just pull the updated snapshot.
-  if (connected && !wasConnected) {
-    refreshPeersFromApi();
-  }
-}
-
-// Route a secondary-daemon event through its per-host AppState on the
-// Rust/WASM side so it gets the same formatting path as the primary
-// (command_result extraction, agent_output parsing, screenshot
-// decoding, verbosity filtering). Returned UiCommands are filtered
-// to the log-rendering subset and tagged with the host_id before
-// being rendered — side-effects of other command types (status bar,
-// approvals, usage, display lifecycle) would stomp the primary's own
-// state and are deliberately dropped.
-function handleSecondaryEvent(hostId, msg) {
-  if (!app || !app.handle_secondary_message) return;
-
-  // Inspect the raw event before WASM processing for fields that the
-  // UiCommand layer flattens away. `approval_resolved` carries the
-  // resolved approval id, but the UiCommand it produces is the
-  // payload-less HideApproval — which can't tell us *which* approval
-  // was resolved. Drop the matching pending entry here so an external
-  // resolution (peer auto-approved, sibling dashboard resolved it)
-  // doesn't leave a stale row in our pending list.
-  if (msg && typeof msg === 'object' && msg.event === 'approval_resolved') {
-    if (msg.id != null) removePendingApproval(hostId, msg.id);
-  }
-
-  let cmds = app.handle_secondary_message(hostId, msg);
-  if (!cmds || !Array.isArray(cmds)) return;
-  for (const c of cmds) {
-    if (!c || !c.cmd) continue;
-    switch (c.cmd) {
-      case 'add_log_entry':
-        // Tag with the source host so the Activity badge and filter
-        // see it as belonging to the secondary.
-        c.host_id = hostId;
-        renderLogEntry(c);
-        break;
-      case 'add_turn_separator':
-        renderTurnSeparator(c.turn);
-        break;
-      case 'update_usage':
-        // Cache under the secondary's host_id so the Stats host picker
-        // can render it. Live-render only if the picker is currently
-        // showing this host — otherwise it'd stomp whatever the user
-        // is viewing.
-        hostStatsCache.set(hostId, c);
-        if (activeStatsHost === hostId) renderUsageTab(c);
-        break;
-      case 'show_approval':
-        // Surface the approval in this peer's controls panel. The
-        // global approval surface (`hidePanel('approval-panel')` etc)
-        // is reserved for the local agent's approvals — secondaries
-        // route to the per-peer panel instead.
-        addPendingApproval(hostId, c.id, c.command, c.category);
-        break;
-      case 'hide_approval':
-        // Payload-less. Don't drain the entire pending list — the
-        // raw `approval_resolved` tap above (or the optimistic POST
-        // path) handles individual removals. Suppressed here.
-        break;
-      case 'clear_logs':
-        // Explicitly ignored: clearing the whole stream when a
-        // secondary resets would delete primary history too.
-        break;
-      default:
-        // Everything else (status_bar, displays, recordings,
-        // phase, badges, terminal data) is intentionally dropped —
-        // those tabs are primary-scoped in phase 1.
-        break;
+  // Wire the Coordinator panel. Sibling of the daemon-add wiring above:
+  // both belong to the Network settings pane and are wired here so the
+  // listeners attach exactly once after the DOM is ready.
+  document.getElementById('coord-eligible-btn').addEventListener('click', findEligiblePeers);
+  document.getElementById('coord-eligible-caps').addEventListener('keydown', e => {
+    if (e.key === 'Enter') findEligiblePeers();
+  });
+  document.getElementById('coord-route-btn').addEventListener('click', routeTask);
+  document.getElementById('coord-route-caps').addEventListener('keydown', e => {
+    if (e.key === 'Enter') routeTask();
+  });
+  // Cmd/Ctrl+Enter in the multi-line instructions textarea fires Route
+  // — plain Enter is reserved for newlines so the user can format the
+  // instructions across multiple lines.
+  document.getElementById('coord-route-instructions').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      routeTask();
     }
-  }
+  });
 }
 
 // ── Activity host filter ──
@@ -11275,10 +11705,11 @@ function applyHostFilter() {
 // ── Stats host picker ──
 //
 // Dropdown at the top of the Stats tab switches between the primary's
-// usage/cost/history view and each configured secondary's. Payloads
-// are captured from `update_usage` commands as they flow in (primary
-// via processCommands, secondaries via handleSecondaryEvent) so switching
-// is instant from cache.
+// usage/cost/history view and each configured peer's. Payloads are
+// captured from `update_usage` commands (primary) and `peer_usage`
+// commands translated through `peerSnapshotToUpdateUsage` (peers)
+// as they flow in via processCommands, so switching is instant from
+// cache.
 
 function isStatsShowingSelf() {
   return !activeStatsHost || activeStatsHost === selfPeerId;
@@ -12871,6 +13302,20 @@ document.addEventListener('click', (e) => {
 });
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && displayPickerVisible) hideDisplayPicker();
+});
+
+// Rollback modal: Escape closes, click on the backdrop (outside the
+// dialog) also closes — follows the same dismissal pattern as the
+// display picker so keyboard flows feel consistent.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const modal = document.getElementById('rollback-modal');
+  if (modal && modal.style.display !== 'none') {
+    closeRollbackModal();
+  }
+});
+document.getElementById('rollback-modal')?.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'rollback-modal') closeRollbackModal();
 });
 
 // Enter to submit
