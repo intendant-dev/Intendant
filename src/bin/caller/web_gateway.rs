@@ -2030,6 +2030,21 @@ pub fn spawn_web_gateway(
     // can't easily set headers on `WebSocket` opens) which lands in
     // slice 2d.
     inbound_bearer_token: Option<String>,
+    // What to advertise in the local Agent Card's `auth` field —
+    // tells connecting peers what wire-layer (transport) and
+    // application-layer (bearer) auth they need to satisfy.
+    // Built by `crate::main::build_local_advertised_auth` from
+    // `[server.auth] advertised_transport` (`"none"` /
+    // `"mutual-tls"` / `"pin-self-cert"`) and
+    // `[server.auth] bearer_token`. The `pin-self-cert` path reads
+    // the daemon's own `server.crt` from the LAN cert dir and
+    // pre-fills the fingerprint so operators don't have to compute
+    // it manually.
+    //
+    // Test call sites pass `AuthRequirements::none()` since they
+    // don't exercise the advertise path; production call sites in
+    // main.rs build the requirements from the project config.
+    local_card_auth: crate::peer::AuthRequirements,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -2043,7 +2058,7 @@ pub fn spawn_web_gateway(
     // — the connecting peer probes them in order.
     let advertise_urls =
         resolve_advertise_urls(listener.local_addr().ok(), &advertise_urls);
-    let agent_card = build_local_agent_card(advertise_urls);
+    let agent_card = build_local_agent_card(advertise_urls, local_card_auth);
     let agent_card_json =
         serde_json::to_string(&agent_card).unwrap_or_else(|_| "{}".to_string());
 
@@ -6261,8 +6276,20 @@ fn format_ws_url(host: &str, port: u16) -> String {
 /// Built by [`resolve_advertise_urls`], which merges operator
 /// overrides (`--advertise-url`, `[server.advertise]`) with auto-
 /// detected fallback. The list is non-empty by construction.
-pub fn build_local_agent_card(advertise_urls: Vec<String>) -> crate::peer::AgentCard {
-    use crate::peer::{AuthRequirements, Capability, TransportSpec};
+///
+/// `auth` is the [`crate::peer::AuthRequirements`] to advertise —
+/// what connecting peers should send. Built by
+/// `crate::main::build_local_advertised_auth` from
+/// `[server.auth]` (advertised_transport + bearer_token) and the
+/// LAN cert dir (for `pin-self-cert` fingerprint). Phase 1 of slice
+/// 2c always passed `AuthRequirements::none()`; this signature
+/// change lets the operator advertise mTLS / pinned-mTLS / bearer
+/// in the card so connecting peers know what to send.
+pub fn build_local_agent_card(
+    advertise_urls: Vec<String>,
+    auth: crate::peer::AuthRequirements,
+) -> crate::peer::AgentCard {
+    use crate::peer::{Capability, TransportSpec};
     let transports: Vec<TransportSpec> = advertise_urls
         .into_iter()
         .map(|url| TransportSpec::IntendantWs { url })
@@ -6273,7 +6300,7 @@ pub fn build_local_agent_card(advertise_urls: Vec<String>) -> crate::peer::Agent
         Some(env!("INTENDANT_GIT_SHA").to_string()),
         transports,
         vec![Capability::ComputerUse, Capability::Knowledge],
-        AuthRequirements::none(),
+        auth,
     )
 }
 
@@ -6730,7 +6757,7 @@ mod tests {
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
 
         // Give it a moment to start
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -6749,7 +6776,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -6792,7 +6819,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx.clone(), config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx.clone(), config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -6860,6 +6887,7 @@ mod tests {
             peer_registry,
             Vec::new(),
             None,
+            crate::peer::AuthRequirements::none(),
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
@@ -6906,6 +6934,7 @@ mod tests {
             peer_registry,
             Vec::new(),
             bearer_token,
+            crate::peer::AuthRequirements::none(),
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
@@ -7986,7 +8015,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Plain HTTP GET
@@ -8030,7 +8059,7 @@ mod tests {
             ice_servers: Vec::new(),
             ..Default::default()
         };
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // GET /config
@@ -8076,6 +8105,7 @@ mod tests {
             WebGatewayConfig::default(),
             ActiveSessionState::empty(),
             None, None, None, None, None, None, Vec::new(), None,
+            crate::peer::AuthRequirements::none(),
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -8144,6 +8174,7 @@ mod tests {
             WebGatewayConfig::default(),
             ActiveSessionState::empty(),
             None, None, None, None, None, None, Vec::new(), None,
+            crate::peer::AuthRequirements::none(),
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -8250,7 +8281,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -8305,7 +8336,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -8363,7 +8394,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new(), None)
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none())
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -8422,7 +8453,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new(), None)
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none())
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -8491,7 +8522,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new(), None)
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none())
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -8566,7 +8597,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -8615,7 +8646,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -8668,7 +8699,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // POST /session without any API key env var set
@@ -8703,7 +8734,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
@@ -8740,7 +8771,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -8795,7 +8826,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -8864,7 +8895,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -8961,7 +8992,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -9033,7 +9064,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);

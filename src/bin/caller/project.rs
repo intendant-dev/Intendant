@@ -450,7 +450,7 @@ pub struct ServerConfig {
 /// What it does NOT configure: outbound auth credentials this daemon
 /// sends to other peers. Those live on each `[[peer]]` block as
 /// `bearer_token = "..."` and are sent when this daemon connects out.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerAuthConfig {
     /// When set, inbound HTTP and WebSocket requests must carry
     /// `Authorization: Bearer <token>` matching this exact value.
@@ -469,6 +469,57 @@ pub struct ServerAuthConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
+    /// What this daemon advertises in its Agent Card's
+    /// `auth.transport` field — tells connecting peers what wire-
+    /// layer auth to expect. Distinct from `bearer_token` which
+    /// covers application-layer auth.
+    ///
+    /// Accepted values:
+    ///
+    /// - `"none"` (default) — advertise no transport-layer
+    ///   requirement. Right for trusted-LAN federation behind a
+    ///   firewall.
+    /// - `"mutual-tls"` — advertise plain mTLS. Operator must have
+    ///   set up `intendant lan setup` so the nginx proxy actually
+    ///   enforces it. The card just announces the requirement;
+    ///   enforcement is at the proxy layer.
+    /// - `"pin-self-cert"` — advertise mTLS PLUS pin this daemon's
+    ///   server cert by SHA-256 fingerprint. Daemon reads its own
+    ///   `server.crt` from the LAN cert dir at startup, computes
+    ///   the fingerprint, and embeds it in the local card's
+    ///   `auth.transport = PinnedMutualTls` so connecting peers can
+    ///   verify against it without the operator having to compute
+    ///   and paste the fingerprint by hand. Fails startup if no
+    ///   `server.crt` exists (run `intendant lan setup` first).
+    ///
+    /// Example:
+    /// ```toml
+    /// [server.auth]
+    /// advertised_transport = "pin-self-cert"
+    /// ```
+    #[serde(default = "default_advertised_transport")]
+    pub advertised_transport: String,
+}
+
+/// Default value for [`ServerAuthConfig::advertised_transport`] —
+/// the no-transport-requirement advertise.
+fn default_advertised_transport() -> String {
+    "none".to_string()
+}
+
+impl Default for ServerAuthConfig {
+    /// Manual `Default` impl because the derived one would produce
+    /// `advertised_transport = ""` (via `String::default()`), which
+    /// `build_local_advertised_auth` rejects as invalid. The serde
+    /// `default = "default_advertised_transport"` attribute only
+    /// covers deserialization; programmatic construction (in tests
+    /// and elsewhere) uses this impl.
+    fn default() -> Self {
+        Self {
+            bearer_token: None,
+            advertised_transport: default_advertised_transport(),
+        }
+    }
 }
 
 /// A federated peer daemon advertised via `intendant.toml [[peer]]`.

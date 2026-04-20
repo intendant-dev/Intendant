@@ -136,6 +136,38 @@ fn regenerate_server_cert(cert_dir: &Path, lan_ip: &str) -> LanResult<()> {
     Ok(())
 }
 
+/// SHA-256 fingerprint of this daemon's local server cert, in
+/// the lowercase-hex format that
+/// [`crate::peer::transport::pinning::parse_fingerprint`] consumes.
+///
+/// Used by `[server.auth] advertised_transport = "pin-self-cert"`
+/// to auto-fill the local Agent Card's
+/// `auth.transport = PinnedMutualTls` field — operators don't have
+/// to compute the fingerprint by hand. Returns `None` when no
+/// `server.crt` is present in `cert_dir` (e.g. `intendant lan
+/// setup` hasn't been run yet); the caller treats `None` as a
+/// configuration error since `pin-self-cert` without a cert is
+/// nonsensical.
+///
+/// Reads the PEM cert, converts to DER, hashes via SHA-256.
+/// Same byte-for-byte hash a connecting peer's
+/// `PinnedFingerprintVerifier` will compute on the wire, so the
+/// pin matches.
+pub fn read_server_cert_fingerprint(cert_dir: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let cert = read_pem_cert(&cert_dir.join(SERVER_CRT)).ok()?;
+    let der = cert.to_der().ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&der);
+    let fp: [u8; 32] = hasher.finalize().into();
+    let mut s = String::with_capacity(64);
+    for byte in fp {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    Some(s)
+}
+
 /// Extract the current server cert's SAN IP (for drift detection).
 pub fn current_cert_ip(cert_dir: &Path) -> LanResult<String> {
     let cert = read_pem_cert(&cert_dir.join(SERVER_CRT))?;
@@ -424,6 +456,59 @@ mod tests {
         ensure_certs(tmp.path(), "10.0.0.42", "label", false).unwrap();
         let ip = current_cert_ip(tmp.path()).unwrap();
         assert_eq!(ip, "10.0.0.42");
+    }
+
+    /// `read_server_cert_fingerprint` returns `None` when no cert
+    /// is present. The caller (`build_local_advertised_auth`) treats
+    /// this as a configuration error for `pin-self-cert` since the
+    /// pin would be empty.
+    #[test]
+    fn read_server_cert_fingerprint_returns_none_when_no_cert() {
+        let tmp = TempDir::new().unwrap();
+        assert!(read_server_cert_fingerprint(tmp.path()).is_none());
+    }
+
+    /// `read_server_cert_fingerprint` returns a 64-char lowercase
+    /// hex string for an existing cert, matching the format
+    /// `parse_fingerprint` consumes. Same SHA-256 a connecting
+    /// peer's `PinnedFingerprintVerifier` will compute on the wire,
+    /// so the pin matches.
+    #[test]
+    fn read_server_cert_fingerprint_matches_pinning_format() {
+        let tmp = TempDir::new().unwrap();
+        ensure_certs(tmp.path(), "10.0.0.99", "fp-test", false).unwrap();
+
+        let fp = read_server_cert_fingerprint(tmp.path()).expect("cert exists");
+        assert_eq!(fp.len(), 64, "lowercase hex, no separators");
+        assert!(
+            fp.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "all chars must be lowercase hex, got: {fp}"
+        );
+        // Round-trips through the pinning parser — same byte sequence
+        // a connecting peer's verifier consumes.
+        let parsed =
+            crate::peer::transport::pinning::parse_fingerprint(&fp).unwrap();
+        let reformatted =
+            crate::peer::transport::pinning::format_fingerprint(&parsed);
+        assert_eq!(fp, reformatted);
+    }
+
+    /// `read_server_cert_fingerprint` is deterministic: same cert →
+    /// same fingerprint. Recerting (which writes a new cert) changes
+    /// the fingerprint.
+    #[test]
+    fn read_server_cert_fingerprint_changes_on_recert() {
+        let tmp = TempDir::new().unwrap();
+        ensure_certs(tmp.path(), "10.0.0.1", "label", false).unwrap();
+        let before = read_server_cert_fingerprint(tmp.path()).unwrap();
+
+        recert(tmp.path(), "10.0.0.2", false).unwrap();
+        let after = read_server_cert_fingerprint(tmp.path()).unwrap();
+
+        assert_ne!(
+            before, after,
+            "fingerprint must change when the cert is regenerated"
+        );
     }
 
     #[test]

@@ -81,6 +81,69 @@ fn slog(log: &SharedSessionLog, f: impl FnOnce(&mut session_log::SessionLog)) {
     }
 }
 
+/// Build the [`peer::AuthRequirements`] this daemon advertises in
+/// its own Agent Card from the project's `[server.auth]` config and
+/// the LAN cert dir.
+///
+/// Resolution rules:
+///
+/// - `transport`:
+///   - `advertised_transport = "none"` (default) → [`peer::TransportAuth::None`]
+///   - `"mutual-tls"` → [`peer::TransportAuth::MutualTls`]
+///   - `"pin-self-cert"` → read this daemon's own `server.crt` from
+///     the LAN cert dir, compute its SHA-256 fingerprint, embed it
+///     in [`peer::TransportAuth::PinnedMutualTls`]. Errors if no
+///     cert is present (operator forgot to run `intendant lan
+///     setup`).
+///   - any other value → config error
+/// - `application`:
+///   - `bearer_token = "..."` set → `Some(Bearer { hint, rotation_url: None })`
+///     where `hint` documents where the token comes from so peers
+///     can give operators a useful "configure me" message
+///   - unset → `None`
+///
+/// Called once per spawn_web_gateway invocation, at daemon startup.
+/// Errors propagate as `CallerError::Config` so the operator sees
+/// a clean startup failure rather than a silent misconfigure.
+fn build_local_advertised_auth(
+    server_auth: &project::ServerAuthConfig,
+    cert_dir: &std::path::Path,
+) -> Result<peer::AuthRequirements, CallerError> {
+    let transport = match server_auth.advertised_transport.as_str() {
+        "none" => peer::TransportAuth::None,
+        "mutual-tls" => peer::TransportAuth::MutualTls,
+        "pin-self-cert" => {
+            let fp = lan::certs::read_server_cert_fingerprint(cert_dir).ok_or_else(|| {
+                CallerError::Config(format!(
+                    "[server.auth] advertised_transport = \"pin-self-cert\" requires \
+                     a local server cert at {}/server.crt — run `intendant lan setup` \
+                     first, or change advertised_transport to \"none\" / \"mutual-tls\"",
+                    cert_dir.display()
+                ))
+            })?;
+            peer::TransportAuth::PinnedMutualTls {
+                server_cert_fingerprints: vec![fp],
+            }
+        }
+        other => {
+            return Err(CallerError::Config(format!(
+                "[server.auth] advertised_transport = {other:?} is not a valid value \
+                 (accepted: \"none\", \"mutual-tls\", \"pin-self-cert\")"
+            )));
+        }
+    };
+    let application = server_auth.bearer_token.as_ref().map(|_| {
+        peer::ApplicationAuth::Bearer {
+            hint: Some("[server.auth] bearer_token".to_string()),
+            rotation_url: None,
+        }
+    });
+    Ok(peer::AuthRequirements {
+        transport,
+        application,
+    })
+}
+
 /// Resolve the advertise-URL list passed to `spawn_web_gateway`,
 /// applying CLI > config > auto-detect precedence.
 ///
@@ -2319,6 +2382,137 @@ fn normalize_command_batch(json_str: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `build_local_advertised_auth` with the default config (all
+    /// `[server.auth]` fields unset) produces `AuthRequirements::none()`
+    /// — the conservative default that doesn't advertise any auth.
+    /// Doesn't touch the cert dir at all; safe to run with no LAN
+    /// setup.
+    #[test]
+    fn build_local_advertised_auth_defaults_to_none() {
+        let server_auth = project::ServerAuthConfig::default();
+        let cert_dir = std::path::PathBuf::from("/nonexistent");
+        let auth = build_local_advertised_auth(&server_auth, &cert_dir).unwrap();
+        assert_eq!(auth, peer::AuthRequirements::none());
+    }
+
+    /// `advertised_transport = "mutual-tls"` advertises plain mTLS.
+    /// Doesn't read the cert dir (no fingerprint to compute).
+    #[test]
+    fn build_local_advertised_auth_mutual_tls_no_cert_lookup() {
+        let server_auth = project::ServerAuthConfig {
+            bearer_token: None,
+            advertised_transport: "mutual-tls".to_string(),
+        };
+        let cert_dir = std::path::PathBuf::from("/nonexistent");
+        let auth = build_local_advertised_auth(&server_auth, &cert_dir).unwrap();
+        assert!(matches!(auth.transport, peer::TransportAuth::MutualTls));
+        assert!(auth.application.is_none());
+    }
+
+    /// `advertised_transport = "pin-self-cert"` reads the LAN cert
+    /// dir, computes the fingerprint, embeds it in PinnedMutualTls.
+    /// Uses `lan::certs::ensure_certs` to populate a tempdir.
+    #[test]
+    fn build_local_advertised_auth_pin_self_cert_reads_cert_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        lan::certs::ensure_certs(tmp.path(), "10.0.0.1", "test", false).unwrap();
+        let expected_fp = lan::certs::read_server_cert_fingerprint(tmp.path()).unwrap();
+
+        let server_auth = project::ServerAuthConfig {
+            bearer_token: None,
+            advertised_transport: "pin-self-cert".to_string(),
+        };
+        let auth = build_local_advertised_auth(&server_auth, tmp.path()).unwrap();
+        match &auth.transport {
+            peer::TransportAuth::PinnedMutualTls {
+                server_cert_fingerprints,
+            } => {
+                assert_eq!(server_cert_fingerprints, &vec![expected_fp]);
+            }
+            other => panic!("expected PinnedMutualTls, got {other:?}"),
+        }
+    }
+
+    /// `advertised_transport = "pin-self-cert"` with no cert in
+    /// the dir errors with a clear message that points the
+    /// operator at `intendant lan setup`.
+    #[test]
+    fn build_local_advertised_auth_pin_self_cert_errors_without_cert() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server_auth = project::ServerAuthConfig {
+            bearer_token: None,
+            advertised_transport: "pin-self-cert".to_string(),
+        };
+        let err = build_local_advertised_auth(&server_auth, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("server.crt"), "msg: {msg}");
+        assert!(msg.contains("intendant lan setup"), "msg: {msg}");
+    }
+
+    /// Unrecognized `advertised_transport` value errors loudly at
+    /// startup so the operator notices the typo (vs. silent fall
+    /// back to "none" which would surprise them).
+    #[test]
+    fn build_local_advertised_auth_rejects_invalid_transport_value() {
+        let server_auth = project::ServerAuthConfig {
+            bearer_token: None,
+            advertised_transport: "definitely-not-valid".to_string(),
+        };
+        let cert_dir = std::path::PathBuf::from("/nonexistent");
+        let err = build_local_advertised_auth(&server_auth, &cert_dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("definitely-not-valid"), "msg: {msg}");
+        assert!(msg.contains("none"), "msg: {msg}");
+        assert!(msg.contains("mutual-tls"), "msg: {msg}");
+        assert!(msg.contains("pin-self-cert"), "msg: {msg}");
+    }
+
+    /// `bearer_token` set produces `application = Some(Bearer)`
+    /// regardless of the transport value. The `hint` field
+    /// documents where the token comes from so connecting peers
+    /// can give operators a useful "configure me" message.
+    #[test]
+    fn build_local_advertised_auth_bearer_token_sets_application() {
+        let server_auth = project::ServerAuthConfig {
+            bearer_token: Some("secret".to_string()),
+            advertised_transport: "none".to_string(),
+        };
+        let cert_dir = std::path::PathBuf::from("/nonexistent");
+        let auth = build_local_advertised_auth(&server_auth, &cert_dir).unwrap();
+        match &auth.application {
+            Some(peer::ApplicationAuth::Bearer { hint, rotation_url }) => {
+                assert!(hint.is_some(), "hint should document the source");
+                assert!(hint.as_ref().unwrap().contains("[server.auth]"));
+                assert!(rotation_url.is_none(), "rotation_url unset until rotation lands");
+            }
+            other => panic!("expected Bearer application auth, got {other:?}"),
+        }
+    }
+
+    /// Combination: `pin-self-cert` + `bearer_token` produces the
+    /// full defense-in-depth advertise (PinnedMutualTls transport +
+    /// Bearer application). The expected configuration for WAN-
+    /// exposed daemons that want both wire-layer and app-layer auth.
+    #[test]
+    fn build_local_advertised_auth_full_defense_in_depth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        lan::certs::ensure_certs(tmp.path(), "10.0.0.99", "wan-test", false).unwrap();
+
+        let server_auth = project::ServerAuthConfig {
+            bearer_token: Some("wan-secret".to_string()),
+            advertised_transport: "pin-self-cert".to_string(),
+        };
+        let auth = build_local_advertised_auth(&server_auth, tmp.path()).unwrap();
+        assert!(matches!(
+            auth.transport,
+            peer::TransportAuth::PinnedMutualTls { .. }
+        ));
+        assert!(matches!(
+            auth.application,
+            Some(peer::ApplicationAuth::Bearer { .. })
+        ));
+    }
 
     #[test]
     fn parse_diff_file_paths_new_file() {
@@ -8118,6 +8312,10 @@ async fn main() -> Result<(), CallerError> {
                 Some(peer_registry),
                 advertise_urls,
                 project.config.server.auth.bearer_token.clone(),
+                build_local_advertised_auth(
+                    &project.config.server.auth,
+                    &lan::backend::select_backend().cert_dir(),
+                )?,
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -8660,6 +8858,10 @@ async fn main() -> Result<(), CallerError> {
                 Some(peer_registry),
                 advertise_urls,
                 project.config.server.auth.bearer_token.clone(),
+                build_local_advertised_auth(
+                    &project.config.server.auth,
+                    &lan::backend::select_backend().cert_dir(),
+                )?,
             );
             app.log(
                 types::LogLevel::Info,
@@ -9121,6 +9323,10 @@ async fn main() -> Result<(), CallerError> {
                 Some(peer_registry),
                 advertise_urls,
                 project.config.server.auth.bearer_token.clone(),
+                build_local_advertised_auth(
+                    &project.config.server.auth,
+                    &lan::backend::select_backend().cert_dir(),
+                )?,
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",
