@@ -23,7 +23,8 @@
 //!
 //! - **Internally / adjacently tagged enums** (anything with
 //!   `#[serde(tag = "...")]`) get a unit variant `Unknown` marked
-//!   `#[serde(other)]`. Examples: `TransportSpec`, `AuthScheme`,
+//!   `#[serde(other)]`. Examples: `TransportSpec`, `TransportAuth`,
+//!   `ApplicationAuth`,
 //!   `Capability`, `ActivityOutcome`, `TaskUpdate`, `MessageContent`,
 //!   `MessagePart`. Note that `#[serde(other)]` variants cannot be
 //!   *serialized* at runtime (serde rejects that explicitly); in
@@ -68,7 +69,8 @@
 //! ## Module layout
 //!
 //! - [`id`] — `PeerId`, `PeerKind`. Stable opaque identity.
-//! - [`card`] — `AgentCard`, `Capability`, `TransportSpec`, `AuthScheme`.
+//! - [`card`] — `AgentCard`, `Capability`, `TransportSpec`, `AuthRequirements`
+//!   (layered: `TransportAuth` + optional `ApplicationAuth`).
 //!   Served at `/.well-known/agent-card.json`. Replaces the
 //!   host_label/version/git_sha fields of `WebGatewayConfig`.
 //! - [`event`] — `PeerEvent`, the lean transport-neutral event vocabulary.
@@ -100,7 +102,8 @@ pub mod transport;
 pub mod upcast;
 
 pub use card::{
-    AgentCard, AuthScheme, Capability, McpTransportKind, OpenClawRole, TransportSpec,
+    AgentCard, ApplicationAuth, AuthRequirements, Capability, McpTransportKind, OpenClawRole,
+    TransportAuth, TransportSpec,
 };
 pub use event::{
     ActivityId, ActivityKind, ActivityOutcome, ApprovalDecision, ApprovalRequest, LogLevel,

@@ -1839,6 +1839,20 @@ pub fn spawn_web_gateway(
     mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
     peer_registry: Option<crate::peer::PeerRegistry>,
     advertise_urls: Vec<String>,
+    // Inbound bearer token enforcement. When `Some`, federation REST
+    // endpoints (/api/peers*, /api/coordinator/*, /api/sessions)
+    // require `Authorization: Bearer <token>` matching the configured
+    // value; missing or wrong token returns 401. When `None`, no
+    // application-layer auth is enforced — the operator's expected to
+    // rely on transport security (mTLS proxy, tailnet, loopback).
+    // Sourced from `[server.auth] bearer_token` in intendant.toml.
+    //
+    // /ws, /.well-known/agent-card.json, /config, the dashboard HTML,
+    // and static assets are intentionally exempt in this slice — /ws
+    // enforcement requires a parallel dashboard auth flow (browser
+    // can't easily set headers on `WebSocket` opens) which lands in
+    // slice 2d.
+    inbound_bearer_token: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -2103,6 +2117,7 @@ pub fn spawn_web_gateway(
             let project_root = project_root.clone();
             let mcp_server = mcp_server.clone();
             let terminal_registry = terminal_registry.clone();
+            let inbound_bearer_token = inbound_bearer_token.clone();
 
             tokio::spawn(async move {
                 // Snapshot session state at connection time
@@ -3594,6 +3609,39 @@ pub fn spawn_web_gateway(
                             \r\n";
                         let _ = stream.write_all(response.as_bytes()).await;
                         return;
+                    }
+
+                    // Federation auth enforcement. Applied before any
+                    // federation API branch in the dispatch chain
+                    // below; non-federation paths (WASM, frames,
+                    // dashboard HTML, /config, /.well-known, /ws,
+                    // /static/*) sail through unauthenticated. See
+                    // `is_federation_path` for the exact set and the
+                    // `inbound_bearer_token` docs on `spawn_web_gateway`
+                    // for the design rationale.
+                    if is_federation_path(request_line) {
+                        if let Err((status, body)) =
+                            verify_bearer_token(&header_text, inbound_bearer_token.as_deref())
+                        {
+                            use tokio::io::AsyncWriteExt;
+                            let reason = match status {
+                                401 => "Unauthorized",
+                                _ => "Error",
+                            };
+                            let response = format!(
+                                "HTTP/1.1 {status} {reason}\r\n\
+                                 Content-Type: application/json\r\n\
+                                 Content-Length: {}\r\n\
+                                 Cache-Control: no-cache\r\n\
+                                 WWW-Authenticate: Bearer\r\n\
+                                 Connection: close\r\n\
+                                 \r\n\
+                                 {body}",
+                                body.len(),
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            return;
+                        }
                     }
 
                     // Route WASM binaries (need async write_all for large payloads)
@@ -5458,6 +5506,78 @@ async fn coordinator_route(
     }
 }
 
+/// True for HTTP requests that hit the federation REST surface:
+/// `/api/peers*`, `/api/coordinator/*`, and `/api/sessions`. These
+/// are the endpoints the bearer-token enforcement layer protects
+/// when `[server.auth] bearer_token` is set. Discovery
+/// (`/.well-known/agent-card.json`), browser bootstrap (`/config`,
+/// `/`, `/static/*`), and `/ws` are exempt — see
+/// `spawn_web_gateway::inbound_bearer_token` docs for why.
+fn is_federation_path(request_line: &str) -> bool {
+    request_line.contains(" /api/peers")
+        || request_line.contains(" /api/coordinator/")
+        || request_line.contains(" /api/sessions")
+}
+
+/// Verify a federation HTTP request carries the expected bearer
+/// token in the `Authorization` header. Header name lookup is
+/// case-insensitive per the HTTP spec; the `Bearer` scheme prefix
+/// match accepts either case.
+///
+/// Returns `Ok(())` when no token is required (no
+/// `inbound_bearer_token` configured) or when the request presents
+/// the matching token. Returns `Err((401, body_json))` otherwise —
+/// the caller writes that response and returns.
+pub(crate) fn verify_bearer_token(
+    header_text: &str,
+    expected_token: Option<&str>,
+) -> Result<(), (u16, String)> {
+    let Some(expected) = expected_token else {
+        return Ok(());
+    };
+    let auth_header = header_text.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("authorization") {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    });
+    let auth = match auth_header {
+        Some(v) => v,
+        None => {
+            return Err((
+                401,
+                serde_json::json!({"error": "missing Authorization header"})
+                    .to_string(),
+            ));
+        }
+    };
+    let token = auth
+        .strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("bearer "));
+    let token = match token {
+        Some(t) => t.trim(),
+        None => {
+            return Err((
+                401,
+                serde_json::json!({
+                    "error": "Authorization header must use Bearer scheme"
+                })
+                .to_string(),
+            ));
+        }
+    };
+    if token == expected {
+        Ok(())
+    } else {
+        Err((
+            401,
+            serde_json::json!({"error": "invalid bearer token"}).to_string(),
+        ))
+    }
+}
+
 /// Resolve the list of WebSocket URLs to advertise in the Agent
 /// Card for this daemon, in preference order.
 ///
@@ -5587,7 +5707,7 @@ fn format_ws_url(host: &str, port: u16) -> String {
 /// overrides (`--advertise-url`, `[server.advertise]`) with auto-
 /// detected fallback. The list is non-empty by construction.
 pub fn build_local_agent_card(advertise_urls: Vec<String>) -> crate::peer::AgentCard {
-    use crate::peer::{AuthScheme, Capability, TransportSpec};
+    use crate::peer::{AuthRequirements, Capability, TransportSpec};
     let transports: Vec<TransportSpec> = advertise_urls
         .into_iter()
         .map(|url| TransportSpec::IntendantWs { url })
@@ -5598,7 +5718,7 @@ pub fn build_local_agent_card(advertise_urls: Vec<String>) -> crate::peer::Agent
         Some(env!("INTENDANT_GIT_SHA").to_string()),
         transports,
         vec![Capability::ComputerUse, Capability::Knowledge],
-        AuthScheme::None,
+        AuthRequirements::none(),
     )
 }
 
@@ -6055,7 +6175,7 @@ mod tests {
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
 
         // Give it a moment to start
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -6074,7 +6194,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -6117,7 +6237,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx.clone(), config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx.clone(), config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -6184,6 +6304,7 @@ mod tests {
             None,
             peer_registry,
             Vec::new(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
@@ -6204,6 +6325,217 @@ mod tests {
         )
         .await;
         String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// Same as `spawn_test_gateway_with_registry` but also wires an
+    /// inbound bearer token. Used by the federation auth tests.
+    async fn spawn_test_gateway_with_auth(
+        peer_registry: Option<crate::peer::PeerRegistry>,
+        bearer_token: Option<String>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            WebGatewayConfig::default(),
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            peer_registry,
+            Vec::new(),
+            bearer_token,
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        (port, handle)
+    }
+
+    // -----------------------------------------------------------------
+    // verify_bearer_token + is_federation_path unit tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn verify_bearer_token_passes_when_no_token_configured() {
+        let header = "GET /api/peers HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert!(verify_bearer_token(header, None).is_ok());
+    }
+
+    #[test]
+    fn verify_bearer_token_rejects_missing_header_when_required() {
+        let header = "GET /api/peers HTTP/1.1\r\nHost: x\r\n\r\n";
+        let err = verify_bearer_token(header, Some("expected-token")).unwrap_err();
+        assert_eq!(err.0, 401);
+        assert!(err.1.contains("missing Authorization"));
+    }
+
+    #[test]
+    fn verify_bearer_token_rejects_wrong_token() {
+        let header = "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\n\r\n";
+        let err = verify_bearer_token(header, Some("expected-token")).unwrap_err();
+        assert_eq!(err.0, 401);
+        assert!(err.1.contains("invalid bearer"));
+    }
+
+    #[test]
+    fn verify_bearer_token_accepts_correct_token() {
+        let header =
+            "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer right\r\n\r\n";
+        assert!(verify_bearer_token(header, Some("right")).is_ok());
+    }
+
+    #[test]
+    fn verify_bearer_token_header_name_case_insensitive() {
+        let header =
+            "GET /api/peers HTTP/1.1\r\nHost: x\r\nauthorization: Bearer right\r\n\r\n";
+        assert!(verify_bearer_token(header, Some("right")).is_ok());
+    }
+
+    #[test]
+    fn verify_bearer_token_scheme_case_insensitive() {
+        let header =
+            "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: bearer right\r\n\r\n";
+        assert!(verify_bearer_token(header, Some("right")).is_ok());
+    }
+
+    #[test]
+    fn verify_bearer_token_rejects_non_bearer_scheme() {
+        let header =
+            "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: Basic Zm9vOmJhcg==\r\n\r\n";
+        let err = verify_bearer_token(header, Some("right")).unwrap_err();
+        assert_eq!(err.0, 401);
+        assert!(err.1.contains("Bearer scheme"));
+    }
+
+    #[test]
+    fn is_federation_path_recognizes_federation_endpoints() {
+        assert!(is_federation_path("GET /api/peers HTTP/1.1"));
+        assert!(is_federation_path("POST /api/peers HTTP/1.1"));
+        assert!(is_federation_path(
+            "DELETE /api/peers HTTP/1.1"
+        ));
+        assert!(is_federation_path("GET /api/peers/eligible HTTP/1.1"));
+        assert!(is_federation_path("POST /api/peers/intendant:foo/message HTTP/1.1"));
+        assert!(is_federation_path(
+            "POST /api/coordinator/route HTTP/1.1"
+        ));
+        assert!(is_federation_path("GET /api/sessions HTTP/1.1"));
+    }
+
+    #[test]
+    fn is_federation_path_excludes_unauthenticated_endpoints() {
+        // Discovery, dashboard bootstrap, and `/ws` must NOT be
+        // mistaken for federation paths — they're intentionally
+        // exempt from bearer enforcement.
+        assert!(!is_federation_path(
+            "GET /.well-known/agent-card.json HTTP/1.1"
+        ));
+        assert!(!is_federation_path("GET /config HTTP/1.1"));
+        assert!(!is_federation_path("GET / HTTP/1.1"));
+        assert!(!is_federation_path("GET /static/app.js HTTP/1.1"));
+        assert!(!is_federation_path(
+            "GET /ws HTTP/1.1\r\nUpgrade: websocket"
+        ));
+        assert!(!is_federation_path("GET /api/settings HTTP/1.1"));
+        assert!(!is_federation_path("POST /api/api-keys HTTP/1.1"));
+    }
+
+    // -----------------------------------------------------------------
+    // End-to-end: federation REST auth enforcement
+    // -----------------------------------------------------------------
+
+    /// With `inbound_bearer_token` configured, a federation request
+    /// without an Authorization header is rejected 401.
+    #[tokio::test]
+    async fn test_federation_endpoint_rejects_missing_bearer() {
+        let (port, handle) =
+            spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
+        // Request without auth — should 401, NOT pass through to the
+        // 503-no-registry response that would happen otherwise.
+        let resp = http_request(port, "GET /api/peers HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.contains("401"), "expected 401, got: {resp}");
+        assert!(resp.contains("missing Authorization"));
+        assert!(
+            resp.contains("WWW-Authenticate: Bearer"),
+            "WWW-Authenticate header signals the auth scheme"
+        );
+        handle.abort();
+    }
+
+    /// Wrong bearer token → 401 with "invalid bearer token".
+    #[tokio::test]
+    async fn test_federation_endpoint_rejects_wrong_bearer() {
+        let (port, handle) =
+            spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
+        let resp = http_request(
+            port,
+            "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("401"), "expected 401, got: {resp}");
+        assert!(resp.contains("invalid bearer"));
+        handle.abort();
+    }
+
+    /// Correct bearer token → request flows through to the normal
+    /// handler (which then returns 503 because no registry was
+    /// configured — proves auth passed and dispatch ran).
+    #[tokio::test]
+    async fn test_federation_endpoint_accepts_correct_bearer() {
+        let (port, handle) =
+            spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
+        let resp = http_request(
+            port,
+            "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-token\r\n\r\n",
+        )
+        .await;
+        // Auth passed; handler returned its 503 (no registry).
+        assert!(resp.contains("503"), "expected 503 (auth passed, registry missing), got: {resp}");
+        assert!(!resp.contains("401"));
+        handle.abort();
+    }
+
+    /// /config is exempt — even when bearer is required for
+    /// federation endpoints, the dashboard bootstrap continues to work
+    /// without auth. This is how the dashboard remains usable on the
+    /// loopback / trusted-network case where the operator has set a
+    /// bearer for WAN federation.
+    #[tokio::test]
+    async fn test_config_endpoint_unauthenticated_when_bearer_set() {
+        let (port, handle) =
+            spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
+        let resp = http_request(port, "GET /config HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(
+            resp.contains("200 OK"),
+            "config should serve unauthenticated, got: {resp}"
+        );
+        assert!(!resp.contains("401"));
+        handle.abort();
+    }
+
+    /// /.well-known/agent-card.json is exempt — discovery must work
+    /// before any auth handshake. Connecting peers fetch the card to
+    /// see what auth they need to satisfy.
+    #[tokio::test]
+    async fn test_agent_card_endpoint_unauthenticated_when_bearer_set() {
+        let (port, handle) =
+            spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
+        let resp = http_request(
+            port,
+            "GET /.well-known/agent-card.json HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.contains("200 OK"),
+            "agent card should serve unauthenticated, got: {resp}"
+        );
+        assert!(!resp.contains("401"));
+        handle.abort();
     }
 
     /// `GET /api/peers` returns 503 when the web gateway was spawned
@@ -6915,7 +7247,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Plain HTTP GET
@@ -6959,7 +7291,7 @@ mod tests {
             ice_servers: Vec::new(),
             ..Default::default()
         };
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // GET /config
@@ -7004,7 +7336,7 @@ mod tests {
             broadcast_tx,
             WebGatewayConfig::default(),
             ActiveSessionState::empty(),
-            None, None, None, None, None, None, Vec::new(),
+            None, None, None, None, None, None, Vec::new(), None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -7060,7 +7392,7 @@ mod tests {
     /// before anyone hits it in the browser.
     #[tokio::test]
     async fn test_agent_card_endpoint_reflects_live_state() {
-        use crate::peer::{AgentCard, AuthScheme, Capability, TransportSpec};
+        use crate::peer::{AgentCard, AuthRequirements, Capability, TransportAuth, TransportSpec};
 
         let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
@@ -7072,7 +7404,7 @@ mod tests {
             broadcast_tx,
             WebGatewayConfig::default(),
             ActiveSessionState::empty(),
-            None, None, None, None, None, None, Vec::new(),
+            None, None, None, None, None, None, Vec::new(), None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -7161,8 +7493,8 @@ mod tests {
 
         // Auth defaults to None in phase 1 (trust the network layer).
         assert!(
-            matches!(card.auth, AuthScheme::None),
-            "expected AuthScheme::None in phase 1, got {:?}",
+            matches!(card.auth.transport, TransportAuth::None) && card.auth.application.is_none(),
+            "expected AuthRequirements::none() in phase 1, got {:?}",
             card.auth
         );
 
@@ -7179,7 +7511,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7234,7 +7566,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7292,7 +7624,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new())
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new(), None)
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -7351,7 +7683,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new())
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new(), None)
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -7420,7 +7752,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new())
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new(), None)
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -7495,7 +7827,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7544,7 +7876,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7597,7 +7929,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // POST /session without any API key env var set
@@ -7632,7 +7964,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
@@ -7669,7 +8001,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7724,7 +8056,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7793,7 +8125,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7890,7 +8222,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7962,7 +8294,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);

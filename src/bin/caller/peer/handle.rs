@@ -516,7 +516,7 @@ mod tests {
     /// test times out.
     #[tokio::test]
     async fn disconnect_short_circuits_reconnect_backoff() {
-        use crate::peer::card::{AgentCard, AuthScheme, TransportSpec};
+        use crate::peer::card::{AgentCard, AuthRequirements, TransportSpec};
         use crate::peer::id::{PeerId, PeerKind};
         use crate::peer::transport::IntendantWsTransport;
         use tokio::sync::mpsc;
@@ -538,7 +538,7 @@ mod tests {
                 url: ws_url.clone(),
             }],
             capabilities: vec![],
-            auth: AuthScheme::None,
+            auth: AuthRequirements::none(),
         };
         let url_for_closure = ws_url.clone();
         let handle = spawn_peer(

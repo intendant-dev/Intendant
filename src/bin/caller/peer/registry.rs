@@ -159,46 +159,63 @@ impl PeerRegistry {
     /// [`PeerError::Rejected`] — idempotent re-registration is a
     /// follow-up concern.
     pub async fn add_peer(&self, card_url: &str) -> Result<PeerId, PeerError> {
-        self.add_peer_with_via(card_url, Vec::new()).await
+        self.add_peer_with_via_and_auth(card_url, Vec::new(), None).await
     }
 
     /// Variant of [`add_peer`] that lets the connecting operator
-    /// override the card's transport URLs at peer-add time. When
-    /// `via_urls` is non-empty, the fetched card's `transports` field
-    /// is replaced with one [`TransportSpec::IntendantWs`] per
-    /// supplied URL, in the given preference order — the operator
-    /// is asserting "reach this peer at these URLs, ignore what its
-    /// card advertised."
-    ///
-    /// Use cases:
-    ///
-    /// - Connecting daemon knows about a port-forward / proxy / named
-    ///   tunnel that the advertising peer's card doesn't list (the
-    ///   advertising side can't always know every path peers might
-    ///   take to reach it).
-    /// - Connecting daemon is on a Tailscale tailnet that the
-    ///   advertising peer is also on, but the peer's card only lists
-    ///   its LAN URL because that's what its `--advertise-url` set up.
-    /// - Operator wants to force a specific path for testing, even
-    ///   though the card lists working alternatives.
-    ///
-    /// The card's identity (`id`, `label`, `version`, `capabilities`,
-    /// `auth`) is preserved — only `transports` is overridden. The
-    /// peer is still uniquely identified by `card.id`, so duplicate
-    /// registration still rejects with the same error.
+    /// override the card's transport URLs at peer-add time. See
+    /// [`add_peer_with_via_and_auth`] for the auth-aware variant.
     pub async fn add_peer_with_via(
         &self,
         card_url: &str,
         via_urls: Vec<String>,
     ) -> Result<PeerId, PeerError> {
-        let mut card = fetch_card(card_url).await?;
+        self.add_peer_with_via_and_auth(card_url, via_urls, None).await
+    }
+
+    /// Full add-peer entry point: card_url + optional via override +
+    /// optional outbound bearer token. The token is sent on the
+    /// initial card fetch (via `fetch_card`) and stored on the
+    /// per-peer transport for subsequent requests.
+    ///
+    /// When `via_urls` is non-empty, the fetched card's `transports`
+    /// field is replaced with one [`TransportSpec::IntendantWs`] per
+    /// supplied URL, in the given preference order — the operator
+    /// is asserting "reach this peer at these URLs, ignore what its
+    /// card advertised."
+    ///
+    /// Use cases for `via_urls`:
+    /// - Connecting daemon knows about a port-forward / proxy / named
+    ///   tunnel that the advertising peer's card doesn't list.
+    /// - Connecting daemon is on a Tailscale tailnet that the
+    ///   advertising peer is also on, but the peer's card only lists
+    ///   its LAN URL because that's what its `--advertise-url` set up.
+    /// - Operator wants to force a specific path for testing.
+    ///
+    /// Use case for `bearer_token`: the peer requires application-
+    /// layer auth (its card advertises
+    /// `auth.application = Some(Bearer)`) and the operator has the
+    /// matching credential in `[[peer]] bearer_token` in
+    /// intendant.toml.
+    ///
+    /// The card's identity (`id`, `label`, `version`, `capabilities`,
+    /// `auth`) is preserved — only `transports` is overridden. The
+    /// peer is still uniquely identified by `card.id`, so duplicate
+    /// registration still rejects with the same error.
+    pub async fn add_peer_with_via_and_auth(
+        &self,
+        card_url: &str,
+        via_urls: Vec<String>,
+        bearer_token: Option<String>,
+    ) -> Result<PeerId, PeerError> {
+        let mut card = fetch_card(card_url, bearer_token.as_deref()).await?;
         if !via_urls.is_empty() {
             card.transports = via_urls
                 .into_iter()
                 .map(|url| TransportSpec::IntendantWs { url })
                 .collect();
         }
-        self.add_peer_with_card(card).await
+        self.add_peer_with_card_and_auth(card, bearer_token).await
     }
 
     /// Variant of [`add_peer`] that accepts a pre-fetched or
@@ -209,6 +226,19 @@ impl PeerRegistry {
     /// - Loopback registration (registering the local daemon as a
     ///   "peer" of itself, for dashboard symmetry)
     pub async fn add_peer_with_card(&self, card: AgentCard) -> Result<PeerId, PeerError> {
+        self.add_peer_with_card_and_auth(card, None).await
+    }
+
+    /// Auth-aware variant of [`add_peer_with_card`] — stores the
+    /// outbound bearer token on each per-peer transport so it's
+    /// sent on subsequent connects (currently the agent-card HTTP
+    /// fetch; `/ws` enforcement lands with the dashboard auth
+    /// slice).
+    pub async fn add_peer_with_card_and_auth(
+        &self,
+        card: AgentCard,
+        bearer_token: Option<String>,
+    ) -> Result<PeerId, PeerError> {
         if self.inner.peers.read().unwrap().contains_key(&card.id) {
             return Err(PeerError::Rejected {
                 code: "already_registered".into(),
@@ -232,12 +262,13 @@ impl PeerRegistry {
 
         let handle = spawn_peer(peer_id.clone(), card, log_sink, move |events_tx| {
             // Build one concrete transport per supported spec (each
-            // gets its own clone of `events_tx`) and wrap them in a
-            // `MultiTransport` that probes them in order on connect.
+            // gets its own clone of `events_tx` and `bearer_token`)
+            // and wrap them in a `MultiTransport` that probes them
+            // in order on connect.
             let candidates: Vec<Box<dyn crate::peer::traits::PeerTransport>> =
                 supported_specs
                     .iter()
-                    .map(|spec| build_transport(spec, events_tx.clone()))
+                    .map(|spec| build_transport(spec, events_tx.clone(), bearer_token.clone()))
                     .collect();
             Box::new(crate::peer::transport::MultiTransport::new(candidates))
         });
@@ -383,7 +414,8 @@ fn spawn_event_forwarder(
     });
 }
 
-/// Fetch an Agent Card from the given URL via HTTP GET.
+/// Fetch an Agent Card from the given URL via HTTP GET, optionally
+/// sending `Authorization: Bearer <token>`.
 ///
 /// Separate from [`IntendantWsTransport::fetch_agent_card`] because
 /// the transport fetches as part of its own connect handshake (off
@@ -391,13 +423,19 @@ fn spawn_event_forwarder(
 /// (as provided by a user adding a peer). Small duplication; kept
 /// here so the registry doesn't depend on a specific transport
 /// implementation for its discovery step.
-async fn fetch_card(card_url: &str) -> Result<AgentCard, PeerError> {
+async fn fetch_card(
+    card_url: &str,
+    bearer_token: Option<&str>,
+) -> Result<AgentCard, PeerError> {
     let client = reqwest::Client::builder()
         .timeout(CARD_FETCH_TIMEOUT)
         .build()
         .map_err(|e| PeerError::CardFetch(format!("build http client: {e}")))?;
-    let response = client
-        .get(card_url)
+    let mut request = client.get(card_url);
+    if let Some(token) = bearer_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| PeerError::CardFetch(format!("GET {card_url}: {e}")))?;
@@ -438,11 +476,14 @@ fn pick_supported_transports(transports: &[TransportSpec]) -> Vec<TransportSpec>
 fn build_transport(
     spec: &TransportSpec,
     events_tx: mpsc::Sender<crate::peer::event::PeerEvent>,
+    bearer_token: Option<String>,
 ) -> Box<dyn crate::peer::traits::PeerTransport> {
     match spec {
-        TransportSpec::IntendantWs { url } => {
-            Box::new(IntendantWsTransport::new(url.clone(), events_tx))
-        }
+        TransportSpec::IntendantWs { url } => Box::new(IntendantWsTransport::with_bearer(
+            url.clone(),
+            events_tx,
+            bearer_token,
+        )),
         other => {
             // Should be unreachable: `pick_supported_transports`
             // filters to variants this function knows. If we get
@@ -457,7 +498,7 @@ fn build_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::card::{AuthScheme, Capability};
+    use crate::peer::card::{AuthRequirements, Capability};
     use crate::peer::id::PeerKind;
     use crate::web_gateway::{spawn_web_gateway, ActiveSessionState, WebGatewayConfig};
     use crate::event::EventBus;
@@ -487,6 +528,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
         (port, handle)
@@ -504,7 +546,7 @@ mod tests {
                 url: ws_url.to_string(),
             }],
             capabilities: vec![Capability::ComputerUse, Capability::Knowledge],
-            auth: AuthScheme::None,
+            auth: AuthRequirements::none(),
         }
     }
 
@@ -587,7 +629,7 @@ mod tests {
                 url: "https://future/a2a".into(),
             }],
             capabilities: vec![],
-            auth: AuthScheme::None,
+            auth: AuthRequirements::none(),
         };
 
         match reg.add_peer_with_card(card).await {

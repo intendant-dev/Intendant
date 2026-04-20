@@ -399,19 +399,21 @@ pub struct ProjectConfig {
     pub peers: Vec<PeerConfig>,
 }
 
-/// Daemon-level settings for what this Intendant advertises to peers.
+/// Daemon-level settings for what this Intendant advertises to peers
+/// and what it requires of inbound peer connections.
 /// Lives under `[server]` in intendant.toml.
 ///
-/// The CLI flag `--advertise-url` (repeatable) overrides the config
-/// value entirely when given — operator at the command line wins
-/// over operator at the config file.
+/// The CLI flag `--advertise-url` (repeatable) is *additive* over the
+/// `advertise` field via `web_gateway::resolve_advertise_urls`:
+/// operator overrides come first, auto-detected interface URLs append
+/// behind them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// WebSocket URLs to advertise in this daemon's Agent Card,
     /// in preference order (most-preferred first). Each becomes
     /// an `IntendantWs` transport entry. Empty (the default) means
-    /// "auto-detect a single URL from the listener bind address" —
-    /// the historical behavior.
+    /// "rely entirely on auto-detection" — the daemon enumerates
+    /// its routable interfaces and emits one URL each.
     ///
     /// Use this when the daemon's local view of its own address
     /// doesn't match how peers reach it: NAT'd VMs reachable via
@@ -428,6 +430,45 @@ pub struct ServerConfig {
     /// ```
     #[serde(default)]
     pub advertise: Vec<String>,
+
+    /// Inbound auth requirements for federation peers connecting to
+    /// this daemon. See [`ServerAuthConfig`].
+    #[serde(default)]
+    pub auth: ServerAuthConfig,
+}
+
+/// Auth requirements this daemon enforces on inbound peer connections.
+/// Lives under `[server.auth]` in intendant.toml.
+///
+/// What this configures: what *peers* must present when connecting
+/// to *this* daemon. The advertised counterpart is
+/// [`crate::peer::AgentCard.auth`], which tells connecting peers what
+/// to send. The two are normally kept consistent by the operator — if
+/// `[server.auth] bearer_token` is set, the daemon's Agent Card should
+/// advertise `application: Some(Bearer)` so peers know to send it.
+///
+/// What it does NOT configure: outbound auth credentials this daemon
+/// sends to other peers. Those live on each `[[peer]]` block as
+/// `bearer_token = "..."` and are sent when this daemon connects out.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerAuthConfig {
+    /// When set, inbound HTTP and WebSocket requests must carry
+    /// `Authorization: Bearer <token>` matching this exact value.
+    /// Missing or wrong token returns 401.
+    ///
+    /// `None` (the default) means no application-layer requirement —
+    /// either trust the transport (LAN, mTLS proxy, tailnet) or rely
+    /// on the network firewall. For WAN exposure, operators should
+    /// set this in addition to whatever transport-layer auth they
+    /// have (mTLS proxy in front, etc.) for defense in depth.
+    ///
+    /// Example:
+    /// ```toml
+    /// [server.auth]
+    /// bearer_token = "long-random-secret-from-`openssl rand -hex 32`"
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
 }
 
 /// A federated peer daemon advertised via `intendant.toml [[peer]]`.
@@ -436,6 +477,9 @@ pub struct ServerConfig {
 /// peer's Agent Card from that URL at startup, picks a supported
 /// transport, and spawns the actor. `label` is an optional display
 /// override; when absent the card's own `label` field is used.
+/// `bearer_token` is the credential this daemon sends when connecting
+/// out to the peer — must match what the peer's `[server.auth]`
+/// expects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerConfig {
     /// URL of the peer's Agent Card. Typically
@@ -448,6 +492,23 @@ pub struct PeerConfig {
     /// affect routing — the registry still keys on `card.id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Outbound bearer token sent to this peer in the
+    /// `Authorization: Bearer <token>` header on every HTTP and
+    /// WebSocket request. The peer enforces it via its own
+    /// `[server.auth] bearer_token`.
+    ///
+    /// Should be set when the peer's Agent Card advertises
+    /// `auth.application = Some(Bearer)`. If the peer requires it
+    /// and this is `None`, the connect attempt will fail with 401.
+    ///
+    /// Example:
+    /// ```toml
+    /// [[peer]]
+    /// card_url = "https://wan-peer.example.com/.well-known/agent-card.json"
+    /// bearer_token = "matching-secret-from-the-peer-side"
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
 }
 
 /// Recording configuration in intendant.toml.
@@ -669,10 +730,12 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                 PeerConfig {
                     card_url: "http://a.local/.well-known/agent-card.json".into(),
                     label: Some("A".into()),
+                    bearer_token: None,
                 },
                 PeerConfig {
                     card_url: "http://b.local/.well-known/agent-card.json".into(),
                     label: None,
+                    bearer_token: Some("secret-for-b".into()),
                 },
             ],
             ..ProjectConfig::default()
@@ -682,8 +745,10 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
         assert_eq!(parsed.peers.len(), 2);
         assert_eq!(parsed.peers[0].card_url, original.peers[0].card_url);
         assert_eq!(parsed.peers[0].label, original.peers[0].label);
+        assert_eq!(parsed.peers[0].bearer_token, original.peers[0].bearer_token);
         assert_eq!(parsed.peers[1].card_url, original.peers[1].card_url);
         assert!(parsed.peers[1].label.is_none());
+        assert_eq!(parsed.peers[1].bearer_token, original.peers[1].bearer_token);
     }
 
     #[test]

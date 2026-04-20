@@ -170,7 +170,7 @@ fn union_features(candidates: &[Box<dyn PeerTransport>]) -> TransportFeatures {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::card::{AuthScheme, Capability};
+    use crate::peer::card::{AuthRequirements, Capability};
     use crate::peer::event::{MessageContent, MessageRole, PeerMessage};
     use crate::peer::id::{PeerId, PeerKind};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -208,7 +208,7 @@ mod tests {
             git_sha: None,
             transports: vec![],
             capabilities: vec![Capability::ComputerUse],
-            auth: AuthScheme::None,
+            auth: AuthRequirements::none(),
         }
     }
 

@@ -133,8 +133,16 @@ fn build_and_hydrate_peer_registry(
     for cfg in peer_configs {
         let registry_for_task = registry.clone();
         let card_url = cfg.card_url.clone();
+        let bearer_token = cfg.bearer_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = registry_for_task.add_peer(&card_url).await {
+            // Vec::new() for via_urls (could be threaded through
+            // PeerConfig later if config-driven via overrides become
+            // a need; per-peer dashboard adds already use the via_urls
+            // field on AddPeerRequest).
+            if let Err(e) = registry_for_task
+                .add_peer_with_via_and_auth(&card_url, Vec::new(), bearer_token)
+                .await
+            {
                 eprintln!(
                     "intendant: failed to register peer from intendant.toml \
                      ({card_url}): {e}"
@@ -8004,6 +8012,7 @@ async fn main() -> Result<(), CallerError> {
                 mcp_http_server,
                 Some(peer_registry),
                 advertise_urls,
+                project.config.server.auth.bearer_token.clone(),
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -8545,6 +8554,7 @@ async fn main() -> Result<(), CallerError> {
                 mcp_http_server,
                 Some(peer_registry),
                 advertise_urls,
+                project.config.server.auth.bearer_token.clone(),
             );
             app.log(
                 types::LogLevel::Info,
@@ -9005,6 +9015,7 @@ async fn main() -> Result<(), CallerError> {
                 mcp_http_server,
                 Some(peer_registry),
                 advertise_urls,
+                project.config.server.auth.bearer_token.clone(),
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",

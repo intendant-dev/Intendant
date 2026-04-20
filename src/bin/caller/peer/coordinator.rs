@@ -198,7 +198,7 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::card::{AgentCard, AuthScheme, TransportSpec};
+    use crate::peer::card::{AgentCard, AuthRequirements, TransportSpec};
     use crate::peer::event::TaggedPeerEvent;
     use crate::peer::id::PeerKind;
     use crate::peer::transport::IntendantWsTransport;
@@ -229,6 +229,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
         (port, handle)
@@ -254,7 +255,7 @@ mod tests {
                 url: ws_url.to_string(),
             }],
             capabilities: caps,
-            auth: AuthScheme::None,
+            auth: AuthRequirements::none(),
         }
     }
 
