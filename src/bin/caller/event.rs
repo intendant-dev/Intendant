@@ -949,6 +949,12 @@ pub enum ControlMsg {
     /// auth/lifecycle rules without reading the raw `t` discriminator.
     /// The matching peer→connector direction comes back as
     /// [`crate::types::OutboundEvent::WebRtcSignal`] over the same WS.
+    ///
+    /// Explicit `rename` because serde's default `rename_all = "snake_case"`
+    /// mangles the "Rtc" acronym into `web_rtc_signal` — same class of
+    /// bug as `PeerKind::A2A → a2_a`. Canonical wire name is
+    /// `webrtc_signal` (no underscore in the acronym).
+    #[serde(rename = "webrtc_signal")]
     WebRtcSignal {
         display_id: u32,
         session_id: String,

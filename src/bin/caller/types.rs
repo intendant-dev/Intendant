@@ -521,6 +521,11 @@ pub enum OutboundEvent {
     /// on the corresponding `ControlMsg::WebRtcSignal` — round-trips
     /// verbatim so the browser's per-session `RTCPeerConnection` can
     /// match incoming answers/candidates to the right peer connection.
+    ///
+    /// Explicit `rename` because serde's default `rename_all = "snake_case"`
+    /// mangles "Rtc" into `web_rtc_signal`. Canonical wire name is
+    /// `webrtc_signal`.
+    #[serde(rename = "webrtc_signal")]
     WebRtcSignal {
         display_id: u32,
         session_id: String,

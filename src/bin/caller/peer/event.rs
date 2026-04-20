@@ -168,6 +168,13 @@ pub enum PeerEvent {
     /// and trickled `IceCandidate`s. In the primary→peer direction
     /// (via [`crate::peer::traits::PeerOp::WebRtcSignal`]), it carries
     /// the browser's `Offer` and trickled `IceCandidate`s.
+    ///
+    /// Explicit `rename` because serde's default `rename_all = "snake_case"`
+    /// mangles the "Rtc" acronym into `web_rtc_signal` — same class of
+    /// bug as `PeerKind::A2A → a2_a`. Canonical wire name is
+    /// `webrtc_signal` (no underscore in the acronym); the WASM
+    /// dashboard's `render_peer_event` dispatches on this string.
+    #[serde(rename = "webrtc_signal")]
     WebRtcSignal {
         display_id: u32,
         session_id: WebRtcSessionId,

@@ -163,6 +163,7 @@ fn union_features(candidates: &[Box<dyn PeerTransport>]) -> TransportFeatures {
         u.task_query |= f.task_query;
         u.invoke_capability |= f.invoke_capability;
         u.resolve_approval |= f.resolve_approval;
+        u.webrtc_signal |= f.webrtc_signal;
     }
     u
 }

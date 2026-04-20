@@ -279,16 +279,49 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
 
         // Set working directory to the directory containing the .app bundle.
         // For ~/projects/intendant/target/Intendant.app this gives ~/projects/intendant/target/
-        // Then walk up to find the project root (directory with .env or Cargo.toml)
+        // Then walk up to find the project root (directory with .env or Cargo.toml).
+        //
+        // When the .app is installed (the common case — /Applications/Intendant.app),
+        // the walk-up from /Applications never finds a Cargo.toml / .env marker and
+        // terminates at `/`. If we then set cwd=/, the Rust daemon's FileWatcher::new
+        // recursively indexes the entire root filesystem (every /System, /Library,
+        // /Volumes mount) and blocks main forever — web_gateway never spawns, the
+        // app's WKWebView sits on "Waiting for backend…" until it gives up.
+        //
+        // Fallback: when no project marker is found after the walk, use ~/.intendant
+        // as the cwd. That directory is small, bounded, and already the home of the
+        // daemon's logs + config — so FileWatcher completes in milliseconds rather
+        // than hanging on /System.
         var dir = URL(fileURLWithPath: bundle.bundlePath).deletingLastPathComponent()
+        var foundProjectMarker = false
         for _ in 0..<5 {
             if FileManager.default.fileExists(atPath: dir.appendingPathComponent("Cargo.toml").path) ||
                FileManager.default.fileExists(atPath: dir.appendingPathComponent(".env").path) {
+                foundProjectMarker = true
                 break
             }
             let parent = dir.deletingLastPathComponent()
             if parent.path == dir.path { break }
             dir = parent
+        }
+        if !foundProjectMarker {
+            // Bandaid until we land a proper "no project open" story
+            // (tracked separately): give the daemon a fresh, empty
+            // workspace under ~/projects/ as its cwd. NOT ~/.intendant
+            // — that's where the daemon writes its own logs + snapshots,
+            // so setting cwd there makes FileWatcher + file_snapshots
+            // watch the daemon's own output and loop forever.
+            //
+            // ~/projects/intendant-workspace is empty on first launch,
+            // persists across launches (so the agent's edits stay
+            // visible), and is out of the daemon's state dir. The
+            // sustainable fix makes project_root optional on the Rust
+            // side so there's no cwd-is-project-root fallback at all.
+            let workspace = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("projects/intendant-workspace")
+            try? FileManager.default.createDirectory(
+                at: workspace, withIntermediateDirectories: true)
+            dir = workspace
         }
         process.currentDirectoryURL = dir
         NSLog("Working directory: \(dir.path)")
