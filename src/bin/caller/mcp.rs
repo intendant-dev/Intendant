@@ -2424,6 +2424,8 @@ pub fn spawn_event_listener(
                     }
                     AppEvent::DisplayMetrics { .. }
                     | AppEvent::FileChanged { .. }
+                    | AppEvent::UploadReady { .. }
+                    | AppEvent::UploadDeleted { .. }
                     | AppEvent::SnapshotCreated { .. }
                     | AppEvent::RolledBack { .. }
                     | AppEvent::Redone { .. }

@@ -275,6 +275,8 @@ impl AppEventUpcaster {
             | AppEvent::CodexThreadActionRequested { .. }
             | AppEvent::GeminiThreadActionRequested { .. }
             | AppEvent::FileChanged { .. }
+            | AppEvent::UploadReady { .. }
+            | AppEvent::UploadDeleted { .. }
             | AppEvent::SnapshotCreated { .. }
             | AppEvent::RolledBack { .. }
             | AppEvent::Redone { .. }
@@ -1211,6 +1213,8 @@ impl WireEventUpcaster {
             OutboundEvent::Unknown
             | OutboundEvent::DisplayMetrics { .. }
             | OutboundEvent::FileChanged { .. }
+            | OutboundEvent::UploadReady { .. }
+            | OutboundEvent::UploadDeleted { .. }
             | OutboundEvent::SnapshotCreated { .. }
             | OutboundEvent::RolledBack { .. }
             | OutboundEvent::Redone { .. }
