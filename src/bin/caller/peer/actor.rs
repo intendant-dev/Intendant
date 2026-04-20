@@ -91,6 +91,44 @@ pub(crate) struct PeerActor {
     pub status_tx: watch::Sender<PeerStatus>,
     pub card_tx: watch::Sender<Arc<AgentCard>>,
     pub seq: u64,
+    /// Operator's via-URL override, preserved across card refreshes.
+    ///
+    /// The transport calls `fetch_agent_card()` on every connect and
+    /// returns a fresh card — which, without intervention, wipes the
+    /// via-override the registry applied to the card's transports at
+    /// peer-add time. Storing it here lets the actor re-apply the
+    /// override to every card it publishes to the watch channel,
+    /// preserving operator intent across reconnects.
+    ///
+    /// Empty `Vec` means "no override" — the fresh card's transports
+    /// stand as-is. Non-empty means "replace the card's transports
+    /// with exactly this list of `IntendantWs` URLs, in this order."
+    /// Identical semantics to how the registry applies it at
+    /// [`crate::peer::PeerRegistry::add_peer_with_credentials`].
+    pub via_urls: Vec<String>,
+}
+
+impl PeerActor {
+    /// Re-apply the operator's via-URL override to a fresh card.
+    /// Called every place we receive a card from outside (transport
+    /// `connect()` return value, inbound `PeerEvent::Connected`) so
+    /// the override persists across reconnects instead of getting
+    /// wiped on the first successful handshake.
+    ///
+    /// No-op when `via_urls` is empty — the peer's self-advertised
+    /// transports stand.
+    fn apply_via_override(&self, card: &mut AgentCard) {
+        if self.via_urls.is_empty() {
+            return;
+        }
+        card.transports = self
+            .via_urls
+            .iter()
+            .map(|url| crate::peer::card::TransportSpec::IntendantWs {
+                url: url.clone(),
+            })
+            .collect();
+    }
 }
 
 impl PeerActor {
@@ -101,8 +139,16 @@ impl PeerActor {
             // ---- Attempt connect ----
             let _ = self.connection_tx.send(ConnectionState::Connecting);
             match self.transport.connect().await {
-                Ok(new_card) => {
+                Ok(mut new_card) => {
                     backoff.reset();
+                    // Re-apply the operator's via-URL override so it
+                    // persists across the fresh card the transport
+                    // just fetched. Without this, the first successful
+                    // connect wipes via_urls and PeerSnapshot.ws_url
+                    // reverts to the peer's self-advertised URL —
+                    // which is often unreachable from the browser in
+                    // NAT / tunnel / overlay topologies.
+                    self.apply_via_override(&mut new_card);
                     let card_arc = Arc::new(new_card.clone());
                     let _ = self.card_tx.send(card_arc);
                     let _ = self.connection_tx.send(ConnectionState::Connected);
@@ -270,7 +316,13 @@ impl PeerActor {
                 let _ = self.status_tx.send(*status);
             }
             PeerEvent::Connected { card } => {
-                let _ = self.card_tx.send(Arc::new(card.clone()));
+                // Same via-URL preservation as the transport-connect
+                // path above. Inbound Connected events happen when a
+                // peer re-announces itself mid-session; preserving
+                // the override keeps PeerSnapshot.ws_url stable.
+                let mut patched = card.clone();
+                self.apply_via_override(&mut patched);
+                let _ = self.card_tx.send(Arc::new(patched));
             }
             _ => {}
         }

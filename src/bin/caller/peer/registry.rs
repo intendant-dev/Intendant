@@ -241,9 +241,18 @@ impl PeerRegistry {
         override_pinned_fingerprints: Vec<String>,
     ) -> Result<PeerId, PeerError> {
         let mut card = fetch_card(card_url, bearer_token.as_deref()).await?;
+        // Apply the via-URL override to the initial card so the
+        // first PeerSnapshot the dashboard sees (before the actor
+        // completes its first connect) shows the operator's URL
+        // — not the peer's self-advertised one that's likely
+        // unreachable in NAT / tunnel topologies. Passed separately
+        // to `add_peer_with_card_and_auth` so the actor can re-apply
+        // it on every reconnect (the transport's `fetch_agent_card`
+        // on reconnect would otherwise wipe it).
         if !via_urls.is_empty() {
             card.transports = via_urls
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(|url| TransportSpec::IntendantWs { url })
                 .collect();
         }
@@ -252,7 +261,8 @@ impl PeerRegistry {
                 server_cert_fingerprints: override_pinned_fingerprints,
             };
         }
-        self.add_peer_with_card_and_auth(card, bearer_token).await
+        self.add_peer_with_card_and_auth(card, via_urls, bearer_token)
+            .await
     }
 
     /// Variant of [`add_peer`] that accepts a pre-fetched or
@@ -263,7 +273,7 @@ impl PeerRegistry {
     /// - Loopback registration (registering the local daemon as a
     ///   "peer" of itself, for dashboard symmetry)
     pub async fn add_peer_with_card(&self, card: AgentCard) -> Result<PeerId, PeerError> {
-        self.add_peer_with_card_and_auth(card, None).await
+        self.add_peer_with_card_and_auth(card, Vec::new(), None).await
     }
 
     /// Auth-aware variant of [`add_peer_with_card`] — stores the
@@ -283,6 +293,7 @@ impl PeerRegistry {
     pub async fn add_peer_with_card_and_auth(
         &self,
         card: AgentCard,
+        via_urls: Vec<String>,
         bearer_token: Option<String>,
     ) -> Result<PeerId, PeerError> {
         if self.inner.peers.read().unwrap().contains_key(&card.id) {
@@ -319,7 +330,7 @@ impl PeerRegistry {
         let peer_id = card.id.clone();
         let log_sink = self.inner.log_sink.clone();
 
-        let handle = spawn_peer(peer_id.clone(), card, log_sink, move |events_tx| {
+        let handle = spawn_peer(peer_id.clone(), card, via_urls, log_sink, move |events_tx| {
             // Build one concrete transport per supported spec (each
             // gets its own clone of `events_tx`, `bearer_token`, and
             // `pinned_fingerprints`) and wrap them in a
@@ -1023,6 +1034,91 @@ mod tests {
         gateway.abort();
     }
 
+    /// Regression guard: via_urls must persist across the actor's
+    /// first successful connect. The transport's `fetch_agent_card()`
+    /// on connect returns a fresh card (with the peer's
+    /// self-advertised transports); without intervention that card
+    /// overwrites the registry's initial patched card in the watch
+    /// channel, which wipes the operator's override. The actor
+    /// reapplies via_urls on every fresh card it publishes — this
+    /// test exercises that path end-to-end against a real gateway.
+    ///
+    /// Before the fix, `card_snapshot().transports` would revert to
+    /// the gateway's auto-detected URLs within ~100ms of add. After
+    /// the fix, it stays pinned to the via URL for the lifetime of
+    /// the actor (including across reconnects — not exercised here
+    /// because tearing down the gateway mid-test is fragile; the
+    /// preservation logic is the same in both paths of
+    /// `PeerActor::run` that call `apply_via_override`).
+    #[tokio::test]
+    async fn add_peer_with_via_persists_across_initial_card_refresh() {
+        let (port, gateway) = spawn_test_peer().await;
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let reg = PeerRegistry::new(log_tx);
+
+        // Reach the test gateway via localhost, but declare a via URL
+        // that's the SAME localhost:port pattern so the actor can
+        // actually connect. The test would also work with an
+        // unreachable via URL (actor just retries forever) but
+        // connectable is more faithful to the real-world case.
+        let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
+        let via_url = format!("ws://127.0.0.1:{port}/ws");
+        let via_urls = vec![via_url.clone()];
+        let peer_id = reg
+            .add_peer_with_via(&card_url, via_urls)
+            .await
+            .expect("add_peer_with_via succeeds");
+        let handle = reg.get(&peer_id).expect("peer is in registry");
+
+        // Wait until the actor has finished its first connect — the
+        // exact bug window. Without the fix, the card in the watch
+        // channel flips from the via URL to the gateway's
+        // auto-detected URLs as soon as ConnectionState becomes
+        // Connected.
+        let mut conn_rx = handle.connection_updates();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if matches!(*conn_rx.borrow(), crate::peer::ConnectionState::Connected) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "actor didn't reach Connected within 2s; current state: {:?}",
+                    *conn_rx.borrow()
+                );
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let _ = tokio::time::timeout(remaining, conn_rx.changed()).await;
+        }
+
+        // Give the card watch channel a tick to settle after the
+        // Connected transition — the actor sends card_tx before
+        // connection_tx in `run()` so by the time we see Connected
+        // the card is already updated, but tests run fast enough
+        // that a short yield keeps this robust against scheduling.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let card = handle.card_snapshot();
+        assert_eq!(
+            card.transports.len(),
+            1,
+            "via override should yield exactly one transport; got: {:?}",
+            card.transports
+        );
+        match &card.transports[0] {
+            TransportSpec::IntendantWs { url } => {
+                assert_eq!(
+                    url, &via_url,
+                    "via URL should persist across the actor's connect-time card refresh"
+                );
+            }
+            other => panic!("expected IntendantWs, got {other:?}"),
+        }
+
+        reg.remove_peer(&peer_id).await.unwrap();
+        gateway.abort();
+    }
+
     /// `add_peer_with_via` overrides the card's transports with the
     /// operator-supplied URLs. The card's identity (id, label,
     /// capabilities, auth) is preserved — only `transports` changes.
@@ -1312,7 +1408,7 @@ mod tests {
             },
             application: None,
         };
-        let result = reg.add_peer_with_card_and_auth(card, None).await;
+        let result = reg.add_peer_with_card_and_auth(card, Vec::new(), None).await;
         match result {
             Err(PeerError::Auth(msg)) => {
                 assert!(msg.contains("intendant:bad-pin"), "msg: {msg}");
@@ -1343,7 +1439,7 @@ mod tests {
             application: None,
         };
         let peer_id = reg
-            .add_peer_with_card_and_auth(card, None)
+            .add_peer_with_card_and_auth(card, Vec::new(), None)
             .await
             .expect("valid pinned card should register");
         assert_eq!(peer_id.label(), "good-pin");

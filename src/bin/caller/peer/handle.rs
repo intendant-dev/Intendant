@@ -454,12 +454,21 @@ pub struct PeerSnapshot {
 ///
 /// `initial_card` is the "last known card" — typically whatever was
 /// fetched at discovery time from the peer's
-/// `/.well-known/agent-card.json`. The actor overwrites it with the
-/// card returned from `transport.connect()` as soon as the first
-/// handshake completes.
+/// `/.well-known/agent-card.json`, with any operator overrides
+/// (via_urls, pinned fingerprints) already applied by the caller.
+/// The actor overwrites it with the card returned from
+/// `transport.connect()` as soon as the first handshake completes,
+/// applying `via_urls` to the fresh card so the operator's override
+/// persists across reconnects.
+///
+/// `via_urls` is the same list the caller passed through
+/// [`crate::peer::PeerRegistry::add_peer_with_credentials`] — stored
+/// on the actor and re-applied to every card it publishes. Empty
+/// means "no override; trust what the peer advertises."
 pub fn spawn_peer<F>(
     id: PeerId,
     initial_card: AgentCard,
+    via_urls: Vec<String>,
     log_sink: mpsc::Sender<TaggedPeerEvent>,
     build_transport: F,
 ) -> PeerHandle
@@ -487,6 +496,7 @@ where
         status_tx,
         card_tx,
         seq: 0,
+        via_urls,
     };
 
     tokio::spawn(actor.run());
@@ -575,6 +585,7 @@ mod tests {
         let handle = spawn_peer(
             initial_card.id.clone(),
             initial_card,
+            Vec::new(),
             log_tx,
             move |events_tx| {
                 Box::new(IntendantWsTransport::new(url_for_closure, events_tx))
