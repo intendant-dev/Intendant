@@ -7542,6 +7542,14 @@ class DisplaySlot {
     this._answerApplied = false;     // true after setRemoteDescription completes
     this._pendingCandidates = [];    // queued until answer is applied
     this._reconnectAttempts = 0;     // ICE failure reconnect counter
+    // True once the user has intentionally closed this slot (display
+    // toggled off, slot removed by user_display_revoked, etc). Gates the
+    // `onconnectionstatechange` 'failed' retry path so we don't spam
+    // offers at a server that deliberately tore the session down. Without
+    // this flag, revoke → server stops session → browser sees ICE failed
+    // → retry loop, which visually manifests as "off doesn't stay off"
+    // even though the server keeps (correctly) dropping each new offer.
+    this._closedByUser = false;
     this._streamIntervalId = null;
     this._streamFrameCounter = 0;
     this._streamCanvas = document.createElement('canvas');
@@ -7724,6 +7732,16 @@ class DisplaySlot {
         // ICE negotiation failed — tear down and create a fresh
         // offer/answer exchange.  The server-side DisplaySession stays
         // alive; only the WebRTC peer is recreated.
+        //
+        // Exception: if the user has explicitly closed this slot (toggle
+        // off, user_display_revoked), don't retry — the server has
+        // torn the session down deliberately, our offers would find no
+        // session to bind to, and the visible effect is "off doesn't
+        // stay off" because every retry briefly flips the UI back to
+        // reconnecting. `_closedByUser` sticks until the slot is
+        // destroyed; re-granting the display creates a fresh slot
+        // with the flag cleared.
+        if (this._closedByUser) return;
         this.connected = false;
         const attempts = (this._reconnectAttempts || 0) + 1;
         this._reconnectAttempts = attempts;
@@ -7732,7 +7750,10 @@ class DisplaySlot {
           this.statusEl.textContent = `Connection failed, reconnecting in ${delay/1000}s (attempt ${attempts})...`;
           this.statusEl.className = 'display-status error';
           this.disconnect();
-          setTimeout(() => this.connect(), delay);
+          setTimeout(() => {
+            if (this._closedByUser) return;
+            this.connect();
+          }, delay);
         } else {
           this.statusEl.textContent = 'Connection failed after 5 attempts';
           this.statusEl.className = 'display-status error';
@@ -8089,6 +8110,10 @@ function removeDisplaySlot(displayId) {
   displayId = Number(displayId);
   const slot = displaySlots.get(displayId);
   if (!slot) return;
+  // Mark as user-intent-closed BEFORE disconnect so any in-flight
+  // reconnect timer short-circuits and any subsequent `failed` event
+  // skips the retry path. See DisplaySlot._closedByUser.
+  slot._closedByUser = true;
   slot.disconnect();
   if (slot.el && slot.el.parentNode) slot.el.parentNode.removeChild(slot.el);
   displaySlots.delete(displayId);
