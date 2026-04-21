@@ -14035,6 +14035,19 @@ window.cycleAutonomy = function() {
 window.toggleUserDisplay = function() {
   if (!app) return;
   if (userDisplayGranted) {
+    // Tear the display slot down locally before the round-trip. The
+    // server processes the revoke instantly, but when the browser is
+    // busy decoding a live WebRTC video (toggling off the very stream
+    // it's rendering), the JS main thread is saturated and the
+    // inbound `user_display_revoked` broadcast waits behind video-
+    // render work for tens of seconds — observed as "button flips but
+    // streaming continues" on the peer's guest UI. Mirroring user
+    // intent client-side frees the main thread (pc.close() stops the
+    // decoder), and the server's subsequent broadcast becomes a
+    // confirmation of something we've already done rather than a gate
+    // on the UI response. removeDisplaySlot is idempotent — if the
+    // broadcast does arrive later, re-running it is a no-op.
+    removeDisplaySlot(Number(grantedDisplayId));
     app.revoke_user_display_with_id(grantedDisplayId);
     setUserDisplayState(false);
     return;
