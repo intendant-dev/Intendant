@@ -2760,6 +2760,30 @@ pub fn spawn_web_gateway(
                                                 bus_inbound.send(AppEvent::Resize(cols, rows));
                                             }
                                         }
+                                        Some("term_subscribe") => {
+                                            // Dashboard entered the Terminal tab. Start
+                                            // emitting ratatui frames to this connection.
+                                            // Every non-Terminal tab (Activity, Stats,
+                                            // Video, Sessions, Network, Settings, Debug)
+                                            // leaves us unsubscribed, which means WebTui
+                                            // stays idle instead of flooding the socket
+                                            // with frames nobody is watching.
+                                            if let Some(ref tx) = web_tui_tx {
+                                                let _ = tx.send(crate::tui::web::WebTuiCommand::Subscribe {
+                                                    id: connection_id_inbound.clone(),
+                                                });
+                                            }
+                                        }
+                                        Some("term_unsubscribe") => {
+                                            // Dashboard left the Terminal tab. Stop
+                                            // emitting ratatui frames to this connection
+                                            // until the next term_subscribe.
+                                            if let Some(ref tx) = web_tui_tx {
+                                                let _ = tx.send(crate::tui::web::WebTuiCommand::Unsubscribe {
+                                                    id: connection_id_inbound.clone(),
+                                                });
+                                            }
+                                        }
                                         Some("presence_connect") => {
                                             is_presence_connected = true;
                                             voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner()).connected = true;

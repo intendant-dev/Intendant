@@ -5416,6 +5416,20 @@ async function main() {
   // Connection state indicator
   app.set_on_server_state((connected) => {
     document.getElementById('sb-conn').className = connected ? 'conn-dot ok' : 'conn-dot err';
+    if (connected) {
+      // Fresh WS sessions start unsubscribed on the server. Reassert
+      // our local subscription state so reloads / reconnects restore
+      // frame flow to a Terminal-tab view without requiring the user
+      // to toggle tabs. termSubscribed is reset to false first so
+      // updateTermSubscription() sends the message; the server would
+      // otherwise see no-op cycles across reconnect.
+      termSubscribed = false;
+      updateTermSubscription();
+    } else {
+      // Server lost — mark the local state unsubscribed so the next
+      // onopen re-sends.
+      termSubscribed = false;
+    }
   });
 
   // ── Voice Callbacks ──
@@ -7398,6 +7412,25 @@ function switchTerminalSubtab(name) {
   } else if (name === 'tui' && fitAddon) {
     requestAnimationFrame(() => fitAddon.fit());
   }
+  // Only the TUI sub-tab consumes ratatui frames. Switching between
+  // TUI and Shell flips the server-side subscription so the Shell
+  // sub-tab doesn't receive term frames it wouldn't render.
+  updateTermSubscription();
+}
+
+// ── Terminal-frame subscription ──
+//
+// The server (intendant's `WebTui`) only emits `{"t":"term",...}` frames
+// when the connection is subscribed. We subscribe exactly when the
+// Terminal tab's TUI sub-tab is visible; otherwise we unsubscribe so
+// WebTui stops rendering for this connection entirely. Disconnecting
+// the WebSocket implicitly unsubscribes (the connection is removed).
+let termSubscribed = false;
+function updateTermSubscription() {
+  const wantSubscribed = activeTab === 'terminal' && activeTermSubtab === 'tui';
+  if (wantSubscribed === termSubscribed) return;
+  termSubscribed = wantSubscribed;
+  sendRawMessage({ t: wantSubscribed ? 'term_subscribe' : 'term_unsubscribe' });
 }
 
 // ── Shell key bar ──
@@ -10775,6 +10808,11 @@ function switchTab(tabId) {
       if (shellTerm) requestAnimationFrame(() => shellFitAddon && shellFitAddon.fit());
     }
   }
+  // Gate the server's ratatui frame stream on whether the user is
+  // actually looking at the TUI terminal. Every other tab keeps the
+  // WebSocket quiet, which is what prevents the render firehose from
+  // back-pressuring outbound control messages.
+  updateTermSubscription();
   if (tabId === 'activity' || tabId === 'displays') {
     relocateDisplays(tabId);
   }

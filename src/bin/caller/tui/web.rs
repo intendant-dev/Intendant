@@ -56,6 +56,12 @@ impl Write for SharedWriter {
 
 /// Commands from the web gateway to the WebTui event loop.
 /// Key/resize events are routed per-connection instead of through EventBus.
+///
+/// Subscription model: connections start silent. A connection must send
+/// `Subscribe` before any ratatui frames (`{"t":"term",...}`) are emitted
+/// to it; `Unsubscribe` stops emission without tearing the connection
+/// down. The dashboard subscribes only when the Terminal tab is visible,
+/// which keeps WebTui idle while the user is on any other tab.
 pub enum WebTuiCommand {
     AddConnection {
         id: String,
@@ -75,6 +81,18 @@ pub enum WebTuiCommand {
         id: String,
         key: crossterm::event::KeyEvent,
     },
+    /// Start emitting terminal frames for this connection.  Emits an
+    /// alternate-screen-enter sequence and an immediate full draw so the
+    /// browser sees the current UI state, not a blank screen.
+    Subscribe {
+        id: String,
+    },
+    /// Stop emitting terminal frames for this connection.  The underlying
+    /// ratatui `Terminal` is retained so a subsequent `Subscribe` can
+    /// resume cleanly with the latest geometry.
+    Unsubscribe {
+        id: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +104,11 @@ struct WebConnection {
     writer: SharedWriter,
     view: ViewState,
     direct_tx: mpsc::UnboundedSender<String>,
+    /// Whether this connection wants terminal frames. Set to `true` when
+    /// the dashboard is showing the Terminal tab; `false` otherwise.
+    /// No draws and no `{"t":"term",...}` emissions happen when this is
+    /// `false` — the whole render path is gated on it.
+    subscribed: bool,
 }
 
 impl WebConnection {
@@ -103,33 +126,70 @@ impl WebConnection {
             },
         )?;
 
-        // Send alternate-screen enter sequence to this connection
-        let mut init_writer = writer.clone();
-        execute!(init_writer, EnterAlternateScreen)?;
-        let init_data = writer.take();
-        if !init_data.is_empty() {
-            let b64 = encode_term(&init_data);
-            let _ = direct_tx.send(b64);
-        }
-
         Ok(Self {
             terminal,
             writer,
             view: ViewState::default(),
             direct_tx,
+            subscribed: false,
         })
+    }
+
+    /// Begin emitting term frames to this connection.  Sends the
+    /// alternate-screen-enter sequence plus a fresh full draw so the
+    /// browser sees the current UI state immediately; returns `Ok(())`
+    /// without touching the terminal if this connection is already
+    /// subscribed.
+    fn subscribe(&mut self, app: &mut App) -> io::Result<()> {
+        if self.subscribed {
+            return Ok(());
+        }
+        self.subscribed = true;
+
+        // Send alternate-screen enter sequence, then clear so the next
+        // draw paints the whole viewport (ratatui otherwise diffs against
+        // its previous buffer and may skip cells that actually need
+        // re-painting on the browser).
+        let mut init_writer = self.writer.clone();
+        execute!(init_writer, EnterAlternateScreen)?;
+        let _ = self.terminal.clear();
+        let init_data = self.writer.take();
+        if !init_data.is_empty() {
+            let _ = self.direct_tx.send(encode_term(&init_data));
+        }
+        self.draw(app)
+    }
+
+    /// Stop emitting term frames to this connection.  The terminal is
+    /// kept intact so a subsequent `subscribe` resumes cleanly.
+    fn unsubscribe(&mut self) {
+        self.subscribed = false;
+        // Discard any buffered output — we already skipped sending it
+        // during the draw gate, but a stray resize/clear could have left
+        // bytes queued; dropping them keeps state clean for the next
+        // subscribe.
+        let _ = self.writer.take();
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
         let _ = self.terminal.resize(Rect::new(0, 0, cols, rows));
         let _ = self.terminal.clear();
-        let data = self.writer.take();
-        if !data.is_empty() {
-            let _ = self.direct_tx.send(encode_term(&data));
+        if self.subscribed {
+            let data = self.writer.take();
+            if !data.is_empty() {
+                let _ = self.direct_tx.send(encode_term(&data));
+            }
+        } else {
+            // Discard: the next subscribe will redraw from scratch
+            // against the new geometry.
+            let _ = self.writer.take();
         }
     }
 
     fn draw(&mut self, app: &mut App) -> io::Result<()> {
+        if !self.subscribed {
+            return Ok(());
+        }
         let view = &self.view;
         self.terminal.draw(|f| {
             super::render_frame(f, app, view);
@@ -189,16 +249,26 @@ impl WebTui {
         bus: crate::event::EventBus,
     ) -> io::Result<()> {
         loop {
-            // Apply any pending verbosity override from control socket
+            // Apply any pending verbosity override from control socket.
+            // Apply it to every connection's view (even unsubscribed ones)
+            // so re-subscribing picks up the latest setting immediately.
             if let Some(v) = app.pending_verbosity.take() {
                 for conn in self.connections.values_mut() {
                     conn.view.verbosity = v;
                 }
             }
 
-            // Render each connection independently
-            for conn in self.connections.values_mut() {
-                let _ = conn.draw(app);
+            // Render only subscribed connections. When nobody is
+            // subscribed, this loop is effectively idle — no draws, no
+            // emitted frames, no CPU burn — and we wait for the next
+            // AppEvent or WebTuiCommand. This is the payoff: every tab
+            // other than Terminal leaves the browser quiet.
+            if self.has_subscribers() {
+                for conn in self.connections.values_mut() {
+                    if conn.subscribed {
+                        let _ = conn.draw(app);
+                    }
+                }
             }
 
             // Wait for next event (AppEvent or WebTuiCommand)
@@ -224,10 +294,14 @@ impl WebTui {
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(WebTuiCommand::AddConnection { id, direct_tx, cols, rows }) => {
+                            // Connections start silent. The browser is
+                            // responsible for sending Subscribe when it
+                            // wants frames (i.e. the Terminal tab is
+                            // active).  No initial draw here; that would
+                            // leak term frames to connections that never
+                            // intend to look at the Terminal tab.
                             match WebConnection::new(cols, rows, direct_tx) {
-                                Ok(mut conn) => {
-                                    // Immediately render so the browser doesn't see a blank screen
-                                    let _ = conn.draw(app);
+                                Ok(conn) => {
                                     self.connections.insert(id, conn);
                                 }
                                 Err(e) => eprintln!("WebTui: failed to create connection: {}", e),
@@ -251,6 +325,18 @@ impl WebTui {
                                 }
                             }
                         }
+                        Some(WebTuiCommand::Subscribe { id }) => {
+                            if let Some(conn) = self.connections.get_mut(&id) {
+                                if let Err(e) = conn.subscribe(app) {
+                                    eprintln!("WebTui: subscribe failed for {}: {}", id, e);
+                                }
+                            }
+                        }
+                        Some(WebTuiCommand::Unsubscribe { id }) => {
+                            if let Some(conn) = self.connections.get_mut(&id) {
+                                conn.unsubscribe();
+                            }
+                        }
                         None => break,
                     }
                     if app.should_quit {
@@ -261,6 +347,12 @@ impl WebTui {
         }
 
         Ok(())
+    }
+
+    /// Returns true when at least one connection is currently subscribed
+    /// to terminal frames.  When false, the render loop is fully idle.
+    fn has_subscribers(&self) -> bool {
+        self.connections.values().any(|c| c.subscribed)
     }
 }
 
@@ -433,5 +525,167 @@ mod tests {
             .decode(parsed["d"].as_str().unwrap())
             .unwrap();
         assert_eq!(decoded, b"\x1b[2J");
+    }
+
+    // ------------------------------------------------------------------
+    // Subscription-gated rendering tests
+    //
+    // These cover the invariant documented on `WebTuiCommand`:
+    // connections start silent, only subscribed connections receive
+    // `{"t":"term",...}` frames, and unsubscribe stops the stream while
+    // leaving the underlying terminal intact for a later re-subscribe.
+    // ------------------------------------------------------------------
+
+    fn test_app() -> App {
+        let autonomy = crate::autonomy::shared_autonomy(
+            crate::autonomy::AutonomyState::default(),
+        );
+        App::new(
+            "openai".to_string(),
+            "gpt-5".to_string(),
+            autonomy,
+            std::path::PathBuf::from("/tmp/test_webtui_session"),
+        )
+    }
+
+    /// Drain an mpsc receiver non-blockingly. Returns every message
+    /// currently queued.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            out.push(m);
+        }
+        out
+    }
+
+    fn count_term_frames(msgs: &[String]) -> usize {
+        msgs.iter()
+            .filter(|m| {
+                serde_json::from_str::<serde_json::Value>(m)
+                    .ok()
+                    .and_then(|v| v.get("t").and_then(|t| t.as_str()).map(str::to_string))
+                    .as_deref()
+                    == Some("term")
+            })
+            .count()
+    }
+
+    #[test]
+    fn new_connection_emits_nothing() {
+        // A fresh WebConnection must not push anything to its direct_tx
+        // until Subscribe lands. Previously `new()` sent an alternate-
+        // screen-enter sequence, which is exactly the kind of per-open
+        // chatter that adds up when nobody is watching the Terminal tab.
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let _conn = WebConnection::new(80, 24, tx).expect("new");
+        assert!(drain(&mut rx).is_empty(), "fresh connection must be silent");
+    }
+
+    #[test]
+    fn unsubscribed_draw_is_a_noop() {
+        // Even when `draw()` is called explicitly, the writer must not
+        // produce a term frame while the connection is unsubscribed. This
+        // is the subscription gate enforced at the draw site.
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let mut conn = WebConnection::new(80, 24, tx).expect("new");
+        let mut app = test_app();
+        conn.draw(&mut app).expect("draw");
+        assert_eq!(count_term_frames(&drain(&mut rx)), 0);
+    }
+
+    #[test]
+    fn subscribe_then_unsubscribe_stops_frames() {
+        // Subscribe must produce at least one term frame (the initial
+        // full draw). After unsubscribe, subsequent draws must not emit
+        // any frames. This is the gate the whole change exists for.
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let mut conn = WebConnection::new(80, 24, tx).expect("new");
+        let mut app = test_app();
+
+        conn.subscribe(&mut app).expect("subscribe");
+        let after_subscribe = drain(&mut rx);
+        assert!(
+            count_term_frames(&after_subscribe) >= 1,
+            "subscribe should push at least one frame, got {:?}",
+            after_subscribe
+        );
+
+        // A few more draws while subscribed — each should produce frames
+        // (contents may be identical, but ratatui writes at least some
+        // cursor-position sequence).
+        for _ in 0..3 {
+            conn.draw(&mut app).expect("draw");
+        }
+        assert!(count_term_frames(&drain(&mut rx)) >= 1);
+
+        // Now unsubscribe and draw repeatedly — zero frames should
+        // reach the wire.
+        conn.unsubscribe();
+        for _ in 0..5 {
+            conn.draw(&mut app).expect("draw");
+        }
+        assert_eq!(
+            count_term_frames(&drain(&mut rx)),
+            0,
+            "no frames should flow to an unsubscribed connection"
+        );
+    }
+
+    #[test]
+    fn resubscribe_after_unsubscribe_redraws() {
+        // Re-subscribing has to restart the frame stream (otherwise the
+        // dashboard would show a stale view after tab switching).
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let mut conn = WebConnection::new(80, 24, tx).expect("new");
+        let mut app = test_app();
+
+        conn.subscribe(&mut app).expect("initial subscribe");
+        let _ = drain(&mut rx); // discard bootstrap frames
+
+        conn.unsubscribe();
+        assert_eq!(count_term_frames(&drain(&mut rx)), 0);
+
+        conn.subscribe(&mut app).expect("resubscribe");
+        assert!(
+            count_term_frames(&drain(&mut rx)) >= 1,
+            "re-subscribe must push a fresh draw"
+        );
+    }
+
+    #[test]
+    fn resize_while_unsubscribed_does_not_leak() {
+        // A browser that's sitting on (say) the Stats tab can still emit
+        // resize messages when the window reflows. Those must not
+        // produce term frames while unsubscribed.
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let mut conn = WebConnection::new(80, 24, tx).expect("new");
+        conn.resize(100, 30);
+        assert_eq!(count_term_frames(&drain(&mut rx)), 0);
+    }
+
+    #[test]
+    fn has_subscribers_reflects_connection_state() {
+        // The WebTui run loop skips its draw pass entirely when
+        // `has_subscribers()` is false. This test pins that predicate so
+        // the optimization can't regress silently.
+        let (broadcast_tx, _) = broadcast::channel::<String>(4);
+        let mut tui = WebTui::new(80, 24, broadcast_tx).expect("new");
+        assert!(!tui.has_subscribers(), "empty WebTui has no subscribers");
+
+        let (tx_a, _rx_a) = mpsc::unbounded_channel::<String>();
+        let conn_a = WebConnection::new(80, 24, tx_a).expect("conn a");
+        tui.connections.insert("a".into(), conn_a);
+        assert!(
+            !tui.has_subscribers(),
+            "adding an unsubscribed connection doesn't make the loop active"
+        );
+
+        // Flip connection A to subscribed (bypassing the side-effect of
+        // subscribe() so we don't need to drive an App here).
+        tui.connections.get_mut("a").unwrap().subscribed = true;
+        assert!(tui.has_subscribers());
+
+        tui.connections.get_mut("a").unwrap().subscribed = false;
+        assert!(!tui.has_subscribers());
     }
 }
