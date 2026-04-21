@@ -1599,6 +1599,16 @@ async fn find_available_port(
 /// expose `IPV6_V6ONLY`. The constructed `std::net::TcpListener` is
 /// set non-blocking and handed to tokio via `from_std`, which is the
 /// same path tokio's own `TcpSocket::listen` takes under the hood.
+///
+/// Sets `SO_REUSEADDR` so a restart lands on the same port even
+/// when the previous daemon's sockets are still in `TIME_WAIT`.
+/// Without this, the Intendant.app wrapper's IPv4 probe (which
+/// does set `SO_REUSEADDR`) says 8765 is free — the backend then
+/// fails to bind it and slides to 8766, the WKWebView's HTTP poll
+/// keeps hitting 8765, and the UI shows "Failed to connect to
+/// backend on port 8765" even though the backend is healthy on
+/// the next port. Matching the wrapper's assumption keeps the
+/// port stable across restarts.
 async fn bind_dual_stack_or_v4(port: u16) -> std::io::Result<tokio::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     use std::net::SocketAddr;
@@ -1607,6 +1617,10 @@ async fn bind_dual_stack_or_v4(port: u16) -> std::io::Result<tokio::net::TcpList
         // kernel doesn't support the toggle (hardened sandboxes),
         // fall through to the IPv4 fallback path.
         if socket.set_only_v6(false).is_ok() {
+            // Best-effort: SO_REUSEADDR isn't load-bearing for
+            // correctness (ignore Err), but without it a quick
+            // restart races the kernel's TIME_WAIT window.
+            let _ = socket.set_reuse_address(true);
             let v6_wildcard: SocketAddr = format!("[::]:{port}")
                 .parse()
                 .expect("IPv6 wildcard literal parses");
@@ -1623,7 +1637,19 @@ async fn bind_dual_stack_or_v4(port: u16) -> std::io::Result<tokio::net::TcpList
             return tokio::net::TcpListener::from_std(std_listener);
         }
     }
-    tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await
+    // IPv4 fallback for hosts without an IPv6 stack. Same TIME_WAIT
+    // reasoning as the v6 path above — set SO_REUSEADDR via socket2
+    // rather than going through tokio's bind (which doesn't expose it).
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    let _ = socket.set_reuse_address(true);
+    let v4_wildcard: SocketAddr = format!("0.0.0.0:{port}")
+        .parse()
+        .expect("IPv4 wildcard literal parses");
+    socket.bind(&v4_wildcard.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
 }
 
 fn parse_cli_flags() -> Result<CliFlags, CallerError> {
