@@ -1098,8 +1098,32 @@ impl DisplaySession {
         .await?;
 
         let peer = Arc::new(peer);
-        self.peers.write().await.insert(peer_id, Arc::clone(&peer));
-        self.counters.peer_count.fetch_add(1, Ordering::Relaxed);
+        // `HashMap::insert` silently drops a displaced value, which strands
+        // the previous peer's driver task and — worse — lets the gauge
+        // increment below double-count it. Every `peer_count` drift I saw
+        // during federation smoke-tests (1 → 5 → 6 across a single
+        // debugging session, even as clients closed) was one of these
+        // replacements. Toggling the display off/on "fixed" it by wiping
+        // the whole HashMap on session teardown; doing it properly means
+        // closing the replaced peer and skipping the fetch_add so the
+        // counter stays a true gauge.
+        //
+        // Replacement happens legitimately on every repeat offer for the
+        // same `peer_id` — browser renegotiation, federated signaling that
+        // reuses the primary's WS peer_id across sessions, a Retry-After
+        // driven reconnect, etc. — so this isn't a corner case.
+        let replaced = {
+            let mut guard = self.peers.write().await;
+            guard.insert(peer_id, Arc::clone(&peer))
+        };
+        match replaced {
+            Some(old) => {
+                old.close().await;
+            }
+            None => {
+                self.counters.peer_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
         // Start clipboard monitoring (remote -> browser) if not already running.
         self.ensure_clipboard_forwarding().await;
