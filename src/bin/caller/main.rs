@@ -7275,10 +7275,25 @@ pub fn spawn_user_display_listener(
 }
 
 /// Tear down a user display session on revoke.
+///
+/// Registry removal is the only part that has to complete before the
+/// caller returns — once the session is out of the registry, no new
+/// offer can find it. `session.stop()` then tears down the capture,
+/// encoder, and clipboard tasks, which can take many seconds (each
+/// awaits a thread join). We run that in the background so the
+/// caller — `spawn_user_display_listener`'s `rx.recv()` loop — can
+/// pick up the next event (e.g. a follow-up `UserDisplayGranted`
+/// from a user who toggled off and back on) without waiting for the
+/// old session's threads to exit. Before this, a toggle-off-then-on
+/// cycle serialized behind `session.stop().await` — "turn on, wait
+/// 20+s, turn on is instant" mapped exactly to "the old stop finally
+/// finished and the listener got to the new grant".
 async fn deactivate_user_display(session_registry: &display::SharedSessionRegistry, display_id: u32) {
     if let Some(session) = session_registry.write().await.remove(display_id) {
         eprintln!("[user_display] Stopping display session for :{}", display_id);
-        session.stop().await;
+        tokio::spawn(async move {
+            session.stop().await;
+        });
     }
 }
 
