@@ -1577,6 +1577,7 @@ dependencies = [
  "sha2",
  "shiguredo_video_toolbox",
  "similar",
+ "socket2",
  "str0m",
  "tempfile",
  "thiserror 1.0.69",

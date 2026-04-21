@@ -52,6 +52,12 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 tokio-util = { version = "0.7", features = ["rt"] }
 presence-core = { path = "crates/presence-core" }
 libc = "0.2"
+# Used by `find_available_port` / `bind_dual_stack_or_v4` to flip
+# IPV6_V6ONLY off before bind — tokio's `TcpSocket` doesn't expose
+# that knob, and macOS defaults it to true so an IPv6 bind without
+# this refuses IPv4 connections. Kept pinned to tokio 1.x's transitive
+# version so there's no risk of dual copies in the dep tree.
+socket2 = "0.6"
 str0m = { version = "=0.18.0", default-features = false, features = ["openssl"] }
 env-libvpx-sys = { version = "5.1", features = ["generate"] }
 agent-client-protocol-schema = "0.11.5"

@@ -1552,12 +1552,29 @@ fn print_help() {
 
 /// Try binding to ports starting from `preferred`, returning the bound listener.
 /// Avoids TOCTOU by keeping the listener alive instead of probing and releasing.
+///
+/// Binds dual-stack (IPv6 with `IPV6_V6ONLY=false`) so the listener
+/// accepts both IPv6 and IPv4 connections. Without this, macOS
+/// defaults `V6ONLY=true` on IPv6 sockets and an IPv4-only bind
+/// would mismatch [`web_gateway::resolve_advertise_urls`], which
+/// enumerates every routable interface (v4 and v6) into the Agent
+/// Card. Federation code that picks a card URL verbatim — notably
+/// slice 3b's `relay_advertise_url` — would then inject an
+/// unreachable IPv6 ICE-TCP candidate and the browser would fail
+/// to form a pair. Dual-stack keeps every advertised URL
+/// truthful.
+///
+/// Falls back to IPv4-only if an IPv6 socket can't be created or
+/// configured (containerized envs with no IPv6 stack, hardened
+/// sandboxes that block V6ONLY toggling, etc). On those hosts
+/// `routable_local_addrs` won't find any IPv6 interfaces either,
+/// so the card's URL list stays consistent with the bind.
 async fn find_available_port(
     preferred: u16,
 ) -> Result<(u16, tokio::net::TcpListener), CallerError> {
     for offset in 0..20u16 {
         let port = preferred.checked_add(offset).unwrap_or(preferred);
-        match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+        match bind_dual_stack_or_v4(port).await {
             Ok(listener) => return Ok((port, listener)),
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
             Err(e) => {
@@ -1573,6 +1590,40 @@ async fn find_available_port(
         preferred,
         preferred + 19
     )))
+}
+
+/// Bind a TCP listener on `port`, preferring IPv6 dual-stack.
+/// See [`find_available_port`] for why dual-stack matters.
+///
+/// Uses `socket2` directly because `tokio::net::TcpSocket` doesn't
+/// expose `IPV6_V6ONLY`. The constructed `std::net::TcpListener` is
+/// set non-blocking and handed to tokio via `from_std`, which is the
+/// same path tokio's own `TcpSocket::listen` takes under the hood.
+async fn bind_dual_stack_or_v4(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::SocketAddr;
+    if let Ok(socket) = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)) {
+        // Flip V6ONLY off so the listener accepts IPv4 too. If the
+        // kernel doesn't support the toggle (hardened sandboxes),
+        // fall through to the IPv4 fallback path.
+        if socket.set_only_v6(false).is_ok() {
+            let v6_wildcard: SocketAddr = format!("[::]:{port}")
+                .parse()
+                .expect("IPv6 wildcard literal parses");
+            // Propagate bind errors (AddrInUse / EACCES / etc) so the
+            // caller's loop can walk to the next port or fail loudly.
+            // Don't silently fall back to IPv4 here — an in-use IPv6
+            // port is in use for IPv4 too on a dual-stack host.
+            socket.bind(&v6_wildcard.into())?;
+            socket.listen(1024)?;
+            // tokio::net::TcpListener::from_std requires the underlying
+            // socket to be in non-blocking mode.
+            socket.set_nonblocking(true)?;
+            let std_listener: std::net::TcpListener = socket.into();
+            return tokio::net::TcpListener::from_std(std_listener);
+        }
+    }
+    tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await
 }
 
 fn parse_cli_flags() -> Result<CliFlags, CallerError> {
