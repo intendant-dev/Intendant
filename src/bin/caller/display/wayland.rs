@@ -222,7 +222,15 @@ impl DisplayBackend for WaylandBackend {
 
         if let Some(mut ps) = self.portal_session.lock().await.take() {
             if let Some(handle) = ps.pw_thread.take() {
-                let _ = handle.join();
+                // Same rationale as x11.rs: don't block the executor on
+                // a std::thread::join — any other async task scheduled
+                // on this thread (the WebSocket outbound pump, the
+                // spawn_user_display_listener loop itself) stalls for
+                // the duration, making revokes feel flaky.
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = handle.join();
+                })
+                .await;
             }
             // Explicitly close the portal session so the GNOME sharing
             // indicator disappears immediately on revoke.

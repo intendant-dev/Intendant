@@ -225,7 +225,20 @@ impl DisplayBackend for X11Backend {
         self.shutdown.store(true, Ordering::SeqCst);
 
         if let Some(state) = self.capture.lock().await.take() {
-            let _ = state.thread.join();
+            // `std::thread::join()` is blocking — parking it on the tokio
+            // executor thread stalls every other async task scheduled
+            // there, including the WebSocket outbound pump that's trying
+            // to deliver UserDisplayRevoked to the dashboard. That
+            // explained the 1-minute revoke lag and the flakiness (the
+            // user sees "streaming continues live" because the broadcast
+            // is queued behind a join that's itself waiting for the
+            // capture thread to finish an in-flight XShmGetImage call).
+            // Push the join onto the blocking pool so the executor thread
+            // stays free.
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = state.thread.join();
+            })
+            .await;
         }
     }
 
