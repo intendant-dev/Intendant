@@ -2090,6 +2090,37 @@ pub fn spawn_web_gateway(
         None
     };
 
+    // Slice 3b: TCP relay registry for primary-as-media-relay. When
+    // a federated WebRTC `Answer` flows from a peer back to the
+    // browser, the translator (below) extracts the peer's ICE ufrag
+    // from the SDP, resolves the peer's outbound TCP address, and
+    // registers the mapping here. The accept loop (below) then
+    // dispatches incoming STUN-framed TCP connections whose ufrag
+    // matches an entry to the relay byte-forwarding path instead of
+    // the local WebRtcPeer path — the primary opens a fresh TCP
+    // connection to the peer and shuttles bytes between browser and
+    // peer until either side closes. Browser ICE treats this as a
+    // TCP candidate alongside the peer's direct candidate; direct
+    // wins on reachable topologies, relay covers the browser-can-
+    // only-reach-primary case (e.g. hypervisor-isolated VMs).
+    let tcp_relay_registry = crate::display::webrtc::TcpRelayRegistry::new();
+
+    // Primary's relay TCP URL, used to inject a relay candidate into
+    // forwarded `Answer` SDPs. Derived from the agent card's first
+    // IntendantWs transport — that's the URL the primary advertises
+    // to peers, which on most deployments is also what browsers use
+    // to reach the primary. Stored as a string so DNS resolution
+    // happens lazily at per-Answer rewrite time rather than once at
+    // startup (hostnames may not resolve at boot for Tailscale /
+    // mDNS / etc).
+    let relay_advertise_url: Option<String> = agent_card
+        .transports
+        .iter()
+        .find_map(|t| match t {
+            crate::peer::TransportSpec::IntendantWs { url } => Some(url.clone()),
+            _ => None,
+        });
+
     // Inject content-hash version into WASM/JS URLs for cache-busting.
     let v = asset_version_hash();
     let session_provider = config.provider.clone();
@@ -2223,6 +2254,10 @@ pub fn spawn_web_gateway(
     if let Some(reg) = peer_registry.as_ref() {
         let mut reg_rx = reg.subscribe();
         let push_tx = broadcast_tx.clone();
+        let reg_for_task = reg.clone();
+        let relay_registry_for_task = Arc::clone(&tcp_relay_registry);
+        let relay_url_for_task = relay_advertise_url.clone();
+        let bus_for_task = bus.clone();
         tokio::spawn(async move {
             loop {
                 match reg_rx.recv().await {
@@ -2243,9 +2278,27 @@ pub fn spawn_web_gateway(
                                 peer,
                                 event,
                             } => {
+                                // Slice 3b: when a federated Answer
+                                // comes back toward the browser, rewrite
+                                // the SDP to inject a TCP candidate
+                                // pointing at the primary's own relay
+                                // address, and register the peer's ufrag
+                                // in the relay registry so incoming
+                                // browser TCP connections with that
+                                // ufrag get forwarded to the peer. Other
+                                // event variants pass through verbatim.
+                                let rewritten_event = maybe_rewrite_federated_answer(
+                                    &peer,
+                                    event,
+                                    &reg_for_task,
+                                    &relay_registry_for_task,
+                                    relay_url_for_task.as_deref(),
+                                    &bus_for_task,
+                                )
+                                .await;
                                 crate::types::OutboundEvent::PeerEventForwarded {
                                     peer_id: peer.as_str().to_string(),
-                                    payload: event,
+                                    payload: rewritten_event,
                                 }
                             }
                         };
@@ -2290,6 +2343,7 @@ pub fn spawn_web_gateway(
             let peer_registry = peer_registry.clone();
             let ice_config = ice_config.clone();
             let tcp_peer_registry = Arc::clone(&tcp_peer_registry);
+            let tcp_relay_registry = Arc::clone(&tcp_relay_registry);
             let tcp_advertised_port = tcp_advertised_port;
             let shared_session = shared_session.clone();
             let voice_debug = voice_debug.clone();
@@ -2376,13 +2430,51 @@ pub fn spawn_web_gateway(
                         Ok(a) => a,
                         Err(_) => return,
                     };
-                    if let Err(e) = tcp_peer_registry
-                        .route_accepted(stream, first_frame, remote_addr)
-                        .await
-                    {
-                        eprintln!(
-                            "[web_gateway] ICE-TCP routing for {remote_addr} failed: {e}"
-                        );
+
+                    // Slice 3b dispatch: parse the frame's ufrag once,
+                    // then check the local `TcpPeerRegistry` first (for
+                    // local WebRtcPeers the daemon owns) and fall
+                    // through to the `TcpRelayRegistry` (federated
+                    // peers the primary relays to). Unknown ufrag =
+                    // close with a diagnostic log.
+                    //
+                    // Local first keeps the existing behavior
+                    // unchanged for non-federated topologies;
+                    // relay-as-fallback adds the federation relay
+                    // path without touching the local fast path.
+                    match crate::display::webrtc::parse_first_frame_ufrag(&first_frame) {
+                        Some(ufrag) if tcp_peer_registry.contains_ufrag(&ufrag) => {
+                            if let Err(e) = tcp_peer_registry
+                                .route_accepted(stream, first_frame, remote_addr)
+                                .await
+                            {
+                                eprintln!(
+                                    "[web_gateway] ICE-TCP local routing for {remote_addr} failed: {e}"
+                                );
+                            }
+                        }
+                        Some(ufrag) if tcp_relay_registry.contains_ufrag(&ufrag) => {
+                            if let Err(e) = tcp_relay_registry
+                                .route_accepted(stream, first_frame)
+                                .await
+                            {
+                                eprintln!(
+                                    "[web_gateway] ICE-TCP relay routing for ufrag={ufrag} from {remote_addr} failed: {e}"
+                                );
+                            }
+                        }
+                        Some(ufrag) => {
+                            eprintln!(
+                                "[web_gateway] ICE-TCP: no route for ufrag {ufrag:?} from {remote_addr} \
+                                 (neither local peer nor registered relay)"
+                            );
+                        }
+                        None => {
+                            eprintln!(
+                                "[web_gateway] ICE-TCP: first frame from {remote_addr} isn't a \
+                                 STUN binding request with a parseable USERNAME"
+                            );
+                        }
                     }
                     return;
                 }
@@ -5901,6 +5993,164 @@ async fn peers_webrtc_signal(
                 serde_json::json!({"error": e.to_string()}).to_string(),
             )
         }
+    }
+}
+
+/// Slice 3b: rewrite an outgoing federated `WebRtcSignal::Answer` to
+/// (a) register the peer's ICE ufrag in the relay registry and
+/// (b) inject a TCP candidate pointing at the primary's own address
+/// alongside the peer's direct candidate.
+///
+/// After the rewrite, a browser receiving this Answer has two TCP
+/// candidates: the peer's direct TCP candidate (if the peer provided
+/// one via `advertise_tcp_via_url`) and the primary's relay
+/// candidate. Browser ICE tries both and uses whichever forms first.
+/// Because the relay candidate is emitted with a lower priority
+/// (see `inject_relay_tcp_candidate`), direct wins on reachable
+/// topologies and relay is the fallback.
+///
+/// Non-Answer events pass through verbatim. Events with malformed
+/// SDPs, missing ufrags, or a peer URL that can't be resolved fall
+/// through without rewriting — the browser still sees the original
+/// Answer, just without the relay candidate.
+async fn maybe_rewrite_federated_answer(
+    peer: &crate::peer::PeerId,
+    event: crate::peer::PeerEvent,
+    registry: &crate::peer::PeerRegistry,
+    relay_registry: &Arc<crate::display::webrtc::TcpRelayRegistry>,
+    relay_advertise_url: Option<&str>,
+    bus: &EventBus,
+) -> crate::peer::PeerEvent {
+    const LOG_SOURCE: &str = "webrtc-peer";
+
+    // Match only the specific variant that carries an Answer SDP; all
+    // other event variants (Log, Usage, ActivityStarted, IceCandidate,
+    // etc.) pass through unchanged.
+    let (display_id, session_id, sdp) = match &event {
+        crate::peer::PeerEvent::WebRtcSignal {
+            display_id,
+            session_id,
+            signal: crate::peer::WebRtcSignal::Answer { sdp },
+        } => (*display_id, session_id.clone(), sdp.clone()),
+        _ => return event,
+    };
+
+    // Extract the peer's ICE ufrag from the Answer SDP. Without it we
+    // can't key the relay registry, so we skip rewriting and let the
+    // browser try whatever direct candidate the peer advertised.
+    let ufrag = match crate::display::webrtc::parse_sdp_ice_ufrag(&sdp) {
+        Some(u) => u,
+        None => {
+            bus.send(AppEvent::LogEntry {
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "skipping relay registration for peer={peer} session={session_id}: \
+                     Answer SDP missing a=ice-ufrag attribute"
+                ),
+                turn: None,
+            });
+            return event;
+        }
+    };
+
+    // Resolve the peer's outbound TCP address — where the primary
+    // will dial when it sees a relay-destined TCP connection. Prefer
+    // `browser_tcp_via_url` (operator's split-browser-side URL) then
+    // fall back to `ws_url` (primary-side via URL). In the typical
+    // co-located case the two are the same; in split topologies the
+    // operator uses browser_tcp_via_url to point at where they'd
+    // like the BROWSER to reach the peer. Here we're dialing FROM
+    // the primary, but the primary typically shares the LAN position
+    // of the operator's browser-reachable URL when one is set.
+    let outbound_url = registry.get(peer).and_then(|h| {
+        let snap = h.snapshot();
+        snap.browser_tcp_via_url.or(snap.ws_url)
+    });
+    let outbound_url = match outbound_url {
+        Some(u) => u,
+        None => {
+            bus.send(AppEvent::LogEntry {
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "skipping relay registration for peer={peer} session={session_id}: \
+                     no outbound URL on the peer's snapshot (peer removed mid-Answer?)"
+                ),
+                turn: None,
+            });
+            return event;
+        }
+    };
+    let outbound_addr = match resolve_url_to_socket_addr(&outbound_url).await {
+        Some(addr) => addr,
+        None => {
+            bus.send(AppEvent::LogEntry {
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "skipping relay registration for peer={peer} session={session_id}: \
+                     outbound URL {outbound_url:?} didn't resolve to a SocketAddr"
+                ),
+                turn: None,
+            });
+            return event;
+        }
+    };
+    relay_registry.register(ufrag.clone(), outbound_addr);
+
+    // Resolve the primary's own relay URL into a SocketAddr we can
+    // put in an SDP candidate line. When the primary has no
+    // advertised URL we can work with (local_addr() was None at
+    // spawn, headless mode, etc), skip injection and just forward
+    // the Answer unchanged — the browser still has the peer's
+    // direct candidate to try.
+    let primary_relay_addr = match relay_advertise_url {
+        Some(url) => match resolve_url_to_socket_addr(url).await {
+            Some(addr) => addr,
+            None => {
+                bus.send(AppEvent::LogEntry {
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "registered ufrag={ufrag} outbound={outbound_addr} for peer={peer} session={session_id} \
+                         but can't inject relay candidate — primary's own URL {url:?} doesn't resolve"
+                    ),
+                    turn: None,
+                });
+                return event;
+            }
+        },
+        None => {
+            bus.send(AppEvent::LogEntry {
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "registered ufrag={ufrag} outbound={outbound_addr} for peer={peer} session={session_id} \
+                     but no primary relay URL configured — skipping candidate injection"
+                ),
+                turn: None,
+            });
+            return event;
+        }
+    };
+
+    let rewritten_sdp =
+        crate::display::webrtc::inject_relay_tcp_candidate(&sdp, primary_relay_addr);
+    bus.send(AppEvent::LogEntry {
+        level: "info".to_string(),
+        source: LOG_SOURCE.to_string(),
+        content: format!(
+            "relay registered ufrag={ufrag} peer={peer} session={session_id} \
+             primary_relay={primary_relay_addr} outbound={outbound_addr}"
+        ),
+        turn: None,
+    });
+
+    crate::peer::PeerEvent::WebRtcSignal {
+        display_id,
+        session_id,
+        signal: crate::peer::WebRtcSignal::Answer { sdp: rewritten_sdp },
     }
 }
 
