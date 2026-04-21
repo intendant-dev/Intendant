@@ -10935,6 +10935,40 @@ function wsUrlToBaseUrl(wsUrl) {
     .replace(/\/ws$/, '');
 }
 
+// True when `url`'s hostname is loopback (127.0.0.1 / ::1 / localhost).
+// Used to filter out loopback URLs before handing them to WebRTC as
+// advertise_tcp_via_url: browsers silently drop remote loopback ICE
+// candidates as an anti-rebinding mitigation, so advertising loopback
+// breaks ICE-TCP pairing. When the browser omits the hint, slice 3b's
+// primary-as-media-relay fallback kicks in and media flows via the
+// primary's non-loopback address.
+function isLoopbackUrl(url) {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  } catch {
+    return false;
+  }
+}
+
+// Return the URL the browser should advertise as `advertise_tcp_via_url`
+// when opening a peer display, or '' when none is usable. Precedence:
+// (1) explicit operator browser_tcp_via_url, (2) ws_url fallback, (3)
+// empty to let slice 3b's primary-as-media-relay fallback take over.
+// Loopback URLs at either position collapse to '' — browsers can't use
+// a remote loopback ICE-TCP candidate, and falling back to ws_url when
+// it's loopback would silently break federation in the single-machine-
+// with-ssh-tunnel case. See renderDaemonRow / openPeerDisplay callers.
+function resolveBrowserTcpViaUrl(d) {
+  const explicit = d && d.browser_tcp_via_url;
+  if (explicit && !isLoopbackUrl(explicit)) return explicit;
+  const fallback = d && d.ws_url;
+  if (fallback && !isLoopbackUrl(fallback)) return fallback;
+  return '';
+}
+
 /// Fetch the peer list from /api/peers and update the in-memory
 /// `daemons` array, re-register with WASM for live event streaming,
 /// and re-render the Daemons panel. Single source of truth for
@@ -11378,14 +11412,11 @@ function renderDaemonRow(d, isSelf) {
   // the peer's HTTP port — passed as `advertise_tcp_via_url` in the
   // Offer so the peer can advertise an ICE-TCP candidate the browser
   // can actually dial (slice 3a.2, operator-configurable since 3a.4).
-  // Precedence: d.browser_tcp_via_url (explicit operator choice for
-  // the browser) overrides d.ws_url (the primary-side via URL). When
-  // the two differ, the operator is asserting "the browser reaches
-  // the peer HERE, even though the primary reaches it via some other
-  // URL" — the split-browser/split-primary topology.
-  const tcpViaUrl = (d.browser_tcp_via_url && d.browser_tcp_via_url !== '')
-    ? d.browser_tcp_via_url
-    : (d.ws_url || '');
+  // resolveBrowserTcpViaUrl applies the precedence (operator URL →
+  // ws_url → empty) and filters loopback at either position so slice
+  // 3b's primary-as-media-relay takes over when no non-loopback path
+  // is known — same contract the peer-side loopback warn describes.
+  const tcpViaUrl = resolveBrowserTcpViaUrl(d);
   const viewDisplayBtn = !isSelf && peerCanShareDisplay(d)
     ? `<button class="daemon-display-view" data-host-id="${escapeHtml(d.host_id)}" data-display-id="0" data-tcp-via-url="${escapeHtml(tcpViaUrl)}" title="Open this peer's display via WebRTC (browser↔peer direct, primary signals only)">View display</button>`
     : '';
@@ -11919,7 +11950,7 @@ async function openPeerDisplay(hostId, displayId, advertiseTcpViaUrl) {
   if (!effectiveUrl) {
     const d = daemons.find(x => x.host_id === hostId);
     if (d) {
-      effectiveUrl = d.browser_tcp_via_url || d.ws_url || '';
+      effectiveUrl = resolveBrowserTcpViaUrl(d);
     }
   }
   const conn = new PeerDisplayConnection(hostId, displayId, sessionId, effectiveUrl);
