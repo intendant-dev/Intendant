@@ -174,17 +174,23 @@ impl PeerRegistry {
     }
 
     /// Wrapper over [`add_peer_with_credentials`] that doesn't pass
-    /// pinned-fingerprint overrides. Kept for the existing call sites
-    /// that don't need the override; new code should use
-    /// `add_peer_with_credentials` directly.
+    /// pinned-fingerprint overrides or a browser-side TCP via URL.
+    /// Kept for existing call sites that don't need either; new code
+    /// should use `add_peer_with_credentials` directly.
     pub async fn add_peer_with_via_and_auth(
         &self,
         card_url: &str,
         via_urls: Vec<String>,
         bearer_token: Option<String>,
     ) -> Result<PeerId, PeerError> {
-        self.add_peer_with_credentials(card_url, via_urls, bearer_token, Vec::new())
-            .await
+        self.add_peer_with_credentials(
+            card_url,
+            via_urls,
+            bearer_token,
+            Vec::new(),
+            None,
+        )
+        .await
     }
 
     /// Full add-peer entry point: card_url + optional via override +
@@ -233,12 +239,23 @@ impl PeerRegistry {
     /// (conditionally) `auth.transport` are overridden. The peer is
     /// still uniquely identified by `card.id`, so duplicate
     /// registration still rejects with the same error.
+    ///
+    /// `browser_tcp_via_url` is orthogonal operator metadata: the
+    /// URL the **browser** uses to reach the peer's HTTP port for
+    /// WebRTC ICE-TCP. Stored on the resulting [`PeerHandle`] and
+    /// surfaced to the dashboard via
+    /// [`PeerSnapshot::browser_tcp_via_url`]; the dashboard sends it
+    /// as the `advertise_tcp_via_url` hint in federated WebRTC
+    /// offers. `None` falls back to the primary-side via URL (slice
+    /// 3a.2 behavior). See [`crate::project::PeerConfig`]'s field
+    /// of the same name for the motivation.
     pub async fn add_peer_with_credentials(
         &self,
         card_url: &str,
         via_urls: Vec<String>,
         bearer_token: Option<String>,
         override_pinned_fingerprints: Vec<String>,
+        browser_tcp_via_url: Option<String>,
     ) -> Result<PeerId, PeerError> {
         let mut card = fetch_card(card_url, bearer_token.as_deref()).await?;
         // Apply the via-URL override to the initial card so the
@@ -261,7 +278,7 @@ impl PeerRegistry {
                 server_cert_fingerprints: override_pinned_fingerprints,
             };
         }
-        self.add_peer_with_card_and_auth(card, via_urls, bearer_token)
+        self.add_peer_with_card_and_auth(card, via_urls, bearer_token, browser_tcp_via_url)
             .await
     }
 
@@ -273,7 +290,8 @@ impl PeerRegistry {
     /// - Loopback registration (registering the local daemon as a
     ///   "peer" of itself, for dashboard symmetry)
     pub async fn add_peer_with_card(&self, card: AgentCard) -> Result<PeerId, PeerError> {
-        self.add_peer_with_card_and_auth(card, Vec::new(), None).await
+        self.add_peer_with_card_and_auth(card, Vec::new(), None, None)
+            .await
     }
 
     /// Auth-aware variant of [`add_peer_with_card`] — stores the
@@ -295,6 +313,7 @@ impl PeerRegistry {
         card: AgentCard,
         via_urls: Vec<String>,
         bearer_token: Option<String>,
+        browser_tcp_via_url: Option<String>,
     ) -> Result<PeerId, PeerError> {
         if self.inner.peers.read().unwrap().contains_key(&card.id) {
             return Err(PeerError::Rejected {
@@ -330,7 +349,13 @@ impl PeerRegistry {
         let peer_id = card.id.clone();
         let log_sink = self.inner.log_sink.clone();
 
-        let handle = spawn_peer(peer_id.clone(), card, via_urls, log_sink, move |events_tx| {
+        let handle = spawn_peer(
+            peer_id.clone(),
+            card,
+            via_urls,
+            browser_tcp_via_url,
+            log_sink,
+            move |events_tx| {
             // Build one concrete transport per supported spec (each
             // gets its own clone of `events_tx`, `bearer_token`, and
             // `pinned_fingerprints`) and wrap them in a
@@ -1257,6 +1282,7 @@ mod tests {
                 Vec::new(),
                 None,
                 override_pinned.clone(),
+                None,
             )
             .await
             .expect("add_peer_with_credentials with valid override succeeds");
@@ -1294,7 +1320,7 @@ mod tests {
 
         let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
         let peer_id = reg
-            .add_peer_with_credentials(&card_url, Vec::new(), None, Vec::new())
+            .add_peer_with_credentials(&card_url, Vec::new(), None, Vec::new(), None)
             .await
             .expect("empty override succeeds");
 
@@ -1329,6 +1355,7 @@ mod tests {
                 Vec::new(),
                 None,
                 vec!["not-a-fingerprint".into()],
+                None,
             )
             .await;
         match result {
@@ -1408,7 +1435,9 @@ mod tests {
             },
             application: None,
         };
-        let result = reg.add_peer_with_card_and_auth(card, Vec::new(), None).await;
+        let result = reg
+            .add_peer_with_card_and_auth(card, Vec::new(), None, None)
+            .await;
         match result {
             Err(PeerError::Auth(msg)) => {
                 assert!(msg.contains("intendant:bad-pin"), "msg: {msg}");
@@ -1439,7 +1468,7 @@ mod tests {
             application: None,
         };
         let peer_id = reg
-            .add_peer_with_card_and_auth(card, Vec::new(), None)
+            .add_peer_with_card_and_auth(card, Vec::new(), None, None)
             .await
             .expect("valid pinned card should register");
         assert_eq!(peer_id.label(), "good-pin");

@@ -5506,6 +5506,16 @@ struct AddPeerRequest {
     /// as the card's: lowercase hex with optional `:` separators.
     #[serde(default)]
     pinned_fingerprints: Vec<String>,
+    /// Explicit URL the **browser** uses to reach this peer's HTTP
+    /// port for WebRTC ICE-TCP. When set, the dashboard uses this
+    /// (not `d.ws_url`) as the `advertise_tcp_via_url` hint in the
+    /// federated WebRTC offer. Decouples the browser-side URL from
+    /// the via URL the primary uses for federation, which matters
+    /// when the two network positions differ (primary-side localhost
+    /// tunnel, browser on a different machine, etc.). `None` falls
+    /// back to the slice 3a.2 behavior of using the primary's via URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    browser_tcp_via_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -5550,6 +5560,7 @@ async fn peers_add(
             req.via_urls,
             req.bearer_token,
             req.pinned_fingerprints,
+            req.browser_tcp_via_url,
         )
         .await
     {

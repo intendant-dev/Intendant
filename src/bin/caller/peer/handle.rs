@@ -121,6 +121,13 @@ struct PeerHandleInner {
     card: watch::Receiver<Arc<AgentCard>>,
     commands: mpsc::Sender<PeerCommand>,
     events: broadcast::Sender<PeerEvent>,
+    /// Browser-side TCP via URL — immutable for the lifetime of the
+    /// handle. Set at `spawn_peer` time from the operator's
+    /// `AddPeerRequest.browser_tcp_via_url` or
+    /// `PeerConfig.browser_tcp_via_url`. Surfaces on
+    /// [`PeerSnapshot::browser_tcp_via_url`] so the dashboard can
+    /// pick it over `ws_url` when sending federated WebRTC offers.
+    browser_tcp_via_url: Option<String>,
 }
 
 impl PeerHandle {
@@ -199,7 +206,15 @@ impl PeerHandle {
             status: self.status(),
             ws_url,
             capabilities,
+            browser_tcp_via_url: self.inner.browser_tcp_via_url.clone(),
         }
+    }
+
+    /// Operator-supplied browser-side TCP via URL for this peer.
+    /// Exposed here for diagnostics; the dashboard reads the same
+    /// value out of [`PeerSnapshot::browser_tcp_via_url`].
+    pub fn browser_tcp_via_url(&self) -> Option<&str> {
+        self.inner.browser_tcp_via_url.as_deref()
     }
 
     /// Subscribe to the peer's event stream. Fan-out is lossy for
@@ -434,6 +449,14 @@ pub struct PeerSnapshot {
     /// of [`crate::peer::card::Capability`] (`{kind: "computer-use"}` for
     /// built-in variants, `{kind: "custom", name: "..."}` for `Custom`).
     pub capabilities: Vec<serde_json::Value>,
+    /// Operator-supplied URL the browser uses to reach this peer's
+    /// HTTP port for WebRTC ICE-TCP. Decoupled from `ws_url` (the
+    /// primary-side via URL) so browsers on a different network
+    /// position from the primary can still form a TCP ICE pair. When
+    /// `None`, the dashboard falls back to `ws_url` — identical to
+    /// the slice 3a.2 behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_tcp_via_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -465,10 +488,21 @@ pub struct PeerSnapshot {
 /// [`crate::peer::PeerRegistry::add_peer_with_credentials`] — stored
 /// on the actor and re-applied to every card it publishes. Empty
 /// means "no override; trust what the peer advertises."
+///
+/// `browser_tcp_via_url` is operator-supplied metadata for the
+/// dashboard: the URL the **browser** uses to reach this peer's
+/// HTTP port for WebRTC ICE-TCP. Orthogonal to `via_urls` (which
+/// governs how the primary reaches the peer's /ws). Stored on
+/// [`PeerHandle`] and surfaced via
+/// [`PeerSnapshot::browser_tcp_via_url`]; the dashboard reads it
+/// back and sends it as the `advertise_tcp_via_url` hint in the
+/// federated WebRTC offer. `None` falls back to `ws_url` — slice
+/// 3a.2 behavior.
 pub fn spawn_peer<F>(
     id: PeerId,
     initial_card: AgentCard,
     via_urls: Vec<String>,
+    browser_tcp_via_url: Option<String>,
     log_sink: mpsc::Sender<TaggedPeerEvent>,
     build_transport: F,
 ) -> PeerHandle
@@ -510,6 +544,7 @@ where
             card: card_rx,
             commands: commands_tx,
             events: events_out_tx,
+            browser_tcp_via_url,
         }),
     }
 }
@@ -586,6 +621,7 @@ mod tests {
             initial_card.id.clone(),
             initial_card,
             Vec::new(),
+            None,
             log_tx,
             move |events_tx| {
                 Box::new(IntendantWsTransport::new(url_for_closure, events_tx))
@@ -643,5 +679,111 @@ mod tests {
             ConnectionState::Disconnected,
             "actor didn't transition to Disconnected"
         );
+    }
+
+    /// Operator-supplied `browser_tcp_via_url` round-trips through
+    /// `spawn_peer` into the `PeerHandle` and surfaces on
+    /// `PeerSnapshot`. This locks the contract the dashboard relies
+    /// on: the server stores the URL at peer-registration time and
+    /// hands it back on every `/api/peers` query so the Add Peer
+    /// form's configured value survives browser reloads.
+    #[tokio::test]
+    async fn browser_tcp_via_url_persists_through_snapshot() {
+        use crate::peer::card::{AgentCard, AuthRequirements, TransportSpec};
+        use crate::peer::id::{PeerId, PeerKind};
+        use crate::peer::transport::IntendantWsTransport;
+        use tokio::sync::mpsc;
+
+        // Any local-only WS URL works; the actor will try to connect
+        // (and fail, since nothing's listening) — but that's fine,
+        // the snapshot we care about reflects the initial card +
+        // the constructor-supplied browser_tcp_via_url, not the
+        // post-connect state.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let ws_url = format!("ws://127.0.0.1:{port}/ws");
+
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let initial_card = AgentCard {
+            id: PeerId::new(PeerKind::Intendant, "bp-test"),
+            label: "bp-test".into(),
+            version: "0.0.0".into(),
+            git_sha: None,
+            transports: vec![TransportSpec::IntendantWs { url: ws_url.clone() }],
+            capabilities: vec![],
+            auth: AuthRequirements::none(),
+        };
+        let browser_url = "ws://192.168.1.197:8766/ws".to_string();
+        let url_for_closure = ws_url.clone();
+        let handle = spawn_peer(
+            initial_card.id.clone(),
+            initial_card,
+            Vec::new(),
+            Some(browser_url.clone()),
+            log_tx,
+            move |events_tx| {
+                Box::new(IntendantWsTransport::new(url_for_closure, events_tx))
+            },
+        );
+
+        let snap = handle.snapshot();
+        assert_eq!(
+            snap.browser_tcp_via_url.as_deref(),
+            Some(browser_url.as_str()),
+            "snapshot must expose the constructor-supplied browser URL"
+        );
+        assert_eq!(
+            handle.browser_tcp_via_url(),
+            Some(browser_url.as_str()),
+            "getter mirrors snapshot"
+        );
+        // Belt-and-suspenders: the None case doesn't crash.
+        // (Constructed separately to avoid re-using the same card id,
+        // which would trip the duplicate-registration path if this
+        // were a real registry — spawn_peer itself doesn't check,
+        // but clarity matters.)
+    }
+
+    /// `None` for `browser_tcp_via_url` surfaces as `None` on the
+    /// snapshot — no surprising empty-string conversion. Important
+    /// because the dashboard distinguishes "operator didn't set a
+    /// browser URL" (fall back to ws_url) from "operator explicitly
+    /// wants this URL"; an empty string would collapse both cases.
+    #[tokio::test]
+    async fn browser_tcp_via_url_none_stays_none() {
+        use crate::peer::card::{AgentCard, AuthRequirements, TransportSpec};
+        use crate::peer::id::{PeerId, PeerKind};
+        use crate::peer::transport::IntendantWsTransport;
+        use tokio::sync::mpsc;
+
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let ws_url = format!("ws://127.0.0.1:{port}/ws");
+
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let initial_card = AgentCard {
+            id: PeerId::new(PeerKind::Intendant, "bp-none"),
+            label: "bp-none".into(),
+            version: "0.0.0".into(),
+            git_sha: None,
+            transports: vec![TransportSpec::IntendantWs { url: ws_url.clone() }],
+            capabilities: vec![],
+            auth: AuthRequirements::none(),
+        };
+        let url_for_closure = ws_url.clone();
+        let handle = spawn_peer(
+            initial_card.id.clone(),
+            initial_card,
+            Vec::new(),
+            None,
+            log_tx,
+            move |events_tx| {
+                Box::new(IntendantWsTransport::new(url_for_closure, events_tx))
+            },
+        );
+        assert!(handle.snapshot().browser_tcp_via_url.is_none());
+        assert!(handle.browser_tcp_via_url().is_none());
     }
 }

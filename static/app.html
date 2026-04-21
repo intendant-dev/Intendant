@@ -4450,6 +4450,9 @@ html, body {
               <div class="daemon-add-row daemon-add-row-via">
                 <input id="daemon-add-via" type="text" placeholder="via URL(s), e.g. ws://192.168.1.42:8766/ws — override card's transports (optional)" autocomplete="off">
               </div>
+              <div class="daemon-add-row daemon-add-row-via">
+                <input id="daemon-add-browser-tcp-via" type="text" placeholder="browser TCP URL, e.g. ws://192.168.1.197:8766/ws — WebRTC ICE-TCP when browser's view differs from via URL (optional)" autocomplete="off">
+              </div>
               <span id="daemons-status" class="daemons-status"></span>
             </fieldset>
 
@@ -10978,6 +10981,11 @@ function snapshotToDaemonEntry(p) {
     version: p.version || '',
     git_sha: p.git_sha || '',
     ws_url: p.ws_url || '',
+    // Browser-side TCP via URL (slice 3a.4). Operator-supplied URL the
+    // browser uses to reach the peer's HTTP port for WebRTC ICE-TCP —
+    // see PeerConfig.browser_tcp_via_url / AddPeerRequest.browser_tcp_via_url.
+    // Takes precedence over ws_url in openPeerDisplay when set.
+    browser_tcp_via_url: p.browser_tcp_via_url || '',
     capabilities: p.capabilities || [],
     server_connection_state: p.connection_state,
     server_status: p.status,
@@ -11154,8 +11162,10 @@ function renderDaemonsList() {
   el.querySelectorAll('.daemon-display-view').forEach(btn => {
     btn.addEventListener('click', () => {
       const displayId = parseInt(btn.dataset.displayId || '0', 10);
-      const wsUrl = btn.dataset.wsUrl || '';
-      openPeerDisplay(btn.dataset.hostId, displayId, wsUrl).catch(err => {
+      // data-tcp-via-url is pre-resolved at render time (see renderDaemonRow):
+      // d.browser_tcp_via_url when set, else d.ws_url.
+      const tcpViaUrl = btn.dataset.tcpViaUrl || '';
+      openPeerDisplay(btn.dataset.hostId, displayId, tcpViaUrl).catch(err => {
         console.error('openPeerDisplay failed:', err);
       });
     });
@@ -11338,15 +11348,20 @@ function renderDaemonRow(d, isSelf) {
   // advertises Capability::Display get the affordance. Slice 3a opens
   // display_id 0 by default; multi-display picker is a follow-up.
   //
-  // `data-ws-url` carries the URL the browser would use to reach the
-  // peer's HTTP port — passed as `advertise_tcp_via_url` in the Offer
-  // so the peer can advertise an ICE-TCP candidate the browser can
-  // actually dial (slice 3a.2). `d.ws_url` is the peer's first
-  // IntendantWs transport after via-override / auto-detect merge;
-  // when the browser is co-located with the primary, that URL
-  // resolves the same way on both sides.
+  // `data-tcp-via-url` carries the URL the browser would use to reach
+  // the peer's HTTP port — passed as `advertise_tcp_via_url` in the
+  // Offer so the peer can advertise an ICE-TCP candidate the browser
+  // can actually dial (slice 3a.2, operator-configurable since 3a.4).
+  // Precedence: d.browser_tcp_via_url (explicit operator choice for
+  // the browser) overrides d.ws_url (the primary-side via URL). When
+  // the two differ, the operator is asserting "the browser reaches
+  // the peer HERE, even though the primary reaches it via some other
+  // URL" — the split-browser/split-primary topology.
+  const tcpViaUrl = (d.browser_tcp_via_url && d.browser_tcp_via_url !== '')
+    ? d.browser_tcp_via_url
+    : (d.ws_url || '');
   const viewDisplayBtn = !isSelf && peerCanShareDisplay(d)
-    ? `<button class="daemon-display-view" data-host-id="${escapeHtml(d.host_id)}" data-display-id="0" data-ws-url="${escapeHtml(d.ws_url || '')}" title="Open this peer's display via WebRTC (browser↔peer direct, primary signals only)">View display</button>`
+    ? `<button class="daemon-display-view" data-host-id="${escapeHtml(d.host_id)}" data-display-id="0" data-tcp-via-url="${escapeHtml(tcpViaUrl)}" title="Open this peer's display via WebRTC (browser↔peer direct, primary signals only)">View display</button>`
     : '';
   const controlsPanel = isSelf
     ? ''
@@ -11870,12 +11885,16 @@ async function openPeerDisplay(hostId, displayId, advertiseTcpViaUrl) {
   const sessionId = generateSessionId();
   // Fall back to the daemon-list lookup when the caller didn't
   // supply the URL explicitly (e.g., future programmatic callers).
-  // The button click handler always passes d.ws_url when the peer
-  // has one, so this fallback is belt-and-suspenders.
+  // The button click handler passes the pre-resolved
+  // d.browser_tcp_via_url || d.ws_url via data-tcp-via-url, so this
+  // fallback only fires for programmatic callers. Same precedence:
+  // explicit browser-side URL wins, ws_url is the fallback.
   let effectiveUrl = advertiseTcpViaUrl || '';
   if (!effectiveUrl) {
     const d = daemons.find(x => x.host_id === hostId);
-    if (d && d.ws_url) effectiveUrl = d.ws_url;
+    if (d) {
+      effectiveUrl = d.browser_tcp_via_url || d.ws_url || '';
+    }
   }
   const conn = new PeerDisplayConnection(hostId, displayId, sessionId, effectiveUrl);
   peerDisplayConnections.set(conn.sessionKey(), conn);
@@ -11956,6 +11975,7 @@ async function addDaemon() {
   const urlInput = document.getElementById('daemon-add-url');
   const labelInput = document.getElementById('daemon-add-label');
   const viaInput = document.getElementById('daemon-add-via');
+  const browserTcpViaInput = document.getElementById('daemon-add-browser-tcp-via');
   const baseUrl = urlInput.value.trim();
   const userLabel = labelInput.value.trim();
   // Per-peer connecting-side override: replaces the card's transports
@@ -11963,6 +11983,14 @@ async function addDaemon() {
   // advertising peer's card doesn't list (port-forwards, proxies,
   // named tunnels, Tailscale tailnet on this side only).
   const viaUrls = parseTokenList(viaInput ? viaInput.value : '');
+  // Browser-side TCP via URL: what URL the browser uses to reach the
+  // peer's HTTP port for WebRTC ICE-TCP. Decoupled from via_urls for
+  // the topology where browser and primary see different addresses
+  // (primary-side localhost tunnel, split-machine setup, etc.).
+  // Empty → server falls back to d.ws_url, matching slice 3a.2 behavior.
+  const browserTcpViaUrl = browserTcpViaInput
+    ? browserTcpViaInput.value.trim()
+    : '';
 
   if (!baseUrl) { setDaemonsStatus('URL is required', 'error'); return; }
   if (!/^https?:\/\//.test(baseUrl)) {
@@ -11993,6 +12021,7 @@ async function addDaemon() {
   // continue to work without it.
   const body = { card_url: cardUrl };
   if (viaUrls.length > 0) body.via_urls = viaUrls;
+  if (browserTcpViaUrl) body.browser_tcp_via_url = browserTcpViaUrl;
   try {
     const resp = await authedFetch('/api/peers', {
       method: 'POST',
@@ -12019,6 +12048,7 @@ async function addDaemon() {
   urlInput.value = '';
   labelInput.value = '';
   if (viaInput) viaInput.value = '';
+  if (browserTcpViaInput) browserTcpViaInput.value = '';
 }
 
 async function removeDaemon(hostId) {

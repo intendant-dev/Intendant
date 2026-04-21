@@ -199,6 +199,7 @@ fn build_and_hydrate_peer_registry(
         let card_url = cfg.card_url.clone();
         let bearer_token = cfg.bearer_token.clone();
         let pinned_fingerprints = cfg.pinned_fingerprints.clone();
+        let browser_tcp_via_url = cfg.browser_tcp_via_url.clone();
         tokio::spawn(async move {
             // Vec::new() for via_urls (could be threaded through
             // PeerConfig later if config-driven via overrides become
@@ -207,12 +208,18 @@ fn build_and_hydrate_peer_registry(
             // non-empty, replaces the card's auth.transport with
             // PinnedMutualTls — operator distrusts the card's claim
             // and pins against fingerprints they got out-of-band.
+            // browser_tcp_via_url, when set, overrides the dashboard's
+            // default `d.ws_url` fallback when opening WebRTC display
+            // — used when the browser and primary can't share the
+            // same URL (primary-side localhost tunnel, split
+            // browser/primary machines, etc.).
             if let Err(e) = registry_for_task
                 .add_peer_with_credentials(
                     &card_url,
                     Vec::new(),
                     bearer_token,
                     pinned_fingerprints,
+                    browser_tcp_via_url,
                 )
                 .await
             {

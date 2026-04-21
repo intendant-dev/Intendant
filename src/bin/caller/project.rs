@@ -588,6 +588,37 @@ pub struct PeerConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_fingerprints: Vec<String>,
+    /// Explicit URL the **browser** uses to reach this peer's HTTP
+    /// port for WebRTC ICE-TCP — decoupled from the via URL the
+    /// primary uses for federation.
+    ///
+    /// Slice 3a.2 wired `advertise_tcp_via_url` from `d.ws_url` (the
+    /// primary-side via URL). That works when the browser shares
+    /// the primary's network position, but breaks when the primary
+    /// reaches the peer via a tunnel endpoint the browser can't use
+    /// — most commonly, a `localhost:NNNN` tunnel that's bound on
+    /// the primary VM's loopback and invisible to the browser's
+    /// machine, or that resolves to `[::1]` on the peer and hits
+    /// WKWebView's anti-rebinding filter. This field is the escape
+    /// hatch: when set, it replaces `d.ws_url` as the
+    /// `advertise_tcp_via_url` sent in the federated WebRTC offer.
+    ///
+    /// Example (browser on the operator's Mac, primary on a
+    /// hypervisor VM, peer reachable from the Mac via a non-loopback
+    /// tunnel endpoint):
+    /// ```toml
+    /// [[peer]]
+    /// card_url = "http://localhost:8766/.well-known/agent-card.json"
+    /// # Primary reaches the peer via this (loopback on the primary VM):
+    /// # — via_urls are CLI / dashboard-add-time only; this config
+    /// #   key is for the browser-side URL specifically.
+    /// browser_tcp_via_url = "ws://192.168.1.197:8766/ws"
+    /// ```
+    ///
+    /// `None` (the default) means "use the primary-side via URL" —
+    /// identical behavior to slice 3a.2 before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_tcp_via_url: Option<String>,
 }
 
 /// Recording configuration in intendant.toml.
@@ -811,6 +842,7 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                     label: Some("A".into()),
                     bearer_token: None,
                     pinned_fingerprints: Vec::new(),
+                    browser_tcp_via_url: None,
                 },
                 PeerConfig {
                     card_url: "http://b.local/.well-known/agent-card.json".into(),
@@ -819,6 +851,9 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                     pinned_fingerprints: vec![
                         "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
                     ],
+                    browser_tcp_via_url: Some(
+                        "ws://192.168.1.197:8766/ws".into(),
+                    ),
                 },
             ],
             ..ProjectConfig::default()
@@ -839,6 +874,23 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
         assert!(
             parsed.peers[0].pinned_fingerprints.is_empty(),
             "empty pinning preserved across round-trip"
+        );
+        // Slice 3a.4: browser_tcp_via_url round-trips verbatim.
+        assert_eq!(
+            parsed.peers[0].browser_tcp_via_url,
+            original.peers[0].browser_tcp_via_url
+        );
+        assert_eq!(
+            parsed.peers[1].browser_tcp_via_url,
+            original.peers[1].browser_tcp_via_url,
+        );
+        assert!(
+            parsed.peers[0].browser_tcp_via_url.is_none(),
+            "None is serialized-then-deserialized as None"
+        );
+        assert_eq!(
+            parsed.peers[1].browser_tcp_via_url.as_deref(),
+            Some("ws://192.168.1.197:8766/ws"),
         );
     }
 
