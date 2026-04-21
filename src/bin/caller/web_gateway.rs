@@ -6080,6 +6080,38 @@ async fn handle_federated_webrtc_signal(
                 ),
                 turn: None,
             });
+            // Loopback TCP candidates (127.0.0.1 / ::1) are silently
+            // dropped by browsers as anti-rebinding mitigation (same
+            // filter documented for the local path at
+            // display/webrtc.rs:38-43; the federated path hits the
+            // same trap when an operator configures a `localhost:NNNN`
+            // tunnel on the primary side but the browser doesn't have
+            // a matching loopback tunnel). No observable signaling
+            // failure — ICE just silently never pairs. Emit a
+            // prominent warn here so operators catch it at the first
+            // Offer rather than debugging by inference through
+            // "media never forms despite signaling completing."
+            if let Some(addr) = tcp_advertised_addr {
+                if addr.ip().is_loopback() {
+                    bus.send(AppEvent::LogEntry {
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "advertise_tcp_via_url resolved to loopback ({}) — \
+                             browsers silently drop remote loopback ICE \
+                             candidates (anti-rebinding mitigation), so ICE-TCP \
+                             will never pair. Configure the peer's \
+                             `browser_tcp_via_url` (slice 3a.4) with a \
+                             non-loopback address the browser's machine can \
+                             reach (LAN IP, port-forward on a real NIC, \
+                             Tailscale URL, etc.) or wait for slice 3b's \
+                             primary-as-media-relay fallback.",
+                            addr
+                        ),
+                        turn: None,
+                    });
+                }
+            }
             let (ice_tx, mut ice_rx) =
                 tokio::sync::mpsc::channel::<(crate::display::PeerId, String)>(64);
             let answer_result = session
