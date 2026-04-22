@@ -14052,21 +14052,35 @@ window.toggleUserDisplay = function() {
     setUserDisplayState(false);
     return;
   }
-  // Fetch available displays, show picker if multiple
+  // If we've already enumerated displays this session, use the cached
+  // result and short-circuit the fetch. /api/displays runs xrandr
+  // against the X server, which blocks behind in-flight XShmGetImage
+  // calls from any concurrent capture — so right after a revoke
+  // (while the backgrounded capture thread is still joining), the
+  // call can take 1-1.5s and stalls the indicator flip by the same
+  // margin. Displays rarely change mid-session, so honoring the
+  // cache between toggles makes ON#2 as fast as ON#1 without trading
+  // correctness for speed: we still fetch on first toggle to
+  // populate the cache, and a hotplug that invalidates the cache
+  // would surface either as a stale picker entry (benign) or a
+  // failed grant that user can retry (also benign).
+  const applyDisplayList = (displays) => {
+    cachedDisplays = displays;
+    if (!displays || displays.length <= 1) {
+      app.grant_user_display();
+      grantedDisplayId = 0;
+      setUserDisplayState(true);
+    } else {
+      showDisplayPicker(displays);
+    }
+  };
+  if (cachedDisplays && cachedDisplays.length > 0) {
+    applyDisplayList(cachedDisplays);
+    return;
+  }
   fetch('/api/displays')
     .then(r => r.json())
-    .then(displays => {
-      cachedDisplays = displays;
-      if (!displays || displays.length <= 1) {
-        // Single display or fallback: grant immediately (unchanged behavior)
-        app.grant_user_display();
-        grantedDisplayId = 0;
-        setUserDisplayState(true);
-      } else {
-        // Multiple displays: show picker
-        showDisplayPicker(displays);
-      }
-    })
+    .then(applyDisplayList)
     .catch(() => {
       // Fetch failed: fall back to granting default display
       app.grant_user_display();
