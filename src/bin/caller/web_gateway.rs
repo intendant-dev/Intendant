@@ -3636,9 +3636,19 @@ pub fn spawn_web_gateway(
                                             let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
                                             let sdp = json["sdp"].as_str().unwrap_or("").to_string();
 
-                                            if let Some(ref sr) = session_registry_inbound {
-                                                if let Some(session) = sr.read().await.get(display_id) {
-                                                    let (ice_tx, mut ice_rx) = mpsc::channel::<(crate::display::PeerId, String)>(64);
+                                            // Clone the Arc<DisplaySession> out of the read
+                                            // lock before calling handle_offer. Holding the
+                                            // guard across the await chokes any writer
+                                            // (notably deactivate_user_display's
+                                            // registry.write()) for as long as this block
+                                            // runs. The Arc keeps the session alive
+                                            // independently of the lock.
+                                            let session: Option<Arc<crate::display::DisplaySession>> = match session_registry_inbound.as_ref() {
+                                                Some(sr) => sr.read().await.get(display_id),
+                                                None => None,
+                                            };
+                                            if let Some(session) = session {
+                                                let (ice_tx, mut ice_rx) = mpsc::channel::<(crate::display::PeerId, String)>(64);
                                                     // Combine the Host-header IP with the
                                                     // port we want to advertise (HTTP port
                                                     // for Phase 3 multiplex, or standalone
@@ -3691,7 +3701,6 @@ pub fn spawn_web_gateway(
                                                         }
                                                     }
                                                 }
-                                            }
                                         }
                                         Some("display_ice") => {
                                             // Trickle ICE candidate from browser. Spawn the
@@ -3718,11 +3727,25 @@ pub fn spawn_web_gateway(
                                             let sr_clone = session_registry_inbound.clone();
                                             let pid = peer_id;
                                             tokio::spawn(async move {
-                                                if let Some(ref sr) = sr_clone {
-                                                    if let Some(session) = sr.read().await.get(display_id) {
-                                                        if let Err(e) = session.add_ice_candidate(pid, &candidate).await {
-                                                            eprintln!("[web_gateway] ICE candidate failed for display {}: {}", display_id, e);
-                                                        }
+                                                // Clone the session Arc out of the read
+                                                // lock first. The previous spread-across-
+                                                // `if let` form held the guard across
+                                                // add_ice_candidate's mDNS resolution,
+                                                // which on hosts without Avahi blocks for
+                                                // 5-20s per candidate — starving any
+                                                // concurrent writer (notably
+                                                // deactivate_user_display's
+                                                // registry.write()). Dropping the guard
+                                                // first lets deactivate proceed
+                                                // immediately; the session Arc keeps the
+                                                // target alive while mDNS resolves.
+                                                let session: Option<Arc<crate::display::DisplaySession>> = match sr_clone.as_ref() {
+                                                    Some(sr) => sr.read().await.get(display_id),
+                                                    None => None,
+                                                };
+                                                if let Some(session) = session {
+                                                    if let Err(e) = session.add_ice_candidate(pid, &candidate).await {
+                                                        eprintln!("[web_gateway] ICE candidate failed for display {}: {}", display_id, e);
                                                     }
                                                 }
                                             });
@@ -3824,15 +3847,21 @@ pub fn spawn_web_gateway(
                                             terminal_registry_inbound.close(&key).await;
                                         }
                                         Some("display_input") => {
-                                            // Input event (keyboard/mouse) for a display session
+                                            // Input event (keyboard/mouse) for a display session.
+                                            // Drop the registry read lock before the inject
+                                            // (which runs xdotool/cliclick subprocesses) so a
+                                            // concurrent deactivate can take the write lock
+                                            // without waiting on subprocess exits.
                                             let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
                                             if let Some(evt) = json.get("event") {
                                                 if let Ok(input_event) = serde_json::from_value::<crate::display::InputEvent>(evt.clone()) {
-                                                    if let Some(ref sr) = session_registry_inbound {
-                                                        if let Some(session) = sr.read().await.get(display_id) {
-                                                            if let Err(e) = session.inject_input(input_event).await {
-                                                                eprintln!("[web_gateway] display input injection failed: {}", e);
-                                                            }
+                                                    let session: Option<Arc<crate::display::DisplaySession>> = match session_registry_inbound.as_ref() {
+                                                        Some(sr) => sr.read().await.get(display_id),
+                                                        None => None,
+                                                    };
+                                                    if let Some(session) = session {
+                                                        if let Err(e) = session.inject_input(input_event).await {
+                                                            eprintln!("[web_gateway] display input injection failed: {}", e);
                                                         }
                                                     }
                                                 }
