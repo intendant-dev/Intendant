@@ -7250,10 +7250,14 @@ pub fn spawn_user_display_listener(
         loop {
             match rx.recv().await {
                 Ok(AppEvent::UserDisplayGranted { display_id }) => {
+                    eprintln!("[TIMING {}] listener recv UserDisplayGranted display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
                     activate_user_display(&bus, &session_registry, frame_registry.clone(), display_id).await;
+                    eprintln!("[TIMING {}] listener activate_user_display returned display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
                 }
                 Ok(AppEvent::UserDisplayRevoked { display_id, .. }) => {
+                    eprintln!("[TIMING {}] listener recv UserDisplayRevoked display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
                     deactivate_user_display(&session_registry, display_id).await;
+                    eprintln!("[TIMING {}] listener deactivate_user_display returned display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
                 }
                 Ok(AppEvent::DisplayCaptureLost { display_id, ref reason }) => {
                     // Capture backend stopped unexpectedly (portal session
@@ -7289,12 +7293,20 @@ pub fn spawn_user_display_listener(
 /// 20+s, turn on is instant" mapped exactly to "the old stop finally
 /// finished and the listener got to the new grant".
 async fn deactivate_user_display(session_registry: &display::SharedSessionRegistry, display_id: u32) {
+    eprintln!("[TIMING {}] deactivate_user_display ENTER display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
     if let Some(session) = session_registry.write().await.remove(display_id) {
+        eprintln!("[TIMING {}] deactivate_user_display registry.remove done display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
         eprintln!("[user_display] Stopping display session for :{}", display_id);
         tokio::spawn(async move {
+            eprintln!("[TIMING {}] deactivate bg stop task ENTER display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
             session.stop().await;
+            eprintln!("[TIMING {}] deactivate bg stop task EXIT display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
         });
+        eprintln!("[TIMING {}] deactivate_user_display spawned bg stop display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
+    } else {
+        eprintln!("[TIMING {}] deactivate_user_display no session in registry display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
     }
+    eprintln!("[TIMING {}] deactivate_user_display EXIT display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
 }
 
 /// Handle user display grant: create a `DisplaySession` and emit
@@ -7309,12 +7321,20 @@ async fn activate_user_display(
     frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<frames::FrameRegistry>>>,
     target_display_id: u32,
 ) {
+    eprintln!("[TIMING {}] activate_user_display ENTER display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), target_display_id);
     let display_id: u32 = target_display_id;
     let (width, height) = query_display_resolution(display_id);
+    eprintln!("[TIMING {}] activate_user_display query_display_resolution done {}x{}", chrono::Utc::now().format("%H:%M:%S%.3f"), width, height);
 
     // On Wayland: create a DisplaySession with WaylandBackend.
     // Detect Wayland even when WAYLAND_DISPLAY isn't in our env (e.g. started
     // from a tty/ssh session while a graphical session is active).
+    #[cfg(target_os = "linux")]
+    {
+        let wayland_env = std::env::var("WAYLAND_DISPLAY").ok();
+        let wayland_socket = detect_wayland_socket();
+        eprintln!("[TIMING {}] activate_user_display wayland check: env={:?} socket={:?}", chrono::Utc::now().format("%H:%M:%S%.3f"), wayland_env, wayland_socket);
+    }
     #[cfg(target_os = "linux")]
     if std::env::var("WAYLAND_DISPLAY").is_ok() || detect_wayland_socket().is_some() {
         if let Some(socket) = detect_wayland_socket() {
@@ -7346,6 +7366,7 @@ async fn activate_user_display(
             display_id,
             backend: "wayland",
         });
+        eprintln!("[TIMING {}] activate_user_display Wayland: calling session.start (45s timeout)", chrono::Utc::now().format("%H:%M:%S%.3f"));
         match tokio::time::timeout(
             std::time::Duration::from_secs(45),
             session.start(30, frame_registry.clone(), Some(bus.clone())),
@@ -7353,18 +7374,22 @@ async fn activate_user_display(
         .await
         {
             Ok(Ok(())) => {
+                eprintln!("[TIMING {}] activate_user_display Wayland: session.start Ok", chrono::Utc::now().format("%H:%M:%S%.3f"));
                 // Use the backend's resolution (from portal), not xdpyinfo.
                 let (width, height) = session.resolution();
                 let session = Arc::new(session);
                 session.spawn_metrics_logger(Some(bus.clone()));
                 session_registry.write().await.insert(display_id, session);
+                eprintln!("[TIMING {}] activate_user_display Wayland: emitting DisplayReady {}x{}", chrono::Utc::now().format("%H:%M:%S%.3f"), width, height);
                 bus.send(AppEvent::DisplayReady { display_id, width, height });
                 return;
             }
             Ok(Err(e)) => {
+                eprintln!("[TIMING {}] activate_user_display Wayland: session.start Err {}", chrono::Utc::now().format("%H:%M:%S%.3f"), e);
                 eprintln!("[user_display] Wayland display session failed: {}", e);
             }
             Err(_) => {
+                eprintln!("[TIMING {}] activate_user_display Wayland: 45s TIMEOUT, falling through to X11", chrono::Utc::now().format("%H:%M:%S%.3f"));
                 eprintln!(
                     "[user_display] Wayland portal timed out after 45s \
                      (screen-sharing dialog was not approved), trying X11"
@@ -7378,6 +7403,7 @@ async fn activate_user_display(
     {
         let has_x11 = std::env::var("DISPLAY").is_ok()
             || vision::detect_x11_display().is_some();
+        eprintln!("[TIMING {}] activate_user_display X11 branch: has_x11={}", chrono::Utc::now().format("%H:%M:%S%.3f"), has_x11);
         if has_x11 {
             // Ensure DISPLAY is set for downstream tools (xdotool, import, etc.)
             if std::env::var("DISPLAY").is_err() {
@@ -7416,15 +7442,21 @@ async fn activate_user_display(
                     .map_err(|e| eprintln!("[user_display] X11 backend failed: {}", e))
             };
             if let Ok(backend) = backend {
+                eprintln!("[TIMING {}] activate_user_display X11: backend created", chrono::Utc::now().format("%H:%M:%S%.3f"));
                 let session = display::DisplaySession::new(display_id, Arc::new(backend));
+                eprintln!("[TIMING {}] activate_user_display X11: DisplaySession::new done, calling session.start", chrono::Utc::now().format("%H:%M:%S%.3f"));
                 if let Err(e) = session.start(30, frame_registry.clone(), Some(bus.clone())).await {
+                    eprintln!("[TIMING {}] activate_user_display X11: session.start Err {}", chrono::Utc::now().format("%H:%M:%S%.3f"), e);
                     eprintln!("[user_display] X11 display session failed: {}", e);
                 } else {
+                    eprintln!("[TIMING {}] activate_user_display X11: session.start Ok", chrono::Utc::now().format("%H:%M:%S%.3f"));
                     let (width, height) = session.resolution();
                     let session = Arc::new(session);
                     session.spawn_metrics_logger(Some(bus.clone()));
                     session_registry.write().await.insert(display_id, session);
+                    eprintln!("[TIMING {}] activate_user_display X11: emitting DisplayReady {}x{}", chrono::Utc::now().format("%H:%M:%S%.3f"), width, height);
                     bus.send(AppEvent::DisplayReady { display_id, width, height });
+                    eprintln!("[TIMING {}] activate_user_display X11: EXIT (success) display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
                     return;
                 }
             }

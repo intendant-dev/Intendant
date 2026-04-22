@@ -461,9 +461,13 @@ impl DisplaySession {
         frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
         event_bus: Option<crate::event::EventBus>,
     ) -> Result<(), CallerError> {
+        eprintln!("[TIMING {}] DisplaySession::start ENTER display_id={} fps={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id, fps);
+        eprintln!("[TIMING {}] DisplaySession::start calling backend.start_capture display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
         let mut capture_rx = self.backend.start_capture(fps).await?;
+        eprintln!("[TIMING {}] DisplaySession::start backend.start_capture returned Ok display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
 
         let (width, height) = self.backend.resolution();
+        eprintln!("[TIMING {}] DisplaySession::start resolution={}x{}", chrono::Utc::now().format("%H:%M:%S%.3f"), width, height);
 
         // --- Task 1: Capture bridge ---
         let frame_tx = self.frame_tx.clone();
@@ -595,6 +599,7 @@ impl DisplaySession {
             drop(reg_handle); // Managed by shutdown token; task self-cancels.
         }
 
+        eprintln!("[TIMING {}] DisplaySession::start EXIT display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
         Ok(())
     }
 
@@ -662,24 +667,34 @@ impl DisplaySession {
 
     /// Stop capture, cancel all tasks, and close all peers.
     pub async fn stop(&self) {
+        eprintln!("[TIMING {}] DisplaySession::stop ENTER display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
         self.shutdown.cancel();
+        eprintln!("[TIMING {}] DisplaySession::stop shutdown.cancel done display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
         self.clipboard_monitor.stop();
+        eprintln!("[TIMING {}] DisplaySession::stop clipboard_monitor.stop done display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
+        eprintln!("[TIMING {}] DisplaySession::stop calling backend.stop_capture display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
         self.backend.stop_capture().await;
+        eprintln!("[TIMING {}] DisplaySession::stop backend.stop_capture returned display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
 
         if let Some(h) = self.capture_handle.lock().await.take() {
             let _ = h.await;
+            eprintln!("[TIMING {}] DisplaySession::stop capture_handle joined display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
         }
         if let Some(h) = self.encoder_handle.lock().await.take() {
             let _ = h.await;
+            eprintln!("[TIMING {}] DisplaySession::stop encoder_handle joined display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
         }
         if let Some(h) = self.clipboard_handle.lock().await.take() {
             let _ = h.await;
+            eprintln!("[TIMING {}] DisplaySession::stop clipboard_handle joined display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
         }
 
         let mut peers = self.peers.write().await;
+        let peer_count = peers.len();
         for (_, peer) in peers.drain() {
             peer.close().await;
         }
+        eprintln!("[TIMING {}] DisplaySession::stop EXIT display_id={} (closed {} peers)", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id, peer_count);
     }
 
     /// Subscribe to the raw frame broadcast.

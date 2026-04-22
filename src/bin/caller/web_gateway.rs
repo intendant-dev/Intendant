@@ -3838,6 +3838,19 @@ pub fn spawn_web_gateway(
                                                     ).await;
                                                 }
                                                 Ok(ctrl) => {
+                                                    // TIMING: log display grant/revoke frames at the /ws
+                                                    // boundary so we can diff wire arrival against the
+                                                    // listener's recv time and isolate bus dispatch
+                                                    // latency from activation latency.
+                                                    match &ctrl {
+                                                        ControlMsg::GrantUserDisplay { display_id } => {
+                                                            eprintln!("[TIMING {}] /ws rx GrantUserDisplay display_id={:?}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
+                                                        }
+                                                        ControlMsg::RevokeUserDisplay { display_id, .. } => {
+                                                            eprintln!("[TIMING {}] /ws rx RevokeUserDisplay display_id={:?}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
+                                                        }
+                                                        _ => {}
+                                                    }
                                                     bus_inbound.send(AppEvent::PresenceLog {
                                                         message: format!("[ws] ControlMsg: {:?}",
                                                             match &ctrl {
