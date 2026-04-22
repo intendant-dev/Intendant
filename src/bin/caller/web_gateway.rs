@@ -3888,19 +3888,6 @@ pub fn spawn_web_gateway(
                                                     ).await;
                                                 }
                                                 Ok(ctrl) => {
-                                                    // TIMING: log display grant/revoke frames at the /ws
-                                                    // boundary so we can diff wire arrival against the
-                                                    // listener's recv time and isolate bus dispatch
-                                                    // latency from activation latency.
-                                                    match &ctrl {
-                                                        ControlMsg::GrantUserDisplay { display_id } => {
-                                                            eprintln!("[TIMING {}] /ws rx GrantUserDisplay display_id={:?}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
-                                                        }
-                                                        ControlMsg::RevokeUserDisplay { display_id, .. } => {
-                                                            eprintln!("[TIMING {}] /ws rx RevokeUserDisplay display_id={:?}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
-                                                        }
-                                                        _ => {}
-                                                    }
                                                     bus_inbound.send(AppEvent::PresenceLog {
                                                         message: format!("[ws] ControlMsg: {:?}",
                                                             match &ctrl {
@@ -5229,11 +5216,9 @@ pub fn spawn_web_gateway(
                     } else if request_line.contains("/api/displays") {
                         // Display enumeration endpoint
                         use tokio::io::AsyncWriteExt;
-                        eprintln!("[TIMING {}] /api/displays ENTER", chrono::Utc::now().format("%H:%M:%S%.3f"));
                         let displays =
                             crate::display::enumerate_displays_with_sessions(&session_registry)
                                 .await;
-                        eprintln!("[TIMING {}] /api/displays enumerate returned {} displays", chrono::Utc::now().format("%H:%M:%S%.3f"), displays.len());
                         let body = serde_json::to_string(&displays).unwrap_or_else(|_| "[]".to_string());
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\

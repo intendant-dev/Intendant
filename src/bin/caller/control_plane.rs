@@ -431,7 +431,6 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             });
         }
         ControlMsg::GrantUserDisplay { display_id } => {
-            eprintln!("[TIMING {}] control_plane::GrantUserDisplay ENTER display_id={:?}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
             // Moved out of `tui/app.rs::handle_control_command` — the TUI is
             // now display-only and the display-control path shouldn't depend
             // on a rendering loop running to process revokes/grants. Before
@@ -453,24 +452,19 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             // (agent runners, etc.) observe the same state the autonomy
             // guard reports. Matches the tui/mcp paths that set it.
             std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-            eprintln!("[TIMING {}] control_plane::GrantUserDisplay bus.send UserDisplayGranted display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), did);
             state.bus.send(AppEvent::UserDisplayGranted { display_id: did });
-            eprintln!("[TIMING {}] control_plane::GrantUserDisplay EXIT display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), did);
         }
         ControlMsg::RevokeUserDisplay { display_id, note } => {
-            eprintln!("[TIMING {}] control_plane::RevokeUserDisplay ENTER display_id={:?}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_id);
             let did = display_id.unwrap_or(0);
             {
                 let mut guard = state.autonomy.write().await;
                 guard.user_display_granted = false;
             }
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
-            eprintln!("[TIMING {}] control_plane::RevokeUserDisplay bus.send UserDisplayRevoked display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), did);
             state.bus.send(AppEvent::UserDisplayRevoked {
                 display_id: did,
                 note: note.clone(),
             });
-            eprintln!("[TIMING {}] control_plane::RevokeUserDisplay EXIT display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), did);
         }
         _ => {} // Other control messages don't update shared state
     }

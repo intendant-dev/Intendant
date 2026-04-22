@@ -203,7 +203,6 @@ impl DisplayBackend for X11Backend {
         &self,
         fps: u32,
     ) -> Result<mpsc::Receiver<Frame>, CallerError> {
-        eprintln!("[TIMING {}] X11Backend::start_capture ENTER fps={}", chrono::Utc::now().format("%H:%M:%S%.3f"), fps);
         self.shutdown.store(false, Ordering::SeqCst);
 
         let (tx, rx) = mpsc::channel::<Frame>(4);
@@ -214,24 +213,18 @@ impl DisplayBackend for X11Backend {
         let shared_w = Arc::clone(&self.width);
         let shared_h = Arc::clone(&self.height);
 
-        eprintln!("[TIMING {}] X11Backend::start_capture spawning OS thread display={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_str);
         let thread = std::thread::spawn(move || {
             run_x11_capture(display_str, tx, shutdown_flag, fps, width, height, shared_w, shared_h);
         });
-        eprintln!("[TIMING {}] X11Backend::start_capture thread spawned", chrono::Utc::now().format("%H:%M:%S%.3f"));
 
         *self.capture.lock().await = Some(CaptureState { thread });
-        eprintln!("[TIMING {}] X11Backend::start_capture EXIT", chrono::Utc::now().format("%H:%M:%S%.3f"));
         Ok(rx)
     }
 
     async fn stop_capture(&self) {
-        eprintln!("[TIMING {}] X11Backend::stop_capture ENTER", chrono::Utc::now().format("%H:%M:%S%.3f"));
         self.shutdown.store(true, Ordering::SeqCst);
-        eprintln!("[TIMING {}] X11Backend::stop_capture shutdown flag set", chrono::Utc::now().format("%H:%M:%S%.3f"));
 
         if let Some(state) = self.capture.lock().await.take() {
-            eprintln!("[TIMING {}] X11Backend::stop_capture taking capture state, calling spawn_blocking(thread.join)", chrono::Utc::now().format("%H:%M:%S%.3f"));
             // `std::thread::join()` is blocking — parking it on the tokio
             // executor thread stalls every other async task scheduled
             // there, including the WebSocket outbound pump that's trying
@@ -243,16 +236,10 @@ impl DisplayBackend for X11Backend {
             // Push the join onto the blocking pool so the executor thread
             // stays free.
             let _ = tokio::task::spawn_blocking(move || {
-                eprintln!("[TIMING {}] X11Backend::stop_capture spawn_blocking ENTER (waiting on thread.join)", chrono::Utc::now().format("%H:%M:%S%.3f"));
                 let _ = state.thread.join();
-                eprintln!("[TIMING {}] X11Backend::stop_capture spawn_blocking EXIT (thread.join returned)", chrono::Utc::now().format("%H:%M:%S%.3f"));
             })
             .await;
-            eprintln!("[TIMING {}] X11Backend::stop_capture spawn_blocking awaited", chrono::Utc::now().format("%H:%M:%S%.3f"));
-        } else {
-            eprintln!("[TIMING {}] X11Backend::stop_capture no capture state to take", chrono::Utc::now().format("%H:%M:%S%.3f"));
         }
-        eprintln!("[TIMING {}] X11Backend::stop_capture EXIT", chrono::Utc::now().format("%H:%M:%S%.3f"));
     }
 
     async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
@@ -540,18 +527,11 @@ fn run_x11_capture(
     use x11rb::connection::Connection;
     use x11rb::protocol::shm;
 
-    eprintln!("[TIMING {}] run_x11_capture THREAD ENTER display={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_str);
-
     let frame_interval = std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
 
-    eprintln!("[TIMING {}] run_x11_capture calling x11rb::connect", chrono::Utc::now().format("%H:%M:%S%.3f"));
     let (conn, screen_num) = match x11rb::connect(Some(&display_str)) {
-        Ok(c) => {
-            eprintln!("[TIMING {}] run_x11_capture x11rb::connect OK", chrono::Utc::now().format("%H:%M:%S%.3f"));
-            c
-        }
+        Ok(c) => c,
         Err(e) => {
-            eprintln!("[TIMING {}] run_x11_capture x11rb::connect FAILED: {e}", chrono::Utc::now().format("%H:%M:%S%.3f"));
             eprintln!("[display/x11] X11 connect failed: {e}");
             return;
         }
@@ -563,13 +543,11 @@ fn run_x11_capture(
 
     // Try to use XShm for fast capture.
     use x11rb::connection::RequestConnection;
-    eprintln!("[TIMING {}] run_x11_capture querying XShm extension", chrono::Utc::now().format("%H:%M:%S%.3f"));
     let shm_available = conn
         .extension_information(shm::X11_EXTENSION_NAME)
         .ok()
         .flatten()
         .is_some();
-    eprintln!("[TIMING {}] run_x11_capture XShm available={}", chrono::Utc::now().format("%H:%M:%S%.3f"), shm_available);
 
     if shm_available {
         eprintln!("[display/x11] XShm available, using shared memory capture {}x{}", width, height);
@@ -578,7 +556,6 @@ fn run_x11_capture(
         eprintln!("[display/x11] XShm unavailable, falling back to XGetImage {}x{}", width, height);
         run_getimage_capture(&conn, root, depth, width, height, &tx, &shutdown, frame_interval, &shared_width, &shared_height);
     }
-    eprintln!("[TIMING {}] run_x11_capture THREAD EXIT display={}", chrono::Utc::now().format("%H:%M:%S%.3f"), display_str);
 }
 
 /// Re-query root window geometry and return the (even-aligned) dimensions.
@@ -618,7 +595,6 @@ fn run_shm_capture(
     // 4 bytes per pixel (BGRA), full screen.
     let seg_size = (width as usize) * (height as usize) * 4;
 
-    eprintln!("[TIMING {}] run_shm_capture calling shmget size={}", chrono::Utc::now().format("%H:%M:%S%.3f"), seg_size);
     let shm_id = unsafe {
         libc::shmget(
             libc::IPC_PRIVATE,
@@ -627,42 +603,33 @@ fn run_shm_capture(
         )
     };
     if shm_id < 0 {
-        eprintln!("[TIMING {}] run_shm_capture shmget FAILED errno={}", chrono::Utc::now().format("%H:%M:%S%.3f"), std::io::Error::last_os_error());
         eprintln!("[display/x11] shmget failed: {}", std::io::Error::last_os_error());
         return;
     }
-    eprintln!("[TIMING {}] run_shm_capture shmget OK shm_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), shm_id);
 
-    eprintln!("[TIMING {}] run_shm_capture calling shmat", chrono::Utc::now().format("%H:%M:%S%.3f"));
     let shm_addr = unsafe { libc::shmat(shm_id, std::ptr::null(), 0) };
     if shm_addr == (-1isize) as *mut libc::c_void {
-        eprintln!("[TIMING {}] run_shm_capture shmat FAILED", chrono::Utc::now().format("%H:%M:%S%.3f"));
         eprintln!("[display/x11] shmat failed: {}", std::io::Error::last_os_error());
         unsafe { libc::shmctl(shm_id, libc::IPC_RMID, std::ptr::null_mut()) };
         return;
     }
-    eprintln!("[TIMING {}] run_shm_capture shmat OK", chrono::Utc::now().format("%H:%M:%S%.3f"));
 
     // Mark for removal on last detach (cleanup even if we crash).
     unsafe { libc::shmctl(shm_id, libc::IPC_RMID, std::ptr::null_mut()) };
-    eprintln!("[TIMING {}] run_shm_capture shmctl IPC_RMID done", chrono::Utc::now().format("%H:%M:%S%.3f"));
 
     // Attach to X server.
     let seg = conn.generate_id().unwrap();
-    eprintln!("[TIMING {}] run_shm_capture calling shm_attach seg={}", chrono::Utc::now().format("%H:%M:%S%.3f"), seg);
     let attach_ok = conn
         .shm_attach(seg, shm_id as u32, false)
         .ok()
         .and_then(|cookie| cookie.check().ok())
         .is_some();
     if !attach_ok {
-        eprintln!("[TIMING {}] run_shm_capture ShmAttach FAILED, falling back to XGetImage", chrono::Utc::now().format("%H:%M:%S%.3f"));
         eprintln!("[display/x11] ShmAttach failed, falling back to XGetImage");
         unsafe { libc::shmdt(shm_addr) };
         run_getimage_capture(conn, root, _depth, width, height, tx, shutdown, frame_interval, shared_width, shared_height);
         return;
     }
-    eprintln!("[TIMING {}] run_shm_capture ShmAttach OK, entering capture loop", chrono::Utc::now().format("%H:%M:%S%.3f"));
 
     let mut frame_count: u64 = 0;
     // Track consecutive capture errors to detect hotplug / display loss.
@@ -752,9 +719,6 @@ fn run_shm_capture(
                 };
 
                 frame_count += 1;
-                if frame_count == 1 {
-                    eprintln!("[TIMING {}] run_shm_capture FIRST FRAME captured {}x{}", chrono::Utc::now().format("%H:%M:%S%.3f"), width, height);
-                }
                 if frame_count == 1 || frame_count % 300 == 0 {
                     eprintln!(
                         "[display/x11] shm frame #{} {}x{} stride={} size={}B depth={}",
@@ -763,9 +727,6 @@ fn run_shm_capture(
                 }
 
                 let _ = tx.try_send(frame);
-                if frame_count == 1 {
-                    eprintln!("[TIMING {}] run_shm_capture FIRST FRAME sent on mpsc", chrono::Utc::now().format("%H:%M:%S%.3f"));
-                }
             }
             Err(e) => {
                 consecutive_errors += 1;
