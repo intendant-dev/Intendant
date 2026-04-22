@@ -764,6 +764,7 @@ impl DisplaySession {
     /// Called exactly once from `handle_offer()` under `encoder_init_lock`.
     /// The caller is responsible for guarding against double-start.
     async fn start_encoder_pipeline(&self, codec_mime: &'static str) {
+        eprintln!("[TIMING {}] start_encoder_pipeline ENTER display_id={} codec={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id, codec_mime);
         let fps = *self.fps.lock().await;
         let event_bus = self.encoder_event_bus.lock().await.clone();
 
@@ -786,12 +787,14 @@ impl DisplaySession {
 
         let enc_counters = Arc::clone(&self.counters);
         let encoder_shutdown = self.shutdown.clone();
+        eprintln!("[TIMING {}] start_encoder_pipeline calling spawn_encoder_thread codec={} {}x{}", chrono::Utc::now().format("%H:%M:%S%.3f"), codec_mime, width, height);
         spawn_encoder_thread(
             width, height, duration_ms,
             codec_mime,
             i420_rx, efr_tx.clone(),
             Arc::clone(&enc_counters), encoder_shutdown,
         );
+        eprintln!("[TIMING {}] start_encoder_pipeline spawn_encoder_thread returned", chrono::Utc::now().format("%H:%M:%S%.3f"));
 
         let (kf_tx, mut kf_rx) = mpsc::unbounded_channel::<()>();
         *self.keyframe_tx.lock().await = Some(kf_tx);
@@ -1023,9 +1026,12 @@ impl DisplaySession {
         tcp_advertised_addr: Option<std::net::SocketAddr>,
         ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<String, CallerError> {
+        eprintln!("[TIMING {}] handle_offer ENTER display_id={} peer_id={} sdp_len={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id, peer_id, sdp.len());
         // Serialize codec selection + encoder startup.
         let codec_mime = {
+            eprintln!("[TIMING {}] handle_offer awaiting encoder_init_lock display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
             let mut init = self.encoder_init_lock.lock().await;
+            eprintln!("[TIMING {}] handle_offer encoder_init_lock acquired init={} display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), *init, self.display_id);
             if *init {
                 // Encoder already running -- verify the new peer supports
                 // the locked codec (name + fmtp profile for H264).
@@ -1058,10 +1064,14 @@ impl DisplaySession {
             } else {
                 // First peer -- negotiate codec from SDP and start encoder.
                 let (width, height) = self.backend.resolution();
+                eprintln!("[TIMING {}] handle_offer calling select_codec display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
                 let (_encoder, codec_choice) = encode::select_codec(sdp, width, height, 2000);
                 let mime = codec_choice.mime();
+                eprintln!("[TIMING {}] handle_offer select_codec OK mime={} display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), mime, self.display_id);
                 *self.codec_mime.write().await = mime;
+                eprintln!("[TIMING {}] handle_offer calling start_encoder_pipeline display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
                 self.start_encoder_pipeline(mime).await;
+                eprintln!("[TIMING {}] handle_offer start_encoder_pipeline returned display_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id);
                 *init = true;
                 mime
             }
@@ -1099,6 +1109,7 @@ impl DisplaySession {
                 });
             });
 
+        eprintln!("[TIMING {}] handle_offer calling WebRtcPeer::new peer_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), peer_id);
         let (peer, answer_sdp) = self::webrtc::WebRtcPeer::new(
             peer_id,
             sdp,
@@ -1111,6 +1122,7 @@ impl DisplaySession {
             ice_tx,
         )
         .await?;
+        eprintln!("[TIMING {}] handle_offer WebRtcPeer::new OK peer_id={} answer_len={}", chrono::Utc::now().format("%H:%M:%S%.3f"), peer_id, answer_sdp.len());
 
         let peer = Arc::new(peer);
         // `HashMap::insert` silently drops a displaced value, which strands
@@ -1151,6 +1163,7 @@ impl DisplaySession {
             let _ = tx.send(());
         }
 
+        eprintln!("[TIMING {}] handle_offer EXIT display_id={} peer_id={}", chrono::Utc::now().format("%H:%M:%S%.3f"), self.display_id, peer_id);
         Ok(answer_sdp)
     }
 
@@ -1244,9 +1257,15 @@ fn spawn_encoder_thread(
     shutdown: CancellationToken,
 ) {
     std::thread::spawn(move || {
+        eprintln!("[TIMING {}] encoder thread ENTER codec={} {}x{}", chrono::Utc::now().format("%H:%M:%S%.3f"), codec_mime, width, height);
+        eprintln!("[TIMING {}] encoder thread calling select_codec_for_mime", chrono::Utc::now().format("%H:%M:%S%.3f"));
         let mut encoder: Box<dyn encode::Encoder> = match encode::select_codec_for_mime(codec_mime, width, height, 2000) {
-            Ok((enc, _choice)) => enc,
+            Ok((enc, _choice)) => {
+                eprintln!("[TIMING {}] encoder thread select_codec_for_mime OK", chrono::Utc::now().format("%H:%M:%S%.3f"));
+                enc
+            }
             Err(e) => {
+                eprintln!("[TIMING {}] encoder thread select_codec_for_mime FAILED: {}", chrono::Utc::now().format("%H:%M:%S%.3f"), e);
                 eprintln!("[display/encoder] {} encoder FAILED for {}x{}: {}", codec_mime, width, height, e);
                 return;
             }
