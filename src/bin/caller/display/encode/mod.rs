@@ -4,6 +4,7 @@ use super::EncodedFrame;
 pub mod h264_linux;
 #[cfg(target_os = "macos")]
 pub mod h264_macos;
+pub mod pool;
 pub mod vp8;
 
 pub use vp8::Vp8Encoder;

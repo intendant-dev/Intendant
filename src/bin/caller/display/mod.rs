@@ -34,6 +34,7 @@ use crate::error::CallerError;
 
 pub mod clipboard;
 pub mod encode;
+pub mod forward;
 pub mod keymap;
 #[cfg(target_os = "macos")]
 pub mod macos;
