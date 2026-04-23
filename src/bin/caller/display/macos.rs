@@ -124,6 +124,12 @@ impl DisplayBackend for MacOSBackend {
         &self,
         fps: u32,
     ) -> Result<mpsc::Receiver<Frame>, CallerError> {
+        // Defensive: matching the x11.rs pattern — teardown any previous
+        // capture before starting a new one, so a double-start doesn't
+        // leak the ScreenCaptureKit stream. `stop_capture` is idempotent
+        // when nothing's running.
+        self.stop_capture().await;
+
         self.shutdown.store(false, Ordering::SeqCst);
 
         // Get shareable content (triggers TCC permission prompt on first use).

@@ -1173,15 +1173,25 @@ impl DisplaySession {
     }
 
     /// Forward a trickle ICE candidate to a connected peer.
+    ///
+    /// If the peer has already been removed (its `remove_peer` raced ahead
+    /// of a late-arrival trickle candidate), this returns `Ok(())` instead
+    /// of an error. The candidate is dropped silently because the browser's
+    /// own RTCPeerConnection has already transitioned away from this peer
+    /// — the candidate has nowhere to go regardless, and raising it to an
+    /// error spams the federation log with "unknown peer N" during every
+    /// normal disconnect. Before this change, a browser closing a display
+    /// panel would reliably emit N of these errors as its last trickled
+    /// ICE candidates arrived after `remove_peer` ran.
     pub async fn add_ice_candidate(
         &self,
         peer_id: PeerId,
         candidate_json: &str,
     ) -> Result<(), CallerError> {
         let peers = self.peers.read().await;
-        let peer = peers.get(&peer_id).ok_or_else(|| {
-            CallerError::WebRtc(format!("unknown peer {peer_id}"))
-        })?;
+        let Some(peer) = peers.get(&peer_id) else {
+            return Ok(());
+        };
         peer.add_ice_candidate(candidate_json).await
     }
 

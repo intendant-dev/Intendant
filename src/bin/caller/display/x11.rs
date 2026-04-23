@@ -203,6 +203,18 @@ impl DisplayBackend for X11Backend {
         &self,
         fps: u32,
     ) -> Result<mpsc::Receiver<Frame>, CallerError> {
+        // Defensive: if a prior start_capture wasn't paired with a matching
+        // stop_capture (double-grant, race between revoke-and-regrant, etc.)
+        // the old thread would otherwise be silently leaked by the
+        // `*self.capture.lock().await = Some(...)` overwrite below — its
+        // JoinHandle gets dropped but the thread itself keeps running
+        // because `shutdown` is a shared AtomicBool and nothing's flipped it
+        // to true. Two parallel X11 capture threads then contend for the
+        // SHM segment and the encoder sees interleaved frames. Paper this
+        // over by running the normal teardown path first; it's idempotent
+        // when no capture is running (early-returns inside the `if let`).
+        self.stop_capture().await;
+
         self.shutdown.store(false, Ordering::SeqCst);
 
         let (tx, rx) = mpsc::channel::<Frame>(4);

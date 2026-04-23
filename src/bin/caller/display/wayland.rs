@@ -80,6 +80,14 @@ impl DisplayBackend for WaylandBackend {
         &self,
         _fps: u32,
     ) -> Result<mpsc::Receiver<Frame>, CallerError> {
+        // Defensive: matching the x11.rs pattern — teardown any previous
+        // capture (portal session + pipewire stream) before starting a new
+        // one, so a double-start doesn't leak the portal session. The
+        // portal dialog re-prompts on every new RemoteDesktop session
+        // anyway, so losing the old session is the right behavior here.
+        // `stop_capture` is idempotent when nothing's running.
+        self.stop_capture().await;
+
         self.shutdown.store(false, Ordering::SeqCst);
 
         // --- Portal session: RemoteDesktop + ScreenCast combined ---
