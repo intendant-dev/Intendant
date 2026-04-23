@@ -241,6 +241,31 @@ export class PresenceWeb {
         wasm.presenceweb_release_display(this.__wbg_ptr, display_id, ptr0, len0);
     }
     /**
+     * Phase 5: release this connection's input authority for one
+     * display.  No-op if the calling connection doesn't currently
+     * hold the authority — prevents browser A from unclaiming
+     * browser B's control by mistake.  After release, the slot is
+     * unclaimed and the gate reverts to the backwards-compatible
+     * any-connection-can-input default until someone claims again.
+     * @param {number} display_id
+     */
+    release_display_input_authority(display_id) {
+        wasm.presenceweb_release_display_input_authority(this.__wbg_ptr, display_id);
+    }
+    /**
+     * Phase 5: claim exclusive input authority for one display.
+     * The server gates `display_input` messages so only the holder
+     * can drive the platform mouse/keyboard; other connections see
+     * their input silently dropped.  Auto-revokes any prior holder
+     * (Zoom-style "grant control" UX), and the current connection
+     * receives a `display_input_authority_granted` confirmation
+     * message back over the WS.
+     * @param {number} display_id
+     */
+    request_display_input_authority(display_id) {
+        wasm.presenceweb_request_display_input_authority(this.__wbg_ptr, display_id);
+    }
+    /**
      * Revoke agent access to the user's session display (primary / id 0).
      */
     revoke_user_display() {

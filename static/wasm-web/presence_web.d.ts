@@ -84,6 +84,25 @@ export class PresenceWeb {
      */
     release_display(display_id: bigint, note?: string | null): void;
     /**
+     * Phase 5: release this connection's input authority for one
+     * display.  No-op if the calling connection doesn't currently
+     * hold the authority — prevents browser A from unclaiming
+     * browser B's control by mistake.  After release, the slot is
+     * unclaimed and the gate reverts to the backwards-compatible
+     * any-connection-can-input default until someone claims again.
+     */
+    release_display_input_authority(display_id: number): void;
+    /**
+     * Phase 5: claim exclusive input authority for one display.
+     * The server gates `display_input` messages so only the holder
+     * can drive the platform mouse/keyboard; other connections see
+     * their input silently dropped.  Auto-revokes any prior holder
+     * (Zoom-style "grant control" UX), and the current connection
+     * receives a `display_input_authority_granted` confirmation
+     * message back over the WS.
+     */
+    request_display_input_authority(display_id: number): void;
+    /**
      * Revoke agent access to the user's session display (primary / id 0).
      */
     revoke_user_display(): void;
@@ -322,6 +341,8 @@ export interface InitOutput {
     readonly presenceweb_phase: (a: number) => [number, number];
     readonly presenceweb_reconnect_server: (a: number, b: number, c: number) => void;
     readonly presenceweb_release_display: (a: number, b: bigint, c: number, d: number) => void;
+    readonly presenceweb_release_display_input_authority: (a: number, b: number) => void;
+    readonly presenceweb_request_display_input_authority: (a: number, b: number) => void;
     readonly presenceweb_revoke_user_display: (a: number) => void;
     readonly presenceweb_revoke_user_display_with_id: (a: number, b: number) => void;
     readonly presenceweb_send_approval: (a: number, b: number, c: number) => any;

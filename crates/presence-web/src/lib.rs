@@ -1073,5 +1073,36 @@ impl PresenceWeb {
         let msg = serde_json::json!({"action": "revoke_user_display", "display_id": display_id});
         self.server.borrow().send_json(&msg);
     }
+
+    /// Phase 5: claim exclusive input authority for one display.
+    /// The server gates `display_input` messages so only the holder
+    /// can drive the platform mouse/keyboard; other connections see
+    /// their input silently dropped.  Auto-revokes any prior holder
+    /// (Zoom-style "grant control" UX), and the current connection
+    /// receives a `display_input_authority_granted` confirmation
+    /// message back over the WS.
+    #[wasm_bindgen]
+    pub fn request_display_input_authority(&self, display_id: u32) {
+        let msg = serde_json::json!({
+            "action": "request_display_input_authority",
+            "display_id": display_id,
+        });
+        self.server.borrow().send_json(&msg);
+    }
+
+    /// Phase 5: release this connection's input authority for one
+    /// display.  No-op if the calling connection doesn't currently
+    /// hold the authority — prevents browser A from unclaiming
+    /// browser B's control by mistake.  After release, the slot is
+    /// unclaimed and the gate reverts to the backwards-compatible
+    /// any-connection-can-input default until someone claims again.
+    #[wasm_bindgen]
+    pub fn release_display_input_authority(&self, display_id: u32) {
+        let msg = serde_json::json!({
+            "action": "release_display_input_authority",
+            "display_id": display_id,
+        });
+        self.server.borrow().send_json(&msg);
+    }
 }
 } // mod wasm_impl
