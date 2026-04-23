@@ -1963,6 +1963,16 @@ async fn handle_control_command_mcp(
             // streams; this variant is a no-op here.
             None
         }
+        ControlMsg::RequestDisplayInputAuthority { .. }
+        | ControlMsg::ReleaseDisplayInputAuthority { .. } => {
+            // Per-display input authority is a WebSocket-connection-
+            // scoped concept (the gate uses the connection's identity
+            // to allow/deny display_input messages). MCP doesn't have
+            // a per-client connection identity in the same sense, so
+            // there's no coherent way to grant authority to an MCP
+            // caller here. Ignored.
+            None
+        }
     }
 }
 

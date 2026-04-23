@@ -1559,6 +1559,13 @@ impl App {
                 // web gateway's WS handler, not the TUI control command
                 // path. The TUI doesn't drive WebRTC sessions; no-op.
             }
+            ControlMsg::RequestDisplayInputAuthority { .. }
+            | ControlMsg::ReleaseDisplayInputAuthority { .. } => {
+                // Per-display input authority is a browser-WS concept
+                // (handled in the gateway's /ws dispatcher using the
+                // connection id as the authority holder). The TUI
+                // has no analogous notion; no-op.
+            }
         }
     }
 

@@ -878,6 +878,28 @@ pub enum ControlMsg {
         #[serde(default)]
         note: Option<String>,
     },
+    /// Claim input authority for one display (phase 5 of the multi-viewer
+    /// redesign).  When granted, this WebSocket connection becomes the
+    /// sole source of `display_input` events for `display_id`; other
+    /// connections' input messages are silently dropped on the gate.
+    /// If another connection currently holds the authority, it is force-
+    /// released and this connection takes over — matches Zoom's
+    /// "granting remote control auto-revokes prior" UX.
+    ///
+    /// Unclaimed state (no connection has requested authority) is the
+    /// backwards-compatible default: every connection's input flows
+    /// through unchanged, same as pre-phase-5 behavior.  The authority
+    /// gate only activates on the first claim.
+    RequestDisplayInputAuthority {
+        display_id: u32,
+    },
+    /// Release input authority for one display.  No-op if the calling
+    /// connection doesn't currently hold the authority (prevents one
+    /// browser from unclaiming another's control).  Releases the slot,
+    /// returning input to the unclaimed-any-connection-can-input state.
+    ReleaseDisplayInputAuthority {
+        display_id: u32,
+    },
     ListDisplays,
     QueryDetail {
         scope: String,
@@ -2297,6 +2319,30 @@ mod tests {
                 assert_eq!(note.as_deref(), Some("done"));
             }
             _ => panic!("expected RevokeUserDisplay"),
+        }
+    }
+
+    #[test]
+    fn control_msg_request_display_input_authority_deserialize() {
+        let json = r#"{"action":"request_display_input_authority","display_id":0}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::RequestDisplayInputAuthority { display_id } => {
+                assert_eq!(display_id, 0);
+            }
+            _ => panic!("expected RequestDisplayInputAuthority"),
+        }
+    }
+
+    #[test]
+    fn control_msg_release_display_input_authority_deserialize() {
+        let json = r#"{"action":"release_display_input_authority","display_id":2}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ReleaseDisplayInputAuthority { display_id } => {
+                assert_eq!(display_id, 2);
+            }
+            _ => panic!("expected ReleaseDisplayInputAuthority"),
         }
     }
 

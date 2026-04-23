@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Monotonically increasing counter for assigning unique peer IDs to WebSocket
@@ -19,6 +19,30 @@ static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
 /// Tracks which WebSocket connection currently owns the voice model (is "active").
 /// Only one connection can be active at a time; all others are "passive" (TUI-only).
 struct ActivePresence {
+    connection_id: String,
+    direct_tx: mpsc::UnboundedSender<String>,
+}
+
+/// Tracks which WebSocket connection currently holds input authority for
+/// one display (phase 5 of the multi-viewer display redesign).  Distinct
+/// axis from [`ActivePresence`] — presence authority governs voice/model
+/// ownership (single global slot), display-input authority governs which
+/// connection's `display_input` messages actually flow through to the
+/// platform backend (per-display slot).
+///
+/// The authority map (`Arc<RwLock<HashMap<u32, ActiveDisplayInput>>>`)
+/// uses entry absence to mean "unclaimed" — the pre-phase-5 backwards-
+/// compatible state where every connection's input flows through.  Once
+/// a connection claims via `RequestDisplayInputAuthority`, the entry
+/// exists and only that connection's input is honored; all others are
+/// silently dropped in the `display_input` handler gate.
+///
+/// Mirrors the `ActivePresence` shape so the handover protocol can
+/// reuse the "force-release old + grant new" pattern — sending a
+/// `display_input_authority_revoked` message to the prior holder over
+/// `direct_tx` is the same mechanism as `force_disconnect_voice` for
+/// the presence slot.
+struct ActiveDisplayInput {
     connection_id: String,
     direct_tx: mpsc::UnboundedSender<String>,
 }
@@ -2127,6 +2151,11 @@ pub fn spawn_web_gateway(
     let session_model = config.model.clone();
     let voice_debug = Arc::new(Mutex::new(VoiceDebugState::default()));
     let active_presence: Arc<Mutex<Option<ActivePresence>>> = Arc::new(Mutex::new(None));
+    // Per-display input authority (phase 5).  Entry absence = unclaimed
+    // (any connection can input — pre-phase-5 default); entry presence =
+    // exclusive ownership by that one `connection_id`.
+    let display_input_authority: Arc<RwLock<HashMap<u32, ActiveDisplayInput>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 
     // Process-wide registry of standalone shell PTY sessions, keyed by
     // (host_id, terminal_id). Lives as long as the web gateway task and
@@ -2364,6 +2393,7 @@ pub fn spawn_web_gateway(
             let mcp_server = mcp_server.clone();
             let terminal_registry = terminal_registry.clone();
             let inbound_bearer_token = inbound_bearer_token.clone();
+            let display_input_authority = display_input_authority.clone();
 
             tokio::spawn(async move {
                 // Snapshot session state at connection time
@@ -2681,6 +2711,7 @@ pub fn spawn_web_gateway(
                     let live_model = session_model.clone();
                     let transcriber_inbound = transcriber.clone();
                     let active_presence_inbound = active_presence.clone();
+                    let display_input_authority_inbound = display_input_authority.clone();
                     let connection_id_inbound = connection_id.clone();
                     let web_tui_tx_inbound = web_tui_tx.clone();
                     let frame_registry_inbound = frame_registry.clone();
@@ -3853,6 +3884,33 @@ pub fn spawn_web_gateway(
                                             // concurrent deactivate can take the write lock
                                             // without waiting on subprocess exits.
                                             let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
+
+                                            // Phase 5 authority gate: if someone has claimed
+                                            // input authority for this display, only that
+                                            // connection's input flows through. Unclaimed
+                                            // (no entry in the map) = pre-phase-5 default,
+                                            // every connection can input. See the
+                                            // `ActiveDisplayInput` struct doc for the full
+                                            // contract.
+                                            let allowed = {
+                                                let authority =
+                                                    display_input_authority_inbound.read().await;
+                                                match authority.get(&display_id) {
+                                                    Some(holder) => {
+                                                        holder.connection_id == connection_id_inbound
+                                                    }
+                                                    None => true,
+                                                }
+                                            };
+                                            if !allowed {
+                                                // Silent drop — matches the "force_disconnect_voice"
+                                                // convention where demoted connections don't get
+                                                // per-message denial feedback; the browser already
+                                                // knows it's passive from the authority_revoked
+                                                // notification it received when it was demoted.
+                                                continue;
+                                            }
+
                                             if let Some(evt) = json.get("event") {
                                                 if let Ok(input_event) = serde_json::from_value::<crate::display::InputEvent>(evt.clone()) {
                                                     let session: Option<Arc<crate::display::DisplaySession>> = match session_registry_inbound.as_ref() {
@@ -3886,6 +3944,78 @@ pub fn spawn_web_gateway(
                                                         direct_tx_inbound.clone(),
                                                         &bus_inbound,
                                                     ).await;
+                                                }
+                                                Ok(ControlMsg::RequestDisplayInputAuthority { display_id }) => {
+                                                    // Grant this connection input authority for
+                                                    // `display_id`.  Auto-revokes any prior holder
+                                                    // (Zoom "grant auto-revokes prior controller"
+                                                    // pattern) and notifies both parties over
+                                                    // direct_tx.
+                                                    let new_holder = ActiveDisplayInput {
+                                                        connection_id: connection_id_inbound.clone(),
+                                                        direct_tx: direct_tx_inbound.clone(),
+                                                    };
+                                                    let prior = {
+                                                        let mut authority =
+                                                            display_input_authority_inbound.write().await;
+                                                        authority.insert(display_id, new_holder)
+                                                    };
+                                                    if let Some(prior_holder) = prior {
+                                                        if prior_holder.connection_id != connection_id_inbound {
+                                                            // Tell the prior holder they've been
+                                                            // revoked.  Send failure means the
+                                                            // holder's WebSocket is already gone —
+                                                            // the new claim stands regardless, and
+                                                            // the cleanup block at WS drop would
+                                                            // have eventually cleared the entry.
+                                                            let notify = serde_json::json!({
+                                                                "t": "display_input_authority_revoked",
+                                                                "display_id": display_id,
+                                                                "reason": "another connection requested control",
+                                                            }).to_string();
+                                                            let _ = prior_holder.direct_tx.send(notify);
+                                                        }
+                                                    }
+                                                    // Confirm to the new holder.
+                                                    let granted = serde_json::json!({
+                                                        "t": "display_input_authority_granted",
+                                                        "display_id": display_id,
+                                                    }).to_string();
+                                                    let _ = direct_tx_inbound.send(granted);
+                                                    bus_inbound.send(AppEvent::PresenceLog {
+                                                        message: format!(
+                                                            "[ws] display_input_authority granted display={} holder={}",
+                                                            display_id, connection_id_inbound,
+                                                        ),
+                                                        level: Some(LogLevel::Debug),
+                                                        turn: None,
+                                                    });
+                                                }
+                                                Ok(ControlMsg::ReleaseDisplayInputAuthority { display_id }) => {
+                                                    // Release this connection's authority, IF it
+                                                    // actually holds it.  Prevents browser A from
+                                                    // unclaiming browser B's control by mistake.
+                                                    let removed = {
+                                                        let mut authority =
+                                                            display_input_authority_inbound.write().await;
+                                                        match authority.get(&display_id) {
+                                                            Some(holder) if holder.connection_id == connection_id_inbound => {
+                                                                authority.remove(&display_id);
+                                                                true
+                                                            }
+                                                            _ => false,
+                                                        }
+                                                    };
+                                                    if removed {
+                                                        bus_inbound.send(AppEvent::PresenceLog {
+                                                            message: format!(
+                                                                "[ws] display_input_authority released display={} holder={}",
+                                                                display_id, connection_id_inbound,
+                                                            ),
+                                                            level: Some(LogLevel::Debug),
+                                                            turn: None,
+                                                        });
+                                                    }
                                                 }
                                                 Ok(ctrl) => {
                                                     bus_inbound.send(AppEvent::PresenceLog {
@@ -3922,6 +4052,21 @@ pub fn spawn_web_gateway(
                             if slot.as_ref().map(|a| a.connection_id == connection_id_inbound).unwrap_or(false) {
                                 *slot = None;
                             }
+                        }
+                        // Also release any display input authority this
+                        // connection held (phase 5).  Without this, a
+                        // dangling entry would block other browsers from
+                        // claiming the display until someone explicitly
+                        // sent RequestDisplayInputAuthority to force-take
+                        // it — the `retain` below is the normal-drop
+                        // cleanup that keeps the map consistent with
+                        // live connections.
+                        {
+                            let mut authority =
+                                display_input_authority_inbound.write().await;
+                            authority.retain(|_, holder| {
+                                holder.connection_id != connection_id_inbound
+                            });
                         }
                         if is_presence_connected && is_active {
                             bus_inbound.send(AppEvent::PresenceDisconnected);
