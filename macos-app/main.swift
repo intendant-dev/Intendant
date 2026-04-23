@@ -383,6 +383,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         webView.navigationDelegate = self
         webView.customUserAgent = "Intendant/1.0"
 
+        // Starting in macOS 13.3, the legacy `developerExtrasEnabled` KVC
+        // trick above is a no-op for release-signed builds; Safari's Web
+        // Inspector only attaches to a WKWebView when `isInspectable` is
+        // explicitly set to `true`. Without this, Safari → Develop →
+        // [Mac name] silently omits the Intendant process — which blocks
+        // any WebRTC diagnostics that rely on Safari Web Inspector
+        // (ICE candidate events, iceConnectionState, getStats output).
+        if #available(macOS 13.3, *) {
+            webView.isInspectable = true
+        }
+
         let screen = NSScreen.main ?? NSScreen.screens[0]
         let screenFrame = screen.visibleFrame
         let width = min(1400.0, screenFrame.width * 0.85)
