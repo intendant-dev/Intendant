@@ -423,6 +423,26 @@ pub struct DisplaySession {
     /// decodable reference within ~1 tick instead of waiting for the next
     /// GOP boundary).  `Some` after `start_encoder_pipeline()` has run.
     keyframe_tx: Mutex<Option<mpsc::UnboundedSender<()>>>,
+    /// Shared multi-codec encoder pool. Constructed lazily on the first
+    /// `start()` call once the backend's resolution and fps are known;
+    /// ownership is `Arc` so subsequent integration code can hand it to
+    /// per-peer forwarders without lifetime juggling.
+    ///
+    /// Phase 3c.1 only establishes the lifetime — the pool spawns its
+    /// always-on VP8 encoder, but nothing pushes frames into it and no
+    /// peer subscribes. The idle encoder thread is ~free (it blocks in
+    /// `blocking_recv` until the bridge starts publishing I420 frames in
+    /// 3c.2). The existing single-encoder pipeline at
+    /// `start_encoder_pipeline` / `codec_mime` / `encoder_init_lock`
+    /// remains the live path until 3c.4 flips the default and deletes
+    /// the old fanout.
+    ///
+    /// `std::sync::OnceLock` (stable since 1.70) is the right shape:
+    /// one-time init with shared read access afterward, synchronous so
+    /// the blocking portion of `start()` can construct it inline, no
+    /// tokio dependency. Concurrent `start()` callers (not expected but
+    /// cheap to tolerate) converge on a single pool.
+    pool: std::sync::OnceLock<Arc<encode::pool::EncoderPool>>,
 }
 
 impl DisplaySession {
@@ -447,6 +467,7 @@ impl DisplaySession {
             clipboard_monitor: Arc::new(clipboard::ClipboardMonitor::new()),
             clipboard_handle: Mutex::new(None),
             keyframe_tx: Mutex::new(None),
+            pool: std::sync::OnceLock::new(),
         }
     }
 
@@ -527,6 +548,32 @@ impl DisplaySession {
         // so we know which codec the peer negotiated.
         *self.fps.lock().await = fps;
         *self.encoder_event_bus.lock().await = event_bus_for_encoder;
+
+        // Phase 3c.1: construct the shared encoder pool with a single
+        // always-on VP8 layer at the source resolution. The pool spawns
+        // its encoder thread immediately; that thread blocks in
+        // `blocking_recv` until the bridge task starts publishing I420
+        // frames in 3c.2. Idle cost is negligible. No peer subscribes to
+        // this pool until 3c.3 wires `handle_offer` through
+        // `pool.subscribe(...)`; the pre-pool pipeline
+        // (`start_encoder_pipeline`, `codec_mime`, `encoder_init_lock`)
+        // stays the live path until 3c.4.
+        //
+        // `get_or_init` swallows concurrent initializations cheaply; in
+        // practice `start()` is called at most once per session.
+        let _ = self.pool.get_or_init(|| {
+            Arc::new(encode::pool::EncoderPool::new(
+                width,
+                height,
+                fps,
+                vec![encode::pool::LayerSpec::single(
+                    encode::pool::CodecKind::Vp8,
+                    width,
+                    height,
+                    fps,
+                )],
+            ))
+        });
 
         // --- Task 3: FrameRegistry sampler (1 Hz JPEG for model feeds) ---
         if let Some(registry) = frame_registry {
@@ -1680,5 +1727,78 @@ mod tests {
         assert!(json.contains("\"display_id\":1"));
         assert!(json.contains("\"capture_fps\":30.0"));
         assert!(json.contains("\"encode_drops\":2"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3c.1: pool lifetime on DisplaySession
+    // -----------------------------------------------------------------------
+
+    /// Minimal in-process `DisplayBackend` for session-level lifecycle
+    /// tests. Returns a dropped receiver from `start_capture` — the
+    /// capture bridge sees channel-closed immediately and exits cleanly,
+    /// which is enough to exercise the `start()` path without spinning
+    /// up a real capture source.
+    struct StubBackend {
+        width: u32,
+        height: u32,
+    }
+
+    #[async_trait]
+    impl DisplayBackend for StubBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<mpsc::Receiver<Frame>, CallerError> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+        async fn stop_capture(&self) {}
+        async fn inject_input(&self, _event: InputEvent) -> Result<(), CallerError> {
+            Ok(())
+        }
+        fn resolution(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+        fn kind(&self) -> &'static str {
+            "stub"
+        }
+    }
+
+    /// Before `start()` runs, the pool is uninitialized. `get()` returning
+    /// `None` is the contract other phases rely on to know whether the
+    /// session is hot (bridge running, pool ready) or still cold.
+    #[test]
+    fn display_session_pool_uninitialized_before_start() {
+        let backend = Arc::new(StubBackend { width: 640, height: 480 });
+        let session = DisplaySession::new(0, backend);
+        assert!(
+            session.pool.get().is_none(),
+            "pool must be uninitialized until start() runs"
+        );
+    }
+
+    /// `start()` constructs the pool exactly once, with one always-on
+    /// VP8 layer at the capture resolution. This test pins the 3c.1
+    /// contract:
+    ///   1. The pool is populated after `start()`.
+    ///   2. It has exactly one always-on layer (the VP8 layer we asked
+    ///      for), not zero (construction failure would panic in
+    ///      `EncoderPool::new`) and not many (simulcast lands in phase 4).
+    /// Neither the bridge nor any peer is wired to the pool yet, so this
+    /// test confirms lifetime only — not frame flow.
+    #[tokio::test]
+    async fn display_session_start_initializes_pool_with_one_vp8_layer() {
+        let backend = Arc::new(StubBackend { width: 640, height: 480 });
+        let session = DisplaySession::new(0, backend);
+        session.start(30, None, None).await.expect("start() must succeed");
+        let pool = session
+            .pool
+            .get()
+            .expect("pool must be initialized after start()");
+        assert_eq!(
+            pool.always_on().len(),
+            1,
+            "exactly one always-on VP8 layer spawned"
+        );
     }
 }
