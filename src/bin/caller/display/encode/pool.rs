@@ -136,7 +136,7 @@
 use crate::display::EncodedFrame;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -501,9 +501,21 @@ impl PeerCodecPreferences {
 /// Always-on encoders use a different code path: they're never released
 /// and never tracked by refcount (an always-on slot at refcount 0 is
 /// still alive, intentionally).
+///
+/// `generation` is a monotonically-increasing per-slot-instance token
+/// allocated from the pool-level [`EncoderPoolInner::slot_gen_counter`]
+/// every time a new slot is inserted for a given `EncoderId`. Leases
+/// record the generation at subscribe time; release only decrements
+/// the refcount when the current slot's generation matches the
+/// recorded one. This prevents a stale lease from
+/// [`Self::on_resize`]-torn-down incarnation A from decrementing the
+/// refcount of a subsequently-subscribed incarnation B that happens
+/// to share the same `EncoderId` — the scenario where the forwarder
+/// detects Closed, re-subscribes, and THEN drops its old lease last.
 struct OnDemandSlot {
     handle: EncoderHandle,
     refcount: usize,
+    generation: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -560,11 +572,14 @@ impl std::error::Error for SubscribeError {}
 /// matches what the pool actually bumped.
 pub struct PoolLease {
     pool: Arc<EncoderPoolInner>,
-    /// Exact on-demand `EncoderId`s this lease refcounts. Only contains
-    /// ids that `subscribe` successfully incremented (construction
-    /// failures never land here), so `Drop` can decrement safely
-    /// without re-validating.
-    on_demand_ids: Vec<EncoderId>,
+    /// Exact on-demand `(EncoderId, generation)` pairs this lease
+    /// refcounts. Only contains entries that `subscribe` successfully
+    /// incremented (construction failures never land here). The
+    /// `generation` is the slot's instance-unique token at subscribe
+    /// time, used by [`Self::release_impl`] to guard against the
+    /// stale-lease-on-replaced-slot scenario — see
+    /// [`OnDemandSlot::generation`] for the full contract.
+    on_demand_refs: Vec<(EncoderId, u64)>,
     /// Set on explicit release so `Drop` is a no-op. Atomic because
     /// `Drop` takes `&mut self` but we want `release(self)` to consume
     /// while also being robust against accidental double-release.
@@ -584,7 +599,7 @@ impl PoolLease {
     /// open. Useful for diagnostics and for tests that verify
     /// refcount semantics. Always-on encoders aren't counted.
     pub fn on_demand_count(&self) -> usize {
-        self.on_demand_ids.len()
+        self.on_demand_refs.len()
     }
 
     fn release_impl(&mut self) {
@@ -592,8 +607,20 @@ impl PoolLease {
             return;
         }
         let mut guard = self.pool.on_demand.lock().unwrap();
-        for id in &self.on_demand_ids {
+        for (id, recorded_gen) in &self.on_demand_refs {
             if let Some(slot) = guard.get_mut(id) {
+                // Generation gate: only decrement when the slot still
+                // has the same incarnation this lease subscribed
+                // against. If `on_resize` (or any future replace-in-
+                // place path) dropped the old slot and a new one was
+                // installed under the same `EncoderId`, its
+                // generation differs — this lease's claim was against
+                // the OLD slot and must not decrement the NEW one.
+                // The new slot's refcount is owned by whichever
+                // forwarder subscribed against it post-replace.
+                if slot.generation != *recorded_gen {
+                    continue;
+                }
                 slot.refcount = slot.refcount.saturating_sub(1);
                 if slot.refcount == 0 {
                     // Signal the encoder thread to exit. Dropping the
@@ -605,6 +632,9 @@ impl PoolLease {
                     guard.remove(id);
                 }
             }
+            // Slot not in map: either already torn down by another
+            // lease's release, or dropped entirely by on_resize.
+            // Either way, our claim is moot — skip.
         }
     }
 }
@@ -754,6 +784,16 @@ struct EncoderPoolInner {
     source_width: AtomicU32,
     source_height: AtomicU32,
     framerate: u32,
+
+    /// Monotonically-increasing counter that allocates a unique
+    /// `generation` token for every `OnDemandSlot` inserted into the
+    /// `on_demand` map. Leases record the slot's generation at
+    /// subscribe time so release can distinguish the slot they
+    /// subscribed against from a later incarnation that happens to
+    /// reuse the same `EncoderId`. Pool-level (not per-id) because
+    /// unique-across-all-slots is sufficient; the bookkeeping cost of
+    /// a per-id counter isn't worth the extra state.
+    slot_gen_counter: AtomicU64,
 }
 
 impl EncoderPool {
@@ -822,6 +862,7 @@ impl EncoderPool {
                 source_width: AtomicU32::new(source_width),
                 source_height: AtomicU32::new(source_height),
                 framerate,
+                slot_gen_counter: AtomicU64::new(0),
             }),
         }
     }
@@ -954,44 +995,35 @@ impl EncoderPool {
             }
         }
 
-        // Swap on-demand slots. Same respawn, but construction
-        // failures log-and-drop rather than panic — a peer using a
-        // dropped slot sees Closed and can re-negotiate. Mirrors the
-        // subscribe path's "skip codec on construction failure"
-        // policy.
+        // Drop on-demand slots entirely. We do NOT respawn them in
+        // place because that would create a lifetime mismatch: the
+        // new slot would inherit the same `EncoderId` but have
+        // (correctly) a new generation, so any existing lease for
+        // the old slot would not match and the refcount transferred
+        // from the old slot would be orphaned — the new slot would
+        // sit at non-zero refcount nobody owns, leaking a live
+        // encoder thread that no forwarder ever claimed.
+        //
+        // Dropping the slots instead matches the subscribe path's
+        // natural recovery: a forwarder whose Receiver sees Closed
+        // calls `subscribe` again, which re-spawns the encoder at
+        // the current source dimensions with refcount=1 and a fresh
+        // generation. Old leases that haven't dropped yet find
+        // nothing in the map on release and skip — the generation
+        // check in `release_impl` handles the case where a newer
+        // subscribe reinstalled before an older lease dropped.
+        //
+        // Failure mode: if no forwarder re-subscribes (e.g. the
+        // peer's RTCPeerConnection closed concurrently with
+        // on_resize), the codec simply isn't served until someone
+        // asks for it — which is what we want; zombie slots at
+        // refcount=0 would be a CPU leak.
         {
             let mut on_demand = self.inner.on_demand.lock().unwrap();
             let old_slots: HashMap<EncoderId, OnDemandSlot> =
                 std::mem::take(&mut *on_demand);
-            for (id, old_slot) in old_slots {
+            for (_id, old_slot) in old_slots {
                 old_slot.handle.shutdown.cancel();
-                let rescaled = rescale_layer_spec(
-                    &old_slot.handle.layer,
-                    old_width,
-                    old_height,
-                    new_width,
-                    new_height,
-                );
-                match try_spawn_encoder_thread(
-                    id.clone(),
-                    rescaled,
-                    &self.inner.i420_tx,
-                    self.inner.duration_ms,
-                ) {
-                    Ok(new_handle) => {
-                        on_demand.insert(
-                            id,
-                            OnDemandSlot { handle: new_handle, refcount: old_slot.refcount },
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[encode/pool] on_resize: on-demand respawn failed \
-                             for {id:?}: {e} — slot dropped; subscribers will \
-                             see Closed and can re-negotiate"
-                        );
-                    }
-                }
             }
         }
     }
@@ -1083,7 +1115,11 @@ impl EncoderPool {
         // off-lock so it doesn't block other subscribe / release /
         // request_keyframe callers on an async tokio worker. Race
         // handling for concurrent subscribes is below.
-        let mut on_demand_ids: Vec<EncoderId> = Vec::new();
+        //
+        // Each entry records the slot's `generation` so release can
+        // tell "this lease holds the slot I inserted" apart from
+        // "this lease holds a predecessor that was already replaced."
+        let mut on_demand_refs: Vec<(EncoderId, u64)> = Vec::new();
 
         // Pass 1 (lock held, fast path only): for every codec already
         // running, bump refcount and emit the subscription. Collect
@@ -1102,7 +1138,7 @@ impl EncoderPool {
                 let id = EncoderId::new(codec, rid);
                 if let Some(slot) = on_demand.get_mut(&id) {
                     slot.refcount += 1;
-                    on_demand_ids.push(id.clone());
+                    on_demand_refs.push((id.clone(), slot.generation));
                     subs.push(EncoderSubscription {
                         id: slot.handle.id.clone(),
                         layer: slot.handle.layer.clone(),
@@ -1163,7 +1199,7 @@ impl EncoderPool {
                         // and the thread exits; refcount stays
                         // consistent.
                         existing.refcount += 1;
-                        on_demand_ids.push(id.clone());
+                        on_demand_refs.push((id.clone(), existing.generation));
                         subs.push(EncoderSubscription {
                             id: existing.handle.id.clone(),
                             layer: existing.handle.layer.clone(),
@@ -1172,13 +1208,18 @@ impl EncoderPool {
                         handle.shutdown.cancel();
                     }
                     None => {
-                        // Race win: no slot yet. Install ours.
+                        // Race win: no slot yet. Install ours with a
+                        // fresh generation from the pool-level
+                        // counter.
+                        let generation =
+                            self.inner.slot_gen_counter.fetch_add(1, Ordering::SeqCst);
                         let slot = OnDemandSlot {
                             handle: handle.clone(),
                             refcount: 1,
+                            generation,
                         };
                         on_demand.insert(id.clone(), slot);
-                        on_demand_ids.push(id.clone());
+                        on_demand_refs.push((id.clone(), generation));
                         subs.push(EncoderSubscription {
                             id: handle.id.clone(),
                             layer: handle.layer.clone(),
@@ -1197,7 +1238,7 @@ impl EncoderPool {
             subs,
             PoolLease {
                 pool: Arc::clone(&self.inner),
-                on_demand_ids,
+                on_demand_refs,
                 released: AtomicBool::new(false),
             },
         ))
@@ -1442,6 +1483,29 @@ fn spawn_encoder_thread_with(
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             };
+
+            // Re-check shutdown after waking from blocking_recv.
+            // Between the top-of-loop check and this point, another
+            // task may have cancelled our shutdown — typically
+            // `EncoderPool::on_resize` for an old-generation handle,
+            // or `PoolLease::release_impl` for an on-demand slot
+            // whose refcount hit zero. Without this second check the
+            // thread would run encode on `frame`, which for the
+            // on_resize case is already post-resize data at new
+            // dimensions that this encoder (configured for old
+            // dimensions) would misinterpret — feeding a stale frame
+            // to any still-live subscriber before finally exiting on
+            // the next top-of-loop check.
+            //
+            // Dropping the frame and exiting here is cheaper than
+            // restructuring the `blocking_recv` into a tokio select
+            // on shutdown (which would require the encoder loop to
+            // become async), and matches the semantics every other
+            // shutdown-aware Rust loop uses: "if shutdown fires, do
+            // not produce another unit of output."
+            if shutdown_for_thread.is_cancelled() {
+                break;
+            }
 
             let force_kf = force_kf_for_thread.swap(false, Ordering::SeqCst);
 
@@ -1767,6 +1831,172 @@ mod tests {
         assert_eq!(
             scaled.target_bitrate_kbps, 400,
             "bitrate preserved across rescale; TWCC adjusts at runtime"
+        );
+    }
+
+    /// Finding 1 fix: after on_resize cancels an encoder's shutdown
+    /// token, the next wake-push must not produce an encoded frame.
+    /// The thread sees shutdown at the top of the loop OR re-checks
+    /// after `blocking_recv` returns; either way it exits before
+    /// calling `encoder.encode` on post-resize data its encoder
+    /// (configured for old dimensions) would misinterpret.
+    ///
+    /// Exercises the fix directly: cancel shutdown on an encoder
+    /// handle, push a wake-frame, verify the subscriber sees Closed
+    /// rather than Ok(frame). The pre-fix bug would emit one frame
+    /// before exiting.
+    #[tokio::test]
+    async fn encoder_thread_exits_on_shutdown_without_emitting_frame() {
+        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+
+        // Subscribe to the always-on encoder's frames.
+        let mut frames_rx = {
+            let always_on = pool.always_on();
+            always_on[0].frames.subscribe()
+        };
+
+        // Cancel the thread's shutdown token. From the pool API this
+        // isn't how shutdown normally fires (it's driven by on_resize
+        // or lease drop), but the contract we're testing is "a
+        // cancelled-shutdown encoder must not produce another encoded
+        // frame," which is the same regardless of what fired the
+        // cancellation.
+        {
+            let always_on = pool.always_on();
+            always_on[0].shutdown.cancel();
+        }
+
+        // Push a wake-frame so the thread wakes from blocking_recv.
+        let frame = Arc::new(vec![0u8; 64 * 64 * 3 / 2]);
+        pool.push_i420_frame(frame, Instant::now());
+
+        // Wait long enough for the thread to wake, observe the
+        // cancelled shutdown, and exit without encoding. 200ms is
+        // orders of magnitude above one frame interval at 30fps
+        // (~33ms) — if the encoder were going to emit a stale
+        // frame, it would have by now.
+        //
+        // NB: we don't wait for `RecvError::Closed` because the
+        // handle's `frames` Sender is still alive in
+        // `pool.always_on` (only the thread's Sender clone drops on
+        // exit). The test's contract is "no frame was emitted," not
+        // "channel closed" — in on_resize the channel does close
+        // because the handle itself is dropped, but that's a
+        // separate path already covered by
+        // `on_resize_to_new_dimensions_respawns_always_on`.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        match frames_rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Empty) => {
+                // Expected: thread exited before encoding.
+            }
+            Err(broadcast::error::TryRecvError::Closed) => {
+                // Also acceptable if somehow the handle dropped; the
+                // contract (no stale frame) still holds.
+            }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                panic!(
+                    "unexpected Lagged — encoder should not have produced \
+                     enough frames to lag a fresh subscriber"
+                )
+            }
+            Ok(_) => panic!(
+                "encoder emitted a frame after shutdown — the post-blocking_recv \
+                 shutdown check is missing or reordered, allowing one stale \
+                 encode pass through"
+            ),
+        }
+    }
+
+    /// Finding 2 fix (a): on_resize drops on-demand slots entirely.
+    /// Earlier drafts respawned them in place (preserving refcount),
+    /// which created a lifetime mismatch where existing leases held
+    /// stale generations against the new slot. Post-fix, on_resize
+    /// simply tears slots down; forwarders re-subscribe on Closed
+    /// and get fresh slots.
+    #[tokio::test]
+    async fn on_resize_drops_on_demand_slots_rather_than_respawning() {
+        // Construct with empty always_on so VP8 falls to on-demand,
+        // giving us a VP8 slot to observe.
+        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+        let (_subs, _lease) = pool
+            .subscribe(&prefs)
+            .expect("on-demand VP8 spawn");
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
+            Some(1),
+            "on-demand slot present pre-resize"
+        );
+
+        pool.on_resize(128, 96);
+
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
+            None,
+            "on_resize must tear down on-demand slots; the forwarder's \
+             Closed-driven re-subscribe is what spawns a fresh slot \
+             (phase 3c.3b)"
+        );
+    }
+
+    /// Finding 2 fix (b): a stale lease from a pre-resize subscribe
+    /// MUST NOT decrement the refcount of a post-resize re-subscribed
+    /// slot that happens to share the same EncoderId. The generation
+    /// token on each slot and in each lease's on_demand_refs is what
+    /// makes this safe.
+    ///
+    /// Scenario:
+    ///   T0: subscribe → slot gen=0, lease A refs gen=0, refcount=1
+    ///   T1: on_resize → slot gen=0 dropped
+    ///   T2: subscribe → slot gen=1, lease B refs gen=1, refcount=1
+    ///   T3: drop lease A — must NOT decrement slot gen=1's refcount
+    ///   T4: drop lease B — tears slot down
+    #[tokio::test]
+    async fn stale_lease_does_not_decrement_replacement_slot() {
+        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+
+        let (_subs_a, lease_a) = pool.subscribe(&prefs).expect("first subscribe");
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
+            Some(1),
+            "slot created at refcount=1"
+        );
+
+        pool.on_resize(128, 96);
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
+            None,
+            "slot dropped by resize"
+        );
+
+        let (_subs_b, lease_b) = pool.subscribe(&prefs).expect("re-subscribe");
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
+            Some(1),
+            "re-subscribe spawns fresh slot at refcount=1 with new generation"
+        );
+
+        // Drop the stale lease. If the generation gate is missing or
+        // broken, this would decrement slot B's refcount to 0 and
+        // tear it down — the exact bug. With the gate, release_impl
+        // sees slot B's gen != lease A's recorded gen and skips.
+        drop(lease_a);
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
+            Some(1),
+            "stale lease from the pre-resize slot must NOT decrement \
+             the post-resize slot's refcount; gen mismatch should skip"
+        );
+
+        // Legitimate drop: lease B was against slot B, genes match,
+        // refcount → 0, slot torn down.
+        drop(lease_b);
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
+            None,
+            "legitimate lease drop tears slot down when refcount hits 0"
         );
     }
 
