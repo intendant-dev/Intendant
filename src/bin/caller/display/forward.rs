@@ -265,11 +265,16 @@ pub fn codec_preferences_from_offer(sdp: &str) -> PeerCodecPreferences {
             "VP8" => supported.push(CodecKind::Vp8),
             "H264" => {
                 // Only include H.264 if the offer carries a variant
-                // compatible with our encoder's exact spec. Otherwise
-                // the pool would subscribe, str0m would negotiate a
-                // variant the encoder's PayloadSpec can't match, and
-                // every frame would silently drop.
-                if crate::display::encode::has_compatible_h264_offer(sdp) {
+                // that str0m's Writer::match_params would accept
+                // against our encoder's exact PayloadSpec. The older
+                // `has_compatible_h264_offer` is broader than that
+                // (it accepts packetization-mode 0, missing fmtp,
+                // and any profile_idc = 0x42 regardless of
+                // constraint_set1_flag) — str0m rejects all of
+                // those, so they'd result in silent black-screen
+                // frame-drop. See the detailed rules next to
+                // `offer_has_poolable_h264_variant`.
+                if crate::display::encode::offer_has_poolable_h264_variant(sdp) {
                     supported.push(CodecKind::H264);
                 }
             }
@@ -332,13 +337,19 @@ mod tests {
 
     #[test]
     fn codec_preferences_from_offer_parses_known_codecs() {
-        // Skeleton SDP carrying the codec rtpmap lines
-        // parse_offered_codecs looks for.
+        // Skeleton SDP carrying the codec rtpmap lines that
+        // `parse_offered_codecs` looks for. The H.264 line carries
+        // a Constrained Baseline + packetization-mode 1 fmtp so the
+        // strict `offer_has_poolable_h264_variant` gate admits it —
+        // this test is about "do we see all three codec families,"
+        // separate from the H.264-profile-specific tests below that
+        // cover the edge cases of the strict gate.
         let sdp = concat!(
             "v=0\r\n",
             "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98\r\n",
             "a=rtpmap:96 VP8/90000\r\n",
             "a=rtpmap:97 H264/90000\r\n",
+            "a=fmtp:97 profile-level-id=42e01f;packetization-mode=1\r\n",
             "a=rtpmap:98 AV1/90000\r\n",
         );
         let prefs = codec_preferences_from_offer(sdp);
@@ -423,6 +434,109 @@ mod tests {
         assert!(
             prefs.supports(CodecKind::H264),
             "H.264 must be claimed when at least one offered variant is compatible"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Strict H.264 filter tests (findings #1 revisited in 3c.0a review)
+    //
+    // Each of these variants was previously accepted by the legacy
+    // `has_compatible_h264_offer` helper but would be rejected by
+    // str0m's `Writer::match_params` against the encoder's exact
+    // `PayloadSpec::h264_constrained_baseline`. Result: silent
+    // black-screen frame drops. The new `offer_has_poolable_h264_variant`
+    // gate must exclude each one.
+    // -----------------------------------------------------------------------
+
+    /// `42e01f` profile (Constrained Baseline, the match) but
+    /// packetization-mode 0 (encoder produces mode 1). str0m's matcher
+    /// requires equality on packetization-mode.
+    #[test]
+    fn codec_preferences_excludes_h264_wrong_packetization_mode() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 97\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+            "a=fmtp:97 profile-level-id=42e01f;packetization-mode=0\r\n",
+        );
+        let prefs = codec_preferences_from_offer(sdp);
+        assert!(
+            !prefs.supports(CodecKind::H264),
+            "packetization-mode 0 must be rejected — encoder emits mode 1 only"
+        );
+    }
+
+    /// `42001f` profile (Baseline, NOT Constrained Baseline) at
+    /// packetization-mode 1. str0m's profile resolver maps this to
+    /// `H264Profile::Baseline` while our encoder emits
+    /// `ConstrainedBaseline`; the matcher requires profile equality.
+    #[test]
+    fn codec_preferences_excludes_h264_pure_baseline_without_cs1() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 97\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+            "a=fmtp:97 profile-level-id=42001f;packetization-mode=1\r\n",
+        );
+        let prefs = codec_preferences_from_offer(sdp);
+        assert!(
+            !prefs.supports(CodecKind::H264),
+            "Pure Baseline (cs1 unset) must be rejected — encoder emits Constrained Baseline"
+        );
+    }
+
+    /// H.264 rtpmap with NO fmtp line at all. `parse_h264_fmtp` treats
+    /// missing fmtp as packetization-mode 0 + empty profile-level-id,
+    /// and str0m's `match_params` falls back to Baseline/Level 1 for
+    /// missing profile-level-id. Both axes disagree with our encoder.
+    #[test]
+    fn codec_preferences_excludes_h264_with_no_fmtp() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 97\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+        );
+        let prefs = codec_preferences_from_offer(sdp);
+        assert!(
+            !prefs.supports(CodecKind::H264),
+            "No fmtp implies str0m-fallback Baseline + mode 0 — must be rejected"
+        );
+    }
+
+    /// Correct profile + mode but offered level 5.0 (`4d0032` —
+    /// actually Main at Level 5.0; use `42e028` for ConstrainedBaseline
+    /// at Level 4.0 to keep profile family). Level 4.0 (0x28) > our
+    /// encoder's Level 3.1 (0x1f); str0m rejects when the offer's
+    /// level exceeds ours.
+    #[test]
+    fn codec_preferences_excludes_h264_when_offered_level_exceeds_encoder() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 97\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+            "a=fmtp:97 profile-level-id=42e028;packetization-mode=1\r\n",
+        );
+        let prefs = codec_preferences_from_offer(sdp);
+        assert!(
+            !prefs.supports(CodecKind::H264),
+            "Level 4.0 offer exceeds encoder's Level 3.1 ceiling — must be rejected"
+        );
+    }
+
+    /// Correct profile, correct mode, level LOWER than ours (3.0 vs 3.1).
+    /// str0m accepts `c1_level <= c0_level`, so this matches.
+    #[test]
+    fn codec_preferences_includes_h264_at_lower_level() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 97\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+            "a=fmtp:97 profile-level-id=42e01e;packetization-mode=1\r\n", // Level 3.0
+        );
+        let prefs = codec_preferences_from_offer(sdp);
+        assert!(
+            prefs.supports(CodecKind::H264),
+            "Level 3.0 is below encoder's Level 3.1 — must be accepted (str0m: c1_level <= c0_level)"
         );
     }
 
