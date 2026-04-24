@@ -845,6 +845,20 @@ impl DisplaySession {
         );
         let display_id = self.display_id;
         let codec_mime_for_bridge = codec_mime;
+        // Phase 3c.2: capture the pool Arc (if populated by `start()`) so
+        // the bridge can dual-feed I420 frames into it. No peer subscribes
+        // to the pool until 3c.3 wires `handle_offer`; this feed is
+        // transitional and exists so the pool's always-on encoder sees
+        // real frames rather than sitting idle. Cloned here (outside the
+        // spawned task) so the task closure owns an `Option<Arc>` and
+        // doesn't need to touch `self.pool` at runtime.
+        //
+        // Deliberately unconditional — if the pool is None (shouldn't
+        // happen post-start, but belt-and-braces), the dual-feed is a
+        // no-op. Old path stays the only one that affects peer
+        // observability until 3c.3/3c.4.
+        let pool_for_bridge: Option<Arc<encode::pool::EncoderPool>> =
+            self.pool.get().map(Arc::clone);
         let bridge_handle = tokio::spawn(async move {
             // Track current encoder dimensions for resize detection.
             let mut enc_width = width;
@@ -996,11 +1010,44 @@ impl DisplaySession {
                             burst_first = false;
                         }
 
-                        if i420_tx.try_send((i420.clone(), arrived, force_kf)).is_err() {
+                        let old_path_ok = i420_tx
+                            .try_send((i420.clone(), arrived, force_kf))
+                            .is_ok();
+                        if !old_path_ok {
                             bridge_counters
                                 .encode_drops
                                 .fetch_add(1, Ordering::Relaxed);
-                        } else {
+                        }
+
+                        // Phase 3c.2: dual-feed the same gated I420 frame
+                        // into the pool's broadcast so the pool's
+                        // always-on encoder (and, in 3c.3+, on-demand
+                        // encoders) see the same tick rhythm, heartbeat
+                        // cadence, and burst window the old path does.
+                        // Pool has its own broadcast capacity and its
+                        // own dropping semantics, so the two paths don't
+                        // serialize on each other. `push_i420_frame`
+                        // returns the current subscriber count — a
+                        // healthy pool post-`start()` has ≥1 always-on
+                        // encoder subscribed, but we don't react to the
+                        // return value here (the pool's own lag/drop
+                        // handling covers encoder stalls).
+                        //
+                        // Done unconditionally (not gated on
+                        // `old_path_ok`) because the pool has independent
+                        // capacity; rate-limiting it to the old path's
+                        // success would tie the new path's throughput
+                        // to the old one's failure mode, which is the
+                        // opposite of what dual-feed is for.
+                        //
+                        // TODO 3c.4: when the old single-encoder path
+                        // is deleted, switch to `Arc<Vec<u8>>` end-to-end
+                        // so this doesn't double-clone.
+                        if let Some(ref pool) = pool_for_bridge {
+                            pool.push_i420_frame(Arc::new(i420.clone()), arrived);
+                        }
+
+                        if old_path_ok {
                             last_sent_gen = Some(generation);
                             last_send_at = Instant::now();
                         }
@@ -1799,6 +1846,40 @@ mod tests {
             pool.always_on().len(),
             1,
             "exactly one always-on VP8 layer spawned"
+        );
+    }
+
+    /// Phase 3c.2 relies on the pool's always-on VP8 encoder being an
+    /// i420-broadcast subscriber the moment `start()` completes — the
+    /// bridge's dual-feed `push_i420_frame` call must deliver to at
+    /// least one receiver, otherwise the new path is a silent no-op
+    /// and 3c.3's peer subscription wiring will observe a never-
+    /// decoding stream. This test locks that precondition by pushing
+    /// a synthetic I420 frame through the pool directly (no bridge
+    /// involvement) and asserting the subscriber count is non-zero.
+    ///
+    /// If this test ever fires, `EncoderPool::new` is spawning its
+    /// always-on encoders without subscribing them to `i420_tx` — a
+    /// silent-black-screen regression that phase 4 (simulcast) would
+    /// amplify.
+    #[tokio::test]
+    async fn pool_always_on_encoder_subscribed_to_i420_after_start() {
+        let backend = Arc::new(StubBackend { width: 640, height: 480 });
+        let session = DisplaySession::new(0, backend);
+        session.start(30, None, None).await.expect("start() must succeed");
+        let pool = session.pool.get().expect("pool initialized after start()");
+
+        // 640x480 I420 frame is width*height*3/2 bytes (Y plane full,
+        // U+V half each). Contents don't matter — we're checking the
+        // broadcast topology, not encoder output.
+        let i420 = Arc::new(vec![0u8; 640 * 480 * 3 / 2]);
+        let subscriber_count = pool.push_i420_frame(i420, Instant::now());
+        assert!(
+            subscriber_count >= 1,
+            "pool.push_i420_frame must deliver to ≥1 subscriber (the \
+             always-on VP8 encoder); got {subscriber_count}. If this is \
+             0, EncoderPool::new is not wiring up always-on encoders \
+             to the i420 broadcast."
         );
     }
 }
