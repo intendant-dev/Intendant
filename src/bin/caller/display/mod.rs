@@ -955,6 +955,29 @@ impl DisplaySession {
                                     height: enc_height,
                                 });
                             }
+
+                            // Phase 3c.3a: replace the pool's encoders
+                            // at the new dimensions in the same beat
+                            // the old path respawns its encoder. After
+                            // this call the pool's dimensions, its
+                            // always_on handles, and (eventually) its
+                            // on_demand slots are all coherent with
+                            // the new capture size, and the
+                            // dimensions-gate from 3c.2a becomes an
+                            // invariant assert rather than a runtime
+                            // skip.
+                            //
+                            // Subscribers (3c.3b onward) see their
+                            // broadcast::Receiver<Arc<EncodedFrame>>
+                            // close on the next recv and must
+                            // re-subscribe via `pool.subscribe`. The
+                            // forwarder learns to do that when 3c.3b
+                            // lands peer routing; until then, no
+                            // subscribers exist and the swap is
+                            // pool-internal only.
+                            if let Some(ref pool) = pool_for_bridge {
+                                pool.on_resize(enc_width, enc_height);
+                            }
                         }
 
                         // Convert the new BGRA capture to I420 and stash
@@ -1044,43 +1067,27 @@ impl DisplaySession {
                         // is deleted, switch to `Arc<Vec<u8>>` end-to-end
                         // so this doesn't double-clone.
                         if let Some(ref pool) = pool_for_bridge {
-                            // 3c.2 safety gate: the pool's always-on
-                            // encoder is pinned to the dimensions
-                            // `EncoderPool::new` was given (captured at
-                            // `start()`, stored as `source_width/height`).
-                            // The old path detects a resolution change
-                            // upstream and respawns its encoder; the pool
-                            // does not yet have an equivalent on_resize
-                            // path. Until 3c.3 adds pool-side resize
-                            // handling, we skip the push when the
-                            // bridge's current encode dimensions differ
-                            // from the pool's — pushing an I420 buffer
-                            // whose byte length doesn't match the
-                            // encoder's configured width*height*3/2
-                            // would feed garbage or trip an assertion
-                            // inside libvpx/libx264.
-                            //
-                            // With no pool consumers yet (3c.3 wires
-                            // them), the effect today is just "pool
-                            // encoder goes idle after a resize" rather
-                            // than a visible regression — exactly the
-                            // "wasted encode/log noise" we don't want
-                            // to amplify into a black stream once 3c.3
-                            // lands.
-                            //
-                            // TODO 3c.3: replace with
-                            // `pool.on_resize(enc_width, enc_height)`
-                            // called from the resize branch above, at
-                            // which point this dimensions check becomes
-                            // an invariant assert rather than a runtime
-                            // skip.
-                            let (pool_w, pool_h) = pool.dimensions();
-                            if (enc_width, enc_height) == (pool_w, pool_h) {
-                                pool.push_i420_frame(
-                                    Arc::new(i420.clone()),
-                                    arrived,
-                                );
-                            }
+                            // 3c.3a established the invariant that the
+                            // resize branch above calls
+                            // `pool.on_resize(...)` in the same beat it
+                            // updates `enc_width`/`enc_height`, so by
+                            // the time we get here the pool's
+                            // dimensions always match the bridge's.
+                            // `debug_assert` catches a future regression
+                            // (someone adds a resize path that bypasses
+                            // pool.on_resize) without costing anything
+                            // in release builds.
+                            debug_assert_eq!(
+                                pool.dimensions(),
+                                (enc_width, enc_height),
+                                "pool.on_resize must be called in the bridge's \
+                                 resize branch before any push at the new \
+                                 dimensions"
+                            );
+                            pool.push_i420_frame(
+                                Arc::new(i420.clone()),
+                                arrived,
+                            );
                         }
 
                         if old_path_ok {

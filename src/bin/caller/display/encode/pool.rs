@@ -136,8 +136,8 @@
 use crate::display::EncodedFrame;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -701,10 +701,19 @@ pub struct EncoderPool {
 }
 
 struct EncoderPoolInner {
-    /// Always-on encoders (constructed at pool creation, never torn
-    /// down). Today: a single VP8 layer at the source resolution.
-    /// Phase 4 expands this into VP8 simulcast (multiple layers).
-    always_on: Vec<EncoderHandle>,
+    /// Always-on encoders (constructed at pool creation, torn down and
+    /// respawned atomically on resize). Today: a single VP8 layer at
+    /// the source resolution. Phase 4 expands this into VP8 simulcast
+    /// (multiple layers).
+    ///
+    /// Behind `StdRwLock` because [`EncoderPool::on_resize`] mutates
+    /// the vec (swapping every handle for a fresh one at new
+    /// dimensions) while readers — `subscribe`, `request_keyframe`,
+    /// `Drop` — iterate it. Reads are frequent and short; writes (only
+    /// `on_resize`) are rare. std's `RwLock` is fine; we don't need
+    /// parking_lot's extra features and consistency with the `StdMutex`
+    /// already used for `on_demand` is easier to reason about.
+    always_on: StdRwLock<Vec<EncoderHandle>>,
 
     /// On-demand encoders, keyed by `(codec, rid)`. Spawned on first
     /// peer that needs them, torn down when the last peer leaves.
@@ -735,8 +744,15 @@ struct EncoderPoolInner {
     /// layers carry their own width/height (may be downscaled simulcast
     /// layers), but on-demand encoders default to the source resolution
     /// and bitrate appropriate for their codec (from `LayerSpec::single`).
-    source_width: u32,
-    source_height: u32,
+    ///
+    /// Atomic because [`EncoderPool::on_resize`] updates these when the
+    /// capture backend reports a new resolution; `dimensions()` readers
+    /// must see the updated value without taking a lock. Stores use
+    /// `Ordering::SeqCst` to match the ordering model the `always_on`
+    /// write lock provides — on_resize writes dimensions then swaps
+    /// handles, readers see them in that order.
+    source_width: AtomicU32,
+    source_height: AtomicU32,
     framerate: u32,
 }
 
@@ -798,13 +814,13 @@ impl EncoderPool {
 
         Self {
             inner: Arc::new(EncoderPoolInner {
-                always_on,
+                always_on: StdRwLock::new(always_on),
                 on_demand: StdMutex::new(HashMap::new()),
                 keyframe_coalescer: KeyframeCoalescer::new(),
                 i420_tx,
                 duration_ms,
-                source_width,
-                source_height,
+                source_width: AtomicU32::new(source_width),
+                source_height: AtomicU32::new(source_height),
                 framerate,
             }),
         }
@@ -826,10 +842,158 @@ impl EncoderPool {
     /// them at new dimensions. Until that exists, a push at the wrong
     /// size would deliver a buffer the encoder can't interpret.
     ///
-    /// Returns `(source_width, source_height)` — the same values passed
-    /// to [`Self::new`].
+    /// Returns `(source_width, source_height)` — the values most
+    /// recently set by either [`Self::new`] or [`Self::on_resize`].
     pub fn dimensions(&self) -> (u32, u32) {
-        (self.inner.source_width, self.inner.source_height)
+        (
+            self.inner.source_width.load(Ordering::SeqCst),
+            self.inner.source_height.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Replace every encoder in the pool with a fresh one at new source
+    /// dimensions.
+    ///
+    /// Called by the capture bridge when the backend reports a
+    /// resolution change (X11 xrandr, window mode switch, hot-plug).
+    /// Each existing encoder handle has its shutdown cancelled and a
+    /// new handle is spawned at the layer-proportional rescaled size,
+    /// keeping the same codec/rid identity. The pool's dimension
+    /// atomics advance to the new values BEFORE the handle swap so
+    /// concurrent `dimensions()` readers (including the bridge's
+    /// push_i420_frame gate) observe a consistent (new dimensions +
+    /// new handles) pair.
+    ///
+    /// Post-conditions:
+    /// - `self.dimensions() == (new_width, new_height)`.
+    /// - Every always-on handle is fresh, at a layer size proportional
+    ///   to the old layer's ratio of the old source dimensions
+    ///   (simulcast-safe).
+    /// - Every on-demand slot is fresh at the same rescale, with its
+    ///   refcount preserved.
+    /// - Every old handle's `shutdown` is cancelled; its encoder
+    ///   thread exits on next `blocking_recv` wakeup (one frame
+    ///   interval at most).
+    ///
+    /// Subscriber impact: any existing
+    /// `broadcast::Receiver<Arc<EncodedFrame>>` obtained from one of
+    /// the swapped handles observes `RecvError::Closed` on its next
+    /// recv. Peer forwarders (phase 3c.3b onward) must handle Closed
+    /// by tearing the peer down or re-subscribing via
+    /// [`Self::subscribe`] — the same contract they'd see on any
+    /// transient encoder failure. This matches the str0m chat.rs
+    /// "re-subscribe per publisher epoch" pattern.
+    ///
+    /// No-op when `(new_width, new_height) == self.dimensions()` —
+    /// avoids encoder churn when the capture backend emits a
+    /// same-dimensions re-announcement (common on xrandr
+    /// notifications that only changed refresh rate, etc.).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a new always-on encoder fails to construct: an
+    /// always-on construction failure at any lifecycle point —
+    /// startup or resize — is unrecoverable by contract (see
+    /// [`Self::new`]). A failed on-demand respawn is logged and the
+    /// slot is dropped; subscribers to that slot will see Closed and
+    /// the peer-level code can re-negotiate on a different codec or
+    /// terminate.
+    pub fn on_resize(&self, new_width: u32, new_height: u32) {
+        let old_width = self.inner.source_width.load(Ordering::SeqCst);
+        let old_height = self.inner.source_height.load(Ordering::SeqCst);
+        if (old_width, old_height) == (new_width, new_height) {
+            return;
+        }
+
+        // Advance dimension atomics first so any concurrent reader —
+        // the bridge's push_i420_frame dimension gate, a subscribe
+        // that consults source_width/height for an on-demand
+        // LayerSpec::single default — sees the new size before it
+        // sees the new handles. SeqCst matches the write lock's
+        // ordering so observers see (dims, handles) atomically on
+        // release.
+        self.inner.source_width.store(new_width, Ordering::SeqCst);
+        self.inner.source_height.store(new_height, Ordering::SeqCst);
+
+        // Swap always-on handles. Hold the write lock across
+        // try_spawn_encoder_thread (synchronous codec probe,
+        // potentially a subprocess spawn for ffmpeg-based backends).
+        // This serializes resize against subscribe / request_keyframe
+        // / drop — which is the right tradeoff: resize is rare and
+        // expensive; a brief read-side block during a resize is
+        // correct (callers see either all-old or all-new state).
+        {
+            let mut always_on = self.inner.always_on.write().unwrap();
+            let old_handles: Vec<EncoderHandle> = std::mem::take(&mut *always_on);
+            for handle in &old_handles {
+                handle.shutdown.cancel();
+            }
+            for old_handle in old_handles {
+                let rescaled = rescale_layer_spec(
+                    &old_handle.layer,
+                    old_width,
+                    old_height,
+                    new_width,
+                    new_height,
+                );
+                let new_handle = try_spawn_encoder_thread(
+                    old_handle.id.clone(),
+                    rescaled,
+                    &self.inner.i420_tx,
+                    self.inner.duration_ms,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "on_resize: always-on respawn failed for {:?}: {} — \
+                         always-on construction failure is unrecoverable by \
+                         contract (see EncoderPool::new)",
+                        old_handle.id, e,
+                    )
+                });
+                always_on.push(new_handle);
+            }
+        }
+
+        // Swap on-demand slots. Same respawn, but construction
+        // failures log-and-drop rather than panic — a peer using a
+        // dropped slot sees Closed and can re-negotiate. Mirrors the
+        // subscribe path's "skip codec on construction failure"
+        // policy.
+        {
+            let mut on_demand = self.inner.on_demand.lock().unwrap();
+            let old_slots: HashMap<EncoderId, OnDemandSlot> =
+                std::mem::take(&mut *on_demand);
+            for (id, old_slot) in old_slots {
+                old_slot.handle.shutdown.cancel();
+                let rescaled = rescale_layer_spec(
+                    &old_slot.handle.layer,
+                    old_width,
+                    old_height,
+                    new_width,
+                    new_height,
+                );
+                match try_spawn_encoder_thread(
+                    id.clone(),
+                    rescaled,
+                    &self.inner.i420_tx,
+                    self.inner.duration_ms,
+                ) {
+                    Ok(new_handle) => {
+                        on_demand.insert(
+                            id,
+                            OnDemandSlot { handle: new_handle, refcount: old_slot.refcount },
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[encode/pool] on_resize: on-demand respawn failed \
+                             for {id:?}: {e} — slot dropped; subscribers will \
+                             see Closed and can re-negotiate"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Push one I420 frame into the pool. Bridge calls this for every
@@ -892,17 +1056,22 @@ impl EncoderPool {
 
         // Always-on: no refcount, subscribe-only. These are guaranteed
         // to be producing frames — EncoderPool::new panics on
-        // always-on construction failure.
-        for handle in &self.inner.always_on {
-            if prefs.supports(handle.id.codec) {
-                subs.push(EncoderSubscription {
-                    id: handle.id.clone(),
-                    layer: handle.layer.clone(),
-                    frames: handle.subscribe(),
-                });
-            }
-            if !always_on_codecs.contains(&handle.id.codec) {
-                always_on_codecs.push(handle.id.codec);
+        // always-on construction failure. Read lock is held only for
+        // the duration of this iteration; on_resize acquires the write
+        // lock to swap handles.
+        {
+            let always_on = self.inner.always_on.read().unwrap();
+            for handle in always_on.iter() {
+                if prefs.supports(handle.id.codec) {
+                    subs.push(EncoderSubscription {
+                        id: handle.id.clone(),
+                        layer: handle.layer.clone(),
+                        frames: handle.subscribe(),
+                    });
+                }
+                if !always_on_codecs.contains(&handle.id.codec) {
+                    always_on_codecs.push(handle.id.codec);
+                }
             }
         }
 
@@ -942,8 +1111,8 @@ impl EncoderPool {
                 } else {
                     let layer = LayerSpec::single(
                         codec,
-                        self.inner.source_width,
-                        self.inner.source_height,
+                        self.inner.source_width.load(Ordering::SeqCst),
+                        self.inner.source_height.load(Ordering::SeqCst),
                         self.inner.framerate,
                     );
                     to_construct.push((codec, id, layer));
@@ -1058,11 +1227,15 @@ impl EncoderPool {
             return false;
         }
         let id = EncoderId::new(codec, rid);
-        // Always-on first.
-        for handle in &self.inner.always_on {
-            if handle.id == id {
-                handle.force_keyframe.store(true, Ordering::SeqCst);
-                return true;
+        // Always-on first. Read-only iteration; on_resize's writer
+        // waits until this read guard drops before swapping handles.
+        {
+            let always_on = self.inner.always_on.read().unwrap();
+            for handle in always_on.iter() {
+                if handle.id == id {
+                    handle.force_keyframe.store(true, Ordering::SeqCst);
+                    return true;
+                }
             }
         }
         // On-demand.
@@ -1076,9 +1249,15 @@ impl EncoderPool {
 
     /// Test-only access to the always-on handles. Lets tests verify
     /// pool composition without exposing internals to production code.
+    ///
+    /// Returns a read guard; callers hold it for the duration of the
+    /// slice's use. `RwLock` backing means on_resize waits for all
+    /// test guards to drop before swapping handles — fine for tests
+    /// (short critical sections) and matches production's reader
+    /// pattern.
     #[cfg(test)]
-    pub(crate) fn always_on(&self) -> &[EncoderHandle] {
-        &self.inner.always_on
+    pub(crate) fn always_on(&self) -> std::sync::RwLockReadGuard<'_, Vec<EncoderHandle>> {
+        self.inner.always_on.read().unwrap()
     }
 
     /// Test-only access to on-demand slot counts. Lets tests verify
@@ -1105,8 +1284,10 @@ impl Drop for EncoderPoolInner {
         // Cancel sets the flag for the loop's per-iter check, then
         // dropping the broadcast sender below closes the channel and
         // the recv returns Err(Closed) immediately.
-        for handle in &self.always_on {
-            handle.shutdown.cancel();
+        if let Ok(always_on) = self.always_on.read() {
+            for handle in always_on.iter() {
+                handle.shutdown.cancel();
+            }
         }
         // try_lock avoids blocking Drop if the mutex is contended (e.g.
         // a subscribe or release racing pool teardown). If we can't
@@ -1153,6 +1334,53 @@ impl Drop for EncoderPoolInner {
 /// subscribers. That behavior surfaced as "the peer negotiated a
 /// codec the system can't actually produce" — which was one of the
 /// root causes the encoder-pool redesign exists to fix.
+/// Rescale a `LayerSpec` proportionally from source dimensions
+/// `(old_src_w, old_src_h)` to `(new_src_w, new_src_h)`. Preserves
+/// the layer's ratio to its source — a full-resolution layer stays
+/// at the new source dimensions, a half-resolution simulcast layer
+/// stays at half of the new source, etc.
+///
+/// Widths and heights are rounded down to even (VP8/H.264 both
+/// require even dimensions). `rid`, `target_bitrate_kbps`, and
+/// `framerate` are preserved unchanged — RID identifies the layer
+/// across resize, and bitrate adaptation is TWCC's responsibility
+/// (future phase).
+///
+/// For the single-VP8-layer baseline case (phase 3c.3a), this
+/// simplifies to "the new source dimensions," because the always-on
+/// layer's dimensions match the source. The general form exists for
+/// simulcast (phase 4), where always_on will have multiple layers at
+/// different ratios.
+fn rescale_layer_spec(
+    spec: &LayerSpec,
+    old_src_w: u32,
+    old_src_h: u32,
+    new_src_w: u32,
+    new_src_h: u32,
+) -> LayerSpec {
+    // Defensive — divide-by-zero would be a bug elsewhere (pool is
+    // constructed from real capture dimensions which are always > 0),
+    // but emit a sensible spec rather than panicking.
+    if old_src_w == 0 || old_src_h == 0 {
+        return LayerSpec {
+            rid: spec.rid.clone(),
+            width: new_src_w & !1,
+            height: new_src_h & !1,
+            target_bitrate_kbps: spec.target_bitrate_kbps,
+            framerate: spec.framerate,
+        };
+    }
+    let w = (spec.width as u64 * new_src_w as u64 / old_src_w as u64) as u32;
+    let h = (spec.height as u64 * new_src_h as u64 / old_src_h as u64) as u32;
+    LayerSpec {
+        rid: spec.rid.clone(),
+        width: w & !1,
+        height: h & !1,
+        target_bitrate_kbps: spec.target_bitrate_kbps,
+        framerate: spec.framerate,
+    }
+}
+
 fn try_spawn_encoder_thread(
     id: EncoderId,
     layer: LayerSpec,
@@ -1347,6 +1575,199 @@ mod tests {
         sleep(Duration::from_millis(40));
         // Window has elapsed — next request fires.
         assert!(coalescer.should_request(CodecKind::Vp8, &rid));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3c.3a: on_resize
+    // -----------------------------------------------------------------------
+
+    /// Calling `on_resize` with the same dimensions the pool was built
+    /// at is a no-op: same handles, same subscribe behavior. The
+    /// capture backend emits same-dimension re-announcements on xrandr
+    /// notifications that only changed refresh rate; we don't want
+    /// encoder churn there.
+    #[tokio::test]
+    async fn on_resize_with_same_dimensions_is_noop() {
+        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+
+        // Snapshot the single always-on handle's identity *before*
+        // resize. If resize respawns anything on a same-dim call, the
+        // Arc<AtomicBool> for force_keyframe would be a fresh
+        // allocation and pointer inequality would fire.
+        let before_id = {
+            let always_on = pool.always_on();
+            always_on[0].id.clone()
+        };
+        let before_force_kf_ptr = {
+            let always_on = pool.always_on();
+            Arc::as_ptr(&always_on[0].force_keyframe) as usize
+        };
+
+        pool.on_resize(64, 64);
+
+        assert_eq!(pool.dimensions(), (64, 64));
+        let after_id = {
+            let always_on = pool.always_on();
+            always_on[0].id.clone()
+        };
+        let after_force_kf_ptr = {
+            let always_on = pool.always_on();
+            Arc::as_ptr(&always_on[0].force_keyframe) as usize
+        };
+        assert_eq!(before_id, after_id);
+        assert_eq!(
+            before_force_kf_ptr, after_force_kf_ptr,
+            "same-dim on_resize must leave handle identity untouched"
+        );
+    }
+
+    /// `on_resize` to different dimensions advances the pool's
+    /// atomic dimensions, keeps the always-on handle count the same,
+    /// and replaces the handle with a freshly-spawned one (so
+    /// existing subscribers see Closed on next recv and the new
+    /// handle carries the new layer dimensions). This is the
+    /// contract the bridge depends on.
+    #[tokio::test]
+    async fn on_resize_to_new_dimensions_respawns_always_on() {
+        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+
+        // Grab a subscription against the old handle. After resize
+        // it should return Closed on its next recv (the old handle's
+        // broadcast::Sender drops when the vec is overwritten).
+        let mut old_frames_rx = {
+            let always_on = pool.always_on();
+            always_on[0].frames.subscribe()
+        };
+        let old_layer = {
+            let always_on = pool.always_on();
+            always_on[0].layer.clone()
+        };
+
+        pool.on_resize(128, 96);
+
+        assert_eq!(pool.dimensions(), (128, 96));
+        let (new_handle_count, new_layer) = {
+            let always_on = pool.always_on();
+            (always_on.len(), always_on[0].layer.clone())
+        };
+        assert_eq!(new_handle_count, 1, "resize must preserve handle count");
+        // Layer rescales proportionally. For the single-layer case
+        // old_layer was (64, 64), source was (64, 64), new source is
+        // (128, 96) → new layer is (128, 96).
+        assert_eq!(new_layer.width, 128);
+        assert_eq!(new_layer.height, 96);
+        assert_eq!(
+            new_layer.rid, old_layer.rid,
+            "rid preserved across resize"
+        );
+
+        // Old subscription must terminate. The mechanics:
+        // - on_resize cancels the old handle's shutdown token, but the
+        //   encoder thread only checks shutdown at the top of its loop
+        //   — so we need a frame push to wake it from `blocking_recv`.
+        // - The wake-push causes BOTH old and new encoder threads to
+        //   wake and process the frame. Both may emit a frame to their
+        //   respective `frames_tx` broadcasts before the next loop iter
+        //   checks shutdown. The old thread then sees shutdown
+        //   cancelled at the top of the loop, exits, drops its
+        //   `frames_tx_for_thread` clone. Combined with the earlier
+        //   drop of `handle.frames` in on_resize, both senders are
+        //   gone, the broadcast channel closes, and subscribers
+        //   receive `Closed` on their next recv.
+        // - So the subscriber may see one final frame (a VP8 encode of
+        //   the wake-push I420) followed by Closed, OR Closed
+        //   directly if timing happens to catch the thread mid-exit.
+        //   Both orderings are valid; the contract is "terminates
+        //   eventually."
+        let wake_frame = Arc::new(vec![0u8; 128 * 96 * 3 / 2]);
+        pool.push_i420_frame(wake_frame, Instant::now());
+
+        // Drain until we see Closed or hit the timeout. Up to 3
+        // iterations is plenty — one for the wake-push's trailing
+        // encode, one or two for Lagged slots from the broadcast's
+        // internal recycling.
+        let mut closed = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        for _ in 0..3 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let Ok(result) =
+                tokio::time::timeout(remaining, old_frames_rx.recv()).await
+            else {
+                break;
+            };
+            match result {
+                Err(broadcast::error::RecvError::Closed) => {
+                    closed = true;
+                    break;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Ok(_) => continue, // final trailing frame; loop again
+            }
+        }
+        assert!(
+            closed,
+            "old subscription must see Closed within 2s after on_resize + wake-push; \
+             either the old handle's frames-Sender clone didn't drop, or the old \
+             encoder thread didn't exit after shutdown-cancellation."
+        );
+    }
+
+    /// `on_resize` preserves the pool's invariant that pushing an
+    /// I420 frame at the new dimensions reaches the always-on
+    /// encoder. This is the direct precondition the bridge's
+    /// post-resize push relies on.
+    #[tokio::test]
+    async fn on_resize_leaves_pool_ready_for_push_at_new_dimensions() {
+        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+
+        pool.on_resize(128, 96);
+
+        // New I420 buffer sized for 128x96. If on_resize left a stale
+        // subscriber count (e.g. old handle's subscription is gone
+        // but new handle didn't subscribe), push would return 0 and
+        // the always-on encoder would see no frames.
+        let i420 = Arc::new(vec![0u8; 128 * 96 * 3 / 2]);
+        let subscriber_count = pool.push_i420_frame(i420, Instant::now());
+        assert!(
+            subscriber_count >= 1,
+            "post-resize always-on must be i420-subscribed; got {subscriber_count}"
+        );
+    }
+
+    /// `on_resize` with proportional layer rescale. A simulcast-
+    /// layered pool (half-resolution always-on layer) resized from
+    /// 1000x500 → 2000x1000 should see that layer scaled to 1000x500
+    /// (still half of source). Locks the rescale formula for the
+    /// phase 4 simulcast case even though phase 3c.3a doesn't
+    /// exercise it directly.
+    #[tokio::test]
+    async fn on_resize_rescales_layers_proportionally() {
+        let half_layer = LayerSpec {
+            rid: SimulcastRid::half(),
+            width: 500,
+            height: 250,
+            target_bitrate_kbps: 400,
+            framerate: 30,
+        };
+        // Use vp8_simulcast-style: half-res layer on a 1000x500 source.
+        let pool = EncoderPool::new(1000, 500, 30, vec![half_layer]);
+
+        pool.on_resize(2000, 1000);
+
+        let scaled = {
+            let always_on = pool.always_on();
+            always_on[0].layer.clone()
+        };
+        assert_eq!(scaled.width, 1000); // was 500 (half of 1000), now half of 2000
+        assert_eq!(scaled.height, 500); // was 250 (half of 500), now half of 1000
+        assert_eq!(scaled.rid, SimulcastRid::half());
+        assert_eq!(
+            scaled.target_bitrate_kbps, 400,
+            "bitrate preserved across rescale; TWCC adjusts at runtime"
+        );
     }
 
     #[tokio::test]
