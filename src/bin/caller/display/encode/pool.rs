@@ -817,6 +817,21 @@ impl EncoderPool {
         matches!(codec, CodecKind::Vp8 | CodecKind::H264)
     }
 
+    /// Source (capture) dimensions the pool was constructed with.
+    ///
+    /// Used by the bridge's dual-feed path to guard against pushing
+    /// I420 frames of mismatched size after a resolution change — the
+    /// pool's encoders are locked to these dimensions until a future
+    /// `on_resize` method (phase 3c.3) tears them down and respawns
+    /// them at new dimensions. Until that exists, a push at the wrong
+    /// size would deliver a buffer the encoder can't interpret.
+    ///
+    /// Returns `(source_width, source_height)` — the same values passed
+    /// to [`Self::new`].
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.inner.source_width, self.inner.source_height)
+    }
+
     /// Push one I420 frame into the pool. Bridge calls this for every
     /// I420 frame produced from a fresh BGRA capture (and during
     /// idle-heartbeat ticks).
@@ -1332,6 +1347,20 @@ mod tests {
         sleep(Duration::from_millis(40));
         // Window has elapsed — next request fires.
         assert!(coalescer.should_request(CodecKind::Vp8, &rid));
+    }
+
+    #[tokio::test]
+    async fn pool_dimensions_reflects_construction() {
+        // The bridge uses `pool.dimensions()` to gate push_i420_frame
+        // when the capture resolution changes out from under the pool's
+        // startup-dimension-locked encoders. This test pins that the
+        // accessor returns the same (width, height) pair that was
+        // passed to `EncoderPool::new` — any drift between construction
+        // and readback would silently bypass the bridge's safety gate
+        // and feed mis-sized I420 into the encoder.
+        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
+        let pool = EncoderPool::new(1280, 720, 30, vec![layer]);
+        assert_eq!(pool.dimensions(), (1280, 720));
     }
 
     #[tokio::test]
