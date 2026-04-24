@@ -794,6 +794,24 @@ struct EncoderPoolInner {
     /// unique-across-all-slots is sufficient; the bookkeeping cost of
     /// a per-id counter isn't worth the extra state.
     slot_gen_counter: AtomicU64,
+
+    /// Epoch counter incremented by [`EncoderPool::on_resize`] whenever
+    /// source dimensions actually change. `EncoderPool::subscribe`
+    /// snapshots this at pass 1 (when it reads `source_width`/
+    /// `source_height` to build a `LayerSpec::single` for an on-demand
+    /// codec), runs encoder construction OFF-lock in pass 2, then
+    /// compares under the on-demand lock in pass 3 before installing
+    /// the constructed encoder. If the epoch has moved, the encoder
+    /// is at stale dimensions and must be cancelled rather than
+    /// installed — otherwise a peer subscribing during a resize
+    /// could latch an old-dimensions encoder into the pool, which
+    /// would then receive post-resize I420 frames and produce
+    /// misinterpreted output.
+    ///
+    /// Bumped inside `on_resize` only after the same-dim early-return
+    /// has been cleared, so readers that observe a bumped epoch can
+    /// trust the source dimensions have actually changed.
+    source_gen: AtomicU64,
 }
 
 impl EncoderPool {
@@ -863,6 +881,7 @@ impl EncoderPool {
                 source_height: AtomicU32::new(source_height),
                 framerate,
                 slot_gen_counter: AtomicU64::new(0),
+                source_gen: AtomicU64::new(0),
             }),
         }
     }
@@ -907,38 +926,47 @@ impl EncoderPool {
     ///
     /// Post-conditions:
     /// - `self.dimensions() == (new_width, new_height)`.
+    /// - `self.source_gen` has been bumped; in-flight subscribes that
+    ///   snapshotted it earlier will detect the race and cancel their
+    ///   orphan encoders rather than installing them at stale
+    ///   dimensions.
     /// - Every always-on handle is fresh, at a layer size proportional
     ///   to the old layer's ratio of the old source dimensions
     ///   (simulcast-safe).
-    /// - Every on-demand slot is fresh at the same rescale, with its
-    ///   refcount preserved.
+    /// - Every on-demand slot has been **dropped** (map cleared, each
+    ///   old handle's `shutdown` cancelled). On-demand slots are NOT
+    ///   respawned in place — doing so would produce a generation-vs-
+    ///   refcount mismatch (the transferred refcount would be owned
+    ///   by no live lease). Forwarders detecting `RecvError::Closed`
+    ///   re-subscribe via [`Self::subscribe`], which spawns a fresh
+    ///   slot at the new dimensions with refcount=1 and a fresh
+    ///   generation.
     /// - Every old handle's `shutdown` is cancelled; its encoder
     ///   thread exits on next `blocking_recv` wakeup (one frame
-    ///   interval at most).
+    ///   interval at most) and, per the post-recv shutdown check,
+    ///   does not emit a stale frame on its way out.
     ///
     /// Subscriber impact: any existing
     /// `broadcast::Receiver<Arc<EncodedFrame>>` obtained from one of
-    /// the swapped handles observes `RecvError::Closed` on its next
-    /// recv. Peer forwarders (phase 3c.3b onward) must handle Closed
-    /// by tearing the peer down or re-subscribing via
-    /// [`Self::subscribe`] — the same contract they'd see on any
-    /// transient encoder failure. This matches the str0m chat.rs
-    /// "re-subscribe per publisher epoch" pattern.
+    /// the swapped always-on handles or a dropped on-demand slot
+    /// observes `RecvError::Closed` on its next recv. Peer forwarders
+    /// (phase 3c.3b onward) must handle Closed by tearing the peer
+    /// down or re-subscribing via [`Self::subscribe`]. Matches the
+    /// str0m chat.rs "re-subscribe per publisher epoch" pattern.
     ///
     /// No-op when `(new_width, new_height) == self.dimensions()` —
     /// avoids encoder churn when the capture backend emits a
     /// same-dimensions re-announcement (common on xrandr
-    /// notifications that only changed refresh rate, etc.).
+    /// notifications that only changed refresh rate, etc.). In that
+    /// case `source_gen` is NOT bumped, so in-flight subscribes keep
+    /// their in-construction encoders and install normally.
     ///
     /// # Panics
     ///
     /// Panics if a new always-on encoder fails to construct: an
     /// always-on construction failure at any lifecycle point —
     /// startup or resize — is unrecoverable by contract (see
-    /// [`Self::new`]). A failed on-demand respawn is logged and the
-    /// slot is dropped; subscribers to that slot will see Closed and
-    /// the peer-level code can re-negotiate on a different codec or
-    /// terminate.
+    /// [`Self::new`]).
     pub fn on_resize(&self, new_width: u32, new_height: u32) {
         let old_width = self.inner.source_width.load(Ordering::SeqCst);
         let old_height = self.inner.source_height.load(Ordering::SeqCst);
@@ -955,6 +983,17 @@ impl EncoderPool {
         // release.
         self.inner.source_width.store(new_width, Ordering::SeqCst);
         self.inner.source_height.store(new_height, Ordering::SeqCst);
+        // Bump the source_gen epoch. Any subscribe that captured
+        // source_gen before this store AND is still off-lock
+        // constructing its on-demand encoder will detect the
+        // mismatch in pass 3 and cancel its stale-dimensions
+        // encoder instead of installing it. Bumped between the
+        // dimension stores and the handle swaps so the epoch
+        // transition is the authoritative "resize has happened"
+        // signal — concurrent readers that observe a bumped epoch
+        // are guaranteed to see both the new dimensions and the
+        // (about-to-be) new handles.
+        self.inner.source_gen.fetch_add(1, Ordering::SeqCst);
 
         // Swap always-on handles. Hold the write lock across
         // try_spawn_encoder_thread (synchronous codec probe,
@@ -1086,6 +1125,21 @@ impl EncoderPool {
         let mut subs = Vec::new();
         let mut always_on_codecs: Vec<CodecKind> = Vec::new();
 
+        // Snapshot the source epoch at the start of the subscribe so
+        // pass 3 can detect a race with `on_resize`. Any on-demand
+        // encoder we construct in pass 2 uses dimensions we read here
+        // (via pass 1's source_width/height reads); if `on_resize`
+        // fires between pass 2 and pass 3, the epoch changes and the
+        // encoder we built is at stale dimensions. Pass 3 checks
+        // under the on-demand lock and cancels stale constructs
+        // instead of installing them. Always-on subs aren't affected
+        // because their handles live in `self.inner.always_on`,
+        // which `on_resize` swaps atomically — their subscribe()
+        // receivers observe Closed via the normal broadcast path if
+        // a resize happened before they're consumed.
+        let source_gen_at_start =
+            self.inner.source_gen.load(Ordering::SeqCst);
+
         // Always-on: no refcount, subscribe-only. These are guaranteed
         // to be producing frames — EncoderPool::new panics on
         // always-on construction failure. Read lock is held only for
@@ -1183,12 +1237,51 @@ impl EncoderPool {
         }
 
         // Pass 3 (lock held): install constructed encoders, handling
-        // the race where another subscribe installed the same slot
-        // while our construction was off-lock. Loser cancels its
-        // orphan encoder's shutdown token (the thread exits on next
-        // blocking_recv wake) and bumps the winner's refcount instead.
+        // two races:
+        //   (a) another subscribe installed the same slot while our
+        //       construction was off-lock (install-race, existing),
+        //   (b) on_resize fired while our construction was off-lock
+        //       (resize-race, new in 3c.3a3): any constructed
+        //       encoder we have was built at pre-resize dimensions
+        //       and would receive post-resize I420 if installed.
         if !constructed.is_empty() {
             let mut on_demand = self.inner.on_demand.lock().unwrap();
+            // Check for the resize race (b) under the lock — the
+            // bumped epoch combined with on_resize's on-demand
+            // teardown means if source_gen advanced since pass 1,
+            // every entry in `constructed` is stale. Cancel them
+            // all; the subscribe result returns whatever pass 1's
+            // fast-path + always-on slots supplied, or
+            // NoCompatibleCodec if that set is empty. The caller
+            // (WebRTC offer handler / forwarder) treats this as a
+            // transient subscribe failure and retries on the next
+            // offer/reconnect — same semantics as any other
+            // encoder construction failure.
+            let stale_epoch = self.inner.source_gen.load(Ordering::SeqCst)
+                != source_gen_at_start;
+            if stale_epoch {
+                for (id, handle, _layer) in &constructed {
+                    eprintln!(
+                        "[encoder/pool] subscribe: cancelling stale-dimensions \
+                         encoder for {id:?} — on_resize fired during construction"
+                    );
+                    handle.shutdown.cancel();
+                }
+                // Don't install; skip directly to the
+                // empty-result check below.
+                drop(on_demand);
+                if subs.is_empty() {
+                    return Err(SubscribeError::NoCompatibleCodec);
+                }
+                return Ok((
+                    subs,
+                    PoolLease {
+                        pool: Arc::clone(&self.inner),
+                        on_demand_refs,
+                        released: AtomicBool::new(false),
+                    },
+                ));
+            }
             for (id, handle, _layer) in constructed {
                 match on_demand.get_mut(&id) {
                     Some(existing) => {
@@ -1312,6 +1405,16 @@ impl EncoderPool {
         let id = EncoderId::new(codec, rid);
         let map = self.inner.on_demand.lock().unwrap();
         map.get(&id).map(|slot| slot.refcount)
+    }
+
+    /// Test-only access to the source-generation epoch. Lets tests
+    /// assert that `on_resize` actually bumped it — the contract the
+    /// subscribe-race fix depends on. Not exposed in production
+    /// because no hot-path caller needs it; the race check lives
+    /// inside subscribe itself.
+    #[cfg(test)]
+    pub(crate) fn source_gen(&self) -> u64 {
+        self.inner.source_gen.load(Ordering::SeqCst)
     }
 }
 
@@ -1998,6 +2101,79 @@ mod tests {
             None,
             "legitimate lease drop tears slot down when refcount hits 0"
         );
+    }
+
+    /// Finding 1 (3c.3a3): subscribe's pass 2 runs off-lock; an
+    /// on_resize that fires during construction must be detected in
+    /// pass 3 so a stale-dimensions encoder isn't installed as the
+    /// slot for its EncoderId. The mechanism is the `source_gen`
+    /// epoch: on_resize bumps it, subscribe captures it at start,
+    /// pass 3 compares. This test pins the on_resize half of the
+    /// contract — the epoch actually advances on a real-dim change
+    /// and stays flat on a same-dim no-op.
+    #[tokio::test]
+    async fn on_resize_bumps_source_gen_epoch() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            vec![LayerSpec::single(CodecKind::Vp8, 64, 64, 30)],
+        );
+        let before = pool.source_gen();
+
+        // Same-dim: no-op, epoch unchanged.
+        pool.on_resize(64, 64);
+        assert_eq!(
+            pool.source_gen(),
+            before,
+            "same-dim on_resize must not bump source_gen; subscribe \
+             races against an epoch that didn't actually move would \
+             cancel valid encoders unnecessarily"
+        );
+
+        // Real change: epoch must advance at least by one. Monotonic
+        // is sufficient; no need to assert exact value since test
+        // ordering vs other methods that might bump it is fragile.
+        pool.on_resize(128, 96);
+        assert!(
+            pool.source_gen() > before,
+            "on_resize must bump source_gen when dims actually change"
+        );
+
+        // Another real change: advances again.
+        let mid = pool.source_gen();
+        pool.on_resize(320, 240);
+        assert!(
+            pool.source_gen() > mid,
+            "on_resize must bump source_gen on every real-dim change"
+        );
+    }
+
+    /// Finding 2 (3c.3a3): a subscribe that completes entirely after
+    /// an on_resize uses the new dimensions (captured fresh when
+    /// subscribe runs), so its constructed encoder is at the new
+    /// dimensions and passes pass 3's epoch check. The scenario that
+    /// would trip the race — subscribe's pass 2 overlapping with
+    /// on_resize — is hard to produce deterministically in a unit
+    /// test (pass 2 is a few-microsecond critical section for VP8).
+    /// This test pins the no-race happy path as a regression guard:
+    /// subscribe after resize must produce a working slot at the
+    /// post-resize dimensions.
+    #[tokio::test]
+    async fn subscribe_after_resize_uses_new_dimensions() {
+        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        pool.on_resize(128, 96);
+
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+        let (subs, _lease) = pool
+            .subscribe(&prefs)
+            .expect("subscribe must succeed post-resize");
+
+        assert_eq!(subs.len(), 1);
+        // The on-demand VP8 encoder was constructed after on_resize,
+        // so LayerSpec::single picked up the new atomics. Verify.
+        assert_eq!(subs[0].layer.width, 128);
+        assert_eq!(subs[0].layer.height, 96);
     }
 
     #[tokio::test]
