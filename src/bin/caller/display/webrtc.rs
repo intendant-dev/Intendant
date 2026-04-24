@@ -910,35 +910,52 @@ impl WebRtcPeer {
 // Driver task
 // ---------------------------------------------------------------------------
 
+/// Per-[`crate::display::encode::PayloadSpec`] negotiation + readiness
+/// state. Keyed off the full `PayloadSpec` in [`DriverState::video_specs`]
+/// so H.264 fmtp variants (profile-level-id + packetization-mode) stay
+/// distinct — str0m negotiates those independently and caching by
+/// `CodecKind` alone would conflate them.
+///
+/// The combined cache structure is deliberate: under the encoder pool a
+/// peer can receive frames from multiple codecs in quick succession
+/// (VP8 always-on + H.264 on-demand, etc.). A global `keyframe_seen` flag
+/// (the pre-3c.0a shape) lets a stray keyframe from an *unsupported* spec
+/// open the gate for P-frames of a *supported* one — a subtle silent-
+/// black-screen class of bug. Making readiness per-spec AND flipping it
+/// only after a successful `writer.write` eliminates that path.
+enum SpecState {
+    /// `Writer::match_params` resolved this spec to a peer-negotiated PT.
+    /// Use `pt` for `writer.write`; `keyframe_seen` flips to `true` only
+    /// after the first **successful** write on this spec (see
+    /// `write_video_frame`), so a keyframe from this spec that matches
+    /// but fails to write doesn't leave the gate open.
+    Resolved {
+        pt: Pt,
+        /// Has this spec had ≥1 keyframe successfully written to the peer?
+        /// Until true, non-keyframe frames drop. Scoped per spec so codec
+        /// A's keyframe gate is independent of codec B's.
+        keyframe_seen: bool,
+    },
+    /// `Writer::match_params` returned `None` for this spec. str0m's
+    /// negotiation is fixed post-answer, so every future frame carrying
+    /// this spec drops without re-asking. A single log line is emitted
+    /// on the transition into this state; subsequent frames are silent.
+    Unsupported,
+}
+
 /// State the driver carries between iterations.
 struct DriverState {
     /// Mid of the outbound video media. Set on `Event::MediaAdded`.
     video_mid: Option<Mid>,
-    /// Per-[`crate::display::encode::PayloadSpec`] cache of resolved
-    /// payload types. First frame for a given spec calls
-    /// `writer.match_params(...)` to find the peer-negotiated PT; the
-    /// result (including `None` for "peer did not negotiate this
-    /// codec") is cached here and reused for every subsequent frame
-    /// carrying the same spec. Keyed on the full `PayloadSpec` rather
-    /// than just `CodecKind` so H.264 fmtp variants (profile-level-id
-    /// + packetization-mode) stay distinct — str0m negotiates those
-    /// independently.
-    ///
-    /// Replaces the pre-locked `video_codec` + `video_pt` fields:
-    /// under the encoder pool the peer can receive frames from
-    /// multiple codecs (VP8 always-on + H.264 on-demand, etc.) and
-    /// `match_params` is the correct resolution mechanism for each.
-    video_pt_cache: HashMap<crate::display::encode::PayloadSpec, Option<Pt>>,
+    /// Per-`PayloadSpec` resolved PT + keyframe readiness. See [`SpecState`].
+    /// Replaces the earlier split `video_pt_cache` + global `keyframe_seen`
+    /// (findings #2 in 3c.0a review).
+    video_specs: HashMap<crate::display::encode::PayloadSpec, SpecState>,
     /// Map of channel label → ChannelId for routing channel data and clipboard sends.
     channels: HashMap<String, ChannelId>,
     /// Wallclock anchor: Instant at which the first frame was emitted.
     /// All subsequent rtp_time values are relative to this.
     first_frame_at: Option<Instant>,
-    /// True once we've written at least one keyframe to this peer. Until this
-    /// is true we drop all encoded frames — a peer that joins mid-stream
-    /// can't decode the first delta frames and would otherwise show a black
-    /// or garbage screen until the encoder's next periodic IDR.
-    keyframe_seen: bool,
 }
 
 /// Inbound packet from one of the per-interface forwarder tasks or a
@@ -975,10 +992,9 @@ async fn driver(
 ) {
     let mut state = DriverState {
         video_mid: None,
-        video_pt_cache: HashMap::new(),
+        video_specs: HashMap::new(),
         channels: HashMap::new(),
         first_frame_at: None,
-        keyframe_seen: false,
     };
 
     // Index sockets by their local address so we can route Output::Transmit
@@ -1427,51 +1443,57 @@ fn write_video_frame(rtc: &mut Rtc, state: &mut DriverState, frame: &EncodedFram
     let Some(mid) = state.video_mid else {
         return;
     };
-    // Wait for a keyframe before forwarding anything: a peer that joins
-    // mid-stream can't decode delta frames and would otherwise see black
-    // until the encoder's next periodic IDR.
-    if !state.keyframe_seen {
-        if !frame.is_keyframe {
-            return;
-        }
-        state.keyframe_seen = true;
-    }
     let Some(writer) = rtc.writer(mid) else {
         return;
     };
-    // Resolve the peer-negotiated PT for this frame's PayloadSpec.
-    // The cache maps PayloadSpec → Option<Pt>:
-    //   - `Some(pt)`: cached hit, use this PT.
-    //   - `None`: we already asked match_params for this spec and it
-    //     didn't resolve. The peer hasn't negotiated this codec in its
-    //     SDP — happens e.g. when a peer offers VP8 but the pool also
-    //     subscribed it to H.264 and the H.264 frames arrive here.
-    //     Drop silently; str0m's negotiation is fixed so re-matching
-    //     won't suddenly work.
-    //   - absent: first frame for this spec, call match_params.
-    let pt = match state.video_pt_cache.get(&frame.payload_spec).copied() {
-        Some(Some(pt)) => pt,
-        Some(None) => return,
-        None => {
-            let resolved =
-                writer.match_params(payload_spec_to_str0m(&frame.payload_spec));
-            state
-                .video_pt_cache
-                .insert(frame.payload_spec.clone(), resolved);
-            match resolved {
-                Some(pt) => pt,
-                None => {
-                    eprintln!(
-                        "[display/webrtc] no match_params for {} — peer did not \
-                         negotiate this codec profile, frames on this spec will \
-                         be dropped",
-                        frame.payload_spec.codec_mime
-                    );
-                    return;
-                }
+
+    // Step 1: resolve the spec's PT via match_params if we haven't yet.
+    // Inserts a `SpecState::Resolved { pt, keyframe_seen: false }` on
+    // success or `SpecState::Unsupported` on None, so the lookup below
+    // always finds an entry. A spec ending in `Unsupported` stays that
+    // way — str0m's negotiation is fixed post-answer, so re-matching
+    // won't start working.
+    if !state.video_specs.contains_key(&frame.payload_spec) {
+        let resolved = writer.match_params(payload_spec_to_str0m(&frame.payload_spec));
+        let new = match resolved {
+            Some(pt) => SpecState::Resolved {
+                pt,
+                keyframe_seen: false,
+            },
+            None => {
+                eprintln!(
+                    "[display/webrtc] no match_params for {} — peer did not \
+                     negotiate this codec profile, frames on this spec will \
+                     be dropped",
+                    frame.payload_spec.codec_mime
+                );
+                SpecState::Unsupported
             }
-        }
+        };
+        state.video_specs.insert(frame.payload_spec.clone(), new);
+    }
+
+    // Step 2: extract pt + current keyframe readiness from the spec state.
+    // Copy out immutably so we can mutate `state.first_frame_at` below
+    // without borrow conflicts with `state.video_specs`.
+    let (pt, keyframe_ready) = match state.video_specs.get(&frame.payload_spec) {
+        Some(SpecState::Resolved { pt, keyframe_seen }) => (*pt, *keyframe_seen),
+        // Unsupported or (impossibly) missing — drop silently. The
+        // first arm already emitted a log on entering Unsupported.
+        _ => return,
     };
+
+    // Step 3: per-spec keyframe gate. Closed until this spec has had
+    // ≥1 keyframe *successfully written* (see step 5 — the flag flips
+    // only after `writer.write` returns Ok). A keyframe from codec A
+    // that match_params resolved but that then fails to write does not
+    // open the gate for codec A's P-frames, and no keyframe of codec A
+    // ever opens codec B's gate.
+    if !keyframe_ready && !frame.is_keyframe {
+        return;
+    }
+
+    // Step 4: wallclock anchor + media time.
     let now = Instant::now();
     if state.first_frame_at.is_none() {
         state.first_frame_at = Some(now);
@@ -1479,8 +1501,24 @@ fn write_video_frame(rtc: &mut Rtc, state: &mut DriverState, frame: &EncodedFram
     let anchor = state.first_frame_at.unwrap();
     let elapsed_ms = now.duration_since(anchor).as_millis() as u64;
     let media_time = MediaTime::from_90khz(elapsed_ms.saturating_mul(90));
-    if let Err(e) = writer.write(pt, now, media_time, frame.data.clone()) {
-        eprintln!("[display/webrtc] writer.write failed: {e:?}");
+
+    // Step 5: write + on-success gate flip.
+    match writer.write(pt, now, media_time, frame.data.clone()) {
+        Ok(()) => {
+            // Only flip keyframe_seen for this spec AFTER a successful
+            // write (findings #2 in 3c.0a review). If the write is the
+            // first keyframe on this spec, the gate opens for subsequent
+            // P-frames. If it wasn't a keyframe (gate was already open),
+            // this is a no-op.
+            if !keyframe_ready {
+                if let Some(SpecState::Resolved { keyframe_seen, .. }) =
+                    state.video_specs.get_mut(&frame.payload_spec)
+                {
+                    *keyframe_seen = true;
+                }
+            }
+        }
+        Err(e) => eprintln!("[display/webrtc] writer.write failed: {e:?}"),
     }
 }
 

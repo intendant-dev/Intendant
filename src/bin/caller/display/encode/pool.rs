@@ -892,64 +892,64 @@ impl EncoderPool {
         }
 
         // On-demand: for codecs the peer wants that aren't in
-        // always_on, spawn + refcount. Track the exact ids we bumped
-        // so the PoolLease can release them precisely.
+        // always_on, spawn + refcount. The mutex is held ONLY for the
+        // existence check and the install step — construction
+        // (select_codec_for_mime, which for H.264 on Linux runs
+        // `ffmpeg -version` + `Command::spawn`, see h264_linux.rs) runs
+        // off-lock so it doesn't block other subscribe / release /
+        // request_keyframe callers on an async tokio worker. Race
+        // handling for concurrent subscribes is below.
         let mut on_demand_ids: Vec<EncoderId> = Vec::new();
-        let mut on_demand = self.inner.on_demand.lock().unwrap();
-        for &codec in &prefs.supported {
-            if always_on_codecs.contains(&codec) {
-                continue;
-            }
-            if !Self::on_demand_spawnable(codec) {
-                continue;
-            }
-            // Single-layer on-demand (simulcast is phase 4, always-on only).
-            let rid = SimulcastRid::full();
-            let id = EncoderId::new(codec, rid);
 
-            // Fast path: slot already running, just bump refcount.
-            if let Some(slot) = on_demand.get_mut(&id) {
-                slot.refcount += 1;
-                on_demand_ids.push(id.clone());
-                subs.push(EncoderSubscription {
-                    id: slot.handle.id.clone(),
-                    layer: slot.handle.layer.clone(),
-                    frames: slot.handle.subscribe(),
-                });
-                continue;
+        // Pass 1 (lock held, fast path only): for every codec already
+        // running, bump refcount and emit the subscription. Collect
+        // the codecs that still need construction into a worklist.
+        let mut to_construct: Vec<(CodecKind, EncoderId, LayerSpec)> = Vec::new();
+        {
+            let mut on_demand = self.inner.on_demand.lock().unwrap();
+            for &codec in &prefs.supported {
+                if always_on_codecs.contains(&codec) {
+                    continue;
+                }
+                if !Self::on_demand_spawnable(codec) {
+                    continue;
+                }
+                let rid = SimulcastRid::full();
+                let id = EncoderId::new(codec, rid);
+                if let Some(slot) = on_demand.get_mut(&id) {
+                    slot.refcount += 1;
+                    on_demand_ids.push(id.clone());
+                    subs.push(EncoderSubscription {
+                        id: slot.handle.id.clone(),
+                        layer: slot.handle.layer.clone(),
+                        frames: slot.handle.subscribe(),
+                    });
+                } else {
+                    let layer = LayerSpec::single(
+                        codec,
+                        self.inner.source_width,
+                        self.inner.source_height,
+                        self.inner.framerate,
+                    );
+                    to_construct.push((codec, id, layer));
+                }
             }
+        } // lock released here
 
-            // Slow path: construct the encoder synchronously. On Err,
-            // log and skip this codec — we do NOT insert a half-alive
-            // slot and we do NOT return a subscription. A browser
-            // that prefers only this codec will get NoCompatibleCodec
-            // at the end; a browser that also supports an always-on
-            // codec falls through to that one.
-            let layer = LayerSpec::single(
-                codec,
-                self.inner.source_width,
-                self.inner.source_height,
-                self.inner.framerate,
-            );
+        // Pass 2 (lock released): construct each needed encoder. This
+        // is the slow/blocking work (subprocess spawn, codec init, VAAPI
+        // probe). Two concurrent subscribe calls asking for the same
+        // codec may both land here — pass 3 deduplicates via the race
+        // check.
+        let mut constructed: Vec<(EncoderId, EncoderHandle, LayerSpec)> = Vec::new();
+        for (_codec, id, layer) in to_construct {
             match try_spawn_encoder_thread(
                 id.clone(),
-                layer,
+                layer.clone(),
                 &self.inner.i420_tx,
                 self.inner.duration_ms,
             ) {
-                Ok(handle) => {
-                    let slot = OnDemandSlot {
-                        handle: handle.clone(),
-                        refcount: 1,
-                    };
-                    on_demand.insert(id.clone(), slot);
-                    on_demand_ids.push(id.clone());
-                    subs.push(EncoderSubscription {
-                        id: handle.id.clone(),
-                        layer: handle.layer.clone(),
-                        frames: handle.subscribe(),
-                    });
-                }
+                Ok(handle) => constructed.push((id, handle, layer)),
                 Err(e) => {
                     eprintln!(
                         "[encoder/pool] on-demand {} construction failed, \
@@ -961,7 +961,49 @@ impl EncoderPool {
                 }
             }
         }
-        drop(on_demand);
+
+        // Pass 3 (lock held): install constructed encoders, handling
+        // the race where another subscribe installed the same slot
+        // while our construction was off-lock. Loser cancels its
+        // orphan encoder's shutdown token (the thread exits on next
+        // blocking_recv wake) and bumps the winner's refcount instead.
+        if !constructed.is_empty() {
+            let mut on_demand = self.inner.on_demand.lock().unwrap();
+            for (id, handle, _layer) in constructed {
+                match on_demand.get_mut(&id) {
+                    Some(existing) => {
+                        // Race loss: another subscribe installed this
+                        // slot first. Bump their refcount, cancel our
+                        // orphan encoder. Brief CPU waste on the
+                        // orphan until the cancellation token observes
+                        // and the thread exits; refcount stays
+                        // consistent.
+                        existing.refcount += 1;
+                        on_demand_ids.push(id.clone());
+                        subs.push(EncoderSubscription {
+                            id: existing.handle.id.clone(),
+                            layer: existing.handle.layer.clone(),
+                            frames: existing.handle.subscribe(),
+                        });
+                        handle.shutdown.cancel();
+                    }
+                    None => {
+                        // Race win: no slot yet. Install ours.
+                        let slot = OnDemandSlot {
+                            handle: handle.clone(),
+                            refcount: 1,
+                        };
+                        on_demand.insert(id.clone(), slot);
+                        on_demand_ids.push(id.clone());
+                        subs.push(EncoderSubscription {
+                            id: handle.id.clone(),
+                            layer: handle.layer.clone(),
+                            frames: handle.subscribe(),
+                        });
+                    }
+                }
+            }
+        }
 
         if subs.is_empty() {
             return Err(SubscribeError::NoCompatibleCodec);
@@ -1546,6 +1588,48 @@ mod tests {
         assert_eq!(
             pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
             Some(1)
+        );
+    }
+
+    /// Finding 3 in the 3c.0a review: construction runs off-lock.
+    /// Two subscribe calls racing for the same on-demand codec must
+    /// both succeed, end up sharing one slot, with refcount = 2 and
+    /// no deadlock. Spawns two concurrent subscribes via tokio tasks;
+    /// joins them and asserts final state.
+    ///
+    /// Race coverage is also asymmetric timing: one subscribe gets
+    /// slightly ahead in its construction, other subscribe races
+    /// behind. Both paths of the pass-3 dedup (race win / race loss)
+    /// are exercised over many runs even though any single run hits
+    /// only one ordering.
+    #[tokio::test]
+    async fn subscribe_race_for_same_on_demand_codec() {
+        let pool = Arc::new(EncoderPool::new(64, 64, 30, vec![]));
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+
+        let pool_a = Arc::clone(&pool);
+        let prefs_a = prefs.clone();
+        let pool_b = Arc::clone(&pool);
+        let prefs_b = prefs.clone();
+
+        let task_a = tokio::task::spawn_blocking(move || pool_a.subscribe(&prefs_a));
+        let task_b = tokio::task::spawn_blocking(move || pool_b.subscribe(&prefs_b));
+
+        let (result_a, result_b) = tokio::join!(task_a, task_b);
+        let (subs_a, _lease_a) = result_a.expect("task a join").expect("subscribe a");
+        let (subs_b, _lease_b) = result_b.expect("task b join").expect("subscribe b");
+
+        assert_eq!(subs_a.len(), 1);
+        assert_eq!(subs_b.len(), 1);
+        assert_eq!(
+            subs_a[0].id, subs_b[0].id,
+            "concurrent subscribes must end up sharing one slot"
+        );
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
+            Some(2),
+            "refcount must be exactly 2 — both subscribers counted \
+             (never 1 from a missed install, never 3+ from a double-install)"
         );
     }
 

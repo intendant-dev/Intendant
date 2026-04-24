@@ -236,17 +236,43 @@ impl Default for LayerSelector {
 
 /// Build [`PeerCodecPreferences`] from a browser's offer SDP.
 ///
-/// Uses the existing [`crate::display::encode::parse_offered_codecs`]
-/// parser so we share vocabulary with the legacy codec-selection
-/// path — there's one source of truth for "what did this SDP
-/// advertise."
+/// The returned preferences contain only codecs whose **exact**
+/// payload spec the encoder pool can actually match via
+/// `str0m::Writer::match_params`. This matters for H.264: an offer
+/// with an rtpmap of `H264/90000` but fmtp of `profile-level-id=64001f`
+/// (High) and `packetization-mode=0` would previously end up as
+/// `CodecKind::H264` in prefs, get subscribed, and then every
+/// encoded frame would fail match_params because the pool's encoder
+/// produces Constrained Baseline / mode 1 — a silent-black-screen
+/// class of bug that the whole 3c.0 contract exists to prevent.
+///
+/// The guard is [`crate::display::encode::has_compatible_h264_offer`],
+/// which checks for a Baseline-family (profile_idc 0x42) variant
+/// with packetization-mode 0 or 1 — the intersection of what our
+/// VideoToolbox / VAAPI / libx264 backends produce and what str0m
+/// will actually negotiate against the encoder's cached
+/// [`crate::display::encode::PayloadSpec::h264_constrained_baseline`].
+///
+/// VP9 / AV1 don't need the guard today (no backend; pool excludes
+/// them at `on_demand_spawnable`), but including them unconditionally
+/// in prefs is harmless and matches the "prefs advertise what the
+/// peer supports, pool decides what's serveable" split.
 pub fn codec_preferences_from_offer(sdp: &str) -> PeerCodecPreferences {
     let offered = crate::display::encode::parse_offered_codecs(sdp);
     let mut supported = Vec::new();
     for name in offered {
         match name.as_str() {
             "VP8" => supported.push(CodecKind::Vp8),
-            "H264" => supported.push(CodecKind::H264),
+            "H264" => {
+                // Only include H.264 if the offer carries a variant
+                // compatible with our encoder's exact spec. Otherwise
+                // the pool would subscribe, str0m would negotiate a
+                // variant the encoder's PayloadSpec can't match, and
+                // every frame would silently drop.
+                if crate::display::encode::has_compatible_h264_offer(sdp) {
+                    supported.push(CodecKind::H264);
+                }
+            }
             "VP9" => supported.push(CodecKind::Vp9),
             "AV1" => supported.push(CodecKind::Av1),
             _ => {
@@ -337,6 +363,67 @@ mod tests {
         );
         let prefs = codec_preferences_from_offer(sdp);
         assert_eq!(prefs.supported, vec![CodecKind::Vp8]);
+    }
+
+    /// Finding 1 in the 3c.0a review: an offer that advertises H.264
+    /// with an *incompatible* profile (e.g., High `64001f` + mode 2)
+    /// must NOT produce `CodecKind::H264` in prefs, because the pool
+    /// only produces Constrained Baseline / mode 1 and str0m would
+    /// match_params-miss every frame. The legacy path's
+    /// `is_compatible_h264_profile` does the exact check.
+    #[test]
+    fn codec_preferences_excludes_incompatible_h264_profile() {
+        // H.264 High (profile_idc=0x64 = 100), packetization-mode=2 (well
+        // beyond our encoder's max). VP8 on a separate PT so the peer
+        // still has a compatible codec.
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n",
+            "a=rtpmap:96 VP8/90000\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+            "a=fmtp:97 profile-level-id=64001f;packetization-mode=2\r\n",
+        );
+        let prefs = codec_preferences_from_offer(sdp);
+        assert!(prefs.supports(CodecKind::Vp8), "VP8 must remain supported");
+        assert!(
+            !prefs.supports(CodecKind::H264),
+            "H.264 High/mode 2 must NOT be claimed — encoder produces \
+             Constrained Baseline/mode 1 only, str0m would drop every frame"
+        );
+    }
+
+    /// Complement of the above: Baseline + mode 1 is what our encoder
+    /// produces, so it must be included.
+    #[test]
+    fn codec_preferences_includes_compatible_h264_baseline() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 97\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+            "a=fmtp:97 profile-level-id=42e01f;packetization-mode=1\r\n",
+        );
+        let prefs = codec_preferences_from_offer(sdp);
+        assert!(prefs.supports(CodecKind::H264));
+    }
+
+    /// An offer with multiple H.264 variants — one compatible, one not —
+    /// should still claim H.264 support. str0m picks the compatible
+    /// variant for negotiation; the incompatible one is ignored.
+    #[test]
+    fn codec_preferences_h264_mixed_variants_keeps_codec() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 97 98\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+            "a=fmtp:97 profile-level-id=64001f;packetization-mode=0\r\n", // High, incompatible
+            "a=rtpmap:98 H264/90000\r\n",
+            "a=fmtp:98 profile-level-id=42e01f;packetization-mode=1\r\n", // Baseline, compatible
+        );
+        let prefs = codec_preferences_from_offer(sdp);
+        assert!(
+            prefs.supports(CodecKind::H264),
+            "H.264 must be claimed when at least one offered variant is compatible"
+        );
     }
 
     #[test]
