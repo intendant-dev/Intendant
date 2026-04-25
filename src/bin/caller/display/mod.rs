@@ -798,6 +798,14 @@ impl DisplaySession {
         if let Some(h) = self.clipboard_handle.lock().await.take() {
             let _ = h.await;
         }
+        // 3c.3b.3c-followup: the pool-feed bridge observes
+        // `shutdown.cancel()` above and exits on its own, but for
+        // deterministic shutdown ordering (and parity with the
+        // other tasks DisplaySession owns) we take the handle and
+        // await its completion here too.
+        if let Some(h) = self.pool_feed_bridge_handle.lock().await.take() {
+            let _ = h.await;
+        }
 
         let mut peers = self.peers.write().await;
         for (_, peer) in peers.drain() {
@@ -1669,6 +1677,19 @@ impl DisplaySession {
         let frame_interval = std::time::Duration::from_millis(
             if fps > 0 { 1000 / fps as u64 } else { 33 },
         );
+        // Snapshot the most recent BGRA the capture has already
+        // produced so the bridge can seed its `latest_i420` cache
+        // before entering the select loop. Without this, a pool
+        // peer arriving AFTER the capture has produced one frame
+        // and gone idle (typical Wayland damage-driven behavior:
+        // initial rendering then no events) leaves the bridge with
+        // `latest_i420 = None` and the heartbeat has nothing to
+        // re-push — the encoder starves until the next desktop
+        // damage. The 3c.3b.3c heartbeat test pushed BGRA AFTER
+        // bridge spawn, which doesn't exercise this idle-on-arrival
+        // path. Cloning the Arc<RwLock> outside the spawned task
+        // so the closure owns its handle.
+        let latest_frame = Arc::clone(&self.latest_frame);
         let task = tokio::spawn(async move {
             // Heartbeat cadence. Mirrors the legacy bridge's value;
             // 1 second strikes the balance between "encoder stays
@@ -1692,6 +1713,45 @@ impl DisplaySession {
             let mut generation: u64 = 0;
             let mut last_sent_gen: Option<u64> = None;
             let mut last_send_at = Instant::now();
+
+            // 3c.3b.3c-followup seed: convert the most recent BGRA
+            // the capture has already produced (if any) so the first
+            // tick has something to push even if no new BGRA arrives
+            // before the heartbeat. Closes the "first pool peer
+            // arrives after the capture went idle" black-screen path.
+            // Bumps `generation`; the very first tick sees
+            // `last_sent_gen=None != Some(1)` → forwards immediately,
+            // not waiting for IDLE_HEARTBEAT.
+            //
+            // enc_w/enc_h are also seeded from the snapshotted
+            // frame's actual dimensions. Without that, the first
+            // BGRA arriving on the broadcast at a different size
+            // than `backend.resolution()` would emit a spurious
+            // resize event ("64x64 -> actual" when the frame was
+            // never at 64x64 to begin with).
+            if let Some(frame) = latest_frame.read().await.clone() {
+                let frame_w = frame.width & !1;
+                let frame_h = frame.height & !1;
+                if frame_w > 0 && frame_h > 0 {
+                    enc_w = frame_w;
+                    enc_h = frame_h;
+                    let frame_arc = Arc::clone(&frame);
+                    let arrived = Instant::now();
+                    let i420_result = tokio::task::spawn_blocking(move || {
+                        encode::bgra_to_i420(
+                            &frame_arc.data,
+                            frame_arc.width,
+                            frame_arc.height,
+                            frame_arc.stride,
+                        )
+                    })
+                    .await;
+                    if let Ok(i420) = i420_result {
+                        generation = generation.wrapping_add(1);
+                        latest_i420 = Some((Arc::new(i420), arrived));
+                    }
+                }
+            }
 
             let mut tick = tokio::time::interval(frame_interval);
             tick.set_missed_tick_behavior(
@@ -2765,5 +2825,112 @@ mod tests {
         );
 
         session.shutdown.cancel();
+    }
+
+    /// **3c.3b.3c follow-up finding 1.** First-pool-peer-joins-mid-idle
+    /// black screen: if the capture has already produced a frame
+    /// into `latest_frame` before the first pool offer, then goes
+    /// idle (typical Wayland damage-driven shape: initial render,
+    /// no further events), the bridge spawned by
+    /// `ensure_pool_feed_bridge_started` would historically miss
+    /// that frame and the heartbeat would have nothing to re-push.
+    /// The fix seeds the bridge's `latest_i420` from
+    /// `self.latest_frame` at startup. This test pins it: write a
+    /// BGRA into `latest_frame` BEFORE starting the bridge, never
+    /// push anything via `frame_tx`, and assert encoded frames flow
+    /// to a pool subscriber.
+    #[tokio::test]
+    async fn pool_feed_bridge_seeds_latest_i420_from_capture_snapshot() {
+        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let session = DisplaySession::new(0, backend);
+        session
+            .start(30, None, None)
+            .await
+            .expect("start must succeed");
+
+        // Pre-seed latest_frame as if the capture had produced one
+        // frame and gone idle. With StubBackend's closed channel,
+        // the capture task exits before populating latest_frame
+        // organically — this write simulates the "capture was here,
+        // then went silent" state that triggers the bug.
+        *session.latest_frame.write().await =
+            Some(Arc::new(make_test_bgra(64, 64)));
+
+        // Subscribe to the pool's encoder BEFORE spawning the
+        // bridge so we don't miss the first encoded output.
+        let pool = session
+            .pool
+            .get()
+            .expect("pool initialized after start");
+        let prefs = encode::pool::PeerCodecPreferences::new(vec![
+            encode::pool::CodecKind::Vp8,
+        ]);
+        let (subs, _lease) = pool
+            .subscribe(&prefs)
+            .expect("VP8 always-on subscribe");
+        let mut frame_rx = subs
+            .into_iter()
+            .next()
+            .expect("at least one subscription")
+            .frames;
+
+        // Spawn the bridge. Critically: do NOT push any BGRA via
+        // `frame_tx` — we're testing the seed-from-snapshot path,
+        // not the broadcast-recv path. Pre-fix the bridge would have
+        // `latest_i420 = None` and the encoder would never see input.
+        session.ensure_pool_feed_bridge_started().await;
+
+        // Within one tick (~33ms at fps=30) the seeded buffer should
+        // be forwarded. Generous timeout for VP8 encoder warmup
+        // (cold-start can take a few hundred ms before the first
+        // packet emerges). Pre-fix would never produce ANY frame.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            frame_rx.recv(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok() && result.as_ref().unwrap().is_ok(),
+            "bridge must seed latest_i420 from capture snapshot and \
+             forward it on the first tick — got timeout or recv \
+             error within 2s. Pre-fix: pool encoder never sees \
+             input → no frames ever emitted."
+        );
+
+        session.shutdown.cancel();
+    }
+
+    /// **3c.3b.3c follow-up finding 2.** `DisplaySession::stop()`
+    /// must take + await the pool-feed bridge handle alongside
+    /// the other owned tasks (capture/encoder/clipboard) for
+    /// deterministic shutdown. The pool-feed task observes
+    /// `shutdown.cancel()` on its own, but leaving the JoinHandle
+    /// in the slot breaks the cleanup pattern and makes "is this
+    /// session fully stopped" non-observable.
+    #[tokio::test]
+    async fn stop_takes_and_awaits_pool_feed_bridge_handle() {
+        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let session = DisplaySession::new(0, backend);
+        session
+            .start(30, None, None)
+            .await
+            .expect("start must succeed");
+        session.ensure_pool_feed_bridge_started().await;
+
+        // Pre-condition: bridge spawned, handle is Some.
+        assert!(
+            session.pool_feed_bridge_handle.lock().await.is_some(),
+            "pool feed bridge must be spawned before stop"
+        );
+
+        session.stop().await;
+
+        assert!(
+            session.pool_feed_bridge_handle.lock().await.is_none(),
+            "stop() must take + await the pool-feed bridge handle, \
+             leaving the slot empty (parity with capture/encoder/\
+             clipboard cleanup at display/mod.rs:792-800)"
+        );
     }
 }
