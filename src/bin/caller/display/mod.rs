@@ -430,6 +430,24 @@ pub struct DisplaySession {
     /// decodable reference within ~1 tick instead of waiting for the next
     /// GOP boundary).  `Some` after `start_encoder_pipeline()` has run.
     keyframe_tx: Mutex<Option<mpsc::UnboundedSender<()>>>,
+    /// Pool-path counterpart to [`Self::keyframe_tx`]. Wakes the
+    /// pool-feed bridge to open a peer-join burst window when a new
+    /// pool peer attaches. Distinct from `keyframe_tx` because the
+    /// pool-feed bridge has its own select loop and own state. `Some`
+    /// after [`Self::ensure_pool_feed_bridge_started`] has run.
+    ///
+    /// **Why a burst is needed even though the pool also sets
+    /// `force_keyframe`:** [`crate::display::encode::pool::EncoderPool::request_keyframe_all`]
+    /// sets a per-encoder atomic flag that VP8 and macOS H.264 honor
+    /// on their next encode. Linux H.264 (ffmpeg-pipe) explicitly
+    /// ignores the flag (see `h264_linux.rs::encode`'s `_force_keyframe`
+    /// underscore) — there's no per-frame "emit IDR now" path on a
+    /// long-running rawvideo pipe. Compensation is the same as the
+    /// legacy bridge: clock the encoder at tick rate for ~one GOP
+    /// boundary so its `-g 30` natural cadence emits a keyframe
+    /// inside the burst window. Without this, an idle-desktop pool
+    /// peer-join on Linux H.264 stays black for many seconds.
+    pool_feed_keyframe_tx: Mutex<Option<mpsc::UnboundedSender<()>>>,
     /// Shared multi-codec encoder pool. Constructed lazily on the first
     /// `start()` call once the backend's resolution and fps are known;
     /// ownership is `Arc` so subsequent integration code can hand it to
@@ -532,6 +550,7 @@ impl DisplaySession {
             clipboard_monitor: Arc::new(clipboard::ClipboardMonitor::new()),
             clipboard_handle: Mutex::new(None),
             keyframe_tx: Mutex::new(None),
+            pool_feed_keyframe_tx: Mutex::new(None),
             pool: std::sync::OnceLock::new(),
             pool_feed_bridge_handle: Mutex::new(None),
         }
@@ -1439,11 +1458,17 @@ impl DisplaySession {
     ///     returned. No first-peer codec lock.
     ///   - No `keyframe_tx` wake: pool peers don't share the legacy
     ///     bridge's keyframe channel. Peer-join keyframe is wired
-    ///     via [`crate::display::encode::pool::EncoderPool::request_keyframe_all`]
-    ///     called at the end of this function (3c.3b.4a), which
-    ///     fires a coalesced PLI-equivalent across every active
-    ///     encoder so the new peer's first encoded frame is
-    ///     decodable rather than waiting up to one GOP boundary.
+    ///     in two parts at the tail of this function:
+    ///     * [`crate::display::encode::pool::EncoderPool::request_keyframe_all`]
+    ///       (3c.3b.4a): fires a coalesced PLI-equivalent across
+    ///       every active encoder. Honored by VP8 and macOS H.264.
+    ///     * [`Self::pool_feed_keyframe_tx`] burst signal (3c.3b.4b):
+    ///       wakes the pool-feed bridge to clock the encoder at
+    ///       tick rate for ~1.5s. Required for codecs that ignore
+    ///       `force_keyframe` on a long-running pipe (Linux ffmpeg
+    ///       H.264) — without the burst, an idle-desktop pool
+    ///       peer-join on Linux H.264 stays black for many seconds
+    ///       waiting on the heartbeat-paced 1 push/sec cadence.
     ///     The PLI-driven per-peer explicit request from str0m's
     ///     inbound RTCP lands with the simulcast work.
     ///   - No `pool_leases` tracking on `DisplaySession`:
@@ -1597,6 +1622,23 @@ impl DisplaySession {
         // is in place when the keyframe lands in the encoder broadcast.
         pool.request_keyframe_all();
 
+        // 3c.3b.4b: open the pool-feed bridge's peer-join burst window.
+        // Required for codecs that ignore `force_keyframe` on a
+        // long-running pipe (Linux ffmpeg H.264 — see
+        // `h264_linux.rs::encode`'s `_force_keyframe` underscore):
+        // request_keyframe_all alone won't reach those encoders, so
+        // we clock the encoder at tick rate for ~1.5s so its `-g 30`
+        // natural cadence emits a keyframe inside the window. Mirrors
+        // the legacy bridge's `keyframe_tx.send(())` → burst_until
+        // pathway at mod.rs:984-998. No-op if the bridge isn't yet
+        // running (the kf signal is just dropped on the unbounded
+        // channel; bridge startup later won't replay it, which is
+        // fine — `ensure_pool_feed_bridge_started` ran above and
+        // installed the sender BEFORE peer setup).
+        if let Some(tx) = self.pool_feed_keyframe_tx.lock().await.as_ref() {
+            let _ = tx.send(());
+        }
+
         Ok(answer_sdp)
     }
 
@@ -1616,10 +1658,15 @@ impl DisplaySession {
     ///   2. **Doesn't spawn a legacy encoder thread or fan-out task**
     ///      — so a pool-only deployment doesn't pay the CPU cost of
     ///      a legacy VP8 encoder running with no consumers.
-    ///   3. **No force-keyframe burst window** — pool peers' keyframe
-    ///      cadence is owned by the pool's `request_keyframe_*` API
-    ///      (wired in 3c.4) and the encoder's GOP. The pool-feed
-    ///      bridge does not need a peer-join wake here.
+    ///   3. **Pool-private peer-join burst channel.** As of 3c.3b.4b
+    ///      the bridge listens on `pool_feed_keyframe_tx` and opens
+    ///      a 1.5s burst window when signaled (mirrors legacy
+    ///      `keyframe_tx`). Required because `force_keyframe` on a
+    ///      long-running ffmpeg-pipe encoder (Linux H.264) is a
+    ///      no-op, so `EncoderPool::request_keyframe_all` alone
+    ///      can't reach those encoders — the burst clocks the
+    ///      encoder at tick rate so its `-g 30` natural cadence
+    ///      lands a keyframe inside the window.
     ///
     /// What it DOES match from the legacy bridge (3c.3b.3b
     /// follow-up): the **tick + heartbeat** pattern. The bridge
@@ -1703,6 +1750,17 @@ impl DisplaySession {
         // path. Cloning the Arc<RwLock> outside the spawned task
         // so the closure owns its handle.
         let latest_frame = Arc::clone(&self.latest_frame);
+        // 3c.3b.4b: peer-join keyframe burst channel. `handle_offer_pool_mode`
+        // sends `()` after every successful peer attach; the bridge opens a
+        // ~1.5s burst window during which every tick forwards latest_i420
+        // regardless of dirty state. Required for codecs that ignore
+        // `force_keyframe` on a long-running pipe (Linux ffmpeg H.264) —
+        // pool.request_keyframe_all alone won't reach those encoders, and
+        // the heartbeat-only path (1 push/sec) means an idle-desktop
+        // peer-join can wait many seconds for a natural GOP boundary.
+        // Mirrors the legacy bridge's `kf_rx`/burst at mod.rs:984-998.
+        let (kf_tx, mut kf_rx) = mpsc::unbounded_channel::<()>();
+        *self.pool_feed_keyframe_tx.lock().await = Some(kf_tx);
         let task = tokio::spawn(async move {
             // Heartbeat cadence. Mirrors the legacy bridge's value;
             // 1 second strikes the balance between "encoder stays
@@ -1712,6 +1770,13 @@ impl DisplaySession {
             // a peer-join window on truly static desktops.
             const IDLE_HEARTBEAT: std::time::Duration =
                 std::time::Duration::from_secs(1);
+            // Peer-join burst window. Sized to comfortably exceed
+            // one Linux ffmpeg H.264 GOP at 30fps (`-g 30` → ~1s) so
+            // the natural keyframe lands inside the window even
+            // though `force_keyframe` is ignored on the rawvideo pipe.
+            // Same constant the legacy bridge uses (mod.rs:984).
+            const PEER_JOIN_BURST: std::time::Duration =
+                std::time::Duration::from_millis(1500);
 
             let mut enc_w = initial_w & !1;
             let mut enc_h = initial_h & !1;
@@ -1726,6 +1791,13 @@ impl DisplaySession {
             let mut generation: u64 = 0;
             let mut last_sent_gen: Option<u64> = None;
             let mut last_send_at = Instant::now();
+            // 3c.3b.4b: peer-join burst window. `None` outside a
+            // burst; `Some(deadline)` while clocking the encoder
+            // through to a natural keyframe regardless of dirty
+            // state. Opened by `kf_rx.recv()` (signaled by
+            // `handle_offer_pool_mode`'s tail), expires after
+            // `PEER_JOIN_BURST` past the deadline.
+            let mut burst_until: Option<Instant> = None;
 
             // 3c.3b.3c-followup seed: convert the most recent BGRA
             // the capture has already produced (if any) so the first
@@ -1803,6 +1875,18 @@ impl DisplaySession {
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
+                    maybe_kf = kf_rx.recv() => {
+                        // `Some(())` = peer-join signal. `None` =
+                        // sender dropped (DisplaySession dropped); the
+                        // shutdown.cancelled() arm will fire on the
+                        // next select pass and break the loop. Either
+                        // way, opening (or refreshing) the burst
+                        // window is the right action only on Some.
+                        if maybe_kf.is_some() {
+                            burst_until =
+                                Some(Instant::now() + PEER_JOIN_BURST);
+                        }
+                    }
                     result = broadcast_rx.recv() => {
                         let frame = match result {
                             Ok(f) => f,
@@ -1869,12 +1953,17 @@ impl DisplaySession {
                     }
                     _ = tick.tick() => {
                         // Forward latest_i420 if anything's worth
-                        // forwarding. "Worth forwarding" = either
-                        // there's a fresher buffer than last sent, OR
-                        // the heartbeat is due (kicks the encoder so
-                        // a peer joining a damage-idle desktop sees
-                        // output within ~one GOP rather than waiting
-                        // for the next desktop event).
+                        // forwarding. "Worth forwarding" = a fresher
+                        // buffer than last sent, OR the heartbeat is
+                        // due (kicks the encoder so a peer joining a
+                        // damage-idle desktop sees output within ~one
+                        // GOP rather than waiting for the next desktop
+                        // event), OR a peer-join burst is active (3c.3b.4b
+                        // — clocks the encoder at tick rate so codecs
+                        // that ignore `force_keyframe` on a long-running
+                        // pipe (Linux ffmpeg H.264) hit a natural
+                        // keyframe inside the burst window rather than
+                        // waiting many seconds on heartbeat-only).
                         let Some((ref i420, arrived)) = latest_i420 else {
                             continue;
                         };
@@ -1882,7 +1971,9 @@ impl DisplaySession {
                         let changed = last_sent_gen != Some(generation);
                         let heartbeat_due =
                             last_send_at.elapsed() >= IDLE_HEARTBEAT;
-                        if !(changed || heartbeat_due) {
+                        let in_burst = burst_until
+                            .map_or(false, |u| Instant::now() < u);
+                        if !(changed || heartbeat_due || in_burst) {
                             continue;
                         }
 
@@ -3042,6 +3133,104 @@ mod tests {
              receive new-dim I420 from the first tick — encoder \
              mis-encodes or rejects.",
             pool.dimensions(),
+        );
+
+        session.shutdown.cancel();
+    }
+
+    /// **3c.3b.4b regression test.** After a peer-join signal on
+    /// `pool_feed_keyframe_tx`, the pool-feed bridge must push
+    /// `latest_i420` at tick rate for the burst window — even when
+    /// the buffer hasn't changed and the heartbeat hasn't elapsed.
+    /// Without this, codecs that ignore `force_keyframe` on a
+    /// long-running pipe (Linux ffmpeg H.264) wait many seconds for
+    /// a natural keyframe on idle desktops because the heartbeat-
+    /// only path delivers ~1 frame/sec — `pool.request_keyframe_all`
+    /// alone won't reach those encoders. Counts encoded frames
+    /// received by a pool subscriber over the burst window; without
+    /// burst the count would be ≤2 (initial encode + at most one
+    /// heartbeat), with burst it should be at tick rate (~30fps).
+    #[tokio::test]
+    async fn pool_feed_bridge_burst_clocks_encoder_at_tick_rate() {
+        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let session = DisplaySession::new(0, backend);
+        session
+            .start(30, None, None)
+            .await
+            .expect("start must succeed");
+
+        // Pre-seed `latest_frame` so the bridge has something to
+        // push from tick 1 (the seed branch converts and primes
+        // `latest_i420`). Avoids racing on the broadcast-recv path
+        // and isolates the test to "what happens when burst fires
+        // on a static buffer."
+        *session.latest_frame.write().await =
+            Some(Arc::new(make_test_bgra(64, 64)));
+
+        let pool = session
+            .pool
+            .get()
+            .expect("pool initialized after start");
+        let prefs = encode::pool::PeerCodecPreferences::new(vec![
+            encode::pool::CodecKind::Vp8,
+        ]);
+        let (subs, _lease) = pool
+            .subscribe(&prefs)
+            .expect("VP8 always-on subscribe");
+        let mut frame_rx = subs
+            .into_iter()
+            .next()
+            .expect("at least one subscription")
+            .frames;
+
+        session.ensure_pool_feed_bridge_started().await;
+
+        // Drain the seeded frame's initial encode before measuring;
+        // we want to count what the BURST produces, not the cold-
+        // start encode that happens regardless.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            frame_rx.recv(),
+        )
+        .await;
+
+        // Signal peer-join burst.
+        session
+            .pool_feed_keyframe_tx
+            .lock()
+            .await
+            .as_ref()
+            .expect("kf_tx installed by ensure_pool_feed_bridge_started")
+            .send(())
+            .expect("kf channel must be open");
+
+        // Count frames over 1.2s — burst window is 1.5s, so we're
+        // measuring inside the active window. Tick rate is 30fps so
+        // we expect close to 36 frames; threshold at 10 gives 3–4x
+        // slack for environmental jitter (VP8 encoder warm-up,
+        // scheduler pauses, broadcast lag). Pre-3c.3b.4b: heartbeat
+        // only would deliver 1 frame in 1.2s (the IDLE_HEARTBEAT
+        // re-push at the 1s boundary).
+        let start = Instant::now();
+        let mut count = 0u32;
+        while start.elapsed() < std::time::Duration::from_millis(1200) {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                frame_rx.recv(),
+            )
+            .await
+            {
+                Ok(Ok(_)) => count += 1,
+                _ => break,
+            }
+        }
+
+        assert!(
+            count >= 10,
+            "burst window must clock encoder at tick rate; got \
+             {count} frames in 1.2s. Pre-3c.3b.4b: heartbeat-only \
+             would deliver ≤2 — Linux ffmpeg H.264 stays black on \
+             idle peer-join.",
         );
 
         session.shutdown.cancel();
