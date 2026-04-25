@@ -2215,9 +2215,24 @@ fn spawn_encoder_thread(
 /// Returns `Some(encoder)` only when:
 /// - the codec is H.264 (no fallback strategy for VP8 — libvpx doesn't
 ///   exhibit this silent-failure pattern), and
-/// - VA-API hasn't already been banned (if it has, the current encoder
-///   is already libx264 and there's nothing better to swap to), and
 /// - the new encoder spawns cleanly.
+///
+/// **3c.3b.4g:** the previous version ALSO early-returned when
+/// `is_vaapi_banned()` was already true, on the assumption that the
+/// current encoder must already be libx264. That assumption fails
+/// for encoders constructed BEFORE a sibling watchdog set the ban
+/// (multi-H.264-pool-slot and mixed pool/legacy sessions both reach
+/// this state): the second watchdog would see the ban, return None,
+/// and leave a pre-ban VAAPI encoder stranded on the broken path
+/// forever. Fix: drop the `is_vaapi_banned` early-return, treat
+/// `ban_vaapi()` as the idempotent no-op it is, always attempt
+/// construction. At worst an already-libx264 encoder respawns
+/// libx264 once (a one-time waste; the watchdog latches and won't
+/// fire again); at best a pre-ban VAAPI encoder gets the libx264
+/// it would otherwise miss. Mirrors the same fix in
+/// [`crate::display::encode::pool::try_h264_fallback_for_layer`] —
+/// the two helpers will collapse to one when 3c.4 deletes this
+/// legacy path.
 ///
 /// On non-Linux targets there's no VA-API path to ban, so this is a no-op.
 #[cfg(target_os = "linux")]
@@ -2229,9 +2244,9 @@ fn try_h264_fallback(
     if codec_mime != encode::MIME_TYPE_H264 {
         return None;
     }
-    if encode::h264_linux::is_vaapi_banned() {
-        return None;
-    }
+    // Idempotent — see VAAPI_BANNED in encode/h264_linux.rs (one-way
+    // AtomicBool that's never cleared). Calling when already banned
+    // is a no-op store.
     encode::h264_linux::ban_vaapi();
     match encode::select_codec_for_mime(codec_mime, width, height, 2000) {
         Ok((enc, _)) => Some(enc),

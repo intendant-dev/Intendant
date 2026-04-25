@@ -1824,12 +1824,25 @@ impl WatchdogState {
 
 /// 3c.3b.4f: pool-path counterpart to `mod.rs::try_h264_fallback`.
 ///
-/// Same invariants:
+/// Invariants:
 ///   - only fires for H.264 (no fallback for VP8 — libvpx doesn't
 ///     exhibit the silent-failure pattern)
-///   - VA-API not already banned (if it is, we're already on
-///     libx264 and there's nothing better to swap to)
 ///   - the new encoder constructs cleanly
+///
+/// **3c.3b.4g:** the previous version ALSO early-returned when
+/// `is_vaapi_banned()` was already true, on the assumption "we're
+/// already on libx264 so there's nothing to swap to." That
+/// assumption holds for an encoder constructed AFTER a ban, but
+/// fails for encoders constructed BEFORE a sibling watchdog set
+/// the ban: the second watchdog would see the ban, return None,
+/// and leave a pre-ban VAAPI encoder stranded on the broken path
+/// forever. Multi-H.264-pool-slot and mixed pool/legacy sessions
+/// can both reach this state. Fix: drop the early-return, treat
+/// `ban_vaapi()` as the idempotent no-op it is, and always attempt
+/// construction. At worst an already-libx264 encoder respawns
+/// libx264 once (a one-time waste; the watchdog latches and won't
+/// fire again on this thread); at best a pre-ban VAAPI encoder
+/// gets the libx264 it would otherwise miss.
 ///
 /// Layer-aware: takes the existing [`LayerSpec`] so the replacement
 /// encoder is configured for the same width / height / bitrate /
@@ -1848,9 +1861,9 @@ fn try_h264_fallback_for_layer(
     if codec != CodecKind::H264 {
         return None;
     }
-    if super::h264_linux::is_vaapi_banned() {
-        return None;
-    }
+    // Idempotent — see VAAPI_BANNED in h264_linux.rs (one-way
+    // AtomicBool that's never cleared). Calling when already
+    // banned is a no-op store.
     super::h264_linux::ban_vaapi();
     match super::select_codec_for_mime(
         codec.mime(),
