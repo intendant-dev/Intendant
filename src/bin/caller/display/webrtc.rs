@@ -918,6 +918,27 @@ impl WebRtcPeer {
             ));
         }
         let codec_set = codec_set_from_subscriptions(&subscriptions);
+        // Filter the peer's original prefs against codec_set BEFORE
+        // building the answer — both must agree exactly. The answer
+        // enables `codec_set` (via `enable_*()` calls in `Self::new`),
+        // and the intake uses `negotiated_prefs` for every subsequent
+        // `pool.subscribe`. They derive from the same source so they
+        // can't drift.
+        let negotiated_prefs = filter_prefs_to_negotiated(&prefs, &codec_set);
+        // Defensive — should be unreachable: subscriptions is non-empty
+        // (early return above), codec_set is non-empty (one entry per
+        // unique codec in subs), and codec_set ⊆ original prefs (the
+        // pool only returns subs for codecs the prefs include). So the
+        // intersection is non-empty whenever original prefs is
+        // non-empty. If it's empty here, something upstream is producing
+        // subs for a codec the prefs doesn't include — fail loud.
+        if negotiated_prefs.is_empty() {
+            return Err(CallerError::WebRtc(
+                "new_pool_mode: filter_prefs_to_negotiated produced empty set; \
+                 pool returned subscriptions for codecs not in peer prefs"
+                    .to_string(),
+            ));
+        }
         let (peer, answer_sdp) = Self::new(
             peer_id,
             offer_sdp,
@@ -940,7 +961,7 @@ impl WebRtcPeer {
         let intake_shutdown = peer.shutdown.clone();
         tokio::spawn(pool_frame_intake(
             pool,
-            prefs,
+            negotiated_prefs,
             subscriptions,
             lease,
             intake_tx,
@@ -1799,6 +1820,49 @@ fn codec_set_from_subscriptions(subscriptions: &[EncoderSubscription]) -> Vec<Co
     codecs
 }
 
+/// Build the **negotiated** codec preferences the intake uses for
+/// every `pool.subscribe` call (initial AND every resubscribe).
+///
+/// Filters `original_prefs` against the codec set actually returned
+/// by the initial subscribe (`actual_codecs`). Preserves
+/// `original_prefs` ordering — the intake's
+/// [`select_active_subscription`] uses prefs order as the
+/// preference signal, and re-ordering would silently change the
+/// peer's chosen codec.
+///
+/// **Why this matters (3c.3b.2b finding 1):** the peer's SDP answer
+/// is built from `actual_codecs` (via `codec_set_from_subscriptions`),
+/// not from `original_prefs`. If `original_prefs = [VP8, H.264]` but
+/// initial subscribe returned only `[VP8]` (because H.264 encoder
+/// construction failed at that moment — VAAPI exhaustion, ffmpeg
+/// missing, etc.), the answer enables only VP8. Resubscribing with
+/// `original_prefs` after a later resize could pick H.264 if it
+/// became available — and the peer's WebRTC sender would then
+/// `match_params` against a PT cache that has no H.264 entry, mark
+/// the spec `Unsupported` per the 3c.0a per-spec gate, and silently
+/// drop every frame. Locking the resubscribe prefs to
+/// `actual_codecs` makes that reachability bug impossible.
+///
+/// Returns an empty `PeerCodecPreferences` only if the intersection
+/// is empty, which the caller (`new_pool_mode`) prevents by erroring
+/// upstream when `subscriptions` is empty (codec_set non-empty →
+/// intersection non-empty when `original_prefs` is non-empty). The
+/// upstream contract is asserted by the early-return at the top of
+/// `new_pool_mode`.
+fn filter_prefs_to_negotiated(
+    original_prefs: &PeerCodecPreferences,
+    actual_codecs: &[CodecKind],
+) -> PeerCodecPreferences {
+    PeerCodecPreferences::new(
+        original_prefs
+            .supported
+            .iter()
+            .copied()
+            .filter(|c| actual_codecs.contains(c))
+            .collect(),
+    )
+}
+
 /// Why the intake exits a forwarder loop. The intake's outer select
 /// branches on this to decide between resubscribe (encoder epoch
 /// rolled over) and clean shutdown (driver gone, intake should exit).
@@ -1897,18 +1961,41 @@ fn select_active_subscription(
 /// the stream black.
 ///
 /// The active subscription is picked via [`select_active_subscription`]
-/// from `prefs`'s codec ordering. The unused subscriptions are
-/// dropped explicitly so their `broadcast::Receiver` clones release
-/// immediately rather than lingering until end-of-scope. Dropping a
-/// subscription does **not** decrement the encoder's refcount — that
-/// happens via [`PoolLease::drop`] when the lease itself is dropped.
-/// This means the unused encoders keep running until the lease is
-/// released; that's acceptable today (each peer is short-lived
-/// relative to encoder lifetimes; the on-demand encoder remains
-/// available for the next peer that wants it). Phase 4's TWCC-driven
-/// layer switching will need to revisit this — switching layers
-/// without releasing the lease will require either holding all subs
-/// alive across the switch or a more granular release API.
+/// from `negotiated_prefs`'s codec ordering. The unused subscriptions
+/// are dropped explicitly so their `broadcast::Receiver` clones release
+/// immediately rather than lingering until end-of-scope.
+///
+/// Dropping a subscription **does not** decrement the encoder's
+/// refcount — refcounts live on the [`PoolLease`]. So we additionally
+/// call [`PoolLease::release_on_demand_subset`] with the inactive
+/// subs' ids: on-demand encoders the peer's active codec doesn't use
+/// drop their refcount immediately, and (when the refcount hits zero)
+/// the encoder is torn down. Always-on slots have no refcount entry;
+/// passing their ids is a silent no-op. The 3c.3b.2a review caught
+/// this as a wasted-CPU regression (multi-codec pool with a
+/// VP8-preferring peer would keep the H.264 encoder spinning into
+/// no-op broadcast until peer disconnect); 3c.3b.2b closed it.
+///
+/// ## `negotiated_prefs` — the 3c.3b.2b finding-1 contract
+///
+/// `negotiated_prefs` is the **caller-filtered** subset of the peer's
+/// original SDP-offer prefs that intersects the codecs the pool's
+/// initial subscribe actually returned. This is the codec set the
+/// peer's SDP answer enabled (`new_pool_mode` derives both the answer's
+/// `enable_*()` calls AND `negotiated_prefs` from the same
+/// `codec_set_from_subscriptions(initial_subs)` source).
+///
+/// The intake passes `negotiated_prefs` to every `pool.subscribe` —
+/// resubscribe-after-Closed included. If we passed the original
+/// unfiltered prefs, the resubscribe could return a codec the peer
+/// never negotiated (e.g. H.264 construction failed initially but
+/// succeeds after a later resize that respawns the on-demand slot).
+/// `select_active_subscription` would then pick that codec, the
+/// driver would call `match_params` against the negotiated PT cache,
+/// the codec wouldn't match, the per-spec gate would mark it
+/// `Unsupported`, and every frame would silently drop → black stream.
+/// Locking the prefs to the negotiated set at construction time and
+/// using that on every resubscribe is the structural fix.
 ///
 /// ## Lossy forwarding — the 3c.3b.2a contract (continued)
 ///
@@ -1943,20 +2030,21 @@ fn select_active_subscription(
 /// as a normal "encoder epoch transitioned" signal, drops the lease
 /// (which decrements refcounts under the generation gate, so stale
 /// claims don't decrement replacement slots), calls
-/// `pool.subscribe(prefs)` again, and continues with fresh handles.
-/// The peer never sees the transition; no offer rejection, no peer
-/// teardown.
+/// `pool.subscribe(&negotiated_prefs)` again, and continues with
+/// fresh handles. The peer never sees the transition; no offer
+/// rejection, no peer teardown.
 ///
-/// The escalation path: if `pool.subscribe(prefs)` itself returns
-/// `NoCompatibleCodec` (typically: peer's prefs no longer overlap
-/// anything the pool can produce) — or if `select_active_subscription`
-/// returns `None` against a non-empty subscription set (a contract
-/// violation indicating pool/peer divergence) — the intake signals
-/// `shutdown.cancel()` so the driver tears the peer down cleanly
-/// rather than leaving a never-decoding stream behind.
+/// The escalation path: if `pool.subscribe(&negotiated_prefs)` itself
+/// returns `NoCompatibleCodec` (typically: a resize wiped every
+/// negotiated codec and re-spawn failed) — or if
+/// `select_active_subscription` returns `None` against a non-empty
+/// subscription set (a contract violation indicating pool/peer
+/// divergence) — the intake signals `shutdown.cancel()` so the driver
+/// tears the peer down cleanly rather than leaving a never-decoding
+/// stream behind.
 async fn pool_frame_intake(
     pool: Arc<EncoderPool>,
-    prefs: PeerCodecPreferences,
+    negotiated_prefs: PeerCodecPreferences,
     initial_subs: Vec<EncoderSubscription>,
     initial_lease: PoolLease,
     encoded_frame_tx: mpsc::Sender<Arc<EncodedFrame>>,
@@ -1970,7 +2058,7 @@ async fn pool_frame_intake(
         // Pick exactly one subscription. Drop the rest explicitly so
         // their broadcast::Receiver clones release at this scope's
         // statement boundary rather than at end-of-function.
-        let active = match select_active_subscription(&mut current_subs, &prefs) {
+        let active = match select_active_subscription(&mut current_subs, &negotiated_prefs) {
             Some(s) => s,
             None => {
                 // Strict-by-construction `codec_set_from_subscriptions`
@@ -1982,21 +2070,41 @@ async fn pool_frame_intake(
                 // never-decoding stream is the worst possible outcome.
                 eprintln!(
                     "[display/webrtc/pool-intake] no subscription matched \
-                     peer prefs (supported={:?}) from {} returned subs; \
+                     negotiated_prefs (supported={:?}) from {} returned subs; \
                      signalling peer shutdown",
-                    prefs.supported,
+                    negotiated_prefs.supported,
                     current_subs.len(),
                 );
                 shutdown.cancel();
                 return;
             }
         };
+        // Collect the inactive subs' ids BEFORE dropping the subs so
+        // we can release their on-demand claims (3c.3b.2b finding 2).
+        // Always-on slots have no on_demand_refs entry; passing their
+        // ids is a silent no-op via `release_on_demand_subset`'s
+        // skip-unknown-ids contract. So we don't have to distinguish
+        // always-on from on-demand here — just pass everything.
+        let inactive_ids: Vec<EncoderId> =
+            current_subs.iter().map(|s| s.id.clone()).collect();
         // Make the drop point obvious. Future maintainers reading the
         // function should not have to wonder when the unused subs go
         // away — it's right here, between selection and forwarder
         // spawn.
         drop(current_subs);
         current_subs = Vec::new();
+        // Release the inactive on-demand claims on the active lease.
+        // For a peer with prefs [VP8, H264] against a pool that has
+        // VP8 always-on + H264 on-demand, this is what tears down the
+        // never-consumed H264 encoder when the active codec is VP8 —
+        // without it, H264 keeps encoding into a broadcast channel
+        // with no receivers until peer disconnect (the wasted-CPU
+        // regression caught in the 3c.3b.2a review).
+        if !inactive_ids.is_empty() {
+            if let Some(lease) = current_lease.as_mut() {
+                lease.release_on_demand_subset(&inactive_ids);
+            }
+        }
 
         let active_id = active.id.clone();
         let mut rx = active.frames;
@@ -2090,7 +2198,22 @@ async fn pool_frame_intake(
                         // reason about.
                         drop(current_lease.take());
 
-                        match pool.subscribe(&prefs) {
+                        // Use `negotiated_prefs`, not the original
+                        // peer prefs. Resubscribing with original
+                        // prefs would let the pool return codecs the
+                        // peer's SDP answer never enabled (e.g. if
+                        // initial subscribe excluded H.264 because
+                        // construction failed, but a later resize +
+                        // resubscribe finds H.264 working). The
+                        // intake would then `match_params` against a
+                        // codec the peer never negotiated and the
+                        // driver's per-spec gate marks `Unsupported`,
+                        // dropping every frame → silent black stream.
+                        // This is the high-priority finding from the
+                        // 3c.3b.2a review. The narrowed prefs locks
+                        // resubscribe to exactly the codecs the
+                        // peer's answer enabled.
+                        match pool.subscribe(&negotiated_prefs) {
                             Ok((subs, lease)) => {
                                 current_subs = subs;
                                 current_lease = Some(lease);
@@ -2393,6 +2516,74 @@ mod tests {
         assert_eq!(codecs.len(), 2);
         assert!(codecs.contains(&CodecKind::Vp8));
         assert!(codecs.contains(&CodecKind::H264));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3c.3b.2b: filter_prefs_to_negotiated unit tests
+    // -----------------------------------------------------------------------
+
+    /// **3c.3b.2b finding 1 contract.** Filters original prefs against
+    /// the codec set actually returned by initial subscribe, preserving
+    /// the original ordering. Order matters because
+    /// `select_active_subscription` uses prefs order as the codec
+    /// preference signal — re-ordering would change which codec the
+    /// peer actually receives.
+    #[test]
+    fn filter_prefs_to_negotiated_preserves_original_order() {
+        let original = PeerCodecPreferences::new(vec![
+            CodecKind::H264,
+            CodecKind::Vp8,
+            CodecKind::Vp9,
+        ]);
+        // Pool returned VP8 + Vp9 only (no H.264 backend at the moment).
+        let actual = vec![CodecKind::Vp8, CodecKind::Vp9];
+        let filtered = filter_prefs_to_negotiated(&original, &actual);
+        assert_eq!(filtered.supported, vec![CodecKind::Vp8, CodecKind::Vp9]);
+        // Different order in `actual` must NOT re-rank the result —
+        // the result follows `original`'s ordering.
+        let actual_reversed = vec![CodecKind::Vp9, CodecKind::Vp8];
+        let filtered2 = filter_prefs_to_negotiated(&original, &actual_reversed);
+        assert_eq!(filtered2.supported, vec![CodecKind::Vp8, CodecKind::Vp9]);
+    }
+
+    /// Identity case: when actual ⊇ original, the filter is a no-op
+    /// (everything in original survives).
+    #[test]
+    fn filter_prefs_to_negotiated_identity_when_actual_covers_original() {
+        let original = PeerCodecPreferences::new(vec![CodecKind::Vp8, CodecKind::H264]);
+        let actual = vec![CodecKind::Vp8, CodecKind::H264, CodecKind::Vp9];
+        let filtered = filter_prefs_to_negotiated(&original, &actual);
+        assert_eq!(filtered.supported, vec![CodecKind::Vp8, CodecKind::H264]);
+    }
+
+    /// No overlap → empty result. Caller must reject this case
+    /// upstream (see the `is_empty()` guard in `new_pool_mode`); the
+    /// filter itself doesn't error.
+    #[test]
+    fn filter_prefs_to_negotiated_returns_empty_when_no_overlap() {
+        let original = PeerCodecPreferences::new(vec![CodecKind::H264]);
+        let actual = vec![CodecKind::Vp8];
+        let filtered = filter_prefs_to_negotiated(&original, &actual);
+        assert!(filtered.is_empty());
+    }
+
+    /// Empty original → empty result. Belt-and-suspenders.
+    #[test]
+    fn filter_prefs_to_negotiated_returns_empty_for_empty_original() {
+        let original = PeerCodecPreferences::new(vec![]);
+        let actual = vec![CodecKind::Vp8, CodecKind::H264];
+        let filtered = filter_prefs_to_negotiated(&original, &actual);
+        assert!(filtered.is_empty());
+    }
+
+    /// Empty actual → empty result. (The pool returned no codecs;
+    /// negotiation would be impossible; upstream rejects via the
+    /// "subscriptions is_empty" guard before reaching the filter.)
+    #[test]
+    fn filter_prefs_to_negotiated_returns_empty_for_empty_actual() {
+        let original = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+        let filtered = filter_prefs_to_negotiated(&original, &[]);
+        assert!(filtered.is_empty());
     }
 
     /// **3c.3b.2 first explicit test, per the 3c.3b.1a review.**

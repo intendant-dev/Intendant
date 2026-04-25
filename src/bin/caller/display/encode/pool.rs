@@ -625,6 +625,72 @@ impl PoolLease {
         self.on_demand_refs.len()
     }
 
+    /// Release the lease's claim on a subset of its on-demand
+    /// encoders without releasing the entire lease. The remaining
+    /// claims continue to be the lease's responsibility on full
+    /// release ([`Self::release`] or `Drop`).
+    ///
+    /// Used by the per-peer pool intake at
+    /// `webrtc.rs::pool_frame_intake` after
+    /// `select_active_subscription` picks one subscription out of a
+    /// multi-codec / multi-layer set: the inactive codecs' on-demand
+    /// claims must be released so encoders we won't consume don't
+    /// stay refcounted into perpetuity (encoding into a broadcast
+    /// channel with no receivers — the wasted-CPU regression caught
+    /// in the 3c.3b.2a review).
+    ///
+    /// IDs in `ids` that don't appear in `on_demand_refs` are
+    /// silently skipped. This is the always-on case: the intake
+    /// passes "every inactive subscription's id" without
+    /// distinguishing always-on from on-demand, and always-on slots
+    /// have no refcount entry so passing their ids is a no-op.
+    ///
+    /// The generation gate from [`Self::release_impl`] applies:
+    /// stale claims against replaced slots (post-`on_resize`) are
+    /// skipped without decrementing the replacement slot's refcount.
+    ///
+    /// Idempotent against double-release: if [`Self::release`] or
+    /// `Drop` already ran, this is a no-op (the `released` flag
+    /// short-circuits the entire path).
+    pub fn release_on_demand_subset(&mut self, ids: &[EncoderId]) {
+        if self.released.load(Ordering::SeqCst) {
+            return;
+        }
+        if ids.is_empty() {
+            return;
+        }
+        // Partition the lease's claims: the ones we're releasing
+        // now, and the ones we keep for full-release later.
+        let (to_release, keep): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.on_demand_refs)
+                .into_iter()
+                .partition(|(id, _gen)| ids.contains(id));
+        self.on_demand_refs = keep;
+
+        if to_release.is_empty() {
+            return;
+        }
+
+        let mut guard = self.pool.on_demand.lock().unwrap();
+        for (id, recorded_gen) in &to_release {
+            if let Some(slot) = guard.get_mut(id) {
+                // Generation gate: stale claim against a replaced
+                // slot must not decrement the replacement. See
+                // `release_impl` for the full contract.
+                if slot.generation != *recorded_gen {
+                    continue;
+                }
+                slot.refcount = slot.refcount.saturating_sub(1);
+                if slot.refcount == 0 {
+                    slot.handle.shutdown.cancel();
+                    guard.remove(id);
+                }
+            }
+            // Slot not in map: already torn down by another lease's
+            // release, or by on_resize. No work for us.
+        }
+    }
+
     fn release_impl(&mut self) {
         if self.released.swap(true, Ordering::SeqCst) {
             return;
@@ -2617,6 +2683,121 @@ mod tests {
 
         // A fresh subscribe spawns a new slot at refcount 1.
         let (_subs_c, _lease_c) = pool.subscribe(&prefs).expect("subscribe c");
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
+            Some(1)
+        );
+    }
+
+    /// **3c.3b.2b finding 2 fix.** `release_on_demand_subset` releases
+    /// only the specified IDs while keeping the lease alive for the
+    /// rest. After it runs, the lease's full release (Drop) handles
+    /// the remaining claims; the partially-released slots' refcount
+    /// is unaffected by the eventual full release.
+    ///
+    /// Setup pins the per-id semantics by:
+    ///   1. Two leases on the same VP8 on-demand slot → refcount=2.
+    ///   2. Lease A partial-releases the VP8 id → its claim removed
+    ///      from on_demand_refs, slot refcount → 1. Lease B's claim
+    ///      still alive.
+    ///   3. Lease A's Drop is now a no-op for VP8 (removed from
+    ///      on_demand_refs above).
+    ///   4. Lease B's Drop releases its claim → refcount → 0 → slot
+    ///      torn down.
+    #[tokio::test]
+    async fn release_on_demand_subset_decrements_only_specified_ids() {
+        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+
+        let (_subs_a, mut lease_a) =
+            pool.subscribe(&prefs).expect("subscribe a");
+        let (_subs_b, lease_b) =
+            pool.subscribe(&prefs).expect("subscribe b");
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
+            Some(2),
+            "two leases against the same on-demand slot → refcount 2"
+        );
+        assert_eq!(lease_a.on_demand_count(), 1);
+
+        // Lease A partial-releases its VP8 claim. Refcount drops to
+        // 1 (Lease B still holds), slot stays alive.
+        let vp8_full = EncoderId::new(CodecKind::Vp8, SimulcastRid::full());
+        lease_a.release_on_demand_subset(&[vp8_full.clone()]);
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
+            Some(1),
+            "partial release decrements specified slot's refcount"
+        );
+        assert_eq!(
+            lease_a.on_demand_count(),
+            0,
+            "partial release removes the claim from on_demand_refs"
+        );
+
+        // Drop Lease A entirely. Its full-release iterates an empty
+        // on_demand_refs (we already partial-released VP8) → no-op
+        // for VP8 → refcount stays at 1.
+        drop(lease_a);
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
+            Some(1),
+            "Lease A drop must NOT double-release the slot it already \
+             released via release_on_demand_subset"
+        );
+
+        // Drop Lease B → refcount → 0 → torn down.
+        drop(lease_b);
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
+            None,
+            "Lease B drop releases the last claim; slot torn down"
+        );
+    }
+
+    /// IDs not in the lease's on_demand_refs are silently skipped.
+    /// Two scenarios:
+    ///   - Always-on slot id (never refcounted) → no-op.
+    ///   - Codec the lease never claimed → no-op.
+    /// The intake passes "every inactive subscription's id" without
+    /// distinguishing always-on from on-demand, relying on this
+    /// silent-skip behaviour to keep the call site simple.
+    #[tokio::test]
+    async fn release_on_demand_subset_silently_skips_unknown_ids() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            vec![LayerSpec::single(CodecKind::Vp8, 64, 64, 30)],
+        );
+        // VP8 is always-on; no on-demand claim. Subscribe still
+        // returns the always-on sub but lease has empty on_demand_refs.
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+        let (_subs, mut lease) =
+            pool.subscribe(&prefs).expect("subscribe always-on VP8");
+        assert_eq!(lease.on_demand_count(), 0);
+
+        // Pass an always-on id and a never-claimed id; both should
+        // be silently skipped (no-op, no panic).
+        let vp8_full = EncoderId::new(CodecKind::Vp8, SimulcastRid::full());
+        let h264_full = EncoderId::new(CodecKind::H264, SimulcastRid::full());
+        lease.release_on_demand_subset(&[vp8_full, h264_full]);
+        assert_eq!(lease.on_demand_count(), 0);
+    }
+
+    /// Empty `ids` slice is a no-op fast-path (skips even the lock
+    /// acquisition). Pinning so a future "always partition" refactor
+    /// doesn't accidentally make a hot path slower.
+    #[tokio::test]
+    async fn release_on_demand_subset_empty_ids_is_noop() {
+        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+        let (_subs, mut lease) =
+            pool.subscribe(&prefs).expect("subscribe on-demand VP8");
+        assert_eq!(lease.on_demand_count(), 1);
+
+        lease.release_on_demand_subset(&[]);
+        assert_eq!(lease.on_demand_count(), 1, "empty ids must not touch refs");
         assert_eq!(
             pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
             Some(1)
