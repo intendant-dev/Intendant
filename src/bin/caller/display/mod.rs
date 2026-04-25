@@ -280,12 +280,9 @@ pub struct DisplayMetricsCounters {
 
     /// Total per-peer try_send failures in the fan-out task.
     ///
-    /// `Arc<AtomicU64>` (not bare `AtomicU64`) so the pool-mode
-    /// per-peer intake task at `webrtc.rs::pool_frame_intake` can
-    /// share the same counter via `Arc::clone(&self.counters.peer_drops)`.
-    /// Until 3c.4 deletes the legacy fan-out, both paths feed this
-    /// counter so `DisplayMetricsSnapshot.peer_drops` continues to
-    /// reflect total drops across pre-pool and pool peers.
+    /// `Arc<AtomicU64>` (not bare `AtomicU64`) so the per-peer
+    /// `pool_frame_intake` task at `webrtc.rs` can share the same
+    /// counter via `Arc::clone(&self.counters.peer_drops)`.
     pub peer_drops: Arc<AtomicU64>,
     /// Current number of connected WebRTC peers.
     pub peer_count: AtomicU64,
@@ -402,20 +399,11 @@ pub struct DisplaySession {
     frame_tx: broadcast::Sender<Arc<Frame>>,
     latest_frame: Arc<RwLock<Option<Arc<Frame>>>>,
     peers: Arc<RwLock<HashMap<PeerId, Arc<self::webrtc::WebRtcPeer>>>>,
-    encoder_handle: Mutex<Option<JoinHandle<()>>>,
     capture_handle: Mutex<Option<JoinHandle<()>>>,
     shutdown: CancellationToken,
     counters: Arc<DisplayMetricsCounters>,
     /// Instant used as the epoch for rate computations.
     metrics_epoch: Mutex<Instant>,
-    /// Negotiated codec MIME type for the encoder pipeline.
-    /// Set on the first peer connection, all subsequent peers use the same codec.
-    codec_mime: RwLock<&'static str>,
-    /// Serializes codec selection + encoder startup on the first `handle_offer()`.
-    /// Guards a bool: `false` = encoder not yet started, `true` = running.
-    /// All concurrent first-offer callers block on this mutex so only one
-    /// task performs codec negotiation and starts the encoder pipeline.
-    encoder_init_lock: Mutex<bool>,
     /// Capture FPS stored from `start()` for deferred encoder startup.
     fps: Mutex<u32>,
     /// EventBus stored from `start()` for deferred encoder startup.
@@ -424,17 +412,9 @@ pub struct DisplaySession {
     clipboard_monitor: Arc<clipboard::ClipboardMonitor>,
     /// Handle for the clipboard forwarding task (remote -> browser).
     clipboard_handle: Mutex<Option<JoinHandle<()>>>,
-    /// Channel used by `handle_offer` to wake the capture/encode bridge when
-    /// a new peer attaches.  The bridge responds by forcing a keyframe on
-    /// the next encoded frame (so a peer joining on an idle desktop gets a
-    /// decodable reference within ~1 tick instead of waiting for the next
-    /// GOP boundary).  `Some` after `start_encoder_pipeline()` has run.
-    keyframe_tx: Mutex<Option<mpsc::UnboundedSender<()>>>,
-    /// Pool-path counterpart to [`Self::keyframe_tx`]. Wakes the
-    /// pool-feed bridge to open a peer-join burst window when a new
-    /// pool peer attaches. Distinct from `keyframe_tx` because the
-    /// pool-feed bridge has its own select loop and own state. `Some`
-    /// after [`Self::ensure_pool_feed_bridge_started`] has run.
+    /// Wakes the pool-feed bridge to open a peer-join burst window
+    /// when a new pool peer attaches. `Some` after
+    /// [`Self::ensure_pool_feed_bridge_started`] has run.
     ///
     /// **Why a burst is needed even though the pool also sets
     /// `force_keyframe`:** [`crate::display::encode::pool::EncoderPool::request_keyframe_all`]
@@ -442,25 +422,16 @@ pub struct DisplaySession {
     /// on their next encode. Linux H.264 (ffmpeg-pipe) explicitly
     /// ignores the flag (see `h264_linux.rs::encode`'s `_force_keyframe`
     /// underscore) — there's no per-frame "emit IDR now" path on a
-    /// long-running rawvideo pipe. Compensation is the same as the
-    /// legacy bridge: clock the encoder at tick rate for ~one GOP
-    /// boundary so its `-g 30` natural cadence emits a keyframe
-    /// inside the burst window. Without this, an idle-desktop pool
-    /// peer-join on Linux H.264 stays black for many seconds.
+    /// long-running rawvideo pipe. Compensation: clock the encoder
+    /// at tick rate for ~one GOP boundary so its `-g 30` natural
+    /// cadence emits a keyframe inside the burst window. Without
+    /// this, an idle-desktop pool peer-join on Linux H.264 stays
+    /// black for many seconds.
     pool_feed_keyframe_tx: Mutex<Option<mpsc::UnboundedSender<()>>>,
     /// Shared multi-codec encoder pool. Constructed lazily on the first
     /// `start()` call once the backend's resolution and fps are known;
     /// ownership is `Arc` so subsequent integration code can hand it to
     /// per-peer forwarders without lifetime juggling.
-    ///
-    /// Phase 3c.1 only establishes the lifetime — the pool spawns its
-    /// always-on VP8 encoder, but nothing pushes frames into it and no
-    /// peer subscribes. The idle encoder thread is ~free (it blocks in
-    /// `blocking_recv` until the bridge starts publishing I420 frames in
-    /// 3c.2). The existing single-encoder pipeline at
-    /// `start_encoder_pipeline` / `codec_mime` / `encoder_init_lock`
-    /// remains the live path until 3c.4 flips the default and deletes
-    /// the old fanout.
     ///
     /// `std::sync::OnceLock` (stable since 1.70) is the right shape:
     /// one-time init with shared read access afterward, synchronous so
@@ -468,55 +439,31 @@ pub struct DisplaySession {
     /// tokio dependency. Concurrent `start()` callers (not expected but
     /// cheap to tolerate) converge on a single pool.
     pool: std::sync::OnceLock<Arc<encode::pool::EncoderPool>>,
-    /// Handle for the pool-only capture-to-I420 bridge task, or
-    /// `None` when no pool peer has connected yet (and never set in
-    /// legacy-only sessions — there the legacy bridge dual-feeds the
-    /// pool itself).
-    ///
-    /// Spawned by [`Self::ensure_pool_feed_bridge_started`] on the
-    /// first pool-mode offer. Owns its own BGRA→I420 conversion and
-    /// `pool.push_i420_frame` loop, so it doesn't touch
-    /// `encoder_init_lock` / `codec_mime` / the legacy encoder
-    /// pipeline. That's the 3c.3b.3a fix for the codec-lock-in
-    /// regression: a pool first-offer no longer locks the session
-    /// codec to VP8 and reject a later legacy H.264-only peer.
-    ///
-    /// Coordination with the legacy `start_encoder_pipeline`'s
-    /// dual-feed: both paths take `encoder_init_lock` (legacy as part
-    /// of its first-peer dance, pool inside `ensure_pool_feed_bridge_started`)
-    /// before consulting this handle, so the "pool gets fed by exactly
-    /// one bridge" invariant holds across concurrent first-offers.
-    /// Whichever path takes the init lock first wins the right to
-    /// own the pool feed; the loser observes the winner's state and
-    /// skips its own attempt.
-    ///
-    /// 3c.4 deletes the legacy pipeline; the pool-feed bridge becomes
-    /// the only bridge and gets spawned unconditionally from `start()`.
-    /// At that point this field becomes vestigial and goes away
-    /// alongside the legacy code.
+    /// Handle for the capture-to-I420 bridge task, or `None` before
+    /// the first offer arrives. Spawned by
+    /// [`Self::ensure_pool_feed_bridge_started`] on the first
+    /// `handle_offer` call; owns the BGRA→I420 conversion and
+    /// `pool.push_i420_frame` loop. Drained on `stop()` for
+    /// deterministic teardown ordering. 3c.4c moves the spawn
+    /// to `start()` so the bridge runs unconditionally even
+    /// before any peer connects.
     pool_feed_bridge_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// Parse the truthiness of an `INTENDANT_DISPLAY_POOL` env value
-/// (or any equivalent on/off flag).
+/// Parse the truthiness of an `INTENDANT_DISPLAY_POOL` env value.
 ///
-/// **3c.4a flipped the default.** Pool is now the default path; the
-/// flag is interpreted as opt-OUT, narrow. Only `Some("0")` and
-/// `Some("false")` (case-insensitive) explicitly disable pool mode
-/// and route through the legacy single-encoder fan-out. `None`,
-/// empty string, and any other value (including `"1"`, `"true"`,
-/// garbage) all enable pool mode.
+/// **3c.4b made this inert.** The legacy single-encoder fan-out has
+/// been deleted, so the env flag no longer affects behavior — pool
+/// is now the only path. The function and its tests are retained
+/// pending 3c.5's full removal of the flag and its callers.
 ///
-/// The narrow opt-out matches the previous narrow opt-in: there are
-/// only two documented "pool off" values, mirroring the previous
-/// two "pool on" values. Operators who set `INTENDANT_DISPLAY_POOL=1`
-/// for the pre-flip rollout continue to get pool mode (no behavior
-/// change for them), and the flag remains an emergency rollback path
-/// until 3c.5 deletes both the env flag and the legacy code.
+/// Pre-3c.4b semantics (kept for the doc trail): default ON;
+/// `Some("0")` / `Some("false")` (case-insensitive) opted out to
+/// the legacy fan-out; everything else stayed on pool.
 ///
-/// Extracted from [`pool_mode_enabled`] so the parsing rules can be
-/// unit-tested without touching `std::env::var` (env mutation in
-/// parallel tests is racy across the cargo-test process).
+/// Extracted from [`pool_mode_enabled`] so the parsing rules can
+/// be unit-tested without touching `std::env::var` (env mutation
+/// in parallel tests is racy across the cargo-test process).
 fn parse_pool_flag(value: Option<&str>) -> bool {
     match value {
         Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
@@ -524,19 +471,11 @@ fn parse_pool_flag(value: Option<&str>) -> bool {
     }
 }
 
-/// Whether the encoder-pool path
-/// (`DisplaySession::handle_offer_pool_mode`) is active. **Default
-/// ON** as of 3c.4a; opt out with `INTENDANT_DISPLAY_POOL=0` (or
-/// `=false`, case-insensitive) for emergency rollback to the legacy
-/// single-encoder fan-out. 3c.5 removes the env flag and deletes
-/// the legacy code entirely.
-///
-/// Read per-call rather than at startup so an operator can flip the
-/// flag mid-session via `kill -HUP`-and-restart pattern (or, more
-/// usefully, set/unset between offers in a debug session). Concurrent
-/// peers can be on different paths; the [`webrtc::WebRtcPeer::is_pool_mode`]
-/// marker keeps the legacy fan-out from duplicating frames into pool
-/// peers.
+/// Whether `INTENDANT_DISPLAY_POOL` is set to a non-opt-out value.
+/// **3c.4b made this inert** — the legacy path is gone, so callers
+/// that previously branched on this no longer exist. Retained for
+/// 3c.5 deletion alongside [`parse_pool_flag`].
+#[allow(dead_code)]
 fn pool_mode_enabled() -> bool {
     parse_pool_flag(std::env::var("INTENDANT_DISPLAY_POOL").as_deref().ok())
 }
@@ -551,18 +490,14 @@ impl DisplaySession {
             frame_tx,
             latest_frame: Arc::new(RwLock::new(None)),
             peers: Arc::new(RwLock::new(HashMap::new())),
-            encoder_handle: Mutex::new(None),
             capture_handle: Mutex::new(None),
             shutdown: CancellationToken::new(),
             counters: Arc::new(DisplayMetricsCounters::new()),
             metrics_epoch: Mutex::new(Instant::now()),
-            codec_mime: RwLock::new(encode::MIME_TYPE_VP8),
-            encoder_init_lock: Mutex::new(false),
             fps: Mutex::new(30),
             encoder_event_bus: Mutex::new(None),
             clipboard_monitor: Arc::new(clipboard::ClipboardMonitor::new()),
             clipboard_handle: Mutex::new(None),
-            keyframe_tx: Mutex::new(None),
             pool_feed_keyframe_tx: Mutex::new(None),
             pool: std::sync::OnceLock::new(),
             pool_feed_bridge_handle: Mutex::new(None),
@@ -641,24 +576,21 @@ impl DisplaySession {
         });
         *self.capture_handle.lock().await = Some(capture_handle);
 
-        // Store fps and event_bus for deferred encoder startup.
-        // The encoder pipeline is started on the first handle_offer() call
-        // so we know which codec the peer negotiated.
+        // Store fps and event_bus for deferred pool-feed bridge spawn.
+        // The pool-feed bridge starts on the first handle_offer() call
+        // (via `ensure_pool_feed_bridge_started`).
         *self.fps.lock().await = fps;
         *self.encoder_event_bus.lock().await = event_bus_for_encoder;
 
-        // Phase 3c.1: construct the shared encoder pool with a single
-        // always-on VP8 layer at the source resolution. The pool spawns
-        // its encoder thread immediately; that thread blocks in
-        // `blocking_recv` until the bridge task starts publishing I420
-        // frames in 3c.2. Idle cost is negligible. No peer subscribes to
-        // this pool until 3c.3 wires `handle_offer` through
-        // `pool.subscribe(...)`; the pre-pool pipeline
-        // (`start_encoder_pipeline`, `codec_mime`, `encoder_init_lock`)
-        // stays the live path until 3c.4.
+        // Construct the shared encoder pool with a single always-on
+        // VP8 layer at the source resolution. The pool spawns its
+        // VP8 encoder thread immediately; that thread blocks in
+        // `blocking_recv` until the pool-feed bridge starts
+        // publishing I420 frames on the first offer. Idle cost is
+        // negligible.
         //
-        // `get_or_init` swallows concurrent initializations cheaply; in
-        // practice `start()` is called at most once per session.
+        // `get_or_init` swallows concurrent initializations cheaply;
+        // in practice `start()` is called at most once per session.
         let _ = self.pool.get_or_init(|| {
             Arc::new(encode::pool::EncoderPool::new(
                 width,
@@ -749,10 +681,8 @@ impl DisplaySession {
                     }
                 }
             });
-            // Store handle — stop() cancels via shutdown token.
-            // Reuse encoder_handle field slot since we don't have a dedicated one.
-            // Actually, let's just let it be managed by the CancellationToken.
-            drop(reg_handle); // Managed by shutdown token; task self-cancels.
+            // Managed by shutdown token; task self-cancels on stop().
+            drop(reg_handle);
         }
 
         Ok(())
@@ -827,9 +757,6 @@ impl DisplaySession {
         self.backend.stop_capture().await;
 
         if let Some(h) = self.capture_handle.lock().await.take() {
-            let _ = h.await;
-        }
-        if let Some(h) = self.encoder_handle.lock().await.take() {
             let _ = h.await;
         }
         if let Some(h) = self.clipboard_handle.lock().await.take() {
@@ -912,383 +839,21 @@ impl DisplaySession {
         Ok(png_buf.into_inner())
     }
 
-    /// Start the encoder pipeline with the given codec.
-    ///
-    /// Called exactly once from `handle_offer()` under `encoder_init_lock`.
-    /// The caller is responsible for guarding against double-start.
-    async fn start_encoder_pipeline(&self, codec_mime: &'static str) {
-        let fps = *self.fps.lock().await;
-        let event_bus = self.encoder_event_bus.lock().await.clone();
-
-        let (width, height) = self.backend.resolution();
-        let mut broadcast_rx = self.frame_tx.subscribe();
-        let peers = Arc::clone(&self.peers);
-
-        let duration_ms = if fps > 0 { 1000 / fps as u64 } else { 33 };
-
-        // Encoded frame channel -- survives encoder restarts.  The fanout
-        // task reads from `efr_rx`; each encoder thread gets a clone of
-        // `efr_tx` so dropping+respawning the encoder thread does not
-        // close the channel.
-        let (efr_tx, mut efr_rx) = mpsc::channel::<Arc<EncodedFrame>>(16);
-
-        // Spawn the initial encoder thread.
-        // Channel payload: (i420 buffer, arrival time, force_keyframe_flag).
-        let (i420_tx, i420_rx) =
-            std::sync::mpsc::sync_channel::<(Vec<u8>, Instant, bool)>(4);
-
-        let enc_counters = Arc::clone(&self.counters);
-        let encoder_shutdown = self.shutdown.clone();
-        spawn_encoder_thread(
-            width, height, duration_ms,
-            codec_mime,
-            i420_rx, efr_tx.clone(),
-            Arc::clone(&enc_counters), encoder_shutdown,
-        );
-
-        let (kf_tx, mut kf_rx) = mpsc::unbounded_channel::<()>();
-        *self.keyframe_tx.lock().await = Some(kf_tx);
-
-        let bridge_counters = Arc::clone(&self.counters);
-        let shutdown_bridge = self.shutdown.clone();
-        let frame_interval = std::time::Duration::from_millis(
-            if fps > 0 { 1000 / fps as u64 } else { 33 },
-        );
-        let display_id = self.display_id;
-        let codec_mime_for_bridge = codec_mime;
-        // Phase 3c.2: capture the pool Arc (if populated by `start()`) so
-        // the bridge can dual-feed I420 frames into it. No peer subscribes
-        // to the pool until 3c.3 wires `handle_offer`; this feed is
-        // transitional and exists so the pool's always-on encoder sees
-        // real frames rather than sitting idle. Cloned here (outside the
-        // spawned task) so the task closure owns an `Option<Arc>` and
-        // doesn't need to touch `self.pool` at runtime.
-        //
-        // **Phase 3c.3b.3a coordination:** if `ensure_pool_feed_bridge_started`
-        // already spawned a pool-only bridge for an earlier pool-mode
-        // offer, that bridge owns the pool feed; the legacy bridge
-        // here MUST NOT also push to the pool, or each captured frame
-        // would be I420-converted and pushed twice → duplicate frames
-        // on the pool's broadcast → encoded duplicates on every pool
-        // peer's RTP stream → corrupted decode (same shape as the
-        // 3c.3b.2a multi-sub fan-out bug). The Option short-circuits
-        // both `pool.push_i420_frame` and `pool.on_resize` calls below
-        // — pool-feed bridge handles both for the pool side when it
-        // owns the feed. The check is one mutex acquisition before
-        // the bridge task spawn (not in the hot per-frame path).
-        let pool_for_bridge: Option<Arc<encode::pool::EncoderPool>> = {
-            let pool_feed_running = self
-                .pool_feed_bridge_handle
-                .lock()
-                .await
-                .is_some();
-            if pool_feed_running {
-                None
-            } else {
-                self.pool.get().map(Arc::clone)
-            }
-        };
-        let bridge_handle = tokio::spawn(async move {
-            // Track current encoder dimensions for resize detection.
-            let mut enc_width = width;
-            let mut enc_height = height;
-            let mut i420_tx = i420_tx;
-            // Most recently captured (and BGRA->I420 converted) frame.
-            // `generation` is bumped each time the capture branch replaces
-            // the buffer; the tick branch compares against `last_sent_gen`
-            // to tell new content from a repeat.
-            let mut latest_i420: Option<(Vec<u8>, Instant)> = None;
-            let mut generation: u64 = 0;
-            let mut last_sent_gen: Option<u64> = None;
-            // Wall-clock time of the most recent send to the encoder.
-            // Used to drive the idle heartbeat.
-            let mut last_send_at = Instant::now();
-            // Force-keyframe window opened by `handle_offer` when a new
-            // peer attaches.  During the window every tick forwards to
-            // the encoder regardless of dirty state; the very first
-            // forwarded frame carries `force_keyframe=true`.  Sized to
-            // comfortably exceed one H.264 GOP at the configured feed
-            // rate so the fallback path (ffmpeg-pipe, which ignores the
-            // force flag) still lands a natural keyframe inside it.
-            let mut burst_until: Option<Instant> = None;
-            let mut burst_first = false;
-            // Heartbeat: when the buffer hasn't changed and we aren't in
-            // a burst, send one repeat every IDLE_HEARTBEAT so the
-            // encoder's internal timebase and RTP cadence keep flowing
-            // without re-encoding the same static frame 30 times/second.
-            const IDLE_HEARTBEAT: std::time::Duration =
-                std::time::Duration::from_secs(1);
-            const PEER_JOIN_BURST: std::time::Duration =
-                std::time::Duration::from_millis(1500);
-
-            let mut tick = tokio::time::interval(frame_interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    _ = shutdown_bridge.cancelled() => break,
-                    _ = kf_rx.recv() => {
-                        // Peer attached (or a PLI is being simulated).
-                        // Open/refresh the burst window.  The next tick
-                        // will forward the latest frame with
-                        // force_keyframe=true.
-                        burst_until = Some(Instant::now() + PEER_JOIN_BURST);
-                        burst_first = true;
-                    }
-                    result = broadcast_rx.recv() => {
-                        let frame = match result {
-                            Ok(f) => f,
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(broadcast::error::RecvError::Closed) => break,
-                        };
-
-                        // -- Resize detection --
-                        // Round to even dimensions for codec compatibility.
-                        let frame_w = frame.width & !1;
-                        let frame_h = frame.height & !1;
-                        if frame_w > 0 && frame_h > 0
-                            && (frame_w != enc_width || frame_h != enc_height)
-                        {
-                            eprintln!(
-                                "[display/bridge] resolution changed {}x{} -> {}x{}, recreating encoder",
-                                enc_width, enc_height, frame_w, frame_h,
-                            );
-                            enc_width = frame_w;
-                            enc_height = frame_h;
-
-                            // Drop the old sender -- the encoder thread's
-                            // `i420_rx.recv()` will return Err and the
-                            // thread will exit cleanly.
-                            drop(i420_tx);
-                            // Drop stale buffer: dimensions changed.
-                            latest_i420 = None;
-                            last_sent_gen = None;
-
-                            // Spawn a fresh encoder thread at the new
-                            // dimensions, reusing the same `efr_tx`.
-                            let (new_tx, new_rx) =
-                                std::sync::mpsc::sync_channel::<(Vec<u8>, Instant, bool)>(4);
-                            i420_tx = new_tx;
-                            let counters_clone = Arc::clone(&bridge_counters);
-                            let shutdown_clone = shutdown_bridge.clone();
-                            spawn_encoder_thread(
-                                enc_width, enc_height, duration_ms,
-                                codec_mime_for_bridge,
-                                new_rx, efr_tx.clone(),
-                                counters_clone, shutdown_clone,
-                            );
-
-                            if let Some(ref bus) = event_bus {
-                                bus.send(crate::event::AppEvent::DisplayResize {
-                                    display_id,
-                                    width: enc_width,
-                                    height: enc_height,
-                                });
-                            }
-
-                            // Phase 3c.3a: replace the pool's encoders
-                            // at the new dimensions in the same beat
-                            // the old path respawns its encoder. After
-                            // this call the pool's dimensions, its
-                            // always_on handles, and (eventually) its
-                            // on_demand slots are all coherent with
-                            // the new capture size, and the
-                            // dimensions-gate from 3c.2a becomes an
-                            // invariant assert rather than a runtime
-                            // skip.
-                            //
-                            // Subscribers (3c.3b onward) see their
-                            // broadcast::Receiver<Arc<EncodedFrame>>
-                            // close on the next recv and must
-                            // re-subscribe via `pool.subscribe`. The
-                            // forwarder learns to do that when 3c.3b
-                            // lands peer routing; until then, no
-                            // subscribers exist and the swap is
-                            // pool-internal only.
-                            if let Some(ref pool) = pool_for_bridge {
-                                pool.on_resize(enc_width, enc_height);
-                            }
-                        }
-
-                        // Convert the new BGRA capture to I420 and stash
-                        // it as the latest buffer.  The tick branch will
-                        // pick it up on the next interval (or sooner if
-                        // we're in a burst).  We deliberately keep the
-                        // conversion out of the send path so the broadcast
-                        // receiver can drain quickly; libvpx/libx264 see
-                        // frames at the tick rate, decoupled from capture
-                        // jitter.
-                        let arrived = Instant::now();
-                        let frame_arc = Arc::clone(&frame);
-                        let i420 = tokio::task::spawn_blocking(move || {
-                            encode::bgra_to_i420(
-                                &frame_arc.data,
-                                frame_arc.width,
-                                frame_arc.height,
-                                frame_arc.stride,
-                            )
-                        }).await;
-                        if let Ok(i420) = i420 {
-                            generation = generation.wrapping_add(1);
-                            latest_i420 = Some((i420, arrived));
-                        }
-                    }
-                    _ = tick.tick() => {
-                        let Some((ref i420, arrived)) = latest_i420 else {
-                            // No capture yet -- nothing to forward.  The
-                            // encoder is happy to sit idle.
-                            continue;
-                        };
-
-                        let in_burst = burst_until
-                            .map(|t| Instant::now() < t)
-                            .unwrap_or(false);
-                        if !in_burst {
-                            burst_until = None;
-                        }
-
-                        let changed = last_sent_gen != Some(generation);
-                        let heartbeat_due = last_send_at.elapsed() >= IDLE_HEARTBEAT;
-
-                        if !(changed || heartbeat_due || in_burst) {
-                            // Nothing new and nothing overdue -- skip the
-                            // tick.  This is the main CPU win: a fully
-                            // idle desktop stops clocking the encoder
-                            // at 30fps.
-                            continue;
-                        }
-
-                        let force_kf = in_burst && burst_first;
-                        if force_kf {
-                            burst_first = false;
-                        }
-
-                        let old_path_ok = i420_tx
-                            .try_send((i420.clone(), arrived, force_kf))
-                            .is_ok();
-                        if !old_path_ok {
-                            bridge_counters
-                                .encode_drops
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-
-                        // Phase 3c.2: dual-feed the same gated I420 frame
-                        // into the pool's broadcast so the pool's
-                        // always-on encoder (and, in 3c.3+, on-demand
-                        // encoders) see the same tick rhythm, heartbeat
-                        // cadence, and burst window the old path does.
-                        // Pool has its own broadcast capacity and its
-                        // own dropping semantics, so the two paths don't
-                        // serialize on each other. `push_i420_frame`
-                        // returns the current subscriber count — a
-                        // healthy pool post-`start()` has ≥1 always-on
-                        // encoder subscribed, but we don't react to the
-                        // return value here (the pool's own lag/drop
-                        // handling covers encoder stalls).
-                        //
-                        // Done unconditionally (not gated on
-                        // `old_path_ok`) because the pool has independent
-                        // capacity; rate-limiting it to the old path's
-                        // success would tie the new path's throughput
-                        // to the old one's failure mode, which is the
-                        // opposite of what dual-feed is for.
-                        //
-                        // TODO 3c.4: when the old single-encoder path
-                        // is deleted, switch to `Arc<Vec<u8>>` end-to-end
-                        // so this doesn't double-clone.
-                        if let Some(ref pool) = pool_for_bridge {
-                            // 3c.3a established the invariant that the
-                            // resize branch above calls
-                            // `pool.on_resize(...)` in the same beat it
-                            // updates `enc_width`/`enc_height`, so by
-                            // the time we get here the pool's
-                            // dimensions always match the bridge's.
-                            // `debug_assert` catches a future regression
-                            // (someone adds a resize path that bypasses
-                            // pool.on_resize) without costing anything
-                            // in release builds.
-                            debug_assert_eq!(
-                                pool.dimensions(),
-                                (enc_width, enc_height),
-                                "pool.on_resize must be called in the bridge's \
-                                 resize branch before any push at the new \
-                                 dimensions"
-                            );
-                            pool.push_i420_frame(
-                                Arc::new(i420.clone()),
-                                arrived,
-                            );
-                        }
-
-                        if old_path_ok {
-                            last_sent_gen = Some(generation);
-                            last_send_at = Instant::now();
-                        }
-                    }
-                }
-            }
-        });
-
-        let fanout_counters = Arc::clone(&self.counters);
-        let shutdown_fanout = self.shutdown.clone();
-        let fanout_display_id = self.display_id;
-        let encoder_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = shutdown_fanout.cancelled() => break,
-                    ef = efr_rx.recv() => {
-                        let Some(ef) = ef else {
-                            eprintln!(
-                                "[display/fanout] display {} encoder channel \
-                                 closed, fan-out exiting",
-                                fanout_display_id,
-                            );
-                            break;
-                        };
-                        let peers_guard = peers.read().await;
-                        for peer in peers_guard.values() {
-                            // Phase 3c.3b.3: skip pool-mode peers.
-                            // They receive frames via their per-peer
-                            // `pool_frame_intake` task; forwarding
-                            // here would produce duplicate RTP
-                            // samples on the peer's encoded-frame
-                            // mpsc and corrupt decode (codec PTs
-                            // wouldn't match either, since the pool
-                            // peer's str0m enabled codec set was
-                            // negotiated separately from the legacy
-                            // session codec). The marker is a bool
-                            // on `WebRtcPeer` (no lock acquisition
-                            // on this hot path).
-                            if peer.is_pool_mode() {
-                                continue;
-                            }
-                            if peer.encoded_frame_tx().try_send(Arc::clone(&ef)).is_err() {
-                                fanout_counters
-                                    .peer_drops
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-            }
-            bridge_handle.abort();
-        });
-        *self.encoder_handle.lock().await = Some(encoder_handle);
-    }
 
     /// Handle a WebRTC SDP offer from a browser peer.
     ///
-    /// On the first call, selects the best available codec and starts the
-    /// encoder pipeline.  Subsequent peers reuse the running encoder's codec
-    /// without re-negotiating -- all peers share one encoder, so the codec
-    /// is locked once it starts.
+    /// Per-peer codec selection via the encoder pool: each peer's
+    /// codec set is negotiated from its own SDP rather than locked
+    /// to a session-wide codec, so concurrent peers can use different
+    /// codecs without interfering. See [`Self::handle_offer_pool_mode`]
+    /// for the implementation; this method is a thin wrapper retained
+    /// for the public API surface.
     ///
-    /// The `encoder_init_lock` mutex serializes codec selection and encoder
-    /// startup so that concurrent first-offer calls cannot race on codec
-    /// negotiation.  Only the first caller performs negotiation and starts
-    /// the encoder; all others wait and then use the established codec.
-    ///
-    /// Creates a `WebRtcPeer`, subscribes it to the encoder output, adds it to
-    /// the peer map, starts clipboard monitoring, and returns the SDP answer.
+    /// Creates a `WebRtcPeer`, subscribes it to the pool encoder
+    /// output for its negotiated codec, inserts it into the peer
+    /// map (closing any displaced peer with the same id), starts
+    /// clipboard monitoring, fires a peer-join keyframe + burst,
+    /// and returns the SDP answer.
     #[allow(clippy::too_many_arguments)]
     pub async fn handle_offer(
         &self,
@@ -1299,217 +864,49 @@ impl DisplaySession {
         tcp_advertised_addr: Option<std::net::SocketAddr>,
         ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<String, CallerError> {
-        // Phase 3c.3b.3: env-gated route to the pool-mode path.
-        // `INTENDANT_DISPLAY_POOL=1` (or `=true`, case-insensitive)
-        // routes the offer through the encoder pool +
-        // `WebRtcPeer::new_pool_mode`. Default OFF — the legacy
-        // single-encoder fan-out below remains the live path until
-        // 3c.4 flips the default and 3c.5 deletes the legacy code.
-        // Read per-call so an operator can enable the flag without
-        // restarting; concurrent peers can be on different paths
-        // (the `WebRtcPeer.pool_mode` marker keeps the fan-out from
-        // duplicating frames into pool peers).
-        if pool_mode_enabled() {
-            return self
-                .handle_offer_pool_mode(
-                    peer_id,
-                    sdp,
-                    ice_config,
-                    tcp_peer_registry,
-                    tcp_advertised_addr,
-                    ice_tx,
-                )
-                .await;
-        }
-
-        // Serialize codec selection + encoder startup.
-        let codec_mime = {
-            let mut init = self.encoder_init_lock.lock().await;
-            if *init {
-                // Encoder already running -- verify the new peer supports
-                // the locked codec (name + fmtp profile for H264).
-                let locked_mime = *self.codec_mime.read().await;
-                let locked_name = locked_mime.split('/').last().unwrap_or("");
-                if locked_name.eq_ignore_ascii_case("H264") {
-                    // For H264, verify fmtp compatibility (profile-level-id
-                    // and packetization-mode), not just codec name.
-                    if !encode::has_compatible_h264_offer(sdp) {
-                        let browser_codecs = encode::parse_offered_codecs(sdp);
-                        return Err(CallerError::WebRtc(format!(
-                            "peer does not support session codec {} with compatible profile (offered: {:?})",
-                            locked_mime, browser_codecs,
-                        )));
-                    }
-                } else {
-                    // Non-H264 codecs: name-only check.
-                    let browser_codecs = encode::parse_offered_codecs(sdp);
-                    if !browser_codecs
-                        .iter()
-                        .any(|c| c.eq_ignore_ascii_case(locked_name))
-                    {
-                        return Err(CallerError::WebRtc(format!(
-                            "peer does not support session codec {} (offered: {:?})",
-                            locked_mime, browser_codecs,
-                        )));
-                    }
-                }
-                locked_mime
-            } else {
-                // First peer -- negotiate codec from SDP and start encoder.
-                let (width, height) = self.backend.resolution();
-                let (_encoder, codec_choice) = encode::select_codec(sdp, width, height, 2000);
-                let mime = codec_choice.mime();
-                *self.codec_mime.write().await = mime;
-                self.start_encoder_pipeline(mime).await;
-                *init = true;
-                mime
-            }
-        };
-
-        let backend = Arc::clone(&self.backend);
-        let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> =
-            Arc::new(move |event: InputEvent| {
-                let backend = Arc::clone(&backend);
-                tokio::spawn(async move {
-                    if let Err(e) = backend.inject_input(event).await {
-                        eprintln!("[display] input injection failed: {e}");
-                    }
-                });
-            });
-
-        // Clipboard handler: browser -> remote clipboard.
-        let clipboard_monitor = Arc::clone(&self.clipboard_monitor);
-        let clipboard_handler: Arc<dyn Fn(clipboard::ClipboardContent) + Send + Sync> =
-            Arc::new(move |content: clipboard::ClipboardContent| {
-                let monitor = Arc::clone(&clipboard_monitor);
-                tokio::spawn(async move {
-                    match content {
-                        clipboard::ClipboardContent::Text(text) => {
-                            if let Err(e) = monitor.set_text(&text).await {
-                                eprintln!("[display/clipboard] set_text failed: {e}");
-                            }
-                        }
-                        clipboard::ClipboardContent::Image { mime, data } => {
-                            if let Err(e) = monitor.set_image(&mime, &data).await {
-                                eprintln!("[display/clipboard] set_image failed: {e}");
-                            }
-                        }
-                    }
-                });
-            });
-
-        // Translate the session-level `codec_mime` (today: singleton because
-        // the encoder pool isn't yet wired) into the per-peer codec set
-        // WebRtcPeer::new now expects. Phase 3 will replace this singleton
-        // with the actual pool's currently-running codec set, at which point
-        // a peer offering multiple codecs gets its Rtc configured to
-        // negotiate the best overlap rather than pre-locked to the first
-        // peer's choice.
-        let codec_kind = encode::pool::CodecKind::from_mime(codec_mime)
-            .ok_or_else(|| CallerError::WebRtc(format!(
-                "unsupported session codec mime: {codec_mime}"
-            )))?;
-        let codec_set = [codec_kind];
-
-        let (peer, answer_sdp) = self::webrtc::WebRtcPeer::new(
+        self.handle_offer_pool_mode(
             peer_id,
             sdp,
-            &codec_set,
             ice_config,
             tcp_peer_registry,
             tcp_advertised_addr,
-            input_handler,
-            clipboard_handler,
             ice_tx,
         )
-        .await?;
-
-        let peer = Arc::new(peer);
-        // `HashMap::insert` silently drops a displaced value, which strands
-        // the previous peer's driver task and — worse — lets the gauge
-        // increment below double-count it. Every `peer_count` drift I saw
-        // during federation smoke-tests (1 → 5 → 6 across a single
-        // debugging session, even as clients closed) was one of these
-        // replacements. Toggling the display off/on "fixed" it by wiping
-        // the whole HashMap on session teardown; doing it properly means
-        // closing the replaced peer and skipping the fetch_add so the
-        // counter stays a true gauge.
-        //
-        // Replacement happens legitimately on every repeat offer for the
-        // same `peer_id` — browser renegotiation, federated signaling that
-        // reuses the primary's WS peer_id across sessions, a Retry-After
-        // driven reconnect, etc. — so this isn't a corner case.
-        let replaced = {
-            let mut guard = self.peers.write().await;
-            guard.insert(peer_id, Arc::clone(&peer))
-        };
-        match replaced {
-            Some(old) => {
-                old.close().await;
-            }
-            None => {
-                self.counters.peer_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        // Start clipboard monitoring (remote -> browser) if not already running.
-        self.ensure_clipboard_forwarding().await;
-
-        // Wake the bridge so the next forwarded frame is a forced keyframe.
-        // Without this, a peer joining during an idle desktop would wait up
-        // to one GOP interval (and, for VP8 on static content, potentially
-        // much longer) for a decodable reference.
-        if let Some(tx) = self.keyframe_tx.lock().await.as_ref() {
-            let _ = tx.send(());
-        }
-
-        Ok(answer_sdp)
+        .await
     }
 
-    /// Pool-mode counterpart to [`Self::handle_offer`], gated by
-    /// `INTENDANT_DISPLAY_POOL=1` (3c.3b.3 → 3c.4 cutover).
+    /// The body of [`Self::handle_offer`]. Kept separate so the
+    /// public method stays a thin wrapper that callers can audit at
+    /// a glance; 3c.5 may inline this once the env-flag and the last
+    /// stale references are gone.
     ///
-    /// Differences from the legacy path:
-    ///   - No `encoder_init_lock` dance: codec selection is per-peer
-    ///     via str0m's `enable_*()` calls in `WebRtcPeer::new_pool_mode`,
-    ///     driven by the codecs the pool's initial subscribe actually
-    ///     returned. No first-peer codec lock.
-    ///   - No `keyframe_tx` wake: pool peers don't share the legacy
-    ///     bridge's keyframe channel. Peer-join keyframe is wired
-    ///     in two parts at the tail of this function:
+    /// Pipeline:
+    ///   - Codec selection is per-peer via str0m's `enable_*()` calls
+    ///     in [`webrtc::WebRtcPeer::new_pool_mode`], driven by the
+    ///     codecs the pool's initial subscribe actually returned.
+    ///     No first-peer codec lock.
+    ///   - Peer-join keyframe is wired in two parts at the tail:
     ///     * [`crate::display::encode::pool::EncoderPool::request_keyframe_all`]
-    ///       (3c.3b.4a): fires a coalesced PLI-equivalent across
+    ///       (3c.3b.4a) fires a coalesced PLI-equivalent across
     ///       every active encoder. Honored by VP8 and macOS H.264.
     ///     * Burst signal via [`Self::signal_peer_join_burst`]
-    ///       (3c.3b.4b/.4c): wakes whichever bridge owns the pool
-    ///       feed (pool-feed bridge in pool-only sessions, legacy
-    ///       bridge in mixed sessions where a legacy peer attached
-    ///       first) to clock the encoder at tick rate for ~1.5s.
-    ///       Required for codecs that ignore `force_keyframe` on a
-    ///       long-running pipe (Linux ffmpeg H.264) — without the
-    ///       burst, an idle-desktop pool peer-join on Linux H.264
-    ///       stays black for many seconds waiting on the heartbeat-
-    ///       paced 1 push/sec cadence.
+    ///       (3c.3b.4b) wakes the pool-feed bridge to clock the
+    ///       encoder at tick rate for ~1.5s. Required for codecs
+    ///       that ignore `force_keyframe` on a long-running pipe
+    ///       (Linux ffmpeg H.264) — without the burst, an idle-
+    ///       desktop pool peer-join on Linux H.264 stays black for
+    ///       many seconds waiting on the heartbeat-paced 1 push/sec
+    ///       cadence.
     ///     The PLI-driven per-peer explicit request from str0m's
     ///     inbound RTCP lands with the simulcast work.
     ///   - No `pool_leases` tracking on `DisplaySession`:
-    ///     `WebRtcPeer::new_pool_mode` hands the lease to the
-    ///     per-peer `pool_frame_intake` task, which owns it for the
-    ///     peer's lifetime. `Self::remove_peer` calls
-    ///     `peer.close()`, which fires the shutdown token, which the
-    ///     intake task observes — its select-arm drops the lease via
-    ///     `drop(current_lease.take())` (RAII releases on-demand
-    ///     refcounts under the existing generation gate). The
-    ///     primer's "DisplaySession stores HashMap<PeerId, PoolLease>"
-    ///     suggestion was written before the 3c.3b.2 design
-    ///     finalized intake-owns-lease; tracking the lease in two
-    ///     places would either duplicate ownership (won't compile)
-    ///     or race the intake's resubscribe path on early release.
-    ///
-    /// Common with legacy: input/clipboard handler closures, peer
-    /// insertion + replaced-peer close + counter, ensure_clipboard_forwarding.
-    /// 3c.4 deletes the legacy path and folds the common boilerplate
-    /// into a single fn; until then the duplication is intentional.
+    ///     [`webrtc::WebRtcPeer::new_pool_mode`] hands the lease to
+    ///     the per-peer `pool_frame_intake` task, which owns it for
+    ///     the peer's lifetime. [`Self::remove_peer`] calls
+    ///     `peer.close()`, the shutdown token fires, and the intake
+    ///     task drops the lease via `drop(current_lease.take())`
+    ///     (RAII releases on-demand refcounts under the existing
+    ///     generation gate).
     async fn handle_offer_pool_mode(
         &self,
         peer_id: PeerId,
@@ -1657,55 +1054,25 @@ impl DisplaySession {
         Ok(answer_sdp)
     }
 
-    /// Open the peer-join burst window on the bridge currently
-    /// **feeding the pool**.
+    /// Open the peer-join burst window on the pool-feed bridge.
     ///
-    /// **Pool feed ownership invariant.** The pool feed has exactly
-    /// one owner at any time, established by the 3c.3b.3b
-    /// coordination: `encoder_init_lock` serializes the decision,
-    /// and whichever bridge wins the lock first owns pool feed
-    /// ownership for the session lifetime. Specifically:
-    ///   - Pool-first session: `ensure_pool_feed_bridge_started`
-    ///     installs `pool_feed_keyframe_tx` and spawns the pool-feed
-    ///     bridge. If a legacy peer arrives LATER,
-    ///     `start_encoder_pipeline` runs with `pool_for_bridge=None` —
-    ///     its `keyframe_tx` is installed but its bridge does NOT
-    ///     feed the pool. Both channels are `Some` in this state.
-    ///   - Legacy-first session: `start_encoder_pipeline` installs
-    ///     `keyframe_tx` and the legacy bridge feeds the pool via
-    ///     `pool_for_bridge=Some`. `ensure_pool_feed_bridge_started`
-    ///     early-returns when `*init == true`, so
-    ///     `pool_feed_keyframe_tx` stays `None`.
-    /// In every state, `pool_feed_keyframe_tx.is_some()` is the
-    /// single source of truth for "pool-feed bridge owns the pool
-    /// feed" — see [`Self::pool_feed_keyframe_tx`] field doc and
-    /// [`Self::ensure_pool_feed_bridge_started`].
+    /// **3c.4b** collapsed this from a two-channel dispatch
+    /// (pool-feed + legacy fallback) into a single
+    /// `pool_feed_keyframe_tx` send, because the legacy bridge is
+    /// gone. The pool-feed bridge is now the only bridge that ever
+    /// feeds the pool, so its keyframe channel is the only burst
+    /// channel.
     ///
-    /// **Dispatch.** Try the pool-feed bridge first; fall back to
-    /// the legacy bridge only if pool-feed isn't installed. Exactly
-    /// one channel is signaled per call. Sending to BOTH (the
-    /// 3c.3b.4c-pre version) was correct but over-woke the legacy
-    /// bridge in pool-first → legacy-later sessions where the legacy
-    /// bridge runs but doesn't feed the pool — wasted work and an
-    /// obscured invariant.
-    ///
-    /// **Why this exists.** 3c.3b.4b only signaled
-    /// `pool_feed_keyframe_tx`, which leaves legacy-first mixed
-    /// sessions black: pool-feed bridge never starts →
-    /// `pool_feed_keyframe_tx` stays `None` → 4b's signal no-ops →
-    /// later pool peer's Linux H.264 forwarder waits seconds on the
-    /// 1 push/sec heartbeat cadence (the ffmpeg-pipe encoder
-    /// ignores `force_keyframe`).
+    /// Required for codecs that ignore `force_keyframe` on a
+    /// long-running pipe (Linux ffmpeg H.264) — `request_keyframe_all`
+    /// alone won't reach those encoders, so the burst clocks the
+    /// encoder at tick rate so its `-g 30` natural cadence emits a
+    /// keyframe inside the window. No-op when the pool-feed bridge
+    /// hasn't been spawned yet (the kf signal is silently dropped on
+    /// the unbounded channel; first-offer flows install the sender
+    /// before signaling).
     async fn signal_peer_join_burst(&self) {
-        // Pool-feed bridge owns the pool feed iff its keyframe
-        // channel is installed. Try it first.
         if let Some(tx) = self.pool_feed_keyframe_tx.lock().await.as_ref() {
-            let _ = tx.send(());
-            return;
-        }
-        // Pool-feed bridge isn't installed → legacy bridge owns the
-        // pool feed via `pool_for_bridge=Some`. Wake its burst.
-        if let Some(tx) = self.keyframe_tx.lock().await.as_ref() {
             let _ = tx.send(());
         }
     }
@@ -1768,19 +1135,12 @@ impl DisplaySession {
     /// Either way the pool's broadcast gets exactly one feed, and
     /// no double-encoding bug.
     async fn ensure_pool_feed_bridge_started(&self) {
-        // Order: encoder_init_lock first, then pool_feed_bridge_handle.
-        // Same nesting in `start_encoder_pipeline`'s consultation, so
-        // concurrent first-offers can't deadlock and can't both end up
-        // owning the pool feed.
-        let init = self.encoder_init_lock.lock().await;
+        // 3c.4b deleted the legacy bridge, so the pool-feed bridge
+        // is the only bridge that ever feeds the pool. The only
+        // coordination needed now is "don't spawn twice" — a second
+        // call from a later offer just returns.
         let mut handle = self.pool_feed_bridge_handle.lock().await;
         if handle.is_some() {
-            // Already running from a previous pool offer.
-            return;
-        }
-        if *init {
-            // Legacy bridge is running and dual-feeds the pool. We'd
-            // double-feed if we also spawned. Skip.
             return;
         }
         let Some(pool) = self.pool.get().map(Arc::clone) else {
@@ -2132,160 +1492,7 @@ impl DisplaySession {
 
 // ---------------------------------------------------------------------------
 // Encoder thread helper
-// ---------------------------------------------------------------------------
 
-/// Spawn an encoder thread that reads I420 frames from `i420_rx`, encodes
-/// them using the negotiated codec, and sends `Arc<EncodedFrame>` to `efr_tx`.
-///
-/// `codec_mime` selects the encoder implementation (currently only `"video/VP8"`
-/// is supported; future codecs will be added here).
-///
-/// The thread exits cleanly when `i420_rx` is closed (sender dropped) or
-/// the shutdown token is cancelled.  This is a free function so the
-/// broadcast-to-encoder bridge can call it on resize without needing
-/// `&self`.
-fn spawn_encoder_thread(
-    width: u32,
-    height: u32,
-    duration_ms: u64,
-    codec_mime: &'static str,
-    i420_rx: std::sync::mpsc::Receiver<(Vec<u8>, Instant, bool)>,
-    efr_tx: mpsc::Sender<Arc<EncodedFrame>>,
-    counters: Arc<DisplayMetricsCounters>,
-    shutdown: CancellationToken,
-) {
-    std::thread::spawn(move || {
-        let mut encoder: Box<dyn encode::Encoder> = match encode::select_codec_for_mime(codec_mime, width, height, 2000) {
-            Ok((enc, _choice)) => enc,
-            Err(e) => {
-                eprintln!("[display/encoder] {} encoder FAILED for {}x{}: {}", codec_mime, width, height, e);
-                return;
-            }
-        };
-
-        // Watchdog: detect silent encoders that accept input but produce
-        // nothing on the wire (e.g. h264_vaapi on hosts where virtio-gpu
-        // video acceleration is broken — vaInitialize "succeeds" but no
-        // NALs ever come out of stdout). After this many consecutive input
-        // frames with no encoded packet, swap to a known-good fallback.
-        // 30 frames ≈ 1s at 30fps, well above the normal 1-2 frame
-        // pipeline depth for any healthy encoder.
-        const WATCHDOG_THRESHOLD: u64 = 30;
-        let mut frames_since_last_output: u64 = 0;
-        let mut watchdog_swap_done = false;
-
-        while let Ok((i420, arrived, force_keyframe)) = i420_rx.recv() {
-            if shutdown.is_cancelled() {
-                break;
-            }
-
-            let produced = match encoder.encode(&i420, duration_ms, force_keyframe) {
-                Ok(packets) => {
-                    let n = packets.len();
-                    let latency_us = arrived.elapsed().as_micros() as u64;
-                    for pkt in packets {
-                        counters.encode_frames.fetch_add(1, Ordering::Relaxed);
-                        counters
-                            .encode_latency_us_sum
-                            .fetch_add(latency_us, Ordering::Relaxed);
-                        let ef = Arc::new(pkt.into_encoded_frame());
-                        if efr_tx.blocking_send(ef).is_err() {
-                            return;
-                        }
-                    }
-                    n
-                }
-                Err(e) => {
-                    eprintln!("[display/encoder] encode error: {}", e);
-                    0
-                }
-            };
-
-            if produced > 0 {
-                frames_since_last_output = 0;
-            } else {
-                frames_since_last_output += 1;
-                if !watchdog_swap_done && frames_since_last_output >= WATCHDOG_THRESHOLD {
-                    watchdog_swap_done = true;
-                    eprintln!(
-                        "[display/encoder] watchdog: {} consecutive input frames produced no output",
-                        frames_since_last_output,
-                    );
-                    if let Some(new_enc) = try_h264_fallback(codec_mime, width, height) {
-                        eprintln!(
-                            "[display/encoder] watchdog: swapped encoder to libx264 fallback",
-                        );
-                        encoder = new_enc;
-                        frames_since_last_output = 0;
-                    } else {
-                        eprintln!(
-                            "[display/encoder] watchdog: no fallback available, encoder stays",
-                        );
-                    }
-                }
-            }
-        }
-    });
-}
-
-/// Attempt a watchdog-triggered swap to the libx264 software H.264 encoder.
-///
-/// Returns `Some(encoder)` only when:
-/// - the codec is H.264 (no fallback strategy for VP8 — libvpx doesn't
-///   exhibit this silent-failure pattern), and
-/// - the new encoder spawns cleanly.
-///
-/// **3c.3b.4g:** the previous version ALSO early-returned when
-/// `is_vaapi_banned()` was already true, on the assumption that the
-/// current encoder must already be libx264. That assumption fails
-/// for encoders constructed BEFORE a sibling watchdog set the ban
-/// (multi-H.264-pool-slot and mixed pool/legacy sessions both reach
-/// this state): the second watchdog would see the ban, return None,
-/// and leave a pre-ban VAAPI encoder stranded on the broken path
-/// forever. Fix: drop the `is_vaapi_banned` early-return, treat
-/// `ban_vaapi()` as the idempotent no-op it is, always attempt
-/// construction. At worst an already-libx264 encoder respawns
-/// libx264 once (a one-time waste; the watchdog latches and won't
-/// fire again); at best a pre-ban VAAPI encoder gets the libx264
-/// it would otherwise miss. Mirrors the same fix in
-/// [`crate::display::encode::pool::try_h264_fallback_for_layer`] —
-/// the two helpers will collapse to one when 3c.4 deletes this
-/// legacy path.
-///
-/// On non-Linux targets there's no VA-API path to ban, so this is a no-op.
-#[cfg(target_os = "linux")]
-fn try_h264_fallback(
-    codec_mime: &'static str,
-    width: u32,
-    height: u32,
-) -> Option<Box<dyn encode::Encoder>> {
-    if codec_mime != encode::MIME_TYPE_H264 {
-        return None;
-    }
-    // Idempotent — see VAAPI_BANNED in encode/h264_linux.rs (one-way
-    // AtomicBool that's never cleared). Calling when already banned
-    // is a no-op store.
-    encode::h264_linux::ban_vaapi();
-    match encode::select_codec_for_mime(codec_mime, width, height, 2000) {
-        Ok((enc, _)) => Some(enc),
-        Err(e) => {
-            eprintln!(
-                "[display/encoder] watchdog: libx264 fallback creation failed: {}",
-                e,
-            );
-            None
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn try_h264_fallback(
-    _codec_mime: &'static str,
-    _width: u32,
-    _height: u32,
-) -> Option<Box<dyn encode::Encoder>> {
-    None
-}
 
 // ---------------------------------------------------------------------------
 // SessionRegistry
@@ -2770,60 +1977,6 @@ mod tests {
     // Phase 3c.3b.3a: pool-feed bridge — does NOT lock legacy codec
     // -----------------------------------------------------------------------
 
-    /// **3c.3b.3a finding 1 regression test.** The first iteration of
-    /// the pool-mode bridge-startup hook piggybacked on
-    /// `start_encoder_pipeline(VP8)` and set `encoder_init_lock=true`
-    /// + `codec_mime=VP8` as a side effect. That weakened the
-    /// coexistence story: a pool first-offer would lock the session
-    /// to VP8 and reject a later legacy H.264-only peer that the
-    /// original first-peer codec negotiation would have accepted.
-    ///
-    /// The fix decouples "bridge needs to run for pool feed" from
-    /// "legacy codec is decided." The pool-feed bridge is a separate
-    /// task that does BGRA→I420→`pool.push_i420_frame` without
-    /// touching `encoder_init_lock` or `codec_mime`. This test pins
-    /// the contract.
-    #[tokio::test]
-    async fn ensure_pool_feed_bridge_started_does_not_lock_legacy_codec() {
-        let backend = Arc::new(StubBackend { width: 64, height: 64 });
-        let session = DisplaySession::new(0, backend);
-        session
-            .start(30, None, None)
-            .await
-            .expect("start() must succeed");
-
-        // Pre-condition baseline: legacy pipeline never started.
-        assert!(!*session.encoder_init_lock.lock().await);
-        let codec_before = *session.codec_mime.read().await;
-
-        session.ensure_pool_feed_bridge_started().await;
-
-        // Post-condition: bridge handle is set (pool feed is running)
-        // BUT the legacy codec/init state is untouched. A legacy
-        // H.264-only peer arriving next runs through handle_offer's
-        // first-peer codec-negotiation path normally.
-        assert!(
-            session.pool_feed_bridge_handle.lock().await.is_some(),
-            "pool feed bridge must be spawned"
-        );
-        assert!(
-            !*session.encoder_init_lock.lock().await,
-            "encoder_init_lock MUST stay false — pool path does not \
-             decide a session codec, only ensures the pool feed is \
-             running. A later legacy peer must be free to negotiate \
-             its own codec via select_codec."
-        );
-        assert_eq!(
-            *session.codec_mime.read().await,
-            codec_before,
-            "codec_mime MUST stay at its default — pool path does not \
-             touch the legacy session codec. Changing it would break \
-             a later legacy peer's codec validation."
-        );
-
-        // Cleanup: cancel shutdown so the bridge task exits.
-        session.shutdown.cancel();
-    }
 
     /// Calling the bridge starter a second time is a no-op: the
     /// handle guard returns early. The first task keeps running; we
@@ -2870,41 +2023,6 @@ mod tests {
         session.shutdown.cancel();
     }
 
-    /// When the legacy bridge is already running (legacy first-peer
-    /// arrived before any pool peer), the pool-feed bridge MUST NOT
-    /// spawn — the legacy bridge's existing 3c.2 dual-feed already
-    /// covers the pool. Spawning a second bridge would double-feed
-    /// the pool's I420 broadcast → duplicate encoded frames on every
-    /// pool peer → corrupted decode (3c.3b.2a multi-sub fan-out
-    /// shape).
-    ///
-    /// We simulate "legacy bridge already running" by setting
-    /// `encoder_init_lock=true` directly. The `start_encoder_pipeline`
-    /// call sequence isn't necessary for this contract — the gate
-    /// the test exercises is purely the init-lock check inside
-    /// `ensure_pool_feed_bridge_started`.
-    #[tokio::test]
-    async fn ensure_pool_feed_bridge_started_skips_when_legacy_running() {
-        let backend = Arc::new(StubBackend { width: 64, height: 64 });
-        let session = DisplaySession::new(0, backend);
-        session
-            .start(30, None, None)
-            .await
-            .expect("start() must succeed");
-
-        // Pretend the legacy first-peer path has already run.
-        *session.encoder_init_lock.lock().await = true;
-
-        session.ensure_pool_feed_bridge_started().await;
-
-        assert!(
-            session.pool_feed_bridge_handle.lock().await.is_none(),
-            "with encoder_init_lock=true, the pool-feed bridge must \
-             NOT spawn — legacy bridge owns the pool feed via dual-feed"
-        );
-
-        session.shutdown.cancel();
-    }
 
     /// Build a synthetic BGRA frame for tests. Contents are
     /// uninteresting (all zeros) — we only care that the bridge
@@ -3343,110 +2461,7 @@ mod tests {
         session.shutdown.cancel();
     }
 
-    /// **3c.3b.4c regression test (legacy-first mixed session).**
-    /// When a legacy peer attached first, the legacy bridge owns
-    /// the pool feed and `ensure_pool_feed_bridge_started` early-
-    /// returns without installing `pool_feed_keyframe_tx`. A later
-    /// pool peer's burst signal must reach the LEGACY bridge's
-    /// `keyframe_tx`, or Linux H.264 stays black on the pool peer.
-    /// `signal_peer_join_burst` dispatches to the pool-feed channel
-    /// first and falls back to the legacy channel only when
-    /// `pool_feed_keyframe_tx` is `None` (3c.3b.4d). Asserting the
-    /// legacy channel receives in this state confirms the fallback
-    /// path is wired.
-    #[tokio::test]
-    async fn signal_peer_join_burst_wakes_legacy_bridge_in_mixed_session() {
-        let backend = Arc::new(StubBackend { width: 64, height: 64 });
-        let session = DisplaySession::new(0, backend);
 
-        // Simulate "legacy bridge owns pool feed":
-        //   - install legacy `keyframe_tx` (as `start_encoder_pipeline`
-        //     would have done after taking `encoder_init_lock`)
-        //   - leave `pool_feed_keyframe_tx` as `None` (mirrors the
-        //     `ensure_pool_feed_bridge_started` early-return when
-        //     `*init == true`).
-        let (legacy_tx, mut legacy_rx) = mpsc::unbounded_channel::<()>();
-        *session.keyframe_tx.lock().await = Some(legacy_tx);
-        assert!(
-            session.pool_feed_keyframe_tx.lock().await.is_none(),
-            "test premise: pool_feed_keyframe_tx must be None to \
-             model the mixed-session path",
-        );
-
-        session.signal_peer_join_burst().await;
-
-        let recv = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            legacy_rx.recv(),
-        )
-        .await;
-        assert!(
-            matches!(recv, Ok(Some(()))),
-            "legacy keyframe_tx must receive burst signal in mixed \
-             session; got {recv:?}. Pre-3c.3b.4c: signal only went \
-             to pool_feed_keyframe_tx (which is None here) → no-op \
-             → Linux H.264 pool peer stays black.",
-        );
-    }
-
-    /// **3c.3b.4d regression test (pool-first → legacy-later
-    /// session).** Both keyframe channels are `Some` in this state
-    /// (pool-feed bridge owns the pool feed via the install-first
-    /// invariant; the legacy bridge runs but with `pool_for_bridge=
-    /// None` per 3c.3b.3b coordination). `signal_peer_join_burst`
-    /// MUST dispatch to the pool-feed channel only — over-waking
-    /// the legacy bridge is wasted work and obscures the
-    /// "pool_feed_keyframe_tx.is_some() ⇔ pool-feed bridge owns the
-    /// pool feed" invariant.
-    ///
-    /// 3c.3b.4c-pre version sent to BOTH channels, which was correct
-    /// (the legacy bridge with `pool_for_bridge=None` doesn't feed
-    /// the pool, so the over-wake had no effect on the pool feed)
-    /// but wasted work and made the invariant easy to misread. This
-    /// test would have passed against both implementations; it
-    /// exists to PIN the tightened semantics so a future "send to
-    /// both for safety" regression fires here.
-    #[tokio::test]
-    async fn signal_peer_join_burst_dispatches_to_pool_feed_when_both_installed(
-    ) {
-        let backend = Arc::new(StubBackend { width: 64, height: 64 });
-        let session = DisplaySession::new(0, backend);
-
-        let (pool_tx, mut pool_rx) = mpsc::unbounded_channel::<()>();
-        let (legacy_tx, mut legacy_rx) = mpsc::unbounded_channel::<()>();
-        *session.pool_feed_keyframe_tx.lock().await = Some(pool_tx);
-        *session.keyframe_tx.lock().await = Some(legacy_tx);
-
-        session.signal_peer_join_burst().await;
-
-        // Pool-feed channel MUST receive (it owns the feed).
-        let pool_recv = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            pool_rx.recv(),
-        )
-        .await;
-        assert!(
-            matches!(pool_recv, Ok(Some(()))),
-            "pool_feed_keyframe_tx must receive when both channels \
-             are installed; got {pool_recv:?}",
-        );
-
-        // Legacy channel must NOT receive — it's not feeding the
-        // pool in this state. Bounded short timeout: if the signal
-        // were going to land it would be near-instantaneous.
-        let legacy_recv = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            legacy_rx.recv(),
-        )
-        .await;
-        assert!(
-            legacy_recv.is_err(),
-            "keyframe_tx must NOT receive when pool-feed bridge \
-             owns the pool feed; got {legacy_recv:?}. Sending to \
-             both over-wakes the legacy bridge — wasted work and \
-             muddies the dispatch invariant.",
-        );
-    }
 
     /// **3c.3b.4c regression test (pool-only session).** Symmetric
     /// to the mixed-session test above: in a pool-only session the
@@ -3462,11 +2477,6 @@ mod tests {
 
         let (pool_tx, mut pool_rx) = mpsc::unbounded_channel::<()>();
         *session.pool_feed_keyframe_tx.lock().await = Some(pool_tx);
-        assert!(
-            session.keyframe_tx.lock().await.is_none(),
-            "test premise: keyframe_tx must be None to model the \
-             pool-only path",
-        );
 
         session.signal_peer_join_burst().await;
 
