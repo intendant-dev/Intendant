@@ -1639,39 +1639,54 @@ impl DisplaySession {
         Ok(answer_sdp)
     }
 
-    /// Open the peer-join burst window on whichever bridge currently
-    /// owns the pool feed.
+    /// Open the peer-join burst window on the bridge currently
+    /// **feeding the pool**.
     ///
-    /// **Why two channels.** The pool feed has exactly one owner at
-    /// any time, established by the single-feed-ownership invariant
-    /// in 3c.3b.3b: `encoder_init_lock` serializes the decision, and
-    /// [`Self::ensure_pool_feed_bridge_started`] no-ops if `*init ==
-    /// true` (legacy bridge wins). So at most one of
-    /// `pool_feed_keyframe_tx` / `keyframe_tx` is `Some` at any
-    /// moment. Sending to both is idempotent on the `None` side and
-    /// avoids a "which bridge is active right now?" check at every
-    /// call site — call sites just call this and stay correct
-    /// regardless of which lifecycle path the session followed.
+    /// **Pool feed ownership invariant.** The pool feed has exactly
+    /// one owner at any time, established by the 3c.3b.3b
+    /// coordination: `encoder_init_lock` serializes the decision,
+    /// and whichever bridge wins the lock first owns pool feed
+    /// ownership for the session lifetime. Specifically:
+    ///   - Pool-first session: `ensure_pool_feed_bridge_started`
+    ///     installs `pool_feed_keyframe_tx` and spawns the pool-feed
+    ///     bridge. If a legacy peer arrives LATER,
+    ///     `start_encoder_pipeline` runs with `pool_for_bridge=None` —
+    ///     its `keyframe_tx` is installed but its bridge does NOT
+    ///     feed the pool. Both channels are `Some` in this state.
+    ///   - Legacy-first session: `start_encoder_pipeline` installs
+    ///     `keyframe_tx` and the legacy bridge feeds the pool via
+    ///     `pool_for_bridge=Some`. `ensure_pool_feed_bridge_started`
+    ///     early-returns when `*init == true`, so
+    ///     `pool_feed_keyframe_tx` stays `None`.
+    /// In every state, `pool_feed_keyframe_tx.is_some()` is the
+    /// single source of truth for "pool-feed bridge owns the pool
+    /// feed" — see [`Self::pool_feed_keyframe_tx`] field doc and
+    /// [`Self::ensure_pool_feed_bridge_started`].
     ///
-    /// **What gets signaled.** `pool_feed_keyframe_tx`'s receiver is
-    /// in the pool-feed bridge spawned by `ensure_pool_feed_bridge_started`
-    /// (3c.3b.4b). `keyframe_tx`'s receiver is in the legacy bridge
-    /// spawned by `start_encoder_pipeline`. Either fires the same
-    /// 1.5s burst window mechanism on its own bridge — clocks the
-    /// encoder at tick rate so codecs that ignore `force_keyframe`
-    /// on a long-running pipe (Linux ffmpeg H.264) hit a natural
-    /// keyframe inside the window.
+    /// **Dispatch.** Try the pool-feed bridge first; fall back to
+    /// the legacy bridge only if pool-feed isn't installed. Exactly
+    /// one channel is signaled per call. Sending to BOTH (the
+    /// 3c.3b.4c-pre version) was correct but over-woke the legacy
+    /// bridge in pool-first → legacy-later sessions where the legacy
+    /// bridge runs but doesn't feed the pool — wasted work and an
+    /// obscured invariant.
     ///
-    /// **Why this exists.** 3c.3b.4b only signaled `pool_feed_keyframe_tx`,
-    /// which leaves mixed sessions black: a legacy peer attaches first
-    /// → legacy bridge owns the pool feed → pool-feed bridge never
-    /// starts → `pool_feed_keyframe_tx` stays `None` → 4b's signal
-    /// no-ops → later pool peer's Linux H.264 forwarder waits seconds
-    /// on the 1 push/sec heartbeat cadence. Closing 4b's high finding.
+    /// **Why this exists.** 3c.3b.4b only signaled
+    /// `pool_feed_keyframe_tx`, which leaves legacy-first mixed
+    /// sessions black: pool-feed bridge never starts →
+    /// `pool_feed_keyframe_tx` stays `None` → 4b's signal no-ops →
+    /// later pool peer's Linux H.264 forwarder waits seconds on the
+    /// 1 push/sec heartbeat cadence (the ffmpeg-pipe encoder
+    /// ignores `force_keyframe`).
     async fn signal_peer_join_burst(&self) {
+        // Pool-feed bridge owns the pool feed iff its keyframe
+        // channel is installed. Try it first.
         if let Some(tx) = self.pool_feed_keyframe_tx.lock().await.as_ref() {
             let _ = tx.send(());
+            return;
         }
+        // Pool-feed bridge isn't installed → legacy bridge owns the
+        // pool feed via `pool_for_bridge=Some`. Wake its burst.
         if let Some(tx) = self.keyframe_tx.lock().await.as_ref() {
             let _ = tx.send(());
         }
@@ -3312,6 +3327,65 @@ mod tests {
              session; got {recv:?}. Pre-3c.3b.4c: signal only went \
              to pool_feed_keyframe_tx (which is None here) → no-op \
              → Linux H.264 pool peer stays black.",
+        );
+    }
+
+    /// **3c.3b.4d regression test (pool-first → legacy-later
+    /// session).** Both keyframe channels are `Some` in this state
+    /// (pool-feed bridge owns the pool feed via the install-first
+    /// invariant; the legacy bridge runs but with `pool_for_bridge=
+    /// None` per 3c.3b.3b coordination). `signal_peer_join_burst`
+    /// MUST dispatch to the pool-feed channel only — over-waking
+    /// the legacy bridge is wasted work and obscures the
+    /// "pool_feed_keyframe_tx.is_some() ⇔ pool-feed bridge owns the
+    /// pool feed" invariant.
+    ///
+    /// 3c.3b.4c-pre version sent to BOTH channels, which was correct
+    /// (the legacy bridge with `pool_for_bridge=None` doesn't feed
+    /// the pool, so the over-wake had no effect on the pool feed)
+    /// but wasted work and made the invariant easy to misread. This
+    /// test would have passed against both implementations; it
+    /// exists to PIN the tightened semantics so a future "send to
+    /// both for safety" regression fires here.
+    #[tokio::test]
+    async fn signal_peer_join_burst_dispatches_to_pool_feed_when_both_installed(
+    ) {
+        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let session = DisplaySession::new(0, backend);
+
+        let (pool_tx, mut pool_rx) = mpsc::unbounded_channel::<()>();
+        let (legacy_tx, mut legacy_rx) = mpsc::unbounded_channel::<()>();
+        *session.pool_feed_keyframe_tx.lock().await = Some(pool_tx);
+        *session.keyframe_tx.lock().await = Some(legacy_tx);
+
+        session.signal_peer_join_burst().await;
+
+        // Pool-feed channel MUST receive (it owns the feed).
+        let pool_recv = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            pool_rx.recv(),
+        )
+        .await;
+        assert!(
+            matches!(pool_recv, Ok(Some(()))),
+            "pool_feed_keyframe_tx must receive when both channels \
+             are installed; got {pool_recv:?}",
+        );
+
+        // Legacy channel must NOT receive — it's not feeding the
+        // pool in this state. Bounded short timeout: if the signal
+        // were going to land it would be near-instantaneous.
+        let legacy_recv = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            legacy_rx.recv(),
+        )
+        .await;
+        assert!(
+            legacy_recv.is_err(),
+            "keyframe_tx must NOT receive when pool-feed bridge \
+             owns the pool feed; got {legacy_recv:?}. Sending to \
+             both over-wakes the legacy bridge — wasted work and \
+             muddies the dispatch invariant.",
         );
     }
 
