@@ -539,11 +539,30 @@ impl DisplaySession {
         });
         *self.capture_handle.lock().await = Some(capture_handle);
 
-        // Construct the shared encoder pool with a single always-on
-        // VP8 layer at the source resolution. The pool spawns its
-        // VP8 encoder thread immediately; that thread blocks in
-        // `blocking_recv` until the pool-feed bridge below starts
-        // publishing I420 frames. Idle cost is negligible.
+        // Phase 4b: validate that VP8 simulcast can produce at least
+        // one encodable layer for this source resolution. The pool
+        // constructor (`EncoderPool::new`) accepts an empty always-on
+        // set deliberately — many unit tests pass `|_, _| vec![]` to
+        // exercise on-demand-only flows. But production sources are
+        // always ≥ MIN_LAYER_DIM in both dims, so an empty result here
+        // means the capture backend is reporting impossible dims (or
+        // the source is genuinely too small to encode). Fail loud
+        // before construction rather than building a pool that emits
+        // no media silently.
+        if encode::pool::LayerSpec::vp8_simulcast(width, height, fps).is_empty() {
+            return Err(CallerError::Display(format!(
+                "source too small for VP8 simulcast: {width}x{height} \
+                 (each candidate layer falls below MIN_LAYER_DIM={})",
+                encode::pool::MIN_LAYER_DIM,
+            )));
+        }
+
+        // Construct the shared encoder pool with VP8 simulcast layers
+        // (full / half / quarter, dropping any below MIN_LAYER_DIM).
+        // The pool spawns one VP8 encoder thread per surviving layer
+        // immediately; each thread blocks in `blocking_recv` until
+        // the pool-feed bridge below starts publishing I420 frames.
+        // Idle cost is negligible per layer.
         //
         // `get_or_init` swallows concurrent initializations cheaply;
         // in practice `start()` is called at most once per session.
@@ -552,20 +571,24 @@ impl DisplaySession {
                 width,
                 height,
                 fps,
-                // Single full-source VP8 layer. The factory receives
-                // the (possibly resized) source dims and returns a
-                // matching layer — so a runtime resize regenerates
-                // a layer at the new dims rather than rescaling
-                // (and accumulating rounding drift on) the previous
-                // epoch's layer. Phase 4b will swap this for
-                // `LayerSpec::vp8_simulcast(w, h, fps)` to enable
-                // the multi-layer simulcast path in production.
-                move |w, h| vec![encode::pool::LayerSpec::single(
-                    encode::pool::CodecKind::Vp8,
-                    w,
-                    h,
-                    fps,
-                )],
+                // Phase 4b: VP8 simulcast (full / half / quarter).
+                // The factory receives the (possibly resized) source
+                // dims and re-derives the canonical layout from them
+                // — so a runtime resize regenerates the layer set at
+                // the new dims rather than rescaling (and accumulating
+                // rounding drift on) the previous epoch's handles.
+                // This is the contract from 4a-fix-#3: every
+                // construction site (initial spawn AND on_resize) goes
+                // through `vp8_simulcast`'s `normalize_layer_dims`
+                // filter, so resize-down dropping the quarter layer
+                // and resize-up restoring it both work cleanly.
+                //
+                // Phase 4b's encoder change has no user-visible
+                // behavior — `select_active_subscription` still picks
+                // one RID per peer. Phase 4c (SDP simulcast
+                // negotiation) and 4d (multi-RID forwarding) light
+                // up the additional layers on the wire.
+                move |w, h| encode::pool::LayerSpec::vp8_simulcast(w, h, fps),
                 // Pool encoders feed the same metrics counters as the
                 // capture bridge so DisplayMetricsSnapshot continues to
                 // reflect total throughput. Pool is the sole producer
@@ -1782,17 +1805,27 @@ mod tests {
         );
     }
 
-    /// `start()` constructs the pool exactly once, with one always-on
-    /// VP8 layer at the capture resolution. This test pins the 3c.1
-    /// contract:
+    /// **Phase 4b**: `start()` constructs the pool with the full VP8
+    /// simulcast layer set (full / half / quarter). Pre-4b the factory
+    /// returned a single layer; post-4b it returns the canonical
+    /// `LayerSpec::vp8_simulcast(w, h, fps)` layout. Each surviving
+    /// layer spawns its own encoder thread immediately.
+    ///
+    /// This test pins:
     ///   1. The pool is populated after `start()`.
-    ///   2. It has exactly one always-on layer (the VP8 layer we asked
-    ///      for), not zero (construction failure would panic in
-    ///      `EncoderPool::new`) and not many (simulcast lands in phase 4).
-    /// Neither the bridge nor any peer is wired to the pool yet, so this
-    /// test confirms lifetime only — not frame flow.
+    ///   2. For a typical capture dim (640×480, ≥ MIN_LAYER_DIM on
+    ///      every divisor), all three layers spawn — full, half,
+    ///      quarter — at the expected dims and RIDs.
+    ///   3. Layer ordering matches `vp8_simulcast`'s canonical order
+    ///      (full → half → quarter), so the receive-side picker can
+    ///      rely on the highest-quality layer being index 0.
+    ///
+    /// Neither the bridge nor any peer is wired to the pool yet, so
+    /// this test confirms construction lifetime only — not frame flow.
+    /// (See `pool_always_on_layers_all_subscribe_to_i420_after_start`
+    /// for the end-to-end frame-flow test.)
     #[tokio::test]
-    async fn display_session_start_initializes_pool_with_one_vp8_layer() {
+    async fn display_session_start_initializes_pool_with_vp8_simulcast() {
         let backend = Arc::new(StubBackend { width: 640, height: 480 });
         let session = DisplaySession::new(0, backend);
         session.start(30, None, None).await.expect("start() must succeed");
@@ -1800,10 +1833,186 @@ mod tests {
             .pool
             .get()
             .expect("pool must be initialized after start()");
+        let always_on = pool.always_on();
         assert_eq!(
-            pool.always_on().len(),
-            1,
-            "exactly one always-on VP8 layer spawned"
+            always_on.len(),
+            3,
+            "VP8 simulcast spawns three always-on layers for a 640×480 source"
+        );
+        // Order is full / half / quarter — matches `vp8_simulcast`'s
+        // canonical layout. Pinning order so receive-side layer picking
+        // can index by position.
+        assert_eq!(
+            always_on[0].id.codec,
+            encode::pool::CodecKind::Vp8,
+            "all simulcast layers are VP8"
+        );
+        assert_eq!(
+            always_on[0].id.rid,
+            encode::pool::SimulcastRid::full(),
+            "layer 0 is the full-resolution RID"
+        );
+        assert_eq!((always_on[0].layer.width, always_on[0].layer.height), (640, 480));
+        assert_eq!(
+            always_on[1].id.rid,
+            encode::pool::SimulcastRid::half(),
+            "layer 1 is the half-resolution RID"
+        );
+        assert_eq!((always_on[1].layer.width, always_on[1].layer.height), (320, 240));
+        assert_eq!(
+            always_on[2].id.rid,
+            encode::pool::SimulcastRid::quarter(),
+            "layer 2 is the quarter-resolution RID"
+        );
+        assert_eq!((always_on[2].layer.width, always_on[2].layer.height), (160, 120));
+    }
+
+    /// **Phase 4b**: `start()` must reject source dims for which
+    /// `vp8_simulcast` produces no encodable layers. The pool
+    /// constructor itself accepts an empty always-on set (many unit
+    /// tests rely on this for on-demand-only flows), but production
+    /// always-on must be guaranteed — an empty result means the
+    /// session has no media path and would silently produce no
+    /// frames. Fail loud at `start()` rather than half-initialize.
+    ///
+    /// Source dims < MIN_LAYER_DIM (16) on either axis trigger this:
+    /// `vp8_simulcast`'s `normalize_layer_dims` filter drops every
+    /// layer the divisor produces, including the full layer.
+    #[tokio::test]
+    async fn display_session_start_fails_loud_on_source_too_small_for_vp8() {
+        // 14×14 — both dims below MIN_LAYER_DIM=16, every layer
+        // (full / half / quarter) drops, vp8_simulcast returns empty.
+        let backend = Arc::new(StubBackend { width: 14, height: 14 });
+        let session = DisplaySession::new(0, backend);
+        let err = session
+            .start(30, None, None)
+            .await
+            .expect_err("start() must fail for source too small for VP8 simulcast");
+        match err {
+            CallerError::Display(msg) => {
+                assert!(
+                    msg.contains("too small") && msg.contains("14x14"),
+                    "error must name the source dims; got: {msg}"
+                );
+                assert!(
+                    msg.contains("MIN_LAYER_DIM"),
+                    "error must mention MIN_LAYER_DIM for diagnostic clarity; got: {msg}"
+                );
+            }
+            other => panic!("expected CallerError::Display, got {other:?}"),
+        }
+        // Pool must NOT have been constructed — fail-loud means no
+        // half-initialized state is left behind for the caller to
+        // accidentally use.
+        assert!(
+            session.pool.get().is_none(),
+            "pool must remain uninitialized when start() fails"
+        );
+    }
+
+    /// **Phase 4b**: every always-on simulcast layer must be subscribed
+    /// to the pool's I420 broadcast the moment `start()` returns.
+    /// Pre-4b only the single full layer was spawned, so the existing
+    /// `pool_always_on_encoder_subscribed_to_i420_after_start` test
+    /// asserted `subscriber_count >= 1`. Post-4b we have three layers,
+    /// and any one of them being unsubscribed is a silent-black-screen
+    /// regression for the peers that pick that RID. Tightening the
+    /// assertion to require exactly the always-on count.
+    #[tokio::test]
+    async fn pool_always_on_layers_all_subscribe_to_i420_after_start() {
+        let backend = Arc::new(StubBackend { width: 640, height: 480 });
+        let session = DisplaySession::new(0, backend);
+        session.start(30, None, None).await.expect("start() must succeed");
+        let pool = session.pool.get().expect("pool initialized after start()");
+        let expected_count = pool.always_on().len();
+        assert_eq!(
+            expected_count, 3,
+            "precondition: 640×480 source spawns 3 simulcast layers"
+        );
+
+        // 640x480 I420 frame — what the bridge will push during
+        // production operation. Each always-on encoder needs its
+        // own subscription receiver; the encoder thread does the
+        // per-layer downscale (4a) before encode, so source-dim
+        // I420 is the correct shape to push.
+        let i420 = Arc::new(vec![0u8; 640 * 480 * 3 / 2]);
+        let subscriber_count = pool.push_i420_frame(i420, Instant::now());
+        assert_eq!(
+            subscriber_count, expected_count,
+            "pool.push_i420_frame must deliver to every always-on \
+             encoder ({expected_count} subscribers expected); got \
+             {subscriber_count}. If this is < {expected_count}, one \
+             or more simulcast layers is not wired to the i420 \
+             broadcast — silent-black-screen regression for any peer \
+             that picks the missing RID."
+        );
+    }
+
+    /// **Phase 4b**: real-dim resize through 1366×768 must regenerate
+    /// the simulcast layer set via the pool's stored factory, NOT by
+    /// rescaling the previous epoch's handles. The pool-level
+    /// `vp8_simulcast_normalizes_odd_layer_dims_for_1366x768` test
+    /// already pins the layer arithmetic; this DisplaySession-level
+    /// smoke test confirms the production `start()` path wires the
+    /// factory through correctly so a typical-laptop resize
+    /// (e.g. 1280×720 → 1366×768 → 1280×720) ends up at canonical
+    /// dims at every step.
+    ///
+    /// Pre-4b this would have been a no-op test (single layer at
+    /// source dim, which trivially regenerates). Post-4b each resize
+    /// re-derives 3 layers from canonical inputs — a regression that
+    /// stored-then-rescaled the previous layout would land here as
+    /// "half/quarter dims drift by one pixel after a series of
+    /// odd-dim resizes."
+    #[tokio::test]
+    async fn pool_resize_through_1366x768_yields_canonical_layout_at_every_step() {
+        let backend = Arc::new(StubBackend { width: 1280, height: 720 });
+        let session = DisplaySession::new(0, backend);
+        session.start(30, None, None).await.expect("start() must succeed");
+        let pool = session.pool.get().expect("pool initialized after start()");
+
+        // Step 1: starting dims 1280×720 — even on every divisor,
+        // canonical layout is the trivial case.
+        let layers = pool.always_on();
+        assert_eq!(
+            [(layers[0].layer.width, layers[0].layer.height),
+             (layers[1].layer.width, layers[1].layer.height),
+             (layers[2].layer.width, layers[2].layer.height)],
+            [(1280, 720), (640, 360), (320, 180)],
+            "1280×720 source produces canonical even-dim simulcast"
+        );
+        drop(layers); // release read guard before mutating via on_resize
+
+        // Step 2: resize to 1366×768 — half=683 (odd → 682), quarter=341 (odd → 340).
+        // Pre-4a-fix-#3 a rescale-from-handles path could have produced
+        // drift here; post-fix the factory re-derives from canonical
+        // 1366×768 inputs.
+        pool.on_resize(1366, 768);
+        let layers = pool.always_on();
+        assert_eq!(
+            [(layers[0].layer.width, layers[0].layer.height),
+             (layers[1].layer.width, layers[1].layer.height),
+             (layers[2].layer.width, layers[2].layer.height)],
+            [(1366, 768), (682, 384), (340, 192)],
+            "1366×768 resize must re-derive layout from canonical inputs \
+             (half=682×384 NOT drift-derived 682-or-some-other-value)"
+        );
+        drop(layers);
+
+        // Step 3: resize back to 1280×720 — must restore the trivial
+        // even-dim layout, NOT the drift-accumulated dims that would
+        // result from rescaling the 1366×768 layout. This is the
+        // 4a-fix-#3 contract: factory regeneration eliminates the
+        // round-trip drift bug class.
+        pool.on_resize(1280, 720);
+        let layers = pool.always_on();
+        assert_eq!(
+            [(layers[0].layer.width, layers[0].layer.height),
+             (layers[1].layer.width, layers[1].layer.height),
+             (layers[2].layer.width, layers[2].layer.height)],
+            [(1280, 720), (640, 360), (320, 180)],
+            "resize back to 1280×720 must restore canonical layout, not \
+             accumulate drift from the intermediate 1366×768 epoch"
         );
     }
 
