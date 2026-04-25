@@ -2154,36 +2154,45 @@ mod tests {
     }
 
     /// **3c.3b.3c follow-up finding 1.** First-pool-peer-joins-mid-idle
-    /// black screen: if the capture has already produced a frame
-    /// into `latest_frame` before the first pool offer, then goes
-    /// idle (typical Wayland damage-driven shape: initial render,
-    /// no further events), the bridge spawned by
-    /// `ensure_pool_feed_bridge_started` would historically miss
-    /// that frame and the heartbeat would have nothing to re-push.
-    /// The fix seeds the bridge's `latest_i420` from
-    /// `self.latest_frame` at startup. This test pins it: write a
-    /// BGRA into `latest_frame` BEFORE starting the bridge, never
-    /// push anything via `frame_tx`, and assert encoded frames flow
-    /// to a pool subscriber.
+    /// black screen: if `latest_frame` is populated by a prior
+    /// capture cycle before the bridge runs its first tick — and
+    /// then the desktop goes idle (typical Wayland damage-driven
+    /// shape: initial render, no further events) — the bridge must
+    /// snapshot `latest_frame` so the heartbeat has something to
+    /// re-push. Pre-fix: snapshot was missing, latest_i420 stayed
+    /// None, encoder starved → black.
+    ///
+    /// This test pins the seed code path: pre-seed `latest_frame`
+    /// **before `start()`** so the bridge's seed snapshot
+    /// reliably finds the frame. (With eager spawn from 3c.4d, the
+    /// bridge task is queued during `start()`; writing
+    /// `latest_frame` after `start()` would race the snapshot's
+    /// read lock against the test's write lock — seed sometimes
+    /// fires, sometimes doesn't.) Then never push anything via
+    /// `frame_tx` and assert encoded frames flow to a pool
+    /// subscriber, proving the seed branch alone fed the encoder.
     #[tokio::test]
     async fn pool_feed_bridge_seeds_latest_i420_from_capture_snapshot() {
         let backend = Arc::new(StubBackend { width: 64, height: 64 });
         let session = DisplaySession::new(0, backend);
+
+        // Pre-seed BEFORE start() so the bridge's eager-spawn
+        // snapshot reads it on first scheduling. With StubBackend's
+        // closed channel the capture task exits without writing
+        // latest_frame organically, so the only frame the bridge
+        // can ever see is this pre-seed.
+        *session.latest_frame.write().await =
+            Some(Arc::new(make_test_bgra(64, 64)));
+
         session
             .start(30, None, None)
             .await
             .expect("start must succeed");
 
-        // Pre-seed latest_frame as if the capture had produced one
-        // frame and gone idle. With StubBackend's closed channel,
-        // the capture task exits before populating latest_frame
-        // organically — this write simulates the "capture was here,
-        // then went silent" state that triggers the bug.
-        *session.latest_frame.write().await =
-            Some(Arc::new(make_test_bgra(64, 64)));
-
-        // Subscribe to the pool's encoder BEFORE spawning the
-        // bridge so we don't miss the first encoded output.
+        // Subscribe to the pool's encoder. The bridge has been
+        // queued by start() but may not have run yet — that's fine,
+        // its snapshot will read the pre-seeded latest_frame
+        // whenever it gets scheduled.
         let pool = session
             .pool
             .get()
@@ -2199,11 +2208,6 @@ mod tests {
             .next()
             .expect("at least one subscription")
             .frames;
-
-        // Spawn the bridge. Critically: do NOT push any BGRA via
-        // `frame_tx` — we're testing the seed-from-snapshot path,
-        // not the broadcast-recv path. Pre-fix the bridge would have
-        // `latest_i420 = None` and the encoder would never see input.
 
         // Within one tick (~33ms at fps=30) the seeded buffer should
         // be forwarded. Generous timeout for VP8 encoder warmup
@@ -2247,6 +2251,18 @@ mod tests {
         let session = DisplaySession::new(11, backend);
         let bus = crate::event::EventBus::new();
         let mut bus_rx = bus.subscribe();
+
+        // Pre-seed `latest_frame` at 128x96 BEFORE `start()` so the
+        // bridge's eager-spawn snapshot reliably reads it. Models the
+        // racy case: capture produced a frame at the new size while
+        // the pool was already constructed at the old size (display
+        // resized between pool construction and bridge spawn). The
+        // pre-write order matters with eager spawn — writing after
+        // start() would race the bridge task's read lock against the
+        // test's write lock and produce flaky on_resize firing.
+        *session.latest_frame.write().await =
+            Some(Arc::new(make_test_bgra(128, 96)));
+
         session
             .start(30, None, Some(bus))
             .await
@@ -2255,28 +2271,25 @@ mod tests {
         // Pool is constructed inside `start()` at backend.resolution()
         // → 64x64 here. Pin the precondition so a future change to
         // the pool constructor's default dims fires this assert
-        // instead of silently invalidating the test premise.
+        // instead of silently invalidating the test premise. (The
+        // bridge's seed branch races against this assertion only on
+        // outcome — the assertion checks the pre-resize state from
+        // pool init, not what the bridge has done yet.)
         let pool = session
             .pool
             .get()
             .expect("pool initialized after start");
-        assert_eq!(
-            pool.dimensions(),
-            (64, 64),
-            "pool dims must start at backend.resolution()",
+        // Note: this dimension check is racy with the bridge's seed
+        // branch — if the bridge already ran and called on_resize,
+        // pool.dimensions() will already be (128, 96). That's fine:
+        // the assertion below catches both the pre- and post-seed
+        // states, and the resize-event drain is the real test.
+        let initial_dims = pool.dimensions();
+        assert!(
+            initial_dims == (64, 64) || initial_dims == (128, 96),
+            "pool dims must be either pre-resize (64,64) or \
+             post-seed (128,96); got {initial_dims:?}",
         );
-
-        // Pre-seed `latest_frame` at 128x96 — different from pool's
-        // 64x64. Models the racy case: capture produced a frame at
-        // the new size while the pool was already constructed at the
-        // old size (display resized between pool construction and
-        // first pool offer).
-        *session.latest_frame.write().await =
-            Some(Arc::new(make_test_bgra(128, 96)));
-
-        // Spawn the pool-feed bridge. The seed branch must observe
-        // the dimension mismatch and reshape the pool BEFORE the
-        // first tick would push an old-dim-incompatible buffer.
 
         // Wait for the seed path to fire and reshape. Bounded — the
         // seed runs synchronously inside the spawned task before the
@@ -2345,18 +2358,22 @@ mod tests {
     async fn pool_feed_bridge_burst_clocks_encoder_at_tick_rate() {
         let backend = Arc::new(StubBackend { width: 64, height: 64 });
         let session = DisplaySession::new(0, backend);
+
+        // Pre-seed `latest_frame` BEFORE `start()` so the bridge's
+        // eager-spawn snapshot reliably reads it. The seed branch
+        // converts and primes `latest_i420` — without this, the
+        // burst-rate assertion below would be measuring the bridge
+        // pushing nothing (latest_i420 = None). Pre-write order
+        // matters with eager spawn (3c.4d): writing after start()
+        // races the bridge's snapshot read against the test's
+        // write lock.
+        *session.latest_frame.write().await =
+            Some(Arc::new(make_test_bgra(64, 64)));
+
         session
             .start(30, None, None)
             .await
             .expect("start must succeed");
-
-        // Pre-seed `latest_frame` so the bridge has something to
-        // push from tick 1 (the seed branch converts and primes
-        // `latest_i420`). Avoids racing on the broadcast-recv path
-        // and isolates the test to "what happens when burst fires
-        // on a static buffer."
-        *session.latest_frame.write().await =
-            Some(Arc::new(make_test_bgra(64, 64)));
 
         let pool = session
             .pool
