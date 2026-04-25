@@ -1735,6 +1735,35 @@ impl DisplaySession {
                 if frame_w > 0 && frame_h > 0 {
                     enc_w = frame_w;
                     enc_h = frame_h;
+                    // 3c.3b.3e: if the snapshotted frame's dims differ
+                    // from the pool's (display resized between pool
+                    // construction at `backend.resolution()` and the
+                    // first pool offer, or `backend.resolution()`
+                    // returned pre-resize dims), reshape the pool
+                    // BEFORE the first tick pushes the seeded I420 at
+                    // these dims. Without this, the pool's encoders
+                    // stay configured at the original dimensions while
+                    // receiving new-dim I420 — silent black-screen
+                    // class. Mirrors the in-loop resize branch below
+                    // (on_resize + DisplayResize event in one beat),
+                    // emitting via `event_bus` so presence / MCP /
+                    // outbound listeners learn about the seed-time
+                    // dimension change.
+                    if (frame_w, frame_h) != pool.dimensions() {
+                        eprintln!(
+                            "[display/pool-feed] display {} seed \
+                             resolution {:?} -> {}x{}",
+                            display_id, pool.dimensions(), frame_w, frame_h,
+                        );
+                        pool.on_resize(frame_w, frame_h);
+                        if let Some(ref bus) = event_bus {
+                            bus.send(crate::event::AppEvent::DisplayResize {
+                                display_id,
+                                width: frame_w,
+                                height: frame_h,
+                            });
+                        }
+                    }
                     let frame_arc = Arc::clone(&frame);
                     let arrived = Instant::now();
                     let i420_result = tokio::task::spawn_blocking(move || {
@@ -2896,6 +2925,110 @@ mod tests {
              forward it on the first tick — got timeout or recv \
              error within 2s. Pre-fix: pool encoder never sees \
              input → no frames ever emitted."
+        );
+
+        session.shutdown.cancel();
+    }
+
+    /// **3c.3b.3d follow-up finding (3c.3b.3e).** Seed-path pool
+    /// dimension desync. The 3c.3b.3d seed branch updates `enc_w`/
+    /// `enc_h` from the snapshotted frame's actual dimensions but
+    /// did NOT call `pool.on_resize` if the pool was constructed at
+    /// a different size — display resized between pool construction
+    /// (at `backend.resolution()`) and the first pool offer, OR
+    /// `backend.resolution()` returned pre-resize dims, etc. The
+    /// seed-then-tick sequence then pushed the new-dim I420 into a
+    /// pool whose encoders were configured for the old dims. Pre-
+    /// 3c.3b.3e: silent black-screen / encoder reject. The
+    /// `pool_feed_bridge_seeds_latest_i420_from_capture_snapshot`
+    /// regression test uses 64x64 backend AND 64x64 cached frame so
+    /// it does NOT cover this mismatch — this test does. Asserts
+    /// BOTH the pool resize AND the `DisplayResize` event parity
+    /// (mirroring the in-loop resize branch's two-effect contract).
+    #[tokio::test]
+    async fn pool_feed_bridge_seed_resizes_pool_when_snapshot_dims_differ() {
+        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let session = DisplaySession::new(11, backend);
+        let bus = crate::event::EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        session
+            .start(30, None, Some(bus))
+            .await
+            .expect("start must succeed");
+
+        // Pool is constructed inside `start()` at backend.resolution()
+        // → 64x64 here. Pin the precondition so a future change to
+        // the pool constructor's default dims fires this assert
+        // instead of silently invalidating the test premise.
+        let pool = session
+            .pool
+            .get()
+            .expect("pool initialized after start");
+        assert_eq!(
+            pool.dimensions(),
+            (64, 64),
+            "pool dims must start at backend.resolution()",
+        );
+
+        // Pre-seed `latest_frame` at 128x96 — different from pool's
+        // 64x64. Models the racy case: capture produced a frame at
+        // the new size while the pool was already constructed at the
+        // old size (display resized between pool construction and
+        // first pool offer).
+        *session.latest_frame.write().await =
+            Some(Arc::new(make_test_bgra(128, 96)));
+
+        // Spawn the pool-feed bridge. The seed branch must observe
+        // the dimension mismatch and reshape the pool BEFORE the
+        // first tick would push an old-dim-incompatible buffer.
+        session.ensure_pool_feed_bridge_started().await;
+
+        // Wait for the seed path to fire and reshape. Bounded — the
+        // seed runs synchronously inside the spawned task before the
+        // first `tick.tick()` await, but we need to give the task
+        // time to be scheduled, grab the latest_frame read lock, and
+        // complete the spawn_blocking BGRA→I420 conversion. Drain
+        // events looking for our DisplayResize; other events
+        // (capture-side, etc.) might land first.
+        let saw_resize = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            async {
+                loop {
+                    match bus_rx.recv().await {
+                        Ok(crate::event::AppEvent::DisplayResize {
+                            display_id: 11,
+                            width: 128,
+                            height: 96,
+                        }) => return true,
+                        Ok(_) => continue,
+                        Err(_) => return false,
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            saw_resize,
+            "seed branch must emit AppEvent::DisplayResize when \
+             snapshot dims differ from pool dims; got timeout. \
+             Pre-3c.3b.3e: enc_w/enc_h get updated locally but pool \
+             and listeners never learn — black-screen class bug.",
+        );
+
+        // Pool must have been reshaped. If pool.dimensions() still
+        // reports (64, 64) here, encoders are at 64x64 while the
+        // first tick pushed 128x96 I420 — mis-encode / reject.
+        assert_eq!(
+            pool.dimensions(),
+            (128, 96),
+            "seed branch must call pool.on_resize when snapshot \
+             dims differ from pool dims; pool stayed at {:?}. \
+             Pre-3c.3b.3e: pool encoders configured at old dims \
+             receive new-dim I420 from the first tick — encoder \
+             mis-encodes or rejects.",
+            pool.dimensions(),
         );
 
         session.shutdown.cancel();
