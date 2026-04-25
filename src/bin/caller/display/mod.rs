@@ -490,7 +490,41 @@ impl DisplaySession {
     ) -> Result<(), CallerError> {
         let mut capture_rx = self.backend.start_capture(fps).await?;
 
-        let (width, height) = self.backend.resolution();
+        // Source resolution is resolved AFTER `start_capture` because
+        // some backends (Wayland portal) revise dims during capture
+        // negotiation. Normalize to even dims as the single point of
+        // enforcement for the bridge + pool + encoder chain — VP8
+        // encoder construction and `downscale_i420` both require even
+        // dims, and most backends already apply `& !1` (X11Backend::new
+        // does), but defending here means the contract holds even if a
+        // future backend forgets.
+        let (raw_width, raw_height) = self.backend.resolution();
+        let width = raw_width & !1;
+        let height = raw_height & !1;
+
+        // Phase 4b validation guard. If `vp8_simulcast` would produce
+        // no encodable layers at these dims, fail loud BEFORE spawning
+        // the capture bridge and AFTER cleanly tearing down the
+        // backend's capture state. `EncoderPool::new` accepts an empty
+        // always-on set deliberately (many unit tests pass
+        // `|_, _| vec![]` for on-demand-only flows), but production
+        // always-on must be guaranteed — half-initializing a pool that
+        // emits no media is the silent-black-screen class.
+        //
+        // This check runs before the `tokio::spawn` below — leaving a
+        // backend capture thread running after `start()` reports
+        // failure is the leak class to avoid (X11's capture thread, in
+        // particular, ignores send-on-dropped-rx and only exits on
+        // explicit `stop_capture`).
+        if encode::pool::LayerSpec::vp8_simulcast(width, height, fps).is_empty() {
+            self.backend.stop_capture().await;
+            return Err(CallerError::Display(format!(
+                "source too small for VP8 simulcast: {raw_width}x{raw_height} \
+                 (normalized to {width}x{height}, each candidate layer falls \
+                 below MIN_LAYER_DIM={})",
+                encode::pool::MIN_LAYER_DIM,
+            )));
+        }
 
         // --- Task 1: Capture bridge ---
         let frame_tx = self.frame_tx.clone();
@@ -538,24 +572,6 @@ impl DisplaySession {
             }
         });
         *self.capture_handle.lock().await = Some(capture_handle);
-
-        // Phase 4b: validate that VP8 simulcast can produce at least
-        // one encodable layer for this source resolution. The pool
-        // constructor (`EncoderPool::new`) accepts an empty always-on
-        // set deliberately — many unit tests pass `|_, _| vec![]` to
-        // exercise on-demand-only flows. But production sources are
-        // always ≥ MIN_LAYER_DIM in both dims, so an empty result here
-        // means the capture backend is reporting impossible dims (or
-        // the source is genuinely too small to encode). Fail loud
-        // before construction rather than building a pool that emits
-        // no media silently.
-        if encode::pool::LayerSpec::vp8_simulcast(width, height, fps).is_empty() {
-            return Err(CallerError::Display(format!(
-                "source too small for VP8 simulcast: {width}x{height} \
-                 (each candidate layer falls below MIN_LAYER_DIM={})",
-                encode::pool::MIN_LAYER_DIM,
-            )));
-        }
 
         // Construct the shared encoder pool with VP8 simulcast layers
         // (full / half / quarter, dropping any below MIN_LAYER_DIM).
@@ -1242,11 +1258,23 @@ impl DisplaySession {
                     }
                     let frame_arc = Arc::clone(&frame);
                     let arrived = Instant::now();
+                    // Pass NORMALIZED dims (frame_w / frame_h, computed
+                    // above with `& !1`) instead of raw frame.width /
+                    // frame.height. Odd raw dims would produce odd-dim
+                    // I420 from `bgra_to_i420`'s ceil-chroma sizing,
+                    // which then hits the layer-encode `downscale_i420`
+                    // path with an unencodable source layout (downscale
+                    // requires even source AND dest). The pool was
+                    // constructed at the same normalized dims, so
+                    // passing odd here would also be a bridge↔pool
+                    // dimension desync (silent black-screen class).
+                    // Cropping the rightmost column / bottom row at
+                    // this stage is invisible at display.
                     let i420_result = tokio::task::spawn_blocking(move || {
                         encode::bgra_to_i420(
                             &frame_arc.data,
-                            frame_arc.width,
-                            frame_arc.height,
+                            frame_w,
+                            frame_h,
                             frame_arc.stride,
                         )
                     })
@@ -1325,11 +1353,17 @@ impl DisplaySession {
 
                         let frame_arc = Arc::clone(&frame);
                         let arrived = Instant::now();
+                        // Same normalized-dims rationale as the seed
+                        // path above: pass `frame_w` / `frame_h`
+                        // (rounded to even with `& !1` at the top of
+                        // this branch) so I420 dims match what
+                        // `downscale_i420` and the pool's encoders
+                        // expect.
                         let i420_result = tokio::task::spawn_blocking(move || {
                             encode::bgra_to_i420(
                                 &frame_arc.data,
-                                frame_arc.width,
-                                frame_arc.height,
+                                frame_w,
+                                frame_h,
                                 frame_arc.stride,
                             )
                         })
@@ -1497,6 +1531,7 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn input_event_deserialize_key_down() {
@@ -1792,6 +1827,48 @@ mod tests {
         }
     }
 
+    /// `DisplayBackend` that records whether `stop_capture` was called.
+    ///
+    /// `StubBackend`'s `start_capture` returns an immediately-dropped
+    /// sender, so the capture bridge exits cleanly on its own and the
+    /// fail-loud test can't tell whether `start()` cleaned up the
+    /// backend or just leaked the in-flight capture state. Real
+    /// backends (X11Backend in particular) spawn a `std::thread` that
+    /// only exits on explicit `stop_capture` — phase 4b's fail-loud
+    /// guard MUST call it before returning Err, otherwise the thread
+    /// runs forever after the session reports failure.
+    ///
+    /// Used by `display_session_start_fails_loud_on_source_too_small_for_vp8`
+    /// to assert the cleanup contract directly.
+    struct CleanupTrackingBackend {
+        width: u32,
+        height: u32,
+        stop_capture_called: AtomicBool,
+    }
+
+    #[async_trait]
+    impl DisplayBackend for CleanupTrackingBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<mpsc::Receiver<Frame>, CallerError> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+        async fn stop_capture(&self) {
+            self.stop_capture_called.store(true, Ordering::SeqCst);
+        }
+        async fn inject_input(&self, _event: InputEvent) -> Result<(), CallerError> {
+            Ok(())
+        }
+        fn resolution(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+        fn kind(&self) -> &'static str {
+            "cleanup-tracking"
+        }
+    }
+
     /// Before `start()` runs, the pool is uninitialized. `get()` returning
     /// `None` is the contract other phases rely on to know whether the
     /// session is hot (bridge running, pool ready) or still cold.
@@ -1867,23 +1944,39 @@ mod tests {
         assert_eq!((always_on[2].layer.width, always_on[2].layer.height), (160, 120));
     }
 
-    /// **Phase 4b**: `start()` must reject source dims for which
-    /// `vp8_simulcast` produces no encodable layers. The pool
-    /// constructor itself accepts an empty always-on set (many unit
-    /// tests rely on this for on-demand-only flows), but production
-    /// always-on must be guaranteed — an empty result means the
-    /// session has no media path and would silently produce no
-    /// frames. Fail loud at `start()` rather than half-initialize.
+    /// **Phase 4b** (post-review fix): `start()` must reject source
+    /// dims for which `vp8_simulcast` produces no encodable layers AND
+    /// must clean up the backend's capture state before returning
+    /// Err. The pool constructor itself accepts an empty always-on
+    /// set (many unit tests rely on this for on-demand-only flows),
+    /// but production always-on must be guaranteed — an empty result
+    /// means the session has no media path and would silently produce
+    /// no frames.
     ///
-    /// Source dims < MIN_LAYER_DIM (16) on either axis trigger this:
-    /// `vp8_simulcast`'s `normalize_layer_dims` filter drops every
-    /// layer the divisor produces, including the full layer.
+    /// The cleanup half of the contract was added in response to
+    /// review: pre-fix the validation ran AFTER the capture bridge
+    /// had already been spawned, leaving the backend's capture
+    /// thread running after `start()` reported failure (X11Backend's
+    /// thread ignores send-on-dropped-rx and only exits on
+    /// `stop_capture`). `CleanupTrackingBackend` records whether
+    /// `stop_capture` was called so this test can assert the cleanup
+    /// directly — `StubBackend`'s no-op `stop_capture` would let a
+    /// regression here pass silently.
+    ///
+    /// Source dims < MIN_LAYER_DIM (16) on either axis trigger the
+    /// fail-loud path: `vp8_simulcast`'s `normalize_layer_dims`
+    /// filter drops every layer the divisor produces, including the
+    /// full layer.
     #[tokio::test]
-    async fn display_session_start_fails_loud_on_source_too_small_for_vp8() {
+    async fn display_session_start_fails_loud_and_cleans_up_on_source_too_small() {
         // 14×14 — both dims below MIN_LAYER_DIM=16, every layer
         // (full / half / quarter) drops, vp8_simulcast returns empty.
-        let backend = Arc::new(StubBackend { width: 14, height: 14 });
-        let session = DisplaySession::new(0, backend);
+        let backend = Arc::new(CleanupTrackingBackend {
+            width: 14,
+            height: 14,
+            stop_capture_called: AtomicBool::new(false),
+        });
+        let session = DisplaySession::new(0, backend.clone());
         let err = session
             .start(30, None, None)
             .await
@@ -1892,7 +1985,7 @@ mod tests {
             CallerError::Display(msg) => {
                 assert!(
                     msg.contains("too small") && msg.contains("14x14"),
-                    "error must name the source dims; got: {msg}"
+                    "error must name the raw source dims; got: {msg}"
                 );
                 assert!(
                     msg.contains("MIN_LAYER_DIM"),
@@ -1907,6 +2000,70 @@ mod tests {
         assert!(
             session.pool.get().is_none(),
             "pool must remain uninitialized when start() fails"
+        );
+        // Backend's capture state must have been torn down — leaving a
+        // backend thread running after start() reports failure is the
+        // leak class the validation reorder was meant to prevent.
+        assert!(
+            backend.stop_capture_called.load(Ordering::SeqCst),
+            "fail-loud must call backend.stop_capture() to undo the \
+             start_capture() call from earlier in start(); without \
+             this, real backends (X11Backend) leak their capture \
+             thread."
+        );
+    }
+
+    /// **Phase 4b** (post-review fix): odd source dimensions must be
+    /// normalized to even before reaching the pool / bridge / encoder
+    /// chain. VP8 encoder construction (vp8.rs) and `downscale_i420`
+    /// (encode/mod.rs) both require even dims, but `vp8_simulcast`'s
+    /// `normalize_layer_dims` filter applies `& !1` only to the LAYER
+    /// dims it returns — not to the source dim those layers were
+    /// derived from. Without explicit normalization in
+    /// `DisplaySession::start`, an odd source like 17×480 would land
+    /// in the pool as `dimensions() == (17, 480)` (raw) but the layer
+    /// factory would emit a 16×480 full layer. The bridge would then
+    /// pass odd-raw-dim BGRA buffers into `bgra_to_i420`, producing
+    /// odd-dim I420, which `downscale_i420` rejects (debug-asserts
+    /// even dims) — silent black-screen class.
+    ///
+    /// Pin: a 17×480 source produces a pool with even `dimensions()`
+    /// (16×480 after normalization) and exactly one surviving
+    /// always-on simulcast layer (the full layer at 16×480, since
+    /// half/quarter at 8/4 width drop below MIN_LAYER_DIM).
+    #[tokio::test]
+    async fn display_session_start_normalizes_odd_source_dims_in_pool() {
+        // 17×480 — width is odd, so `& !1` rounds to 16. Half would
+        // be 8×240 (width below MIN_LAYER_DIM → drop). Quarter would
+        // be 4×120 (drop). So only the full layer at 16×480 survives.
+        let backend = Arc::new(StubBackend { width: 17, height: 480 });
+        let session = DisplaySession::new(0, backend);
+        session
+            .start(30, None, None)
+            .await
+            .expect("start() must succeed for 17×480 (normalizes to 16×480)");
+        let pool = session
+            .pool
+            .get()
+            .expect("pool must be initialized after start()");
+        assert_eq!(
+            pool.dimensions(),
+            (16, 480),
+            "pool dims must be normalized (raw 17×480 → even 16×480), \
+             NOT raw — bridge passes these dims through to bgra_to_i420 \
+             and downscale_i420, both of which require even."
+        );
+        let always_on = pool.always_on();
+        assert_eq!(
+            always_on.len(),
+            1,
+            "only the full simulcast layer survives at 16×480 (half=8×240 \
+             and quarter=4×120 both have a dim below MIN_LAYER_DIM=16)"
+        );
+        assert_eq!(
+            (always_on[0].layer.width, always_on[0].layer.height),
+            (16, 480),
+            "surviving full layer matches the normalized source dims"
         );
     }
 
@@ -2016,39 +2173,11 @@ mod tests {
         );
     }
 
-    /// Phase 3c.2 relies on the pool's always-on VP8 encoder being an
-    /// i420-broadcast subscriber the moment `start()` completes — the
-    /// bridge's dual-feed `push_i420_frame` call must deliver to at
-    /// least one receiver, otherwise the new path is a silent no-op
-    /// and 3c.3's peer subscription wiring will observe a never-
-    /// decoding stream. This test locks that precondition by pushing
-    /// a synthetic I420 frame through the pool directly (no bridge
-    /// involvement) and asserting the subscriber count is non-zero.
-    ///
-    /// If this test ever fires, `EncoderPool::new` is spawning its
-    /// always-on encoders without subscribing them to `i420_tx` — a
-    /// silent-black-screen regression that phase 4 (simulcast) would
-    /// amplify.
-    #[tokio::test]
-    async fn pool_always_on_encoder_subscribed_to_i420_after_start() {
-        let backend = Arc::new(StubBackend { width: 640, height: 480 });
-        let session = DisplaySession::new(0, backend);
-        session.start(30, None, None).await.expect("start() must succeed");
-        let pool = session.pool.get().expect("pool initialized after start()");
-
-        // 640x480 I420 frame is width*height*3/2 bytes (Y plane full,
-        // U+V half each). Contents don't matter — we're checking the
-        // broadcast topology, not encoder output.
-        let i420 = Arc::new(vec![0u8; 640 * 480 * 3 / 2]);
-        let subscriber_count = pool.push_i420_frame(i420, Instant::now());
-        assert!(
-            subscriber_count >= 1,
-            "pool.push_i420_frame must deliver to ≥1 subscriber (the \
-             always-on VP8 encoder); got {subscriber_count}. If this is \
-             0, EncoderPool::new is not wiring up always-on encoders \
-             to the i420 broadcast."
-        );
-    }
+    // (Phase 3c.2's `pool_always_on_encoder_subscribed_to_i420_after_start`
+    //  was superseded by phase 4b's `pool_always_on_layers_all_subscribe
+    //  _to_i420_after_start` above, which tightens the assertion from
+    //  `>= 1` to exact-count and so catches partial-simulcast-subscribe
+    //  regressions the old test couldn't.)
 
     // -----------------------------------------------------------------------
     // Phase 3c.3b.3a: pool-feed bridge — does NOT lock legacy codec
