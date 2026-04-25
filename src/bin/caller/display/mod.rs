@@ -882,7 +882,7 @@ impl DisplaySession {
     ///
     /// Pipeline:
     ///   - Codec selection is per-peer via str0m's `enable_*()` calls
-    ///     in [`webrtc::WebRtcPeer::new_pool_mode`], driven by the
+    ///     in [`webrtc::WebRtcPeer::new`], driven by the
     ///     codecs the pool's initial subscribe actually returned.
     ///     No first-peer codec lock.
     ///   - Peer-join keyframe is wired in two parts at the tail:
@@ -900,7 +900,7 @@ impl DisplaySession {
     ///     The PLI-driven per-peer explicit request from str0m's
     ///     inbound RTCP lands with the simulcast work.
     ///   - No `pool_leases` tracking on `DisplaySession`:
-    ///     [`webrtc::WebRtcPeer::new_pool_mode`] hands the lease to
+    ///     [`webrtc::WebRtcPeer::new`] hands the lease to
     ///     the per-peer `pool_frame_intake` task, which owns it for
     ///     the peer's lifetime. [`Self::remove_peer`] calls
     ///     `peer.close()`, the shutdown token fires, and the intake
@@ -982,7 +982,7 @@ impl DisplaySession {
         // `DisplayMetricsSnapshot.peer_drops`. Cheap clone (Arc).
         let drops_counter = Arc::clone(&self.counters.peer_drops);
 
-        let (peer, answer_sdp) = self::webrtc::WebRtcPeer::new_pool_mode(
+        let (peer, answer_sdp) = self::webrtc::WebRtcPeer::new(
             peer_id,
             sdp,
             ice_config,
@@ -1000,7 +1000,7 @@ impl DisplaySession {
         .await?;
 
         // Bridge spawn deferred until AFTER prefs validation +
-        // pool.subscribe + new_pool_mode all succeed, per the 3c.3b.3a
+        // pool.subscribe + new all succeed, per the 3c.3b.3a
         // review's low-priority finding: an invalid pool offer (no
         // overlapping codecs, encoder backend exhausted, etc.) MUST
         // NOT leave a bridge running with no peer ever attached. By

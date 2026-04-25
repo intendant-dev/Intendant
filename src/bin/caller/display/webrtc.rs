@@ -585,18 +585,6 @@ pub struct WebRtcPeer {
     encoded_frame_tx: mpsc::Sender<Arc<EncodedFrame>>,
     command_tx: mpsc::Sender<Command>,
     shutdown: CancellationToken,
-    /// `true` when this peer was constructed via [`Self::new_pool_mode`]
-    /// (i.e. it gets frames via a per-peer `pool_frame_intake` task,
-    /// not via the legacy single-encoder fan-out at
-    /// `display/mod.rs:1118`). The fan-out checks this and skips
-    /// pool-mode peers — without that skip, pool-mode peers would
-    /// receive frames from BOTH the legacy encoder AND the pool's
-    /// intake, producing duplicate RTP samples and corrupted decode.
-    ///
-    /// Phase 3c.4 deletes the legacy fan-out entirely; this field
-    /// then becomes vestigial and gets removed alongside the legacy
-    /// path.
-    pool_mode: bool,
 }
 
 /// Commands sent from the public `WebRtcPeer` handle to the driver task.
@@ -636,7 +624,7 @@ impl WebRtcPeer {
     /// inline in the answer SDP, so there is nothing to trickle from the
     /// server side. The browser still trickles its candidates via
     /// `add_ice_candidate`.
-    pub async fn new(
+    async fn build_with_codec_set(
         peer_id: PeerId,
         offer_sdp: &str,
         codec_set: &[CodecKind],
@@ -855,22 +843,9 @@ impl WebRtcPeer {
                 encoded_frame_tx,
                 command_tx,
                 shutdown,
-                // Legacy single-encoder fan-out path. The fan-out at
-                // `display/mod.rs:1118` will push frames into this
-                // peer's `encoded_frame_tx`. `new_pool_mode` flips
-                // this to `true` after delegating to `Self::new`.
-                pool_mode: false,
             },
             answer_sdp,
         ))
-    }
-
-    /// Returns whether this peer was constructed via [`Self::new_pool_mode`].
-    /// The legacy fan-out checks this and skips pool-mode peers so
-    /// they don't receive frames from both the legacy encoder AND
-    /// their per-peer pool intake task.
-    pub fn is_pool_mode(&self) -> bool {
-        self.pool_mode
     }
 
     /// Returns the sender side of this peer's encoded-frame channel.
@@ -920,7 +895,7 @@ impl WebRtcPeer {
     /// 3c.3b.3 → 3c.4 cutover. Tests can pass a fresh
     /// `Arc::new(AtomicU64::new(0))` and inspect it directly.
     #[allow(clippy::too_many_arguments)]
-    pub async fn new_pool_mode(
+    pub async fn new(
         peer_id: PeerId,
         offer_sdp: &str,
         ice_config: &IceConfig,
@@ -937,7 +912,7 @@ impl WebRtcPeer {
     ) -> Result<(Self, String), CallerError> {
         if subscriptions.is_empty() {
             return Err(CallerError::WebRtc(
-                "new_pool_mode: empty subscription set — offer handler must \
+                "new: empty subscription set — offer handler must \
                  reject before reaching here"
                     .to_string(),
             ));
@@ -959,12 +934,12 @@ impl WebRtcPeer {
         // subs for a codec the prefs doesn't include — fail loud.
         if negotiated_prefs.is_empty() {
             return Err(CallerError::WebRtc(
-                "new_pool_mode: filter_prefs_to_negotiated produced empty set; \
+                "new: filter_prefs_to_negotiated produced empty set; \
                  pool returned subscriptions for codecs not in peer prefs"
                     .to_string(),
             ));
         }
-        let (mut peer, answer_sdp) = Self::new(
+        let (mut peer, answer_sdp) = Self::build_with_codec_set(
             peer_id,
             offer_sdp,
             &codec_set,
@@ -976,14 +951,6 @@ impl WebRtcPeer {
             ice_tx,
         )
         .await?;
-        // Mark this peer as pool-mode so the legacy single-encoder
-        // fan-out at `display/mod.rs:1118` skips it. Without this,
-        // a pool-mode peer would receive frames from BOTH the legacy
-        // encoder (via `encoded_frame_tx` fed by the fan-out) AND
-        // the pool's per-peer intake task — duplicate RTP samples,
-        // corrupted decode, black/garbage stream.
-        peer.pool_mode = true;
-
         // Spawn the intake task. It clones the encoded_frame_tx and
         // shutdown so it can push frames into the existing driver and
         // exit when the peer is torn down. The task owns the lease
@@ -1831,7 +1798,7 @@ async fn resolve_mdns_in_candidate(candidate: &str) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 /// Distinct codecs covered by `subscriptions`, deduplicated. Used by
-/// [`WebRtcPeer::new_pool_mode`] to drive the str0m enable_*() calls
+/// [`WebRtcPeer::new`] to drive the str0m enable_*() calls
 /// from the actually-served set rather than from the original peer
 /// offer prefs — the SDP we negotiate is exactly what the pool
 /// commits to producing, so there's no path where the peer picks an
@@ -1876,11 +1843,11 @@ fn codec_set_from_subscriptions(subscriptions: &[EncoderSubscription]) -> Vec<Co
 /// `actual_codecs` makes that reachability bug impossible.
 ///
 /// Returns an empty `PeerCodecPreferences` only if the intersection
-/// is empty, which the caller (`new_pool_mode`) prevents by erroring
+/// is empty, which the caller (`new`) prevents by erroring
 /// upstream when `subscriptions` is empty (codec_set non-empty →
 /// intersection non-empty when `original_prefs` is non-empty). The
 /// upstream contract is asserted by the early-return at the top of
-/// `new_pool_mode`.
+/// `new`.
 fn filter_prefs_to_negotiated(
     original_prefs: &PeerCodecPreferences,
     actual_codecs: &[CodecKind],
@@ -2013,7 +1980,7 @@ fn select_active_subscription(
 /// `negotiated_prefs` is the **caller-filtered** subset of the peer's
 /// original SDP-offer prefs that intersects the codecs the pool's
 /// initial subscribe actually returned. This is the codec set the
-/// peer's SDP answer enabled (`new_pool_mode` derives both the answer's
+/// peer's SDP answer enabled (`new` derives both the answer's
 /// `enable_*()` calls AND `negotiated_prefs` from the same
 /// `codec_set_from_subscriptions(initial_subs)` source).
 ///
@@ -2592,7 +2559,7 @@ mod tests {
     }
 
     /// No overlap → empty result. Caller must reject this case
-    /// upstream (see the `is_empty()` guard in `new_pool_mode`); the
+    /// upstream (see the `is_empty()` guard in `new`); the
     /// filter itself doesn't error.
     #[test]
     fn filter_prefs_to_negotiated_returns_empty_when_no_overlap() {
