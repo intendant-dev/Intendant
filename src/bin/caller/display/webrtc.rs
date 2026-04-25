@@ -2090,9 +2090,12 @@ async fn pool_frame_intake(
         // Make the drop point obvious. Future maintainers reading the
         // function should not have to wonder when the unused subs go
         // away — it's right here, between selection and forwarder
-        // spawn.
+        // spawn. `current_subs` is moved-from after this and is only
+        // re-initialized on the resubscribe path
+        // (`current_subs = subs` in the EncoderClosed branch below)
+        // before the next read at the top of the loop, so no
+        // `= Vec::new()` placeholder is needed here.
         drop(current_subs);
-        current_subs = Vec::new();
         // Release the inactive on-demand claims on the active lease.
         // For a peer with prefs [VP8, H264] against a pool that has
         // VP8 always-on + H264 on-demand, this is what tears down the
