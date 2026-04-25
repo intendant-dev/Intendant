@@ -404,17 +404,14 @@ pub struct DisplaySession {
     counters: Arc<DisplayMetricsCounters>,
     /// Instant used as the epoch for rate computations.
     metrics_epoch: Mutex<Instant>,
-    /// Capture FPS stored from `start()` for deferred encoder startup.
-    fps: Mutex<u32>,
-    /// EventBus stored from `start()` for deferred encoder startup.
-    encoder_event_bus: Mutex<Option<crate::event::EventBus>>,
     /// Clipboard monitor for bidirectional clipboard sync.
     clipboard_monitor: Arc<clipboard::ClipboardMonitor>,
     /// Handle for the clipboard forwarding task (remote -> browser).
     clipboard_handle: Mutex<Option<JoinHandle<()>>>,
     /// Wakes the pool-feed bridge to open a peer-join burst window
     /// when a new pool peer attaches. `Some` after
-    /// [`Self::ensure_pool_feed_bridge_started`] has run.
+    /// [`Self::spawn_pool_feed_bridge`] has run (eagerly from
+    /// [`Self::start`] since 3c.4d).
     ///
     /// **Why a burst is needed even though the pool also sets
     /// `force_keyframe`:** [`crate::display::encode::pool::EncoderPool::request_keyframe_all`]
@@ -439,14 +436,12 @@ pub struct DisplaySession {
     /// tokio dependency. Concurrent `start()` callers (not expected but
     /// cheap to tolerate) converge on a single pool.
     pool: std::sync::OnceLock<Arc<encode::pool::EncoderPool>>,
-    /// Handle for the capture-to-I420 bridge task, or `None` before
-    /// the first offer arrives. Spawned by
-    /// [`Self::ensure_pool_feed_bridge_started`] on the first
-    /// `handle_offer` call; owns the BGRA→I420 conversion and
-    /// `pool.push_i420_frame` loop. Drained on `stop()` for
-    /// deterministic teardown ordering. 3c.4c moves the spawn
-    /// to `start()` so the bridge runs unconditionally even
-    /// before any peer connects.
+    /// Handle for the capture-to-I420 bridge task. `Some` for the
+    /// lifetime of a started session: spawned eagerly by
+    /// [`Self::spawn_pool_feed_bridge`] during [`Self::start`]
+    /// (since 3c.4d, was lazy on first offer before that). Owns the
+    /// BGRA→I420 conversion and `pool.push_i420_frame` loop. Drained
+    /// on `stop()` for deterministic teardown ordering.
     pool_feed_bridge_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -494,8 +489,6 @@ impl DisplaySession {
             shutdown: CancellationToken::new(),
             counters: Arc::new(DisplayMetricsCounters::new()),
             metrics_epoch: Mutex::new(Instant::now()),
-            fps: Mutex::new(30),
-            encoder_event_bus: Mutex::new(None),
             clipboard_monitor: Arc::new(clipboard::ClipboardMonitor::new()),
             clipboard_handle: Mutex::new(None),
             pool_feed_keyframe_tx: Mutex::new(None),
@@ -576,22 +569,15 @@ impl DisplaySession {
         });
         *self.capture_handle.lock().await = Some(capture_handle);
 
-        // Store fps and event_bus for deferred pool-feed bridge spawn.
-        // The pool-feed bridge starts on the first handle_offer() call
-        // (via `ensure_pool_feed_bridge_started`).
-        *self.fps.lock().await = fps;
-        *self.encoder_event_bus.lock().await = event_bus_for_encoder;
-
         // Construct the shared encoder pool with a single always-on
         // VP8 layer at the source resolution. The pool spawns its
         // VP8 encoder thread immediately; that thread blocks in
-        // `blocking_recv` until the pool-feed bridge starts
-        // publishing I420 frames on the first offer. Idle cost is
-        // negligible.
+        // `blocking_recv` until the pool-feed bridge below starts
+        // publishing I420 frames. Idle cost is negligible.
         //
         // `get_or_init` swallows concurrent initializations cheaply;
         // in practice `start()` is called at most once per session.
-        let _ = self.pool.get_or_init(|| {
+        let pool_arc = Arc::clone(self.pool.get_or_init(|| {
             Arc::new(encode::pool::EncoderPool::new(
                 width,
                 height,
@@ -602,13 +588,23 @@ impl DisplaySession {
                     height,
                     fps,
                 )],
-                // 3c.3b.4h: pool encoders feed the same metrics
-                // counters as the legacy bridge so DisplayMetricsSnapshot
-                // continues to reflect total throughput. After 3c.4
-                // deletes the legacy bridge, pool is the sole producer.
+                // Pool encoders feed the same metrics counters as the
+                // capture bridge so DisplayMetricsSnapshot continues to
+                // reflect total throughput. Pool is the sole producer
+                // since 3c.4b deleted the legacy fan-out.
                 Some(Arc::clone(&self.counters)),
             ))
-        });
+        }));
+
+        // 3c.4d: spawn the pool-feed bridge eagerly. The bridge owns
+        // BGRA→I420 conversion and `pool.push_i420_frame`; it pumps
+        // every always-on encoder for the lifetime of the session,
+        // independent of whether any peer is connected. Replaces the
+        // previous lazy spawn from `handle_offer_pool_mode` (then
+        // `ensure_pool_feed_bridge_started`) — see
+        // [`Self::spawn_pool_feed_bridge`] for the rationale.
+        self.spawn_pool_feed_bridge(pool_arc, fps, event_bus_for_encoder)
+            .await;
 
         // --- Task 3: FrameRegistry sampler (1 Hz JPEG for model feeds) ---
         if let Some(registry) = frame_registry {
@@ -999,14 +995,13 @@ impl DisplaySession {
         )
         .await?;
 
-        // Bridge spawn deferred until AFTER prefs validation +
-        // pool.subscribe + new all succeed, per the 3c.3b.3a
-        // review's low-priority finding: an invalid pool offer (no
-        // overlapping codecs, encoder backend exhausted, etc.) MUST
-        // NOT leave a bridge running with no peer ever attached. By
-        // gating on success here, every spawned bridge has at least
-        // one peer about to be inserted into the registry.
-        self.ensure_pool_feed_bridge_started().await;
+        // 3c.4d: pool-feed bridge is spawned eagerly in `start()`,
+        // not here. Earlier this call gated bridge spawn on prefs
+        // validation + `pool.subscribe` + `WebRtcPeer::new` all
+        // succeeding (3c.3b.3a finding) — but the bridge has no
+        // dependency on peer presence, and gating it on first-offer
+        // success added complexity for no benefit. The bridge runs
+        // for the lifetime of the session.
 
         let peer = Arc::new(peer);
         // Same replaced-peer handling as the legacy path: close the
@@ -1040,15 +1035,12 @@ impl DisplaySession {
         // is in place when the keyframe lands in the encoder broadcast.
         pool.request_keyframe_all();
 
-        // 3c.3b.4c: open the peer-join burst window via whichever
-        // bridge currently owns the pool feed. In a pool-only session
-        // that's the pool-feed bridge (keyed on `pool_feed_keyframe_tx`,
-        // installed by `ensure_pool_feed_bridge_started` above); in a
-        // mixed session where a legacy peer attached first, the legacy
-        // bridge (keyed on `keyframe_tx`) owns the feed and
-        // `ensure_pool_feed_bridge_started` early-returned without
-        // installing the pool-feed sender. See
-        // [`Self::signal_peer_join_burst`] for the dispatch contract.
+        // Open the peer-join burst window on the pool-feed bridge
+        // (always running since `start()`, see 3c.4d). The burst is
+        // required for codecs that ignore `force_keyframe` on a
+        // long-running pipe (Linux ffmpeg H.264) — without it
+        // `pool.request_keyframe_all` above can't reach those
+        // encoders. See [`Self::signal_peer_join_burst`].
         self.signal_peer_join_burst().await;
 
         Ok(answer_sdp)
@@ -1077,91 +1069,68 @@ impl DisplaySession {
         }
     }
 
-    /// Idempotently ensure the **pool-only** capture-to-I420 bridge is
-    /// running. This bridge's `pool.push_i420_frame` call is what
-    /// keeps the pool's always-on (and on-demand) encoders fed in
-    /// pool-mode-only sessions. Without it, a pool peer subscribes
-    /// successfully but the encoder never produces output → black
-    /// stream (the 3c.3b.3 high-priority finding).
+    /// Spawn the pool-feed bridge — the BGRA→I420 conversion task that
+    /// pumps the encoder pool. Called eagerly from [`Self::start`]
+    /// after the pool is initialized so the bridge runs unconditionally
+    /// for the lifetime of the session, even before any peer connects.
     ///
-    /// Distinct from the legacy bridge inside [`Self::start_encoder_pipeline`]
-    /// in three deliberate ways:
-    ///   1. **Doesn't touch `encoder_init_lock` or `codec_mime`** —
-    ///      so a pool first-offer no longer locks the session codec
-    ///      to VP8 and rejects a later legacy H.264-only peer
-    ///      (3c.3b.3a finding 1).
-    ///   2. **Doesn't spawn a legacy encoder thread or fan-out task**
-    ///      — so a pool-only deployment doesn't pay the CPU cost of
-    ///      a legacy VP8 encoder running with no consumers.
-    ///   3. **Pool-private peer-join burst channel.** As of 3c.3b.4b
-    ///      the bridge listens on `pool_feed_keyframe_tx` and opens
-    ///      a 1.5s burst window when signaled (mirrors legacy
-    ///      `keyframe_tx`). Required because `force_keyframe` on a
-    ///      long-running ffmpeg-pipe encoder (Linux H.264) is a
-    ///      no-op, so `EncoderPool::request_keyframe_all` alone
-    ///      can't reach those encoders — the burst clocks the
-    ///      encoder at tick rate so its `-g 30` natural cadence
-    ///      lands a keyframe inside the window.
+    /// **Why eager (3c.4d):** the bridge used to spawn lazily on the
+    /// first offer (`ensure_pool_feed_bridge_started`, idempotent), but
+    /// nothing about the bridge actually depends on a peer being
+    /// present — it just feeds the pool. Lazy spawn coupled the bridge
+    /// lifecycle to `handle_offer_pool_mode`, requiring an
+    /// idempotency check, a `pool.get()` defensive read, and reaching
+    /// into `Mutex<Option<_>>` storage for `fps` and `event_bus` that
+    /// `start` had set moments earlier. Eager spawn from `start`
+    /// removes all of that machinery and gives the bridge the same
+    /// lifetime as the capture loop.
     ///
-    /// What it DOES match from the legacy bridge (3c.3b.3b
-    /// follow-up): the **tick + heartbeat** pattern. The bridge
-    /// caches the latest I420 buffer and forwards it on every tick
-    /// when the buffer changed OR the idle heartbeat is due. Without
-    /// this, a damage-driven capture backend (Wayland especially)
-    /// that emits nothing while the desktop is idle would leave the
-    /// pool's encoder starved of input — a peer joining mid-idle
-    /// would see a black stream until the next desktop damage event,
-    /// regressing the existing legacy behavior. The heartbeat
+    /// **Why the bridge exists** (unchanged from earlier rationale):
+    /// pool-mode peers subscribe to the encoder broadcast directly;
+    /// without something pumping I420 frames into the pool the
+    /// encoders sit idle and peers see a black stream (3c.3b.3
+    /// high-priority finding).
+    ///
+    /// **Tick + heartbeat pattern.** The bridge caches the latest I420
+    /// buffer and forwards it on every tick when the buffer changed OR
+    /// the idle heartbeat is due. Required because a damage-driven
+    /// capture backend (Wayland especially) emits nothing while the
+    /// desktop is idle — a peer joining mid-idle would see black
+    /// until the next desktop damage event without it. The heartbeat
     /// re-pushes the latest frame once per second so the encoder's
     /// GOP cadence keeps producing decodable references.
     ///
-    /// What it ALSO matches: the legacy bridge's `AppEvent::DisplayResize`
-    /// emission on dimension change. Without this, presence / MCP /
-    /// outbound listeners would never learn about display size
-    /// changes in pool-only sessions (the legacy bridge would either
-    /// be absent or have `pool_for_bridge=None` and skip its own
-    /// emission too).
+    /// **Peer-join burst channel.** The bridge listens on
+    /// `pool_feed_keyframe_tx` and opens a 1.5s burst window when
+    /// signaled. Required because `force_keyframe` on a long-running
+    /// ffmpeg-pipe encoder (Linux H.264) is a no-op, so
+    /// [`EncoderPool::request_keyframe_all`](crate::display::encode::pool::EncoderPool::request_keyframe_all)
+    /// alone can't reach those encoders — the burst clocks the
+    /// encoder at tick rate so its `-g 30` natural cadence lands a
+    /// keyframe inside the window.
     ///
-    /// Coordination with the legacy bridge: both paths take
-    /// `encoder_init_lock` BEFORE consulting `pool_feed_bridge_handle`.
-    /// Whichever first-offer path acquires the init lock first wins
-    /// the right to feed the pool:
-    ///   - If legacy ran first: `init=true` here → skip (legacy bridge
-    ///     dual-feeds the pool via the existing 3c.2 path).
-    ///   - If pool ran first: `init=false` here → spawn the pool-feed
-    ///     bridge. A subsequent legacy offer will see
-    ///     `pool_feed_bridge_handle.is_some()` in
-    ///     `start_encoder_pipeline` and skip its own dual-feed.
-    /// Either way the pool's broadcast gets exactly one feed, and
-    /// no double-encoding bug.
-    async fn ensure_pool_feed_bridge_started(&self) {
-        // 3c.4b deleted the legacy bridge, so the pool-feed bridge
-        // is the only bridge that ever feeds the pool. The only
-        // coordination needed now is "don't spawn twice" — a second
-        // call from a later offer just returns.
-        let mut handle = self.pool_feed_bridge_handle.lock().await;
-        if handle.is_some() {
-            return;
-        }
-        let Some(pool) = self.pool.get().map(Arc::clone) else {
-            // Pool not initialized — caller must invoke `start()` first.
-            // `handle_offer_pool_mode` already errors if the pool is
-            // missing; if we somehow reach here without it, silently
-            // skip rather than panic. Diagnostic eprintln so the bug
-            // is visible in logs without crashing the session.
-            eprintln!(
-                "[display/pool-feed] pool not initialized — \
-                 ensure_pool_feed_bridge_started is a no-op; \
-                 DisplaySession::start() must run before any offer"
-            );
-            return;
-        };
+    /// **`AppEvent::DisplayResize` emission.** The bridge emits the
+    /// resize event when the capture backend hands over a frame at a
+    /// new resolution. Required so presence / MCP / outbound
+    /// listeners learn about display size changes (no other code path
+    /// emits these in pool-only sessions).
+    ///
+    /// **Single-spawn contract.** `start` is the sole caller; this
+    /// function does not check whether the bridge is already running.
+    /// Calling it twice would spawn duplicate bridges — both feeding
+    /// the same pool, both pushing identical I420 frames every tick.
+    /// `start` runs at most once per session, so the contract holds
+    /// by construction.
+    async fn spawn_pool_feed_bridge(
+        &self,
+        pool: Arc<encode::pool::EncoderPool>,
+        fps: u32,
+        event_bus: Option<crate::event::EventBus>,
+    ) {
         let mut broadcast_rx = self.frame_tx.subscribe();
         let (initial_w, initial_h) = self.backend.resolution();
         let shutdown = self.shutdown.clone();
         let display_id = self.display_id;
-        let event_bus = self.encoder_event_bus.lock().await.clone();
-        let fps = *self.fps.lock().await;
         let frame_interval = std::time::Duration::from_millis(
             if fps > 0 { 1000 / fps as u64 } else { 33 },
         );
@@ -1412,7 +1381,7 @@ impl DisplaySession {
                 }
             }
         });
-        *handle = Some(task);
+        *self.pool_feed_bridge_handle.lock().await = Some(task);
     }
 
     /// Ensure a clipboard forwarding task is running.
@@ -1978,11 +1947,18 @@ mod tests {
     // -----------------------------------------------------------------------
 
 
-    /// Calling the bridge starter a second time is a no-op: the
-    /// handle guard returns early. The first task keeps running; we
-    /// don't spawn duplicates.
+    /// 3c.4d: `start()` spawns the pool-feed bridge eagerly, before
+    /// any offer is served. Pre-3c.4d the bridge was lazy and only
+    /// appeared after the first `handle_offer_pool_mode` call —
+    /// regression here would mean a peer subscribing before the
+    /// first offer never sees pool encoder output (the bridge would
+    /// be missing, encoders would sit idle, peer would see black).
+    /// Pin both the eager spawn AND the keyframe channel install,
+    /// since the burst signal at the tail of `handle_offer_pool_mode`
+    /// silently drops on a missing channel — a regression there would
+    /// not fail any other test.
     #[tokio::test]
-    async fn ensure_pool_feed_bridge_started_is_idempotent() {
+    async fn pool_feed_bridge_spawned_eagerly_in_start() {
         let backend = Arc::new(StubBackend { width: 64, height: 64 });
         let session = DisplaySession::new(0, backend);
         session
@@ -1990,34 +1966,28 @@ mod tests {
             .await
             .expect("start() must succeed");
 
-        session.ensure_pool_feed_bridge_started().await;
-        // Capture the handle's task id (via Debug repr) so a
-        // second-spawn regression would surface as a different id.
-        let first_handle_dbg = format!(
-            "{:?}",
+        // Bridge handle must be Some — start() owns the spawn; no
+        // offer has been served.
+        assert!(
             session
                 .pool_feed_bridge_handle
                 .lock()
                 .await
-                .as_ref()
-                .map(|h| h.id())
+                .is_some(),
+            "start() must spawn pool-feed bridge eagerly (3c.4d)"
         );
 
-        session.ensure_pool_feed_bridge_started().await;
-        session.ensure_pool_feed_bridge_started().await;
-
-        let after_handle_dbg = format!(
-            "{:?}",
+        // Keyframe channel must be installed — peer-join burst
+        // signaling depends on it.
+        assert!(
             session
-                .pool_feed_bridge_handle
+                .pool_feed_keyframe_tx
                 .lock()
                 .await
-                .as_ref()
-                .map(|h| h.id())
-        );
-        assert_eq!(
-            first_handle_dbg, after_handle_dbg,
-            "subsequent calls must NOT replace the existing bridge task"
+                .is_some(),
+            "start() must install pool_feed_keyframe_tx so the \
+             peer-join burst signal at the tail of \
+             handle_offer_pool_mode reaches the bridge (3c.4d)"
         );
 
         session.shutdown.cancel();
@@ -2054,7 +2024,6 @@ mod tests {
             .start(30, None, Some(bus))
             .await
             .expect("start must succeed");
-        session.ensure_pool_feed_bridge_started().await;
 
         // Push the FIRST frame at the initial size; this seeds the
         // bridge's enc_w/enc_h tracking but does NOT cross the
@@ -2127,7 +2096,6 @@ mod tests {
             .start(30, None, None)
             .await
             .expect("start must succeed");
-        session.ensure_pool_feed_bridge_started().await;
 
         // Subscribe to the pool's encoder before pushing the BGRA so
         // we don't miss the first frame.
@@ -2236,7 +2204,6 @@ mod tests {
         // `frame_tx` — we're testing the seed-from-snapshot path,
         // not the broadcast-recv path. Pre-fix the bridge would have
         // `latest_i420 = None` and the encoder would never see input.
-        session.ensure_pool_feed_bridge_started().await;
 
         // Within one tick (~33ms at fps=30) the seeded buffer should
         // be forwarded. Generous timeout for VP8 encoder warmup
@@ -2310,7 +2277,6 @@ mod tests {
         // Spawn the pool-feed bridge. The seed branch must observe
         // the dimension mismatch and reshape the pool BEFORE the
         // first tick would push an old-dim-incompatible buffer.
-        session.ensure_pool_feed_bridge_started().await;
 
         // Wait for the seed path to fire and reshape. Bounded — the
         // seed runs synchronously inside the spawned task before the
@@ -2408,7 +2374,6 @@ mod tests {
             .expect("at least one subscription")
             .frames;
 
-        session.ensure_pool_feed_bridge_started().await;
 
         // Drain the seeded frame's initial encode before measuring;
         // we want to count what the BURST produces, not the cold-
@@ -2425,7 +2390,7 @@ mod tests {
             .lock()
             .await
             .as_ref()
-            .expect("kf_tx installed by ensure_pool_feed_bridge_started")
+            .expect("kf_tx installed by spawn_pool_feed_bridge during start()")
             .send(())
             .expect("kf channel must be open");
 
@@ -2507,7 +2472,6 @@ mod tests {
             .start(30, None, None)
             .await
             .expect("start must succeed");
-        session.ensure_pool_feed_bridge_started().await;
 
         // Pre-condition: bridge spawned, handle is Some.
         assert!(
