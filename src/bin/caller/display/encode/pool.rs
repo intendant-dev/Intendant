@@ -1968,9 +1968,18 @@ fn spawn_encoder_thread_with(
                     // frames as encode_drops so the metric reflects
                     // backpressure pressure even when the encoder
                     // itself isn't logging individual drops.
-                    counters_for_thread
-                        .encode_drops
-                        .fetch_add(n, Ordering::Relaxed);
+                    // 3c.3b.4i: gate on receiver_count > 0 — an
+                    // encoder with zero consumers (e.g. always-on
+                    // VP8 during a legacy-only session, or unused
+                    // always-on VP8 in an H.264-only pool session)
+                    // is producing into a void; counting its lag
+                    // would inflate `encode_drops` against work no
+                    // peer is waiting for.
+                    if frames_tx_for_thread.receiver_count() > 0 {
+                        counters_for_thread
+                            .encode_drops
+                            .fetch_add(n, Ordering::Relaxed);
+                    }
                     eprintln!(
                         "[encoder/pool] {} lagged by {} frames, skipping ahead",
                         id_for_log, n
@@ -2017,14 +2026,27 @@ fn spawn_encoder_thread_with(
                     // per packet, matching legacy semantics so
                     // average rates compose cleanly when both
                     // bridges share the counter pre-3c.4).
+                    // 3c.3b.4i: only count metrics when this encoder
+                    // has at least one consumer subscribed. Pool's
+                    // always-on VP8 keeps producing during legacy-only
+                    // sessions (legacy bridge dual-feeds the pool),
+                    // and an H.264-only session leaves the always-on
+                    // VP8 producing into a void — bumping counters
+                    // there inflates dashboard fps/latency by the
+                    // unconsumed work. Receiver-count is an atomic
+                    // load on the broadcast::Sender, cheap enough to
+                    // sample once per encode call.
+                    let has_consumer = frames_tx_for_thread.receiver_count() > 0;
                     let latency_us = frame.arrived.elapsed().as_micros() as u64;
                     for pkt in packets {
-                        counters_for_thread
-                            .encode_frames
-                            .fetch_add(1, Ordering::Relaxed);
-                        counters_for_thread
-                            .encode_latency_us_sum
-                            .fetch_add(latency_us, Ordering::Relaxed);
+                        if has_consumer {
+                            counters_for_thread
+                                .encode_frames
+                                .fetch_add(1, Ordering::Relaxed);
+                            counters_for_thread
+                                .encode_latency_us_sum
+                                .fetch_add(latency_us, Ordering::Relaxed);
+                        }
                         let ef = Arc::new(pkt.into_encoded_frame());
                         // Lossy broadcast: returns Err only if there
                         // are zero subscribers, which is fine.
@@ -3027,6 +3049,93 @@ mod tests {
             latency_sum > 0,
             "encode_latency_us_sum must accumulate from frame.arrived → \
              encoded packet emission; got {latency_sum}",
+        );
+    }
+
+    /// **3c.3b.4i regression test.** Pool encoder must NOT bump
+    /// `encode_frames` / `encode_latency_us_sum` / `encode_drops`
+    /// when its `frames_tx` has zero subscribers. Two production
+    /// scenarios hit this:
+    ///   1. Legacy-only session (default before 3c.4 flips the
+    ///      env-flag default): legacy bridge dual-feeds the pool,
+    ///      pool's always-on VP8 keeps encoding, but no pool peer
+    ///      is subscribed — counting those packets alongside the
+    ///      legacy encoder's packets inflates dashboard fps.
+    ///   2. H.264-only pool session: always-on VP8 stays alive
+    ///      even when no peer subscribes to it (the only consumers
+    ///      are on the on-demand H.264 slot) — VP8 packets land
+    ///      in a void.
+    /// This test pins the gate: construct a pool, push frames
+    /// WITHOUT subscribing, assert counters stay zero. Then
+    /// subscribe, push more, assert they start incrementing.
+    /// Pre-3c.3b.4i this assertion would fail (counters bumped
+    /// regardless of consumers).
+    #[tokio::test]
+    async fn pool_encoder_does_not_count_metrics_without_subscribers() {
+        const W: usize = 64;
+        const H: usize = 64;
+        let mut frame_data = vec![0u8; W * H * 3 / 2];
+        for byte in &mut frame_data[W * H..] {
+            *byte = 128;
+        }
+        let frame_arc = Arc::new(frame_data);
+
+        let counters = Arc::new(crate::display::DisplayMetricsCounters::new());
+        let layer = LayerSpec::single(CodecKind::Vp8, W as u32, H as u32, 30);
+        let pool = EncoderPool::new(
+            W as u32,
+            H as u32,
+            30,
+            vec![layer],
+            Some(Arc::clone(&counters)),
+        );
+
+        // Phase 1: NO subscribe. Encoder thread is alive and
+        // consuming I420 (always-on), but its frames_tx has zero
+        // receivers — the gate must skip metric increments.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..10 {
+            pool.push_i420_frame(Arc::clone(&frame_arc), Instant::now());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Wait for the encoder to finish processing the pushed frames.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let frames_no_sub = counters.encode_frames.load(Ordering::SeqCst);
+        let latency_no_sub = counters.encode_latency_us_sum.load(Ordering::SeqCst);
+        assert_eq!(
+            frames_no_sub, 0,
+            "encode_frames must NOT increment when encoder has zero \
+             subscribers; got {frames_no_sub}. Pre-3c.3b.4i: legacy-\
+             only sessions saw doubled metrics because pool always-\
+             on VP8 counted alongside the legacy encoder.",
+        );
+        assert_eq!(
+            latency_no_sub, 0,
+            "encode_latency_us_sum must NOT accumulate when encoder \
+             has zero subscribers; got {latency_no_sub}",
+        );
+
+        // Phase 2: subscribe and push more. Counters MUST start
+        // incrementing now — confirms the gate's positive case
+        // still works (regression guard against an over-eager fix
+        // that gates everything off).
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+        let (mut subs, _lease) = pool.subscribe(&prefs).expect("subscribe");
+        let _rx = subs.remove(0).frames;
+
+        for _ in 0..5 {
+            pool.push_i420_frame(Arc::clone(&frame_arc), Instant::now());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let frames_with_sub = counters.encode_frames.load(Ordering::SeqCst);
+        assert!(
+            frames_with_sub > 0,
+            "encode_frames MUST increment after a subscriber attaches; \
+             got {frames_with_sub}. Gate must only skip when there are \
+             actually zero consumers.",
         );
     }
 
