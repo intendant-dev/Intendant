@@ -2336,12 +2336,13 @@ mod tests {
 
 
 
-    /// **3c.3b.4c regression test (pool-only session).** Symmetric
-    /// to the mixed-session test above: in a pool-only session the
-    /// pool-feed bridge owns the feed and `pool_feed_keyframe_tx` is
-    /// installed. Legacy `keyframe_tx` is `None`. `signal_peer_join_burst`
-    /// must hit the pool-feed channel. Pins the existing 3c.3b.4b
-    /// path stays correct after the dual-channel dispatch refactor.
+    /// `signal_peer_join_burst` must send `()` on
+    /// `pool_feed_keyframe_tx` whenever the channel is installed.
+    /// Pins the contract that `handle_offer_pool_mode`'s tail relies
+    /// on for the burst window — without the send, codecs that
+    /// ignore `force_keyframe` on a long-running pipe (Linux ffmpeg
+    /// H.264) sit on a P-frame stream past `request_keyframe_all`
+    /// for many seconds on idle desktops.
     #[tokio::test]
     async fn signal_peer_join_burst_wakes_pool_feed_bridge_in_pool_only_session(
     ) {

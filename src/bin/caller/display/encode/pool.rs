@@ -2,14 +2,16 @@
 //!
 //! ## Why this exists
 //!
-//! The pre-pool design has one [`Encoder`](super::Encoder) per
-//! [`DisplaySession`], with the codec locked to the first peer's offer
-//! (see `display/mod.rs:396` `codec_mime: RwLock<&'static str>` and
-//! `display/mod.rs:1044-1048` "First peer -- negotiate codec from SDP").
-//! Every subsequent viewer must accept that locked codec or its WebRTC
-//! offer fails outright with "peer does not support session codec
-//! video/H264 with compatible profile" — exactly the symptom that bit
-//! us in the multi-browser federation E2E session.
+//! The pre-pool design used one [`Encoder`](super::Encoder) per
+//! [`DisplaySession`] with the codec locked to the first peer's
+//! offer (a single `codec_mime: RwLock<&'static str>` set in
+//! `handle_offer`'s "first peer" branch and never reset). Every
+//! subsequent viewer had to accept that locked codec or its WebRTC
+//! offer failed outright with "peer does not support session codec
+//! video/H264 with compatible profile" — the failure mode that bit
+//! us in the multi-browser federation E2E session. The pre-pool
+//! path was deleted entirely in 3c.4b; the description here is
+//! retained to motivate the design.
 //!
 //! ## Why per-peer encoder is the wrong answer
 //!
