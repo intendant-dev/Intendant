@@ -1462,13 +1462,16 @@ impl DisplaySession {
     ///     * [`crate::display::encode::pool::EncoderPool::request_keyframe_all`]
     ///       (3c.3b.4a): fires a coalesced PLI-equivalent across
     ///       every active encoder. Honored by VP8 and macOS H.264.
-    ///     * [`Self::pool_feed_keyframe_tx`] burst signal (3c.3b.4b):
-    ///       wakes the pool-feed bridge to clock the encoder at
-    ///       tick rate for ~1.5s. Required for codecs that ignore
-    ///       `force_keyframe` on a long-running pipe (Linux ffmpeg
-    ///       H.264) — without the burst, an idle-desktop pool
-    ///       peer-join on Linux H.264 stays black for many seconds
-    ///       waiting on the heartbeat-paced 1 push/sec cadence.
+    ///     * Burst signal via [`Self::signal_peer_join_burst`]
+    ///       (3c.3b.4b/.4c): wakes whichever bridge owns the pool
+    ///       feed (pool-feed bridge in pool-only sessions, legacy
+    ///       bridge in mixed sessions where a legacy peer attached
+    ///       first) to clock the encoder at tick rate for ~1.5s.
+    ///       Required for codecs that ignore `force_keyframe` on a
+    ///       long-running pipe (Linux ffmpeg H.264) — without the
+    ///       burst, an idle-desktop pool peer-join on Linux H.264
+    ///       stays black for many seconds waiting on the heartbeat-
+    ///       paced 1 push/sec cadence.
     ///     The PLI-driven per-peer explicit request from str0m's
     ///     inbound RTCP lands with the simulcast work.
     ///   - No `pool_leases` tracking on `DisplaySession`:
@@ -1622,24 +1625,56 @@ impl DisplaySession {
         // is in place when the keyframe lands in the encoder broadcast.
         pool.request_keyframe_all();
 
-        // 3c.3b.4b: open the pool-feed bridge's peer-join burst window.
-        // Required for codecs that ignore `force_keyframe` on a
-        // long-running pipe (Linux ffmpeg H.264 — see
-        // `h264_linux.rs::encode`'s `_force_keyframe` underscore):
-        // request_keyframe_all alone won't reach those encoders, so
-        // we clock the encoder at tick rate for ~1.5s so its `-g 30`
-        // natural cadence emits a keyframe inside the window. Mirrors
-        // the legacy bridge's `keyframe_tx.send(())` → burst_until
-        // pathway at mod.rs:984-998. No-op if the bridge isn't yet
-        // running (the kf signal is just dropped on the unbounded
-        // channel; bridge startup later won't replay it, which is
-        // fine — `ensure_pool_feed_bridge_started` ran above and
-        // installed the sender BEFORE peer setup).
+        // 3c.3b.4c: open the peer-join burst window via whichever
+        // bridge currently owns the pool feed. In a pool-only session
+        // that's the pool-feed bridge (keyed on `pool_feed_keyframe_tx`,
+        // installed by `ensure_pool_feed_bridge_started` above); in a
+        // mixed session where a legacy peer attached first, the legacy
+        // bridge (keyed on `keyframe_tx`) owns the feed and
+        // `ensure_pool_feed_bridge_started` early-returned without
+        // installing the pool-feed sender. See
+        // [`Self::signal_peer_join_burst`] for the dispatch contract.
+        self.signal_peer_join_burst().await;
+
+        Ok(answer_sdp)
+    }
+
+    /// Open the peer-join burst window on whichever bridge currently
+    /// owns the pool feed.
+    ///
+    /// **Why two channels.** The pool feed has exactly one owner at
+    /// any time, established by the single-feed-ownership invariant
+    /// in 3c.3b.3b: `encoder_init_lock` serializes the decision, and
+    /// [`Self::ensure_pool_feed_bridge_started`] no-ops if `*init ==
+    /// true` (legacy bridge wins). So at most one of
+    /// `pool_feed_keyframe_tx` / `keyframe_tx` is `Some` at any
+    /// moment. Sending to both is idempotent on the `None` side and
+    /// avoids a "which bridge is active right now?" check at every
+    /// call site — call sites just call this and stay correct
+    /// regardless of which lifecycle path the session followed.
+    ///
+    /// **What gets signaled.** `pool_feed_keyframe_tx`'s receiver is
+    /// in the pool-feed bridge spawned by `ensure_pool_feed_bridge_started`
+    /// (3c.3b.4b). `keyframe_tx`'s receiver is in the legacy bridge
+    /// spawned by `start_encoder_pipeline`. Either fires the same
+    /// 1.5s burst window mechanism on its own bridge — clocks the
+    /// encoder at tick rate so codecs that ignore `force_keyframe`
+    /// on a long-running pipe (Linux ffmpeg H.264) hit a natural
+    /// keyframe inside the window.
+    ///
+    /// **Why this exists.** 3c.3b.4b only signaled `pool_feed_keyframe_tx`,
+    /// which leaves mixed sessions black: a legacy peer attaches first
+    /// → legacy bridge owns the pool feed → pool-feed bridge never
+    /// starts → `pool_feed_keyframe_tx` stays `None` → 4b's signal
+    /// no-ops → later pool peer's Linux H.264 forwarder waits seconds
+    /// on the 1 push/sec heartbeat cadence. Closing 4b's high finding.
+    async fn signal_peer_join_burst(&self) {
         if let Some(tx) = self.pool_feed_keyframe_tx.lock().await.as_ref() {
             let _ = tx.send(());
         }
-
-        Ok(answer_sdp)
+        if let Some(tx) = self.keyframe_tx.lock().await.as_ref() {
+            let _ = tx.send(());
+        }
     }
 
     /// Idempotently ensure the **pool-only** capture-to-I420 bridge is
@@ -3234,6 +3269,84 @@ mod tests {
         );
 
         session.shutdown.cancel();
+    }
+
+    /// **3c.3b.4c regression test (mixed session).** When a legacy
+    /// peer attached first, the legacy bridge owns the pool feed
+    /// and `ensure_pool_feed_bridge_started` early-returns without
+    /// installing `pool_feed_keyframe_tx`. A later pool peer's
+    /// burst signal must reach the LEGACY bridge's `keyframe_tx`,
+    /// or Linux H.264 stays black on the pool peer.
+    /// `signal_peer_join_burst` dispatches to both channels;
+    /// asserting the legacy channel receives confirms the mixed-
+    /// session path is wired.
+    #[tokio::test]
+    async fn signal_peer_join_burst_wakes_legacy_bridge_in_mixed_session() {
+        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let session = DisplaySession::new(0, backend);
+
+        // Simulate "legacy bridge owns pool feed":
+        //   - install legacy `keyframe_tx` (as `start_encoder_pipeline`
+        //     would have done after taking `encoder_init_lock`)
+        //   - leave `pool_feed_keyframe_tx` as `None` (mirrors the
+        //     `ensure_pool_feed_bridge_started` early-return when
+        //     `*init == true`).
+        let (legacy_tx, mut legacy_rx) = mpsc::unbounded_channel::<()>();
+        *session.keyframe_tx.lock().await = Some(legacy_tx);
+        assert!(
+            session.pool_feed_keyframe_tx.lock().await.is_none(),
+            "test premise: pool_feed_keyframe_tx must be None to \
+             model the mixed-session path",
+        );
+
+        session.signal_peer_join_burst().await;
+
+        let recv = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            legacy_rx.recv(),
+        )
+        .await;
+        assert!(
+            matches!(recv, Ok(Some(()))),
+            "legacy keyframe_tx must receive burst signal in mixed \
+             session; got {recv:?}. Pre-3c.3b.4c: signal only went \
+             to pool_feed_keyframe_tx (which is None here) → no-op \
+             → Linux H.264 pool peer stays black.",
+        );
+    }
+
+    /// **3c.3b.4c regression test (pool-only session).** Symmetric
+    /// to the mixed-session test above: in a pool-only session the
+    /// pool-feed bridge owns the feed and `pool_feed_keyframe_tx` is
+    /// installed. Legacy `keyframe_tx` is `None`. `signal_peer_join_burst`
+    /// must hit the pool-feed channel. Pins the existing 3c.3b.4b
+    /// path stays correct after the dual-channel dispatch refactor.
+    #[tokio::test]
+    async fn signal_peer_join_burst_wakes_pool_feed_bridge_in_pool_only_session(
+    ) {
+        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let session = DisplaySession::new(0, backend);
+
+        let (pool_tx, mut pool_rx) = mpsc::unbounded_channel::<()>();
+        *session.pool_feed_keyframe_tx.lock().await = Some(pool_tx);
+        assert!(
+            session.keyframe_tx.lock().await.is_none(),
+            "test premise: keyframe_tx must be None to model the \
+             pool-only path",
+        );
+
+        session.signal_peer_join_burst().await;
+
+        let recv = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            pool_rx.recv(),
+        )
+        .await;
+        assert!(
+            matches!(recv, Ok(Some(()))),
+            "pool_feed_keyframe_tx must receive burst signal in \
+             pool-only session; got {recv:?}",
+        );
     }
 
     /// **3c.3b.3c follow-up finding 2.** `DisplaySession::stop()`
