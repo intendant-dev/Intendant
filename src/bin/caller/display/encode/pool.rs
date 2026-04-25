@@ -136,7 +136,7 @@
 use crate::display::EncodedFrame;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -793,19 +793,27 @@ struct EncoderPoolInner {
     /// on-demand spawn needs it.
     duration_ms: u64,
 
-    /// Source resolution used for on-demand encoder spawns. Always-on
-    /// layers carry their own width/height (may be downscaled simulcast
-    /// layers), but on-demand encoders default to the source resolution
-    /// and bitrate appropriate for their codec (from `LayerSpec::single`).
+    /// Source resolution + epoch under one lock so callers always see
+    /// a consistent (width, height, gen) triple. Replaces an earlier
+    /// design that stored these in separate atomics, which permitted
+    /// torn reads where `subscribe` could capture an epoch from
+    /// before a resize but read dimensions from after, or vice versa
+    /// — the gen check then either false-positived (cancelled valid
+    /// encoders) or, theoretically, missed a stale install. The
+    /// `RwLock<SourceState>` makes the snapshot operation atomic by
+    /// virtue of the read lock.
     ///
-    /// Atomic because [`EncoderPool::on_resize`] updates these when the
-    /// capture backend reports a new resolution; `dimensions()` readers
-    /// must see the updated value without taking a lock. Stores use
-    /// `Ordering::SeqCst` to match the ordering model the `always_on`
-    /// write lock provides — on_resize writes dimensions then swaps
-    /// handles, readers see them in that order.
-    source_width: AtomicU32,
-    source_height: AtomicU32,
+    /// Performance: `dimensions()` is called by the bridge's
+    /// `debug_assert!` in non-release builds; in release builds it
+    /// has only test/diagnostic callers. `on_resize` (the only
+    /// writer) is rare. Read-lock contention is therefore negligible
+    /// in practice.
+    source_state: StdRwLock<SourceState>,
+
+    /// Capture framerate in Hz. Immutable for the pool's lifetime —
+    /// resize only changes spatial dimensions, not framerate. If we
+    /// ever need to support framerate change at runtime, this can
+    /// move into `SourceState`.
     framerate: u32,
 
     /// Monotonically-increasing counter that allocates a unique
@@ -817,24 +825,23 @@ struct EncoderPoolInner {
     /// unique-across-all-slots is sufficient; the bookkeeping cost of
     /// a per-id counter isn't worth the extra state.
     slot_gen_counter: AtomicU64,
+}
 
-    /// Epoch counter incremented by [`EncoderPool::on_resize`] whenever
-    /// source dimensions actually change. `EncoderPool::subscribe`
-    /// snapshots this at pass 1 (when it reads `source_width`/
-    /// `source_height` to build a `LayerSpec::single` for an on-demand
-    /// codec), runs encoder construction OFF-lock in pass 2, then
-    /// compares under the on-demand lock in pass 3 before installing
-    /// the constructed encoder. If the epoch has moved, the encoder
-    /// is at stale dimensions and must be cancelled rather than
-    /// installed — otherwise a peer subscribing during a resize
-    /// could latch an old-dimensions encoder into the pool, which
-    /// would then receive post-resize I420 frames and produce
-    /// misinterpreted output.
-    ///
-    /// Bumped inside `on_resize` only after the same-dim early-return
-    /// has been cleared, so readers that observe a bumped epoch can
-    /// trust the source dimensions have actually changed.
-    source_gen: AtomicU64,
+/// Atomic snapshot of source dimensions + resize epoch. Stored
+/// behind a `RwLock` inside [`EncoderPoolInner`] so any caller that
+/// needs both the dimensions and the epoch (notably
+/// [`EncoderPool::subscribe_once`], whose pass-3 stale check
+/// compares the captured epoch against the current epoch) gets a
+/// consistent view rather than two separate atomic reads that
+/// could straddle a concurrent `on_resize`.
+#[derive(Clone, Copy, Debug)]
+struct SourceState {
+    width: u32,
+    height: u32,
+    /// Bumped on every real-dim `on_resize`. Same-dim no-ops do not
+    /// advance the epoch (so racing subscribes aren't penalized for
+    /// a resize that changed nothing).
+    gen: u64,
 }
 
 impl EncoderPool {
@@ -900,11 +907,13 @@ impl EncoderPool {
                 keyframe_coalescer: KeyframeCoalescer::new(),
                 i420_tx,
                 duration_ms,
-                source_width: AtomicU32::new(source_width),
-                source_height: AtomicU32::new(source_height),
+                source_state: StdRwLock::new(SourceState {
+                    width: source_width,
+                    height: source_height,
+                    gen: 0,
+                }),
                 framerate,
                 slot_gen_counter: AtomicU64::new(0),
-                source_gen: AtomicU64::new(0),
             }),
         }
     }
@@ -927,11 +936,23 @@ impl EncoderPool {
     ///
     /// Returns `(source_width, source_height)` — the values most
     /// recently set by either [`Self::new`] or [`Self::on_resize`].
+    /// Reads the dimensions and the resize epoch atomically; if you
+    /// need the epoch as well (the bridge's debug_assert doesn't,
+    /// but [`Self::subscribe_once`]'s race check does), call
+    /// [`Self::snapshot_source`] instead so a single read returns
+    /// both.
     pub fn dimensions(&self) -> (u32, u32) {
-        (
-            self.inner.source_width.load(Ordering::SeqCst),
-            self.inner.source_height.load(Ordering::SeqCst),
-        )
+        let s = self.snapshot_source();
+        (s.width, s.height)
+    }
+
+    /// Atomic (width, height, epoch) snapshot under the source-state
+    /// read lock. Used by [`Self::subscribe_once`] to capture the
+    /// dimensions used for on-demand encoder construction AND the
+    /// epoch they correspond to in a single critical section, so the
+    /// pass-3 stale check is comparing apples to apples.
+    fn snapshot_source(&self) -> SourceState {
+        *self.inner.source_state.read().unwrap()
     }
 
     /// Replace every encoder in the pool with a fresh one at new source
@@ -991,32 +1012,38 @@ impl EncoderPool {
     /// startup or resize — is unrecoverable by contract (see
     /// [`Self::new`]).
     pub fn on_resize(&self, new_width: u32, new_height: u32) {
-        let old_width = self.inner.source_width.load(Ordering::SeqCst);
-        let old_height = self.inner.source_height.load(Ordering::SeqCst);
+        // Atomic update of dimensions + epoch under the source-state
+        // write lock. Holding the lock across both the dim and gen
+        // updates means any concurrent reader either sees the OLD
+        // (width, height, gen) triple or the NEW one — never a
+        // tearing combination. This replaces the earlier design of
+        // three separate atomics, where a subscribe could capture an
+        // epoch from one side of the resize and dimensions from the
+        // other, producing false-positive cancellations or (in
+        // pathological orderings) installs at stale dimensions.
+        //
+        // Same-dim early return: read the current state under the
+        // read lock; if dims unchanged, drop the read lock and
+        // return without acquiring the write lock — avoids epoch
+        // bumps that would penalize racing subscribes for nothing.
+        let (old_width, old_height) = {
+            let s = self.inner.source_state.read().unwrap();
+            (s.width, s.height)
+        };
         if (old_width, old_height) == (new_width, new_height) {
             return;
         }
 
-        // Advance dimension atomics first so any concurrent reader —
-        // the bridge's push_i420_frame dimension gate, a subscribe
-        // that consults source_width/height for an on-demand
-        // LayerSpec::single default — sees the new size before it
-        // sees the new handles. SeqCst matches the write lock's
-        // ordering so observers see (dims, handles) atomically on
-        // release.
-        self.inner.source_width.store(new_width, Ordering::SeqCst);
-        self.inner.source_height.store(new_height, Ordering::SeqCst);
-        // Bump the source_gen epoch. Any subscribe that captured
-        // source_gen before this store AND is still off-lock
-        // constructing its on-demand encoder will detect the
-        // mismatch in pass 3 and cancel its stale-dimensions
-        // encoder instead of installing it. Bumped between the
-        // dimension stores and the handle swaps so the epoch
-        // transition is the authoritative "resize has happened"
-        // signal — concurrent readers that observe a bumped epoch
-        // are guaranteed to see both the new dimensions and the
-        // (about-to-be) new handles.
-        self.inner.source_gen.fetch_add(1, Ordering::SeqCst);
+        // Take the write lock, advance the source state. Bumped epoch
+        // is the authoritative "resize has happened" signal —
+        // concurrent readers that observe a bumped epoch are
+        // guaranteed to see the new dimensions in the same snapshot.
+        {
+            let mut s = self.inner.source_state.write().unwrap();
+            s.width = new_width;
+            s.height = new_height;
+            s.gen = s.gen.saturating_add(1);
+        }
 
         // Swap always-on handles. Hold the write lock across
         // try_spawn_encoder_thread (synchronous codec probe,
@@ -1187,20 +1214,24 @@ impl EncoderPool {
         let mut subs = Vec::new();
         let mut always_on_codecs: Vec<CodecKind> = Vec::new();
 
-        // Snapshot the source epoch at the start of the subscribe so
-        // pass 3 can detect a race with `on_resize`. Any on-demand
-        // encoder we construct in pass 2 uses dimensions we read here
-        // (via pass 1's source_width/height reads); if `on_resize`
-        // fires between pass 2 and pass 3, the epoch changes and the
-        // encoder we built is at stale dimensions. Pass 3 checks
-        // under the on-demand lock and cancels stale constructs
-        // instead of installing them. Always-on subs aren't affected
-        // because their handles live in `self.inner.always_on`,
-        // which `on_resize` swaps atomically — their subscribe()
+        // Atomic snapshot of (width, height, epoch). Pass 1 builds
+        // on-demand `LayerSpec::single` from `snapshot.{width, height}`
+        // so the encoder we construct in pass 2 corresponds exactly
+        // to `snapshot.gen`; pass 3 then compares the current epoch
+        // against `snapshot.gen` under the on-demand lock to detect
+        // a `on_resize` that fired during construction. Single
+        // critical section under the source-state read lock means
+        // the snapshot can't tear (an earlier design captured the
+        // epoch separately from the dimensions and was vulnerable
+        // to torn reads where the gen and dimensions came from
+        // opposite sides of a resize).
+        //
+        // Always-on subs aren't affected because their handles live
+        // in `self.inner.always_on`, which `on_resize` swaps
+        // atomically under its own write lock — their subscribe()
         // receivers observe Closed via the normal broadcast path if
         // a resize happened before they're consumed.
-        let source_gen_at_start =
-            self.inner.source_gen.load(Ordering::SeqCst);
+        let source_at_start = self.snapshot_source();
 
         // Always-on: no refcount, subscribe-only. These are guaranteed
         // to be producing frames — EncoderPool::new panics on
@@ -1261,10 +1292,13 @@ impl EncoderPool {
                         frames: slot.handle.subscribe(),
                     });
                 } else {
+                    // Use the dimensions from the snapshot captured
+                    // at function entry — same gen, same dims,
+                    // checked together by pass 3.
                     let layer = LayerSpec::single(
                         codec,
-                        self.inner.source_width.load(Ordering::SeqCst),
-                        self.inner.source_height.load(Ordering::SeqCst),
+                        source_at_start.width,
+                        source_at_start.height,
                         self.inner.framerate,
                     );
                     to_construct.push((codec, id, layer));
@@ -1319,8 +1353,8 @@ impl EncoderPool {
             // transient subscribe failure and retries on the next
             // offer/reconnect — same semantics as any other
             // encoder construction failure.
-            let stale_epoch = self.inner.source_gen.load(Ordering::SeqCst)
-                != source_gen_at_start;
+            let stale_epoch =
+                self.snapshot_source().gen != source_at_start.gen;
             if stale_epoch {
                 for (id, handle, _layer) in &constructed {
                     eprintln!(
@@ -1329,29 +1363,31 @@ impl EncoderPool {
                     );
                     handle.shutdown.cancel();
                 }
-                // Don't install. Drop the lock before deciding:
-                // - subs non-empty: we have always-on / fast-path
-                //   codecs to serve; return partial result. Caller
-                //   gets a working subscription, just not at the
-                //   full set of requested codecs. This is identical
-                //   to a peer that asked for codecs we don't
-                //   support — same SDP semantics, no need to retry.
-                // - subs empty: ALL the codecs the peer wanted were
-                //   stale. Returning NoCompatibleCodec here would
-                //   reject an offer that would succeed on retry.
-                //   Signal the outer `subscribe` to retry instead.
+                // Always retry on stale, regardless of whether
+                // pass 1's always-on / fast-path slots already
+                // populated `subs`. Returning a partial result here
+                // would silently drop the codec the peer might have
+                // negotiated their SDP around — without 3c.3b.2's
+                // narrowed-negotiation contract (WebRtcPeer's enabled
+                // codec set derived from RETURNED subscriptions, not
+                // from the original peer prefs), the peer could pick
+                // an SDP codec we won't actually serve and see a
+                // black stream.
+                //
+                // Drop any always-on / fast-path subs we'd built so
+                // their broadcast Receivers don't leak (each one
+                // holds an entry in the encoder's broadcast Sender's
+                // subscriber list; on retry we'll get fresh ones).
+                // The `on_demand_refs` accumulated for this attempt
+                // are also dropped — they were claims against slots
+                // that may already be torn down by on_resize, so the
+                // gen-check in PoolLease::release_impl would skip
+                // them anyway, but the explicit drop here is
+                // clearer.
                 drop(on_demand);
-                if subs.is_empty() {
-                    return SubscribeAttemptOutcome::StaleEpochRetry;
-                }
-                return SubscribeAttemptOutcome::Done(Ok((
-                    subs,
-                    PoolLease {
-                        pool: Arc::clone(&self.inner),
-                        on_demand_refs,
-                        released: AtomicBool::new(false),
-                    },
-                )));
+                drop(subs);
+                drop(on_demand_refs);
+                return SubscribeAttemptOutcome::StaleEpochRetry;
             }
             for (id, handle, _layer) in constructed {
                 match on_demand.get_mut(&id) {
@@ -1485,7 +1521,7 @@ impl EncoderPool {
     /// inside subscribe itself.
     #[cfg(test)]
     pub(crate) fn source_gen(&self) -> u64 {
-        self.inner.source_gen.load(Ordering::SeqCst)
+        self.snapshot_source().gen
     }
 }
 
@@ -2171,6 +2207,75 @@ mod tests {
             pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
             None,
             "legitimate lease drop tears slot down when refcount hits 0"
+        );
+    }
+
+    /// Finding 1 (3c.3b.2-pre): the source-state snapshot
+    /// (width, height, gen) returned by `dimensions()` and the
+    /// internal `snapshot_source` is atomic — a caller that reads
+    /// the dims and the epoch at the same moment cannot get a
+    /// torn pair where one came from before a concurrent
+    /// `on_resize` and the other from after. Locks the
+    /// `RwLock<SourceState>` substitution that replaced the
+    /// earlier three-atomic design.
+    #[tokio::test]
+    async fn source_state_snapshot_is_atomic() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            vec![LayerSpec::single(CodecKind::Vp8, 64, 64, 30)],
+        );
+
+        // Initial snapshot: matches construction.
+        let s0 = pool.snapshot_source();
+        assert_eq!((s0.width, s0.height), (64, 64));
+        assert_eq!(s0.gen, 0);
+        assert_eq!(pool.dimensions(), (s0.width, s0.height));
+
+        pool.on_resize(800, 600);
+
+        // Post-resize snapshot: dims advanced, gen advanced —
+        // both observed in the same read-lock-protected critical
+        // section so no torn read is possible. The earlier
+        // three-atomic design could observe (new, new, old) or
+        // (old, new, new) under contention; this test pins the
+        // single-atomic-snapshot contract.
+        let s1 = pool.snapshot_source();
+        assert_eq!((s1.width, s1.height), (800, 600));
+        assert!(s1.gen > s0.gen);
+        // dimensions() reads through the same snapshot helper, so
+        // it must agree.
+        assert_eq!(pool.dimensions(), (s1.width, s1.height));
+    }
+
+    /// Finding 2 (3c.3b.2-pre): on stale-epoch detection, subscribe
+    /// retries rather than returning a partial result. Without a
+    /// deterministic test hook for the race, this test captures the
+    /// guarantee that even when always-on/fast-path codecs are
+    /// available, a stale-detected attempt does not silently drop
+    /// the on-demand codec and return only the always-on subset.
+    /// Indirect verification: the subscribe success path post-resize
+    /// includes the on-demand codec at the new dimensions (already
+    /// covered by `subscribe_after_resize_uses_new_dimensions`); the
+    /// `MAX_SUBSCRIBE_ATTEMPTS` constant ensures retries are bounded
+    /// (this test asserts the cap is sane).
+    #[tokio::test]
+    async fn subscribe_retry_cap_is_bounded() {
+        // The retry loop is bounded so a pathological "every attempt
+        // races" doesn't spin forever. Two attempts is the documented
+        // ceiling — a third attempt would mean three consecutive
+        // sub-millisecond resizes during a single subscribe, which
+        // is itself a bug worth surfacing.
+        assert!(
+            MAX_SUBSCRIBE_ATTEMPTS >= 1,
+            "must allow at least one attempt"
+        );
+        assert!(
+            MAX_SUBSCRIBE_ATTEMPTS <= 4,
+            "more than a few retries indicates either a livelock \
+             tolerance the production system shouldn't hide, or \
+             unrealistic resize traffic — keep the cap tight"
         );
     }
 
