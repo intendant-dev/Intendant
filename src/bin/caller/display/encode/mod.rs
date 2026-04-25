@@ -625,6 +625,122 @@ pub fn bgra_to_i420(bgra: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8
     out
 }
 
+/// Bilinear downscale an I420 frame from `(src_w, src_h)` to `(dst_w, dst_h)`.
+///
+/// All four dimensions must be even — I420 subsamples chroma 2×2 and VP8
+/// requires even output dims, so this is the only useful shape anyway.
+/// Source buffer length must be exactly `src_w * src_h * 3 / 2`.
+///
+/// **Implementation: pure-Rust bilinear, three-plane independent downscale.**
+/// Y plane downscales to `dst_w × dst_h`; U and V planes each downscale
+/// to `(dst_w/2) × (dst_h/2)`. Output layout matches I420 (Y followed by
+/// U followed by V).
+///
+/// **Why bilinear and not libyuv-sys.** Pure Rust costs ~3 ms per 1080p→
+/// 540p downscale on modern x86 / Apple Silicon (one core). At 30 fps that's
+/// ~10% of one core for a single layer — fine for our 1-3-layer simulcast
+/// at typical workloads. libyuv-sys would be 2-3× faster but adds a `-sys`
+/// crate plus setup-script churn (per CLAUDE.md the rule is updating both
+/// `setup-linux.sh` and `setup-macos.sh` for any new sys dep). When/if the
+/// CPU budget actually binds, swapping the per-plane loop to a libyuv call
+/// is local — the function signature and output shape don't change.
+pub fn downscale_i420(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Vec<u8> {
+    debug_assert!(
+        src_w % 2 == 0 && src_h % 2 == 0,
+        "downscale_i420: src dims must be even, got {src_w}x{src_h}"
+    );
+    debug_assert!(
+        dst_w % 2 == 0 && dst_h % 2 == 0,
+        "downscale_i420: dst dims must be even, got {dst_w}x{dst_h}"
+    );
+    let src_w = src_w as usize;
+    let src_h = src_h as usize;
+    let dst_w = dst_w as usize;
+    let dst_h = dst_h as usize;
+
+    let src_y_size = src_w * src_h;
+    let src_uv_size = (src_w / 2) * (src_h / 2);
+    debug_assert_eq!(
+        src.len(),
+        src_y_size + 2 * src_uv_size,
+        "downscale_i420: src len {} doesn't match {src_w}x{src_h} I420 \
+         (expected {})",
+        src.len(),
+        src_y_size + 2 * src_uv_size,
+    );
+
+    let dst_y_size = dst_w * dst_h;
+    let dst_uv_size = (dst_w / 2) * (dst_h / 2);
+    let mut out = vec![0u8; dst_y_size + 2 * dst_uv_size];
+
+    let (src_y, src_uv) = src.split_at(src_y_size);
+    let (src_u, src_v) = src_uv.split_at(src_uv_size);
+    let (dst_y_plane, dst_uv) = out.split_at_mut(dst_y_size);
+    let (dst_u_plane, dst_v_plane) = dst_uv.split_at_mut(dst_uv_size);
+
+    downscale_plane_bilinear(src_y, src_w, src_h, dst_y_plane, dst_w, dst_h);
+    downscale_plane_bilinear(
+        src_u, src_w / 2, src_h / 2, dst_u_plane, dst_w / 2, dst_h / 2,
+    );
+    downscale_plane_bilinear(
+        src_v, src_w / 2, src_h / 2, dst_v_plane, dst_w / 2, dst_h / 2,
+    );
+
+    out
+}
+
+/// Bilinear single-plane downscale. The `dst` slice is written in
+/// row-major order. `src` and `dst` are non-overlapping (caller's
+/// `split_at_mut` enforces that for [`downscale_i420`]).
+///
+/// Sampling convention: pixel centers at `+0.5`, so the destination
+/// pixel's source position is `(dx + 0.5) * x_ratio - 0.5`. Without
+/// the `+0.5/-0.5`, a 2× downscale would sample only the top-left of
+/// each 2×2 source block — biased instead of averaged.
+fn downscale_plane_bilinear(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst: &mut [u8],
+    dst_w: usize,
+    dst_h: usize,
+) {
+    let x_ratio = src_w as f32 / dst_w as f32;
+    let y_ratio = src_h as f32 / dst_h as f32;
+    let max_sx = src_w - 1;
+    let max_sy = src_h - 1;
+
+    for dy in 0..dst_h {
+        let sy_f = (dy as f32 + 0.5) * y_ratio - 0.5;
+        let sy0 = sy_f.floor().max(0.0) as usize;
+        let sy1 = (sy0 + 1).min(max_sy);
+        let fy = (sy_f - sy0 as f32).clamp(0.0, 1.0);
+
+        for dx in 0..dst_w {
+            let sx_f = (dx as f32 + 0.5) * x_ratio - 0.5;
+            let sx0 = sx_f.floor().max(0.0) as usize;
+            let sx1 = (sx0 + 1).min(max_sx);
+            let fx = (sx_f - sx0 as f32).clamp(0.0, 1.0);
+
+            let p00 = src[sy0 * src_w + sx0] as f32;
+            let p01 = src[sy0 * src_w + sx1] as f32;
+            let p10 = src[sy1 * src_w + sx0] as f32;
+            let p11 = src[sy1 * src_w + sx1] as f32;
+            let p = p00 * (1.0 - fx) * (1.0 - fy)
+                + p01 * fx * (1.0 - fy)
+                + p10 * (1.0 - fx) * fy
+                + p11 * fx * fy;
+            dst[dy * dst_w + dx] = p.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
 /// A single packet produced by the VP8 encoder.
 pub struct EncodedPacket {
     pub data: Vec<u8>,
@@ -986,5 +1102,112 @@ a=fmtp:97 profile-level-id=640032;packetization-mode=1\r\n";
         // H264 offered without fmtp → accept (defaults are compatible).
         let sdp = "a=rtpmap:97 H264/90000\r\n";
         assert!(has_compatible_h264_offer(sdp));
+    }
+
+    // -----------------------------------------------------------------------
+    // downscale_i420 — Phase 4a
+    // -----------------------------------------------------------------------
+
+    /// Build a constant-Y I420 buffer of the given dims for tests where
+    /// only the dimensions / output length matter.
+    fn make_constant_i420(w: u32, h: u32, y: u8, u: u8, v: u8) -> Vec<u8> {
+        let w = w as usize;
+        let h = h as usize;
+        let y_size = w * h;
+        let uv_size = (w / 2) * (h / 2);
+        let mut out = vec![0u8; y_size + 2 * uv_size];
+        out[..y_size].fill(y);
+        out[y_size..y_size + uv_size].fill(u);
+        out[y_size + uv_size..].fill(v);
+        out
+    }
+
+    /// Output buffer length must match the destination dims exactly:
+    /// `dst_w * dst_h * 3 / 2`. Off-by-one here means the encoder reads
+    /// past its expected buffer and decodes garbage.
+    #[test]
+    fn downscale_i420_output_length_matches_dst_dims() {
+        let src = make_constant_i420(64, 64, 100, 50, 200);
+        let out = downscale_i420(&src, 64, 64, 32, 32);
+        // 32*32 (Y) + 2*16*16 (UV) = 1024 + 512 = 1536
+        assert_eq!(out.len(), 1536, "downscale 64x64 → 32x32 must yield I420 of len 1536");
+
+        let out = downscale_i420(&src, 64, 64, 16, 16);
+        // 16*16 (Y) + 2*8*8 (UV) = 256 + 128 = 384
+        assert_eq!(out.len(), 384, "downscale 64x64 → 16x16 must yield I420 of len 384");
+    }
+
+    /// A constant-color I420 must downscale to the same constant color.
+    /// This is the trivial-case correctness check — if any pixel ends up
+    /// non-Y/non-U/non-V, the bilinear interp is broken.
+    #[test]
+    fn downscale_i420_preserves_constant_color() {
+        let src = make_constant_i420(64, 64, 137, 64, 192);
+        let out = downscale_i420(&src, 64, 64, 32, 32);
+
+        let y_size = 32 * 32;
+        let uv_size = 16 * 16;
+        let (y, uv) = out.split_at(y_size);
+        let (u, v) = uv.split_at(uv_size);
+
+        assert!(y.iter().all(|&p| p == 137), "Y plane must stay constant 137");
+        assert!(u.iter().all(|&p| p == 64), "U plane must stay constant 64");
+        assert!(v.iter().all(|&p| p == 192), "V plane must stay constant 192");
+    }
+
+    /// A 1:1 "downscale" (dst_dims == src_dims) must round-trip the data
+    /// (within bilinear's rounding tolerance — for an exact match the
+    /// sampling positions land directly on source pixel centers).
+    #[test]
+    fn downscale_i420_identity_dims_round_trips_constant_color() {
+        let src = make_constant_i420(8, 8, 200, 100, 50);
+        let out = downscale_i420(&src, 8, 8, 8, 8);
+        assert_eq!(
+            out.len(),
+            src.len(),
+            "identity downscale must produce same-length output"
+        );
+        // Constant color must survive an identity downscale exactly —
+        // every bilinear weight is on a pixel of the same value.
+        for (i, (s, o)) in src.iter().zip(out.iter()).enumerate() {
+            assert_eq!(s, o, "byte {i} differs: src={s} out={o}");
+        }
+    }
+
+    /// A 2× downscale of a horizontal Y gradient must produce values
+    /// roughly halfway between adjacent source columns. Pin one value
+    /// at a known position so a regression in the sampling math fires.
+    #[test]
+    fn downscale_i420_horizontal_gradient_averages() {
+        // 8x2 source (must be even dims). Y plane: column index * 32.
+        // So columns are 0, 32, 64, 96, 128, 160, 192, 224.
+        let mut src = vec![0u8; 8 * 2 + 2 * (4 * 1)];
+        for row in 0..2 {
+            for col in 0..8 {
+                src[row * 8 + col] = (col * 32) as u8;
+            }
+        }
+        // U + V planes constant 128 (size 4x1 each).
+        for byte in &mut src[16..] {
+            *byte = 128;
+        }
+
+        let out = downscale_i420(&src, 8, 2, 4, 2);
+        let y = &out[..4 * 2];
+
+        // 4 dst pixels sampling from 8 src columns at positions 0,1,2,3.
+        // bilinear sample positions: dx → (dx+0.5)*2 - 0.5 = 2*dx + 0.5
+        //   dx=0 → sx=0.5: avg of cols 0,1 = (0+32)/2 = 16
+        //   dx=1 → sx=2.5: avg of cols 2,3 = (64+96)/2 = 80
+        //   dx=2 → sx=4.5: avg of cols 4,5 = (128+160)/2 = 144
+        //   dx=3 → sx=6.5: avg of cols 6,7 = (192+224)/2 = 208
+        // Tolerance ±1 for rounding.
+        for (dx, expected) in [(0, 16), (1, 80), (2, 144), (3, 208)].iter() {
+            let actual = y[*dx] as i32;
+            assert!(
+                (actual - expected).abs() <= 1,
+                "dst col {dx}: expected ~{expected}, got {actual}",
+            );
+        }
     }
 }

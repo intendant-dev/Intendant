@@ -974,9 +974,16 @@ impl EncoderPool {
             // loud at pool construction than produce a silent
             // never-decoding stream.
             let id = EncoderId::new(CodecKind::Vp8, layer.rid.clone());
-            let handle =
-                try_spawn_encoder_thread(id.clone(), layer, &i420_tx, duration_ms, &counters)
-                    .unwrap_or_else(|e| {
+            let handle = try_spawn_encoder_thread(
+                id.clone(),
+                layer,
+                source_width,
+                source_height,
+                &i420_tx,
+                duration_ms,
+                &counters,
+            )
+            .unwrap_or_else(|e| {
                         panic!(
                             "always-on encoder {} construction failed at pool startup: {} — \
                              always-on codecs must always be constructable; a VP8 libvpx \
@@ -1157,6 +1164,8 @@ impl EncoderPool {
                 let new_handle = try_spawn_encoder_thread(
                     old_handle.id.clone(),
                     rescaled,
+                    new_width,
+                    new_height,
                     &self.inner.i420_tx,
                     self.inner.duration_ms,
                     &self.inner.counters,
@@ -1405,6 +1414,14 @@ impl EncoderPool {
             match try_spawn_encoder_thread(
                 id.clone(),
                 layer.clone(),
+                // On-demand encoders are always at source dim
+                // (LayerSpec::single uses snapshot dims), so
+                // needs_downscale is false for them — passing
+                // source dims here is a no-op the encoder thread
+                // never exercises. Threading them anyway keeps
+                // the API uniform with the always-on case.
+                source_at_start.width,
+                source_at_start.height,
                 &self.inner.i420_tx,
                 self.inner.duration_ms,
                 &self.inner.counters,
@@ -1771,6 +1788,8 @@ fn rescale_layer_spec(
 fn try_spawn_encoder_thread(
     id: EncoderId,
     layer: LayerSpec,
+    source_w: u32,
+    source_h: u32,
     i420_tx: &broadcast::Sender<I420Frame>,
     duration_ms: u64,
     counters: &Arc<crate::display::DisplayMetricsCounters>,
@@ -1785,7 +1804,7 @@ fn try_spawn_encoder_thread(
         layer.target_bitrate_kbps,
     )?;
     Ok(spawn_encoder_thread_with(
-        id, layer, encoder, i420_tx, duration_ms, counters,
+        id, layer, source_w, source_h, encoder, i420_tx, duration_ms, counters,
     ))
 }
 
@@ -1919,6 +1938,8 @@ fn try_h264_fallback_for_layer(
 fn spawn_encoder_thread_with(
     id: EncoderId,
     layer: LayerSpec,
+    source_w: u32,
+    source_h: u32,
     encoder: Box<dyn super::Encoder>,
     i420_tx: &broadcast::Sender<I420Frame>,
     duration_ms: u64,
@@ -1940,6 +1961,17 @@ fn spawn_encoder_thread_with(
     // + a SimulcastRid String).
     let codec_for_thread = id.codec;
     let layer_for_thread = layer.clone();
+    // Phase 4a: per-layer downscale. The bridge pushes I420 at the
+    // source dims; this encoder is constructed for `layer.width` ×
+    // `layer.height`. When they differ (simulcast: half/quarter
+    // layers), each frame must be downscaled before encode or the
+    // encoder will reject (size mismatch) or mis-encode.
+    let needs_downscale =
+        (layer.width, layer.height) != (source_w, source_h);
+    let downscale_src_w = source_w;
+    let downscale_src_h = source_h;
+    let downscale_dst_w = layer.width;
+    let downscale_dst_h = layer.height;
     // 3c.3b.4h: per-encoder metrics. Bumped per encoded packet
     // (encode_frames + encode_latency_us_sum) and on broadcast lag
     // (encode_drops). Counter is shared with DisplaySession via Arc.
@@ -2009,7 +2041,28 @@ fn spawn_encoder_thread_with(
 
             let force_kf = force_kf_for_thread.swap(false, Ordering::SeqCst);
 
-            let produced = match encoder.encode(&frame.data, duration_ms, force_kf) {
+            // Phase 4a: per-layer downscale. The bridge pushes I420
+            // at source dims; for simulcast layers (half/quarter) the
+            // encoder is sized differently and would mis-encode or
+            // reject without resizing first. The `needs_downscale`
+            // check is computed once at thread spawn, so the hot path
+            // for the source-dim layer (always-on full + every
+            // on-demand on-source-dim layer) pays nothing.
+            let scaled_buf;
+            let i420_for_encode: &[u8] = if needs_downscale {
+                scaled_buf = super::downscale_i420(
+                    &frame.data,
+                    downscale_src_w,
+                    downscale_src_h,
+                    downscale_dst_w,
+                    downscale_dst_h,
+                );
+                &scaled_buf
+            } else {
+                &frame.data
+            };
+
+            let produced = match encoder.encode(i420_for_encode, duration_ms, force_kf) {
                 Ok(packets) => {
                     let n = packets.len();
                     // 3c.3b.4h: latency from capture-arrival to
@@ -2965,6 +3018,72 @@ mod tests {
             .expect("encoded frame should arrive within 2s")
             .expect("broadcast should not be closed while pool is alive");
         assert!(!ef.data.is_empty(), "encoded frame payload must be non-empty");
+    }
+
+    /// **Phase 4a regression test.** A pool with a half-resolution
+    /// always-on layer (e.g. `vp8_simulcast`'s middle layer at
+    /// 32x32 against a 64x64 source) must downscale incoming
+    /// source-dim I420 to the layer's dim before encoding —
+    /// otherwise the encoder configured for 32x32 would either
+    /// reject a 64x64 buffer or mis-encode it. Pre-fix: subscribing
+    /// to the half/quarter layer with a source-dim push silently
+    /// produced no decodable frames (encoder either errored on
+    /// every encode or emitted garbage). This test pins the
+    /// downscale path end-to-end: encoded frames flow from a
+    /// half-dim subscriber when fed source-dim I420.
+    #[tokio::test]
+    async fn pool_downscales_source_i420_for_half_resolution_layer() {
+        const SRC_W: u32 = 64;
+        const SRC_H: u32 = 64;
+        const HALF_W: u32 = 32;
+        const HALF_H: u32 = 32;
+
+        // Build a constant-Y I420 at source dims so the encoder
+        // has stable input. (Random-pattern input would change the
+        // encoder's keyframe cadence and complicate timing.)
+        let i420_size = (SRC_W * SRC_H * 3 / 2) as usize;
+        let mut frame_data = vec![0u8; i420_size];
+        for byte in &mut frame_data[(SRC_W * SRC_H) as usize..] {
+            *byte = 128;
+        }
+        let frame_arc = Arc::new(frame_data);
+
+        // Pool with one always-on VP8 layer at HALF_W × HALF_H,
+        // even though the source is SRC_W × SRC_H. This is the
+        // shape the simulcast path uses — multiple layers, each
+        // smaller than the source.
+        let half_layer = LayerSpec {
+            rid: SimulcastRid::half(),
+            width: HALF_W,
+            height: HALF_H,
+            target_bitrate_kbps: 400,
+            framerate: 30,
+        };
+        let pool = EncoderPool::new(SRC_W, SRC_H, 30, vec![half_layer], None);
+
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+        let (mut subs, _lease) = pool.subscribe(&prefs).expect("subscribe");
+        assert_eq!(subs.len(), 1, "should get one always-on VP8 sub");
+        let mut rx = subs.remove(0).frames;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        for _ in 0..5 {
+            pool.push_i420_frame(Arc::clone(&frame_arc), Instant::now());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Expect encoded packets within 2s. Pre-fix the encoder
+        // would reject the size-mismatched buffer on every push
+        // and never produce output.
+        let ef = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("encoded frame from half-layer must arrive within 2s")
+            .expect("broadcast must stay open");
+        assert!(
+            !ef.data.is_empty(),
+            "encoded frame from half-layer must be non-empty",
+        );
     }
 
     /// **3c.3b.4h regression test.** When `EncoderPool::new` is
