@@ -3587,7 +3587,6 @@ mod tests {
         // Construct pool with an EXPLICIT counters Arc (production
         // path) and hold a clone so the test can read post-encode.
         let counters = Arc::new(crate::display::DisplayMetricsCounters::new());
-        let layer = LayerSpec::single(CodecKind::Vp8, W as u32, H as u32, 30);
         let pool = EncoderPool::new(
             W as u32,
             H as u32,
@@ -3660,7 +3659,6 @@ mod tests {
         let frame_arc = Arc::new(frame_data);
 
         let counters = Arc::new(crate::display::DisplayMetricsCounters::new());
-        let layer = LayerSpec::single(CodecKind::Vp8, W as u32, H as u32, 30);
         let pool = EncoderPool::new(
             W as u32,
             H as u32,
