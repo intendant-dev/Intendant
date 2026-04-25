@@ -445,36 +445,6 @@ pub struct DisplaySession {
     pool_feed_bridge_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// Parse the truthiness of an `INTENDANT_DISPLAY_POOL` env value.
-///
-/// **3c.4b made this inert.** The legacy single-encoder fan-out has
-/// been deleted, so the env flag no longer affects behavior — pool
-/// is now the only path. The function and its tests are retained
-/// pending 3c.5's full removal of the flag and its callers.
-///
-/// Pre-3c.4b semantics (kept for the doc trail): default ON;
-/// `Some("0")` / `Some("false")` (case-insensitive) opted out to
-/// the legacy fan-out; everything else stayed on pool.
-///
-/// Extracted from [`pool_mode_enabled`] so the parsing rules can
-/// be unit-tested without touching `std::env::var` (env mutation
-/// in parallel tests is racy across the cargo-test process).
-fn parse_pool_flag(value: Option<&str>) -> bool {
-    match value {
-        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
-        _ => true,
-    }
-}
-
-/// Whether `INTENDANT_DISPLAY_POOL` is set to a non-opt-out value.
-/// **3c.4b made this inert** — the legacy path is gone, so callers
-/// that previously branched on this no longer exist. Retained for
-/// 3c.5 deletion alongside [`parse_pool_flag`].
-#[allow(dead_code)]
-fn pool_mode_enabled() -> bool {
-    parse_pool_flag(std::env::var("INTENDANT_DISPLAY_POOL").as_deref().ok())
-}
-
 impl DisplaySession {
     /// Create a new display session.  Does NOT start capture -- call `start()`.
     pub fn new(display_id: u32, backend: Arc<dyn DisplayBackend>) -> Self {
@@ -973,9 +943,9 @@ impl DisplaySession {
                 });
             });
 
-        // Share the legacy fan-out's `peer_drops` counter so the
-        // pool path's drops show up alongside legacy drops in
-        // `DisplayMetricsSnapshot.peer_drops`. Cheap clone (Arc).
+        // Per-peer forwarder drops feed the session's `peer_drops`
+        // counter so `DisplayMetricsSnapshot.peer_drops` reflects
+        // total drops across all peers. Cheap clone (Arc).
         let drops_counter = Arc::clone(&self.counters.peer_drops);
 
         let (peer, answer_sdp) = self::webrtc::WebRtcPeer::new(
@@ -1048,21 +1018,16 @@ impl DisplaySession {
 
     /// Open the peer-join burst window on the pool-feed bridge.
     ///
-    /// **3c.4b** collapsed this from a two-channel dispatch
-    /// (pool-feed + legacy fallback) into a single
-    /// `pool_feed_keyframe_tx` send, because the legacy bridge is
-    /// gone. The pool-feed bridge is now the only bridge that ever
-    /// feeds the pool, so its keyframe channel is the only burst
-    /// channel.
-    ///
     /// Required for codecs that ignore `force_keyframe` on a
     /// long-running pipe (Linux ffmpeg H.264) — `request_keyframe_all`
     /// alone won't reach those encoders, so the burst clocks the
     /// encoder at tick rate so its `-g 30` natural cadence emits a
-    /// keyframe inside the window. No-op when the pool-feed bridge
-    /// hasn't been spawned yet (the kf signal is silently dropped on
-    /// the unbounded channel; first-offer flows install the sender
-    /// before signaling).
+    /// keyframe inside the window.
+    ///
+    /// Since 3c.4d's eager bridge spawn from `start()`, the pool-feed
+    /// keyframe channel is installed unconditionally for the lifetime
+    /// of a started session — the `if let Some` is defense-in-depth
+    /// for a session whose `start()` hasn't run yet.
     async fn signal_peer_join_burst(&self) {
         if let Some(tx) = self.pool_feed_keyframe_tx.lock().await.as_ref() {
             let _ = tx.send(());
@@ -1155,23 +1120,21 @@ impl DisplaySession {
         // pool.request_keyframe_all alone won't reach those encoders, and
         // the heartbeat-only path (1 push/sec) means an idle-desktop
         // peer-join can wait many seconds for a natural GOP boundary.
-        // Mirrors the legacy bridge's `kf_rx`/burst at mod.rs:984-998.
         let (kf_tx, mut kf_rx) = mpsc::unbounded_channel::<()>();
         *self.pool_feed_keyframe_tx.lock().await = Some(kf_tx);
         let task = tokio::spawn(async move {
-            // Heartbeat cadence. Mirrors the legacy bridge's value;
-            // 1 second strikes the balance between "encoder stays
-            // healthy on idle" and "encoder doesn't burn CPU on
-            // identical-frame re-encodes." Smaller would re-encode
-            // more often; larger would let GOP boundaries drift past
-            // a peer-join window on truly static desktops.
+            // Heartbeat cadence. 1 second strikes the balance
+            // between "encoder stays healthy on idle" and "encoder
+            // doesn't burn CPU on identical-frame re-encodes."
+            // Smaller would re-encode more often; larger would let
+            // GOP boundaries drift past a peer-join window on
+            // truly static desktops.
             const IDLE_HEARTBEAT: std::time::Duration =
                 std::time::Duration::from_secs(1);
             // Peer-join burst window. Sized to comfortably exceed
             // one Linux ffmpeg H.264 GOP at 30fps (`-g 30` → ~1s) so
             // the natural keyframe lands inside the window even
             // though `force_keyframe` is ignored on the rawvideo pipe.
-            // Same constant the legacy bridge uses (mod.rs:984).
             const PEER_JOIN_BURST: std::time::Duration =
                 std::time::Duration::from_millis(1500);
 
@@ -1297,16 +1260,13 @@ impl DisplaySession {
                             continue;
                         }
 
-                        // Resize handling. The legacy bridge calls
-                        // `pool.on_resize` AND emits
-                        // `AppEvent::DisplayResize` from its dual-feed
-                        // path (gated on `pool_for_bridge.is_some()`),
-                        // which is None when this pool-feed bridge
-                        // runs — so we own BOTH for the pool side
-                        // when we're the active feed. Without the
-                        // event emit here, presence / MCP / outbound
-                        // listeners wouldn't learn about display size
-                        // changes in a pool-first session.
+                        // Resize handling. The bridge owns BOTH
+                        // `pool.on_resize` AND the
+                        // `AppEvent::DisplayResize` emission. Without
+                        // the event emit here, presence / MCP /
+                        // outbound listeners wouldn't learn about
+                        // display size changes (the bridge is the
+                        // sole feed since 3c.4b).
                         if frame_w != enc_w || frame_h != enc_h {
                             eprintln!(
                                 "[display/pool-feed] display {} resolution \
@@ -1506,75 +1466,6 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // Phase 3c.3b.3: env-flag parsing
-    // -----------------------------------------------------------------------
-
-    /// `1` → enabled. The canonical "set" value, kept compatible
-    /// with the pre-3c.4a `INTENDANT_DISPLAY_POOL=1` recipe so
-    /// operators who set it during the rollout continue to get pool
-    /// mode (no behavior change).
-    #[test]
-    fn parse_pool_flag_one_is_true() {
-        assert!(parse_pool_flag(Some("1")));
-    }
-
-    /// `true`, `True`, `TRUE`, `tRuE` → enabled. Same back-compat
-    /// rationale as `parse_pool_flag_one_is_true`.
-    #[test]
-    fn parse_pool_flag_true_is_case_insensitive() {
-        for v in ["true", "True", "TRUE", "tRuE", "TRue"] {
-            assert!(
-                parse_pool_flag(Some(v)),
-                "value {:?} must enable pool mode",
-                v
-            );
-        }
-    }
-
-    /// **3c.4a flip.** Unset → enabled (was: disabled). Pool is
-    /// now the default path; operators don't have to set anything
-    /// to opt in.
-    #[test]
-    fn parse_pool_flag_none_is_true_after_flip() {
-        assert!(
-            parse_pool_flag(None),
-            "post-3c.4a default is pool ON when INTENDANT_DISPLAY_POOL is unset",
-        );
-    }
-
-    /// **3c.4a flip.** Only `0` and `false` (case-insensitive)
-    /// explicitly opt OUT to legacy. Narrow opt-out mirroring the
-    /// previous narrow opt-in (`1` / `true`). Empty string, `yes`,
-    /// `no`, garbage all stay enabled — the operator either
-    /// affirmatively typed an opt-out value or they get the default.
-    #[test]
-    fn parse_pool_flag_zero_and_false_disable() {
-        for v in ["0", "false", "False", "FALSE", "fAlSe"] {
-            assert!(
-                !parse_pool_flag(Some(v)),
-                "value {:?} must DISABLE pool mode (legacy opt-out)",
-                v
-            );
-        }
-    }
-
-    /// **3c.4a flip.** Anything that isn't a documented opt-out
-    /// keeps pool ON. Includes obvious "off-ish" garbage like
-    /// "no" and "off" that we deliberately do NOT recognize as
-    /// opt-out — only `0` / `false` qualify (mirrors the pre-flip
-    /// narrowness around `1` / `true` for opt-in).
-    #[test]
-    fn parse_pool_flag_other_values_stay_enabled_after_flip() {
-        for v in ["", "yes", "on", " 0", "0 ", "no", "off", "garbage"] {
-            assert!(
-                parse_pool_flag(Some(v)),
-                "value {:?} must enable pool mode (only `0` / `false` opt out)",
-                v
-            );
-        }
-    }
 
     #[test]
     fn input_event_deserialize_key_down() {

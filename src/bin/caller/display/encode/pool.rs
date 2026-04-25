@@ -892,14 +892,13 @@ struct EncoderPoolInner {
     /// a per-id counter isn't worth the extra state.
     slot_gen_counter: AtomicU64,
 
-    /// 3c.3b.4h: shared metrics counters. Every encoder thread
-    /// holds an `Arc::clone` of this and bumps `encode_frames` +
+    /// Shared metrics counters. Every encoder thread holds an
+    /// `Arc::clone` of this and bumps `encode_frames` +
     /// `encode_latency_us_sum` per encoded packet, plus
-    /// `encode_drops` on broadcast lag. Until 3c.4 deletes the
-    /// legacy bridge, both pool and legacy encoders feed the same
-    /// `Arc<DisplayMetricsCounters>` so [`crate::display::DisplayMetricsSnapshot`]
-    /// continues to reflect total throughput. After 3c.4 the pool
-    /// is the sole producer.
+    /// `encode_drops` on broadcast lag. The pool is the sole
+    /// producer of these counters since 3c.4b deleted the legacy
+    /// fan-out, so [`crate::display::DisplayMetricsSnapshot`]
+    /// reflects total session throughput.
     counters: Arc<crate::display::DisplayMetricsCounters>,
 }
 
@@ -952,13 +951,11 @@ impl EncoderPool {
         always_on_layers: Vec<LayerSpec>,
         counters: Option<Arc<crate::display::DisplayMetricsCounters>>,
     ) -> Self {
-        // 3c.3b.4h: every pool encoder thread bumps these counters on
-        // each encoded packet (encode_frames, encode_latency_us_sum)
-        // and on broadcast lag (encode_drops). When the legacy bridge
-        // also exists in this session, it shares the same Arc so
-        // DisplayMetricsSnapshot continues to reflect total throughput
-        // across pre-pool and pool encoders. Tests that don't care
-        // about metrics pass `None`; production passes
+        // Every pool encoder thread bumps these counters on each
+        // encoded packet (encode_frames, encode_latency_us_sum) and
+        // on broadcast lag (encode_drops). DisplayMetricsSnapshot
+        // reflects the pool's total throughput. Tests that don't
+        // care about metrics pass `None`; production passes
         // `Some(Arc::clone(&self.counters))` from DisplaySession::start.
         let counters = counters
             .unwrap_or_else(|| Arc::new(crate::display::DisplayMetricsCounters::new()));
@@ -1801,18 +1798,14 @@ fn try_spawn_encoder_thread(
 /// the swap (or after the swap-attempt fails) the watchdog stops
 /// firing for the lifetime of this encoder thread.
 ///
-/// Mirrors the legacy bridge's watchdog at `mod.rs::start_encoder_pipeline`
-/// so the pool path doesn't silently regress on hosts where the
-/// legacy path was actually keeping displays alive via the libx264
-/// fallback. The two implementations will collapse to one when 3c.4
-/// deletes the legacy path.
+/// Catches `h264_vaapi` silent-failure (vaInitialize succeeds, no
+/// NALs ever emitted) — without this the stream would stay black
+/// indefinitely on hosts where VAAPI claims to work but doesn't.
 struct WatchdogState {
     frames_since_last_output: u64,
     swap_done: bool,
 }
 
-/// Threshold MUST match `mod.rs::start_encoder_pipeline`'s legacy
-/// constant of the same shape until 3c.4 deletes that path.
 /// 30 frames ≈ 1s at 30fps, well above the normal 1–2 frame
 /// pipeline depth for any healthy encoder.
 const ENCODER_SILENT_FRAMES_THRESHOLD: u64 = 30;
@@ -2025,17 +2018,14 @@ fn spawn_encoder_thread_with(
                     // outputs accumulate the same latency value
                     // per packet, matching legacy semantics so
                     // average rates compose cleanly when both
-                    // bridges share the counter pre-3c.4).
-                    // 3c.3b.4i: only count metrics when this encoder
-                    // has at least one consumer subscribed. Pool's
-                    // always-on VP8 keeps producing during legacy-only
-                    // sessions (legacy bridge dual-feeds the pool),
-                    // and an H.264-only session leaves the always-on
-                    // VP8 producing into a void — bumping counters
-                    // there inflates dashboard fps/latency by the
-                    // unconsumed work. Receiver-count is an atomic
-                    // load on the broadcast::Sender, cheap enough to
-                    // sample once per encode call.
+                    // Only count metrics when this encoder has at
+                    // least one consumer subscribed. An H.264-only
+                    // session leaves the always-on VP8 producing
+                    // into a void — bumping counters there inflates
+                    // dashboard fps/latency by the unconsumed work.
+                    // Receiver-count is an atomic load on the
+                    // broadcast::Sender, cheap enough to sample once
+                    // per encode call.
                     let has_consumer = frames_tx_for_thread.receiver_count() > 0;
                     let latency_us = frame.arrived.elapsed().as_micros() as u64;
                     for pkt in packets {
@@ -2060,13 +2050,11 @@ fn spawn_encoder_thread_with(
                 }
             };
 
-            // 3c.3b.4f: silent-output watchdog. After 30 consecutive
-            // input frames produced no output, attempt a one-shot
-            // fallback swap (Linux H.264 → libx264). Mirrors the
-            // legacy bridge's watchdog at mod.rs::start_encoder_pipeline.
-            // Prevents h264_vaapi silent-failure (vaInitialize
-            // succeeds, no NALs ever emitted) from black-screening
-            // the stream forever.
+            // Silent-output watchdog. After 30 consecutive input
+            // frames produced no output, attempt a one-shot fallback
+            // swap (Linux H.264 → libx264). Prevents h264_vaapi
+            // silent-failure (vaInitialize succeeds, no NALs ever
+            // emitted) from black-screening the stream forever.
             if watchdog.record(produced) {
                 eprintln!(
                     "[encoder/pool] {} watchdog: {} consecutive input \
@@ -2867,9 +2855,6 @@ mod tests {
     ///      either succeeded or there's nothing better to swap to)
     ///   4. interleaved silent/produced frames never accumulate
     ///      across non-silent frames
-    /// Mirrors the legacy `mod.rs::start_encoder_pipeline` watchdog
-    /// state machine; this test pins the parity until 3c.4 deletes
-    /// that path.
     #[test]
     fn watchdog_state_contract() {
         let mut w = WatchdogState::new();
@@ -2983,11 +2968,11 @@ mod tests {
     /// **3c.3b.4h regression test.** When `EncoderPool::new` is
     /// passed an explicit metrics counters Arc, the pool's encoder
     /// thread bumps `encode_frames` and `encode_latency_us_sum` per
-    /// emitted packet. Pre-3c.3b.4h: pool encoders ran but didn't
-    /// touch the counters, so after 3c.4 deletes the legacy bridge
-    /// the dashboard's fps/latency metrics would go dark. This test
-    /// pins the wiring end-to-end: explicit counters Arc → pool →
-    /// encoder thread → counter increments observable from the test.
+    /// emitted packet. Without this wiring the dashboard's
+    /// fps/latency metrics would read zero (pool is the sole
+    /// producer since 3c.4b). Pins the wiring end-to-end: explicit
+    /// counters Arc → pool → encoder thread → counter increments
+    /// observable from the test.
     #[tokio::test]
     async fn pool_encoder_thread_increments_metrics_counters() {
         const W: usize = 64;
@@ -3042,8 +3027,8 @@ mod tests {
         assert!(
             frames_encoded > 0,
             "encode_frames must be incremented per encoded packet; got \
-             {frames_encoded}. Pre-3c.3b.4h: pool encoders didn't touch \
-             metrics → dashboard fps reads zero after 3c.4 deletes legacy.",
+             {frames_encoded}. Without this, dashboard fps reads zero \
+             (pool is the sole producer since 3c.4b).",
         );
         assert!(
             latency_sum > 0,
@@ -3054,22 +3039,16 @@ mod tests {
 
     /// **3c.3b.4i regression test.** Pool encoder must NOT bump
     /// `encode_frames` / `encode_latency_us_sum` / `encode_drops`
-    /// when its `frames_tx` has zero subscribers. Two production
-    /// scenarios hit this:
-    ///   1. Legacy-only session (default before 3c.4 flips the
-    ///      env-flag default): legacy bridge dual-feeds the pool,
-    ///      pool's always-on VP8 keeps encoding, but no pool peer
-    ///      is subscribed — counting those packets alongside the
-    ///      legacy encoder's packets inflates dashboard fps.
-    ///   2. H.264-only pool session: always-on VP8 stays alive
-    ///      even when no peer subscribes to it (the only consumers
-    ///      are on the on-demand H.264 slot) — VP8 packets land
-    ///      in a void.
-    /// This test pins the gate: construct a pool, push frames
-    /// WITHOUT subscribing, assert counters stay zero. Then
-    /// subscribe, push more, assert they start incrementing.
-    /// Pre-3c.3b.4i this assertion would fail (counters bumped
-    /// regardless of consumers).
+    /// when its `frames_tx` has zero subscribers. The production
+    /// scenario this protects: an H.264-only session leaves the
+    /// always-on VP8 encoder alive (it always spawns) even though
+    /// no peer ever subscribes to it — the only consumers are on
+    /// the on-demand H.264 slot. Without the gate, VP8's
+    /// unsubscribed packets would be counted alongside H.264's
+    /// real packets and inflate dashboard fps. This test pins the
+    /// gate: construct a pool, push frames WITHOUT subscribing,
+    /// assert counters stay zero. Then subscribe, push more,
+    /// assert they start incrementing.
     #[tokio::test]
     async fn pool_encoder_does_not_count_metrics_without_subscribers() {
         const W: usize = 64;

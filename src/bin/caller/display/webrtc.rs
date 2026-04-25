@@ -851,22 +851,20 @@ impl WebRtcPeer {
         ))
     }
 
-    /// Pool-mode constructor: builds the same str0m peer as
-    /// [`Self::new`] but feeds frames from the shared
-    /// [`EncoderPool`] rather than the legacy single-encoder fan-out.
-    /// Used by the env-gated `INTENDANT_DISPLAY_POOL` path
-    /// (3c.3b.3 onward); legacy callers continue to use [`Self::new`]
-    /// until the pre-pool pipeline is deleted in 3c.4.
+    /// Build a peer that consumes frames from the shared
+    /// [`EncoderPool`] and forwards them to the browser via str0m.
+    /// The only public constructor (3c.4c renamed `new_pool_mode` →
+    /// `new` after the legacy single-encoder fan-out was deleted in
+    /// 3c.4b).
     ///
     /// `codec_set` is derived from `subscriptions` rather than from
-    /// the original peer offer prefs — this is the contract that
-    /// makes the 3c.3b.1a partial-result discussion safe in the
-    /// other direction: the SDP we negotiate enables exactly the
-    /// codecs the pool can serve, so the peer can never select a
-    /// codec we'll silently drop frames for. Empty subscriptions
-    /// upstream means the offer handler should reject before
-    /// reaching here; we forward the empty case as a clean
-    /// `WebRtc("empty subscription set")` rather than silently
+    /// the original peer offer prefs. This is the contract that
+    /// keeps the partial-result path safe: the SDP we negotiate
+    /// enables exactly the codecs the pool can serve, so the peer
+    /// can never select a codec we'll silently drop frames for.
+    /// Empty subscriptions upstream means the offer handler should
+    /// reject before reaching here; we forward the empty case as a
+    /// clean `WebRtc("empty subscription set")` rather than silently
     /// constructing a peer with no codecs.
     ///
     /// `lease` and `prefs` are handed to a per-peer `pool_frame_intake`
@@ -882,13 +880,11 @@ impl WebRtcPeer {
     ///
     /// `drops_counter` is incremented every time the intake's forwarder
     /// drops a frame because the driver's encoded-frame `mpsc` is full
-    /// (peer is slow). Mirrors the legacy single-encoder fan-out's
-    /// `peer_drops` counter at `display/mod.rs:1120`. Callers should
-    /// share this counter with their metrics aggregation so the
-    /// `peer_drops` field on `DisplayMetricsSnapshot` continues to
-    /// reflect total drops across pre-pool and pool paths during the
-    /// 3c.3b.3 → 3c.4 cutover. Tests can pass a fresh
-    /// `Arc::new(AtomicU64::new(0))` and inspect it directly.
+    /// (peer is slow). Callers should share this counter with their
+    /// metrics aggregation so the `peer_drops` field on
+    /// `DisplayMetricsSnapshot` reflects total drops across all peers.
+    /// Tests can pass a fresh `Arc::new(AtomicU64::new(0))` and inspect
+    /// it directly.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         peer_id: PeerId,
@@ -1997,8 +1993,7 @@ fn select_active_subscription(
 /// `send().await`. When the driver's bounded encoded-frame mpsc is
 /// full (slow peer, network stall, encoder burst), [`try_send`]
 /// returns [`mpsc::error::TrySendError::Full`] and the forwarder
-/// drops the frame and increments `drops_counter`. Mirrors the
-/// legacy single-encoder fan-out at `display/mod.rs:1120` exactly.
+/// drops the frame and increments `drops_counter`.
 ///
 /// Why lossy: `send().await` parks the forwarder inside the mpsc
 /// when full. The forwarder's cancellation `select!` only fires
@@ -2130,11 +2125,10 @@ async fn pool_frame_intake(
                             match frame_tx.try_send(frame) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
-                                    // Driver's mpsc is full. Drop the
-                                    // frame; the codec's keyframe
-                                    // cadence will recover the visual
-                                    // stream. Mirrors legacy fan-out
-                                    // semantics (display/mod.rs:1120).
+                                    // Driver's mpsc is full. Drop
+                                    // the frame; the codec's
+                                    // keyframe cadence will recover
+                                    // the visual stream.
                                     counter.fetch_add(1, Ordering::Relaxed);
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -2981,14 +2975,13 @@ mod tests {
         let _ = intake_handle.await;
     }
 
-    /// **3c.3b.2a contract: lossy forwarding (try_send) parity with
-    /// legacy fan-out.**
+    /// **3c.3b.2a contract: lossy forwarding (try_send).**
     ///
-    /// The legacy fan-out at `display/mod.rs:1120` uses `try_send` and
-    /// drops on `Full`, incrementing `peer_drops`. The intake must
-    /// match: a slow peer (full mpsc) sees frames dropped, the
-    /// `drops_counter` reflects them, and the forwarder stays
-    /// responsive to cancellation.
+    /// The intake forwarder uses `try_send` and drops on `Full`,
+    /// incrementing `drops_counter`. A slow peer (full mpsc) sees
+    /// frames dropped while the forwarder stays responsive to
+    /// cancellation — `send().await` would park inside the mpsc and
+    /// make the cancel path unreachable.
     ///
     /// Pre-fix `send().await` would park the forwarder inside the mpsc
     /// when full. Cancellation would only fire on the next `rx.recv()`,
