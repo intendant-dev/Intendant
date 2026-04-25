@@ -1595,13 +1595,29 @@ impl DisplaySession {
     ///   2. **Doesn't spawn a legacy encoder thread or fan-out task**
     ///      — so a pool-only deployment doesn't pay the CPU cost of
     ///      a legacy VP8 encoder running with no consumers.
-    ///   3. **No tick gating, no force-keyframe burst window** — the
-    ///      pool's encoder threads and the per-peer `pool_frame_intake`
-    ///      manage their own keyframe cadence (PLI, GOP) and lossy
-    ///      forwarding. The pool-feed bridge just converts every
-    ///      captured frame and pushes it. (Phase 4's TWCC layer
-    ///      switching may add gating here when it lands; the legacy
-    ///      bridge's gating is a 3c.4-deletion candidate too.)
+    ///   3. **No force-keyframe burst window** — pool peers' keyframe
+    ///      cadence is owned by the pool's `request_keyframe_*` API
+    ///      (wired in 3c.4) and the encoder's GOP. The pool-feed
+    ///      bridge does not need a peer-join wake here.
+    ///
+    /// What it DOES match from the legacy bridge (3c.3b.3b
+    /// follow-up): the **tick + heartbeat** pattern. The bridge
+    /// caches the latest I420 buffer and forwards it on every tick
+    /// when the buffer changed OR the idle heartbeat is due. Without
+    /// this, a damage-driven capture backend (Wayland especially)
+    /// that emits nothing while the desktop is idle would leave the
+    /// pool's encoder starved of input — a peer joining mid-idle
+    /// would see a black stream until the next desktop damage event,
+    /// regressing the existing legacy behavior. The heartbeat
+    /// re-pushes the latest frame once per second so the encoder's
+    /// GOP cadence keeps producing decodable references.
+    ///
+    /// What it ALSO matches: the legacy bridge's `AppEvent::DisplayResize`
+    /// emission on dimension change. Without this, presence / MCP /
+    /// outbound listeners would never learn about display size
+    /// changes in pool-only sessions (the legacy bridge would either
+    /// be absent or have `pool_for_bridge=None` and skip its own
+    /// emission too).
     ///
     /// Coordination with the legacy bridge: both paths take
     /// `encoder_init_lock` BEFORE consulting `pool_feed_bridge_handle`.
@@ -1648,9 +1664,40 @@ impl DisplaySession {
         let (initial_w, initial_h) = self.backend.resolution();
         let shutdown = self.shutdown.clone();
         let display_id = self.display_id;
+        let event_bus = self.encoder_event_bus.lock().await.clone();
+        let fps = *self.fps.lock().await;
+        let frame_interval = std::time::Duration::from_millis(
+            if fps > 0 { 1000 / fps as u64 } else { 33 },
+        );
         let task = tokio::spawn(async move {
+            // Heartbeat cadence. Mirrors the legacy bridge's value;
+            // 1 second strikes the balance between "encoder stays
+            // healthy on idle" and "encoder doesn't burn CPU on
+            // identical-frame re-encodes." Smaller would re-encode
+            // more often; larger would let GOP boundaries drift past
+            // a peer-join window on truly static desktops.
+            const IDLE_HEARTBEAT: std::time::Duration =
+                std::time::Duration::from_secs(1);
+
             let mut enc_w = initial_w & !1;
             let mut enc_h = initial_h & !1;
+            // `Arc` so `tick.tick()` re-pushes can clone cheaply
+            // instead of the `Vec<u8>` clone the simpler
+            // pre-3c.3b.3b-followup version did.
+            let mut latest_i420: Option<(Arc<Vec<u8>>, Instant)> = None;
+            // `generation` bumps on every replacement; `last_sent_gen`
+            // is what we last forwarded. Mismatch = "buffer changed
+            // since last send" (i.e. real damage on a damage-driven
+            // backend, or any frame on a poll backend).
+            let mut generation: u64 = 0;
+            let mut last_sent_gen: Option<u64> = None;
+            let mut last_send_at = Instant::now();
+
+            let mut tick = tokio::time::interval(frame_interval);
+            tick.set_missed_tick_behavior(
+                tokio::time::MissedTickBehavior::Skip,
+            );
+
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
@@ -1668,11 +1715,15 @@ impl DisplaySession {
                         }
 
                         // Resize handling. The legacy bridge calls
-                        // `pool.on_resize` from its dual-feed path
-                        // (gated on `pool_for_bridge.is_some()`),
+                        // `pool.on_resize` AND emits
+                        // `AppEvent::DisplayResize` from its dual-feed
+                        // path (gated on `pool_for_bridge.is_some()`),
                         // which is None when this pool-feed bridge
-                        // runs — so we own pool resize coordination
-                        // entirely in pool-only mode.
+                        // runs — so we own BOTH for the pool side
+                        // when we're the active feed. Without the
+                        // event emit here, presence / MCP / outbound
+                        // listeners wouldn't learn about display size
+                        // changes in a pool-first session.
                         if frame_w != enc_w || frame_h != enc_h {
                             eprintln!(
                                 "[display/pool-feed] display {} resolution \
@@ -1680,8 +1731,22 @@ impl DisplaySession {
                                 display_id, enc_w, enc_h, frame_w, frame_h,
                             );
                             pool.on_resize(frame_w, frame_h);
+                            if let Some(ref bus) = event_bus {
+                                bus.send(crate::event::AppEvent::DisplayResize {
+                                    display_id,
+                                    width: frame_w,
+                                    height: frame_h,
+                                });
+                            }
                             enc_w = frame_w;
                             enc_h = frame_h;
+                            // Drop stale buffer: it's at the old
+                            // dimensions; pool's encoders have already
+                            // been respawned by `pool.on_resize` and
+                            // would either reject or mis-encode an
+                            // old-dim frame.
+                            latest_i420 = None;
+                            last_sent_gen = None;
                         }
 
                         let frame_arc = Arc::clone(&frame);
@@ -1696,8 +1761,32 @@ impl DisplaySession {
                         })
                         .await;
                         if let Ok(i420) = i420_result {
-                            pool.push_i420_frame(Arc::new(i420), arrived);
+                            generation = generation.wrapping_add(1);
+                            latest_i420 = Some((Arc::new(i420), arrived));
                         }
+                    }
+                    _ = tick.tick() => {
+                        // Forward latest_i420 if anything's worth
+                        // forwarding. "Worth forwarding" = either
+                        // there's a fresher buffer than last sent, OR
+                        // the heartbeat is due (kicks the encoder so
+                        // a peer joining a damage-idle desktop sees
+                        // output within ~one GOP rather than waiting
+                        // for the next desktop event).
+                        let Some((ref i420, arrived)) = latest_i420 else {
+                            continue;
+                        };
+
+                        let changed = last_sent_gen != Some(generation);
+                        let heartbeat_due =
+                            last_send_at.elapsed() >= IDLE_HEARTBEAT;
+                        if !(changed || heartbeat_due) {
+                            continue;
+                        }
+
+                        pool.push_i420_frame(Arc::clone(i420), arrived);
+                        last_sent_gen = Some(generation);
+                        last_send_at = Instant::now();
                     }
                 }
             }
@@ -2512,6 +2601,167 @@ mod tests {
             session.pool_feed_bridge_handle.lock().await.is_none(),
             "with encoder_init_lock=true, the pool-feed bridge must \
              NOT spawn — legacy bridge owns the pool feed via dual-feed"
+        );
+
+        session.shutdown.cancel();
+    }
+
+    /// Build a synthetic BGRA frame for tests. Contents are
+    /// uninteresting (all zeros) — we only care that the bridge
+    /// converts and pushes them.
+    fn make_test_bgra(width: u32, height: u32) -> Frame {
+        Frame {
+            data: vec![0u8; (width * height * 4) as usize],
+            format: FrameFormat::Bgra,
+            width,
+            height,
+            stride: width * 4,
+            timestamp: Instant::now(),
+        }
+    }
+
+    /// **3c.3b.3b finding 2 regression test.** Pool-only sessions
+    /// must emit `AppEvent::DisplayResize` on dimension changes.
+    /// Pre-fix the pool-feed bridge called `pool.on_resize` but
+    /// dropped the event-bus emission entirely — presence / MCP /
+    /// outbound listeners learned about resizes only when the
+    /// legacy bridge was running.
+    #[tokio::test]
+    async fn pool_feed_bridge_emits_display_resize_on_dimension_change() {
+        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let session = DisplaySession::new(7, backend);
+        let bus = crate::event::EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        session
+            .start(30, None, Some(bus))
+            .await
+            .expect("start must succeed");
+        session.ensure_pool_feed_bridge_started().await;
+
+        // Push the FIRST frame at the initial size; this seeds the
+        // bridge's enc_w/enc_h tracking but does NOT cross the
+        // resize threshold (initial==initial).
+        let _ = session
+            .frame_tx
+            .send(Arc::new(make_test_bgra(64, 64)));
+
+        // Push a frame at a NEW size. This must trigger both
+        // `pool.on_resize` (covered by the existing pool tests) AND
+        // the AppEvent::DisplayResize emission (the regression
+        // surface this test pins).
+        let _ = session
+            .frame_tx
+            .send(Arc::new(make_test_bgra(128, 96)));
+
+        // Drain events looking for our DisplayResize. Other events
+        // (capture-side, etc.) might land first; bounded loop with
+        // a generous timeout to give the spawn_blocking BGRA→I420
+        // conversion + tick time to fire.
+        let saw_resize = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            async {
+                loop {
+                    match bus_rx.recv().await {
+                        Ok(crate::event::AppEvent::DisplayResize {
+                            display_id: 7,
+                            width: 128,
+                            height: 96,
+                        }) => return true,
+                        Ok(_) => continue,
+                        Err(_) => return false,
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            saw_resize,
+            "pool-feed bridge MUST emit AppEvent::DisplayResize on \
+             dimension change — without it, presence/MCP/outbound \
+             listeners never learn about resolution changes in \
+             pool-only sessions"
+        );
+
+        session.shutdown.cancel();
+    }
+
+    /// **3c.3b.3b finding 1 regression test.** On damage-driven
+    /// capture backends (Wayland especially), no BGRA frames flow
+    /// while the desktop is idle. The legacy bridge handled this by
+    /// caching `latest_i420` and re-pushing it on the IDLE_HEARTBEAT
+    /// cadence (~1 Hz) so the encoder kept producing output. The
+    /// initial pool-feed bridge dropped that pattern: it pushed only
+    /// when a fresh BGRA frame arrived. A pool peer joining mid-idle
+    /// would see no encoded frames.
+    ///
+    /// This test pins the heartbeat: push exactly one BGRA, wait
+    /// past the IDLE_HEARTBEAT window, count how many encoded
+    /// frames arrive at a pool subscriber. Without heartbeat we'd
+    /// see ≤1 (the initial encode); with heartbeat we see ≥2 (initial
+    /// + at least one heartbeat re-push).
+    #[tokio::test]
+    async fn pool_feed_bridge_heartbeats_on_idle_capture() {
+        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let session = DisplaySession::new(0, backend);
+        session
+            .start(30, None, None)
+            .await
+            .expect("start must succeed");
+        session.ensure_pool_feed_bridge_started().await;
+
+        // Subscribe to the pool's encoder before pushing the BGRA so
+        // we don't miss the first frame.
+        let pool = session
+            .pool
+            .get()
+            .expect("pool initialized after start");
+        let prefs = encode::pool::PeerCodecPreferences::new(vec![
+            encode::pool::CodecKind::Vp8,
+        ]);
+        let (subs, _lease) = pool
+            .subscribe(&prefs)
+            .expect("VP8 always-on subscribe");
+        let mut frame_rx = subs
+            .into_iter()
+            .next()
+            .expect("at least one subscription")
+            .frames;
+
+        // Push EXACTLY ONE BGRA frame. After this, no more capture
+        // activity — simulating a fully idle damage-driven backend.
+        let _ = session
+            .frame_tx
+            .send(Arc::new(make_test_bgra(64, 64)));
+
+        // Count encoded frames over a window > IDLE_HEARTBEAT (1s)
+        // + buffer for VP8 encoder startup. The bridge ticks at
+        // 33ms (fps=30); after the first send, ticks observe
+        // unchanged buffer + heartbeat-not-due → skip. After
+        // ~30 ticks (~1s), heartbeat is due → re-push → encoder
+        // produces another frame.
+        let mut count: u32 = 0;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(1800),
+            async {
+                while let Ok(frame) = frame_rx.recv().await {
+                    let _ = frame;
+                    count += 1;
+                    if count >= 2 {
+                        return;
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            count >= 2,
+            "heartbeat must re-push latest_i420 to the pool encoder; \
+             got {count} frames in 1.8s. Pre-fix behavior would deliver \
+             ≤1 (initial encode then encoder starves on idle BGRA \
+             stream — the regression on damage-driven backends)."
         );
 
         session.shutdown.cancel();
