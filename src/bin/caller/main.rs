@@ -7960,6 +7960,22 @@ fn configure_sandbox_env(flags: &CliFlags, project: &Project, log_dir: &std::pat
 
 #[tokio::main]
 async fn main() -> Result<(), CallerError> {
+    // Install the process-wide rustls `CryptoProvider`. **Required
+    // by rustls 0.23+**: without this, the first DTLS handshake
+    // (typically when the WebRTC driver answers a federated peer's
+    // offer — see `display::webrtc::driver`) panics with
+    //   "Could not automatically determine the process-level
+    //    CryptoProvider from Rustls crate features."
+    // The panic kills the worker thread, the in-flight encoder is
+    // torn down, and every subsequent offer also panics. Tests
+    // call this via the `ensure_rustls_crypto_provider` helper in
+    // `display::webrtc::tests`; production never installed it,
+    // which surfaced during the 4d.3 E2E smoke test.
+    //
+    // `install_default()` returns `Err(Arc<CryptoProvider>)` if a
+    // provider is already installed (idempotent); we ignore that.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Panic hook: handle broken pipe gracefully and persist panic info
     // to the active session's log directory for post-mortem auditing.
     {
