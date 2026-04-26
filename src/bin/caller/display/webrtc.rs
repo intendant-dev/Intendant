@@ -66,6 +66,7 @@ use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp::packetizer::{self, Packetizer};
 use rtc::rtp::sequence;
+use rtc::statistics::StatsSelector;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
     RTCRtpEncodingParameters, RTCRtpHeaderExtensionCapability, RtpCodecKind,
@@ -80,7 +81,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
 
 /// Bound on the per-peer encoded-frame channel. Frames in excess are dropped
@@ -98,6 +99,19 @@ const COMMAND_CHANNEL: usize = 32;
 /// brief PLI storms (e.g. all simulcast layers requesting at once
 /// after a keyframe loss) without backpressure on the rtc poll loop.
 const KEYFRAME_REQUEST_CHANNEL: usize = 16;
+
+/// **Phase 4d.1**: how often the driver polls `rtc.get_stats(..)` to
+/// extract the TWCC-derived per-peer outgoing-bandwidth estimate.
+///
+/// 1s balances reactivity against poll cost: TWCC bandwidth estimates
+/// stabilize on a sub-second timescale (Google congestion control
+/// updates every ~100ms), so polling at 1s catches steady-state shifts
+/// without missing transient drops by more than one interval. Polls
+/// are cheap (read-only walk of the rtc-side accumulator state), so
+/// this isn't a CPU concern; the tradeoff is purely the staleness
+/// of the watch-channel value the layer-selection aggregator (4d.2)
+/// reads.
+const TWCC_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// Maximum UDP datagram we'll receive on the per-peer socket.
 const UDP_BUF_LEN: usize = 2000;
@@ -613,7 +627,39 @@ pub struct WebRtcPeer {
     #[allow(dead_code)]
     pub peer_id: PeerId,
     command_tx: mpsc::Sender<Command>,
+    /// **Phase 4d.1**: per-peer TWCC-derived available outgoing
+    /// bandwidth in bits/sec, refreshed by the driver every
+    /// `TWCC_POLL_INTERVAL`. `None` until the driver completes its
+    /// first poll AND a candidate pair has been nominated; from then
+    /// on, `Some(bps)`. Layer-selection aggregator (4d.2) subscribes
+    /// via [`Self::subscribe_bandwidth_estimate`] to react to changes.
+    bandwidth_estimate_rx: watch::Receiver<Option<u64>>,
     shutdown: CancellationToken,
+}
+
+impl WebRtcPeer {
+    /// **Phase 4d.1**: subscribe to this peer's TWCC-derived
+    /// available-outgoing-bandwidth signal. Returns a fresh
+    /// `watch::Receiver` that always carries the latest published
+    /// estimate (initial value `None` if the first poll hasn't
+    /// completed yet).
+    ///
+    /// Receivers are independent — multiple subscribers (e.g. the
+    /// per-display layer-selection aggregator AND a metrics
+    /// dashboard) can each `subscribe_bandwidth_estimate` and read
+    /// independently; calling `borrow_and_update` on one doesn't
+    /// affect another.
+    pub fn subscribe_bandwidth_estimate(&self) -> watch::Receiver<Option<u64>> {
+        self.bandwidth_estimate_rx.clone()
+    }
+
+    /// **Phase 4d.1**: read the current bandwidth estimate without
+    /// subscribing. Useful for one-shot reads (debug / metrics
+    /// snapshot). For change-driven consumers, prefer
+    /// [`Self::subscribe_bandwidth_estimate`].
+    pub fn current_bandwidth_estimate(&self) -> Option<u64> {
+        *self.bandwidth_estimate_rx.borrow()
+    }
 }
 
 /// Commands sent from the public `WebRtcPeer` handle to the driver task.
@@ -1063,6 +1109,12 @@ impl WebRtcPeer {
         let (encoded_frame_tx, encoded_frame_rx) =
             mpsc::channel::<OutboundEncodedFrame>(ENCODED_FRAME_CHANNEL);
         let (command_tx, command_rx) = mpsc::channel::<Command>(COMMAND_CHANNEL);
+        // Phase 4d.1: per-peer TWCC bandwidth estimate. Initial value
+        // None — the driver's first poll happens within
+        // TWCC_POLL_INTERVAL of construction; until a candidate pair
+        // is nominated, every poll publishes None too.
+        let (bandwidth_estimate_tx, bandwidth_estimate_rx) =
+            watch::channel::<Option<u64>>(None);
         let shutdown = CancellationToken::new();
 
         // Phase 4c: pass the full per-RID encoding map through to the
@@ -1089,6 +1141,7 @@ impl WebRtcPeer {
             input_handler,
             clipboard_handler,
             keyframe_request_tx,
+            bandwidth_estimate_tx,
             shutdown.clone(),
         ));
 
@@ -1096,6 +1149,7 @@ impl WebRtcPeer {
             Self {
                 peer_id,
                 command_tx,
+                bandwidth_estimate_rx,
                 shutdown,
             },
             encoded_frame_tx,
@@ -1434,6 +1488,7 @@ async fn driver(
     input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
     keyframe_request_tx: mpsc::Sender<SimulcastRid>,
+    bandwidth_estimate_tx: watch::Sender<Option<u64>>,
     shutdown: CancellationToken,
 ) {
     if rtp_config.encodings.is_empty() {
@@ -1555,6 +1610,16 @@ async fn driver(
             }
         }));
     }
+
+    // Phase 4d.1: TWCC bandwidth-estimate poll. `tokio::time::interval`
+    // fires immediately on first `.tick().await` by default; the
+    // first tick produces None (no nominated pair yet, no estimate)
+    // and is sent verbatim to the watch channel — fine because the
+    // initial value the channel was constructed with is already None.
+    // `MissedTickBehavior::Skip` ensures a busy driver loop doesn't
+    // produce a burst of catch-up polls when it falls behind.
+    let mut twcc_poll = tokio::time::interval(TWCC_POLL_INTERVAL);
+    twcc_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         // 1. Drain all outputs until we get a Timeout (the next deadline).
@@ -1752,6 +1817,31 @@ async fn driver(
                     return;
                 }
             }
+            // Phase 4d.1: TWCC bandwidth-estimate poll. Calls
+            // `rtc.get_stats(now, StatsSelector::None)` (read-only walk
+            // of the rtc-side accumulator state, cheap), extracts the
+            // nominated ICE candidate pair's
+            // `available_outgoing_bitrate`, and publishes to a
+            // watch channel the layer-selection aggregator (4d.2)
+            // subscribes to.
+            //
+            // `send_replace` (not `send`) so the channel always carries
+            // the latest value even if no receiver has subscribed yet
+            // — semantics align with watch's "always has a current
+            // value" contract.
+            //
+            // No errors propagate from a failed send (channel closed
+            // == aggregator gone == nothing to do), so this branch
+            // never tears down the driver.
+            _ = twcc_poll.tick() => {
+                let report = rtc.get_stats(Instant::now(), StatsSelector::None);
+                let estimate = extract_nominated_outgoing_bandwidth(
+                    report
+                        .candidate_pairs()
+                        .map(|p| (p.nominated, p.available_outgoing_bitrate)),
+                );
+                bandwidth_estimate_tx.send_replace(estimate);
+            }
         }
     }
 }
@@ -1871,6 +1961,55 @@ fn handle_event(
         _ => {}
     }
     false
+}
+
+/// **Phase 4d.1**: extract the TWCC-derived available outgoing
+/// bandwidth (in bits per second) from the nominated ICE candidate
+/// pair's stats. Returns `None` when no pair is nominated, the
+/// nominated pair's estimate is missing, or the value is non-finite
+/// or non-positive (negative / zero estimates are not useful for
+/// layer selection — treat as "no estimate yet").
+///
+/// Takes a flat iterator of `(nominated, available_outgoing_bitrate)`
+/// pairs — projecting `report.candidate_pairs()` to this shape lets
+/// tests construct synthetic input without needing rtc 0.9's
+/// `pub(crate)` `RTCStatsReport::new`. Production caller projects:
+///
+///     extract_nominated_outgoing_bandwidth(
+///         report.candidate_pairs().map(|p| (p.nominated, p.available_outgoing_bitrate))
+///     )
+///
+/// Why only the nominated pair: ICE may track multiple candidate
+/// pairs (failed, in-progress, succeeded), but only one is
+/// nominated at any given time and that's the active path media
+/// flows over. Bandwidth estimates on non-nominated pairs are
+/// either stale (failed pair) or speculative (probing); using them
+/// would produce policy decisions against the wrong network path.
+fn extract_nominated_outgoing_bandwidth(
+    pairs: impl IntoIterator<Item = (bool, f64)>,
+) -> Option<u64> {
+    for (nominated, bps) in pairs {
+        if !nominated {
+            continue;
+        }
+        // Reject non-finite (NaN / ±∞) and any value that would cast
+        // to 0u64. The `>= 1.0` threshold is the lower bound for a
+        // meaningful bandwidth estimate: anything fractional below
+        // 1 bit/sec is physically impossible for media transport
+        // and would produce a misleading `Some(0)` after the
+        // truncating `as u64` cast — the layer-selection aggregator
+        // should treat that as "no estimate yet" rather than "we
+        // have 0 bps available."
+        if !bps.is_finite() || bps < 1.0 {
+            // Nominated pair found but its estimate is unusable.
+            // Don't keep searching — by construction at most one
+            // pair is nominated; further pairs would be ignored
+            // anyway.
+            return None;
+        }
+        return Some(bps as u64);
+    }
+    None
 }
 
 /// Reverse-lookup: given an SSRC reported in an inbound RTCP feedback
@@ -4182,6 +4321,76 @@ mod tests {
         drop(peer);
     }
 
+    /// **Phase 4d.1**: a freshly-constructed `WebRtcPeer` exposes a
+    /// bandwidth-estimate signal that starts at `None` (the watch
+    /// channel's initial value). The driver's first poll happens
+    /// within `TWCC_POLL_INTERVAL` of construction, but until a
+    /// candidate pair is nominated, every poll publishes `None` too
+    /// — so the steady state in this test (no real ICE flow,
+    /// driver task may or may not have run a tick yet) is `None`.
+    ///
+    /// Pin both APIs:
+    /// - `current_bandwidth_estimate()` for one-shot reads.
+    /// - `subscribe_bandwidth_estimate()` for change-driven consumers
+    ///   (the layer-selection aggregator in 4d.2).
+    #[tokio::test]
+    async fn web_rtc_peer_exposes_bandwidth_estimate_api_starting_at_none() {
+        ensure_rustls_crypto_provider();
+        let offer_sdp = synth_recvonly_video_offer_for_rtc();
+        let active_rids = vec![SimulcastRid::full()];
+        let ice_config = IceConfig::default();
+        let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
+        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
+            Arc::new(|_| {});
+        let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
+        let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
+
+        let (peer, _frame_tx, _answer_sdp) = WebRtcPeer::build_with_codec_set(
+            44,
+            &offer_sdp,
+            CodecKind::Vp8,
+            &active_rids,
+            &ice_config,
+            None,
+            None,
+            input_handler,
+            clipboard_handler,
+            ice_tx,
+            kf_tx,
+        )
+        .await
+        .expect("build_with_codec_set must succeed");
+
+        // One-shot read: None initially.
+        assert_eq!(
+            peer.current_bandwidth_estimate(),
+            None,
+            "freshly-constructed peer's bandwidth estimate must be \
+             None until the driver polls a nominated candidate pair"
+        );
+
+        // Subscriber: initial `borrow` returns None too. `borrow()`
+        // reads the current value without marking it as "seen" —
+        // identical semantics to `current_bandwidth_estimate()`
+        // for the initial state.
+        let rx = peer.subscribe_bandwidth_estimate();
+        assert_eq!(
+            *rx.borrow(),
+            None,
+            "fresh subscriber must observe None as the initial value"
+        );
+
+        // Independent receivers: a second subscribe yields a separate
+        // Receiver; mutations on one (in this case, `borrow_and_update`
+        // which marks the current value as seen) don't affect the other.
+        let mut rx2 = peer.subscribe_bandwidth_estimate();
+        assert_eq!(*rx2.borrow_and_update(), None);
+        // The first receiver still sees None — independent state.
+        assert_eq!(*rx.borrow(), None);
+
+        drop(peer);
+    }
+
     /// **Phase 4c**: `RtpSendState` carries a `by_rid` map keyed by
     /// `SimulcastRid`. `build_with_codec_set` populates it with one
     /// entry per active RID — N entries for VP8 simulcast (full +
@@ -4421,6 +4630,119 @@ mod tests {
             rx.try_recv().is_err(),
             "ReceiverReport packets must not emit any routing decisions"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 4d.1: extract_nominated_outgoing_bandwidth helper tests
+    // -------------------------------------------------------------------
+
+    /// Single nominated pair with a positive finite estimate → that
+    /// estimate, cast to u64. The canonical happy path: one ICE pair
+    /// has been nominated and TWCC has produced a real bandwidth
+    /// number.
+    #[test]
+    fn extract_bandwidth_single_nominated_pair_returns_estimate() {
+        let pairs = vec![(true, 2_500_000.0)]; // 2.5 Mbps nominated
+        assert_eq!(
+            extract_nominated_outgoing_bandwidth(pairs),
+            Some(2_500_000)
+        );
+    }
+
+    /// No nominated pair → None. Either ICE hasn't completed yet, or
+    /// every candidate pair failed and none is currently active. The
+    /// layer-selection aggregator must treat None as "no estimate"
+    /// (don't pause anything based on absent data).
+    #[test]
+    fn extract_bandwidth_no_nominated_pair_returns_none() {
+        let pairs = vec![(false, 2_500_000.0), (false, 1_000_000.0)];
+        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
+    }
+
+    /// Multiple pairs, only one nominated → that one's estimate. The
+    /// non-nominated pairs are either failed paths (their estimates
+    /// are stale) or probing paths (their estimates are speculative);
+    /// using them would produce decisions against the wrong network
+    /// path. By the spec at most one pair is nominated at a time.
+    #[test]
+    fn extract_bandwidth_multiple_pairs_picks_only_nominated() {
+        let pairs = vec![
+            (false, 5_000_000.0), // failed pair, stale high estimate
+            (true, 2_000_000.0),  // nominated, real estimate
+            (false, 100.0),       // probing pair, low estimate
+        ];
+        assert_eq!(
+            extract_nominated_outgoing_bandwidth(pairs),
+            Some(2_000_000)
+        );
+    }
+
+    /// Nominated pair with NaN estimate → None. Would happen if the
+    /// rtc-side accumulator has a bug or if TWCC math underflows.
+    /// Casting NaN to u64 is platform-defined behavior in Rust, so
+    /// rejecting NaN here is both safer and more explicit than
+    /// passing the value through.
+    #[test]
+    fn extract_bandwidth_nominated_pair_with_nan_returns_none() {
+        let pairs = vec![(true, f64::NAN)];
+        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
+    }
+
+    /// Nominated pair with infinite estimate → None. Same defensive
+    /// treatment as NaN — infinite isn't a usable bandwidth number
+    /// for layer selection.
+    #[test]
+    fn extract_bandwidth_nominated_pair_with_infinite_returns_none() {
+        let pairs = vec![(true, f64::INFINITY)];
+        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
+        let pairs = vec![(true, f64::NEG_INFINITY)];
+        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
+    }
+
+    /// Nominated pair with non-positive (negative or zero) estimate
+    /// → None. Zero estimate means TWCC has no signal yet (treat as
+    /// "no estimate"); negative is non-physical and indicates a bug.
+    #[test]
+    fn extract_bandwidth_nominated_pair_with_non_positive_returns_none() {
+        let pairs = vec![(true, 0.0)];
+        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
+        let pairs = vec![(true, -1.0)];
+        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
+    }
+
+    /// Empty pairs iterator → None. Defends against the rtc-side
+    /// returning a stats report before any candidate pair has been
+    /// formed (very early in connection lifetime).
+    #[test]
+    fn extract_bandwidth_empty_pairs_returns_none() {
+        let pairs: Vec<(bool, f64)> = vec![];
+        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
+    }
+
+    /// Sub-1bps fractional estimate is rejected by the `bps >= 1.0`
+    /// guard before casting. Without this guard, `0.5 as u64 == 0`
+    /// would produce a misleading `Some(0)` — the aggregator would
+    /// then have to disambiguate "real zero estimate" from "fractional
+    /// estimate the cast truncated." Pin the contract: anything
+    /// below 1 bit/sec is treated as "no estimate," same as None.
+    #[test]
+    fn extract_bandwidth_sub_one_bps_fractional_returns_none() {
+        let pairs = vec![(true, 0.5)];
+        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
+        // Just-below-1.0 also rejected — the threshold is inclusive
+        // at 1.0 (1.0 → Some(1)), exclusive below.
+        let pairs = vec![(true, 0.999_999_9)];
+        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
+    }
+
+    /// Exactly 1.0 bps is the smallest accepted estimate (the `>= 1.0`
+    /// threshold is inclusive). Pins the boundary so a future refactor
+    /// to a stricter threshold (e.g. minimum-meaningful 1Kbps) is an
+    /// explicit, reviewed change.
+    #[test]
+    fn extract_bandwidth_exactly_one_bps_returns_some_one() {
+        let pairs = vec![(true, 1.0)];
+        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), Some(1));
     }
 
     /// `rid_for_ssrc` returns the matching RID for any known SSRC
