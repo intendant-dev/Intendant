@@ -64,10 +64,10 @@ pub struct FfmpegH264Encoder {
     /// Timestamp to assign to the next completed frame.
     pending_frame_pts: u64,
     /// Cached canonical payload spec for this encoder. Attached to every
-    /// emitted packet so the WebRTC driver's `match_params` cache can
-    /// look up the peer-negotiated PT. All ffmpeg H.264 packets produced
-    /// here are Constrained Baseline, packetization-mode 1 (matches both
-    /// the h264_vaapi config and libx264 `-profile:v baseline` above).
+    /// emitted packet so the WebRTC driver can verify it against the
+    /// peer-negotiated sender codec. All ffmpeg H.264 packets produced here
+    /// are Constrained Baseline, packetization-mode 1 (matches both the
+    /// h264_vaapi config and libx264 `-profile:v baseline` above).
     payload_spec: PayloadSpec,
 }
 

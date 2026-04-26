@@ -177,10 +177,10 @@ pub enum FrameFormat {
 /// Encoded video frame -- shared across peers, each peer packetizes independently.
 ///
 /// Carries a [`encode::PayloadSpec`] so the per-peer WebRTC driver can
-/// resolve the peer-negotiated RTP payload type via `str0m::Writer::match_params`
-/// and cache the result. H.264 frames in particular need the full spec
-/// (profile-level-id + packetization-mode) because str0m discriminates
-/// parameter sets, not just codec names.
+/// verify the frame matches the peer-negotiated RTP codec before packetizing.
+/// H.264 frames in particular need the full spec (profile-level-id +
+/// packetization-mode) because browser negotiation discriminates parameter
+/// sets, not just codec names.
 #[derive(Clone)]
 pub struct EncodedFrame {
     pub data: Vec<u8>,
@@ -894,10 +894,9 @@ impl DisplaySession {
     /// stale references are gone.
     ///
     /// Pipeline:
-    ///   - Codec selection is per-peer via str0m's `enable_*()` calls
-    ///     in [`webrtc::WebRtcPeer::new`], driven by the
-    ///     codecs the pool's initial subscribe actually returned.
-    ///     No first-peer codec lock.
+    ///   - Codec selection is per-peer in [`webrtc::WebRtcPeer::new`],
+    ///     driven by the active codec selected from the pool's initial
+    ///     subscribe result. No first-peer codec lock.
     ///   - Peer-join keyframe is wired in two parts at the tail:
     ///     * [`crate::display::encode::pool::EncoderPool::request_keyframe_all`]
     ///       (3c.3b.4a) fires a coalesced PLI-equivalent across
@@ -910,8 +909,8 @@ impl DisplaySession {
     ///       desktop pool peer-join on Linux H.264 stays black for
     ///       many seconds waiting on the heartbeat-paced 1 push/sec
     ///       cadence.
-    ///     The PLI-driven per-peer explicit request from str0m's
-    ///     inbound RTCP lands with the simulcast work.
+    ///     The PLI-driven per-peer explicit request from inbound RTCP
+    ///     lands with the simulcast work.
     ///   - No `pool_leases` tracking on `DisplaySession`:
     ///     [`webrtc::WebRtcPeer::new`] hands the lease to
     ///     the per-peer `pool_frame_intake` task, which owns it for
@@ -940,10 +939,10 @@ impl DisplaySession {
 
         // Build the peer's codec preferences from its SDP offer. The
         // strict `forward::codec_preferences_from_offer` filters
-        // H.264 by str0m's exact match rules (profile / packetization
-        // / level), so an offer that advertises an incompatible H.264
-        // variant is correctly excluded here rather than producing a
-        // black stream after match_params drops the spec downstream.
+        // H.264 by the exact profile / packetization / level that our
+        // encoder can produce, so an incompatible H.264 variant is
+        // excluded here rather than producing a black stream after the
+        // driver drops mismatched frames downstream.
         let prefs = forward::codec_preferences_from_offer(sdp);
         if prefs.is_empty() {
             return Err(CallerError::WebRtc(format!(

@@ -1,17 +1,16 @@
-//! Per-peer WebRTC driver built on `str0m`.
+//! Per-peer WebRTC driver built on the sans-I/O `rtc` 0.20 core.
 //!
 //! Architecture: each `WebRtcPeer` owns a tokio task ("driver") that holds an
-//! `Rtc` instance and a UDP socket. The driver pumps three things in a single
+//! peer connection instance and UDP/TCP sockets. The driver pumps three things in a single
 //! `select!` loop:
 //!
-//! 1. Inbound UDP datagrams → `rtc.handle_input(Receive)`
+//! 1. Inbound UDP/TCP datagrams → `peer.handle_read(TaggedBytesMut)`
 //! 2. Encoded video frames from the shared encoder fan-out → `writer.write(...)`
 //! 3. Commands from the public `WebRtcPeer` handle (ICE candidates, clipboard
-//!    sends, shutdown) → `rtc.add_remote_candidate()` / `rtc.channel().write()`
+//!    sends, shutdown) → `peer.add_remote_candidate()` / data channel writes
 //!
-//! After every input the driver drains `rtc.poll_output()` until it returns
-//! `Output::Timeout`, sending any `Transmit` outputs over the UDP socket and
-//! dispatching `Event` outputs to the input/clipboard handlers.
+//! After every input the driver drains the peer connection's pending writes,
+//! reads, and events, and uses `poll_timeout` / `handle_timeout` to drive timers.
 //!
 //! ## ICE-TCP multiplexing
 //!
@@ -28,7 +27,7 @@
 //! `<target_ufrag>:<sender_ufrag>`), and forwards the connection to the
 //! matching peer's driver. Each TCP connection becomes a bidirectional
 //! channel: inbound frames flow through the same packet channel UDP
-//! uses (tagged with `Protocol::Tcp`), and outbound `Output::Transmit`
+//! uses (tagged with `TransportProtocol::TCP`), and outbound writes
 //! with `proto == Tcp` is written to the connection's write half keyed
 //! on the destination address.
 //!
@@ -49,18 +48,34 @@ use super::encode::pool::{
 };
 use super::{EncodedFrame, IceConfig, InputEvent, PeerId};
 use crate::error::CallerError;
+use bytes::{Bytes, BytesMut};
+use rtc::data_channel::{RTCDataChannelId, RTCDataChannelMessage};
+use rtc::media_stream::MediaStreamTrack;
+use rtc::peer_connection::configuration::media_engine::{
+    MediaEngine, MIME_TYPE_H264 as RTC_MIME_TYPE_H264, MIME_TYPE_VP8 as RTC_MIME_TYPE_VP8,
+};
+use rtc::peer_connection::configuration::setting_engine::SettingEngine;
+use rtc::peer_connection::configuration::RTCConfigurationBuilder;
+use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent};
+use rtc::peer_connection::message::RTCMessage;
+use rtc::peer_connection::sdp::RTCSessionDescription;
+use rtc::peer_connection::transport::{RTCIceCandidateInit, RTCIceProtocol};
+use rtc::peer_connection::RTCPeerConnection;
+use rtc::peer_connection::RTCPeerConnectionBuilder;
+use rtc::rtp::packetizer::{self, Packetizer};
+use rtc::rtp::sequence;
+use rtc::rtp_transceiver::rtp_sender::{
+    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
+    RTCRtpEncodingParameters, RTCRtpHeaderExtensionCapability, RtpCodecKind,
+};
+use rtc::rtp_transceiver::RTCRtpSenderId;
+use rtc::sansio::Protocol as RtcProtocol;
+use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use str0m::change::SdpOffer;
-use str0m::channel::ChannelId;
-use str0m::format::{CodecSpec, FormatParams, PayloadParams};
-use str0m::media::{Frequency, MediaAdded, MediaKind, MediaTime, Mid, Pt};
-use str0m::net::{DatagramRecv, Protocol, Receive};
-use str0m::net::TcpType;
-use str0m::{Candidate, Event, IceCreds, Input, Output, Rtc, RtcConfig, RtcError};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
@@ -112,7 +127,7 @@ pub struct AcceptedTcpConnection {
     pub remote_addr: SocketAddr,
     pub local_addr: SocketAddr,
     /// The first frame we already read off the wire (needed for STUN ufrag
-    /// matching). The peer's driver must feed this to `rtc.handle_input`.
+    /// matching). The peer's driver must feed this to the sans-I/O RTC core.
     pub first_frame: Vec<u8>,
     pub stream: TcpStream,
 }
@@ -161,9 +176,8 @@ impl TcpPeerRegistry {
             .local_addr()
             .map_err(|e| format!("local_addr: {e}"))?;
 
-        let username = parse_stun_username(&first_frame).ok_or_else(|| {
-            "first frame is not a STUN binding request with USERNAME".to_string()
-        })?;
+        let username = parse_stun_username(&first_frame)
+            .ok_or_else(|| "first frame is not a STUN binding request with USERNAME".to_string())?;
 
         // Per RFC 8445 §7.2.2, the STUN USERNAME attribute for an ICE
         // connectivity check sent from A to B is formatted as
@@ -197,7 +211,6 @@ impl TcpPeerRegistry {
         })?;
         Ok(())
     }
-
 }
 
 /// RAII guard that unregisters a peer's ufrag from the registry on drop.
@@ -208,7 +221,11 @@ pub struct PeerRegistration {
 
 impl Drop for PeerRegistration {
     fn drop(&mut self) {
-        self.registry.registry.lock().unwrap().remove(&self.local_ufrag);
+        self.registry
+            .registry
+            .lock()
+            .unwrap()
+            .remove(&self.local_ufrag);
     }
 }
 
@@ -315,9 +332,8 @@ impl TcpRelayRegistry {
         stream: TcpStream,
         first_frame: Vec<u8>,
     ) -> Result<(), String> {
-        let username = parse_stun_username(&first_frame).ok_or_else(|| {
-            "first frame is not a STUN binding request with USERNAME".to_string()
-        })?;
+        let username = parse_stun_username(&first_frame)
+            .ok_or_else(|| "first frame is not a STUN binding request with USERNAME".to_string())?;
         // Target ufrag is the first half of `target:sender`, same as
         // TcpPeerRegistry's dispatch — RFC 8445 §7.2.2.
         let local_ufrag = username
@@ -405,13 +421,13 @@ pub fn parse_first_frame_ufrag(first_frame: &[u8]) -> Option<String> {
 /// The injected line is placed immediately after the first existing
 /// `a=candidate:` line (or, if there are no candidate lines, at the
 /// end of the first media section). `foundation` is deliberately
-/// distinct from str0m's typical values to avoid collision; `priority`
+/// distinct from normal local candidate values to avoid collision; `priority`
 /// is set lower than a typical host-TCP-passive candidate so ICE
 /// prefers the peer's direct candidate when reachable and only falls
 /// back to the relay when direct fails.
 ///
-/// IPv6 addresses are emitted in canonical form (str0m accepts the
-/// same); IPv4 addresses as dotted-quad. `component_id` is always 1
+/// IPv6 addresses are emitted in canonical form; IPv4 addresses as
+/// dotted-quad. `component_id` is always 1
 /// (RTP; same-stream RTCP multiplexed per `a=rtcp-mux`).
 ///
 /// Returns the modified SDP as a new `String`. Pure function — never
@@ -422,7 +438,7 @@ pub fn inject_relay_tcp_candidate(sdp: &str, primary_addr: SocketAddr) -> String
     //
     // type_pref for host is 126; we use 100 so the relay candidate's
     // priority is strictly below a typical peer-direct host TCP
-    // candidate (str0m picks type_pref 126 for those). local_pref
+    // candidate (host candidates normally use type_pref 126). local_pref
     // is 0 (single interface) since the distinction doesn't help here.
     //
     // Result: priority = (2^24)*100 + 0 + 255 = 1_677_721_855.
@@ -436,12 +452,13 @@ pub fn inject_relay_tcp_candidate(sdp: &str, primary_addr: SocketAddr) -> String
         std::net::IpAddr::V6(v6) => v6.to_string(),
     };
     let port = primary_addr.port();
-    // Foundation 9001 is arbitrary; picked to not collide with str0m's
+    // Foundation 9001 is arbitrary; picked to not collide with common
     // typical sequential foundations (1, 2, ...). Same foundation for
     // every injected candidate is fine per RFC 5245 since foundations
     // only need to be unique-per-stream within a single side's set.
-    let candidate_line =
-        format!("a=candidate:9001 {component_id} tcp {priority} {ip} {port} typ host tcptype passive generation 0");
+    let candidate_line = format!(
+        "a=candidate:9001 {component_id} tcp {priority} {ip} {port} typ host tcptype passive generation 0"
+    );
 
     // Walk the SDP line by line. Insert the new candidate immediately
     // after the first existing `a=candidate:` line (keeps the candidate
@@ -453,7 +470,11 @@ pub fn inject_relay_tcp_candidate(sdp: &str, primary_addr: SocketAddr) -> String
     let mut out = String::with_capacity(sdp.len() + candidate_line.len() + 2);
     for line in sdp.split_inclusive('\n') {
         out.push_str(line);
-        if !inserted && line.trim_end_matches(|c| c == '\r' || c == '\n').starts_with("a=candidate:") {
+        if !inserted
+            && line
+                .trim_end_matches(|c| c == '\r' || c == '\n')
+                .starts_with("a=candidate:")
+        {
             out.push_str(&candidate_line);
             out.push_str(newline);
             inserted = true;
@@ -506,9 +527,7 @@ where
 /// that first frame from the stream before handing ownership to the
 /// `TcpPeerRegistry`. We don't want to re-export the generic helper
 /// cross-module, so this is a concrete version for `TcpStream`.
-pub async fn read_rfc4571_frame_pub(
-    stream: &mut TcpStream,
-) -> std::io::Result<Vec<u8>> {
+pub async fn read_rfc4571_frame_pub(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     read_rfc4571_frame(stream).await
 }
 
@@ -578,7 +597,7 @@ fn parse_stun_username(bytes: &[u8]) -> Option<String> {
 /// Public handle to a single WebRTC peer.
 ///
 /// All operations route to the driver task via channels; the driver owns the
-/// `Rtc` instance and the UDP socket exclusively.
+/// RTC peer connection and UDP/TCP sockets exclusively.
 pub struct WebRtcPeer {
     #[allow(dead_code)]
     pub peer_id: PeerId,
@@ -592,37 +611,155 @@ enum Command {
     SendClipboard(ClipboardContent),
 }
 
+struct RtpSendConfig {
+    sender_id: RTCRtpSenderId,
+    ssrc: u32,
+    mid: String,
+    rid: SimulcastRid,
+    codec: RTCRtpCodec,
+}
+
+fn new_ssrc() -> u32 {
+    let raw = uuid::Uuid::new_v4().as_u128() as u32;
+    raw.max(1)
+}
+
+fn new_ice_fragment() -> String {
+    uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(12)
+        .collect()
+}
+
+fn new_ice_password() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+fn video_rtcp_feedback() -> Vec<RTCPFeedback> {
+    vec![
+        RTCPFeedback {
+            typ: "goog-remb".to_string(),
+            parameter: String::new(),
+        },
+        RTCPFeedback {
+            typ: "ccm".to_string(),
+            parameter: "fir".to_string(),
+        },
+        RTCPFeedback {
+            typ: "nack".to_string(),
+            parameter: String::new(),
+        },
+        RTCPFeedback {
+            typ: "nack".to_string(),
+            parameter: "pli".to_string(),
+        },
+    ]
+}
+
+fn rtc_codec_parameters(codec: CodecKind) -> Result<RTCRtpCodecParameters, CallerError> {
+    let rtp_codec = match codec {
+        CodecKind::Vp8 => RTCRtpCodec {
+            mime_type: RTC_MIME_TYPE_VP8.to_string(),
+            clock_rate: 90_000,
+            channels: 0,
+            sdp_fmtp_line: String::new(),
+            rtcp_feedback: video_rtcp_feedback(),
+        },
+        CodecKind::H264 => RTCRtpCodec {
+            mime_type: RTC_MIME_TYPE_H264.to_string(),
+            clock_rate: 90_000,
+            channels: 0,
+            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                .to_string(),
+            rtcp_feedback: video_rtcp_feedback(),
+        },
+        CodecKind::Vp9 | CodecKind::Av1 => {
+            return Err(CallerError::WebRtc(format!(
+                "codec {} not yet wired to rtc 0.20 media engine",
+                codec
+            )));
+        }
+    };
+    let payload_type = match codec {
+        CodecKind::Vp8 => 96,
+        CodecKind::H264 => 125,
+        CodecKind::Vp9 | CodecKind::Av1 => unreachable!(),
+    };
+    Ok(RTCRtpCodecParameters {
+        rtp_codec,
+        payload_type,
+        ..Default::default()
+    })
+}
+
+fn host_candidate_init(addr: SocketAddr, protocol: RTCIceProtocol) -> RTCIceCandidateInit {
+    let (foundation, proto, priority, tcp_suffix) = match protocol {
+        RTCIceProtocol::Udp => ("1", "udp", 2_130_706_431u32, ""),
+        RTCIceProtocol::Tcp => ("9001", "tcp", 1_677_721_855u32, " tcptype passive"),
+        RTCIceProtocol::Unspecified => ("1", "udp", 1_000_000_000u32, ""),
+    };
+    RTCIceCandidateInit {
+        candidate: format!(
+            "candidate:{foundation} 1 {proto} {priority} {} {} typ host{tcp_suffix} generation 0",
+            addr.ip(),
+            addr.port()
+        ),
+        sdp_mid: Some(String::new()),
+        sdp_mline_index: Some(0),
+        username_fragment: None,
+        url: None,
+    }
+}
+
+fn first_video_mid_from_offer(sdp: &str) -> Option<String> {
+    let mut in_video = false;
+    for raw in sdp.lines() {
+        let line = raw.trim_end_matches('\r');
+        if line.starts_with("m=") {
+            in_video = line.starts_with("m=video ");
+            continue;
+        }
+        if in_video {
+            if let Some(mid) = line.strip_prefix("a=mid:") {
+                let mid = mid.trim();
+                if !mid.is_empty() {
+                    return Some(mid.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 impl WebRtcPeer {
     /// Create a new peer from an SDP offer, returning `(Self, answer_sdp)`.
     ///
     /// Steps:
-    /// 1. Build an [`Rtc`] with each codec in `codec_set` enabled — str0m
-    ///    then negotiates from the browser's offer against those codecs.
+    /// 1. Build an [`RTCPeerConnection`] with the active pool codec registered.
     /// 2. Bind a per-peer UDP socket and register it as a host candidate.
-    /// 3. Synchronously generate the SDP answer via `accept_offer`.
+    /// 3. Apply the browser offer and generate the SDP answer.
     /// 4. Spawn the driver task and return.
     ///
     /// ## `codec_set` contract
     ///
-    /// Each peer gets its own [`Rtc`] (str0m does not support per-peer
-    /// codec selection inside one `Rtc`), so codec enablement is a
-    /// per-peer decision. The caller passes the codecs this peer should
-    /// be allowed to negotiate — typically the intersection of "what the
-    /// encoder pipeline can currently produce" with "what the peer's
-    /// offer advertised." An empty set is rejected up front; unknown
-    /// codecs return an explicit error so the failure point is not
-    /// buried inside str0m's accept_offer.
+    /// Each peer gets its own RTC peer connection, so codec registration is a
+    /// per-peer decision. The caller passes the codec this peer should be
+    /// allowed to negotiate — the active codec selected from "what the encoder
+    /// pool can currently produce" and "what the peer's offer advertised."
+    /// An empty set is rejected up front; unknown codecs return an explicit
+    /// error so the failure point is not buried inside SDP answer generation.
     ///
     /// Empty / no-overlap cases are surfaced to `handle_offer` as
     /// [`CallerError::WebRtc`] errors rather than producing a silent
     /// broken stream — matches the "no compatible codec, clean reject"
     /// contract from the multi-viewer redesign.
     ///
-    /// `ice_tx` is accepted for API parity with the previous webrtc-rs
-    /// implementation but is currently unused: str0m emits its host candidates
-    /// inline in the answer SDP, so there is nothing to trickle from the
-    /// server side. The browser still trickles its candidates via
-    /// `add_ice_candidate`.
+    /// `ice_tx` is accepted for API parity with earlier implementations but is
+    /// currently unused: local host candidates are emitted inline in the
+    /// answer SDP, so there is nothing to trickle from the server side. The
+    /// browser still trickles its candidates via `add_ice_candidate`.
     /// Returns `(peer, encoded_frame_tx, answer_sdp)`. The
     /// `encoded_frame_tx` is the sender side of the per-peer encoded
     /// frame channel — the caller (`Self::new`) hands it directly to
@@ -638,18 +775,6 @@ impl WebRtcPeer {
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
         _ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<(Self, mpsc::Sender<Arc<EncodedFrame>>, String), CallerError> {
-        // --- Pre-generate ICE credentials ----------------------------------
-        // We need to know the local ufrag *before* Rtc::build so we can
-        // register it with the TCP dispatcher, if present.
-        let ice_creds = IceCreds::new();
-        let local_ufrag = ice_creds.ufrag.clone();
-
-        // --- Build the Rtc with the per-peer codec set enabled ------------
-        // Previously the session locked one codec at the first peer's offer
-        // and every subsequent peer was pre-restricted to it. Now each peer's
-        // Rtc enables the codec set its handler chose based on this peer's
-        // own offer, so str0m's accept_offer handles SDP negotiation cleanly
-        // against the browser's actual preferences.
         if codec_set.is_empty() {
             return Err(CallerError::WebRtc(
                 "peer codec set is empty — caller must ensure at least one \
@@ -658,29 +783,72 @@ impl WebRtcPeer {
                     .to_string(),
             ));
         }
-        let mut config = RtcConfig::new()
-            .clear_codecs()
-            .set_local_ice_credentials(ice_creds);
-        for codec in codec_set {
-            config = match codec {
-                CodecKind::Vp8 => config.enable_vp8(true),
-                CodecKind::H264 => config.enable_h264(true),
-                // VP9 / AV1 wiring to str0m lands with phase 3 of the
-                // encoder-pool redesign. Reject explicitly so a stray
-                // caller doesn't get silent codec loss.
-                CodecKind::Vp9 | CodecKind::Av1 => {
-                    return Err(CallerError::WebRtc(format!(
-                        "codec {} not yet wired to str0m enable API",
-                        codec
-                    )));
-                }
-            };
+
+        // The existing intake forwards one active codec. Preserve that
+        // behavioral contract while moving the transport stack to rtc 0.20.
+        let active_codec = codec_set[0];
+        let codec_params = rtc_codec_parameters(active_codec)?;
+        let video_mid = first_video_mid_from_offer(offer_sdp).unwrap_or_else(|| "0".to_string());
+
+        // We need to know the local ufrag before SDP generation so the TCP
+        // dispatcher can route accepted ICE-TCP sockets to this peer.
+        let local_ufrag = new_ice_fragment();
+        let local_pwd = new_ice_password();
+
+        let mut setting_engine = SettingEngine::default();
+        setting_engine.set_ice_credentials(local_ufrag.clone(), local_pwd);
+
+        let mut media_engine = MediaEngine::default();
+        media_engine
+            .register_codec(codec_params.clone(), RtpCodecKind::Video)
+            .map_err(|e| CallerError::WebRtc(format!("register codec: {e}")))?;
+        for uri in [
+            "urn:ietf:params:rtp-hdrext:sdes:mid",
+            "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id",
+            "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id",
+        ] {
+            media_engine
+                .register_header_extension(
+                    RTCRtpHeaderExtensionCapability {
+                        uri: uri.to_string(),
+                    },
+                    RtpCodecKind::Video,
+                    None,
+                )
+                .map_err(|e| CallerError::WebRtc(format!("register RTP extension: {e}")))?;
         }
-        let mut rtc = config.build(Instant::now());
+
+        let ssrc = new_ssrc();
+        let rid = SimulcastRid::full();
+        let track = MediaStreamTrack::new(
+            format!("display-{peer_id}"),
+            format!("display-video-{peer_id}"),
+            format!("display-video-{peer_id}"),
+            RtpCodecKind::Video,
+            vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: RTCRtpCodingParameters {
+                    rid: rid.as_str().to_string(),
+                    ssrc: Some(ssrc),
+                    ..Default::default()
+                },
+                codec: codec_params.rtp_codec.clone(),
+                ..Default::default()
+            }],
+        );
+
+        let mut rtc = RTCPeerConnectionBuilder::new()
+            .with_configuration(RTCConfigurationBuilder::new().build())
+            .with_setting_engine(setting_engine)
+            .with_media_engine(media_engine)
+            .build()
+            .map_err(|e| CallerError::WebRtc(format!("build rtc peer: {e}")))?;
+        let sender_id = rtc
+            .add_track(track)
+            .map_err(|e| CallerError::WebRtc(format!("add video track: {e}")))?;
 
         // --- Bind one UDP socket per local interface -----------------------
-        // str0m's ICE agent matches incoming packets against local candidates
-        // by `(local_address, port)`. A single wildcard bind would surface as
+        // The ICE agent matches incoming packets against local candidates by
+        // `(local_address, port)`. A single wildcard bind would surface as
         // `0.0.0.0:port` on `socket.local_addr()`, which never matches the
         // concrete-IP candidates we'd advertise — connectivity checks then
         // can't form a valid pair. So we bind a separate socket per
@@ -695,9 +863,7 @@ impl WebRtcPeer {
             let socket = match UdpSocket::bind(bind_addr).await {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!(
-                        "[display/webrtc] skipping UDP bind on {iface_addr}: {e}"
-                    );
+                    eprintln!("[display/webrtc] skipping UDP bind on {iface_addr}: {e}");
                     continue;
                 }
             };
@@ -710,14 +876,10 @@ impl WebRtcPeer {
                     continue;
                 }
             };
-            match Candidate::host(local, "udp") {
-                Ok(c) => {
-                    rtc.add_local_candidate(c);
-                    sockets.push(Arc::new(socket));
-                }
-                Err(e) => {
-                    eprintln!("[display/webrtc] skipping UDP host candidate {local}: {e}");
-                }
+            let candidate = host_candidate_init(local, RTCIceProtocol::Udp);
+            match rtc.add_local_candidate(candidate) {
+                Ok(()) => sockets.push(Arc::new(socket)),
+                Err(e) => eprintln!("[display/webrtc] skipping UDP host candidate {local}: {e}"),
             }
         }
         if sockets.is_empty() {
@@ -752,11 +914,11 @@ impl WebRtcPeer {
         // no clever ICE trick that gets around Firefox's loopback filter
         // for that case.
         //
-        // On the server side we "lie" to str0m about the inbound
+        // On the server side we "lie" to the RTC core about the inbound
         // destination: regardless of what `stream.local_addr()` says
         // (typically the VM's internal interface IP behind the NAT), we
-        // pass `destination = tcp_advertised_addr` to `handle_input`.
-        // str0m matches the lied-about destination to its single local
+        // pass `destination = tcp_advertised_addr` to `handle_read`.
+        // ICE matches the lied-about destination to its single local
         // TCP candidate and forms a clean pair; data still flows because
         // the TCP stream is bidirectional and we own the write half
         // directly, no kernel routing involved.
@@ -777,20 +939,9 @@ impl WebRtcPeer {
             // lets us set `tcptype: passive` — "the remote actively opens
             // the TCP connection to us", the correct role for a
             // server-side host candidate.
-            match Candidate::builder()
-                .tcp()
-                .host(advertised)
-                .tcptype(TcpType::Passive)
-                .build()
-            {
-                Ok(c) => {
-                    rtc.add_local_candidate(c);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[display/webrtc] failed to add TCP host candidate {advertised}: {e}"
-                    );
-                }
+            let candidate = host_candidate_init(advertised, RTCIceProtocol::Tcp);
+            if let Err(e) = rtc.add_local_candidate(candidate) {
+                eprintln!("[display/webrtc] failed to add TCP host candidate {advertised}: {e}");
             }
             eprintln!(
                 "[display/webrtc] peer {peer_id}: ICE-TCP enabled on {advertised} for ufrag {local_ufrag}"
@@ -806,15 +957,18 @@ impl WebRtcPeer {
         }
 
         // --- Parse the offer and produce the answer ----------------------
-        let offer = SdpOffer::from_sdp_string(offer_sdp)
+        let offer = RTCSessionDescription::offer(offer_sdp.to_string())
             .map_err(|e| CallerError::WebRtc(format!("parse offer: {e}")))?;
+        rtc.set_remote_description(offer)
+            .map_err(|e| CallerError::WebRtc(format!("set remote offer: {e}")))?;
         let answer = rtc
-            .sdp_api()
-            .accept_offer(offer)
-            .map_err(|e| CallerError::WebRtc(format!("accept offer: {e}")))?;
-        let answer_sdp = answer.to_sdp_string();
+            .create_answer(None)
+            .map_err(|e| CallerError::WebRtc(format!("create answer: {e}")))?;
+        rtc.set_local_description(answer.clone())
+            .map_err(|e| CallerError::WebRtc(format!("set local answer: {e}")))?;
+        let answer_sdp = answer.sdp;
         // Dump every a=candidate line from the answer so we can see exactly
-        // what str0m emitted — this is the fastest way to diagnose
+        // what the RTC core emitted — this is the fastest way to diagnose
         // "browser never tries to connect to the TCP candidate" symptoms.
         for line in answer_sdp.lines().filter(|l| l.starts_with("a=candidate:")) {
             eprintln!("[display/webrtc] peer {peer_id}: answer {line}");
@@ -829,6 +983,13 @@ impl WebRtcPeer {
         tokio::spawn(driver(
             peer_id,
             rtc,
+            RtpSendConfig {
+                sender_id,
+                ssrc,
+                mid: video_mid,
+                rid,
+                codec: codec_params.rtp_codec,
+            },
             sockets,
             tcp_conn_rx,
             tcp_advertised,
@@ -852,7 +1013,7 @@ impl WebRtcPeer {
     }
 
     /// Build a peer that consumes frames from the shared
-    /// [`EncoderPool`] and forwards them to the browser via str0m.
+    /// [`EncoderPool`] and forwards them to the browser via the RTC driver.
     /// The only public constructor (3c.4c renamed `new_pool_mode` →
     /// `new` after the legacy single-encoder fan-out was deleted in
     /// 3c.4b).
@@ -908,21 +1069,24 @@ impl WebRtcPeer {
                     .to_string(),
             ));
         }
-        let codec_set = codec_set_from_subscriptions(&subscriptions);
-        // Filter the peer's original prefs against codec_set BEFORE
-        // building the answer — both must agree exactly. The answer
-        // enables `codec_set` (via `enable_*()` calls in `Self::new`),
-        // and the intake uses `negotiated_prefs` for every subsequent
-        // `pool.subscribe`. They derive from the same source so they
-        // can't drift.
-        let negotiated_prefs = filter_prefs_to_negotiated(&prefs, &codec_set);
+        let active_codec =
+            active_codec_from_subscriptions(&subscriptions, &prefs).ok_or_else(|| {
+                CallerError::WebRtc(
+                    "new: no subscription matched peer codec preferences".to_string(),
+                )
+            })?;
+        let active_codec_set = [active_codec];
+        // Filter the peer's original prefs against the single codec the
+        // intake will actually forward. The answer and all future
+        // resubscribes are locked to this codec, so the RTC sender cannot
+        // negotiate one codec while pool_frame_intake selects another.
+        let negotiated_prefs = filter_prefs_to_negotiated(&prefs, &active_codec_set);
         // Defensive — should be unreachable: subscriptions is non-empty
-        // (early return above), codec_set is non-empty (one entry per
-        // unique codec in subs), and codec_set ⊆ original prefs (the
-        // pool only returns subs for codecs the prefs include). So the
-        // intersection is non-empty whenever original prefs is
-        // non-empty. If it's empty here, something upstream is producing
-        // subs for a codec the prefs doesn't include — fail loud.
+        // (early return above), active_codec came from subscriptions,
+        // and active_codec also appears in original prefs. So the
+        // intersection is non-empty. If it's empty here, something
+        // upstream is producing subs for a codec the prefs doesn't
+        // include — fail loud.
         if negotiated_prefs.is_empty() {
             return Err(CallerError::WebRtc(
                 "new: filter_prefs_to_negotiated produced empty set; \
@@ -933,7 +1097,7 @@ impl WebRtcPeer {
         let (peer, encoded_frame_tx, answer_sdp) = Self::build_with_codec_set(
             peer_id,
             offer_sdp,
-            &codec_set,
+            &active_codec_set,
             ice_config,
             tcp_peer_registry,
             tcp_advertised_addr,
@@ -980,13 +1144,12 @@ impl WebRtcPeer {
     /// Add a trickle ICE candidate from the remote peer.
     ///
     /// The browser sends `{candidate, sdpMid, sdpMLineIndex}`; we only need
-    /// the `candidate` string (RFC 5245 format) for str0m.
+    /// the `candidate` string (RFC 5245 format) for the RTC core.
     ///
-    /// Browsers obfuscate host candidates as mDNS `.local` hostnames. str0m's
-    /// candidate parser only accepts literal IP addresses, so we resolve the
-    /// hostname via the system resolver (nss-mdns / Avahi on Linux, Bonjour
-    /// on macOS) and rewrite the candidate string before forwarding to the
-    /// driver. Candidates that already contain a literal IP pass through
+    /// Browsers obfuscate host candidates as mDNS `.local` hostnames. Resolve
+    /// the hostname via the system resolver (nss-mdns / Avahi on Linux,
+    /// Bonjour on macOS) and rewrite the candidate string before forwarding to
+    /// the driver. Candidates that already contain a literal IP pass through
     /// unchanged.
     pub async fn add_ice_candidate(&self, candidate_json: &str) -> Result<(), CallerError> {
         let parsed: serde_json::Value = serde_json::from_str(candidate_json)
@@ -1023,7 +1186,7 @@ impl WebRtcPeer {
 /// Per-[`crate::display::encode::PayloadSpec`] negotiation + readiness
 /// state. Keyed off the full `PayloadSpec` in [`DriverState::video_specs`]
 /// so H.264 fmtp variants (profile-level-id + packetization-mode) stay
-/// distinct — str0m negotiates those independently and caching by
+/// distinct — browser negotiation treats those independently and caching by
 /// `CodecKind` alone would conflate them.
 ///
 /// The combined cache structure is deliberate: under the encoder pool a
@@ -1034,45 +1197,44 @@ impl WebRtcPeer {
 /// black-screen class of bug. Making readiness per-spec AND flipping it
 /// only after a successful `writer.write` eliminates that path.
 enum SpecState {
-    /// `Writer::match_params` resolved this spec to a peer-negotiated PT.
-    /// Use `pt` for `writer.write`; `keyframe_seen` flips to `true` only
-    /// after the first **successful** write on this spec (see
-    /// `write_video_frame`), so a keyframe from this spec that matches
-    /// but fails to write doesn't leave the gate open.
-    Resolved {
-        pt: Pt,
-        /// Has this spec had ≥1 keyframe successfully written to the peer?
-        /// Until true, non-keyframe frames drop. Scoped per spec so codec
-        /// A's keyframe gate is independent of codec B's.
-        keyframe_seen: bool,
-    },
-    /// `Writer::match_params` returned `None` for this spec. str0m's
-    /// negotiation is fixed post-answer, so every future frame carrying
-    /// this spec drops without re-asking. A single log line is emitted
-    /// on the transition into this state; subsequent frames are silent.
+    /// Has this spec had >=1 keyframe successfully packetized for the peer?
+    /// Until true, non-keyframe frames drop. Scoped per spec so codec A's
+    /// keyframe gate is independent of codec B's.
+    Ready { keyframe_seen: bool },
+    /// This frame spec does not match the codec negotiated for this peer.
     Unsupported,
 }
 
 /// State the driver carries between iterations.
 struct DriverState {
-    /// Mid of the outbound video media. Set on `Event::MediaAdded`.
-    video_mid: Option<Mid>,
     /// Per-`PayloadSpec` resolved PT + keyframe readiness. See [`SpecState`].
     /// Replaces the earlier split `video_pt_cache` + global `keyframe_seen`
     /// (findings #2 in 3c.0a review).
     video_specs: HashMap<crate::display::encode::PayloadSpec, SpecState>,
-    /// Map of channel label → ChannelId for routing channel data and clipboard sends.
-    channels: HashMap<String, ChannelId>,
+    /// Map of channel label → DataChannelId for routing channel data and clipboard sends.
+    channels: HashMap<String, RTCDataChannelId>,
     /// Wallclock anchor: Instant at which the first frame was emitted.
     /// All subsequent rtp_time values are relative to this.
     first_frame_at: Option<Instant>,
+    rtp: RtpSendState,
+}
+
+struct RtpSendState {
+    sender_id: RTCRtpSenderId,
+    ssrc: u32,
+    mid: String,
+    rid: SimulcastRid,
+    codec: RTCRtpCodec,
+    packetizer: Box<dyn Packetizer>,
+    mid_ext_id: Option<u8>,
+    rid_ext_id: Option<u8>,
 }
 
 /// Inbound packet from one of the per-interface forwarder tasks or a
 /// TCP connection reader. `proto` tags which transport it arrived on so
-/// the driver can hand it to str0m with the correct metadata.
+/// the driver can hand it to the RTC core with the correct metadata.
 struct InboundPacket {
-    proto: Protocol,
+    proto: TransportProtocol,
     source: SocketAddr,
     destination: SocketAddr,
     bytes: Vec<u8>,
@@ -1081,7 +1243,7 @@ struct InboundPacket {
 
 /// The outbound write-half of a TCP connection. The driver stores one per
 /// connection (keyed by the remote's source address) so it can route
-/// `Output::Transmit { proto: Tcp, destination, .. }` to the right socket.
+/// outbound TCP writes to the right socket.
 /// Writes are serialized through an inner `tokio::Mutex` so concurrent
 /// `write_rfc4571_frame` calls can't interleave frame bytes.
 type TcpWriter = Arc<AsyncMutex<tokio::net::tcp::OwnedWriteHalf>>;
@@ -1089,7 +1251,8 @@ type TcpWriter = Arc<AsyncMutex<tokio::net::tcp::OwnedWriteHalf>>;
 #[allow(clippy::too_many_arguments)]
 async fn driver(
     peer_id: PeerId,
-    mut rtc: Rtc,
+    mut rtc: RTCPeerConnection,
+    rtp_config: RtpSendConfig,
     sockets: Vec<Arc<UdpSocket>>,
     mut tcp_conn_rx: Option<mpsc::Receiver<AcceptedTcpConnection>>,
     tcp_advertised: Option<SocketAddr>,
@@ -1100,14 +1263,39 @@ async fn driver(
     clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
     shutdown: CancellationToken,
 ) {
+    let payloader = match rtp_config.codec.payloader() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[display/webrtc] peer {peer_id}: no RTP payloader for codec: {e}");
+            shutdown.cancel();
+            return;
+        }
+    };
+    let packetizer = packetizer::new_packetizer(
+        1200,
+        96,
+        rtp_config.ssrc,
+        payloader,
+        Box::new(sequence::new_random_sequencer()),
+        rtp_config.codec.clock_rate,
+    );
     let mut state = DriverState {
-        video_mid: None,
         video_specs: HashMap::new(),
         channels: HashMap::new(),
         first_frame_at: None,
+        rtp: RtpSendState {
+            sender_id: rtp_config.sender_id,
+            ssrc: rtp_config.ssrc,
+            mid: rtp_config.mid,
+            rid: rtp_config.rid,
+            codec: rtp_config.codec,
+            packetizer: Box::new(packetizer),
+            mid_ext_id: None,
+            rid_ext_id: None,
+        },
     };
 
-    // Index sockets by their local address so we can route Output::Transmit
+    // Index sockets by their local address so we can route outbound writes
     // through the socket whose source matches.
     let mut sockets_by_addr: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
     for sock in &sockets {
@@ -1117,7 +1305,7 @@ async fn driver(
     }
 
     // Outbound write halves for each active ICE-TCP connection, keyed by the
-    // remote's `SocketAddr` (the transmit.destination str0m emits for TCP).
+    // remote's `SocketAddr`.
     let mut tcp_writers: HashMap<SocketAddr, TcpWriter> = HashMap::new();
 
     // Spawn one forwarder task per UDP socket. Each forwarder reads packets
@@ -1146,7 +1334,7 @@ async fn driver(
                     recv = sock.recv_from(&mut buf) => match recv {
                         Ok((n, source)) => {
                             let pkt = InboundPacket {
-                                proto: Protocol::Udp,
+                                proto: TransportProtocol::UDP,
                                 source,
                                 destination: local_addr,
                                 bytes: buf[..n].to_vec(),
@@ -1189,14 +1377,6 @@ async fn driver(
                 }
                 return;
             }
-            Err(DriverExit::Error(e)) => {
-                eprintln!("[display/webrtc] peer {peer_id}: rtc error {e:?}, exiting");
-                shutdown.cancel();
-                for h in forwarder_handles {
-                    let _ = h.await;
-                }
-                return;
-            }
         };
 
         // 2. Wait for the next event: inbound packet, frame, command,
@@ -1209,7 +1389,6 @@ async fn driver(
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
-                rtc.disconnect();
                 eprintln!("[display/webrtc] peer {peer_id}: shutdown requested");
                 for h in forwarder_handles {
                     let _ = h.await;
@@ -1217,22 +1396,19 @@ async fn driver(
                 return;
             }
             Some(pkt) = inbound_rx.recv() => {
-                let contents: DatagramRecv = match pkt.bytes.as_slice().try_into() {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let input = Input::Receive(
-                    pkt.received_at,
-                    Receive {
-                        proto: pkt.proto,
-                        source: pkt.source,
-                        destination: pkt.destination,
-                        contents,
+                let input = TaggedBytesMut {
+                    now: pkt.received_at,
+                    transport: TransportContext {
+                        local_addr: pkt.destination,
+                        peer_addr: pkt.source,
+                        transport_protocol: pkt.proto,
+                        ecn: None,
                     },
-                );
-                if let Err(e) = rtc.handle_input(input) {
+                    message: BytesMut::from(pkt.bytes.as_slice()),
+                };
+                if let Err(e) = rtc.handle_read(input) {
                     eprintln!(
-                        "[display/webrtc] peer {peer_id}: handle_input(Receive) failed: {e:?}"
+                        "[display/webrtc] peer {peer_id}: handle_read failed: {e:?}"
                     );
                     shutdown.cancel();
                     for h in forwarder_handles {
@@ -1253,12 +1429,12 @@ async fn driver(
                 // frames through the unified inbound channel, and inject the
                 // first-frame we already peeked directly.
                 //
-                // We "lie" to str0m about the destination address: every
+                // We "lie" to the RTC core about the destination address: every
                 // inbound TCP frame gets `destination = tcp_advertised`
                 // (the Host-header-derived IP:port we advertised as our
                 // TCP candidate), not the actual `stream.local_addr()` —
                 // which on a NAT'd VM is the VM's internal interface IP
-                // that str0m has no candidate for. Matching the
+                    // that the RTC core has no candidate for. Matching the
                 // advertised destination to the one local candidate lets
                 // ICE form a valid pair. The underlying TCP stream is
                 // bidirectional so data still flows through the real
@@ -1276,7 +1452,7 @@ async fn driver(
                     continue;
                 };
                 eprintln!(
-                    "[display/webrtc] peer {peer_id}: ICE-TCP connection from {remote_addr} → {real_local} (str0m sees {fake_local})"
+                    "[display/webrtc] peer {peer_id}: ICE-TCP connection from {remote_addr} → {real_local} (rtc sees {fake_local})"
                 );
                 let (read_half, write_half) = stream.into_split();
                 let writer: TcpWriter = Arc::new(AsyncMutex::new(write_half));
@@ -1293,7 +1469,7 @@ async fn driver(
                             frame = read_rfc4571_frame(&mut read_half) => match frame {
                                 Ok(bytes) => {
                                     let pkt = InboundPacket {
-                                        proto: Protocol::Tcp,
+                                        proto: TransportProtocol::TCP,
                                         source: remote_addr,
                                         destination: fake_local,
                                         bytes,
@@ -1314,29 +1490,21 @@ async fn driver(
                     }
                 });
 
-                // Inject the first frame we peeked off the wire so str0m
+                // Inject the first frame we peeked off the wire so the RTC core
                 // processes the STUN binding request we used to route.
-                let contents: DatagramRecv = match first_frame.as_slice().try_into() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!(
-                            "[display/webrtc] first ICE-TCP frame from {remote_addr} not a valid datagram: {e:?}"
-                        );
-                        continue;
-                    }
-                };
-                let input = Input::Receive(
-                    Instant::now(),
-                    Receive {
-                        proto: Protocol::Tcp,
-                        source: remote_addr,
-                        destination: fake_local,
-                        contents,
+                let input = TaggedBytesMut {
+                    now: Instant::now(),
+                    transport: TransportContext {
+                        local_addr: fake_local,
+                        peer_addr: remote_addr,
+                        transport_protocol: TransportProtocol::TCP,
+                        ecn: None,
                     },
-                );
-                if let Err(e) = rtc.handle_input(input) {
+                    message: BytesMut::from(first_frame.as_slice()),
+                };
+                if let Err(e) = rtc.handle_read(input) {
                     eprintln!(
-                        "[display/webrtc] peer {peer_id}: handle_input(first TCP frame) failed: {e:?}"
+                        "[display/webrtc] peer {peer_id}: handle_read(first TCP frame) failed: {e:?}"
                     );
                     shutdown.cancel();
                     for h in forwarder_handles {
@@ -1346,9 +1514,9 @@ async fn driver(
                 }
             }
             _ = tokio::time::sleep(timeout_dur) => {
-                if let Err(e) = rtc.handle_input(Input::Timeout(Instant::now())) {
+                if let Err(e) = rtc.handle_timeout(Instant::now()) {
                     eprintln!(
-                        "[display/webrtc] peer {peer_id}: handle_input(Timeout) failed: {e:?}"
+                        "[display/webrtc] peer {peer_id}: handle_timeout failed: {e:?}"
                     );
                     shutdown.cancel();
                     for h in forwarder_handles {
@@ -1359,9 +1527,9 @@ async fn driver(
             }
             Some(frame) = frame_rx.recv() => {
                 write_video_frame(&mut rtc, &mut state, &frame);
-                if let Err(e) = rtc.handle_input(Input::Timeout(Instant::now())) {
+                if let Err(e) = rtc.handle_timeout(Instant::now()) {
                     eprintln!(
-                        "[display/webrtc] peer {peer_id}: handle_input(Timeout after frame) failed: {e:?}"
+                        "[display/webrtc] peer {peer_id}: handle_timeout after frame failed: {e:?}"
                     );
                     shutdown.cancel();
                     for h in forwarder_handles {
@@ -1372,9 +1540,9 @@ async fn driver(
             }
             Some(cmd) = command_rx.recv() => {
                 handle_command(&mut rtc, &state, cmd);
-                if let Err(e) = rtc.handle_input(Input::Timeout(Instant::now())) {
+                if let Err(e) = rtc.handle_timeout(Instant::now()) {
                     eprintln!(
-                        "[display/webrtc] peer {peer_id}: handle_input(Timeout after command) failed: {e:?}"
+                        "[display/webrtc] peer {peer_id}: handle_timeout after command failed: {e:?}"
                     );
                     shutdown.cancel();
                     for h in forwarder_handles {
@@ -1389,205 +1557,166 @@ async fn driver(
 
 enum DriverExit {
     Closed,
-    Error(RtcError),
 }
 
-/// Drain `rtc.poll_output()` until it yields `Output::Timeout`, sending any
-/// `Transmit` outputs over the socket whose local address matches the
-/// transmit's `source`, and dispatching `Event` outputs through the handlers
-/// and into the driver state.
+/// Drain pending writes, reads, and events from the sans-I/O peer connection.
 async fn drain_outputs(
-    rtc: &mut Rtc,
+    rtc: &mut RTCPeerConnection,
     sockets_by_addr: &HashMap<SocketAddr, Arc<UdpSocket>>,
     tcp_writers: &mut HashMap<SocketAddr, TcpWriter>,
     state: &mut DriverState,
     input_handler: &Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: &Arc<dyn Fn(ClipboardContent) + Send + Sync>,
 ) -> Result<Instant, DriverExit> {
-    loop {
-        if !rtc.is_alive() {
-            return Err(DriverExit::Closed);
+    while let Some(t) = rtc.poll_write() {
+        // Routability filtering only applies to UDP: for UDP we need the
+        // kernel's `sendto` to succeed from our bound socket, and a
+        // loopback-source-to-routable-destination pair would be rejected with
+        // EINVAL. For TCP the connection is already established and we own the
+        // stream directly.
+        if t.transport.transport_protocol == TransportProtocol::UDP {
+            if t.transport.local_addr.is_ipv4() != t.transport.peer_addr.is_ipv4() {
+                continue;
+            }
+            if t.transport.local_addr.ip().is_loopback() != t.transport.peer_addr.ip().is_loopback()
+            {
+                continue;
+            }
         }
-        match rtc.poll_output() {
-            Ok(Output::Timeout(t)) => return Ok(t),
-            Ok(Output::Transmit(t)) => {
-                // Routability filtering only applies to UDP: for UDP we
-                // need the kernel's `sendto` to succeed from our bound
-                // socket, and a loopback-source→routable-destination (or
-                // family mismatch) pair would be rejected with EINVAL
-                // and waste syscalls. For TCP the connection is already
-                // established and we own the stream directly, so we can
-                // write regardless of what the abstract source/destination
-                // addresses would imply at a pure routing layer.
-                if matches!(t.proto, Protocol::Udp) {
-                    if t.source.is_ipv4() != t.destination.is_ipv4() {
-                        continue;
-                    }
-                    if t.source.ip().is_loopback() != t.destination.ip().is_loopback() {
-                        continue;
-                    }
-                }
-                match t.proto {
-                    Protocol::Udp => {
-                        let Some(sock) = sockets_by_addr.get(&t.source) else {
-                            eprintln!(
-                                "[display/webrtc] UDP transmit from unknown source {}, dropping",
-                                t.source
-                            );
-                            continue;
-                        };
-                        if let Err(e) = sock.send_to(&t.contents, t.destination).await {
-                            eprintln!(
-                                "[display/webrtc] udp send {} → {} failed: {e}",
-                                t.source, t.destination
-                            );
-                        }
-                    }
-                    Protocol::Tcp => {
-                        // Look up the established TCP connection by remote
-                        // address (str0m's Transmit.destination for TCP is
-                        // the peer we received the connection from). If the
-                        // writer is gone — connection was closed — drop
-                        // the packet silently; str0m will time out the
-                        // candidate pair and try another.
-                        let Some(writer) = tcp_writers.get(&t.destination).cloned() else {
-                            continue;
-                        };
-                        let contents: Vec<u8> = (*t.contents).to_vec();
-                        tokio::spawn(async move {
-                            let mut guard = writer.lock().await;
-                            if let Err(e) = write_rfc4571_frame(&mut *guard, &contents).await {
-                                eprintln!(
-                                    "[display/webrtc] tcp write failed: {e}"
-                                );
-                            }
-                        });
-                    }
-                    _ => {
-                        // SslTcp / Tls — we don't advertise these, so str0m
-                        // shouldn't ever ask us to send via them.
-                        eprintln!(
-                            "[display/webrtc] unexpected transmit proto {:?}, dropping",
-                            t.proto
-                        );
-                    }
+        match t.transport.transport_protocol {
+            TransportProtocol::UDP => {
+                let Some(sock) = sockets_by_addr.get(&t.transport.local_addr) else {
+                    eprintln!(
+                        "[display/webrtc] UDP transmit from unknown source {}, dropping",
+                        t.transport.local_addr
+                    );
+                    continue;
+                };
+                if let Err(e) = sock.send_to(&t.message, t.transport.peer_addr).await {
+                    eprintln!(
+                        "[display/webrtc] udp send {} -> {} failed: {e}",
+                        t.transport.local_addr, t.transport.peer_addr
+                    );
                 }
             }
-            Ok(Output::Event(event)) => {
-                handle_event(rtc, state, event, input_handler, clipboard_handler);
+            TransportProtocol::TCP => {
+                let Some(writer) = tcp_writers.get(&t.transport.peer_addr).cloned() else {
+                    continue;
+                };
+                let contents: Vec<u8> = t.message.to_vec();
+                tokio::spawn(async move {
+                    let mut guard = writer.lock().await;
+                    if let Err(e) = write_rfc4571_frame(&mut *guard, &contents).await {
+                        eprintln!("[display/webrtc] tcp write failed: {e}");
+                    }
+                });
             }
-            Err(e) => return Err(DriverExit::Error(e)),
         }
     }
+
+    while let Some(message) = rtc.poll_read() {
+        handle_message(message, state, input_handler, clipboard_handler);
+    }
+
+    while let Some(event) = rtc.poll_event() {
+        if handle_event(rtc, state, event) {
+            return Err(DriverExit::Closed);
+        }
+    }
+
+    Ok(rtc
+        .poll_timeout()
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400)))
 }
 
 fn handle_event(
-    rtc: &mut Rtc,
+    rtc: &mut RTCPeerConnection,
     state: &mut DriverState,
-    event: Event,
-    input_handler: &Arc<dyn Fn(InputEvent) + Send + Sync>,
-    clipboard_handler: &Arc<dyn Fn(ClipboardContent) + Send + Sync>,
-) {
+    event: RTCPeerConnectionEvent,
+) -> bool {
     match event {
-        Event::IceConnectionStateChange(s) => {
+        RTCPeerConnectionEvent::OnIceConnectionStateChangeEvent(s) => {
             eprintln!("[display/webrtc] ICE: {s:?}");
-            // Disconnected is recoverable per RFC 8445 — ICE may resume
-            // checking candidates and find a new working pair. Stay in the
-            // driver loop and let str0m retry. The browser-side WebRTC
-            // implementation will close the peer connection cleanly if it
-            // gives up first; we'll see that as Closed and exit naturally.
         }
-        Event::MediaAdded(MediaAdded { mid, kind, .. }) => {
-            if kind == MediaKind::Video {
-                state.video_mid = Some(mid);
-                // No longer pre-resolves a PT at MediaAdded time: PT
-                // resolution has moved to the per-frame path via the
-                // `video_pt_cache` + `writer.match_params(...)`. A
-                // peer may receive frames from multiple codecs
-                // (VP8 always-on + H.264 on-demand + …) and each
-                // `PayloadSpec` gets its own cached PT on first hit.
-                eprintln!("[display/webrtc] video media added: mid={mid:?}");
+        RTCPeerConnectionEvent::OnConnectionStateChangeEvent(s) => {
+            eprintln!("[display/webrtc] connection: {s:?}");
+            if matches!(
+                s,
+                rtc::peer_connection::state::RTCPeerConnectionState::Failed
+                    | rtc::peer_connection::state::RTCPeerConnectionState::Closed
+            ) {
+                return true;
             }
         }
-        Event::ChannelOpen(cid, label) => {
+        RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(cid)) => {
+            let label = rtc
+                .data_channel(cid)
+                .map(|channel| channel.label().to_string())
+                .unwrap_or_else(|| format!("channel-{cid}"));
             eprintln!("[display/webrtc] data channel open: {label}");
             state.channels.insert(label, cid);
         }
-        Event::ChannelClose(cid) => {
+        RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(cid)) => {
             state.channels.retain(|_, v| *v != cid);
         }
-        Event::ChannelData(data) => {
-            let label = state
-                .channels
-                .iter()
-                .find_map(|(k, v)| (*v == data.id).then(|| k.clone()));
-            match label.as_deref() {
-                Some("control") | Some("pointer") => {
-                    if let Ok(text) = std::str::from_utf8(&data.data) {
-                        if let Ok(evt) = serde_json::from_str::<InputEvent>(text) {
-                            input_handler(evt);
-                        }
-                    }
+        _ => {}
+    }
+    false
+}
+
+fn handle_message(
+    message: RTCMessage,
+    state: &mut DriverState,
+    input_handler: &Arc<dyn Fn(InputEvent) + Send + Sync>,
+    clipboard_handler: &Arc<dyn Fn(ClipboardContent) + Send + Sync>,
+) {
+    let RTCMessage::DataChannelMessage(cid, RTCDataChannelMessage { data, .. }) = message else {
+        return;
+    };
+    let label = state
+        .channels
+        .iter()
+        .find_map(|(k, v)| (*v == cid).then(|| k.clone()));
+    match label.as_deref() {
+        Some("control") | Some("pointer") => {
+            if let Ok(text) = std::str::from_utf8(&data) {
+                if let Ok(evt) = serde_json::from_str::<InputEvent>(text) {
+                    input_handler(evt);
                 }
-                Some("clipboard") => {
-                    if let Ok(text) = std::str::from_utf8(&data.data) {
-                        if let Some(content) = parse_clipboard_set(text) {
-                            clipboard_handler(content);
-                        }
-                    }
-                }
-                _ => {}
             }
         }
-        Event::KeyframeRequest(_) => {
-            // Browsers periodically request keyframes via PLI/FIR. Without a
-            // back-channel to the encoder we can't force one on demand, but
-            // the encoder produces keyframes periodically anyway. Future work
-            // could plumb this back to the encoder thread.
+        Some("clipboard") => {
+            if let Ok(text) = std::str::from_utf8(&data) {
+                if let Some(content) = parse_clipboard_set(text) {
+                    clipboard_handler(content);
+                }
+            }
         }
         _ => {}
     }
 }
 
-fn write_video_frame(rtc: &mut Rtc, state: &mut DriverState, frame: &EncodedFrame) {
-    let Some(mid) = state.video_mid else {
-        return;
-    };
-    let Some(writer) = rtc.writer(mid) else {
-        return;
-    };
-
-    // Step 1: resolve the spec's PT via match_params if we haven't yet.
-    // Inserts a `SpecState::Resolved { pt, keyframe_seen: false }` on
-    // success or `SpecState::Unsupported` on None, so the lookup below
-    // always finds an entry. A spec ending in `Unsupported` stays that
-    // way — str0m's negotiation is fixed post-answer, so re-matching
-    // won't start working.
+fn write_video_frame(rtc: &mut RTCPeerConnection, state: &mut DriverState, frame: &EncodedFrame) {
     if !state.video_specs.contains_key(&frame.payload_spec) {
-        let resolved = writer.match_params(payload_spec_to_str0m(&frame.payload_spec));
-        let new = match resolved {
-            Some(pt) => SpecState::Resolved {
-                pt,
+        let new = if payload_spec_matches_codec(&frame.payload_spec, &state.rtp.codec) {
+            SpecState::Ready {
                 keyframe_seen: false,
-            },
-            None => {
-                eprintln!(
-                    "[display/webrtc] no match_params for {} — peer did not \
-                     negotiate this codec profile, frames on this spec will \
-                     be dropped",
-                    frame.payload_spec.codec_mime
-                );
-                SpecState::Unsupported
             }
+        } else {
+            eprintln!(
+                "[display/webrtc] encoded frame spec {} does not match negotiated codec {}; dropping this spec",
+                frame.payload_spec.codec_mime, state.rtp.codec.mime_type,
+            );
+            SpecState::Unsupported
         };
         state.video_specs.insert(frame.payload_spec.clone(), new);
     }
 
-    // Step 2: extract pt + current keyframe readiness from the spec state.
+    // Step 2: extract current keyframe readiness from the spec state.
     // Copy out immutably so we can mutate `state.first_frame_at` below
     // without borrow conflicts with `state.video_specs`.
-    let (pt, keyframe_ready) = match state.video_specs.get(&frame.payload_spec) {
-        Some(SpecState::Resolved { pt, keyframe_seen }) => (*pt, *keyframe_seen),
+    let keyframe_ready = match state.video_specs.get(&frame.payload_spec) {
+        Some(SpecState::Ready { keyframe_seen }) => *keyframe_seen,
         // Unsupported or (impossibly) missing — drop silently. The
         // first arm already emitted a log on entering Unsupported.
         _ => return,
@@ -1595,100 +1724,135 @@ fn write_video_frame(rtc: &mut Rtc, state: &mut DriverState, frame: &EncodedFram
 
     // Step 3: per-spec keyframe gate. Closed until this spec has had
     // ≥1 keyframe *successfully written* (see step 5 — the flag flips
-    // only after `writer.write` returns Ok). A keyframe from codec A
-    // that match_params resolved but that then fails to write does not
+    // only after `write_rtp` returns Ok). A keyframe from codec A
+    // that matched the active sender but then fails to write does not
     // open the gate for codec A's P-frames, and no keyframe of codec A
     // ever opens codec B's gate.
     if !keyframe_ready && !frame.is_keyframe {
         return;
     }
 
-    // Step 4: wallclock anchor + media time.
+    // Step 4: wallclock anchor + RTP timestamp samples.
     let now = Instant::now();
     if state.first_frame_at.is_none() {
         state.first_frame_at = Some(now);
     }
-    let anchor = state.first_frame_at.unwrap();
-    let elapsed_ms = now.duration_since(anchor).as_millis() as u64;
-    let media_time = MediaTime::from_90khz(elapsed_ms.saturating_mul(90));
+    let samples = (frame.duration_ms.max(1) as u32).saturating_mul(90);
 
     // Step 5: write + on-success gate flip.
-    match writer.write(pt, now, media_time, frame.data.clone()) {
-        Ok(()) => {
+    let payload = Bytes::from(frame.data.clone());
+    let packets = match state.rtp.packetizer.packetize(&payload, samples) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[display/webrtc] RTP packetize failed: {e}");
+            return;
+        }
+    };
+
+    let (mid_ext_id, rid_ext_id) = rtp_header_extension_ids(rtc, state);
+    for mut packet in packets {
+        packet.header.ssrc = state.rtp.ssrc;
+        if let Some(id) = mid_ext_id {
+            let _ = packet
+                .header
+                .set_extension(id, Bytes::from(state.rtp.mid.as_bytes().to_vec()));
+        }
+        if let Some(id) = rid_ext_id {
+            let _ = packet
+                .header
+                .set_extension(id, Bytes::from(state.rtp.rid.as_str().as_bytes().to_vec()));
+        }
+
+        let Some(mut sender) = rtc.rtp_sender(state.rtp.sender_id) else {
+            return;
+        };
+        match sender.write_rtp(packet) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[display/webrtc] write_rtp failed: {e:?}");
+                return;
+            }
+        }
+    }
+
+    if !keyframe_ready {
+        if let Some(SpecState::Ready { keyframe_seen }) =
+            state.video_specs.get_mut(&frame.payload_spec)
+        {
             // Only flip keyframe_seen for this spec AFTER a successful
-            // write (findings #2 in 3c.0a review). If the write is the
+            // packet write. If the write is the
             // first keyframe on this spec, the gate opens for subsequent
             // P-frames. If it wasn't a keyframe (gate was already open),
             // this is a no-op.
-            if !keyframe_ready {
-                if let Some(SpecState::Resolved { keyframe_seen, .. }) =
-                    state.video_specs.get_mut(&frame.payload_spec)
-                {
-                    *keyframe_seen = true;
-                }
+            *keyframe_seen = true;
+        }
+    }
+}
+
+fn payload_spec_matches_codec(
+    spec: &crate::display::encode::PayloadSpec,
+    codec: &RTCRtpCodec,
+) -> bool {
+    if spec
+        .codec_mime
+        .eq_ignore_ascii_case(crate::display::encode::MIME_TYPE_VP8)
+    {
+        return codec.mime_type.eq_ignore_ascii_case(RTC_MIME_TYPE_VP8);
+    }
+    if spec
+        .codec_mime
+        .eq_ignore_ascii_case(crate::display::encode::MIME_TYPE_H264)
+    {
+        return codec.mime_type.eq_ignore_ascii_case(RTC_MIME_TYPE_H264)
+            && spec.h264_packetization_mode == Some(1)
+            && spec.h264_profile_level_id.as_deref() == Some("42e01f");
+    }
+    false
+}
+
+fn rtp_header_extension_ids(
+    rtc: &mut RTCPeerConnection,
+    state: &mut DriverState,
+) -> (Option<u8>, Option<u8>) {
+    if state.rtp.mid_ext_id.is_some() || state.rtp.rid_ext_id.is_some() {
+        return (state.rtp.mid_ext_id, state.rtp.rid_ext_id);
+    }
+    if let Some(mut sender) = rtc.rtp_sender(state.rtp.sender_id) {
+        let params = sender.get_parameters();
+        for ext in &params.rtp_parameters.header_extensions {
+            if ext.uri == "urn:ietf:params:rtp-hdrext:sdes:mid" {
+                state.rtp.mid_ext_id = Some(ext.id as u8);
+            } else if ext.uri == "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id" {
+                state.rtp.rid_ext_id = Some(ext.id as u8);
             }
         }
-        Err(e) => eprintln!("[display/webrtc] writer.write failed: {e:?}"),
     }
+    (state.rtp.mid_ext_id, state.rtp.rid_ext_id)
 }
 
-/// Construct a str0m [`PayloadParams`] from our abstract
-/// [`crate::display::encode::PayloadSpec`] suitable for
-/// `Writer::match_params`. The incoming `pt` field is a placeholder
-/// (match_params uses the spec for comparison, not the incoming PT),
-/// so we hand it any valid video PT — 96 is the convention for VP8.
-fn payload_spec_to_str0m(spec: &crate::display::encode::PayloadSpec) -> PayloadParams {
-    use str0m::format::Codec as StrCodec;
-    let codec = match spec.codec_mime {
-        crate::display::encode::MIME_TYPE_VP8 => StrCodec::Vp8,
-        crate::display::encode::MIME_TYPE_H264 => StrCodec::H264,
-        "video/VP9" => StrCodec::Vp9,
-        "video/AV1" => StrCodec::Av1,
-        _ => StrCodec::Unknown,
-    };
-    let mut format = FormatParams::default();
-    // H.264 fmtp fields — populated only when both sides carry the
-    // relevant values. `profile_level_id` on the str0m side is a u32
-    // (6 hex digits packed into the low 24 bits); ours is a string
-    // ("42e01f" etc) for readability. Parse on the fly.
-    if let Some(plid_str) = spec.h264_profile_level_id.as_deref() {
-        if let Ok(plid_u32) = u32::from_str_radix(plid_str, 16) {
-            format.profile_level_id = Some(plid_u32);
-        }
-    }
-    if let Some(pm) = spec.h264_packetization_mode {
-        format.packetization_mode = Some(pm as u8);
-    }
-    let clock_rate = Frequency::NINETY_KHZ;
-    let codec_spec = CodecSpec {
-        codec,
-        clock_rate,
-        channels: None,
-        format,
-    };
-    // The `pt` we pass here is a placeholder: `Writer::match_params`
-    // scores incoming `PayloadParams` against the peer's negotiated
-    // set by codec/format/etc., not by PT. Pick 96 (conventional
-    // first dynamic PT) so the return value is a valid PayloadParams
-    // even though the PT itself is unused downstream.
-    PayloadParams::new(Pt::new_with_value(96), None, codec_spec)
-}
-
-fn handle_command(rtc: &mut Rtc, state: &DriverState, cmd: Command) {
+fn handle_command(rtc: &mut RTCPeerConnection, state: &DriverState, cmd: Command) {
     match cmd {
-        Command::AddIceCandidate(s) => match Candidate::from_sdp_string(&s) {
-            Ok(c) => rtc.add_remote_candidate(c),
-            Err(e) => eprintln!("[display/webrtc] parse remote candidate failed: {e}"),
-        },
+        Command::AddIceCandidate(s) => {
+            let init = RTCIceCandidateInit {
+                candidate: s,
+                sdp_mid: None,
+                sdp_mline_index: None,
+                username_fragment: None,
+                url: None,
+            };
+            if let Err(e) = rtc.add_remote_candidate(init) {
+                eprintln!("[display/webrtc] parse remote candidate failed: {e}");
+            }
+        }
         Command::SendClipboard(content) => {
             let Some(cid) = state.channels.get("clipboard").copied() else {
                 return;
             };
-            let Some(mut channel) = rtc.channel(cid) else {
+            let Some(mut channel) = rtc.data_channel(cid) else {
                 return;
             };
             let json = serialize_clipboard(&content);
-            if let Err(e) = channel.write(false, json.as_bytes()) {
+            if let Err(e) = channel.send_text(json) {
                 eprintln!("[display/webrtc] clipboard channel write failed: {e:?}");
             }
         }
@@ -1698,12 +1862,6 @@ fn handle_command(rtc: &mut Rtc, state: &DriverState, cmd: Command) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-// `first_enabled_video_codec` was removed as part of the 3c.0 contract
-// — codec selection happens per-frame via the `video_pt_cache` +
-// `writer.match_params(...)` path, not pre-locked at driver init.
-// The peer's Rtc can have multiple video codecs enabled (VP8 + H.264
-// + …) and each frame resolves to its own PT.
 
 /// Parse a `clipboard_set` message from a browser data channel, supporting
 /// both text and image (base64-encoded) payloads.
@@ -1778,7 +1936,9 @@ async fn resolve_mdns_in_candidate(candidate: &str) -> Result<String, String> {
     let mut iter = tokio::net::lookup_host(format!("{addr_field}:0"))
         .await
         .map_err(|e| format!("lookup {addr_field}: {e}"))?;
-    let resolved = iter.next().ok_or_else(|| format!("no addrs for {addr_field}"))?;
+    let resolved = iter
+        .next()
+        .ok_or_else(|| format!("no addrs for {addr_field}"))?;
     let ip_str = resolved.ip().to_string();
     fields[4] = &ip_str;
     Ok(fields.join(" "))
@@ -1789,16 +1949,13 @@ async fn resolve_mdns_in_candidate(candidate: &str) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 /// Distinct codecs covered by `subscriptions`, deduplicated. Used by
-/// [`WebRtcPeer::new`] to drive the str0m enable_*() calls
-/// from the actually-served set rather than from the original peer
-/// offer prefs — the SDP we negotiate is exactly what the pool
-/// commits to producing, so there's no path where the peer picks an
-/// unsupported codec and gets a black stream.
+/// tests to pin the actually-served codec set rather than the original
+/// peer offer prefs.
 ///
 /// Order is preserved as encountered (CodecKind isn't `Ord`, and
-/// str0m's `enable_*()` calls are commutative — order has no
-/// observable effect on the negotiated answer). Dedup avoids
-/// calling `enable_vp8(true)` twice on a multi-layer simulcast set.
+/// dedup avoids counting the same codec twice in a multi-layer
+/// simulcast set.
+#[cfg(test)]
 fn codec_set_from_subscriptions(subscriptions: &[EncoderSubscription]) -> Vec<CodecKind> {
     let mut seen: std::collections::HashSet<CodecKind> = std::collections::HashSet::new();
     let mut codecs: Vec<CodecKind> = Vec::new();
@@ -1808,6 +1965,18 @@ fn codec_set_from_subscriptions(subscriptions: &[EncoderSubscription]) -> Vec<Co
         }
     }
     codecs
+}
+
+fn active_codec_from_subscriptions(
+    subscriptions: &[EncoderSubscription],
+    prefs: &PeerCodecPreferences,
+) -> Option<CodecKind> {
+    for &codec in &prefs.supported {
+        if subscriptions.iter().any(|s| s.id.codec == codec) {
+            return Some(codec);
+        }
+    }
+    None
 }
 
 /// Build the **negotiated** codec preferences the intake uses for
@@ -1820,17 +1989,14 @@ fn codec_set_from_subscriptions(subscriptions: &[EncoderSubscription]) -> Vec<Co
 /// preference signal, and re-ordering would silently change the
 /// peer's chosen codec.
 ///
-/// **Why this matters (3c.3b.2b finding 1):** the peer's SDP answer
-/// is built from `actual_codecs` (via `codec_set_from_subscriptions`),
-/// not from `original_prefs`. If `original_prefs = [VP8, H.264]` but
-/// initial subscribe returned only `[VP8]` (because H.264 encoder
-/// construction failed at that moment — VAAPI exhaustion, ffmpeg
-/// missing, etc.), the answer enables only VP8. Resubscribing with
-/// `original_prefs` after a later resize could pick H.264 if it
-/// became available — and the peer's WebRTC sender would then
-/// `match_params` against a PT cache that has no H.264 entry, mark
-/// the spec `Unsupported` per the 3c.0a per-spec gate, and silently
-/// drop every frame. Locking the resubscribe prefs to
+/// **Why this matters (3c.3b.2b finding 1):** the peer's SDP answer is built
+/// from the codec we can actually serve, not from `original_prefs`. If
+/// `original_prefs = [VP8, H.264]` but initial subscribe returned only `[VP8]`
+/// (because H.264 encoder construction failed at that moment — VAAPI
+/// exhaustion, ffmpeg missing, etc.), the answer enables only VP8.
+/// Resubscribing with `original_prefs` after a later resize could pick H.264 if
+/// it became available, and the driver would reject every frame because the
+/// sender was never negotiated for H.264. Locking the resubscribe prefs to
 /// `actual_codecs` makes that reachability bug impossible.
 ///
 /// Returns an empty `PeerCodecPreferences` only if the intersection
@@ -1969,22 +2135,19 @@ fn select_active_subscription(
 /// ## `negotiated_prefs` — the 3c.3b.2b finding-1 contract
 ///
 /// `negotiated_prefs` is the **caller-filtered** subset of the peer's
-/// original SDP-offer prefs that intersects the codecs the pool's
-/// initial subscribe actually returned. This is the codec set the
-/// peer's SDP answer enabled (`new` derives both the answer's
-/// `enable_*()` calls AND `negotiated_prefs` from the same
-/// `codec_set_from_subscriptions(initial_subs)` source).
+/// original SDP-offer prefs that contains the active codec the pool's
+/// initial subscribe can actually serve. This is the codec the peer's SDP
+/// answer enabled (`new` derives both the answer and `negotiated_prefs` from
+/// the same active subscription source).
 ///
 /// The intake passes `negotiated_prefs` to every `pool.subscribe` —
 /// resubscribe-after-Closed included. If we passed the original
 /// unfiltered prefs, the resubscribe could return a codec the peer
 /// never negotiated (e.g. H.264 construction failed initially but
 /// succeeds after a later resize that respawns the on-demand slot).
-/// `select_active_subscription` would then pick that codec, the
-/// driver would call `match_params` against the negotiated PT cache,
-/// the codec wouldn't match, the per-spec gate would mark it
-/// `Unsupported`, and every frame would silently drop → black stream.
-/// Locking the prefs to the negotiated set at construction time and
+/// `select_active_subscription` would then pick that codec, the driver would
+/// reject it as `Unsupported`, and every frame would silently drop -> black
+/// stream. Locking the prefs to the negotiated set at construction time and
 /// using that on every resubscribe is the structural fix.
 ///
 /// ## Lossy forwarding — the 3c.3b.2a contract (continued)
@@ -2074,8 +2237,7 @@ async fn pool_frame_intake(
         // ids is a silent no-op via `release_on_demand_subset`'s
         // skip-unknown-ids contract. So we don't have to distinguish
         // always-on from on-demand here — just pass everything.
-        let inactive_ids: Vec<EncoderId> =
-            current_subs.iter().map(|s| s.id.clone()).collect();
+        let inactive_ids: Vec<EncoderId> = current_subs.iter().map(|s| s.id.clone()).collect();
         // Make the drop point obvious. Future maintainers reading the
         // function should not have to wonder when the unused subs go
         // away — it's right here, between selection and forwarder
@@ -2196,10 +2358,10 @@ async fn pool_frame_intake(
                         // initial subscribe excluded H.264 because
                         // construction failed, but a later resize +
                         // resubscribe finds H.264 working). The
-                        // intake would then `match_params` against a
-                        // codec the peer never negotiated and the
-                        // driver's per-spec gate marks `Unsupported`,
-                        // dropping every frame → silent black stream.
+                        // intake would then select a codec the peer
+                        // never negotiated and the driver's per-spec
+                        // gate marks `Unsupported`, dropping every
+                        // frame -> silent black stream.
                         // This is the high-priority finding from the
                         // 3c.3b.2a review. The narrowed prefs locks
                         // resubscribe to exactly the codecs the
@@ -2273,7 +2435,7 @@ mod tests {
         buf.extend_from_slice(&(msg_len as u16).to_be_bytes()); // length
         buf.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]); // magic
         buf.extend_from_slice(&[0u8; 12]); // transaction ID
-        // USERNAME attribute
+                                           // USERNAME attribute
         buf.extend_from_slice(&0x0006u16.to_be_bytes()); // attr type
         buf.extend_from_slice(&(attr_len as u16).to_be_bytes());
         buf.extend_from_slice(username_bytes);
@@ -2345,7 +2507,10 @@ mod tests {
     /// `None`. The translator treats that as "can't relay this Answer."
     #[test]
     fn parse_sdp_ice_ufrag_returns_none_on_malformed() {
-        assert_eq!(parse_sdp_ice_ufrag("v=0\r\no=- 1 2 IN IP4 0.0.0.0\r\n"), None);
+        assert_eq!(
+            parse_sdp_ice_ufrag("v=0\r\no=- 1 2 IN IP4 0.0.0.0\r\n"),
+            None
+        );
         assert_eq!(parse_sdp_ice_ufrag("a=ice-ufrag:\r\n"), None);
         assert_eq!(parse_sdp_ice_ufrag(""), None);
     }
@@ -2356,10 +2521,7 @@ mod tests {
     #[test]
     fn parse_first_frame_ufrag_picks_target_half() {
         let frame = make_stun_binding_request("peerXYZ:browserABC");
-        assert_eq!(
-            parse_first_frame_ufrag(&frame).as_deref(),
-            Some("peerXYZ")
-        );
+        assert_eq!(parse_first_frame_ufrag(&frame).as_deref(), Some("peerXYZ"));
     }
 
     /// Non-STUN input or USERNAME missing the `:` separator returns
@@ -2483,10 +2645,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// `codec_set_from_subscriptions` dedups codecs across multi-layer
-    /// (simulcast-style) subscription sets. The downstream str0m
-    /// `enable_*(true)` calls would tolerate duplicates, but dedup
-    /// keeps the SDP shape clean and avoids subtle effects in
-    /// future negotiation logic.
+    /// (simulcast-style) subscription sets.
     #[test]
     fn codec_set_from_subscriptions_dedups_multi_layer() {
         use crate::display::encode::pool::{EncoderId, LayerSpec, SimulcastRid};
@@ -2509,6 +2668,52 @@ mod tests {
         assert!(codecs.contains(&CodecKind::H264));
     }
 
+    #[test]
+    fn active_codec_from_subscriptions_respects_peer_pref_order() {
+        use crate::display::encode::pool::{EncoderId, LayerSpec, SimulcastRid};
+        let (s, _r) = broadcast::channel::<Arc<EncodedFrame>>(4);
+        let make = |codec: CodecKind| EncoderSubscription {
+            id: EncoderId::new(codec, SimulcastRid::full()),
+            layer: LayerSpec::single(codec, 64, 64, 30),
+            frames: s.subscribe(),
+        };
+        let subs = vec![make(CodecKind::Vp8), make(CodecKind::H264)];
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::H264, CodecKind::Vp8]);
+        assert_eq!(
+            active_codec_from_subscriptions(&subs, &prefs),
+            Some(CodecKind::H264)
+        );
+    }
+
+    #[test]
+    fn active_codec_from_subscriptions_returns_none_on_no_pref_overlap() {
+        use crate::display::encode::pool::{EncoderId, LayerSpec, SimulcastRid};
+        let (s, _r) = broadcast::channel::<Arc<EncodedFrame>>(4);
+        let subs = vec![EncoderSubscription {
+            id: EncoderId::new(CodecKind::Vp8, SimulcastRid::full()),
+            layer: LayerSpec::single(CodecKind::Vp8, 64, 64, 30),
+            frames: s.subscribe(),
+        }];
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::H264]);
+        assert_eq!(active_codec_from_subscriptions(&subs, &prefs), None);
+    }
+
+    #[test]
+    fn first_video_mid_from_offer_ignores_non_video_m_lines() {
+        let offer = "v=0\r\n\
+                     m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+                     a=mid:data\r\n\
+                     m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+                     a=mid:screen\r\n";
+        assert_eq!(first_video_mid_from_offer(offer).as_deref(), Some("screen"));
+    }
+
+    #[test]
+    fn first_video_mid_from_offer_returns_none_when_absent() {
+        let offer = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:audio\r\n";
+        assert_eq!(first_video_mid_from_offer(offer), None);
+    }
+
     // -----------------------------------------------------------------------
     // Phase 3c.3b.2b: filter_prefs_to_negotiated unit tests
     // -----------------------------------------------------------------------
@@ -2521,11 +2726,8 @@ mod tests {
     /// peer actually receives.
     #[test]
     fn filter_prefs_to_negotiated_preserves_original_order() {
-        let original = PeerCodecPreferences::new(vec![
-            CodecKind::H264,
-            CodecKind::Vp8,
-            CodecKind::Vp9,
-        ]);
+        let original =
+            PeerCodecPreferences::new(vec![CodecKind::H264, CodecKind::Vp8, CodecKind::Vp9]);
         // Pool returned VP8 + Vp9 only (no H.264 backend at the moment).
         let actual = vec![CodecKind::Vp8, CodecKind::Vp9];
         let filtered = filter_prefs_to_negotiated(&original, &actual);
@@ -2618,15 +2820,13 @@ mod tests {
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
         // Subscribe AGAINST the original handle.
-        let (initial_subs, initial_lease) =
-            pool.subscribe(&prefs).expect("initial subscribe");
+        let (initial_subs, initial_lease) = pool.subscribe(&prefs).expect("initial subscribe");
 
         // Resize: original handle dropped, new one spawned.
         // initial_subs's Receivers will return Closed on first recv.
         pool.on_resize(128, 96);
 
-        let (frame_tx, mut frame_rx) =
-            mpsc::channel::<Arc<EncodedFrame>>(16);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<Arc<EncodedFrame>>(16);
         let shutdown = CancellationToken::new();
         let pool_clone = Arc::clone(&pool);
         let intake_shutdown = shutdown.clone();
@@ -2651,17 +2851,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            frame_rx.recv(),
-        )
-        .await
-        .expect(
-            "frame_rx must produce within 2s — timeout indicates the \
+        let result = tokio::time::timeout(Duration::from_secs(2), frame_rx.recv())
+            .await
+            .expect(
+                "frame_rx must produce within 2s — timeout indicates the \
              intake task either deadlocked on a closed Receiver or \
              escalated to peer shutdown instead of treating Closed \
              as a normal epoch transition",
-        );
+            );
         assert!(
             result.is_some(),
             "intake must forward a frame from the post-resize encoder; \
@@ -2707,8 +2904,7 @@ mod tests {
         // Intake must then shutdown.cancel() to terminate the peer
         // cleanly.
         let prefs_unservable = PeerCodecPreferences::new(vec![CodecKind::Vp9]);
-        let (frame_tx, _frame_rx) =
-            mpsc::channel::<Arc<EncodedFrame>>(16);
+        let (frame_tx, _frame_rx) = mpsc::channel::<Arc<EncodedFrame>>(16);
         let shutdown = CancellationToken::new();
         let pool_clone = Arc::clone(&pool);
         let intake_shutdown = shutdown.clone();
@@ -2738,14 +2934,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
 
-        let exited = tokio::time::timeout(
-            Duration::from_secs(2),
-            async {
-                while !shutdown.is_cancelled() {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            },
-        )
+        let exited = tokio::time::timeout(Duration::from_secs(2), async {
+            while !shutdown.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
         .await;
         assert!(
             exited.is_ok(),
@@ -2863,9 +3056,7 @@ mod tests {
     /// empty offers), but the function should still behave sanely.
     #[test]
     fn select_active_subscription_returns_none_for_empty_prefs() {
-        let mut subs = vec![
-            make_test_subscription(CodecKind::Vp8, SimulcastRid::full()),
-        ];
+        let mut subs = vec![make_test_subscription(CodecKind::Vp8, SimulcastRid::full())];
         let prefs = PeerCodecPreferences::new(vec![]);
         assert!(select_active_subscription(&mut subs, &prefs).is_none());
     }
@@ -2916,8 +3107,7 @@ mod tests {
         );
         let input_count = 12u64;
 
-        let (frame_tx, mut frame_rx) =
-            mpsc::channel::<Arc<EncodedFrame>>(256);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<Arc<EncodedFrame>>(256);
         let shutdown = CancellationToken::new();
         let pool_clone = Arc::clone(&pool);
         let intake_shutdown = shutdown.clone();
@@ -3014,8 +3204,7 @@ mod tests {
 
         // Tiny mpsc — fills almost immediately. Keep the receiver
         // alive but never drain it during the push phase.
-        let (frame_tx, mut frame_rx) =
-            mpsc::channel::<Arc<EncodedFrame>>(1);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<Arc<EncodedFrame>>(1);
         let shutdown = CancellationToken::new();
         let pool_clone = Arc::clone(&pool);
         let intake_shutdown = shutdown.clone();
@@ -3061,11 +3250,7 @@ mod tests {
         // never parked, so cancel + intake exit inside a tight bound.
         let cancel_start = Instant::now();
         shutdown.cancel();
-        let exited = tokio::time::timeout(
-            Duration::from_secs(1),
-            intake_handle,
-        )
-        .await;
+        let exited = tokio::time::timeout(Duration::from_secs(1), intake_handle).await;
         let cancel_elapsed = cancel_start.elapsed();
         assert!(
             exited.is_ok(),

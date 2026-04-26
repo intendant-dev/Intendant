@@ -17,15 +17,14 @@ pub const MIME_TYPE_H264: &str = "video/H264";
 // ---------------------------------------------------------------------------
 
 /// Codec + format-params identity carried on every encoded frame, used by
-/// the WebRTC driver to resolve the peer-negotiated RTP payload type via
-/// `str0m::Writer::match_params` and cache the result.
+/// the WebRTC driver to verify the frame matches the peer-negotiated RTP
+/// codec before packetizing it.
 ///
 /// Distinct from [`pool::CodecKind`] because two frames from the same
 /// codec can disagree on fmtp (e.g. H.264 Baseline vs Main with different
-/// profile-level-id, packetization-mode 0 vs 1) and str0m negotiates
-/// those independently per peer. Caching the resolved PT keyed on
-/// `PayloadSpec` (not `CodecKind`) avoids re-running `match_params` on
-/// every frame while staying correct under mixed-profile fleets.
+/// profile-level-id, packetization-mode 0 vs 1) and browsers negotiate those
+/// independently per peer. Keying driver state on `PayloadSpec` (not
+/// `CodecKind`) stays correct under mixed-profile fleets.
 ///
 /// `PartialEq + Eq + Hash` are derived so the driver can use it as a
 /// cache key. Fields not relevant to the codec are `None` by convention
@@ -34,8 +33,7 @@ pub const MIME_TYPE_H264: &str = "video/H264";
 pub struct PayloadSpec {
     /// MIME string for the codec (e.g. `"video/VP8"`, `"video/H264"`).
     /// Using the static str interned by the encoder crate rather than an
-    /// enum so new codecs (VP9, AV1) don't require changes here —
-    /// str0m's `PayloadParams` is the source of truth for matching.
+    /// enum so new codecs (VP9, AV1) don't require changes here.
     pub codec_mime: &'static str,
 
     /// Sample clock rate in Hz. 90000 for all video codecs RFC 7741 /
@@ -44,12 +42,12 @@ pub struct PayloadSpec {
     pub clock_rate: u32,
 
     /// H.264 profile-level-id from SDP fmtp (6 hex digits lowercase, e.g.
-    /// `"42e01f"`). `None` for non-H.264 codecs. Matters because str0m
-    /// discriminates H.264 parameter sets by profile.
+    /// `"42e01f"`). `None` for non-H.264 codecs. Matters because browsers
+    /// discriminate H.264 parameter sets by profile.
     pub h264_profile_level_id: Option<String>,
 
     /// H.264 packetization-mode (0 or 1). `None` for non-H.264 codecs.
-    /// str0m's matcher checks this; mismatches fail to resolve even if
+    /// The WebRTC driver checks this; mismatches fail even if
     /// the codec name matches.
     pub h264_packetization_mode: Option<u32>,
 }
@@ -99,10 +97,9 @@ pub trait Encoder: Send + 'static {
     /// their configured GOP cadence instead.
     ///
     /// Packets emitted must carry this encoder's [`PayloadSpec`] so the
-    /// WebRTC driver can resolve the peer-negotiated payload type via
-    /// `str0m::Writer::match_params`. Encoders should `.clone()` their
-    /// cached `PayloadSpec` onto every emitted packet (cheap — small
-    /// struct with one `Option<String>`).
+    /// WebRTC driver can verify the packet matches the negotiated sender
+    /// codec. Encoders should `.clone()` their cached `PayloadSpec` onto every
+    /// emitted packet (cheap — small struct with one `Option<String>`).
     fn encode(
         &mut self,
         i420: &[u8],
@@ -305,14 +302,9 @@ pub fn is_compatible_h264_profile(profile: &H264FmtpProfile) -> bool {
 /// Returns `false` if H264 is not offered at all, or if every offered H264
 /// variant has an incompatible profile.
 ///
-/// **Legacy helper, broader than the pool path needs.** This function is
-/// used by the pre-3c.0 single-encoder path (`display/mod.rs::handle_offer`'s
-/// locked-codec branch) where "compatible" meant "the encoder can emit
-/// something the browser will accept after some give-and-take." The
-/// encoder-pool path (phase 3c+) uses
-/// [`offer_has_poolable_h264_variant`] instead, which mirrors str0m's
-/// stricter `Writer::match_params` rules against the encoder's exact
-/// producible `PayloadSpec`.
+/// **Legacy helper, broader than the pool path needs.** The encoder-pool path
+/// uses [`offer_has_poolable_h264_variant`] instead, which mirrors the exact
+/// profile / packetization / level that our H.264 encoder can produce.
 pub fn has_compatible_h264_offer(sdp: &str) -> bool {
     let profiles = parse_h264_fmtp(sdp);
     if profiles.is_empty() {
@@ -322,37 +314,33 @@ pub fn has_compatible_h264_offer(sdp: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Encoder-pool-strict H.264 offer check (mirrors str0m Writer::match_params)
+// Encoder-pool-strict H.264 offer check.
 // ---------------------------------------------------------------------------
 //
-// The pool path relies on str0m's matcher being the final gatekeeper:
-// if an offer passes `codec_preferences_from_offer` → pool subscribes →
-// frames flow → str0m rejects the frame's PayloadSpec at write time,
-// the result is a silent black screen. So the offer-level filter
-// must anticipate str0m's rejection rules and pre-exclude variants
-// that would fail.
+// The pool path must reject H.264 variants the encoder cannot produce before
+// constructing a peer. If an offer passes `codec_preferences_from_offer` →
+// pool subscribes → frames flow → the driver rejects the frame's PayloadSpec
+// at write time, the result is a silent black screen. So the offer-level
+// filter pre-excludes variants that would fail.
 //
 // The encoder produces exactly `PayloadSpec::h264_constrained_baseline`:
 // profile-level-id `42e01f`, packetization-mode 1, i.e. Constrained
-// Baseline at Level 3.1. str0m's `match_h264_score` applied against
-// that spec accepts an offer variant iff:
+// Baseline at Level 3.1. We accept an offer variant iff:
 //
 //   1. Its packetization-mode (default 0 if the fmtp line doesn't
 //      mention it, or no fmtp line at all) equals 1.
-//   2. Its profile-level-id, when resolved through str0m's bit-pattern
-//      table (`packet/h264_profile.rs::PROFILES`), yields
-//      `H264Profile::ConstrainedBaseline`. For `profile_idc = 0x42`
-//      that means `constraint_set1_flag == 1` AND reserved bits 4-7 == 0.
+//   2. Its profile-level-id resolves to Constrained Baseline. For
+//      `profile_idc = 0x42` that means `constraint_set1_flag == 1` AND
+//      reserved bits 4-7 == 0.
 //   3. Its level_idc does not exceed our encoder's (`0x1F` = Level 3.1).
 //   4. The profile-level-id must be present (fmtp missing or empty
-//      defaults to str0m's FALLBACK of Baseline+Level 1, which is the
-//      wrong family for our Constrained Baseline encoder).
+//      defaults to Baseline+Level 1, which is the wrong family for our
+//      Constrained Baseline encoder).
 //
-// Other paths to ConstrainedBaseline exist in str0m's PROFILES table
-// (idc 0x4D Main + cs0 flag, idc 0x58 Extended + cs0 cs1 flags). In
-// practice WebRTC browsers advertise the idc 0x42 family, so the
-// simpler check is enough; the fallback is our encoder's broader VP8
-// always-on which handles the long tail.
+// Other paths to ConstrainedBaseline exist in H.264 profile tables (idc 0x4D
+// Main + cs0 flag, idc 0x58 Extended + cs0 cs1 flags). In practice WebRTC
+// browsers advertise the idc 0x42 family, so the simpler check is enough; the
+// fallback is our encoder's broader VP8 always-on which handles the long tail.
 
 /// Packetization-mode our encoder produces. Matches both `h264_linux.rs`
 /// (ffmpeg's default) and `h264_macos.rs` (VideoToolbox Baseline).
@@ -367,9 +355,8 @@ const ENCODER_H264_PROFILE_IDC: u8 = 0x42;
 const ENCODER_H264_MAX_LEVEL_IDC: u8 = 0x1F;
 
 /// Whether one offered H.264 fmtp variant would match the encoder's
-/// exact [`PayloadSpec::h264_constrained_baseline`] under str0m's
-/// `Writer::match_params` rules. See the comment above for the full
-/// set of requirements this encodes.
+/// exact [`PayloadSpec::h264_constrained_baseline`]. See the comment above for
+/// the full set of requirements this encodes.
 pub fn offer_variant_matches_encoder_payload_spec(profile: &H264FmtpProfile) -> bool {
     // Requirement 1: packetization-mode must equal our encoder's.
     // `parse_h264_fmtp` already defaults missing fmtp / missing
@@ -380,9 +367,8 @@ pub fn offer_variant_matches_encoder_payload_spec(profile: &H264FmtpProfile) -> 
     }
 
     // Requirement 4: profile-level-id must be present. An empty
-    // profile_level_id maps to str0m's FALLBACK of
-    // `H264Profile::Baseline` at Level 1, which is the wrong profile
-    // family for our Constrained Baseline encoder.
+    // Missing profile_level_id maps to Baseline at Level 1, which is the wrong
+    // profile family for our Constrained Baseline encoder.
     if profile.profile_level_id.len() != 6 {
         return false;
     }
@@ -408,11 +394,10 @@ pub fn offer_variant_matches_encoder_payload_spec(profile: &H264FmtpProfile) -> 
         return false;
     };
 
-    // Requirement 2: profile_idc must be 0x42 (Baseline family byte)
-    // AND profile-iop must match the bit pattern for ConstrainedBaseline
-    // at that idc — str0m's table says "x1xx0000": constraint_set1_flag
-    // (bit 1 from the left of the iop byte, mask 0x40) must be 1, and
-    // the low four bits (reserved) must be 0.
+    // Requirement 2: profile_idc must be 0x42 (Baseline family byte) AND
+    // profile-iop must match ConstrainedBaseline at that idc: constraint_set1
+    // flag (bit 1 from the left of the iop byte, mask 0x40) must be 1, and the
+    // low four bits (reserved) must be 0.
     if profile_idc != ENCODER_H264_PROFILE_IDC {
         return false;
     }
@@ -423,12 +408,11 @@ pub fn offer_variant_matches_encoder_payload_spec(profile: &H264FmtpProfile) -> 
         return false;
     }
 
-    // Requirement 3: offer's level must be ≤ our encoder's capability.
-    // str0m's `match_h264_score` rejects when `c1_level > c0_level`.
-    // Level_idc ordering is numeric across all common WebRTC levels
-    // (1.0 through 5.2), so a simple inequality suffices; the lone
-    // exception is Level 1b which encodes as 0x09 + constraint_set3_flag
-    // — which is below 3.1 by any measure, so our `<=` is correct.
+    // Requirement 3: offer's level must be <= our encoder's capability.
+    // Level_idc ordering is numeric across all common WebRTC levels (1.0
+    // through 5.2), so a simple inequality suffices; the lone exception is
+    // Level 1b which encodes as 0x09 + constraint_set3_flag, below 3.1 by any
+    // measure.
     if level_idc > ENCODER_H264_MAX_LEVEL_IDC {
         return false;
     }
@@ -437,10 +421,9 @@ pub fn offer_variant_matches_encoder_payload_spec(profile: &H264FmtpProfile) -> 
 }
 
 /// Whether any H.264 variant in the SDP offer would match the encoder's
-/// exact PayloadSpec under str0m's matcher. Use this gate — not the
-/// older [`has_compatible_h264_offer`] — on the encoder-pool path;
-/// see the detailed comment above [`offer_variant_matches_encoder_payload_spec`]
-/// for why.
+/// exact PayloadSpec. Use this gate — not the older
+/// [`has_compatible_h264_offer`] — on the encoder-pool path; see the detailed
+/// comment above [`offer_variant_matches_encoder_payload_spec`] for why.
 pub fn offer_has_poolable_h264_variant(sdp: &str) -> bool {
     parse_h264_fmtp(sdp)
         .iter()
@@ -748,9 +731,8 @@ pub struct EncodedPacket {
     pub duration_ms: u64,
     pub is_keyframe: bool,
     /// Codec + fmtp identity for this packet's payload. Propagated to
-    /// [`EncodedFrame`] on conversion and consumed by the WebRTC driver's
-    /// `match_params` cache. Every encoder attaches its canonical
-    /// [`PayloadSpec`] here.
+    /// [`EncodedFrame`] on conversion and consumed by the WebRTC driver. Every
+    /// encoder attaches its canonical [`PayloadSpec`] here.
     pub payload_spec: PayloadSpec,
 }
 

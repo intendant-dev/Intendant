@@ -26,19 +26,17 @@
 //! - **Hardware**: VAAPI ~4-8 concurrent, NVENC ~8-12, VideoToolbox
 //!   ~3-4 reliably. Per-peer hits the wall at viewer ~5-8 and silently
 //!   degrades to libx264 software fallback.
-//! - **Precedent**: `str0m`'s own SFU example (`examples/chat.rs`) keeps
-//!   one publisher [`Rtc`] and fans out to N subscriber [`Rtc`]s, with
-//!   per-peer payload-type translation via [`Writer::match_params`]
-//!   (str0m docs.rs).
+//! - **Precedent**: production SFUs keep one publisher-side encode bank and
+//!   fan out to N subscriber-side transports, with per-peer packetization and
+//!   codec negotiation at the edge.
 //!
 //! The right pattern is **shared encoder pool + per-peer forwarding**:
 //! a small bank of encoders (typically 1-3) produces frames that all
-//! peers consume; each peer's `Rtc` picks which codec/layer it can
+//! peers consume; each peer's RTC driver picks which codec/layer it can
 //! decode and forwards just those frames. The per-peer forwarding
 //! logic lives inside the `WebRtcPeer` driver task (in
 //! `display/webrtc.rs`), not in a separate module — the driver owns
-//! the `Rtc` and is the only caller that can reach str0m's
-//! `Writer::write_sample`.
+//! the RTC peer connection and is the only caller that can write RTP.
 //!
 //! ## Pool composition
 //!
@@ -62,26 +60,23 @@
 //! Adding a codec is additive: spawn a new on-demand slot, peers that
 //! prefer it pick it up, peers that don't are unaffected.
 //!
-//! ## Relationship to str0m
+//! ## Relationship to the WebRTC driver
 //!
 //! The pool produces [`Arc<EncodedFrame>`] payloads keyed by
-//! [`SimulcastRid`] (str0m's `Rid` newtype). The per-peer forwarding
+//! [`SimulcastRid`]. The per-peer forwarding
 //! lives inside each peer's `WebRtcPeer` driver task
-//! (`display/webrtc.rs`), which owns the peer's `Rtc` and therefore
-//! the only path to str0m's `Writer::write_sample`. Each frame
-//! carries a [`crate::display::encode::PayloadSpec`]; the driver
-//! resolves it to the peer's negotiated payload type via
-//! `Writer::match_params` on first hit and caches the result. An
-//! earlier design sketch had a separate `PerPeerForwarder` task doing
-//! this work, but a separate task can't reach the driver's `Rtc`;
-//! merging the forwarder into the driver sidesteps the problem.
+//! (`display/webrtc.rs`), which owns the peer's RTC connection and therefore
+//! the only path that can write RTP. Each frame carries a
+//! [`crate::display::encode::PayloadSpec`]; the driver checks it against the
+//! negotiated sender codec before packetizing. An earlier design sketch had a
+//! separate `PerPeerForwarder` task doing this work, but a separate task can't
+//! reach the driver's RTC state; merging the forwarder into the driver
+//! sidesteps the problem.
 //!
-//! str0m supports simulcast natively (per the str0m README's feature
-//! matrix and `Rid` API in `str0m::media`). RID semantics: the
-//! publisher emits frames with a per-layer RID (`f`/`h`/`q` for full,
-//! half, quarter resolution by convention); the consumer-side str0m
-//! filters by the active RID it has selected based on TWCC bandwidth
-//! estimates.
+//! RID semantics: the publisher emits frames with a per-layer RID (`f`/`h`/`q`
+//! for full, half, quarter resolution by convention). Phase 4 currently selects
+//! one active subscription per peer; TWCC-driven dynamic RID switching is a
+//! later layer-selection step.
 //!
 //! ## Lifecycle
 //!
@@ -94,8 +89,8 @@
 //!         ▼                     ▼
 //!   if first peer +     forwarder reads from each subscription's
 //!   not always-on:      broadcast::Receiver, picks frames matching
-//!     sync construct    peer's chosen layer, writes to peer's str0m
-//!     + spawn           Rtc with PT translation
+//!     sync construct    peer's chosen layer, packetizes into the
+//!     + spawn           peer's RTC sender
 //!         │
 //!   ─── peer leaves / handle_offer fails ──→ PoolLease::drop
 //!         │
@@ -126,8 +121,8 @@
 //!
 //! ## Out of scope for this stub
 //!
-//! - Encoder spawning (the actual `tokio::task::spawn_blocking` + str0m
-//!   wiring). Phase 3.
+//! - Encoder spawning (the actual `tokio::task::spawn_blocking` wiring).
+//!   Phase 3.
 //! - Layer width/height selection logic. Phase 4.
 //! - Bitrate-aware layer downgrade based on TWCC. Phase 4.
 //! - Hardware encoder slot tracking (VAAPI session counter). Phase 3.
@@ -208,9 +203,8 @@ pub const I420_BROADCAST_CAPACITY: usize = 4;
 // Codec identity
 // ---------------------------------------------------------------------------
 
-/// Codec kinds the pool can produce. Closed enum because str0m only
-/// supports a fixed set anyway, and adding a codec is a coordinated
-/// change (new encoder backend + str0m PT registration + browser
+/// Codec kinds the pool can produce. Closed enum because adding a codec is a
+/// coordinated change (new encoder backend + RTC codec registration + browser
 /// compat survey).
 ///
 /// Distinct from [`super::CodecChoice`] (which is the existing
@@ -277,8 +271,8 @@ impl fmt::Display for CodecKind {
 }
 
 /// Simulcast layer ID, RFC 8853. Newtype around String so we don't
-/// confuse it with arbitrary identifiers. Maps to str0m's
-/// `str0m::media::Rid` at the forwarding layer.
+/// confuse it with arbitrary identifiers. Maps to RTP RID at the
+/// forwarding layer.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SimulcastRid(pub String);
 
@@ -532,7 +526,7 @@ pub struct I420Frame {
 ///
 /// - the [`EncoderId`] (so the forwarder knows which codec/layer this is)
 /// - the [`LayerSpec`] (resolution / bitrate / framerate, useful for
-///   size hints in str0m's media line)
+///   layer-selection policy)
 /// - the live broadcast receiver
 ///
 /// A peer that supports multiple codecs receives multiple
@@ -1194,8 +1188,7 @@ impl EncoderPool {
     /// the swapped always-on handles or a dropped on-demand slot
     /// observes `RecvError::Closed` on its next recv. Peer forwarders
     /// (phase 3c.3b onward) must handle Closed by tearing the peer
-    /// down or re-subscribing via [`Self::subscribe`]. Matches the
-    /// str0m chat.rs "re-subscribe per publisher epoch" pattern.
+    /// down or re-subscribing via [`Self::subscribe`].
     ///
     /// No-op when `(new_width, new_height) == self.dimensions()` —
     /// avoids encoder churn when the capture backend emits a
@@ -1670,8 +1663,8 @@ impl EncoderPool {
     /// `false` if it was deduped against a recent request OR if no
     /// encoder matched the `(codec, rid)` lookup.
     ///
-    /// Called by the per-peer forwarder when str0m signals an inbound
-    /// PLI/FIR for that peer.
+    /// Called by the per-peer forwarder when inbound RTCP requests a
+    /// keyframe for that peer.
     pub fn request_keyframe(
         &self,
         codec: CodecKind,
