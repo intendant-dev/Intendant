@@ -62,6 +62,8 @@ use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::{RTCIceCandidateInit, RTCIceProtocol};
 use rtc::peer_connection::RTCPeerConnection;
 use rtc::peer_connection::RTCPeerConnectionBuilder;
+use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp::packetizer::{self, Packetizer};
 use rtc::rtp::sequence;
 use rtc::rtp_transceiver::rtp_sender::{
@@ -87,6 +89,15 @@ const ENCODED_FRAME_CHANNEL: usize = 8;
 
 /// Bound on the per-peer command channel.
 const COMMAND_CHANNEL: usize = 32;
+
+/// Bound on the per-peer keyframe-request channel (driver → intake).
+///
+/// Lossy by design — the encoder pool's coalescer dedups bursts within
+/// a small window, so a request lost to a full channel is reissued by
+/// the next PLI/FIR within the same coalesce window. Sized to absorb
+/// brief PLI storms (e.g. all simulcast layers requesting at once
+/// after a keyframe loss) without backpressure on the rtc poll loop.
+const KEYFRAME_REQUEST_CHANNEL: usize = 16;
 
 /// Maximum UDP datagram we'll receive on the per-peer socket.
 const UDP_BUF_LEN: usize = 2000;
@@ -825,6 +836,7 @@ impl WebRtcPeer {
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
         _ice_tx: mpsc::Sender<(PeerId, String)>,
+        keyframe_request_tx: mpsc::Sender<SimulcastRid>,
     ) -> Result<(Self, mpsc::Sender<OutboundEncodedFrame>, String), CallerError> {
         if active_rids.is_empty() {
             return Err(CallerError::WebRtc(
@@ -1076,6 +1088,7 @@ impl WebRtcPeer {
             command_rx,
             input_handler,
             clipboard_handler,
+            keyframe_request_tx,
             shutdown.clone(),
         ));
 
@@ -1201,6 +1214,15 @@ impl WebRtcPeer {
                  divergence",
             )));
         }
+        // Phase 4e: keyframe-request channel from driver → intake.
+        // Driver pushes a `SimulcastRid` to this channel for every
+        // PLI / FIR whose target SSRC matches one of our outbound
+        // encodings; intake reads from the channel and calls
+        // `pool.request_keyframe(active_codec, Some(rid))` so PLI
+        // recovery hits ONLY the affected layer's encoder. Bounded +
+        // lossy by design — see `KEYFRAME_REQUEST_CHANNEL` doc.
+        let (keyframe_request_tx, keyframe_request_rx) =
+            mpsc::channel::<SimulcastRid>(KEYFRAME_REQUEST_CHANNEL);
         let (peer, encoded_frame_tx, answer_sdp) = Self::build_with_codec_set(
             peer_id,
             offer_sdp,
@@ -1212,6 +1234,7 @@ impl WebRtcPeer {
             input_handler,
             clipboard_handler,
             ice_tx,
+            keyframe_request_tx,
         )
         .await?;
         // Spawn the intake task. It owns the encoded_frame_tx (no
@@ -1228,6 +1251,7 @@ impl WebRtcPeer {
             lease,
             encoded_frame_tx,
             drops_counter,
+            keyframe_request_rx,
             intake_shutdown,
         ));
 
@@ -1409,6 +1433,7 @@ async fn driver(
     mut command_rx: mpsc::Receiver<Command>,
     input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
+    keyframe_request_tx: mpsc::Sender<SimulcastRid>,
     shutdown: CancellationToken,
 ) {
     if rtp_config.encodings.is_empty() {
@@ -1540,6 +1565,7 @@ async fn driver(
             &mut state,
             &input_handler,
             &clipboard_handler,
+            &keyframe_request_tx,
         )
         .await
         {
@@ -1735,6 +1761,7 @@ enum DriverExit {
 }
 
 /// Drain pending writes, reads, and events from the sans-I/O peer connection.
+#[allow(clippy::too_many_arguments)]
 async fn drain_outputs(
     rtc: &mut RTCPeerConnection,
     sockets_by_addr: &HashMap<SocketAddr, Arc<UdpSocket>>,
@@ -1742,6 +1769,7 @@ async fn drain_outputs(
     state: &mut DriverState,
     input_handler: &Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: &Arc<dyn Fn(ClipboardContent) + Send + Sync>,
+    keyframe_request_tx: &mpsc::Sender<SimulcastRid>,
 ) -> Result<Instant, DriverExit> {
     while let Some(t) = rtc.poll_write() {
         // Routability filtering only applies to UDP: for UDP we need the
@@ -1790,7 +1818,13 @@ async fn drain_outputs(
     }
 
     while let Some(message) = rtc.poll_read() {
-        handle_message(message, state, input_handler, clipboard_handler);
+        handle_message(
+            message,
+            state,
+            input_handler,
+            clipboard_handler,
+            keyframe_request_tx,
+        );
     }
 
     while let Some(event) = rtc.poll_event() {
@@ -1839,12 +1873,119 @@ fn handle_event(
     false
 }
 
+/// Reverse-lookup: given an SSRC reported in an inbound RTCP feedback
+/// packet (PLI's `media_ssrc` or FIR's per-entry `ssrc`), find the
+/// simulcast RID that owns it.
+///
+/// Linear scan over the (rid, ssrc) pairs — N ≤ 3 (VP8 simulcast:
+/// full / half / quarter) or N == 1 (single-encoding codecs like
+/// H.264). Takes a flat slice instead of the production
+/// `HashMap<SimulcastRid, RidRtpState>` so tests can build the table
+/// inline without constructing real packetizers.
+fn rid_for_ssrc(
+    ssrc_table: &[(SimulcastRid, u32)],
+    ssrc: u32,
+) -> Option<SimulcastRid> {
+    ssrc_table
+        .iter()
+        .find_map(|(rid, s)| (*s == ssrc).then(|| rid.clone()))
+}
+
+/// Iterate inbound RTCP packets and emit a keyframe-request RID for
+/// every PLI / FIR whose target SSRC matches one of this peer's
+/// outbound encoding SSRCs. Output goes onto a bounded mpsc; the pool
+/// intake side reads it and calls
+/// [`crate::display::encode::pool::EncoderPool::request_keyframe`]
+/// with the active codec + the routed RID, hitting only that layer's
+/// encoder.
+///
+/// **Per-RID PLI is required for simulcast** because each layer's
+/// browser-side decoder maintains its own keyframe-recovery state.
+/// A PLI on rid `q` (quarter) means "I lost the keyframe on the
+/// quarter layer specifically" — kicking the full-layer encoder in
+/// response would burn one `f` keyframe (at full bandwidth!) for
+/// nothing while the quarter layer stays broken. Routing per-RID
+/// keeps recovery cost proportional to which layer actually lost
+/// frames.
+///
+/// Unknown SSRCs are logged at warn level and dropped — they can
+/// happen briefly during track-renegotiation windows or if the
+/// browser sends RTCP for an SSRC we never advertised. Treating
+/// them as a hard error would be over-eager (they're transient and
+/// don't break correctness); ignoring them silently would mask
+/// genuine SSRC-mapping bugs, hence the log.
+///
+/// RTCP packet types other than PLI/FIR (NACK, RR, SR, SDES, BYE,
+/// transport-cc, REMB, TWCC) are ignored here — those are handled
+/// by rtc 0.9's interceptor for stats/bandwidth-estimation purposes
+/// and never need to flow through this routing path.
+///
+/// Lossy `try_send`: if the keyframe-request channel is full, drop.
+/// The pool's coalescer would dedup the request anyway, and the
+/// next PLI within the coalesce window will re-request. Blocking
+/// the rtc poll loop on a full channel would hurt the entire peer
+/// for the sake of a request that's about to be dropped at the next
+/// hop.
+fn route_rtcp_keyframe_requests(
+    packets: &[Box<dyn rtc::rtcp::Packet>],
+    ssrc_table: &[(SimulcastRid, u32)],
+    keyframe_request_tx: &mpsc::Sender<SimulcastRid>,
+) {
+    for packet in packets {
+        if let Some(pli) = packet.as_any().downcast_ref::<PictureLossIndication>() {
+            match rid_for_ssrc(ssrc_table, pli.media_ssrc) {
+                Some(rid) => {
+                    let _ = keyframe_request_tx.try_send(rid);
+                }
+                None => {
+                    eprintln!(
+                        "[display/webrtc] PLI for unknown SSRC {} \
+                         (known SSRCs: {:?}); dropping",
+                        pli.media_ssrc,
+                        ssrc_table.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+                    );
+                }
+            }
+        } else if let Some(fir) = packet.as_any().downcast_ref::<FullIntraRequest>() {
+            for entry in &fir.fir {
+                match rid_for_ssrc(ssrc_table, entry.ssrc) {
+                    Some(rid) => {
+                        let _ = keyframe_request_tx.try_send(rid);
+                    }
+                    None => {
+                        eprintln!(
+                            "[display/webrtc] FIR for unknown SSRC {} \
+                             (known SSRCs: {:?}); dropping",
+                            entry.ssrc,
+                            ssrc_table.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn handle_message(
     message: RTCMessage,
     state: &mut DriverState,
     input_handler: &Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: &Arc<dyn Fn(ClipboardContent) + Send + Sync>,
+    keyframe_request_tx: &mpsc::Sender<SimulcastRid>,
 ) {
+    if let RTCMessage::RtcpPacket(_track_id, packets) = &message {
+        // Project by_rid → flat (rid, ssrc) table for the routing
+        // helper. N ≤ 3 in production (VP8 simulcast layers);
+        // allocation cost is negligible at RTCP rates.
+        let ssrc_table: Vec<(SimulcastRid, u32)> = state
+            .rtp
+            .by_rid
+            .iter()
+            .map(|(rid, st)| (rid.clone(), st.ssrc))
+            .collect();
+        route_rtcp_keyframe_requests(packets, &ssrc_table, keyframe_request_tx);
+        return;
+    }
     let RTCMessage::DataChannelMessage(cid, RTCDataChannelMessage { data, .. }) = message else {
         return;
     };
@@ -2418,6 +2559,7 @@ enum ForwarderExit {
 /// pool/peer divergence) — the intake signals `shutdown.cancel()` so
 /// the driver tears the peer down cleanly rather than leaving a
 /// never-decoding stream behind.
+#[allow(clippy::too_many_arguments)]
 async fn pool_frame_intake(
     pool: Arc<EncoderPool>,
     negotiated_prefs: PeerCodecPreferences,
@@ -2425,6 +2567,7 @@ async fn pool_frame_intake(
     initial_lease: PoolLease,
     encoded_frame_tx: mpsc::Sender<OutboundEncodedFrame>,
     drops_counter: Arc<AtomicU64>,
+    mut keyframe_request_rx: mpsc::Receiver<SimulcastRid>,
     shutdown: CancellationToken,
 ) {
     let mut current_lease = Some(initial_lease);
@@ -2605,8 +2748,38 @@ async fn pool_frame_intake(
         // teardown.
         drop(exit_tx);
 
-        tokio::select! {
-            _ = shutdown.cancelled() => {
+        // Inner loop: stay here as long as keyframe requests come in
+        // (route them to the pool and keep listening). Break out only
+        // when shutdown fires or a forwarder exits — those drive the
+        // outer 'epoch loop's resubscribe-or-return decisions.
+        //
+        // **Why an inner loop**: the keyframe-request branch must NOT
+        // re-enter the 'epoch loop body. Re-entering would tear down
+        // every forwarder we just spawned and respawn them — a PLI
+        // burst would interrupt streaming on every layer. The inner
+        // loop keeps forwarders running and just routes the request
+        // to the pool's coalescer.
+        enum InnerExit {
+            Shutdown,
+            ForwarderExited(Option<ForwarderExit>),
+        }
+        let inner_exit = 'inner: loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break 'inner InnerExit::Shutdown,
+                // Phase 4e: drain keyframe-request RIDs from the
+                // driver (one per inbound PLI/FIR for one of our
+                // SSRCs). Route to the pool with the active codec —
+                // the pool's coalescer dedups bursts within
+                // KEYFRAME_COALESCE_WINDOW.
+                Some(rid) = keyframe_request_rx.recv() => {
+                    pool.request_keyframe(active_codec, Some(rid));
+                    // Stay in inner loop; forwarders keep running.
+                }
+                recv = exit_rx.recv() => break 'inner InnerExit::ForwarderExited(recv),
+            }
+        };
+        match inner_exit {
+            InnerExit::Shutdown => {
                 // Peer is going away. Cancel all forwarders, await
                 // them, drop the lease, exit.
                 fwd_shutdown.cancel();
@@ -2614,7 +2787,7 @@ async fn pool_frame_intake(
                 drop(current_lease.take());
                 return;
             }
-            recv = exit_rx.recv() => {
+            InnerExit::ForwarderExited(recv) => {
                 // First forwarder to exit reports its reason. Cancel
                 // all sibling forwarders so the (codec, rid) set
                 // doesn't drift (e.g. one rid resubscribing while
@@ -3256,6 +3429,7 @@ mod tests {
         let pool_clone = Arc::clone(&pool);
         let intake_shutdown = shutdown.clone();
         let drops = Arc::new(AtomicU64::new(0));
+        let (_kf_tx, kf_rx) = mpsc::channel::<SimulcastRid>(8);
         let intake_handle = tokio::spawn(pool_frame_intake(
             pool_clone,
             prefs,
@@ -3263,6 +3437,7 @@ mod tests {
             initial_lease,
             frame_tx,
             Arc::clone(&drops),
+            kf_rx,
             intake_shutdown,
         ));
 
@@ -3334,6 +3509,7 @@ mod tests {
         let pool_clone = Arc::clone(&pool);
         let intake_shutdown = shutdown.clone();
         let drops = Arc::new(AtomicU64::new(0));
+        let (_kf_tx, kf_rx) = mpsc::channel::<SimulcastRid>(8);
         let intake_handle = tokio::spawn(pool_frame_intake(
             pool_clone,
             prefs_unservable,
@@ -3341,6 +3517,7 @@ mod tests {
             initial_lease,
             frame_tx,
             Arc::clone(&drops),
+            kf_rx,
             intake_shutdown,
         ));
 
@@ -3435,6 +3612,7 @@ mod tests {
         let pool_clone = Arc::clone(&pool);
         let intake_shutdown = shutdown.clone();
         let drops = Arc::new(AtomicU64::new(0));
+        let (_kf_tx, kf_rx) = mpsc::channel::<SimulcastRid>(8);
         let intake_handle = tokio::spawn(pool_frame_intake(
             pool_clone,
             prefs,
@@ -3442,6 +3620,7 @@ mod tests {
             initial_lease,
             frame_tx,
             Arc::clone(&drops),
+            kf_rx,
             intake_shutdown,
         ));
 
@@ -3539,6 +3718,7 @@ mod tests {
         let intake_shutdown = shutdown.clone();
         let drops = Arc::new(AtomicU64::new(0));
         let drops_for_intake = Arc::clone(&drops);
+        let (_kf_tx, kf_rx) = mpsc::channel::<SimulcastRid>(8);
         let intake_handle = tokio::spawn(pool_frame_intake(
             pool_clone,
             prefs,
@@ -3546,6 +3726,7 @@ mod tests {
             initial_lease,
             frame_tx,
             drops_for_intake,
+            kf_rx,
             intake_shutdown,
         ));
 
@@ -3648,6 +3829,7 @@ mod tests {
         let pool_clone = Arc::clone(&pool);
         let intake_shutdown = shutdown.clone();
         let drops = Arc::new(AtomicU64::new(0));
+        let (_kf_tx, kf_rx) = mpsc::channel::<SimulcastRid>(8);
         let intake_handle = tokio::spawn(pool_frame_intake(
             pool_clone,
             prefs,
@@ -3655,6 +3837,7 @@ mod tests {
             initial_lease,
             frame_tx,
             Arc::clone(&drops),
+            kf_rx,
             intake_shutdown,
         ));
 
@@ -3892,6 +4075,7 @@ mod tests {
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
             Arc::new(|_| {});
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
+        let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
 
         let (peer, _frame_tx, answer_sdp) = WebRtcPeer::build_with_codec_set(
             42,
@@ -3904,6 +4088,7 @@ mod tests {
             input_handler,
             clipboard_handler,
             ice_tx,
+            kf_tx,
         )
         .await
         .expect("build_with_codec_set must succeed for VP8 multi-rid");
@@ -3965,6 +4150,7 @@ mod tests {
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
             Arc::new(|_| {});
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
+        let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
 
         let (peer, _frame_tx, answer_sdp) = WebRtcPeer::build_with_codec_set(
             43,
@@ -3977,6 +4163,7 @@ mod tests {
             input_handler,
             clipboard_handler,
             ice_tx,
+            kf_tx,
         )
         .await
         .expect("build_with_codec_set must succeed for H.264 single-rid");
@@ -4036,5 +4223,231 @@ mod tests {
         // branch in write_video_frame, which fail-loud-logs and drops.
         let unknown_rid = SimulcastRid::new("unknown");
         assert_eq!(by_rid.get(&unknown_rid), None);
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 4e: route_rtcp_keyframe_requests — per-RID PLI/FIR routing
+    // -------------------------------------------------------------------
+
+    /// Stand up a 3-layer VP8 simulcast SSRC table (full / half /
+    /// quarter at distinct SSRCs) for the routing tests below.
+    /// SSRCs are arbitrary but distinct; mirrors what
+    /// `build_with_codec_set` produces from `new_ssrc()` in
+    /// production.
+    fn vp8_simulcast_ssrc_table() -> Vec<(SimulcastRid, u32)> {
+        vec![
+            (SimulcastRid::full(), 0xAAAA_0001),
+            (SimulcastRid::half(), 0xAAAA_0002),
+            (SimulcastRid::quarter(), 0xAAAA_0003),
+        ]
+    }
+
+    fn pli_for(media_ssrc: u32) -> Box<dyn rtc::rtcp::Packet> {
+        Box::new(PictureLossIndication {
+            sender_ssrc: 0,
+            media_ssrc,
+        })
+    }
+
+    fn fir_for(ssrcs: &[u32]) -> Box<dyn rtc::rtcp::Packet> {
+        Box::new(FullIntraRequest {
+            sender_ssrc: 0,
+            media_ssrc: 0,
+            fir: ssrcs
+                .iter()
+                .map(|s| rtc::rtcp::payload_feedbacks::full_intra_request::FirEntry {
+                    ssrc: *s,
+                    sequence_number: 0,
+                })
+                .collect(),
+        })
+    }
+
+    /// PLI for the full layer's SSRC routes to `SimulcastRid::full()`.
+    /// Pre-4e the entire codec was kicked into a keyframe; per-RID
+    /// routing is what makes simulcast recovery proportional to the
+    /// layer that actually lost frames.
+    #[tokio::test]
+    async fn route_rtcp_keyframe_pli_routes_to_full_rid() {
+        let table = vp8_simulcast_ssrc_table();
+        let (tx, mut rx) = mpsc::channel::<SimulcastRid>(8);
+
+        let packets = vec![pli_for(0xAAAA_0001)];
+        route_rtcp_keyframe_requests(&packets, &table, &tx);
+
+        let routed = rx.try_recv().expect("PLI for full SSRC must route");
+        assert_eq!(routed, SimulcastRid::full());
+        assert!(rx.try_recv().is_err(), "no extra emissions");
+    }
+
+    /// PLI for the half layer's SSRC routes to `SimulcastRid::half()` —
+    /// NOT to full. Mis-routing to full would burn a full-layer
+    /// keyframe (highest bandwidth!) for a half-layer recovery and
+    /// leave the half layer broken until its next natural keyframe.
+    #[tokio::test]
+    async fn route_rtcp_keyframe_pli_routes_to_half_rid() {
+        let table = vp8_simulcast_ssrc_table();
+        let (tx, mut rx) = mpsc::channel::<SimulcastRid>(8);
+
+        let packets = vec![pli_for(0xAAAA_0002)];
+        route_rtcp_keyframe_requests(&packets, &table, &tx);
+
+        let routed = rx.try_recv().expect("PLI for half SSRC must route");
+        assert_eq!(routed, SimulcastRid::half());
+        assert!(rx.try_recv().is_err(), "no extra emissions");
+    }
+
+    /// PLI for the quarter layer's SSRC routes to
+    /// `SimulcastRid::quarter()`.
+    #[tokio::test]
+    async fn route_rtcp_keyframe_pli_routes_to_quarter_rid() {
+        let table = vp8_simulcast_ssrc_table();
+        let (tx, mut rx) = mpsc::channel::<SimulcastRid>(8);
+
+        let packets = vec![pli_for(0xAAAA_0003)];
+        route_rtcp_keyframe_requests(&packets, &table, &tx);
+
+        let routed = rx.try_recv().expect("PLI for quarter SSRC must route");
+        assert_eq!(routed, SimulcastRid::quarter());
+        assert!(rx.try_recv().is_err(), "no extra emissions");
+    }
+
+    /// PLI for an SSRC we never advertised is a no-op — no emission
+    /// on the channel. The helper logs at warn level (verified
+    /// indirectly via no panic + no emission); this can happen
+    /// briefly during track-renegotiation windows or if the browser
+    /// references an old SSRC after a track replacement.
+    #[tokio::test]
+    async fn route_rtcp_keyframe_pli_unknown_ssrc_is_noop() {
+        let table = vp8_simulcast_ssrc_table();
+        let (tx, mut rx) = mpsc::channel::<SimulcastRid>(8);
+
+        let packets = vec![pli_for(0xDEAD_BEEF)];
+        route_rtcp_keyframe_requests(&packets, &table, &tx);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "PLI for unknown SSRC must not emit a routing decision"
+        );
+    }
+
+    /// FIR with a single entry for one SSRC routes the same way as
+    /// PLI for that SSRC. RFC 5104 says FIR is "for the rare case
+    /// where a new participant joins" — we treat it as semantically
+    /// equivalent to PLI for keyframe-routing purposes.
+    #[tokio::test]
+    async fn route_rtcp_keyframe_fir_single_entry_routes_to_matching_rid() {
+        let table = vp8_simulcast_ssrc_table();
+        let (tx, mut rx) = mpsc::channel::<SimulcastRid>(8);
+
+        let packets = vec![fir_for(&[0xAAAA_0002])];
+        route_rtcp_keyframe_requests(&packets, &table, &tx);
+
+        let routed = rx.try_recv().expect("FIR for half SSRC must route");
+        assert_eq!(routed, SimulcastRid::half());
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// FIR can carry multiple `(ssrc, seq)` entries. Each known SSRC
+    /// emits its own RID; unknown SSRCs in the same FIR are dropped
+    /// silently without affecting the known ones (independent
+    /// routing per entry).
+    #[tokio::test]
+    async fn route_rtcp_keyframe_fir_multi_entry_routes_each_known_ssrc() {
+        let table = vp8_simulcast_ssrc_table();
+        let (tx, mut rx) = mpsc::channel::<SimulcastRid>(8);
+
+        // FIR with full + unknown + quarter — only full and quarter
+        // are known and must each route; unknown is a no-op for
+        // that entry but must NOT inhibit the other entries.
+        let packets = vec![fir_for(&[0xAAAA_0001, 0xDEAD_BEEF, 0xAAAA_0003])];
+        route_rtcp_keyframe_requests(&packets, &table, &tx);
+
+        let mut routed: Vec<SimulcastRid> = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            routed.push(r);
+        }
+        assert_eq!(
+            routed.len(),
+            2,
+            "FIR with 2 known + 1 unknown SSRC should emit 2 routings"
+        );
+        assert!(routed.contains(&SimulcastRid::full()));
+        assert!(routed.contains(&SimulcastRid::quarter()));
+    }
+
+    /// FIR for an unknown SSRC alone is a no-op — same contract as
+    /// the PLI unknown-SSRC test, exercised through the FIR codepath.
+    #[tokio::test]
+    async fn route_rtcp_keyframe_fir_unknown_ssrc_is_noop() {
+        let table = vp8_simulcast_ssrc_table();
+        let (tx, mut rx) = mpsc::channel::<SimulcastRid>(8);
+
+        let packets = vec![fir_for(&[0xDEAD_BEEF])];
+        route_rtcp_keyframe_requests(&packets, &table, &tx);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "FIR for unknown SSRC must not emit a routing decision"
+        );
+    }
+
+    /// A compound RTCP packet may carry PLI + FIR + non-keyframe
+    /// types (NACK, RR, SR, …). Only PLI and FIR contribute to
+    /// keyframe routing; the helper iterates the whole vec and
+    /// silently passes over non-feedback types.
+    ///
+    /// This test uses ReceiverReport as the "ignored" stand-in
+    /// because it's the simplest non-keyframe RTCP type to
+    /// construct — the same contract holds for NACK / SR / SDES /
+    /// BYE / TWCC etc.
+    #[tokio::test]
+    async fn route_rtcp_keyframe_ignores_non_pli_fir_packets() {
+        use rtc::rtcp::receiver_report::ReceiverReport;
+
+        let table = vp8_simulcast_ssrc_table();
+        let (tx, mut rx) = mpsc::channel::<SimulcastRid>(8);
+
+        let packets: Vec<Box<dyn rtc::rtcp::Packet>> = vec![
+            Box::new(ReceiverReport::default()),
+            pli_for(0xAAAA_0001),
+            Box::new(ReceiverReport::default()),
+        ];
+        route_rtcp_keyframe_requests(&packets, &table, &tx);
+
+        let routed = rx.try_recv().expect("PLI between RR/RR must still route");
+        assert_eq!(routed, SimulcastRid::full());
+        assert!(
+            rx.try_recv().is_err(),
+            "ReceiverReport packets must not emit any routing decisions"
+        );
+    }
+
+    /// `rid_for_ssrc` returns the matching RID for any known SSRC
+    /// in the table; None for unknown SSRC. Same contract as the
+    /// helper that wraps it; tested directly so a refactor that
+    /// changes the lookup data structure (HashMap vs Vec vs
+    /// pre-built reverse map) keeps the contract intact.
+    #[test]
+    fn rid_for_ssrc_returns_matching_rid_or_none() {
+        let table = vp8_simulcast_ssrc_table();
+        assert_eq!(
+            rid_for_ssrc(&table, 0xAAAA_0001),
+            Some(SimulcastRid::full())
+        );
+        assert_eq!(
+            rid_for_ssrc(&table, 0xAAAA_0002),
+            Some(SimulcastRid::half())
+        );
+        assert_eq!(
+            rid_for_ssrc(&table, 0xAAAA_0003),
+            Some(SimulcastRid::quarter())
+        );
+        assert_eq!(rid_for_ssrc(&table, 0xDEAD_BEEF), None);
+        // Empty table: every lookup is None — defends against an
+        // empty by_rid in the `build_with_codec_set` empty-active_rids
+        // path (which errors out upstream, but the lookup must still
+        // be a no-op rather than a panic if it's reached).
+        assert_eq!(rid_for_ssrc(&[], 0xAAAA_0001), None);
     }
 }
