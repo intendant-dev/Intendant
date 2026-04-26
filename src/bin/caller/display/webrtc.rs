@@ -638,22 +638,34 @@ pub struct WebRtcPeer {
     #[allow(dead_code)]
     pub peer_id: PeerId,
     command_tx: mpsc::Sender<Command>,
-    /// **Phase 4d.1**: per-peer TWCC-derived available outgoing
-    /// bandwidth in bits/sec, refreshed by the driver every
-    /// `TWCC_POLL_INTERVAL`. `None` until the driver completes its
-    /// first poll AND a candidate pair has been nominated; from then
-    /// on, `Some(bps)`. Layer-selection aggregator (4d.2) subscribes
-    /// via [`Self::subscribe_observed_send_bitrate`] to react to changes.
+    /// **Phase 4d.1**: per-peer recent observed send bitrate in
+    /// bits/sec, computed by the driver every `TWCC_POLL_INTERVAL`
+    /// from outbound `bytes_sent` deltas across one polling window.
+    /// `None` on the first poll (seeds the per-SSRC `prev` map) and
+    /// any time the most recent window had zero usable deltas (no
+    /// outbound traffic, counter wraparound, etc.); `Some(bps)` once
+    /// a delta can be computed.
+    ///
+    /// **This is local egress, not available capacity.** It tells
+    /// you "how many bits we just sent," not "how many bits the
+    /// link could carry." Treating it as capacity creates a ratchet:
+    /// pausing a layer drops observed egress, which then keeps the
+    /// layer paused permanently. Capacity-driven layer adaptation
+    /// needs a remote signal — RTCP RR `fraction_lost` per SSRC,
+    /// TWCC arrival feedback, browser-side `getStats` — see 4d.3.
     observed_send_bitrate_rx: watch::Receiver<Option<u64>>,
     shutdown: CancellationToken,
 }
 
 impl WebRtcPeer {
-    /// **Phase 4d.1**: subscribe to this peer's TWCC-derived
-    /// available-outgoing-bandwidth signal. Returns a fresh
+    /// **Phase 4d.1**: subscribe to this peer's recent observed send
+    /// bitrate signal. **Local egress only, not available capacity**
+    /// — see the field docstring on [`Self::observed_send_bitrate_rx`]
+    /// for the semantic distinction and why this can't drive
+    /// capacity-based layer adaptation on its own. Returns a fresh
     /// `watch::Receiver` that always carries the latest published
-    /// estimate (initial value `None` if the first poll hasn't
-    /// completed yet).
+    /// value (initial value `None` until the driver computes a
+    /// `bytes_sent` delta).
     ///
     /// Receivers are independent — multiple subscribers (e.g. the
     /// per-display layer-selection aggregator AND a metrics
@@ -664,9 +676,9 @@ impl WebRtcPeer {
         self.observed_send_bitrate_rx.clone()
     }
 
-    /// **Phase 4d.1**: read the current bandwidth estimate without
-    /// subscribing. Useful for one-shot reads (debug / metrics
-    /// snapshot). For change-driven consumers, prefer
+    /// **Phase 4d.1**: read the current observed send bitrate
+    /// without subscribing. Useful for one-shot reads (debug /
+    /// metrics snapshot). For change-driven consumers, prefer
     /// [`Self::subscribe_observed_send_bitrate`].
     pub fn current_observed_send_bitrate(&self) -> Option<u64> {
         *self.observed_send_bitrate_rx.borrow()
@@ -1120,10 +1132,13 @@ impl WebRtcPeer {
         let (encoded_frame_tx, encoded_frame_rx) =
             mpsc::channel::<OutboundEncodedFrame>(ENCODED_FRAME_CHANNEL);
         let (command_tx, command_rx) = mpsc::channel::<Command>(COMMAND_CHANNEL);
-        // Phase 4d.1: per-peer TWCC bandwidth estimate. Initial value
-        // None — the driver's first poll happens within
-        // TWCC_POLL_INTERVAL of construction; until a candidate pair
-        // is nominated, every poll publishes None too.
+        // Phase 4d.1: per-peer observed send bitrate (`bytes_sent`
+        // delta, local egress only — see WebRtcPeer::observed_send_bitrate_rx
+        // for the semantic distinction from capacity). Initial value
+        // None: the driver's first poll seeds the per-SSRC `prev`
+        // map and returns no delta; the second poll, one
+        // TWCC_POLL_INTERVAL later, publishes the first measurable
+        // rate (None still until any RTP has actually been sent).
         let (observed_send_bitrate_tx, observed_send_bitrate_rx) =
             watch::channel::<Option<u64>>(None);
         let shutdown = CancellationToken::new();
@@ -4379,18 +4394,18 @@ mod tests {
         drop(peer);
     }
 
-    /// **Phase 4d.1**: a freshly-constructed `WebRtcPeer` exposes a
-    /// bandwidth-estimate signal that starts at `None` (the watch
-    /// channel's initial value). The driver's first poll happens
-    /// within `TWCC_POLL_INTERVAL` of construction, but until a
-    /// candidate pair is nominated, every poll publishes `None` too
-    /// — so the steady state in this test (no real ICE flow,
-    /// driver task may or may not have run a tick yet) is `None`.
+    /// **Phase 4d.1**: a freshly-constructed `WebRtcPeer` exposes an
+    /// observed-send-bitrate signal that starts at `None` (the watch
+    /// channel's initial value). The driver's first poll seeds the
+    /// per-SSRC `prev` map and publishes nothing; subsequent polls
+    /// publish a delta. With no RTP traffic in this test (no real
+    /// ICE flow, no media writes), `bytes_sent` stays at 0 and the
+    /// helper produces `None` indefinitely — so the steady state
+    /// here is `None`.
     ///
     /// Pin both APIs:
     /// - `current_observed_send_bitrate()` for one-shot reads.
-    /// - `subscribe_observed_send_bitrate()` for change-driven consumers
-    ///   (the layer-selection aggregator in 4d.2).
+    /// - `subscribe_observed_send_bitrate()` for change-driven consumers.
     #[tokio::test]
     async fn web_rtc_peer_exposes_observed_send_bitrate_api_starting_at_none() {
         ensure_rustls_crypto_provider();
@@ -4423,8 +4438,8 @@ mod tests {
         assert_eq!(
             peer.current_observed_send_bitrate(),
             None,
-            "freshly-constructed peer's bandwidth estimate must be \
-             None until the driver polls a nominated candidate pair"
+            "freshly-constructed peer's observed send bitrate must \
+             be None until the driver computes a `bytes_sent` delta"
         );
 
         // Subscriber: initial `borrow` returns None too. `borrow()`
