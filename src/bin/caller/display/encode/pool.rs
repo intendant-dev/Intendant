@@ -1765,26 +1765,6 @@ impl EncoderPool {
         count
     }
 
-    /// **Phase 4d.0**: pause one encoder slot, identified by
-    /// `(codec, rid)`. The slot's encoder thread keeps running and
-    /// keeps draining its `i420_rx` broadcast subscription (so the
-    /// channel doesn't lag), but skips the downscale + encode +
-    /// broadcast step entirely. Resume via [`Self::resume_layer`].
-    ///
-    /// Returns `true` if a matching slot was found and its pause flag
-    /// flipped to `true`; `false` if no slot exists for `(codec, rid)`.
-    /// Idempotent: pausing an already-paused slot returns `true` and
-    /// is a no-op for the encoder thread.
-    ///
-    /// Searches always-on slots first, then on-demand. Mirrors the
-    /// lookup pattern in [`Self::request_keyframe`] so a future code
-    /// path that does both (e.g. a layer-selection policy
-    /// pause-then-resume) sees consistent semantics.
-    ///
-    /// Used by the layer-selection policy (4d.2) to throttle layers
-    /// no peer is consuming under current TWCC bandwidth conditions.
-    /// Direct callers in production should be the aggregator only;
-    /// peer-side code never calls this directly.
     /// Snapshot the current always-on encoder IDs.
     ///
     /// Returns a `Vec` (not a borrow) so callers don't hold the
@@ -1816,6 +1796,29 @@ impl EncoderPool {
             .collect()
     }
 
+    /// **Phase 4d.0**: pause one encoder slot, identified by
+    /// `(codec, rid)`. The slot's encoder thread keeps running and
+    /// keeps draining its `i420_rx` broadcast subscription (so the
+    /// channel doesn't lag), but skips the downscale + encode +
+    /// broadcast step entirely. Resume via [`Self::resume_layer`].
+    ///
+    /// Returns `true` if a matching slot was found and its pause flag
+    /// flipped to `true`; `false` if no slot exists for `(codec, rid)`.
+    /// Idempotent: pausing an already-paused slot returns `true` and
+    /// is a no-op for the encoder thread.
+    ///
+    /// Searches always-on slots first, then on-demand. Mirrors the
+    /// lookup pattern in [`Self::request_keyframe`] so a future code
+    /// path that does both (e.g. a layer-selection policy
+    /// pause-then-resume) sees consistent semantics.
+    ///
+    /// Used by the layer-selection policy: 4d.2's zero-peer
+    /// aggregator pauses all always-on simulcast layers after a
+    /// debounce window at zero peers (CPU saver during idle); 4d.3
+    /// will add receiver-feedback-driven pause for individual
+    /// over-budget layers when a peer's link health degrades.
+    /// Direct callers in production should be the aggregator;
+    /// peer-side code never calls this directly.
     pub fn pause_layer(&self, codec: CodecKind, rid: SimulcastRid) -> bool {
         let id = EncoderId::new(codec, rid);
         {
@@ -2181,9 +2184,12 @@ fn spawn_encoder_thread_with(
         broadcast::channel::<Arc<EncodedFrame>>(ENCODER_FRAME_BROADCAST_CAPACITY);
     let force_keyframe = Arc::new(AtomicBool::new(false));
     // Phase 4d.0: paused defaults to false. Layer-selection policy
-    // (4d.2) flips this via [`EncoderPool::pause_layer`] /
-    // [`EncoderPool::resume_layer`] when no peer is consuming the
-    // layer under current TWCC bandwidth conditions.
+    // flips this via [`EncoderPool::pause_layer`] /
+    // [`EncoderPool::resume_layer`]: 4d.2 pauses all simulcast
+    // layers after a debounce at zero peers (CPU saver during
+    // idle); 4d.3 will pause individual over-budget layers when
+    // receiver feedback (RTCP RR fraction_lost et al.) shows a
+    // peer's link can't sustain them.
     let paused = Arc::new(AtomicBool::new(false));
     let shutdown = CancellationToken::new();
 
