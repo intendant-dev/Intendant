@@ -1990,6 +1990,16 @@ async fn driver(
                             s.fraction_lost,
                             s.received_rtp_stream_stats.packets_lost,
                             s.round_trip_time,
+                            // Phase 4d.3a review fix: rtc 0.9 emits
+                            // default RemoteInboundRTP snapshots for
+                            // every outbound stream even pre-RR (all
+                            // fields zero). The helper filters on
+                            // `rtt_measurements == 0` to drop those
+                            // before the policy sees them — without
+                            // this, every just-connected peer would
+                            // present a phantom "0% loss" signal that
+                            // looks like real health.
+                            s.round_trip_time_measurements,
                         )),
                         _ => None,
                     });
@@ -2129,27 +2139,51 @@ fn handle_event(
 /// are silently dropped — same defensive policy as the per-RID PLI
 /// router in [`route_rtcp_keyframe_requests`].
 ///
-/// Pure: takes flat `(ssrc, fraction_lost, packets_lost, rtt)` tuples
-/// rather than `&RTCRemoteInboundRtpStreamStats` so tests can
-/// construct synthetic inputs directly without the rtc 0.9
-/// `pub(crate)` constructor walls. Production projection from
+/// Pure: takes flat `(ssrc, fraction_lost, packets_lost, rtt,
+/// rtt_measurements)` tuples rather than
+/// `&RTCRemoteInboundRtpStreamStats` so tests can construct
+/// synthetic inputs directly without the rtc 0.9 `pub(crate)`
+/// constructor walls. Production projection from
 /// `report.iter_by_type(RTCStatsType::RemoteInboundRTP)` happens at
 /// the caller (the driver's `twcc_poll` branch).
 ///
-/// **No deltas in 4d.3a.** All input fields are forwarded as-is:
-/// `fraction_lost` is already a per-RR-window value (rtc 0.9 derives
-/// it from RR), `packets_lost` is cumulative-since-start (deltas can
-/// be derived in 4d.3b if the policy needs them), `rtt` is the most
-/// recent measurement. Keeping the helper purely projective lets
-/// 4d.3b decide which signals to use without re-shaping this layer.
+/// **Pre-RR filtering**: rtc 0.9 emits a default-valued
+/// `RemoteInboundRTP` snapshot for every outbound stream even
+/// before any RR has actually been received — all fields are
+/// zero, including `fraction_lost = 0.0` (which would otherwise
+/// look like "perfectly healthy" to the policy). The
+/// `round_trip_time_measurements == 0` predicate filters these
+/// out: a non-zero count means at least one RR has arrived and
+/// the values reflect a real measurement. Without this filter,
+/// the policy would receive a phantom "0% loss" signal for every
+/// outbound layer the moment the peer connects, immediately
+/// confirming `Wanted` for layers that may not even be reaching
+/// the receiver yet.
+///
+/// **No deltas in 4d.3a.** All forwarded input fields are passed
+/// as-is: `fraction_lost` is already a per-RR-window value (rtc
+/// 0.9 derives it from RR), `packets_lost` is cumulative-since-
+/// start (deltas can be derived in 4d.3b if the policy needs
+/// them), `rtt` is the most recent measurement. Keeping the
+/// helper purely projective lets 4d.3b decide which signals to
+/// use without re-shaping this layer.
 fn map_remote_inbound_to_rid_health(
-    remote_inbound: impl IntoIterator<Item = (u32, f64, i64, f64)>,
+    remote_inbound: impl IntoIterator<Item = (u32, f64, i64, f64, u64)>,
     ssrc_table: &[(SimulcastRid, u32)],
 ) -> HashMap<SimulcastRid, PeerLayerHealth> {
     let mut out = HashMap::new();
-    for (ssrc, fraction_lost, packets_lost_total, round_trip_time_seconds) in
-        remote_inbound
+    for (
+        ssrc,
+        fraction_lost,
+        packets_lost_total,
+        round_trip_time_seconds,
+        rtt_measurements,
+    ) in remote_inbound
     {
+        // Pre-RR default snapshot — see helper docstring.
+        if rtt_measurements == 0 {
+            continue;
+        }
         if let Some(rid) = rid_for_ssrc(ssrc_table, ssrc) {
             out.insert(
                 rid,
@@ -5118,10 +5152,13 @@ mod tests {
         // RID table, RR for an SSRC we never advertised). Same
         // defensive policy as `route_rtcp_keyframe_requests`: drop
         // silently rather than fail, since these can occur in the
-        // normal lifecycle and aren't actionable.
+        // normal lifecycle and aren't actionable. `rtt_measurements
+        // = 5` keeps this entry past the pre-RR filter so the test
+        // exercises the SSRC-table-drop path specifically, not the
+        // pre-RR-filter path.
         let table = vp8_simulcast_ssrc_table();
         let out = map_remote_inbound_to_rid_health(
-            vec![(0xDEAD_BEEFu32, 0.05, 42, 0.018)],
+            vec![(0xDEAD_BEEFu32, 0.05, 42, 0.018, 5)],
             &table,
         );
         assert!(out.is_empty());
@@ -5132,9 +5169,10 @@ mod tests {
         let table = vp8_simulcast_ssrc_table();
         let out = map_remote_inbound_to_rid_health(
             vec![
-                (0xAAAA_0001u32, 0.01, 5, 0.012),  // full
-                (0xAAAA_0002u32, 0.05, 23, 0.018), // half
-                (0xAAAA_0003u32, 0.20, 99, 0.025), // quarter
+                // (ssrc, fraction_lost, packets_lost, rtt, rtt_measurements)
+                (0xAAAA_0001u32, 0.01, 5, 0.012, 3),  // full
+                (0xAAAA_0002u32, 0.05, 23, 0.018, 7), // half
+                (0xAAAA_0003u32, 0.20, 99, 0.025, 4), // quarter
             ],
             &table,
         );
@@ -5170,12 +5208,15 @@ mod tests {
         // A realistic transient-window state: RR for one
         // simulcast layer arrives alongside RR for a now-released
         // on-demand H.264 SSRC. Helper preserves the known RID
-        // entry, drops the unknown.
+        // entry, drops the unknown. Both have non-zero
+        // `rtt_measurements` so the pre-RR filter doesn't
+        // intercept either — the test exercises SSRC-table-membership
+        // specifically.
         let table = vp8_simulcast_ssrc_table();
         let out = map_remote_inbound_to_rid_health(
             vec![
-                (0xAAAA_0002u32, 0.07, 30, 0.020), // half (known)
-                (0xCAFE_BABEu32, 0.50, 200, 0.100), // unknown
+                (0xAAAA_0002u32, 0.07, 30, 0.020, 9), // half (known)
+                (0xCAFE_BABEu32, 0.50, 200, 0.100, 11), // unknown
             ],
             &table,
         );
@@ -5197,15 +5238,64 @@ mod tests {
         // Defends the early-session window before `state.rtp.by_rid`
         // is fully populated (or after teardown clears it). Every
         // RR that arrives has nothing to map against; helper returns
-        // empty rather than panicking on the lookup.
+        // empty rather than panicking on the lookup. Inputs use
+        // `rtt_measurements > 0` so the pre-RR filter doesn't pre-
+        // empt the SSRC-table check — the test exercises empty-
+        // table-drop semantics specifically.
         let out = map_remote_inbound_to_rid_health(
             vec![
-                (0xAAAA_0001u32, 0.0, 0, 0.0),
-                (0xAAAA_0002u32, 0.0, 0, 0.0),
+                (0xAAAA_0001u32, 0.01, 5, 0.012, 2),
+                (0xAAAA_0002u32, 0.02, 7, 0.015, 3),
             ],
             &[],
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn map_remote_inbound_filters_pre_rr_default_snapshots() {
+        // **4d.3a review fix regression**: rtc 0.9's accumulator
+        // emits a default-valued `RemoteInboundRTP` entry for every
+        // outbound stream the moment the stream exists, even before
+        // any actual RR has been received. All fields default to
+        // zero, including `fraction_lost = 0.0` (which would
+        // otherwise present as "perfectly healthy" to the 4d.3b
+        // policy and confirm `Wanted` immediately on connect).
+        // `round_trip_time_measurements == 0` is the discriminator:
+        // non-zero means at least one RR has arrived and the values
+        // reflect a real measurement. The helper filters zero-
+        // measurement entries out so the policy receives "no
+        // signal" until the first RR actually lands.
+        let table = vp8_simulcast_ssrc_table();
+        let out = map_remote_inbound_to_rid_health(
+            vec![
+                // Pre-RR snapshot for `full` — must be filtered.
+                (0xAAAA_0001u32, 0.0, 0, 0.0, 0),
+                // Real RR-derived snapshot for `half` — must be kept.
+                (0xAAAA_0002u32, 0.05, 23, 0.018, 4),
+                // Another pre-RR snapshot for `quarter`, with
+                // `fraction_lost = 0.0` that would look "healthy"
+                // if not filtered. Must be filtered.
+                (0xAAAA_0003u32, 0.0, 0, 0.0, 0),
+            ],
+            &table,
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "only the entry with rtt_measurements > 0 should survive; \
+             pre-RR defaults must be filtered. Got {out:?}",
+        );
+        assert!(!out.contains_key(&SimulcastRid::full()));
+        assert!(!out.contains_key(&SimulcastRid::quarter()));
+        assert_eq!(
+            out.get(&SimulcastRid::half()),
+            Some(&PeerLayerHealth {
+                fraction_lost: 0.05,
+                packets_lost_total: 23,
+                round_trip_time_seconds: 0.018,
+            })
+        );
     }
 
     /// **Phase 4d.3a**: a freshly-constructed `WebRtcPeer` exposes a
