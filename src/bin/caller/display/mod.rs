@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::CallerError;
 
+pub mod aggregator;
 pub mod clipboard;
 pub mod encode;
 pub mod forward;
@@ -443,6 +444,15 @@ pub struct DisplaySession {
     /// BGRA→I420 conversion and `pool.push_i420_frame` loop. Drained
     /// on `stop()` for deterministic teardown ordering.
     pool_feed_bridge_handle: Mutex<Option<JoinHandle<()>>>,
+    /// **Phase 4d.2** zero-peer gating handle. `Some` for the
+    /// lifetime of a started session: spawned eagerly by
+    /// [`Self::start`] after the pool-feed bridge, awaited in
+    /// [`Self::stop`] after the bridge is drained. Owns the
+    /// per-display state machine that pauses all always-on simulcast
+    /// layers after `PAUSE_DEBOUNCE` at zero peers and resumes them
+    /// on the first peer arrival. See [`crate::display::aggregator`]
+    /// for the policy. `None` before `start()` / after `stop()`.
+    aggregator_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl DisplaySession {
@@ -464,6 +474,7 @@ impl DisplaySession {
             pool_feed_keyframe_tx: Mutex::new(None),
             pool: std::sync::OnceLock::new(),
             pool_feed_bridge_handle: Mutex::new(None),
+            aggregator_handle: Mutex::new(None),
         }
     }
 
@@ -623,8 +634,45 @@ impl DisplaySession {
         // previous lazy spawn from `handle_offer_pool_mode` (then
         // `ensure_pool_feed_bridge_started`) — see
         // [`Self::spawn_pool_feed_bridge`] for the rationale.
-        self.spawn_pool_feed_bridge(pool_arc, fps, event_bus_for_encoder)
+        self.spawn_pool_feed_bridge(Arc::clone(&pool_arc), fps, event_bus_for_encoder)
             .await;
+
+        // 4d.2: spawn the zero-peer aggregator. Snapshots the
+        // current always-on simulcast rid set (vp8_simulcast at this
+        // session's source dims) for the closure to drive
+        // pool.pause_layer / pool.resume_layer. The snapshot is
+        // stable for the session lifetime — runtime on_resize that
+        // changes the layer set is rare and the worst case is the
+        // aggregator's pause/resume call hitting a rid that no
+        // longer exists, which the pool silently no-ops. 4d.3 may
+        // refresh this snapshot on resize if it matters in practice.
+        let simulcast_rids: Vec<encode::pool::SimulcastRid> =
+            encode::pool::LayerSpec::vp8_simulcast(width, height, fps)
+                .into_iter()
+                .map(|l| l.rid)
+                .collect();
+        let pool_for_aggregator = Arc::clone(&pool_arc);
+        let on_action: Box<dyn Fn(aggregator::AggregatorAction) + Send + Sync> =
+            Box::new(move |action| match action {
+                aggregator::AggregatorAction::PauseAllSimulcast => {
+                    for rid in &simulcast_rids {
+                        pool_for_aggregator
+                            .pause_layer(encode::pool::CodecKind::Vp8, rid.clone());
+                    }
+                }
+                aggregator::AggregatorAction::ResumeAllSimulcast => {
+                    for rid in &simulcast_rids {
+                        pool_for_aggregator
+                            .resume_layer(encode::pool::CodecKind::Vp8, rid.clone());
+                    }
+                }
+            });
+        let aggregator_task = aggregator::spawn_zero_peer_aggregator(
+            Arc::clone(&self.peers),
+            on_action,
+            self.shutdown.clone(),
+        );
+        *self.aggregator_handle.lock().await = Some(aggregator_task);
 
         // --- Task 3: FrameRegistry sampler (1 Hz JPEG for model feeds) ---
         if let Some(registry) = frame_registry {
@@ -784,6 +832,14 @@ impl DisplaySession {
         // other tasks DisplaySession owns) we take the handle and
         // await its completion here too.
         if let Some(h) = self.pool_feed_bridge_handle.lock().await.take() {
+            let _ = h.await;
+        }
+        // 4d.2: aggregator observes the same `shutdown` token and
+        // exits its tick loop on its own. We take + await for
+        // deterministic teardown ordering (parity with the bridge
+        // and capture handles above) and so a follow-up `start()`
+        // doesn't leak the previous session's task.
+        if let Some(h) = self.aggregator_handle.lock().await.take() {
             let _ = h.await;
         }
 
