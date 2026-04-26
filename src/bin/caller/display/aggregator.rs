@@ -425,6 +425,218 @@ pub fn aggregate_wanted_layers(
     out
 }
 
+// ===========================================================================
+// Phase 4d.3c: capacity aggregator wiring
+// ===========================================================================
+//
+// Per-display task that subscribes to per-peer
+// `remote_inbound_health_rx` watches, maintains per-(peer,
+// non-floor-RID) capacity-policy state across ticks, and applies
+// pause/resume actions when the aggregate wanted-layer set changes.
+//
+// **Coexists with the 4d.2 zero-peer aggregator without fighting:**
+// the capacity aggregator skips its tick when `peers.is_empty()` —
+// 4d.2 owns the peer-presence transitions (pause-all-on-zero,
+// resume-all-on-first-peer), and the capacity aggregator only acts
+// while peers are present and have something to say about per-RID
+// link health. Pool methods are idempotent so any race is benign,
+// but skip-on-no-peers prevents the capacity aggregator from
+// firing redundant actions during 4d.2's pause windows.
+//
+// **Floor RID is excluded from capacity decisions** by construction:
+// `get_non_floor_rids` (production: derived from
+// `pool.always_on_ids()` minus the last entry, which `vp8_simulcast`
+// guarantees to be the smallest layer) defines the iteration set.
+// The floor stays unconditionally `Wanted` whenever any peer is
+// connected — its lifecycle is 4d.2's responsibility.
+//
+// **`last_applied` initialization**: the capacity aggregator
+// initializes `last_applied` to the full non-floor RID set on its
+// first tick, mirroring `EncoderPool::new`'s contract that
+// always-on layers start active. Without this, the first tick
+// would diff against an empty `last_applied` and fire
+// `ResumeLayer` for every wanted RID — redundant (the layers are
+// already active) and noisy in tests / logs.
+
+/// Side-effecting action the capacity aggregator can request.
+/// Applied via the closure passed to [`spawn_capacity_aggregator`];
+/// production wiring at [`crate::display::DisplaySession::start`]
+/// maps each variant to [`crate::display::encode::pool::EncoderPool::pause_layer`]
+/// / [`crate::display::encode::pool::EncoderPool::resume_layer`]
+/// with `CodecKind::Vp8` (the always-on simulcast codec).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapacityAction {
+    /// Pause one simulcast layer (a non-floor RID the aggregate no
+    /// longer wants).
+    PauseLayer(SimulcastRid),
+    /// Resume one simulcast layer (a non-floor RID newly present in
+    /// the aggregate). Pool's `resume_layer` already forces a
+    /// keyframe on the paused→active edge per the 4d.0 review fix,
+    /// so a peer waiting on this layer gets a decodable frame
+    /// within one encode tick.
+    ResumeLayer(SimulcastRid),
+}
+
+/// Pure: compute the action sequence for one tick by diffing the
+/// previously-applied wanted set against the current aggregate.
+/// Iteration is bounded by `all_non_floor_rids` (not by either
+/// HashSet) so the action ordering is stable across runs and tests.
+///
+/// Layers in `prev_applied` but missing from `current_aggregate` →
+/// `PauseLayer`; layers in `current_aggregate` but missing from
+/// `prev_applied` → `ResumeLayer`. Layers present in both, or
+/// absent from both, produce no action (idempotent at the pool
+/// layer either way, but skipping the no-op call keeps the
+/// closure-invocation count down — useful in tests with a
+/// recording sink).
+pub fn diff_wanted_aggregate(
+    prev_applied: &HashSet<SimulcastRid>,
+    current_aggregate: &HashSet<SimulcastRid>,
+    all_non_floor_rids: &[SimulcastRid],
+) -> Vec<CapacityAction> {
+    let mut out = Vec::new();
+    for rid in all_non_floor_rids {
+        let was = prev_applied.contains(rid);
+        let is = current_aggregate.contains(rid);
+        if was && !is {
+            out.push(CapacityAction::PauseLayer(rid.clone()));
+        } else if !was && is {
+            out.push(CapacityAction::ResumeLayer(rid.clone()));
+        }
+    }
+    out
+}
+
+/// Spawn the capacity aggregator for one display.
+///
+/// `peers` is shared with the [`crate::display::DisplaySession`]
+/// peer registry — read-only iteration, never mutated. The
+/// aggregator subscribes to each peer's
+/// [`crate::display::webrtc::WebRtcPeer::subscribe_remote_inbound_health`]
+/// watch lazily on first observation per peer, drops subscriptions
+/// for peers no longer present.
+///
+/// `get_non_floor_rids` returns the non-floor simulcast RIDs to
+/// apply policy to. Production wiring captures
+/// `Arc<EncoderPool>` and returns `pool.always_on_ids()` minus the
+/// last entry (the floor); tests pass a fixed Vec.
+///
+/// `on_action` applies the requested side effect. Production wiring
+/// captures `Arc<EncoderPool>` and routes `PauseLayer` /
+/// `ResumeLayer` to `pool.pause_layer` / `pool.resume_layer` with
+/// `CodecKind::Vp8`; tests pass a recording closure.
+///
+/// The task exits cleanly on `shutdown.cancelled()`. Returned
+/// `JoinHandle` is awaited by [`crate::display::DisplaySession::stop`].
+pub fn spawn_capacity_aggregator(
+    peers: Arc<RwLock<HashMap<PeerId, Arc<WebRtcPeer>>>>,
+    get_non_floor_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync>,
+    on_action: Box<dyn Fn(CapacityAction) + Send + Sync>,
+    config: CapacityPolicyConfig,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut state: HashMap<(PeerId, SimulcastRid), LayerCapacityState> =
+            HashMap::new();
+        let mut peer_subs: HashMap<
+            PeerId,
+            tokio::sync::watch::Receiver<HashMap<SimulcastRid, PeerLayerHealth>>,
+        > = HashMap::new();
+        // Initialize on the first tick (after the first
+        // `get_non_floor_rids` call sees the actual layer set).
+        let mut last_applied: HashSet<SimulcastRid> = HashSet::new();
+        let mut initialized = false;
+        let mut tick = tokio::time::interval(TICK);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tick.tick() => {
+                    let now = Instant::now();
+
+                    if !initialized {
+                        last_applied = get_non_floor_rids().into_iter().collect();
+                        initialized = true;
+                    }
+
+                    let current_peers = peers.read().await;
+
+                    // Skip on zero peers: defer to 4d.2's zero-peer
+                    // aggregator. `last_applied` is preserved so when
+                    // peers return, the diff resumes exactly the
+                    // layers that were active before the idle window.
+                    if current_peers.is_empty() {
+                        continue;
+                    }
+
+                    // Sync subscriptions: drop for absent peers,
+                    // add for new peers.
+                    peer_subs.retain(|id, _| current_peers.contains_key(id));
+                    for (id, peer) in current_peers.iter() {
+                        peer_subs
+                            .entry(id.clone())
+                            .or_insert_with(|| peer.subscribe_remote_inbound_health());
+                    }
+
+                    // Drop state entries for peers no longer present.
+                    state.retain(|(pid, _), _| current_peers.contains_key(pid));
+
+                    let peer_ids: Vec<PeerId> =
+                        current_peers.keys().cloned().collect();
+                    drop(current_peers);
+
+                    let non_floor_rids = get_non_floor_rids();
+                    let mut per_peer_wanted: Vec<HashSet<SimulcastRid>> =
+                        Vec::with_capacity(peer_ids.len());
+
+                    for peer_id in &peer_ids {
+                        // SAFE: peer_id is in current_peers (we just
+                        // populated peer_subs from current_peers); the
+                        // `or_insert_with` above guarantees this entry
+                        // exists.
+                        let health_map =
+                            peer_subs.get(peer_id).unwrap().borrow().clone();
+                        let mut peer_wanted_rids: HashSet<SimulcastRid> =
+                            HashSet::new();
+
+                        for rid in &non_floor_rids {
+                            let key = (peer_id.clone(), rid.clone());
+                            // New (peer, RID) entries default to
+                            // Wanted — conservative, matches "no RR
+                            // yet → no signal" semantic from 4d.3a.
+                            let prev = state
+                                .get(&key)
+                                .copied()
+                                .unwrap_or(LayerCapacityState::Wanted);
+                            let health = health_map.get(rid);
+                            let next = step_layer_capacity_state(
+                                prev, health, &config, now,
+                            );
+                            state.insert(key, next);
+                            if layer_state_is_wanted(&next) {
+                                peer_wanted_rids.insert(rid.clone());
+                            }
+                        }
+                        per_peer_wanted.push(peer_wanted_rids);
+                    }
+
+                    let aggregate = aggregate_wanted_layers(per_peer_wanted);
+                    let actions = diff_wanted_aggregate(
+                        &last_applied,
+                        &aggregate,
+                        &non_floor_rids,
+                    );
+                    for action in actions {
+                        on_action(action);
+                    }
+                    last_applied = aggregate;
+                }
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,5 +1117,130 @@ mod tests {
             [SimulcastRid::full()].into_iter().collect();
         let agg = aggregate_wanted_layers(vec![only_full.clone()]);
         assert_eq!(agg, only_full);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 4d.3c: diff_wanted_aggregate + spawn smoke test
+    // -----------------------------------------------------------------
+
+    fn vp8_non_floor_rids() -> Vec<SimulcastRid> {
+        // VP8 simulcast: full / half / quarter (descending bitrate);
+        // floor = quarter; non-floor = [full, half] in spec order.
+        vec![SimulcastRid::full(), SimulcastRid::half()]
+    }
+
+    #[test]
+    fn diff_wanted_no_change_no_actions() {
+        // Steady state: aggregate matches what was last applied.
+        // Test all four "no change" cases to ensure the diff
+        // genuinely respects equality (not just non-empty intersection).
+        for set in [
+            HashSet::<SimulcastRid>::new(),
+            [SimulcastRid::full()].into_iter().collect(),
+            [SimulcastRid::half()].into_iter().collect(),
+            [SimulcastRid::full(), SimulcastRid::half()].into_iter().collect(),
+        ] {
+            let actions =
+                diff_wanted_aggregate(&set, &set, &vp8_non_floor_rids());
+            assert!(
+                actions.is_empty(),
+                "no-change diff fired actions for {set:?}: {actions:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn diff_wanted_layer_dropped_fires_pause_action() {
+        // full was applied, now no longer wanted. Pause action fires.
+        let prev: HashSet<SimulcastRid> =
+            [SimulcastRid::full(), SimulcastRid::half()].into_iter().collect();
+        let current: HashSet<SimulcastRid> =
+            [SimulcastRid::half()].into_iter().collect();
+        let actions = diff_wanted_aggregate(&prev, &current, &vp8_non_floor_rids());
+        assert_eq!(actions, vec![CapacityAction::PauseLayer(SimulcastRid::full())]);
+    }
+
+    #[test]
+    fn diff_wanted_layer_added_fires_resume_action() {
+        // full was paused, now wanted again. Resume action fires.
+        let prev: HashSet<SimulcastRid> =
+            [SimulcastRid::half()].into_iter().collect();
+        let current: HashSet<SimulcastRid> =
+            [SimulcastRid::full(), SimulcastRid::half()].into_iter().collect();
+        let actions = diff_wanted_aggregate(&prev, &current, &vp8_non_floor_rids());
+        assert_eq!(
+            actions,
+            vec![CapacityAction::ResumeLayer(SimulcastRid::full())]
+        );
+    }
+
+    #[test]
+    fn diff_wanted_mixed_pause_and_resume_in_spec_order() {
+        // full was wanted (now paused); half was paused (now wanted).
+        // Iteration order follows `vp8_non_floor_rids()` spec order so
+        // tests + downstream consumers see deterministic ordering.
+        let prev: HashSet<SimulcastRid> =
+            [SimulcastRid::full()].into_iter().collect();
+        let current: HashSet<SimulcastRid> =
+            [SimulcastRid::half()].into_iter().collect();
+        let actions = diff_wanted_aggregate(&prev, &current, &vp8_non_floor_rids());
+        assert_eq!(
+            actions,
+            vec![
+                CapacityAction::PauseLayer(SimulcastRid::full()),
+                CapacityAction::ResumeLayer(SimulcastRid::half()),
+            ]
+        );
+    }
+
+    /// **Spawn smoke test**: with no peers, the capacity aggregator
+    /// produces NO actions even after several ticks. Confirms the
+    /// `peers.is_empty() → skip` guard prevents the aggregator from
+    /// fighting 4d.2's zero-peer pause/resume cycle.
+    ///
+    /// Pure-policy state-machine semantics are exhaustively covered
+    /// by the `capacity_step_*` tests; this smoke test exists to
+    /// pin the spawn-time wiring (init, tick, peer-empty guard,
+    /// closure invocation) without burning real-time on debounce
+    /// windows.
+    #[tokio::test]
+    async fn capacity_spawn_with_no_peers_records_no_actions() {
+        use std::sync::Mutex as StdMutex;
+
+        let peers: Arc<RwLock<HashMap<PeerId, Arc<WebRtcPeer>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let recorded: Arc<StdMutex<Vec<CapacityAction>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let recorded_for_closure = Arc::clone(&recorded);
+        let on_action: Box<dyn Fn(CapacityAction) + Send + Sync> =
+            Box::new(move |a| {
+                recorded_for_closure.lock().unwrap().push(a);
+            });
+        let get_non_floor_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync> =
+            Box::new(|| vp8_non_floor_rids());
+
+        let shutdown = CancellationToken::new();
+        let handle = spawn_capacity_aggregator(
+            Arc::clone(&peers),
+            get_non_floor_rids,
+            on_action,
+            CapacityPolicyConfig::default(),
+            shutdown.clone(),
+        );
+
+        // Wait through several ticks. With no peers, the capacity
+        // aggregator must skip and never call on_action.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let actions = recorded.lock().unwrap().clone();
+        assert!(
+            actions.is_empty(),
+            "capacity aggregator must not fire actions when no peers \
+             are present (defers to 4d.2 zero-peer aggregator); \
+             got {actions:?}",
+        );
+
+        shutdown.cancel();
+        let _ = handle.await;
     }
 }

@@ -453,6 +453,19 @@ pub struct DisplaySession {
     /// on the first peer arrival. See [`crate::display::aggregator`]
     /// for the policy. `None` before `start()` / after `stop()`.
     aggregator_handle: Mutex<Option<JoinHandle<()>>>,
+    /// **Phase 4d.3c** capacity aggregator handle. `Some` for the
+    /// lifetime of a started session: spawned eagerly by
+    /// [`Self::start`] after the zero-peer aggregator, awaited in
+    /// [`Self::stop`] alongside it. Owns the per-(peer, non-floor-RID)
+    /// capacity-policy state machine that pauses individual upper
+    /// simulcast layers when a peer's RTCP-RR-derived `fraction_lost`
+    /// indicates the link can't sustain that layer, and resumes them
+    /// when the signal clearly recovers. Defers to the zero-peer
+    /// aggregator on peer-presence transitions (skips its tick when
+    /// `peers.is_empty()`); pool methods are idempotent so any
+    /// residual race is benign. See [`crate::display::aggregator`]
+    /// for the policy. `None` before `start()` / after `stop()`.
+    capacity_aggregator_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl DisplaySession {
@@ -475,6 +488,7 @@ impl DisplaySession {
             pool: std::sync::OnceLock::new(),
             pool_feed_bridge_handle: Mutex::new(None),
             aggregator_handle: Mutex::new(None),
+            capacity_aggregator_handle: Mutex::new(None),
         }
     }
 
@@ -667,6 +681,64 @@ impl DisplaySession {
         );
         *self.aggregator_handle.lock().await = Some(aggregator_task);
 
+        // 4d.3c: spawn the capacity aggregator. Two closures wired
+        // to the pool:
+        //
+        //   - `get_non_floor_rids` queries `pool.always_on_ids()` at
+        //     action time and drops the last entry. `vp8_simulcast`
+        //     produces layers in descending bitrate order (full,
+        //     half, quarter), so `last()` is the floor. Querying
+        //     fresh each tick mirrors the zero-peer aggregator's
+        //     handling of post-resize layer-set changes.
+        //   - `on_action` routes `CapacityAction::PauseLayer(rid)` /
+        //     `ResumeLayer(rid)` to `pool.pause_layer` /
+        //     `pool.resume_layer` with `CodecKind::Vp8` (the always-
+        //     on simulcast codec).
+        //
+        // Both aggregators run as independent tasks; capacity
+        // skips its tick when `peers.is_empty()` so the zero-peer
+        // aggregator owns presence-transition behavior cleanly.
+        // Pool methods are idempotent — any residual race between
+        // the two is benign (extra encoder atomic flips at worst).
+        let pool_for_capacity_rids = Arc::clone(&pool_arc);
+        let get_non_floor_rids: Box<
+            dyn Fn() -> Vec<encode::pool::SimulcastRid> + Send + Sync,
+        > = Box::new(move || {
+            let mut ids = pool_for_capacity_rids.always_on_ids();
+            // The floor (smallest layer, last in spec order) is
+            // unconditionally `Wanted` whenever any peer is
+            // connected — its lifecycle belongs to the zero-peer
+            // aggregator. Drop it from the capacity-policy
+            // iteration set.
+            ids.pop();
+            ids.into_iter()
+                .filter(|id| id.codec == encode::pool::CodecKind::Vp8)
+                .map(|id| id.rid)
+                .collect()
+        });
+        let pool_for_capacity_action = Arc::clone(&pool_arc);
+        let on_capacity_action: Box<
+            dyn Fn(aggregator::CapacityAction) + Send + Sync,
+        > = Box::new(move |action| match action {
+            aggregator::CapacityAction::PauseLayer(rid) => {
+                pool_for_capacity_action
+                    .pause_layer(encode::pool::CodecKind::Vp8, rid);
+            }
+            aggregator::CapacityAction::ResumeLayer(rid) => {
+                pool_for_capacity_action
+                    .resume_layer(encode::pool::CodecKind::Vp8, rid);
+            }
+        });
+        let capacity_aggregator_task = aggregator::spawn_capacity_aggregator(
+            Arc::clone(&self.peers),
+            get_non_floor_rids,
+            on_capacity_action,
+            aggregator::CapacityPolicyConfig::default(),
+            self.shutdown.clone(),
+        );
+        *self.capacity_aggregator_handle.lock().await =
+            Some(capacity_aggregator_task);
+
         // --- Task 3: FrameRegistry sampler (1 Hz JPEG for model feeds) ---
         if let Some(registry) = frame_registry {
             let latest = Arc::clone(&self.latest_frame);
@@ -833,6 +905,14 @@ impl DisplaySession {
         // and capture handles above) and so a follow-up `start()`
         // doesn't leak the previous session's task.
         if let Some(h) = self.aggregator_handle.lock().await.take() {
+            let _ = h.await;
+        }
+        // 4d.3c: capacity aggregator observes the same `shutdown`
+        // token and exits on its own. Take + await for
+        // deterministic teardown and to avoid leaking the task
+        // across re-`start()` cycles. Same pattern as the
+        // zero-peer aggregator handle above.
+        if let Some(h) = self.capacity_aggregator_handle.lock().await.take() {
             let _ = h.await;
         }
 
