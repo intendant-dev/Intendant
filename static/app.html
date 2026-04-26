@@ -7798,9 +7798,21 @@ class DisplaySlot {
       }
     };
 
-    // Create offer and send to server
+    // Create offer and send to server.
+    //
+    // Phase 4c follow-up: inject `a=rid:* recv` + `a=simulcast:recv`
+    // into the m=video section before setLocalDescription so the
+    // server's answer can carry a multi-encoding sendonly track
+    // (VP8 simulcast f;h;q). Munge BEFORE setLocalDescription so the
+    // localDescription matches what's sent on the wire — server-side
+    // SDP-validation tests assume the offer/local-description
+    // contains the simulcast hint.
     this.pc.createOffer().then(offer => {
-      return this.pc.setLocalDescription(offer);
+      const munged = {
+        type: offer.type,
+        sdp: injectRecvSimulcastIntoVideoOffer(offer.sdp, DISPLAY_SIMULCAST_RIDS),
+      };
+      return this.pc.setLocalDescription(munged);
     }).then(() => {
       if (app) {
         const offerPayload = { t: 'display_offer', display_id: this.displayId, sdp: this.pc.localDescription.sdp };
@@ -11016,6 +11028,67 @@ function isLoopbackUrl(url) {
   }
 }
 
+// VP8 simulcast RIDs the server-side encoder pool produces, in
+// preference order (full → half → quarter). Browser-side Offer SDPs
+// must advertise these as `a=rid:<rid> recv` + `a=simulcast:recv f;h;q`
+// so the server's answer can carry a multi-encoding sendonly track —
+// rtc 0.9 (and previously str0m) only emits `a=simulcast:send` in the
+// answer when the offer side has declared the matching `recv`
+// counterpart. Without the offer hint the negotiation drops back to a
+// single VP8 encoding and the encoder pool's lower simulcast layers
+// are produced-but-never-sent.
+//
+// MUST stay in sync with `LayerSpec::vp8_simulcast` server-side
+// (display/encode/pool.rs) — RIDs are part of the wire contract,
+// drift here vs the encoder pool means the answer SDP advertises
+// RIDs the browser doesn't recognize and the track never wires up.
+const DISPLAY_SIMULCAST_RIDS = ['f', 'h', 'q'];
+
+// Inject `a=rid:<rid> recv` lines + `a=simulcast:recv <rids>` into
+// the m=video section of an Offer SDP. Mirrors the server-side
+// answer-side simulcast advertisement so the browser→server WebRTC
+// negotiation surfaces our 3-layer simulcast track. Called by both
+// `DisplaySlot.connect()` (local display) and
+// `PeerDisplayConnection.connect()` (federated peer display) BEFORE
+// `setLocalDescription` so the local description matches the wire
+// payload exactly.
+//
+// Idempotent: returns `sdp` unchanged if the m=video section already
+// declares `a=simulcast:` — avoids double-injection on the
+// reconnect / re-offer paths that recreate the RTCPeerConnection
+// from a previous offer's SDP.
+//
+// No-op cases (return input unchanged):
+//   - `rids` empty (caller bug — pass at least one RID)
+//   - no m=video section (audio-only offer, shouldn't happen for our
+//     display flows but defensive)
+//   - m=video already declares `a=simulcast:` (idempotent)
+//
+// SDP is split on CRLF (RFC 4566 line terminator) and rejoined the
+// same way; works for the offer SDPs both Chrome and Safari emit.
+function injectRecvSimulcastIntoVideoOffer(sdp, rids) {
+  if (!rids || rids.length === 0) return sdp;
+  const lines = sdp.split('\r\n');
+  let videoStart = -1;
+  let videoEnd = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('m=video')) {
+      videoStart = i;
+    } else if (lines[i].startsWith('m=') && videoStart >= 0) {
+      videoEnd = i;
+      break;
+    }
+  }
+  if (videoStart < 0) return sdp;
+  for (let i = videoStart; i < videoEnd; i++) {
+    if (lines[i].startsWith('a=simulcast:')) return sdp;
+  }
+  const inject = rids.map(rid => `a=rid:${rid} recv`);
+  inject.push(`a=simulcast:recv ${rids.join(';')}`);
+  lines.splice(videoEnd, 0, ...inject);
+  return lines.join('\r\n');
+}
+
 // Return the URL the browser should advertise as `advertise_tcp_via_url`
 // when opening a peer display, or '' when none is usable. Precedence:
 // (1) explicit operator browser_tcp_via_url, (2) ws_url fallback, (3)
@@ -11866,8 +11939,18 @@ class PeerDisplayConnection {
     };
 
     try {
+      // Phase 4c follow-up: inject `a=rid:* recv` + `a=simulcast:recv`
+      // into the m=video section before setLocalDescription so the
+      // peer's answer can carry a multi-encoding sendonly track
+      // (VP8 simulcast f;h;q). Munge BEFORE setLocalDescription so
+      // the localDescription matches what's sent on the wire and
+      // server-side SDP validation sees the same simulcast hint.
       const offer = await this.pc.createOffer();
-      await this.pc.setLocalDescription(offer);
+      const munged = {
+        type: offer.type,
+        sdp: injectRecvSimulcastIntoVideoOffer(offer.sdp, DISPLAY_SIMULCAST_RIDS),
+      };
+      await this.pc.setLocalDescription(munged);
       const offerSignal = {
         kind: 'offer',
         sdp: this.pc.localDescription.sdp,
