@@ -101,16 +101,27 @@ const COMMAND_CHANNEL: usize = 32;
 const KEYFRAME_REQUEST_CHANNEL: usize = 16;
 
 /// **Phase 4d.1**: how often the driver polls `rtc.get_stats(..)` to
-/// extract the TWCC-derived per-peer outgoing-bandwidth estimate.
+/// compute the per-peer recent observed send bitrate from outbound
+/// `bytes_sent` deltas across one polling window.
 ///
-/// 1s balances reactivity against poll cost: TWCC bandwidth estimates
-/// stabilize on a sub-second timescale (Google congestion control
-/// updates every ~100ms), so polling at 1s catches steady-state shifts
-/// without missing transient drops by more than one interval. Polls
-/// are cheap (read-only walk of the rtc-side accumulator state), so
-/// this isn't a CPU concern; the tradeoff is purely the staleness
-/// of the watch-channel value the layer-selection aggregator (4d.2)
-/// reads.
+/// 1s is the smallest interval where the bytes-delta has enough
+/// signal-to-noise to be a useful steady-state observation: a 30fps
+/// VP8 simulcast at ~3 Mbps total produces ~375 KB/poll at 1s, vs
+/// per-packet jitter of single-KB. Faster polling (e.g. 200ms)
+/// would amplify per-packet jitter into the rate estimate without
+/// actually catching real bandwidth shifts any sooner. Polls
+/// themselves are cheap (read-only walk of the rtc-side accumulator
+/// state); the tradeoff is purely the staleness of the watch-channel
+/// value the layer-selection aggregator (4d.2) reads.
+///
+/// **Why not `available_outgoing_bitrate`**: rtc 0.9's
+/// `RTCIceCandidatePairStats::available_outgoing_bitrate` is
+/// initialized to 0.0 by `rtc-ice-0.9.0` and never written to —
+/// rtc 0.9's `update_ice_agent_stats` only copies STUN counters and
+/// RTT, no congestion-control bandwidth estimate flows through.
+/// Polling that field returns 0.0 forever. Deriving from
+/// `bytes_sent` deltas observes a signal rtc 0.9 actually
+/// maintains.
 const TWCC_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// Maximum UDP datagram we'll receive on the per-peer socket.
@@ -632,8 +643,8 @@ pub struct WebRtcPeer {
     /// `TWCC_POLL_INTERVAL`. `None` until the driver completes its
     /// first poll AND a candidate pair has been nominated; from then
     /// on, `Some(bps)`. Layer-selection aggregator (4d.2) subscribes
-    /// via [`Self::subscribe_bandwidth_estimate`] to react to changes.
-    bandwidth_estimate_rx: watch::Receiver<Option<u64>>,
+    /// via [`Self::subscribe_observed_send_bitrate`] to react to changes.
+    observed_send_bitrate_rx: watch::Receiver<Option<u64>>,
     shutdown: CancellationToken,
 }
 
@@ -646,19 +657,19 @@ impl WebRtcPeer {
     ///
     /// Receivers are independent — multiple subscribers (e.g. the
     /// per-display layer-selection aggregator AND a metrics
-    /// dashboard) can each `subscribe_bandwidth_estimate` and read
+    /// dashboard) can each `subscribe_observed_send_bitrate` and read
     /// independently; calling `borrow_and_update` on one doesn't
     /// affect another.
-    pub fn subscribe_bandwidth_estimate(&self) -> watch::Receiver<Option<u64>> {
-        self.bandwidth_estimate_rx.clone()
+    pub fn subscribe_observed_send_bitrate(&self) -> watch::Receiver<Option<u64>> {
+        self.observed_send_bitrate_rx.clone()
     }
 
     /// **Phase 4d.1**: read the current bandwidth estimate without
     /// subscribing. Useful for one-shot reads (debug / metrics
     /// snapshot). For change-driven consumers, prefer
-    /// [`Self::subscribe_bandwidth_estimate`].
-    pub fn current_bandwidth_estimate(&self) -> Option<u64> {
-        *self.bandwidth_estimate_rx.borrow()
+    /// [`Self::subscribe_observed_send_bitrate`].
+    pub fn current_observed_send_bitrate(&self) -> Option<u64> {
+        *self.observed_send_bitrate_rx.borrow()
     }
 }
 
@@ -1113,7 +1124,7 @@ impl WebRtcPeer {
         // None — the driver's first poll happens within
         // TWCC_POLL_INTERVAL of construction; until a candidate pair
         // is nominated, every poll publishes None too.
-        let (bandwidth_estimate_tx, bandwidth_estimate_rx) =
+        let (observed_send_bitrate_tx, observed_send_bitrate_rx) =
             watch::channel::<Option<u64>>(None);
         let shutdown = CancellationToken::new();
 
@@ -1141,7 +1152,7 @@ impl WebRtcPeer {
             input_handler,
             clipboard_handler,
             keyframe_request_tx,
-            bandwidth_estimate_tx,
+            observed_send_bitrate_tx,
             shutdown.clone(),
         ));
 
@@ -1149,7 +1160,7 @@ impl WebRtcPeer {
             Self {
                 peer_id,
                 command_tx,
-                bandwidth_estimate_rx,
+                observed_send_bitrate_rx,
                 shutdown,
             },
             encoded_frame_tx,
@@ -1488,7 +1499,7 @@ async fn driver(
     input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
     keyframe_request_tx: mpsc::Sender<SimulcastRid>,
-    bandwidth_estimate_tx: watch::Sender<Option<u64>>,
+    observed_send_bitrate_tx: watch::Sender<Option<u64>>,
     shutdown: CancellationToken,
 ) {
     if rtp_config.encodings.is_empty() {
@@ -1611,15 +1622,22 @@ async fn driver(
         }));
     }
 
-    // Phase 4d.1: TWCC bandwidth-estimate poll. `tokio::time::interval`
-    // fires immediately on first `.tick().await` by default; the
-    // first tick produces None (no nominated pair yet, no estimate)
-    // and is sent verbatim to the watch channel — fine because the
-    // initial value the channel was constructed with is already None.
+    // Phase 4d.1: poll-driven observed-send-bitrate computation.
+    // Each tick samples `bytes_sent` per outbound stream and computes
+    // the rate over the elapsed interval. `prev_outbound_bytes` carries
+    // the per-SSRC last sample across polls; the helper updates it
+    // in place. First poll produces None (no prev), subsequent polls
+    // produce Some(bps) once at least one SSRC has had two samples.
+    //
+    // `tokio::time::interval` fires immediately on the first
+    // `.tick().await`. That first poll seeds `prev_outbound_bytes`
+    // and publishes None — fine because the initial value the watch
+    // channel was constructed with is already None.
     // `MissedTickBehavior::Skip` ensures a busy driver loop doesn't
     // produce a burst of catch-up polls when it falls behind.
     let mut twcc_poll = tokio::time::interval(TWCC_POLL_INTERVAL);
     twcc_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut prev_outbound_bytes: HashMap<u32, (u64, Instant)> = HashMap::new();
 
     loop {
         // 1. Drain all outputs until we get a Timeout (the next deadline).
@@ -1817,13 +1835,13 @@ async fn driver(
                     return;
                 }
             }
-            // Phase 4d.1: TWCC bandwidth-estimate poll. Calls
+            // Phase 4d.1: observed-send-bitrate poll. Calls
             // `rtc.get_stats(now, StatsSelector::None)` (read-only walk
-            // of the rtc-side accumulator state, cheap), extracts the
-            // nominated ICE candidate pair's
-            // `available_outgoing_bitrate`, and publishes to a
-            // watch channel the layer-selection aggregator (4d.2)
-            // subscribes to.
+            // of the rtc-side accumulator state, cheap), projects
+            // outbound streams to `(ssrc, bytes_sent)`, computes the
+            // recent send bitrate from per-SSRC deltas vs the previous
+            // sample, publishes to the watch channel the layer-
+            // selection aggregator (4d.2) subscribes to.
             //
             // `send_replace` (not `send`) so the channel always carries
             // the latest value even if no receiver has subscribed yet
@@ -1835,12 +1853,15 @@ async fn driver(
             // never tears down the driver.
             _ = twcc_poll.tick() => {
                 let report = rtc.get_stats(Instant::now(), StatsSelector::None);
-                let estimate = extract_nominated_outgoing_bandwidth(
-                    report
-                        .candidate_pairs()
-                        .map(|p| (p.nominated, p.available_outgoing_bitrate)),
+                let bitrate = extract_recent_outbound_bitrate(
+                    report.outbound_rtp_streams().map(|s| (
+                        s.sent_rtp_stream_stats.rtp_stream_stats.ssrc,
+                        s.sent_rtp_stream_stats.bytes_sent,
+                    )),
+                    &mut prev_outbound_bytes,
+                    Instant::now(),
                 );
-                bandwidth_estimate_tx.send_replace(estimate);
+                observed_send_bitrate_tx.send_replace(bitrate);
             }
         }
     }
@@ -1963,53 +1984,90 @@ fn handle_event(
     false
 }
 
-/// **Phase 4d.1**: extract the TWCC-derived available outgoing
-/// bandwidth (in bits per second) from the nominated ICE candidate
-/// pair's stats. Returns `None` when no pair is nominated, the
-/// nominated pair's estimate is missing, or the value is non-finite
-/// or non-positive (negative / zero estimates are not useful for
-/// layer selection — treat as "no estimate yet").
+/// **Phase 4d.1**: compute the per-peer recent observed send bitrate
+/// (bits per second) from the deltas of `bytes_sent` across all
+/// outbound RTP streams over one polling window.
 ///
-/// Takes a flat iterator of `(nominated, available_outgoing_bitrate)`
-/// pairs — projecting `report.candidate_pairs()` to this shape lets
-/// tests construct synthetic input without needing rtc 0.9's
-/// `pub(crate)` `RTCStatsReport::new`. Production caller projects:
+/// **What this signals**: how much data the peer is actually pushing
+/// onto the wire right now, summed across simulcast layers + RTX
+/// streams. NOT a congestion-control bandwidth estimate (rtc 0.9
+/// doesn't expose one — see `TWCC_POLL_INTERVAL` for why). The
+/// layer-selection aggregator (4d.2) interprets this as "delivery
+/// rate the peer's encoder + network are sustaining." A drop from
+/// the encoder's configured target indicates either encoder
+/// underrun or network constraint; either way, it's a layer-
+/// selection signal.
 ///
-///     extract_nominated_outgoing_bandwidth(
-///         report.candidate_pairs().map(|p| (p.nominated, p.available_outgoing_bitrate))
-///     )
+/// `current` is `(ssrc, bytes_sent)` for each outbound stream,
+/// projected from `report.outbound_rtp_streams()` at the production
+/// caller. `prev` is the per-SSRC last-sample state the driver
+/// maintains across polls; this helper updates it in place.
 ///
-/// Why only the nominated pair: ICE may track multiple candidate
-/// pairs (failed, in-progress, succeeded), but only one is
-/// nominated at any given time and that's the active path media
-/// flows over. Bandwidth estimates on non-nominated pairs are
-/// either stale (failed pair) or speculative (probing); using them
-/// would produce policy decisions against the wrong network path.
-fn extract_nominated_outgoing_bandwidth(
-    pairs: impl IntoIterator<Item = (bool, f64)>,
+/// Returns `None` when:
+/// - First poll for a peer (`prev` empty for every observed SSRC).
+/// - All observed SSRCs had zero delta-time since last poll
+///   (caller polled twice in the same instant — shouldn't happen
+///   with the 1s interval).
+/// - All observed SSRCs had non-positive byte deltas (counter
+///   wraparound or stream restart, both defensive).
+///
+/// Returns `Some(total_bps)` when at least one SSRC contributed
+/// a usable delta sample. Total is summed across SSRCs because
+/// the layer-selection decision is per-peer (the peer's outbound
+/// link is the bottleneck, not any individual encoding).
+fn extract_recent_outbound_bitrate(
+    current: impl IntoIterator<Item = (u32, u64)>,
+    prev: &mut HashMap<u32, (u64, Instant)>,
+    now: Instant,
 ) -> Option<u64> {
-    for (nominated, bps) in pairs {
-        if !nominated {
-            continue;
+    let mut total_bits_per_sec: u64 = 0;
+    let mut had_usable_sample = false;
+    for (ssrc, current_bytes) in current {
+        let usable = match prev.get(&ssrc) {
+            Some(&(prev_bytes, prev_at)) => {
+                let elapsed = now.saturating_duration_since(prev_at);
+                if elapsed.is_zero() {
+                    // Two polls in the same instant — shouldn't happen
+                    // with the 1s poll interval, but defensive.
+                    None
+                } else if current_bytes < prev_bytes {
+                    // Counter wraparound (impossible for u64 in
+                    // realistic timeframes) or stream restart
+                    // (rtc dropped + recreated the SSRC's accumulator
+                    // — happens on renegotiation). Either way, treat
+                    // this SSRC's sample as unusable for THIS poll;
+                    // the next poll's prev will be the current value
+                    // and produce a clean delta.
+                    None
+                } else {
+                    let delta_bytes = current_bytes - prev_bytes;
+                    let bps =
+                        (delta_bytes as f64 * 8.0) / elapsed.as_secs_f64();
+                    if !bps.is_finite() {
+                        None
+                    } else {
+                        Some(bps as u64)
+                    }
+                }
+            }
+            None => {
+                // First sample for this SSRC — no prev to delta
+                // against. Record now; next poll produces the first
+                // usable delta.
+                None
+            }
+        };
+        prev.insert(ssrc, (current_bytes, now));
+        if let Some(bps) = usable {
+            total_bits_per_sec = total_bits_per_sec.saturating_add(bps);
+            had_usable_sample = true;
         }
-        // Reject non-finite (NaN / ±∞) and any value that would cast
-        // to 0u64. The `>= 1.0` threshold is the lower bound for a
-        // meaningful bandwidth estimate: anything fractional below
-        // 1 bit/sec is physically impossible for media transport
-        // and would produce a misleading `Some(0)` after the
-        // truncating `as u64` cast — the layer-selection aggregator
-        // should treat that as "no estimate yet" rather than "we
-        // have 0 bps available."
-        if !bps.is_finite() || bps < 1.0 {
-            // Nominated pair found but its estimate is unusable.
-            // Don't keep searching — by construction at most one
-            // pair is nominated; further pairs would be ignored
-            // anyway.
-            return None;
-        }
-        return Some(bps as u64);
     }
-    None
+    if had_usable_sample {
+        Some(total_bits_per_sec)
+    } else {
+        None
+    }
 }
 
 /// Reverse-lookup: given an SSRC reported in an inbound RTCP feedback
@@ -4330,11 +4388,11 @@ mod tests {
     /// driver task may or may not have run a tick yet) is `None`.
     ///
     /// Pin both APIs:
-    /// - `current_bandwidth_estimate()` for one-shot reads.
-    /// - `subscribe_bandwidth_estimate()` for change-driven consumers
+    /// - `current_observed_send_bitrate()` for one-shot reads.
+    /// - `subscribe_observed_send_bitrate()` for change-driven consumers
     ///   (the layer-selection aggregator in 4d.2).
     #[tokio::test]
-    async fn web_rtc_peer_exposes_bandwidth_estimate_api_starting_at_none() {
+    async fn web_rtc_peer_exposes_observed_send_bitrate_api_starting_at_none() {
         ensure_rustls_crypto_provider();
         let offer_sdp = synth_recvonly_video_offer_for_rtc();
         let active_rids = vec![SimulcastRid::full()];
@@ -4363,7 +4421,7 @@ mod tests {
 
         // One-shot read: None initially.
         assert_eq!(
-            peer.current_bandwidth_estimate(),
+            peer.current_observed_send_bitrate(),
             None,
             "freshly-constructed peer's bandwidth estimate must be \
              None until the driver polls a nominated candidate pair"
@@ -4371,9 +4429,9 @@ mod tests {
 
         // Subscriber: initial `borrow` returns None too. `borrow()`
         // reads the current value without marking it as "seen" —
-        // identical semantics to `current_bandwidth_estimate()`
+        // identical semantics to `current_observed_send_bitrate()`
         // for the initial state.
-        let rx = peer.subscribe_bandwidth_estimate();
+        let rx = peer.subscribe_observed_send_bitrate();
         assert_eq!(
             *rx.borrow(),
             None,
@@ -4383,7 +4441,7 @@ mod tests {
         // Independent receivers: a second subscribe yields a separate
         // Receiver; mutations on one (in this case, `borrow_and_update`
         // which marks the current value as seen) don't affect the other.
-        let mut rx2 = peer.subscribe_bandwidth_estimate();
+        let mut rx2 = peer.subscribe_observed_send_bitrate();
         assert_eq!(*rx2.borrow_and_update(), None);
         // The first receiver still sees None — independent state.
         assert_eq!(*rx.borrow(), None);
@@ -4633,116 +4691,201 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Phase 4d.1: extract_nominated_outgoing_bandwidth helper tests
+    // Phase 4d.1 review fix: extract_recent_outbound_bitrate tests
     // -------------------------------------------------------------------
 
-    /// Single nominated pair with a positive finite estimate → that
-    /// estimate, cast to u64. The canonical happy path: one ICE pair
-    /// has been nominated and TWCC has produced a real bandwidth
-    /// number.
+    /// First poll (empty `prev`) → None. The helper has no prior
+    /// sample to delta against; it seeds `prev` with the current
+    /// values so the next poll can compute a real rate.
     #[test]
-    fn extract_bandwidth_single_nominated_pair_returns_estimate() {
-        let pairs = vec![(true, 2_500_000.0)]; // 2.5 Mbps nominated
+    fn extract_bitrate_first_poll_returns_none_seeds_prev() {
+        let mut prev: HashMap<u32, (u64, Instant)> = HashMap::new();
+        let now = Instant::now();
+        let result = extract_recent_outbound_bitrate(
+            vec![(0xAAAA_0001u32, 10_000u64)],
+            &mut prev,
+            now,
+        );
+        assert_eq!(result, None, "first poll has no prev — must return None");
         assert_eq!(
-            extract_nominated_outgoing_bandwidth(pairs),
-            Some(2_500_000)
+            prev.get(&0xAAAA_0001),
+            Some(&(10_000u64, now)),
+            "first poll must seed prev so the next poll has a baseline"
         );
     }
 
-    /// No nominated pair → None. Either ICE hasn't completed yet, or
-    /// every candidate pair failed and none is currently active. The
-    /// layer-selection aggregator must treat None as "no estimate"
-    /// (don't pause anything based on absent data).
+    /// Second poll with positive delta → `Some(bps)` computed as
+    /// `(delta_bytes * 8) / elapsed_secs`. Pin the canonical math so
+    /// a future refactor that switches units (kbps? bytes/sec?)
+    /// surfaces in the test.
     #[test]
-    fn extract_bandwidth_no_nominated_pair_returns_none() {
-        let pairs = vec![(false, 2_500_000.0), (false, 1_000_000.0)];
-        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
-    }
+    fn extract_bitrate_second_poll_computes_delta_bps() {
+        let mut prev: HashMap<u32, (u64, Instant)> = HashMap::new();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
 
-    /// Multiple pairs, only one nominated → that one's estimate. The
-    /// non-nominated pairs are either failed paths (their estimates
-    /// are stale) or probing paths (their estimates are speculative);
-    /// using them would produce decisions against the wrong network
-    /// path. By the spec at most one pair is nominated at a time.
-    #[test]
-    fn extract_bandwidth_multiple_pairs_picks_only_nominated() {
-        let pairs = vec![
-            (false, 5_000_000.0), // failed pair, stale high estimate
-            (true, 2_000_000.0),  // nominated, real estimate
-            (false, 100.0),       // probing pair, low estimate
-        ];
-        assert_eq!(
-            extract_nominated_outgoing_bandwidth(pairs),
-            Some(2_000_000)
+        // Poll 1: seed.
+        extract_recent_outbound_bitrate(vec![(0xAAAA_0001u32, 100_000u64)], &mut prev, t0);
+        // Poll 2: 200 KB more in 1 second → 200_000 bytes * 8 = 1.6 Mbps.
+        let result = extract_recent_outbound_bitrate(
+            vec![(0xAAAA_0001u32, 300_000u64)],
+            &mut prev,
+            t1,
         );
+        assert_eq!(result, Some(1_600_000));
+        // Prev updated to the latest sample.
+        assert_eq!(prev.get(&0xAAAA_0001), Some(&(300_000u64, t1)));
     }
 
-    /// Nominated pair with NaN estimate → None. Would happen if the
-    /// rtc-side accumulator has a bug or if TWCC math underflows.
-    /// Casting NaN to u64 is platform-defined behavior in Rust, so
-    /// rejecting NaN here is both safer and more explicit than
-    /// passing the value through.
+    /// Multi-SSRC: deltas summed across all observed SSRCs. The
+    /// layer-selection aggregator decides per-peer (the link is the
+    /// bottleneck, not any individual encoding) so the helper rolls
+    /// up to a single per-peer total.
     #[test]
-    fn extract_bandwidth_nominated_pair_with_nan_returns_none() {
-        let pairs = vec![(true, f64::NAN)];
-        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
+    fn extract_bitrate_multi_ssrc_sums_deltas() {
+        let mut prev: HashMap<u32, (u64, Instant)> = HashMap::new();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+
+        // VP8 simulcast: 3 outbound SSRCs (full / half / quarter).
+        extract_recent_outbound_bitrate(
+            vec![
+                (0xAAAA_0001u32, 100_000u64),
+                (0xAAAA_0002u32, 50_000u64),
+                (0xAAAA_0003u32, 20_000u64),
+            ],
+            &mut prev,
+            t0,
+        );
+        // After 1s: full +250KB (2 Mbps), half +50KB (400 kbps),
+        // quarter +12.5KB (100 kbps). Total: 2.5 Mbps.
+        let result = extract_recent_outbound_bitrate(
+            vec![
+                (0xAAAA_0001u32, 350_000u64),
+                (0xAAAA_0002u32, 100_000u64),
+                (0xAAAA_0003u32, 32_500u64),
+            ],
+            &mut prev,
+            t1,
+        );
+        assert_eq!(result, Some(2_500_000));
     }
 
-    /// Nominated pair with infinite estimate → None. Same defensive
-    /// treatment as NaN — infinite isn't a usable bandwidth number
-    /// for layer selection.
+    /// Counter wraparound (current_bytes < prev_bytes for the same
+    /// SSRC) skips that SSRC's contribution this poll and re-seeds
+    /// prev with the current value. Defends against rtc-side stream
+    /// restart on renegotiation (rtc drops + recreates the
+    /// accumulator, resetting bytes_sent to 0). Without the skip we'd
+    /// underflow the u64 subtraction and produce a garbage delta.
     #[test]
-    fn extract_bandwidth_nominated_pair_with_infinite_returns_none() {
-        let pairs = vec![(true, f64::INFINITY)];
-        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
-        let pairs = vec![(true, f64::NEG_INFINITY)];
-        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
+    fn extract_bitrate_counter_wraparound_skips_ssrc_reseed_prev() {
+        let mut prev: HashMap<u32, (u64, Instant)> = HashMap::new();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+
+        // Seed at high value, then "wrap" to a low value (stream restart).
+        extract_recent_outbound_bitrate(
+            vec![(0xAAAA_0001u32, 1_000_000u64)],
+            &mut prev,
+            t0,
+        );
+        let result = extract_recent_outbound_bitrate(
+            vec![(0xAAAA_0001u32, 500u64)], // restart, much smaller
+            &mut prev,
+            t1,
+        );
+        assert_eq!(
+            result, None,
+            "wraparound must skip the SSRC's contribution; with one \
+             SSRC and that one skipped, total returns None"
+        );
+        // Prev re-seeded with the current value so the next poll
+        // computes a clean delta against this baseline.
+        assert_eq!(prev.get(&0xAAAA_0001), Some(&(500u64, t1)));
     }
 
-    /// Nominated pair with non-positive (negative or zero) estimate
-    /// → None. Zero estimate means TWCC has no signal yet (treat as
-    /// "no estimate"); negative is non-physical and indicates a bug.
+    /// Zero elapsed time (two polls at the same Instant) skips that
+    /// SSRC's contribution. Defends against the math (divide by zero
+    /// → infinity → cast to u64 = wrong); the 1s poll interval makes
+    /// this practically unreachable, but the helper guards against it.
     #[test]
-    fn extract_bandwidth_nominated_pair_with_non_positive_returns_none() {
-        let pairs = vec![(true, 0.0)];
-        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
-        let pairs = vec![(true, -1.0)];
-        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
+    fn extract_bitrate_zero_elapsed_skips_ssrc() {
+        let mut prev: HashMap<u32, (u64, Instant)> = HashMap::new();
+        let t0 = Instant::now();
+        extract_recent_outbound_bitrate(vec![(0xAAAA_0001u32, 1000u64)], &mut prev, t0);
+        let result = extract_recent_outbound_bitrate(
+            vec![(0xAAAA_0001u32, 5000u64)],
+            &mut prev,
+            t0, // same instant
+        );
+        assert_eq!(result, None);
     }
 
-    /// Empty pairs iterator → None. Defends against the rtc-side
-    /// returning a stats report before any candidate pair has been
-    /// formed (very early in connection lifetime).
+    /// New SSRC appearing mid-stream (not in prev) returns None for
+    /// THAT SSRC this poll, but seeds prev so the next poll produces
+    /// a clean delta. Existing SSRCs continue to contribute normally.
+    /// Models the case where a peer's simulcast layer count grows
+    /// (e.g. an on-demand H.264 spawn during a session).
     #[test]
-    fn extract_bandwidth_empty_pairs_returns_none() {
-        let pairs: Vec<(bool, f64)> = vec![];
-        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
+    fn extract_bitrate_new_ssrc_mid_stream_seeds_only() {
+        let mut prev: HashMap<u32, (u64, Instant)> = HashMap::new();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+
+        // Seed: only one SSRC.
+        extract_recent_outbound_bitrate(vec![(0xAAAA_0001u32, 100_000u64)], &mut prev, t0);
+        // Second poll: existing SSRC has +125KB (1 Mbps), and a new
+        // SSRC appears with 50KB total but no prev to delta against.
+        // Result: 1 Mbps from existing only; new SSRC seeded.
+        let result = extract_recent_outbound_bitrate(
+            vec![
+                (0xAAAA_0001u32, 225_000u64),
+                (0xAAAA_0002u32, 50_000u64),
+            ],
+            &mut prev,
+            t1,
+        );
+        assert_eq!(
+            result,
+            Some(1_000_000),
+            "existing SSRC's delta contributes; new SSRC seeds only"
+        );
+        assert_eq!(prev.get(&0xAAAA_0002), Some(&(50_000u64, t1)));
     }
 
-    /// Sub-1bps fractional estimate is rejected by the `bps >= 1.0`
-    /// guard before casting. Without this guard, `0.5 as u64 == 0`
-    /// would produce a misleading `Some(0)` — the aggregator would
-    /// then have to disambiguate "real zero estimate" from "fractional
-    /// estimate the cast truncated." Pin the contract: anything
-    /// below 1 bit/sec is treated as "no estimate," same as None.
+    /// Empty current iterator → None. Models the very-early-life case
+    /// where the rtc stats report has no outbound streams yet (track
+    /// not yet attached, or pre-handshake).
     #[test]
-    fn extract_bandwidth_sub_one_bps_fractional_returns_none() {
-        let pairs = vec![(true, 0.5)];
-        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
-        // Just-below-1.0 also rejected — the threshold is inclusive
-        // at 1.0 (1.0 → Some(1)), exclusive below.
-        let pairs = vec![(true, 0.999_999_9)];
-        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), None);
+    fn extract_bitrate_empty_current_returns_none() {
+        let mut prev: HashMap<u32, (u64, Instant)> = HashMap::new();
+        let now = Instant::now();
+        let result = extract_recent_outbound_bitrate(Vec::<(u32, u64)>::new(), &mut prev, now);
+        assert_eq!(result, None);
     }
 
-    /// Exactly 1.0 bps is the smallest accepted estimate (the `>= 1.0`
-    /// threshold is inclusive). Pins the boundary so a future refactor
-    /// to a stricter threshold (e.g. minimum-meaningful 1Kbps) is an
-    /// explicit, reviewed change.
+    /// Stable rate over multiple polls produces consistent bps
+    /// readings. Pins that the helper's stateful arithmetic doesn't
+    /// drift across iterations.
     #[test]
-    fn extract_bandwidth_exactly_one_bps_returns_some_one() {
-        let pairs = vec![(true, 1.0)];
-        assert_eq!(extract_nominated_outgoing_bandwidth(pairs), Some(1));
+    fn extract_bitrate_stable_rate_consistent_across_polls() {
+        let mut prev: HashMap<u32, (u64, Instant)> = HashMap::new();
+        let mut t = Instant::now();
+        let mut bytes: u64 = 0;
+
+        // Seed.
+        extract_recent_outbound_bitrate(vec![(0xAAAA_0001u32, bytes)], &mut prev, t);
+        // Three polls each adding 125KB in 1s = steady 1 Mbps.
+        for _ in 0..3 {
+            t += Duration::from_secs(1);
+            bytes += 125_000;
+            let result = extract_recent_outbound_bitrate(
+                vec![(0xAAAA_0001u32, bytes)],
+                &mut prev,
+                t,
+            );
+            assert_eq!(result, Some(1_000_000));
+        }
     }
 
     /// `rid_for_ssrc` returns the matching RID for any known SSRC
