@@ -12076,11 +12076,6 @@ class PeerDisplayConnection {
       await this._sendSignal(offerSignal);
       this._log('info', `offer sent (sdp_len=${offerSignal.sdp.length})`);
       this.setStatus('Offer sent, awaiting answer…', '');
-      // [DIAGNOSTIC — to revert] Browser-side getStats poll —
-      // transport / selected pair / inbound-rtp / codec, every 2s.
-      // Pairs with peer-side [diag/tcp-out|in|relay] class counters
-      // and [diag/sdp] video-section dump for end-to-end visibility.
-      this._startStatsPoll();
     } catch (err) {
       this._log('error', `offer failed: ${err.message}`);
       this.setStatus(`Offer failed: ${err.message}`, 'error');
@@ -12165,84 +12160,7 @@ class PeerDisplayConnection {
     return s;
   }
 
-  // [DIAGNOSTIC — to revert] Periodic getStats() poll covering the
-  // four record types that diagnose #43 ("DTLS completes but media
-  // doesn't decode"): `transport` (DTLS state, ICE state, selected
-  // candidate-pair pointer), the selected `candidate-pair` (bytes
-  // sent/received in both directions), `inbound-rtp` for the video
-  // track (packet/byte/frame counters + ssrc + codec id + frame
-  // dimensions), and the `codec` record the inbound stream points to
-  // (mimeType / payloadType / sdpFmtpLine).
-  //
-  // Read against peer-side [diag/tcp-out|in|relay] class counters
-  // and [diag/sdp] video-section dump:
-  //  - peer emits no RtpRtcp class bytes → rtc sender/SRTP path
-  //    still stuck.
-  //  - peer + relay show RtpRtcp bytes but browser inbound-rtp
-  //    bytesReceived stays 0 → SRTP/transport accept issue on the
-  //    browser side.
-  //  - browser packetsReceived > 0 but framesDecoded == 0 → codec /
-  //    fmtp / payload-type / H.264 packetization mismatch.
-  //  - browser packetsReceived AND framesDecoded > 0 but the
-  //    <video> stays HAVE_NOTHING → frontend attachment / autoplay /
-  //    muted / element rendering issue.
-  _startStatsPoll() {
-    if (this._statsInterval) return;
-    this._statsInterval = setInterval(async () => {
-      if (!this.pc) return;
-      let stats;
-      try { stats = await this.pc.getStats(); }
-      catch (err) {
-        this._log('warn', `[diag/stats] getStats failed: ${err.message}`);
-        return;
-      }
-      let transport = null;
-      let inboundRtp = null;
-      let selectedPair = null;
-      stats.forEach((r) => {
-        if (r.type === 'transport') transport = r;
-        else if (r.type === 'inbound-rtp' && r.kind === 'video') inboundRtp = r;
-        else if (
-          r.type === 'candidate-pair' &&
-          (r.selected || (r.nominated && r.state === 'succeeded'))
-        ) {
-          selectedPair = r;
-        }
-      });
-      let codec = null;
-      if (inboundRtp && inboundRtp.codecId) {
-        stats.forEach((r) => {
-          if (r.id === inboundRtp.codecId) codec = r;
-        });
-      }
-      const fmt = (label, obj, fields) =>
-        obj
-          ? `${label} ` +
-            fields.map((f) => `${f}=${obj[f] ?? '?'}`).join(' ')
-          : `${label} (none)`;
-      this._log('info',
-        fmt('[diag/stats] transport', transport,
-          ['dtlsState', 'iceState', 'selectedCandidatePairId']));
-      this._log('info',
-        fmt('[diag/stats] selected-pair', selectedPair,
-          ['bytesSent', 'bytesReceived', 'state', 'nominated']));
-      this._log('info',
-        fmt('[diag/stats] inbound-rtp', inboundRtp,
-          ['packetsReceived', 'bytesReceived', 'framesReceived',
-            'framesDecoded', 'keyFramesDecoded', 'framesDropped',
-            'ssrc', 'codecId', 'frameWidth', 'frameHeight']));
-      this._log('info',
-        fmt('[diag/stats] codec', codec,
-          ['mimeType', 'payloadType', 'sdpFmtpLine']));
-    }, 2000);
-  }
-
   async close() {
-    // [DIAGNOSTIC — to revert] Stop stats poll.
-    if (this._statsInterval) {
-      clearInterval(this._statsInterval);
-      this._statsInterval = null;
-    }
     // Best-effort tell peer to tear down its WebRtcPeer.
     await this._sendSignal({ kind: 'close' }).catch(() => {});
     if (this.pc) {

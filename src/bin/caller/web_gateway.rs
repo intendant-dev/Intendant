@@ -6595,47 +6595,6 @@ async fn handle_federated_webrtc_signal(
                 .await;
             match answer_result {
                 Ok(answer_sdp) => {
-                    // [DIAGNOSTIC — to revert] Dump video-section SDP
-                    // attributes that drive codec/rtp behavior. Lets us
-                    // cross-reference what the peer offers (rtpmap/fmtp/
-                    // extmap/rid/simulcast/ssrc/setup) with what the
-                    // browser reports decoding via getStats codec/inbound.
-                    let mut in_video = false;
-                    for line in answer_sdp.lines() {
-                        if line.starts_with("m=video") {
-                            in_video = true;
-                            eprintln!("[diag/sdp] {line}");
-                            continue;
-                        }
-                        if line.starts_with("m=") {
-                            in_video = false;
-                            continue;
-                        }
-                        if !in_video {
-                            continue;
-                        }
-                        if line.starts_with("a=rtpmap:")
-                            || line.starts_with("a=fmtp:")
-                            || line.starts_with("a=extmap:")
-                            || line.starts_with("a=rid:")
-                            || line.starts_with("a=simulcast:")
-                            || line.starts_with("a=ssrc:")
-                            || line.starts_with("a=setup:")
-                            || line.starts_with("a=ice-ufrag:")
-                            || line.starts_with("a=fingerprint:")
-                            || line.starts_with("a=mid:")
-                            || line.starts_with("a=msid:")
-                            || line.starts_with("a=ssrc-group:")
-                        {
-                            // Truncate fingerprint hex to keep lines readable.
-                            if line.starts_with("a=fingerprint:") {
-                                let head: String = line.chars().take(60).collect();
-                                eprintln!("[diag/sdp] {head}…");
-                            } else {
-                                eprintln!("[diag/sdp] {line}");
-                            }
-                        }
-                    }
                     bus.send(AppEvent::LogEntry {
                         level: "info".to_string(),
                         source: LOG_SOURCE.to_string(),
