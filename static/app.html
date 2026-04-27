@@ -7692,7 +7692,52 @@ class DisplaySlot {
     // Add a recvonly video transceiver so the SDP offer includes a video
     // media section. Without this, the server can't attach its video track
     // because the answerer can't introduce new media lines.
-    this.pc.addTransceiver('video', { direction: 'recvonly' });
+    const videoTransceiver = this.pc.addTransceiver('video', { direction: 'recvonly' });
+
+    // DisplaySlot is the VP8 simulcast path: we inject
+    // `a=simulcast:recv f;h;q` below, and only VP8 supports the
+    // multi-encoding RID layout cleanly. H.264 in our encoder pool is
+    // single-encoding; if the server picks H.264 it emits a malformed
+    // simulcast answer (`a=simulcast:send f;h;q` with a single ssrc
+    // covering all RIDs) and the browser decodes one keyframe then chokes.
+    //
+    // WKWebView's default offer order puts H.264 PTs (96/98/100) before
+    // VP8 (107), and the server picks the first-offered codec, so we
+    // explicitly reorder via setCodecPreferences to put VP8 first. This
+    // makes the offer honestly describe what this path wants —
+    // VP8 simulcast — instead of relying on the server to disambiguate.
+    if (typeof RTCRtpReceiver !== 'undefined' &&
+        typeof RTCRtpReceiver.getCapabilities === 'function' &&
+        typeof videoTransceiver.setCodecPreferences === 'function') {
+      try {
+        const caps = RTCRtpReceiver.getCapabilities('video');
+        if (caps && Array.isArray(caps.codecs)) {
+          const vp8 = caps.codecs.filter(c => c.mimeType === 'video/VP8');
+          const rtx = caps.codecs.filter(c => c.mimeType === 'video/rtx');
+          const others = caps.codecs.filter(c =>
+            c.mimeType !== 'video/VP8' && c.mimeType !== 'video/rtx');
+          const reordered = [...vp8, ...rtx, ...others];
+          videoTransceiver.setCodecPreferences(reordered);
+          console.info(
+            `[DisplaySlot ${this.displayId}] codec preferences set; first three: `
+              + reordered.slice(0, 3).map(c => c.mimeType).join(', ')
+          );
+        }
+      } catch (e) {
+        // If setCodecPreferences is unsupported or rejects the list, fall
+        // through to default ordering. The fallback (SDP munging to
+        // reorder PTs in the offer) lives at the createOffer call below
+        // and only fires when the codec preference path didn't take.
+        console.warn(
+          `[DisplaySlot ${this.displayId}] setCodecPreferences failed: ${e.message}`
+        );
+      }
+    } else {
+      console.warn(
+        `[DisplaySlot ${this.displayId}] setCodecPreferences not available; `
+          + `offer will use WKWebView default codec order (H.264 first).`
+      );
+    }
 
     // Create data channels BEFORE offer (browser is the offerer)
     this.controlChannel = this.pc.createDataChannel('control', { ordered: true });
@@ -7807,6 +7852,24 @@ class DisplaySlot {
         type: offer.type,
         sdp: injectRecvSimulcastIntoVideoOffer(offer.sdp, DISPLAY_SIMULCAST_RIDS),
       };
+      // Diagnostic: confirm VP8 is the first video codec in the
+      // emitted offer. After setCodecPreferences above, the m=video
+      // PT list and the corresponding rtpmap order should put VP8
+      // before H.264. If this log shows H.264 first, the codec
+      // preference path didn't take and we'll need the SDP-munging
+      // compatibility shim.
+      const firstCodec = (() => {
+        const lines = munged.sdp.split(/\r?\n/);
+        const mLine = lines.find(l => l.startsWith('m=video'));
+        if (!mLine) return '(no m=video)';
+        const pts = mLine.trim().split(/\s+/).slice(3);
+        const firstPt = pts[0];
+        const rtpmap = lines.find(l => l.startsWith(`a=rtpmap:${firstPt} `));
+        return rtpmap ? rtpmap.replace(`a=rtpmap:${firstPt} `, '') : `pt=${firstPt}`;
+      })();
+      console.info(
+        `[DisplaySlot ${this.displayId}] offer first codec: ${firstCodec}`
+      );
       return this.pc.setLocalDescription(munged);
     }).then(() => {
       if (app) {
@@ -7826,6 +7889,24 @@ class DisplaySlot {
   handleAnswer(sdp) {
     if (!this.pc) return;
     this.statusEl.textContent = 'Answer received, applying...';
+    // Diagnostic: confirm the negotiated codec + simulcast direction.
+    // After setCodecPreferences pushes VP8 to the front of the offer,
+    // the answer's m=video PT must map to VP8 and the answer must
+    // carry `a=simulcast:send f;h;q` (multi-RID). H.264 negotiated
+    // here means setCodecPreferences didn't take and we need the SDP
+    // munge fallback.
+    {
+      const lines = sdp.split(/\r?\n/);
+      const mLine = lines.find(l => l.startsWith('m=video'));
+      const firstPt = mLine ? mLine.trim().split(/\s+/)[3] : null;
+      const negotiated = firstPt
+        ? (lines.find(l => l.startsWith(`a=rtpmap:${firstPt} `)) || '').replace(`a=rtpmap:${firstPt} `, '')
+        : '(unknown)';
+      const simulcast = (lines.find(l => l.startsWith('a=simulcast:')) || '(no a=simulcast)').trim();
+      console.info(
+        `[DisplaySlot ${this.displayId}] answer negotiated codec: ${negotiated}; ${simulcast}`
+      );
+    }
     this.pc.setRemoteDescription({ type: 'answer', sdp }).then(() => {
       this._answerApplied = true;
       this.statusEl.textContent = `Answer applied, ICE: ${this.pc.iceConnectionState}, flushing ${this._pendingCandidates.length} candidates`;

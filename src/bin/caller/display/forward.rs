@@ -538,6 +538,51 @@ mod tests {
         );
     }
 
+    /// `codec_preferences_from_offer` must preserve the offer's PT
+    /// order — the order is what the encoder pool uses to pick the
+    /// active codec. The local DisplaySlot path relies on this:
+    /// browser-side `setCodecPreferences` puts VP8 PT first in the
+    /// offer so the simulcast path lands on VP8 (multi-RID-capable)
+    /// rather than H.264 (single-encoding only). If ordering ever
+    /// got sorted lexicographically or by enum discriminant the
+    /// DisplaySlot simulcast negotiation would silently regress to
+    /// H.264 + malformed `a=simulcast:send`.
+    #[test]
+    fn codec_preferences_preserves_offer_order_vp8_first_over_h264() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 107 96\r\n",
+            "a=rtpmap:107 VP8/90000\r\n",
+            "a=rtpmap:96 H264/90000\r\n",
+            "a=fmtp:96 profile-level-id=42e01f;packetization-mode=1\r\n",
+        );
+        let prefs = codec_preferences_from_offer(sdp);
+        assert_eq!(
+            prefs.supported,
+            vec![CodecKind::Vp8, CodecKind::H264],
+            "offer with VP8 PT first must yield Vp8 first in preferences"
+        );
+    }
+
+    /// Mirror of the above with PT order reversed — confirms order
+    /// derives from the offer, not from a fixed codec preference table.
+    #[test]
+    fn codec_preferences_preserves_offer_order_h264_first_over_vp8() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96 107\r\n",
+            "a=rtpmap:96 H264/90000\r\n",
+            "a=fmtp:96 profile-level-id=42e01f;packetization-mode=1\r\n",
+            "a=rtpmap:107 VP8/90000\r\n",
+        );
+        let prefs = codec_preferences_from_offer(sdp);
+        assert_eq!(
+            prefs.supported,
+            vec![CodecKind::H264, CodecKind::Vp8],
+            "offer with H.264 PT first must yield H264 first in preferences"
+        );
+    }
+
     /// Complement of the above: Baseline + mode 1 is what our encoder
     /// produces, so it must be included.
     #[test]
