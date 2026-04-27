@@ -2129,7 +2129,16 @@ async fn driver(
                     .iter()
                     .map(|(rid, s)| (rid.clone(), s.ssrc))
                     .collect();
-                let remote_inbound_iter = report
+                // diag #51: collect raw RRs into a Vec so we can both
+                // forward them to map_remote_inbound_to_rid_health and
+                // log them BEFORE the helper drops unknowns. The
+                // mapping is the suspect — if RR SSRCs don't match
+                // any per-RID send SSRC, every entry is silently
+                // discarded and the policy sees an empty health map.
+                // To revert: replace `raw_rrs.iter().copied()` with
+                // `remote_inbound_iter` (the iterator-only version)
+                // and remove the eprintln below.
+                let raw_rrs: Vec<(u32, f64, i64, f64, u64)> = report
                     .iter_by_type(RTCStatsType::RemoteInboundRTP)
                     .filter_map(|entry| match entry {
                         RTCStatsReportEntry::RemoteInboundRtp(s) => Some((
@@ -2149,10 +2158,32 @@ async fn driver(
                             s.round_trip_time_measurements,
                         )),
                         _ => None,
-                    });
+                    })
+                    .collect();
                 let health = map_remote_inbound_to_rid_health(
-                    remote_inbound_iter,
+                    raw_rrs.iter().copied(),
                     &ssrc_table,
+                );
+                // diag #51 (tightly-scoped, REVERT after smoke): log
+                // sender RID→SSRC table + every raw RR SSRC + the
+                // mapped RID set per poll. Rate is the poll interval
+                // (TWCC_POLL_INTERVAL — ~1s), so volume is bounded
+                // by session duration. The hypothesis being tested:
+                // WebKit's RR SSRC doesn't match any of the
+                // per-RID send SSRCs → `rid_for_ssrc` returns None
+                // for every RR → policy never sees loss. If
+                // confirmed, the fix is an aggregate-loss path that
+                // pauses non-floor layers without per-RID
+                // attribution. If disproved (mapping works), the
+                // bug is elsewhere in the policy chain.
+                eprintln!(
+                    "[diag #51] peer={} sender_table={:?} rr_raw={:?} \
+                     rr_mapped_count={} mapped_rids={:?}",
+                    peer_id,
+                    ssrc_table,
+                    raw_rrs,
+                    health.len(),
+                    health.keys().collect::<Vec<_>>(),
                 );
                 remote_inbound_health_tx.send_replace(health);
             }
