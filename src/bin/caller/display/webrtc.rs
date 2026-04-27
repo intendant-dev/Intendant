@@ -78,7 +78,6 @@ use rtc::sansio::Protocol as RtcProtocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -371,13 +370,6 @@ impl TcpRelayRegistry {
         stream: TcpStream,
         first_frame: Vec<u8>,
     ) -> Result<(), String> {
-        // [DIAGNOSTIC — to revert] Surface entry into the relay path so
-        // we can tell "browser TCP arrived at primary but never made it
-        // here" from "made it here, dispatch failed."
-        eprintln!(
-            "[diag/relay] route_accepted entry first_frame_len={}",
-            first_frame.len()
-        );
         let username = parse_stun_username(&first_frame)
             .ok_or_else(|| "first frame is not a STUN binding request with USERNAME".to_string())?;
         // Target ufrag is the first half of `target:sender`, same as
@@ -390,21 +382,13 @@ impl TcpRelayRegistry {
         let outbound_addr = self
             .lookup(&local_ufrag)
             .ok_or_else(|| format!("no relay registered for ufrag {local_ufrag:?}"))?;
-        // [DIAGNOSTIC — to revert]
-        eprintln!(
-            "[diag/relay] dialing outbound {outbound_addr} for ufrag {local_ufrag:?}"
-        );
 
         // Dial the peer. If this fails, the browser's ICE will see
         // the TCP pair as unformable and (usually) fall back to UDP
         // or time out — no retry at this layer.
-        let mut outbound = TcpStream::connect(outbound_addr).await.map_err(|e| {
-            // [DIAGNOSTIC — to revert]
-            eprintln!("[diag/relay] dial FAILED {outbound_addr}: {e}");
-            format!("dial {outbound_addr}: {e}")
-        })?;
-        // [DIAGNOSTIC — to revert]
-        eprintln!("[diag/relay] dial OK {outbound_addr}");
+        let mut outbound = TcpStream::connect(outbound_addr)
+            .await
+            .map_err(|e| format!("dial {outbound_addr}: {e}"))?;
 
         // Re-frame the peeked first frame and write it to the peer so
         // the peer's accept loop sees the same RFC 4571-framed STUN
@@ -412,71 +396,17 @@ impl TcpRelayRegistry {
         write_rfc4571_frame(&mut outbound, &first_frame)
             .await
             .map_err(|e| format!("write first frame to {outbound_addr}: {e}"))?;
-        // [DIAGNOSTIC — to revert]
-        eprintln!(
-            "[diag/relay] first frame written to peer ({} bytes)",
-            first_frame.len()
-        );
 
-        // [DIAGNOSTIC — to revert] Replace `tokio::io::copy_bidirectional`
-        // with two metered copy tasks so we can see byte counts per
-        // direction in real time. If browser→peer flows but peer→browser
-        // stays at 0, the silent-leg location is unambiguous. The
-        // `diag_relay_copy` helper logs periodic deltas + final
-        // EOF/error; both legs run independently so an early EOF on
-        // one side doesn't tear down the other (slight semantic
-        // change vs `copy_bidirectional`, but acceptable for
-        // diagnostic).
-        let (r_in, w_in) = stream.into_split();
-        let (r_out, w_out) = outbound.into_split();
-        tokio::spawn(diag_relay_copy(r_in, w_out, "browser→peer"));
-        tokio::spawn(diag_relay_copy(r_out, w_in, "peer→browser"));
+        // Spawn a bidirectional byte-forwarder. `copy_bidirectional`
+        // handles both directions concurrently and exits when either
+        // side closes — matches the ICE-TCP lifecycle where a single
+        // candidate pair's TCP connection lives for the WebRTC
+        // session's duration.
+        let mut stream = stream;
+        tokio::spawn(async move {
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut outbound).await;
+        });
         Ok(())
-    }
-}
-
-// [DIAGNOSTIC — to revert] Helper for route_accepted's two-direction
-// metered copy. Reads from `reader`, writes to `writer`, reports byte
-// deltas every 2s with a unique direction tag, and emits a clean
-// EOF/error line at termination. Compatible with
-// `tokio::net::tcp::OwnedReadHalf` / `OwnedWriteHalf` since both
-// implement AsyncRead/AsyncWrite via tokio::io::AsyncReadExt /
-// AsyncWriteExt — same surface `tokio::io::copy_bidirectional` uses.
-async fn diag_relay_copy(
-    mut reader: tokio::net::tcp::OwnedReadHalf,
-    mut writer: tokio::net::tcp::OwnedWriteHalf,
-    name: &'static str,
-) -> std::io::Result<u64> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut buf = vec![0u8; 8192];
-    let mut total = 0u64;
-    let mut last_log = Instant::now();
-    let mut last_total = 0u64;
-    loop {
-        let n = match reader.read(&mut buf).await {
-            Ok(0) => {
-                eprintln!("[diag/relay] {name} EOF total={total}");
-                return Ok(total);
-            }
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("[diag/relay] {name} READ error after {total}B: {e}");
-                return Err(e);
-            }
-        };
-        if let Err(e) = writer.write_all(&buf[..n]).await {
-            eprintln!("[diag/relay] {name} WRITE error after {total}B: {e}");
-            return Err(e);
-        }
-        total += n as u64;
-        if last_log.elapsed() >= Duration::from_secs(2) {
-            eprintln!(
-                "[diag/relay] {name} +{}B (total={total})",
-                total - last_total
-            );
-            last_log = Instant::now();
-            last_total = total;
-        }
     }
 }
 
@@ -1620,21 +1550,6 @@ struct DriverState {
     /// All subsequent rtp_time values are relative to this.
     first_frame_at: Option<Instant>,
     rtp: RtpSendState,
-    // [DIAGNOSTIC — to revert] Per-(rid, ssrc) flag flipped on the first
-    // successful `write_rtp` call. Lets us tell "rtp packetization +
-    // sender path is working" from "encoder produces but rtp send fails."
-    diag_first_write_seen: HashSet<(SimulcastRid, u32)>,
-    // [DIAGNOSTIC — to revert] Per-(proto, local, peer) call+byte counters
-    // for `rtc.poll_write()` transmits. Periodic dump from `drain_outputs`
-    // exposes which destinations are actually being targeted vs which are
-    // silent — distinguishes "rtc emits to UDP peer addr only" from
-    // "rtc emits to TCP peer addr but tcp_writers has no key."
-    diag_transmits: HashMap<(&'static str, SocketAddr, SocketAddr), (u64, u64)>,
-    diag_last_dump_at: Option<Instant>,
-    // [DIAGNOSTIC — to revert] Per-peer_addr flag for the silent-`continue`
-    // in `drain_outputs`'s TCP arm. Logged once per missing key so a
-    // sustained mismatch produces one clear log line, not a spam.
-    diag_tcp_miss_seen: HashSet<SocketAddr>,
 }
 
 /// Per-RID send state — one entry per simulcast layer (or one entry
@@ -1761,11 +1676,6 @@ async fn driver(
             mid_ext_id: None,
             rid_ext_id: None,
         },
-        // [DIAGNOSTIC — to revert] See DriverState field docs.
-        diag_first_write_seen: HashSet::new(),
-        diag_transmits: HashMap::new(),
-        diag_last_dump_at: None,
-        diag_tcp_miss_seen: HashSet::new(),
     };
 
     // Index sockets by their local address so we can route outbound writes
@@ -1948,13 +1858,6 @@ async fn driver(
                 let (read_half, write_half) = stream.into_split();
                 let writer: TcpWriter = Arc::new(AsyncMutex::new(write_half));
                 tcp_writers.insert(remote_addr, Arc::clone(&writer));
-                // [DIAGNOSTIC — to revert] Surface the writer-key + the
-                // fake local separately from the existing line so a grep
-                // for `[diag/tcp-writers]` shows insert/miss pairs side
-                // by side and the cross-reference is unambiguous.
-                eprintln!(
-                    "[diag/tcp-writers] INSERT key={remote_addr} fake_local={fake_local}"
-                );
 
                 // Spawn reader task for subsequent frames on this connection.
                 let reader_tx = inbound_tx.clone();
@@ -2138,25 +2041,6 @@ async fn drain_outputs(
     keyframe_request_tx: &mpsc::Sender<SimulcastRid>,
 ) -> Result<Instant, DriverExit> {
     while let Some(t) = rtc.poll_write() {
-        // [DIAGNOSTIC — to revert] Per-tuple poll_write counters. First
-        // transmit per (proto, local, peer) gets its own one-shot log so
-        // we can see every distinct destination rtc actually targets.
-        let proto_name = match t.transport.transport_protocol {
-            TransportProtocol::UDP => "UDP",
-            TransportProtocol::TCP => "TCP",
-        };
-        let key = (proto_name, t.transport.local_addr, t.transport.peer_addr);
-        let entry = state.diag_transmits.entry(key).or_insert((0u64, 0u64));
-        entry.0 += 1;
-        entry.1 += t.message.len() as u64;
-        if entry.0 == 1 {
-            eprintln!(
-                "[diag/poll_write] FIRST transmit proto={proto_name} {} → {} bytes={}",
-                t.transport.local_addr,
-                t.transport.peer_addr,
-                t.message.len(),
-            );
-        }
         // Routability filtering only applies to UDP: for UDP we need the
         // kernel's `sendto` to succeed from our bound socket, and a
         // loopback-source-to-routable-destination pair would be rejected with
@@ -2189,22 +2073,6 @@ async fn drain_outputs(
             }
             TransportProtocol::TCP => {
                 let Some(writer) = tcp_writers.get(&t.transport.peer_addr).cloned() else {
-                    // [DIAGNOSTIC — to revert] The previously-silent miss
-                    // — key suspect for "ICE pair selected but media
-                    // silent." If rtc emits TCP transmits but our
-                    // tcp_writers map is keyed under a different
-                    // SocketAddr than rtc thinks the peer is at,
-                    // every transmit silently `continue`s. Log the
-                    // peer_addr rtc asked for and the keys we have so
-                    // a mismatch (port re-binding, IPv4/IPv6, etc.)
-                    // is immediately visible.
-                    if state.diag_tcp_miss_seen.insert(t.transport.peer_addr) {
-                        let keys: Vec<_> = tcp_writers.keys().collect();
-                        eprintln!(
-                            "[diag/tcp-writers] MISS peer_addr={} (have keys: {:?})",
-                            t.transport.peer_addr, keys,
-                        );
-                    }
                     continue;
                 };
                 let contents: Vec<u8> = t.message.to_vec();
@@ -2216,24 +2084,6 @@ async fn drain_outputs(
                 });
             }
         }
-    }
-    // [DIAGNOSTIC — to revert] Periodic dump of the per-tuple counters
-    // (every 2s while the driver is awake). Only fires when there has
-    // been at least one transmit since startup.
-    let now_dump = Instant::now();
-    let should_dump = state
-        .diag_last_dump_at
-        .map(|t| now_dump.duration_since(t) >= Duration::from_secs(2))
-        .unwrap_or(true);
-    if should_dump && !state.diag_transmits.is_empty() {
-        state.diag_last_dump_at = Some(now_dump);
-        let mut summary: Vec<String> = state
-            .diag_transmits
-            .iter()
-            .map(|((proto, l, p), (n, b))| format!("{proto} {l}→{p} {n}calls/{b}B"))
-            .collect();
-        summary.sort();
-        eprintln!("[diag/poll_write] dump: [{}]", summary.join(", "));
     }
 
     while let Some(message) = rtc.poll_read() {
@@ -2698,20 +2548,7 @@ fn write_video_frame(
             return;
         };
         match sender.write_rtp(packet) {
-            Ok(()) => {
-                // [DIAGNOSTIC — to revert] Log the first successful
-                // write_rtp per (rid, ssrc) so we can confirm the
-                // sender path produced *some* packets per layer
-                // before turning to drain_outputs/poll_write logs
-                // for the wire side.
-                if state.diag_first_write_seen.insert((rid.clone(), rid_ssrc)) {
-                    eprintln!(
-                        "[diag/write_rtp] FIRST success rid={} ssrc={}",
-                        rid.as_str(),
-                        rid_ssrc,
-                    );
-                }
-            }
+            Ok(()) => {}
             Err(e) => {
                 eprintln!(
                     "[display/webrtc] write_rtp failed on rid {}: {e:?}",
