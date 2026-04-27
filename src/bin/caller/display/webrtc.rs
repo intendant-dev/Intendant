@@ -1174,64 +1174,10 @@ impl WebRtcPeer {
             encodings,
         );
 
-        // diag #51 v2 (TWCC + RR enable spike, TO REVERT after smoke):
-        // the previous spike (commit 3613d6c, reverted in 7bd9b8f)
-        // showed RR-derived stats are all-zero defaults — rtc 0.9 isn't
-        // surfacing real RR data at all. Suspected cause: the peer was
-        // built without an interceptor registry, so the SR/RR and TWCC
-        // interceptors that rtc 0.9 ships in
-        // `peer_connection::configuration::interceptor_registry::*`
-        // never run. Without those interceptors, no SR is emitted (so
-        // the browser has nothing to time-anchor RRs against), no TWCC
-        // extension is attached to outbound RTP (so the browser can't
-        // produce TransportLayerCC feedback), and the RR-stats
-        // accumulator stays at its pre-RR defaults forever.
-        //
-        // This spike configures:
-        //   1. configure_rtcp_reports: SR sender + RR receiver
-        //      interceptors so we emit Sender Reports and process
-        //      incoming Receiver Reports into the stats accumulator.
-        //   2. configure_twcc_sender_only: registers the
-        //      `transport-cc` RTCP feedback type + the
-        //      `http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01`
-        //      RTP header extension on the media engine, then attaches
-        //      the TwccSender interceptor that stamps outbound RTP
-        //      with transport-wide sequence numbers. The browser's
-        //      receive side can then send TransportLayerCC feedback
-        //      back to us.
-        //
-        // Verify in this order:
-        //   1. Answer SDP contains `a=rtcp-fb:<pt> transport-cc`.
-        //   2. Answer SDP contains the TWCC `a=extmap:<id> http://...
-        //      transport-wide-cc-extensions-01`.
-        //   3. Outbound RTP carries the TWCC extension (verify via
-        //      tcpdump or rtc internal stats).
-        //   4. Inbound RTCP yields either real RR updates (non-zero
-        //      `round_trip_time_measurements` in the diag log below)
-        //      OR TransportLayerCC packets reaching rtc's stats path.
-        //   5. Re-run the pf/dnctl 30% loss smoke against UDP/<daemon>.
-        //
-        // To revert: drop the `let registry = ...` block + the
-        // `.with_interceptor_registry(registry)` call + the eprintln
-        // diag at the end of the RR poll path. Imports are inline
-        // qualified so no use-statement cleanup needed.
-        let registry = rtc::interceptor::Registry::new();
-        let registry =
-            rtc::peer_connection::configuration::interceptor_registry::configure_rtcp_reports(
-                registry,
-            );
-        let registry =
-            rtc::peer_connection::configuration::interceptor_registry::configure_twcc_sender_only(
-                registry,
-                &mut media_engine,
-            )
-            .map_err(|e| CallerError::WebRtc(format!("configure twcc: {e}")))?;
-
         let mut rtc = RTCPeerConnectionBuilder::new()
             .with_configuration(RTCConfigurationBuilder::new().build())
             .with_setting_engine(setting_engine)
             .with_media_engine(media_engine)
-            .with_interceptor_registry(registry)
             .build()
             .map_err(|e| CallerError::WebRtc(format!("build rtc peer: {e}")))?;
         let sender_id = rtc
@@ -1405,20 +1351,6 @@ impl WebRtcPeer {
         // "browser never tries to connect to the TCP candidate" symptoms.
         for line in answer_sdp.lines().filter(|l| l.starts_with("a=candidate:")) {
             eprintln!("[display/webrtc] peer {peer_id}: answer {line}");
-        }
-        // diag #51 v2 (TO REVERT): one-shot dump of TWCC plumbing in
-        // the answer SDP. Verifies items 1+2 of the operator's check
-        // list: `a=rtcp-fb:<pt> transport-cc` + the transport-wide CC
-        // `a=extmap` line. If both are present, the interceptor
-        // registry wiring took effect; if either is missing, the
-        // configure_* calls didn't reach the answer path and we
-        // need to investigate the media-engine ordering.
-        for line in answer_sdp.lines().filter(|l| {
-            l.contains("transport-cc")
-                || l.contains("transport-wide-cc")
-                || l.starts_with("a=extmap:")
-        }) {
-            eprintln!("[diag #51 v2] peer {peer_id}: answer {line}");
         }
 
         // --- Spawn the driver --------------------------------------------
@@ -1805,9 +1737,9 @@ struct InboundPacket {
 type TcpWriter = Arc<AsyncMutex<tokio::net::tcp::OwnedWriteHalf>>;
 
 #[allow(clippy::too_many_arguments)]
-async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
+async fn driver(
     peer_id: PeerId,
-    mut rtc: RTCPeerConnection<I>,
+    mut rtc: RTCPeerConnection,
     rtp_config: RtpSendConfig,
     sockets: Vec<Arc<UdpSocket>>,
     mut tcp_conn_rx: Option<mpsc::Receiver<AcceptedTcpConnection>>,
@@ -2197,14 +2129,7 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
                     .iter()
                     .map(|(rid, s)| (rid.clone(), s.ssrc))
                     .collect();
-                // diag #51 v2 (TO REVERT): collect raw RRs into a Vec
-                // so the rr_raw values can be logged BEFORE the
-                // pre-RR-default filter at
-                // `map_remote_inbound_to_rid_health` drops them. With
-                // the SR + TWCC interceptors now wired, expectation:
-                // rtt_measurements becomes non-zero on at least one
-                // SSRC once the browser starts sending real RRs.
-                let raw_rrs: Vec<(u32, f64, i64, f64, u64)> = report
+                let remote_inbound_iter = report
                     .iter_by_type(RTCStatsType::RemoteInboundRTP)
                     .filter_map(|entry| match entry {
                         RTCStatsReportEntry::RemoteInboundRtp(s) => Some((
@@ -2224,20 +2149,10 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
                             s.round_trip_time_measurements,
                         )),
                         _ => None,
-                    })
-                    .collect();
+                    });
                 let health = map_remote_inbound_to_rid_health(
-                    raw_rrs.iter().copied(),
+                    remote_inbound_iter,
                     &ssrc_table,
-                );
-                eprintln!(
-                    "[diag #51 v2] peer={} sender_table={:?} rr_raw={:?} \
-                     rr_mapped_count={} mapped_rids={:?}",
-                    peer_id,
-                    ssrc_table,
-                    raw_rrs,
-                    health.len(),
-                    health.keys().collect::<Vec<_>>(),
                 );
                 remote_inbound_health_tx.send_replace(health);
             }
@@ -2251,8 +2166,8 @@ enum DriverExit {
 
 /// Drain pending writes, reads, and events from the sans-I/O peer connection.
 #[allow(clippy::too_many_arguments)]
-async fn drain_outputs<I: rtc::interceptor::Interceptor>(
-    rtc: &mut RTCPeerConnection<I>,
+async fn drain_outputs(
+    rtc: &mut RTCPeerConnection,
     sockets_by_addr: &HashMap<SocketAddr, Arc<UdpSocket>>,
     tcp_writers: &mut HashMap<SocketAddr, TcpWriter>,
     state: &mut DriverState,
@@ -2327,8 +2242,8 @@ async fn drain_outputs<I: rtc::interceptor::Interceptor>(
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400)))
 }
 
-fn handle_event<I: rtc::interceptor::Interceptor>(
-    rtc: &mut RTCPeerConnection<I>,
+fn handle_event(
+    rtc: &mut RTCPeerConnection,
     state: &mut DriverState,
     event: RTCPeerConnectionEvent,
 ) -> bool {
@@ -2656,8 +2571,8 @@ fn handle_message(
     }
 }
 
-fn write_video_frame<I: rtc::interceptor::Interceptor>(
-    rtc: &mut RTCPeerConnection<I>,
+fn write_video_frame(
+    rtc: &mut RTCPeerConnection,
     state: &mut DriverState,
     outbound: &OutboundEncodedFrame,
 ) {
@@ -2815,8 +2730,8 @@ fn payload_spec_matches_codec(
     false
 }
 
-fn rtp_header_extension_ids<I: rtc::interceptor::Interceptor>(
-    rtc: &mut RTCPeerConnection<I>,
+fn rtp_header_extension_ids(
+    rtc: &mut RTCPeerConnection,
     state: &mut DriverState,
 ) -> (Option<u8>, Option<u8>) {
     if state.rtp.mid_ext_id.is_some() || state.rtp.rid_ext_id.is_some() {
@@ -2835,11 +2750,7 @@ fn rtp_header_extension_ids<I: rtc::interceptor::Interceptor>(
     (state.rtp.mid_ext_id, state.rtp.rid_ext_id)
 }
 
-fn handle_command<I: rtc::interceptor::Interceptor>(
-    rtc: &mut RTCPeerConnection<I>,
-    state: &DriverState,
-    cmd: Command,
-) {
+fn handle_command(rtc: &mut RTCPeerConnection, state: &DriverState, cmd: Command) {
     match cmd {
         Command::AddIceCandidate(s) => {
             let init = RTCIceCandidateInit {
