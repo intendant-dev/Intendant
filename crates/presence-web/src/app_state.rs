@@ -196,6 +196,19 @@ pub enum UiCommand {
     /// JSON value forwarded verbatim — JS dispatches on `signal.kind`
     /// directly so newer signal kinds added to the wire don't require
     /// a coordinated WASM rebuild on the dashboard side.
+    ///
+    /// Explicit `rename`: serde's `rename_all = "snake_case"` mangles
+    /// `WebRtc` to `web_rtc`, producing `peer_web_rtc_signal` on the
+    /// wire — but JS dispatches on `case 'peer_webrtc_signal'` (and
+    /// every primer / doc reference uses the unbroken `webrtc`
+    /// spelling, matching the W3C name). Without this rename the
+    /// answer SDP arrives at the WS layer, gets translated to a
+    /// well-formed UiCommand, and then silently misses the JS switch
+    /// — no error, just a dead pipeline. The
+    /// `peer_webrtc_signal_wire_name` test below is the invariant
+    /// guard. Same hazard the wire-format policy in
+    /// `src/bin/caller/peer/mod.rs` calls out for `A2A`/`OpenClaw`/etc.
+    #[serde(rename = "peer_webrtc_signal")]
     PeerWebRtcSignal {
         host_id: String,
         display_id: u32,
@@ -3677,6 +3690,35 @@ mod tests {
         assert_eq!(session_id, "sess-uuid");
         assert_eq!(signal["kind"], "answer");
         assert_eq!(signal["sdp"], "v=0\r\n...");
+    }
+
+    /// The `cmd` discriminator of `UiCommand::PeerWebRtcSignal` MUST
+    /// serialize to exactly `"peer_webrtc_signal"` because the JS
+    /// dispatch in `static/app.html` matches that literal string. Without
+    /// the explicit `#[serde(rename = "peer_webrtc_signal")]`,
+    /// `rename_all = "snake_case"` mangles `WebRtc` into two words and
+    /// produces `peer_web_rtc_signal`, which silently misses the JS
+    /// switch — answer SDP arrives at the WS layer, gets translated to
+    /// a well-formed UiCommand, then drops on the floor with no error.
+    /// This test catches the regression at compile-test time instead of
+    /// at smoke-test time. Wire-format invariant — see the variant's
+    /// docstring for the full failure narrative.
+    #[test]
+    fn peer_webrtc_signal_wire_name() {
+        let cmd = UiCommand::PeerWebRtcSignal {
+            host_id: "intendant:alpha".to_string(),
+            display_id: 0,
+            session_id: "sess-uuid".to_string(),
+            signal: json!({"kind": "answer", "sdp": ""}),
+        };
+        let v = serde_json::to_value(&cmd).expect("serialize");
+        assert_eq!(
+            v["cmd"].as_str(),
+            Some("peer_webrtc_signal"),
+            "PeerWebRtcSignal must serialize cmd=\"peer_webrtc_signal\" \
+             (without the rename, snake_case would mangle to \
+             peer_web_rtc_signal and JS dispatch would silently miss)"
+        );
     }
 
     /// `webrtc_signal` without a session_id can't route to any
