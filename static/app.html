@@ -11972,6 +11972,8 @@ class PeerDisplayConnection {
       if (videoEl) videoEl.srcObject = this.stream;
       this.setStatus('Connected (view-only)', 'connected');
       this._log('info', 'ontrack fired — video stream attached');
+      // [DIAGNOSTIC — to revert] Black-video investigation.
+      if (videoEl) this._startVideoDiagnostic(videoEl);
     };
 
     this.pc.onicecandidate = (e) => {
@@ -12160,7 +12162,117 @@ class PeerDisplayConnection {
     return s;
   }
 
+  // [DIAGNOSTIC — to revert] Black-video investigation: bytes flow on
+  // the wire (encode>0fps, peers=1, ICE pair selected) but <video>
+  // renders black. Three failure classes:
+  //   1. Codec/RTP/decode — packets arrive but framesDecoded stays 0
+  //      (H.264 packetization-mode mismatch, profile-level-id mismatch,
+  //      Annex-B vs AVCC framing, missing keyframe).
+  //   2. Frontend attach/playback — framesDecoded > 0 but videoWidth
+  //      stays 0 or no 'playing' event (srcObject lifecycle, autoplay
+  //      policy NotAllowedError, mute state, srcObject re-attach race).
+  //   3. Source content actually black — all stats normal but canvas
+  //      sample is all-zero pixels (X11 desktop empty / DPMS-blanked /
+  //      capture pulling stale screen).
+  // This poll covers all three axes in one smoke run. Logs are
+  // 2-second-cadence to keep the line count tractable. Plan to revert
+  // once the failure mode is identified.
+  _startVideoDiagnostic(videoEl) {
+    if (this._diagInterval) return;
+
+    // videoEl event listeners — fire once per state transition.
+    for (const ev of ['loadedmetadata', 'resize', 'playing', 'pause', 'error']) {
+      videoEl.addEventListener(ev, () => {
+        const errInfo = ev === 'error' && videoEl.error
+          ? ` errCode=${videoEl.error.code} errMsg=${videoEl.error.message}`
+          : '';
+        this._log('info',
+          `[diag/videoEl] event=${ev} videoWidth=${videoEl.videoWidth} ` +
+          `videoHeight=${videoEl.videoHeight} paused=${videoEl.paused} ` +
+          `readyState=${videoEl.readyState}${errInfo}`);
+      });
+    }
+
+    // Explicit play() — autoplay-policy rejections surface here as
+    // NotAllowedError, which silently leaves the element paused with
+    // no other observable error.
+    videoEl.play()
+      .then(() => this._log('info', '[diag/videoEl] play() resolved'))
+      .catch(err => this._log('warn',
+        `[diag/videoEl] play() rejected: ${err.name}: ${err.message}`));
+
+    const prev = {
+      bytesReceived: 0, packetsReceived: 0, framesReceived: 0,
+      framesDecoded: 0, keyFramesDecoded: 0, framesDropped: 0,
+    };
+    let canvas = null, ctx = null;
+    this._diagInterval = setInterval(async () => {
+      if (!this.pc) return;
+      let stats;
+      try { stats = await this.pc.getStats(); }
+      catch (err) {
+        this._log('warn', `[diag/inbound-rtp] getStats failed: ${err.message}`);
+        return;
+      }
+      let inbound = null;
+      stats.forEach(r => {
+        if (r.type === 'inbound-rtp' && r.kind === 'video') inbound = r;
+      });
+      if (inbound) {
+        const delta = {};
+        for (const k of Object.keys(prev)) {
+          delta[k] = (inbound[k] || 0) - prev[k];
+          prev[k] = inbound[k] || 0;
+        }
+        this._log('info',
+          `[diag/inbound-rtp] +bytes=${delta.bytesReceived} ` +
+          `+pkts=${delta.packetsReceived} +frames=${delta.framesReceived} ` +
+          `+decoded=${delta.framesDecoded} +keyframes=${delta.keyFramesDecoded} ` +
+          `+dropped=${delta.framesDropped} ` +
+          `dim=${inbound.frameWidth || 0}x${inbound.frameHeight || 0} ` +
+          `decoder=${inbound.decoderImplementation || '?'} ` +
+          `videoEl=${videoEl.videoWidth}x${videoEl.videoHeight} ` +
+          `paused=${videoEl.paused}`);
+      } else {
+        this._log('debug', '[diag/inbound-rtp] no inbound-rtp video stat yet');
+      }
+
+      // Canvas pixel sample — distinguishes "renderer paints black
+      // despite pixels being non-black" from "pixels themselves are
+      // black." 16x16 keeps drawImage + getImageData cheap.
+      if (videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
+        if (!canvas) {
+          canvas = document.createElement('canvas');
+          canvas.width = 16;
+          canvas.height = 16;
+          ctx = canvas.getContext('2d');
+        }
+        try {
+          ctx.drawImage(videoEl, 0, 0, 16, 16);
+          const data = ctx.getImageData(0, 0, 16, 16).data;
+          let nonBlack = 0;
+          for (let i = 0; i < data.length; i += 4) {
+            if (data[i] > 8 || data[i + 1] > 8 || data[i + 2] > 8) nonBlack++;
+          }
+          // Center pixel (8,8) → byte index (8*16 + 8) * 4 = 544.
+          const ci = 544;
+          this._log('info',
+            `[diag/canvas] center=rgb(${data[ci]},${data[ci + 1]},${data[ci + 2]}) ` +
+            `nonBlackPixels=${nonBlack}/256`);
+        } catch (err) {
+          this._log('warn',
+            `[diag/canvas] draw/sample failed: ${err.name}: ${err.message}`);
+        }
+      }
+    }, 2000);
+  }
+
   async close() {
+    // [DIAGNOSTIC — to revert] Stop video diagnostic poll.
+    if (this._diagInterval) {
+      clearInterval(this._diagInterval);
+      this._diagInterval = null;
+    }
     // Best-effort tell peer to tear down its WebRtcPeer.
     await this._sendSignal({ kind: 'close' }).catch(() => {});
     if (this.pc) {
