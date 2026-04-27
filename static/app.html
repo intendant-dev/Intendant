@@ -11986,9 +11986,53 @@ class PeerDisplayConnection {
       }
     };
 
-    this.pc.oniceconnectionstatechange = () => {
+    this.pc.oniceconnectionstatechange = async () => {
       if (!this.pc) return;
-      this._log('debug', `iceConnectionState=${this.pc.iceConnectionState}`);
+      const state = this.pc.iceConnectionState;
+      this._log('debug', `iceConnectionState=${state}`);
+      // When ICE pairs, log the selected pair so future smoke tests
+      // can distinguish which ICE path won — direct host UDP vs the
+      // primary's TCP relay candidate (slice-3a.2 at the peer's
+      // browser_tcp_via_url) vs an actual TURN relay (when a real
+      // TURN server is configured in [webrtc].ice_servers). Without
+      // this, "connection works" doesn't tell you whether you're on
+      // the cheap direct path or paying TURN bandwidth costs.
+      if (state === 'connected' || state === 'completed') {
+        try {
+          const stats = await this.pc.getStats();
+          const candidates = new Map();
+          let pair = null;
+          stats.forEach((r) => {
+            if (r.type === 'local-candidate' || r.type === 'remote-candidate') {
+              candidates.set(r.id, r);
+            } else if (
+              r.type === 'candidate-pair' &&
+              (r.selected || (r.nominated && r.state === 'succeeded'))
+            ) {
+              pair = r;
+            }
+          });
+          const fmt = (c) =>
+            c
+              ? `${c.candidateType || '?'} ${c.protocol || '?'} ` +
+                `${c.address || c.ip || '?'}:${c.port}`
+              : '?';
+          if (pair) {
+            const local = candidates.get(pair.localCandidateId);
+            const remote = candidates.get(pair.remoteCandidateId);
+            this._log(
+              'info',
+              `selected candidate pair: ` +
+                `local=[${fmt(local)}] remote=[${fmt(remote)}] ` +
+                `state=${pair.state} nominated=${pair.nominated}`
+            );
+          } else {
+            this._log('debug', 'no selected candidate-pair in getStats() yet');
+          }
+        } catch (err) {
+          this._log('warn', `getStats() failed: ${err.message}`);
+        }
+      }
     };
 
     this.pc.onconnectionstatechange = () => {
