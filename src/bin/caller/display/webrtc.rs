@@ -718,6 +718,78 @@ pub struct PeerLayerHealth {
     pub round_trip_time_measurements: u64,
 }
 
+/// Sanitize an rtc 0.9-emitted answer SDP, fixing two SDP-writer bugs
+/// that fire on multi-RID simulcast send (specifically when our peer
+/// answers a browser offer that requested `a=simulcast:recv f;h;q`):
+///
+///   1. **Duplicate `a=rid:<rid> send` lines.** rtc 0.9 emits each RID
+///      `send` line twice — six lines for f/h/q instead of three.
+///      Fix: dedupe by full line content within each m= section.
+///
+///   2. **Malformed `a=simulcast:` attribute.** rtc 0.9 concatenates
+///      the direction + RID list as if the answer were bidirectional,
+///      producing `a=simulcast:send f;h;q send f;h;q` instead of the
+///      RFC 8853-correct `a=simulcast:send f;h;q`. WebKit's parser
+///      rejects this with `SyntaxError: Malformed simulcast line`.
+///      Fix: when an `a=simulcast:` line repeats the same direction
+///      twice, keep only the first `<dir> <list>` pair.
+///
+/// Pure / idempotent: already-clean SDP is unchanged, single-RID
+/// answers (H.264, VP8 floor-only) are unchanged, and the function
+/// has no side effects. Tested via `sanitize_answer_sdp_*` below.
+///
+/// Section-aware: `seen_rids` resets at every `m=` boundary so a
+/// theoretical multi-section SDP that legitimately reuses RIDs
+/// across audio + video isn't silently flattened.
+///
+/// Line-ending preserving: detects CRLF vs LF on input and preserves
+/// the same on output, including a trailing terminator if present.
+fn sanitize_answer_sdp(sdp: &str) -> String {
+    let line_ending = if sdp.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut seen_rids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::with_capacity(sdp.lines().count());
+
+    for line in sdp.lines() {
+        if line.starts_with("m=") {
+            seen_rids.clear();
+            out.push(line.to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("a=rid:") {
+            // dedupe by the post-`a=rid:` content (rid + dir + params)
+            if !seen_rids.insert(rest.to_string()) {
+                continue;
+            }
+            out.push(line.to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("a=simulcast:") {
+            // Valid forms (RFC 8853):
+            //   a=simulcast:send f;h;q
+            //   a=simulcast:recv f;h;q
+            //   a=simulcast:send f;h;q recv x          (bidirectional)
+            // Bug form rtc 0.9 emits:
+            //   a=simulcast:send f;h;q send f;h;q      (same dir twice)
+            // Fix: when the second direction equals the first, drop the
+            // second pair; otherwise pass through.
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 4 && parts[0] == parts[2] {
+                out.push(format!("a=simulcast:{} {}", parts[0], parts[1]));
+            } else {
+                out.push(line.to_string());
+            }
+            continue;
+        }
+        out.push(line.to_string());
+    }
+
+    let mut result = out.join(line_ending);
+    if sdp.ends_with("\r\n") || sdp.ends_with('\n') {
+        result.push_str(line_ending);
+    }
+    result
+}
+
 impl WebRtcPeer {
     /// **Phase 4d.1**: subscribe to this peer's recent observed send
     /// bitrate signal. **Local egress only, not available capacity**
@@ -1232,7 +1304,48 @@ impl WebRtcPeer {
             .map_err(|e| CallerError::WebRtc(format!("create answer: {e}")))?;
         rtc.set_local_description(answer.clone())
             .map_err(|e| CallerError::WebRtc(format!("set local answer: {e}")))?;
-        let answer_sdp = answer.sdp;
+        // Sanitized-wire-only shim — narrow workaround for two rtc 0.9
+        // SDP-writer bugs that fire on multi-RID simulcast send:
+        //   1. each `a=rid:<rid> send` line emitted twice (six lines for
+        //      f/h/q instead of three);
+        //   2. `a=simulcast:send f;h;q send f;h;q` instead of the RFC
+        //      8853-correct `a=simulcast:send f;h;q`.
+        // WebKit rejects (2) with `SyntaxError: Malformed simulcast
+        // line` on setRemoteDescription, so the answer never lands and
+        // no media flows. See `sanitize_answer_sdp` above for the
+        // exact transformation + test coverage.
+        //
+        // Why the call sequence is what it is: rtc 0.9 caches the
+        // `create_answer` result in `PeerConnectionInternal.last_answer`
+        // (peer_connection/mod.rs:944) and `set_local_description`
+        // does a direct string-equality check against that cache
+        // (peer_connection/internal.rs:373, :408). Sanitizing
+        // *between* `create_answer` and `set_local_description`
+        // therefore fails with `ErrSDPDoesNotMatchAnswer`. So the
+        // contract here is:
+        //
+        //   - Pass the *literal* `create_answer` output to
+        //     `set_local_description` (above) — rtc's strict gate is
+        //     satisfied, rtc's local state stays internally consistent
+        //     with the malformed SDP it produced.
+        //   - Sanitize *only* the bytes we ship on the wire — WebKit
+        //     accepts the corrected line, media flows.
+        //
+        // Yes, this leaves the rtc state's local SDP and the wire SDP
+        // diverged. The hypothesis being tested is that the divergence
+        // is benign because rtc's media plane was built from track
+        // encodings, not from re-parsing its own emitted SDP — so the
+        // doubled `a=rid:` lines and `a=simulcast:send ... send ...`
+        // attribute are pure signaling artifacts. If this experiment
+        // proves the hypothesis, the shim stays as a narrow
+        // compatibility band-aid until the dep is patched.
+        //
+        // Long-term fix: patch rtc 0.9's SDP writer at source — fix
+        // the per-RID `send` line duplication and the doubled-direction
+        // `a=simulcast:` emission — and remove this sanitizer call,
+        // not the dep's validation gate. Relaxing the gate was
+        // explicitly excluded as the wrong fix shape.
+        let answer_sdp = sanitize_answer_sdp(&answer.sdp);
         // Dump every a=candidate line from the answer so we can see exactly
         // what the RTC core emitted — this is the fastest way to diagnose
         // "browser never tries to connect to the TCP candidate" symptoms.
@@ -4543,23 +4656,52 @@ mod tests {
         // (f / h / q — LiveKit / mediasoup convention, see RID_FULL
         // etc. in pool.rs). The order matches the `active_rids`
         // slice order; rtc emits them in track-encoding order.
-        assert!(
-            answer_sdp.contains("a=simulcast:send f;h;q"),
-            "answer must include a=simulcast:send f;h;q; \
-             got:\n{answer_sdp}"
+        //
+        // After the sanitized-wire-only shim landed in
+        // `build_with_codec_set` (sanitize_answer_sdp called on the
+        // wire bytes after set_local_description), these assertions
+        // pin the exact shape of the WIRE answer that ships to the
+        // browser:
+        //
+        //   - exactly ONE `a=simulcast:send f;h;q` line — not two
+        //     (rtc 0.9's doubled-direction emission was sanitized);
+        //   - exactly ONE `a=rid:<rid> send` line per active rid —
+        //     not two (rtc 0.9's per-RID duplication was sanitized);
+        //   - no `send f;h;q send` substring (the sentinel pattern
+        //     of the rtc-0.9 SDP-writer bug);
+        //   - the wire answer parses as a valid RTCSessionDescription
+        //     of type `answer` — the parse-check that proves WebKit's
+        //     parser would accept it.
+        //
+        // Test-gap discipline: the operator caught earlier that
+        // `assert!(answer_sdp.contains("a=simulcast:send f;h;q"))`
+        // happily passes against the malformed
+        // `a=simulcast:send f;h;q send f;h;q`. Exact-count assertions
+        // + explicit substring negation + parse-check are the
+        // discipline that catches that class of bug.
+        assert_eq!(
+            answer_sdp.matches("a=simulcast:send f;h;q").count(),
+            1,
+            "wire answer must contain exactly ONE \
+             `a=simulcast:send f;h;q` line; got:\n{answer_sdp}"
         );
-        // Per-rid declarations in `send` direction. Use the wire
-        // strings from `SimulcastRid::*::as_str()` so the test
-        // tracks any future change to the RID vocabulary.
+        assert!(
+            !answer_sdp.contains("send f;h;q send"),
+            "wire answer must NOT contain the rtc-0.9 doubled-direction \
+             sentinel `send f;h;q send`; got:\n{answer_sdp}"
+        );
         for rid in [
             SimulcastRid::full(),
             SimulcastRid::half(),
             SimulcastRid::quarter(),
         ] {
             let line = format!("a=rid:{} send", rid.as_str());
-            assert!(
-                answer_sdp.contains(&line),
-                "answer must include `{line}`; got:\n{answer_sdp}"
+            assert_eq!(
+                answer_sdp.matches(&line).count(),
+                1,
+                "wire answer must contain exactly ONE `{line}` line \
+                 (rtc 0.9 emits two; sanitize_answer_sdp dedupes); \
+                 got:\n{answer_sdp}"
             );
         }
         // Sanity: NO recv direction (we're sendonly answerer).
@@ -4567,6 +4709,15 @@ mod tests {
             !answer_sdp.contains("a=simulcast:recv"),
             "answer must NOT contain a=simulcast:recv (we're sendonly); \
              got:\n{answer_sdp}"
+        );
+        // Parse-check: the sanitized wire answer must be acceptable
+        // to rtc's own SDP parser as a type-`answer` description.
+        // This is the strongest available proxy in pure-Rust tests
+        // for "WebKit's parser would accept it" — both consume RFC
+        // 8853-conformant simulcast.
+        RTCSessionDescription::answer(answer_sdp.clone()).expect(
+            "sanitized wire answer must parse as a valid \
+             RTCSessionDescription of type `answer`",
         );
 
         // Clean up the spawned driver. Dropping `peer` cancels its
@@ -5455,5 +5606,124 @@ mod tests {
         assert!(rx2.borrow().is_empty());
 
         drop(peer);
+    }
+
+    // ----- sanitize_answer_sdp -----------------------------------
+    //
+    // Pure-helper tests for the rtc 0.9 SDP-writer workaround.
+    // See `sanitize_answer_sdp` doc-comment for the bugs being
+    // addressed. Each test fixes one input/output pair so a future
+    // regression that re-introduces duplicate rids or the doubled
+    // simulcast direction fires loudly.
+
+    /// rtc 0.9 emits each `a=rid:<rid> send` line twice for multi-RID
+    /// send. The sanitizer must dedupe each to exactly one occurrence
+    /// while preserving line order (first-seen wins) and untouched
+    /// surrounding lines.
+    #[test]
+    fn sanitize_answer_sdp_dedupes_duplicate_rid_send_lines() {
+        let input = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 VP8/90000\r\n",
+            "a=rid:f send\r\n",
+            "a=rid:h send\r\n",
+            "a=rid:q send\r\n",
+            "a=rid:f send\r\n",
+            "a=rid:h send\r\n",
+            "a=rid:q send\r\n",
+            "a=simulcast:send f;h;q\r\n",
+        );
+        let out = super::sanitize_answer_sdp(input);
+        assert_eq!(out.matches("a=rid:f send").count(), 1, "got:\n{out}");
+        assert_eq!(out.matches("a=rid:h send").count(), 1, "got:\n{out}");
+        assert_eq!(out.matches("a=rid:q send").count(), 1, "got:\n{out}");
+        // Preserves CRLF line endings.
+        assert!(out.contains("\r\n"), "must preserve CRLF; got:\n{out}");
+        // Surrounding lines untouched.
+        assert!(out.contains("a=rtpmap:96 VP8/90000"));
+        assert!(out.contains("a=simulcast:send f;h;q"));
+    }
+
+    /// `a=simulcast:send f;h;q send f;h;q` (rtc 0.9 doubled-direction
+    /// bug) must collapse to `a=simulcast:send f;h;q`. The substring
+    /// `send f;h;q send` is the regression marker.
+    #[test]
+    fn sanitize_answer_sdp_collapses_doubled_simulcast_send_direction() {
+        let input = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 VP8/90000\r\n",
+            "a=simulcast:send f;h;q send f;h;q\r\n",
+        );
+        let out = super::sanitize_answer_sdp(input);
+        assert!(
+            out.contains("a=simulcast:send f;h;q"),
+            "must contain a=simulcast:send f;h;q; got:\n{out}"
+        );
+        assert!(
+            !out.contains("send f;h;q send"),
+            "must NOT contain doubled-direction substring `send f;h;q \
+             send`; got:\n{out}"
+        );
+        // Exactly one a=simulcast: line in the output.
+        let count = out.lines().filter(|l| l.starts_with("a=simulcast:")).count();
+        assert_eq!(count, 1, "exactly one a=simulcast: line; got {count}\n{out}");
+    }
+
+    /// Already-clean SDP must pass through unchanged. Dedupe is
+    /// idempotent: re-applying the sanitizer to its own output is a
+    /// no-op.
+    #[test]
+    fn sanitize_answer_sdp_already_clean_unchanged() {
+        let input = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 VP8/90000\r\n",
+            "a=rid:f send\r\n",
+            "a=rid:h send\r\n",
+            "a=rid:q send\r\n",
+            "a=simulcast:send f;h;q\r\n",
+        );
+        let out = super::sanitize_answer_sdp(input);
+        assert_eq!(out, input, "clean input must pass through unchanged");
+        // Idempotent: sanitize(sanitize(x)) == sanitize(x).
+        let twice = super::sanitize_answer_sdp(&out);
+        assert_eq!(twice, out, "sanitizer must be idempotent");
+    }
+
+    /// H.264 / single-RID answers (no `a=rid:` or `a=simulcast:`
+    /// lines at all — the federated peer-display path post-#46 fix
+    /// and any single-encoding answer) must pass through untouched.
+    #[test]
+    fn sanitize_answer_sdp_single_rid_no_simulcast_unchanged() {
+        let input = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 98\r\n",
+            "a=rtpmap:98 H264/90000\r\n",
+            "a=fmtp:98 profile-level-id=42e01f;packetization-mode=1\r\n",
+            "a=ssrc:2616664936 cname:display-1\r\n",
+        );
+        let out = super::sanitize_answer_sdp(input);
+        assert_eq!(out, input);
+    }
+
+    /// Bidirectional simulcast (`send f;h;q recv x`) is valid per
+    /// RFC 8853 — the second pair has a different direction. The
+    /// sanitizer must NOT collapse it. Distinguishes the bug shape
+    /// (same direction twice) from valid bidirectional shape.
+    #[test]
+    fn sanitize_answer_sdp_preserves_valid_bidirectional_simulcast() {
+        let input = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 VP8/90000\r\n",
+            "a=simulcast:send f;h;q recv x\r\n",
+        );
+        let out = super::sanitize_answer_sdp(input);
+        assert!(
+            out.contains("a=simulcast:send f;h;q recv x"),
+            "valid bidirectional simulcast must pass through; got:\n{out}"
+        );
     }
 }
