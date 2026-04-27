@@ -12132,8 +12132,6 @@ class PeerDisplayConnection {
       await this._sendSignal(offerSignal);
       this._log('info', `offer sent (sdp_len=${offerSignal.sdp.length})`);
       this.setStatus('Offer sent, awaiting answer…', '');
-      // [DIAGNOSTIC — to revert] #46 browser-side getStats poll.
-      this._startStatsPoll();
     } catch (err) {
       this._log('error', `offer failed: ${err.message}`);
       this.setStatus(`Offer failed: ${err.message}`, 'error');
@@ -12218,67 +12216,7 @@ class PeerDisplayConnection {
     return s;
   }
 
-  // [DIAGNOSTIC — to revert] #46 getStats poll (transport / selected-
-  // pair / inbound-rtp / codec). Pairs with peer-side [diag/single-rid]
-  // [diag/sdp] [diag/rtp-out] for end-to-end verification of the
-  // single-encoding experiment.
-  _startStatsPoll() {
-    if (this._statsInterval) return;
-    this._statsInterval = setInterval(async () => {
-      if (!this.pc) return;
-      let stats;
-      try { stats = await this.pc.getStats(); }
-      catch (err) {
-        this._log('warn', `[diag/stats] getStats failed: ${err.message}`);
-        return;
-      }
-      let transport = null;
-      let inboundRtp = null;
-      let selectedPair = null;
-      stats.forEach((r) => {
-        if (r.type === 'transport') transport = r;
-        else if (r.type === 'inbound-rtp' && r.kind === 'video') inboundRtp = r;
-        else if (
-          r.type === 'candidate-pair' &&
-          (r.selected || (r.nominated && r.state === 'succeeded'))
-        ) {
-          selectedPair = r;
-        }
-      });
-      let codec = null;
-      if (inboundRtp && inboundRtp.codecId) {
-        stats.forEach((r) => {
-          if (r.id === inboundRtp.codecId) codec = r;
-        });
-      }
-      const fmt = (label, obj, fields) =>
-        obj
-          ? `${label} ` +
-            fields.map((f) => `${f}=${obj[f] ?? '?'}`).join(' ')
-          : `${label} (none)`;
-      this._log('info',
-        fmt('[diag/stats] transport', transport,
-          ['dtlsState', 'iceState', 'selectedCandidatePairId']));
-      this._log('info',
-        fmt('[diag/stats] selected-pair', selectedPair,
-          ['bytesSent', 'bytesReceived', 'state', 'nominated']));
-      this._log('info',
-        fmt('[diag/stats] inbound-rtp', inboundRtp,
-          ['packetsReceived', 'bytesReceived', 'framesReceived',
-            'framesDecoded', 'keyFramesDecoded', 'framesDropped',
-            'ssrc', 'codecId', 'frameWidth', 'frameHeight']));
-      this._log('info',
-        fmt('[diag/stats] codec', codec,
-          ['mimeType', 'payloadType', 'sdpFmtpLine']));
-    }, 2000);
-  }
-
   async close() {
-    // [DIAGNOSTIC — to revert] Stop stats poll.
-    if (this._statsInterval) {
-      clearInterval(this._statsInterval);
-      this._statsInterval = null;
-    }
     // Best-effort tell peer to tear down its WebRtcPeer.
     await this._sendSignal({ kind: 'close' }).catch(() => {});
     if (this.pc) {
