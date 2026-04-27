@@ -1,39 +1,45 @@
 //! Per-peer forwarder: translates encoder output into one peer's
 //! WebRTC RTP stream, with per-peer codec / simulcast-layer selection.
 //!
+//! Implementation note: the codebase uses the `rtc` crate (rtc-rs,
+//! version 0.9). API names below refer to rtc-rs unless explicitly
+//! noted as external prior art.
+//!
 //! ## Why this exists
 //!
 //! The peer pool (see [`crate::display::encode::pool`]) produces
 //! encoded frames per `(codec, rid)`. Each WebRTC peer needs those
 //! frames rewritten into its own RTP track with:
 //!
-//! - **Its own negotiated payload type (PT)**. Different peers can land
-//!   on different PTs for the same codec depending on each peer's
-//!   offer SDP — str0m acknowledges this explicitly in the
-//!   [`Writer::match_params`] documentation: *"a certain codec
-//!   configuration might not have the same payload type (PT) for two
-//!   different peers."*
+//! - **Its own negotiated payload type (PT)**. Different peers can
+//!   land on different PTs for the same codec depending on each peer's
+//!   offer SDP, so a frame produced by the encoder pool with one PT
+//!   must be rewritten to whatever PT each subscriber peer negotiated
+//!   for the same codec.
 //! - **Its own SSRC + sequence numbers + RTP timestamps**, managed by
-//!   str0m internally per [`Rtc`] instance.
-//! - **Its own simulcast layer choice**, which may shift as TWCC
-//!   bandwidth estimates change. Today this is static (`Rid::full`);
-//!   phase 4 wires TWCC events into layer selection.
+//!   rtc-rs per `RTCPeerConnection`.
+//! - **Its own simulcast layer choice**, which may shift as
+//!   bandwidth-estimate feedback (TWCC) changes. Today this is static
+//!   (`Rid::full`); phase 4 wires TWCC events into layer selection.
 //!
-//! ## Pattern: str0m's chat.rs SFU example
+//! ## Pattern: SFU forwarding (modeled on str0m's chat.rs example)
 //!
-//! The str0m crate ships an SFU example that's structurally identical
-//! to what we need. Key elements:
+//! str0m's chat.rs SFU example is the canonical reference for this
+//! pattern (str0m is a separate Rust WebRTC crate from rtc-rs but
+//! the SFU shape is the same). Key elements, expressed in our
+//! rtc-rs vocabulary:
 //!
-//! 1. **One [`Rtc`] per peer.** str0m does not support per-peer codec
-//!    selection inside a single `Rtc`, so each peer gets its own.
-//!    (str0m example: `Rtc::builder().build(Instant::now())`.)
-//! 2. **Receive `Event::MediaData` from the publisher `Rtc`, enqueue
-//!    onto a shared channel.** Our publisher is not an `Rtc` — it's
-//!    the encoder pool producing `EncodedFrame` directly — but the
-//!    channel abstraction is the same.
-//! 3. **For each subscriber `Rtc`, translate PT via
-//!    [`Writer::match_params`] and call [`Writer::write`] with the
-//!    codec-specific sample.** This is the core of the forwarder loop.
+//! 1. **One `RTCPeerConnection` per peer.** rtc-rs's
+//!    `RTCPeerConnection` negotiates a single codec set per instance,
+//!    so each peer gets its own — there is no per-peer-codec
+//!    selection inside one connection.
+//! 2. **Receive encoded frames from the publisher, enqueue onto a
+//!    shared channel.** Our publisher is the encoder pool producing
+//!    `EncodedFrame` directly (not another `RTCPeerConnection`),
+//!    but the fan-out channel is the same shape.
+//! 3. **For each subscriber `RTCPeerConnection`, translate the
+//!    encoder's PT to the peer-negotiated PT and write the codec-
+//!    specific sample.** This is the core of the forwarder loop.
 //! 4. **For simulcast sources, the subscriber filters by RID.** The
 //!    str0m example hard-codes to one RID; we pick per-peer based on
 //!    TWCC bandwidth.
@@ -64,24 +70,20 @@
 //! - Browser on a mobile hotspot: RID `q`.
 //!
 //! The per-peer [`LayerSelector`] holds the currently-active RID and
-//! accepts feedback from str0m's `Event::EgressBitrateEstimate` (phase
-//! 4). In this design stub, selection is static (`RID_FULL` default).
+//! accepts feedback from the WebRTC bandwidth-estimate signal (TWCC,
+//! phase 4). In this design stub, selection is static (`RID_FULL`
+//! default).
 //!
 //! ## What this module is NOT doing yet
 //!
 //! - Spawning the forward loop task (phase 4).
-//! - Wiring str0m's `Event::KeyframeRequest` → pool (phase 4).
-//! - Wiring str0m's `Event::EgressBitrateEstimate` → layer selector
-//!   (phase 4).
-//! - Per-peer RTP timestamp anchoring beyond what str0m does internally
-//!   (phase 4).
+//! - Wiring keyframe-request feedback (PLI / FIR) → pool (phase 4).
+//! - Wiring bandwidth-estimate feedback → layer selector (phase 4).
+//! - Per-peer RTP timestamp anchoring beyond what rtc-rs does
+//!   internally (phase 4).
 //!
 //! This stub captures the types, the forwarder state machine, and the
 //! per-peer contract the pool depends on. Phase 4 fills in the runtime.
-//!
-//! [`Rtc`]: https://docs.rs/str0m
-//! [`Writer::match_params`]: https://docs.rs/str0m/latest/str0m/media/struct.Writer.html
-//! [`Writer::write`]: https://docs.rs/str0m/latest/str0m/media/struct.Writer.html
 
 use crate::display::encode::pool::{
     CodecKind, EncoderSubscription, PeerCodecPreferences, SimulcastRid,
@@ -106,18 +108,19 @@ pub enum ForwarderError {
     /// is producing (or willing to spawn). Surfaces to the WebRTC
     /// handler as "offer rejected: no compatible codec."
     NoCompatibleCodec,
-    /// str0m's [`Writer::match_params`] returned `None` — encoder PT
-    /// doesn't have a peer-negotiated equivalent. Should be impossible
-    /// if the pool subscription set matches the peer's negotiated
-    /// codec set, so this represents a bug: fail loud.
+    /// PT translation between encoder PT and peer-negotiated PT
+    /// returned `None` — the encoder's payload type doesn't have a
+    /// peer-negotiated equivalent. Should be impossible if the pool
+    /// subscription set matches the peer's negotiated codec set, so
+    /// this represents a bug: fail loud.
     PayloadTypeTranslationFailed {
         codec: CodecKind,
         rid: SimulcastRid,
     },
-    /// Subscriber channel lagged past recovery. str0m handles SFU-side
-    /// losses with NACK + PLI, so the forwarder recovers naturally;
-    /// this variant exists for logging / metrics not for failure
-    /// semantics.
+    /// Subscriber channel lagged past recovery. WebRTC's NACK + PLI
+    /// feedback handles transient losses, so the forwarder recovers
+    /// naturally; this variant exists for logging / metrics not for
+    /// failure semantics.
     SubscriptionLagged {
         codec: CodecKind,
         rid: SimulcastRid,
@@ -133,7 +136,7 @@ impl fmt::Display for ForwarderError {
             }
             Self::PayloadTypeTranslationFailed { codec, rid } => write!(
                 f,
-                "str0m match_params returned None for {}:{} (pool/peer codec set mismatch)",
+                "PT translation returned None for {}:{} (pool/peer codec set mismatch)",
                 codec, rid
             ),
             Self::SubscriptionLagged {
@@ -159,8 +162,8 @@ impl std::error::Error for ForwarderError {}
 /// the forwarder reads it on each frame to decide whether to forward
 /// or drop.
 ///
-/// Layer changes come from str0m's `Event::EgressBitrateEstimate` in
-/// phase 4. For now: static default `RID_FULL`, updates via
+/// Layer changes come from WebRTC bandwidth-estimate feedback (TWCC,
+/// phase 4). For now: static default `RID_FULL`, updates via
 /// [`LayerSelector::prefer`] which is called from the forwarder's
 /// keyframe-request path (a new layer needs a fresh keyframe to be
 /// decodable, so layer-switch and keyframe-request are paired).
@@ -206,10 +209,10 @@ impl Default for LayerSelector {
 //
 // An earlier design stub had a separate `PerPeerForwarder` type with a
 // `run()` method that would loop over encoder subscriptions and write
-// via `str0m::Writer::write_sample`. That design can't work: the
-// `Rtc` instance is owned by the `WebRtcPeer` driver task
-// (`display/webrtc.rs`), and a separate forwarder task has no path to
-// call str0m's writer APIs. Moving the forwarder responsibilities
+// to the peer's RTP track from a dedicated task. That design can't
+// work: the `RTCPeerConnection` instance is owned by the `WebRtcPeer`
+// driver task (`display/webrtc.rs`), and a separate forwarder task
+// has no path to call into it. Moving the forwarder responsibilities
 // into the driver avoids the cross-task-Rtc-access problem entirely:
 // each peer's driver select!-loops over its pool subscriptions
 // alongside its existing command/event arms, and the pt-caching +
@@ -228,7 +231,8 @@ impl Default for LayerSelector {
 // What was deleted: `PerPeerForwarder` struct, `PerPeerForwarderState`
 // struct, the `should_forward` keyframe-gate helper (now lives in the
 // driver's `keyframe_seen` check in `write_video_frame`), and the
-// placeholder `run` method that couldn't call str0m.
+// placeholder `run` method that had no path to the peer's RTC
+// instance.
 
 // ---------------------------------------------------------------------------
 // Helper: derive PeerCodecPreferences from an offer SDP
@@ -237,19 +241,19 @@ impl Default for LayerSelector {
 /// Build [`PeerCodecPreferences`] from a browser's offer SDP.
 ///
 /// The returned preferences contain only codecs whose **exact**
-/// payload spec the encoder pool can actually match via
-/// `str0m::Writer::match_params`. This matters for H.264: an offer
-/// with an rtpmap of `H264/90000` but fmtp of `profile-level-id=64001f`
+/// payload spec the encoder pool can actually match via rtc-rs's
+/// PT/profile matcher. This matters for H.264: an offer with an
+/// rtpmap of `H264/90000` but fmtp of `profile-level-id=64001f`
 /// (High) and `packetization-mode=0` would previously end up as
 /// `CodecKind::H264` in prefs, get subscribed, and then every
-/// encoded frame would fail match_params because the pool's encoder
+/// encoded frame would fail PT matching because the pool's encoder
 /// produces Constrained Baseline / mode 1 — a silent-black-screen
 /// class of bug that the whole 3c.0 contract exists to prevent.
 ///
 /// The guard is [`crate::display::encode::has_compatible_h264_offer`],
 /// which checks for a Baseline-family (profile_idc 0x42) variant
 /// with packetization-mode 0 or 1 — the intersection of what our
-/// VideoToolbox / VAAPI / libx264 backends produce and what str0m
+/// VideoToolbox / VAAPI / libx264 backends produce and what rtc-rs
 /// will actually negotiate against the encoder's cached
 /// [`crate::display::encode::PayloadSpec::h264_constrained_baseline`].
 ///
@@ -265,12 +269,12 @@ pub fn codec_preferences_from_offer(sdp: &str) -> PeerCodecPreferences {
             "VP8" => supported.push(CodecKind::Vp8),
             "H264" => {
                 // Only include H.264 if the offer carries a variant
-                // that str0m's Writer::match_params would accept
-                // against our encoder's exact PayloadSpec. The older
+                // that rtc-rs's PT matcher would accept against our
+                // encoder's exact PayloadSpec. The older
                 // `has_compatible_h264_offer` is broader than that
                 // (it accepts packetization-mode 0, missing fmtp,
                 // and any profile_idc = 0x42 regardless of
-                // constraint_set1_flag) — str0m rejects all of
+                // constraint_set1_flag) — rtc-rs rejects all of
                 // those, so they'd result in silent black-screen
                 // frame-drop. See the detailed rules next to
                 // `offer_has_poolable_h264_variant`.
@@ -510,8 +514,8 @@ mod tests {
     /// Finding 1 in the 3c.0a review: an offer that advertises H.264
     /// with an *incompatible* profile (e.g., High `64001f` + mode 2)
     /// must NOT produce `CodecKind::H264` in prefs, because the pool
-    /// only produces Constrained Baseline / mode 1 and str0m would
-    /// match_params-miss every frame. The legacy path's
+    /// only produces Constrained Baseline / mode 1 and rtc-rs would
+    /// PT-miss every frame. The legacy path's
     /// `is_compatible_h264_profile` does the exact check.
     #[test]
     fn codec_preferences_excludes_incompatible_h264_profile() {
@@ -530,7 +534,7 @@ mod tests {
         assert!(
             !prefs.supports(CodecKind::H264),
             "H.264 High/mode 2 must NOT be claimed — encoder produces \
-             Constrained Baseline/mode 1 only, str0m would drop every frame"
+             Constrained Baseline/mode 1 only, rtc-rs would drop every frame"
         );
     }
 
@@ -549,7 +553,7 @@ mod tests {
     }
 
     /// An offer with multiple H.264 variants — one compatible, one not —
-    /// should still claim H.264 support. str0m picks the compatible
+    /// should still claim H.264 support. rtc-rs picks the compatible
     /// variant for negotiation; the incompatible one is ignored.
     #[test]
     fn codec_preferences_h264_mixed_variants_keeps_codec() {
@@ -573,15 +577,15 @@ mod tests {
     //
     // Each of these variants was previously accepted by the legacy
     // `has_compatible_h264_offer` helper but would be rejected by
-    // str0m's `Writer::match_params` against the encoder's exact
+    // rtc-rs's PT/profile matcher against the encoder's exact
     // `PayloadSpec::h264_constrained_baseline`. Result: silent
     // black-screen frame drops. The new `offer_has_poolable_h264_variant`
     // gate must exclude each one.
     // -----------------------------------------------------------------------
 
     /// `42e01f` profile (Constrained Baseline, the match) but
-    /// packetization-mode 0 (encoder produces mode 1). str0m's matcher
-    /// requires equality on packetization-mode.
+    /// packetization-mode 0 (encoder produces mode 1). rtc-rs's
+    /// matcher requires equality on packetization-mode.
     #[test]
     fn codec_preferences_excludes_h264_wrong_packetization_mode() {
         let sdp = concat!(
@@ -598,7 +602,7 @@ mod tests {
     }
 
     /// `42001f` profile (Baseline, NOT Constrained Baseline) at
-    /// packetization-mode 1. str0m's profile resolver maps this to
+    /// packetization-mode 1. rtc-rs's profile resolver maps this to
     /// `H264Profile::Baseline` while our encoder emits
     /// `ConstrainedBaseline`; the matcher requires profile equality.
     #[test]
@@ -618,7 +622,7 @@ mod tests {
 
     /// H.264 rtpmap with NO fmtp line at all. `parse_h264_fmtp` treats
     /// missing fmtp as packetization-mode 0 + empty profile-level-id,
-    /// and str0m's `match_params` falls back to Baseline/Level 1 for
+    /// and rtc-rs's PT matcher falls back to Baseline/Level 1 for
     /// missing profile-level-id. Both axes disagree with our encoder.
     #[test]
     fn codec_preferences_excludes_h264_with_no_fmtp() {
@@ -630,14 +634,14 @@ mod tests {
         let prefs = codec_preferences_from_offer(sdp);
         assert!(
             !prefs.supports(CodecKind::H264),
-            "No fmtp implies str0m-fallback Baseline + mode 0 — must be rejected"
+            "No fmtp implies rtc-rs-fallback Baseline + mode 0 — must be rejected"
         );
     }
 
     /// Correct profile + mode but offered level 5.0 (`4d0032` —
     /// actually Main at Level 5.0; use `42e028` for ConstrainedBaseline
     /// at Level 4.0 to keep profile family). Level 4.0 (0x28) > our
-    /// encoder's Level 3.1 (0x1f); str0m rejects when the offer's
+    /// encoder's Level 3.1 (0x1f); rtc-rs rejects when the offer's
     /// level exceeds ours.
     #[test]
     fn codec_preferences_excludes_h264_when_offered_level_exceeds_encoder() {
@@ -655,7 +659,7 @@ mod tests {
     }
 
     /// Correct profile, correct mode, level LOWER than ours (3.0 vs 3.1).
-    /// str0m accepts `c1_level <= c0_level`, so this matches.
+    /// rtc-rs accepts `c1_level <= c0_level`, so this matches.
     #[test]
     fn codec_preferences_includes_h264_at_lower_level() {
         let sdp = concat!(
@@ -667,7 +671,7 @@ mod tests {
         let prefs = codec_preferences_from_offer(sdp);
         assert!(
             prefs.supports(CodecKind::H264),
-            "Level 3.0 is below encoder's Level 3.1 — must be accepted (str0m: c1_level <= c0_level)"
+            "Level 3.0 is below encoder's Level 3.1 — must be accepted (rtc-rs: c1_level <= c0_level)"
         );
     }
 
