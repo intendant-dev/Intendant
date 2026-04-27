@@ -85,3 +85,8 @@ shiguredo_video_toolbox = "2026.1"
 split-debuginfo = "unpacked"
 
 [dev-dependencies]
+# Enable tokio's `test-util` feature in test builds so `#[tokio::test(start_paused = true)]`
+# and `tokio::time::advance` are available. Cargo merges features additively between
+# [dependencies] and [dev-dependencies] for test/example builds — release builds still
+# get just the `full` feature set from line 18.
+tokio = { version = "1.0", features = ["test-util"] }

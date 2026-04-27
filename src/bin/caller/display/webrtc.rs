@@ -677,6 +677,28 @@ pub struct WebRtcPeer {
     /// (per-(peer, RID) wanted-set + hysteresis); 4d.3c wires the
     /// aggregator to react.
     remote_inbound_health_rx: watch::Receiver<HashMap<SimulcastRid, PeerLayerHealth>>,
+    /// **Phase 4d.3b**: per-peer aggregate TWCC health, published
+    /// once per second by [`crate::display::twcc_tap::spawn_twcc_health_aggregator`].
+    /// `None` initially (no window has fired yet), and `None` for
+    /// any window in which no TWCC events arrived (silence is not
+    /// recovery — see the aggregator's module docs). The channel
+    /// transitions `None → Some(_) → None → Some(_)` as feedback
+    /// arrives and goes silent across windows.
+    ///
+    /// This is the actionable capacity signal on this stack —
+    /// rtc 0.9's `RTCRemoteInboundRtpStreamStats` (above) stays
+    /// at all-zero defaults regardless of received RTCP because
+    /// the rtc-interceptor chain consumes RTCP without
+    /// surfacing it. The TWCC tap fills that gap by parsing
+    /// `TransportLayerCc` packets directly at the chain.
+    ///
+    /// WKWebView's TWCC reporting is aggregate (single sender-SSRC
+    /// across all RIDs in a simulcast send), not per-layer — the
+    /// 4d.3b policy treats the signal as peer-wide and gates upper
+    /// simulcast layers in cascade (full → half → floor-only) under
+    /// sustained loss. Per-layer adaptation is a 4d.3c concern,
+    /// dependent on receivers that emit per-RID TLC.
+    twcc_health_rx: watch::Receiver<Option<crate::display::twcc_tap::TwccHealth>>,
     shutdown: CancellationToken,
 }
 
@@ -845,6 +867,41 @@ impl WebRtcPeer {
         &self,
     ) -> HashMap<SimulcastRid, PeerLayerHealth> {
         self.remote_inbound_health_rx.borrow().clone()
+    }
+
+    /// **Phase 4d.3b**: subscribe to this peer's aggregate TWCC
+    /// health signal. Published once per second by the
+    /// [`crate::display::twcc_tap::spawn_twcc_health_aggregator`]
+    /// task that drains the [`crate::display::twcc_tap::TwccTapInterceptor`]
+    /// event stream.
+    ///
+    /// `None` means either "no window has fired yet" or "the most
+    /// recent window had zero TWCC events." Silence is not
+    /// recovery — see [`crate::display::twcc_tap`] module docs.
+    /// The channel transitions `None → Some(_) → None → Some(_)`
+    /// as feedback arrives and goes silent across windows. The
+    /// capacity policy in [`crate::display::aggregator`] treats
+    /// `None` and `Some(empty_health)` alike via its short-circuit
+    /// arms and gates upper simulcast layers based only on
+    /// sustained, non-empty loss readings.
+    ///
+    /// Receivers are independent — multiple subscribers (capacity
+    /// aggregator + a metrics dashboard, say) can each
+    /// `subscribe_twcc_health` and read independently.
+    pub fn subscribe_twcc_health(
+        &self,
+    ) -> watch::Receiver<Option<crate::display::twcc_tap::TwccHealth>> {
+        self.twcc_health_rx.clone()
+    }
+
+    /// **Phase 4d.3b**: read the current TWCC health snapshot
+    /// without subscribing. Returns `None` if no window has fired
+    /// yet OR if the most recent window had zero TWCC events
+    /// (silence is not recovery — see the module docs at
+    /// [`crate::display::twcc_tap`]). For change-driven consumers,
+    /// prefer [`Self::subscribe_twcc_health`].
+    pub fn current_twcc_health(&self) -> Option<crate::display::twcc_tap::TwccHealth> {
+        *self.twcc_health_rx.borrow()
     }
 }
 
@@ -1174,23 +1231,39 @@ impl WebRtcPeer {
             encodings,
         );
 
-        // diag #51 v4 (TO REVERT after smoke): wire rtc 0.9's
-        // interceptor registry with SR/RR + TWCC sender + a CUSTOM
-        // `TwccTapInterceptor` that reads inbound RTCP at the
-        // chain's outermost `handle_read`, downcasts each packet
-        // to `TransportLayerCc`, and projects compact events onto
-        // an mpsc channel. Spike 3 (commit b842a82, reverted in
-        // 0e28db6) confirmed via tcpdump that the browser sends
-        // TLC continuously but rtc 0.9's stats path never surfaces
-        // it; the tap is the operator-directed alternative — parse
-        // TLC directly at the rtc-interceptor layer.
+        // **Phase 4d.3b — TWCC signal pipeline.** Wire rtc 0.9's
+        // interceptor registry with SR/RR + TWCC sender + the custom
+        // `TwccTapInterceptor`, which observes inbound RTCP at the
+        // chain's outermost `handle_read`, downcasts each
+        // `TransportLayerCc` packet, and projects a compact
+        // [`TwccEvent`] onto an unbounded mpsc channel.
         //
-        // Chain order: rtcp_reports + twcc_sender_only added FIRST
-        // (innermost) so they keep doing their existing job; the
-        // tap added LAST (outermost) so it sees inbound RTCP first.
-        // `Registry::with(|inner| TwccTapInterceptor::new(inner,
-        // tx))` is the canonical rtc-interceptor 0.9 composition.
-        let (twcc_tap_tx, mut twcc_tap_rx) =
+        // **Why a custom tap, not rtc's stats path:** rtc 0.9 consumes
+        // RTCP internally and never surfaces it via
+        // `RTCMessage::RtcpPacket`, and its
+        // `RTCRemoteInboundRtpStreamStats` accumulator stays at all-
+        // zero defaults regardless of which interceptors are wired.
+        // Tapping the interceptor chain is the only place we can
+        // observe TWCC without patching rtc 0.9. See
+        // [`crate::display::twcc_tap`] module docs for the full
+        // background.
+        //
+        // **Chain order:** `Registry::with(...)` puts the supplied
+        // wrapper outermost, so call sequence
+        //
+        //   `Registry::new() → configure_rtcp_reports(.) →
+        //    configure_twcc_sender_only(.) →
+        //    .with(|inner| TwccTapInterceptor::new(inner, tx))`
+        //
+        // produces a chain whose outermost layer is the tap. The tap
+        // observes, then forwards to twcc_sender_only, then
+        // rtcp_reports, then rtc's internals — keeping the existing
+        // stack's behaviour intact. The tap mutates nothing.
+        //
+        // The aggregator that consumes `twcc_tap_rx` is spawned
+        // below, after `shutdown` is created, so it shares the
+        // peer's cancellation token.
+        let (twcc_tap_tx, twcc_tap_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::display::twcc_tap::TwccEvent>();
         let registry = rtc::interceptor::Registry::new();
         let registry =
@@ -1205,77 +1278,6 @@ impl WebRtcPeer {
             .map_err(|e| CallerError::WebRtc(format!("configure twcc: {e}")))?;
         let registry = registry.with(|inner| {
             crate::display::twcc_tap::TwccTapInterceptor::new(inner, twcc_tap_tx.clone())
-        });
-
-        // Spawn a 1-Hz aggregator that consumes TwccEvents and emits
-        // ONE summary line per second. Rate-limited per the
-        // operator's "don't commit high-volume per-frame logs unless
-        // rate-limited" rule. First-acceptance check: under no loss,
-        // `lost=0`; under pf/dnctl 30%, `lost` ≈ 30% of `status`.
-        //
-        // The aggregator's lifetime is tied to the unbounded channel
-        // sender held inside `TwccTapInterceptor`. When the rtc Rtc
-        // is dropped on peer shutdown, the chain is dropped, the
-        // sender is dropped, the channel closes, `recv()` returns
-        // `None`, and this task exits. No explicit shutdown wiring
-        // needed.
-        let twcc_logger_peer_id = peer_id;
-        tokio::spawn(async move {
-            let mut window_start = std::time::Instant::now();
-            let mut batches: u32 = 0;
-            let mut total_status: u64 = 0;
-            let mut total_received: u64 = 0;
-            let mut total_lost: u64 = 0;
-            let mut last_fb_pkt_count: Option<u8> = None;
-            loop {
-                let timeout = tokio::time::sleep_until(
-                    tokio::time::Instant::from_std(window_start)
-                        + std::time::Duration::from_secs(1),
-                );
-                tokio::pin!(timeout);
-                tokio::select! {
-                    biased;
-                    maybe_event = twcc_tap_rx.recv() => {
-                        match maybe_event {
-                            Some(event) => {
-                                batches = batches.saturating_add(1);
-                                total_status =
-                                    total_status.saturating_add(event.packet_status_count as u64);
-                                total_received =
-                                    total_received.saturating_add(event.received as u64);
-                                total_lost =
-                                    total_lost.saturating_add(event.lost as u64);
-                                last_fb_pkt_count = Some(event.fb_pkt_count);
-                            }
-                            None => {
-                                eprintln!(
-                                    "[diag #51 v4 twcc-tap] peer={twcc_logger_peer_id} \
-                                     channel closed; exiting aggregator"
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    _ = &mut timeout => {
-                        let loss_pct = if total_status > 0 {
-                            (total_lost as f64 / total_status as f64) * 100.0
-                        } else {
-                            0.0
-                        };
-                        eprintln!(
-                            "[diag #51 v4 twcc-tap 1s] peer={twcc_logger_peer_id} \
-                             batches={batches} status={total_status} \
-                             received={total_received} lost={total_lost} \
-                             loss_pct={loss_pct:.1}% last_fb_pkt_count={last_fb_pkt_count:?}",
-                        );
-                        window_start = std::time::Instant::now();
-                        batches = 0;
-                        total_status = 0;
-                        total_received = 0;
-                        total_lost = 0;
-                    }
-                }
-            }
         });
 
         let mut rtc = RTCPeerConnectionBuilder::new()
@@ -1480,7 +1482,28 @@ impl WebRtcPeer {
         // stay conservative" rather than as "healthy."
         let (remote_inbound_health_tx, remote_inbound_health_rx) =
             watch::channel::<HashMap<SimulcastRid, PeerLayerHealth>>(HashMap::new());
+        // **Phase 4d.3b**: per-peer aggregate TWCC health, derived
+        // from inbound `TransportLayerCC` packets observed by the
+        // [`crate::display::twcc_tap::TwccTapInterceptor`] wired
+        // into the rtc interceptor chain above. Initial value
+        // `None`: the aggregator hasn't published its first
+        // 1-second window yet. After the first publish the channel
+        // stays `Some(_)`, replaced once per window. The capacity
+        // policy in [`crate::display::aggregator`] subscribes via
+        // [`WebRtcPeer::subscribe_twcc_health`].
+        let (twcc_health_tx, twcc_health_rx) =
+            watch::channel::<Option<crate::display::twcc_tap::TwccHealth>>(None);
         let shutdown = CancellationToken::new();
+        // Aggregator task drains `twcc_tap_rx` and publishes one
+        // `TwccHealth` per second. Exits on `shutdown.cancelled()`,
+        // on the tap channel closing (rtc dropped → tap dropped →
+        // sender dropped → recv returns None), or on all watch
+        // receivers dropping.
+        crate::display::twcc_tap::spawn_twcc_health_aggregator(
+            twcc_tap_rx,
+            twcc_health_tx,
+            shutdown.clone(),
+        );
 
         // Phase 4c: pass the full per-RID encoding map through to the
         // driver. For VP8 simulcast `encodings_by_rid` carries
@@ -1517,6 +1540,7 @@ impl WebRtcPeer {
                 command_tx,
                 observed_send_bitrate_rx,
                 remote_inbound_health_rx,
+                twcc_health_rx,
                 shutdown,
             },
             encoded_frame_tx,

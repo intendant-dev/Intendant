@@ -426,6 +426,259 @@ pub fn aggregate_wanted_layers(
 }
 
 // ===========================================================================
+// Phase 4d.3b: TWCC aggregate-loss capacity policy
+// ===========================================================================
+//
+// Receivers on this stack (notably WKWebView) report TWCC feedback at
+// the **session aggregate** level — one sender-SSRC, one stream of
+// `TransportLayerCc` packets covering all simulcast encodings — not
+// per-RID. Per-layer adaptation as in [`step_layer_capacity_state`]
+// requires per-layer signal, which we don't have here.
+//
+// The aggregate-loss policy is the cascade for that gap: under
+// sustained high TWCC loss, pause the upper simulcast layers in
+// order (top, then middle), keeping the floor layer always active.
+// Under sustained recovery, resume in reverse order. Asymmetric
+// debouncing and hysteresis between [`CapacityPolicyConfig::fraction_lost_threshold`]
+// and [`CapacityPolicyConfig::fraction_lost_recovery`] prevent
+// flapping at the boundary.
+//
+// **Why not per-(peer, RID) like the existing 4d.3c policy:** the
+// existing policy assumes `PeerLayerHealth` per RID — populated from
+// rtc 0.9's `RTCRemoteInboundRtpStreamStats` which doesn't actually
+// fire on this stack. The aggregate-loss policy is the practical
+// substitute: one signal per peer (not per layer), driving a peer-
+// wide cascade rather than per-layer adaptation. Per-RID adaptation
+// reactivates as a 4d.3c concern when receivers expose per-layer
+// TLC.
+//
+// **Why not just reuse `step_layer_capacity_state` driven by the
+// same aggregate signal across all non-floor RIDs:** the existing
+// machine is parallel — every RID's state advances independently
+// from the same signal, so they'd all enter `PendingDrop` at the
+// same instant and all transition to `Dropped` at the same instant.
+// That's a cliff, not a cascade. The directive calls for cascaded
+// pause (top first, middle only after top has been paused for an
+// additional drop_debounce) so the bandwidth pressure from pausing
+// top can be observed before deciding whether middle also needs to
+// go. The cascade requires explicit between-RID ordering that a
+// parallel per-RID machine can't express.
+
+/// Stable + pending positions in the aggregate-loss cascade.
+///
+/// Three stable positions (`AllUpperWanted`, `TopPaused`,
+/// `OnlyFloor`) bracket four pending positions that drive the
+/// transitions between them. The pending positions all carry their
+/// `since: Instant` so the state machine can compute "this signal
+/// has persisted long enough" without external timer state.
+///
+/// Layer naming is deliberately abstract — `top`, `mid`, `floor` —
+/// so the policy can be exercised in tests without committing to a
+/// specific RID identifier ("f", "h", "q" for VP8 simulcast). The
+/// production wiring resolves these to concrete `SimulcastRid`s via
+/// [`aggregate_state_wanted_layers`].
+///
+/// Initial state for a freshly-constructed peer is
+/// [`AggregateLayerCapacity::AllUpperWanted`] — the encoder pool
+/// produces all layers by default; no over-budget signal has been
+/// observed yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateLayerCapacity {
+    /// All upper layers wanted; no over-budget signal persisted.
+    AllUpperWanted,
+    /// Over-budget signal arrived; counting down to pause top.
+    /// Cancels back to `AllUpperWanted` if the signal recovers
+    /// before `drop_debounce` elapses.
+    PendingPauseTop { since: Instant },
+    /// Top paused; mid and floor still wanted. Equilibrium between
+    /// the two cascades: enter `PendingPauseMid` if loss persists,
+    /// enter `PendingResumeTop` if loss recovers cleanly. Stays here
+    /// in the gray band between recovery and threshold.
+    TopPaused,
+    /// Top paused, loss still high after `drop_debounce` elapsed in
+    /// `TopPaused`. Counting down to also pause mid. Cancels back
+    /// to `TopPaused` on any improvement.
+    PendingPauseMid { since: Instant },
+    /// Both upper layers paused; only floor active. Loss must
+    /// recover cleanly to leave this state.
+    OnlyFloor,
+    /// Recovery from `OnlyFloor` underway; counting down to resume
+    /// mid. Cancels back to `OnlyFloor` on regression.
+    PendingResumeMid { since: Instant },
+    /// Recovery from `TopPaused` underway; counting down to resume
+    /// top (i.e. return to `AllUpperWanted`). Cancels back to
+    /// `TopPaused` on regression.
+    PendingResumeTop { since: Instant },
+}
+
+/// Pure transition for one peer's aggregate-loss state given the
+/// most recent [`crate::display::twcc_tap::TwccHealth`] reading.
+/// No side effects; caller owns state.
+///
+/// `health = None` (no snapshot from the aggregator yet, or
+/// subscriber hasn't been polled) preserves the current state —
+/// never triggers a transition on absence of signal alone. This is
+/// load-bearing for new peers (no TWCC yet → stay
+/// `AllUpperWanted`) and for transient subscriber lag.
+///
+/// **Empty-window `Some(_)` readings preserve state too.** Silence
+/// is not recovery: a `TwccHealth { batches: 0, ..}` or
+/// `reported_packets: 0` reading represents "no TLC arrived during
+/// this window," not "the link is healthy." Treating empty-Some
+/// as healthy would resume upper layers under sustained feedback
+/// silence, which is the opposite of what we want — silence likely
+/// means the receiver itself can't get bytes through to us, so the
+/// link is in worse shape than the most recent loss reading
+/// suggested.
+///
+/// The aggregator at [`crate::display::twcc_tap::spawn_twcc_health_aggregator`]
+/// publishes `None` for empty windows precisely so the policy
+/// short-circuits via the `let Some(h) = health` arm above. The
+/// `batches == 0 || reported_packets == 0` guard here is
+/// defense-in-depth — even if some future code path constructs a
+/// `Some(empty_health)` and feeds it in, the policy must not act
+/// on it.
+pub fn step_aggregate_layer_capacity(
+    prev: AggregateLayerCapacity,
+    health: Option<&crate::display::twcc_tap::TwccHealth>,
+    config: &CapacityPolicyConfig,
+    now: Instant,
+) -> AggregateLayerCapacity {
+    let Some(h) = health else {
+        return prev;
+    };
+    if h.batches == 0 || h.reported_packets == 0 {
+        return prev;
+    }
+    let over_budget = h.loss_fraction > config.fraction_lost_threshold;
+    let healthy = h.loss_fraction <= config.fraction_lost_recovery;
+
+    match prev {
+        // ----- Stable: AllUpperWanted -----
+        AggregateLayerCapacity::AllUpperWanted if over_budget => {
+            AggregateLayerCapacity::PendingPauseTop { since: now }
+        }
+        AggregateLayerCapacity::AllUpperWanted => AggregateLayerCapacity::AllUpperWanted,
+
+        // ----- Pending: PendingPauseTop -----
+        // Cancel-on-improvement: any drop below threshold cancels.
+        // (Same as `step_layer_capacity_state`'s PendingDrop arm —
+        // cancelling on `!over_budget` rather than `healthy` keeps
+        // a borderline-but-improving signal from triggering a drop.)
+        AggregateLayerCapacity::PendingPauseTop { .. } if !over_budget => {
+            AggregateLayerCapacity::AllUpperWanted
+        }
+        AggregateLayerCapacity::PendingPauseTop { since }
+            if now >= since + config.drop_debounce =>
+        {
+            AggregateLayerCapacity::TopPaused
+        }
+        AggregateLayerCapacity::PendingPauseTop { since } => {
+            AggregateLayerCapacity::PendingPauseTop { since }
+        }
+
+        // ----- Stable: TopPaused -----
+        // Cascade: still over-budget after top is paused → start
+        // counting down to pause mid as well.
+        AggregateLayerCapacity::TopPaused if over_budget => {
+            AggregateLayerCapacity::PendingPauseMid { since: now }
+        }
+        // Recovery: cleanly healthy → start counting down to resume
+        // top. Has to be `healthy` (≤ recovery threshold), not just
+        // `!over_budget`, to avoid toggling out of TopPaused on
+        // gray-band readings.
+        AggregateLayerCapacity::TopPaused if healthy => {
+            AggregateLayerCapacity::PendingResumeTop { since: now }
+        }
+        AggregateLayerCapacity::TopPaused => AggregateLayerCapacity::TopPaused,
+
+        // ----- Pending: PendingPauseMid -----
+        AggregateLayerCapacity::PendingPauseMid { .. } if !over_budget => {
+            AggregateLayerCapacity::TopPaused
+        }
+        AggregateLayerCapacity::PendingPauseMid { since }
+            if now >= since + config.drop_debounce =>
+        {
+            AggregateLayerCapacity::OnlyFloor
+        }
+        AggregateLayerCapacity::PendingPauseMid { since } => {
+            AggregateLayerCapacity::PendingPauseMid { since }
+        }
+
+        // ----- Pending: PendingResumeTop -----
+        // Symmetric to PendingDrop's cancel-on-recovery in the
+        // per-RID machine: restore cancels on any regression
+        // (`!healthy`), not just `over_budget`. Restoring requires
+        // a clean, persisted healthy signal across the entire
+        // restore_debounce window.
+        AggregateLayerCapacity::PendingResumeTop { .. } if !healthy => {
+            AggregateLayerCapacity::TopPaused
+        }
+        AggregateLayerCapacity::PendingResumeTop { since }
+            if now >= since + config.restore_debounce =>
+        {
+            AggregateLayerCapacity::AllUpperWanted
+        }
+        AggregateLayerCapacity::PendingResumeTop { since } => {
+            AggregateLayerCapacity::PendingResumeTop { since }
+        }
+
+        // ----- Stable: OnlyFloor -----
+        AggregateLayerCapacity::OnlyFloor if healthy => {
+            AggregateLayerCapacity::PendingResumeMid { since: now }
+        }
+        AggregateLayerCapacity::OnlyFloor => AggregateLayerCapacity::OnlyFloor,
+
+        // ----- Pending: PendingResumeMid -----
+        AggregateLayerCapacity::PendingResumeMid { .. } if !healthy => {
+            AggregateLayerCapacity::OnlyFloor
+        }
+        AggregateLayerCapacity::PendingResumeMid { since }
+            if now >= since + config.restore_debounce =>
+        {
+            AggregateLayerCapacity::TopPaused
+        }
+        AggregateLayerCapacity::PendingResumeMid { since } => {
+            AggregateLayerCapacity::PendingResumeMid { since }
+        }
+    }
+}
+
+/// Project an [`AggregateLayerCapacity`] state to the wanted-RID
+/// set, given the concrete RID identifiers for top and mid.
+///
+/// Floor RID is always wanted while peers are present (4d.2 owns
+/// the zero-peer pause); this function returns only the *upper*
+/// layers and is meant to be unioned with `{floor}` at the caller.
+///
+/// "Wanted" semantics: a layer is in the set iff the encoder pool
+/// should currently be producing it. Pending-pause states still
+/// produce (we haven't decided to pause yet); pending-resume
+/// states do not (we paused, and haven't decided to restart yet).
+pub fn aggregate_state_wanted_upper_layers(
+    state: AggregateLayerCapacity,
+    top: &SimulcastRid,
+    mid: &SimulcastRid,
+) -> HashSet<SimulcastRid> {
+    let mut out = HashSet::new();
+    match state {
+        AggregateLayerCapacity::AllUpperWanted
+        | AggregateLayerCapacity::PendingPauseTop { .. } => {
+            out.insert(top.clone());
+            out.insert(mid.clone());
+        }
+        AggregateLayerCapacity::TopPaused
+        | AggregateLayerCapacity::PendingPauseMid { .. }
+        | AggregateLayerCapacity::PendingResumeTop { .. } => {
+            out.insert(mid.clone());
+        }
+        AggregateLayerCapacity::OnlyFloor
+        | AggregateLayerCapacity::PendingResumeMid { .. } => {}
+    }
+    out
+}
+
+// ===========================================================================
 // Phase 4d.3c: capacity aggregator wiring
 // ===========================================================================
 //
@@ -1167,6 +1420,523 @@ mod tests {
         assert!(!layer_state_is_wanted(
             &LayerCapacityState::PendingRestore { since: Instant::now() }
         ));
+    }
+
+    // ----- step_aggregate_layer_capacity -----
+
+    fn twcc(loss_fraction: f64) -> crate::display::twcc_tap::TwccHealth {
+        // Synthetic TwccHealth for state-machine tests. The state
+        // machine reads only `loss_fraction`; other fields are
+        // present to satisfy the type but irrelevant.
+        crate::display::twcc_tap::TwccHealth {
+            at: Instant::now(),
+            loss_fraction,
+            reported_packets: 100,
+            received_packets: ((1.0 - loss_fraction) * 100.0) as u64,
+            lost_packets: (loss_fraction * 100.0) as u64,
+            last_fb_pkt_count: Some(0),
+            batches: 1,
+        }
+    }
+
+    #[test]
+    fn aggregate_no_signal_preserves_state() {
+        // None health must never trigger a transition. Load-bearing
+        // for new peers (no aggregator snapshot yet) and for
+        // transient subscriber lag.
+        for prev in [
+            AggregateLayerCapacity::AllUpperWanted,
+            AggregateLayerCapacity::PendingPauseTop { since: t0() },
+            AggregateLayerCapacity::TopPaused,
+            AggregateLayerCapacity::PendingPauseMid { since: t0() },
+            AggregateLayerCapacity::OnlyFloor,
+            AggregateLayerCapacity::PendingResumeMid { since: t0() },
+            AggregateLayerCapacity::PendingResumeTop { since: t0() },
+        ] {
+            assert_eq!(
+                step_aggregate_layer_capacity(prev, None, &cfg(), t0()),
+                prev,
+                "no-signal must preserve state {prev:?}",
+            );
+        }
+    }
+
+    /// Synthesize an "empty-window" `TwccHealth`: a `Some(_)` value
+    /// the aggregator should never publish in practice (it emits
+    /// `None` for empty windows by design), but which the state
+    /// machine must defensively treat as "no signal" anyway. Used
+    /// by the empty-window-preserves-state suite below.
+    fn twcc_empty() -> crate::display::twcc_tap::TwccHealth {
+        crate::display::twcc_tap::TwccHealth {
+            at: Instant::now(),
+            loss_fraction: 0.0,
+            reported_packets: 0,
+            received_packets: 0,
+            lost_packets: 0,
+            last_fb_pkt_count: None,
+            batches: 0,
+        }
+    }
+
+    /// A pathological `Some(_)` shape we should also ignore: a
+    /// non-zero `batches` count with `reported_packets == 0`. Could
+    /// arise if a future code path counted "events seen" without
+    /// checking whether they carried any reported packets.
+    fn twcc_batches_no_reports() -> crate::display::twcc_tap::TwccHealth {
+        crate::display::twcc_tap::TwccHealth {
+            at: Instant::now(),
+            loss_fraction: 0.0,
+            reported_packets: 0,
+            received_packets: 0,
+            lost_packets: 0,
+            last_fb_pkt_count: Some(7),
+            batches: 3,
+        }
+    }
+
+    #[test]
+    fn aggregate_empty_window_preserves_state() {
+        // The aggregator publishes `None` on empty windows by
+        // design. This guard is defense-in-depth: even if a
+        // `Some(empty_health)` reaches the state machine, every
+        // state must short-circuit to `prev`. Silence is not
+        // recovery; it must not advance the cascade.
+        //
+        // Specifically asserts the user-listed invariants:
+        //   - OnlyFloor + empty window stays OnlyFloor
+        //   - TopPaused + empty window stays TopPaused
+        //   - Pending pause/resume states are not advanced by
+        //     empty windows
+        let states = [
+            AggregateLayerCapacity::AllUpperWanted,
+            AggregateLayerCapacity::PendingPauseTop { since: t0() },
+            AggregateLayerCapacity::TopPaused,
+            AggregateLayerCapacity::PendingPauseMid { since: t0() },
+            AggregateLayerCapacity::OnlyFloor,
+            AggregateLayerCapacity::PendingResumeMid { since: t0() },
+            AggregateLayerCapacity::PendingResumeTop { since: t0() },
+        ];
+        for prev in states {
+            // Both empty-Some shapes must preserve every state.
+            for empty in [twcc_empty(), twcc_batches_no_reports()] {
+                // Even after a full debounce window: empty must
+                // not let pending states advance.
+                let after_debounce = t0() + cfg().drop_debounce;
+                assert_eq!(
+                    step_aggregate_layer_capacity(
+                        prev,
+                        Some(&empty),
+                        &cfg(),
+                        after_debounce,
+                    ),
+                    prev,
+                    "empty-window Some({empty:?}) must preserve state {prev:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_pending_pause_top_does_not_advance_on_empty_window() {
+        // Specifically called out by the user: empty windows must
+        // not let a pending-pause timer advance to the paused
+        // state. Even at exactly drop_debounce, an empty reading
+        // must keep the timer pending.
+        let start = t0();
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::PendingPauseTop { since: start },
+            Some(&twcc_empty()),
+            &cfg(),
+            start + cfg().drop_debounce,
+        );
+        assert_eq!(
+            next,
+            AggregateLayerCapacity::PendingPauseTop { since: start },
+            "empty window must not advance the drop debounce",
+        );
+    }
+
+    #[test]
+    fn aggregate_pending_resume_mid_does_not_advance_on_empty_window() {
+        // Symmetric to the pause case: empty windows must not let
+        // a pending-resume timer advance, since silence is not
+        // recovery either.
+        let start = t0();
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::PendingResumeMid { since: start },
+            Some(&twcc_empty()),
+            &cfg(),
+            start + cfg().restore_debounce,
+        );
+        assert_eq!(
+            next,
+            AggregateLayerCapacity::PendingResumeMid { since: start },
+            "empty window must not advance the restore debounce",
+        );
+    }
+
+    #[test]
+    fn aggregate_all_wanted_enters_pending_on_over_budget() {
+        // 0.10 > threshold 0.05 → PendingPauseTop with `since: now`.
+        let now = t0();
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::AllUpperWanted,
+            Some(&twcc(0.10)),
+            &cfg(),
+            now,
+        );
+        assert_eq!(
+            next,
+            AggregateLayerCapacity::PendingPauseTop { since: now }
+        );
+    }
+
+    #[test]
+    fn aggregate_pending_pause_top_cancels_on_recovery_below_threshold() {
+        // Mid-debounce recovery must cancel back to AllUpperWanted.
+        // Cancel on `!over_budget`, not `healthy` — same rationale
+        // as `step_layer_capacity_state`'s PendingDrop arm.
+        let now = t0();
+        // 0.04 ≤ threshold 0.05 (and is in the gray band) — should
+        // cancel even though it's not `healthy`.
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::PendingPauseTop { since: now },
+            Some(&twcc(0.04)),
+            &cfg(),
+            now + Duration::from_secs(2),
+        );
+        assert_eq!(next, AggregateLayerCapacity::AllUpperWanted);
+    }
+
+    #[test]
+    fn aggregate_pending_pause_top_advances_at_drop_debounce() {
+        // After exactly drop_debounce of sustained over-budget,
+        // transition to TopPaused.
+        let start = t0();
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::PendingPauseTop { since: start },
+            Some(&twcc(0.10)),
+            &cfg(),
+            start + cfg().drop_debounce,
+        );
+        assert_eq!(next, AggregateLayerCapacity::TopPaused);
+    }
+
+    #[test]
+    fn aggregate_pending_pause_top_holds_before_debounce_elapses() {
+        let start = t0();
+        let just_before = start + cfg().drop_debounce - Duration::from_millis(1);
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::PendingPauseTop { since: start },
+            Some(&twcc(0.10)),
+            &cfg(),
+            just_before,
+        );
+        assert_eq!(
+            next,
+            AggregateLayerCapacity::PendingPauseTop { since: start }
+        );
+    }
+
+    #[test]
+    fn aggregate_top_paused_cascades_into_pending_pause_mid() {
+        // Once Top is paused, sustained over-budget kicks the
+        // mid-cascade. NOT a parallel evaluation of mid against
+        // its own debounce — the cascade waits until top has
+        // settled into TopPaused before considering mid.
+        let now = t0();
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::TopPaused,
+            Some(&twcc(0.10)),
+            &cfg(),
+            now,
+        );
+        assert_eq!(
+            next,
+            AggregateLayerCapacity::PendingPauseMid { since: now }
+        );
+    }
+
+    #[test]
+    fn aggregate_top_paused_starts_resume_on_clean_recovery() {
+        // Cleanly healthy (≤ recovery threshold) → start counting
+        // down to resume top. NOT triggered by mere `!over_budget`
+        // (that's the gray band) — TopPaused must see clearly
+        // healthy.
+        let now = t0();
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::TopPaused,
+            Some(&twcc(0.01)),
+            &cfg(),
+            now,
+        );
+        assert_eq!(
+            next,
+            AggregateLayerCapacity::PendingResumeTop { since: now }
+        );
+    }
+
+    #[test]
+    fn aggregate_top_paused_holds_in_gray_band() {
+        // 0.04 is between recovery (0.02) and threshold (0.05) —
+        // should stay TopPaused (no resume countdown, no further
+        // pause cascade). This is the hysteresis band that prevents
+        // flapping at the boundary.
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::TopPaused,
+            Some(&twcc(0.04)),
+            &cfg(),
+            t0(),
+        );
+        assert_eq!(next, AggregateLayerCapacity::TopPaused);
+    }
+
+    #[test]
+    fn aggregate_pending_pause_mid_advances_at_drop_debounce() {
+        let start = t0();
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::PendingPauseMid { since: start },
+            Some(&twcc(0.10)),
+            &cfg(),
+            start + cfg().drop_debounce,
+        );
+        assert_eq!(next, AggregateLayerCapacity::OnlyFloor);
+    }
+
+    #[test]
+    fn aggregate_pending_pause_mid_cancels_on_recovery() {
+        // Same cancel-on-improvement semantic as PendingPauseTop:
+        // any drop below threshold (not necessarily into healthy)
+        // cancels, returning to TopPaused.
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::PendingPauseMid { since: t0() },
+            Some(&twcc(0.04)),
+            &cfg(),
+            t0() + Duration::from_secs(2),
+        );
+        assert_eq!(next, AggregateLayerCapacity::TopPaused);
+    }
+
+    #[test]
+    fn aggregate_only_floor_starts_resume_on_clean_recovery() {
+        let now = t0();
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::OnlyFloor,
+            Some(&twcc(0.01)),
+            &cfg(),
+            now,
+        );
+        assert_eq!(
+            next,
+            AggregateLayerCapacity::PendingResumeMid { since: now }
+        );
+    }
+
+    #[test]
+    fn aggregate_only_floor_stays_in_gray_band() {
+        // Once OnlyFloor, the gray band keeps us pinned — restore
+        // requires cleanly healthy.
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::OnlyFloor,
+            Some(&twcc(0.04)),
+            &cfg(),
+            t0(),
+        );
+        assert_eq!(next, AggregateLayerCapacity::OnlyFloor);
+    }
+
+    #[test]
+    fn aggregate_pending_resume_mid_advances_at_restore_debounce() {
+        let start = t0();
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::PendingResumeMid { since: start },
+            Some(&twcc(0.01)),
+            &cfg(),
+            start + cfg().restore_debounce,
+        );
+        assert_eq!(next, AggregateLayerCapacity::TopPaused);
+    }
+
+    #[test]
+    fn aggregate_pending_resume_mid_cancels_on_regression() {
+        // Symmetric to PendingResume in the per-RID machine:
+        // restore requires sustained healthy. ANY drift out of
+        // healthy (gray band OR over-budget) cancels back to
+        // OnlyFloor.
+        for fraction in [0.04, 0.10] {
+            let next = step_aggregate_layer_capacity(
+                AggregateLayerCapacity::PendingResumeMid { since: t0() },
+                Some(&twcc(fraction)),
+                &cfg(),
+                t0() + Duration::from_millis(500),
+            );
+            assert_eq!(
+                next,
+                AggregateLayerCapacity::OnlyFloor,
+                "regression to {fraction} must cancel pending resume",
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_pending_resume_top_advances_at_restore_debounce() {
+        let start = t0();
+        let next = step_aggregate_layer_capacity(
+            AggregateLayerCapacity::PendingResumeTop { since: start },
+            Some(&twcc(0.01)),
+            &cfg(),
+            start + cfg().restore_debounce,
+        );
+        assert_eq!(next, AggregateLayerCapacity::AllUpperWanted);
+    }
+
+    #[test]
+    fn aggregate_pending_resume_top_cancels_on_regression() {
+        for fraction in [0.04, 0.10] {
+            let next = step_aggregate_layer_capacity(
+                AggregateLayerCapacity::PendingResumeTop { since: t0() },
+                Some(&twcc(fraction)),
+                &cfg(),
+                t0() + Duration::from_millis(500),
+            );
+            assert_eq!(
+                next,
+                AggregateLayerCapacity::TopPaused,
+                "regression to {fraction} must cancel pending resume",
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_full_cascade_drop_then_recover_in_reverse_order() {
+        // Walk the full state machine: AllUpperWanted →
+        // PendingPauseTop → TopPaused → PendingPauseMid →
+        // OnlyFloor → PendingResumeMid → TopPaused →
+        // PendingResumeTop → AllUpperWanted. This is the
+        // f-then-h drop, h-then-f recovery directive verbatim.
+        let cfg = cfg();
+        let mut now = t0();
+        let mut state = AggregateLayerCapacity::AllUpperWanted;
+        let high = twcc(0.10);
+        let low = twcc(0.01);
+
+        // 1. AllUpperWanted + over-budget → PendingPauseTop
+        state = step_aggregate_layer_capacity(state, Some(&high), &cfg, now);
+        assert!(matches!(
+            state,
+            AggregateLayerCapacity::PendingPauseTop { .. }
+        ));
+
+        // 2. ... drop_debounce later → TopPaused
+        now += cfg.drop_debounce;
+        state = step_aggregate_layer_capacity(state, Some(&high), &cfg, now);
+        assert_eq!(state, AggregateLayerCapacity::TopPaused);
+
+        // 3. Still over-budget → PendingPauseMid
+        state = step_aggregate_layer_capacity(state, Some(&high), &cfg, now);
+        assert!(matches!(
+            state,
+            AggregateLayerCapacity::PendingPauseMid { .. }
+        ));
+
+        // 4. ... another drop_debounce → OnlyFloor
+        now += cfg.drop_debounce;
+        state = step_aggregate_layer_capacity(state, Some(&high), &cfg, now);
+        assert_eq!(state, AggregateLayerCapacity::OnlyFloor);
+
+        // 5. Recovery → PendingResumeMid
+        state = step_aggregate_layer_capacity(state, Some(&low), &cfg, now);
+        assert!(matches!(
+            state,
+            AggregateLayerCapacity::PendingResumeMid { .. }
+        ));
+
+        // 6. ... restore_debounce later → TopPaused (mid resumed)
+        now += cfg.restore_debounce;
+        state = step_aggregate_layer_capacity(state, Some(&low), &cfg, now);
+        assert_eq!(state, AggregateLayerCapacity::TopPaused);
+
+        // 7. Still healthy → PendingResumeTop
+        state = step_aggregate_layer_capacity(state, Some(&low), &cfg, now);
+        assert!(matches!(
+            state,
+            AggregateLayerCapacity::PendingResumeTop { .. }
+        ));
+
+        // 8. ... restore_debounce later → AllUpperWanted (full
+        //    recovery)
+        now += cfg.restore_debounce;
+        state = step_aggregate_layer_capacity(state, Some(&low), &cfg, now);
+        assert_eq!(state, AggregateLayerCapacity::AllUpperWanted);
+    }
+
+    #[test]
+    fn aggregate_no_flap_in_gray_band_oscillation() {
+        // Loss oscillating between 0.04 and 0.06 around the
+        // threshold (0.05) within a single drop_debounce window
+        // must not trigger a pause. The cancel-on-improvement
+        // semantic resets the PendingPauseTop timer back to
+        // AllUpperWanted on every dip below threshold.
+        let cfg = cfg();
+        let mut now = t0();
+        let mut state = AggregateLayerCapacity::AllUpperWanted;
+        for tick in 0..10 {
+            let fraction = if tick % 2 == 0 { 0.06 } else { 0.04 };
+            state = step_aggregate_layer_capacity(state, Some(&twcc(fraction)), &cfg, now);
+            now += Duration::from_millis(500);
+        }
+        // Through 5 seconds of oscillation, should never reach
+        // TopPaused — the timer keeps getting cancelled.
+        assert!(
+            matches!(
+                state,
+                AggregateLayerCapacity::AllUpperWanted
+                    | AggregateLayerCapacity::PendingPauseTop { .. }
+            ),
+            "oscillation must not advance past PendingPauseTop, got {state:?}"
+        );
+    }
+
+    // ----- aggregate_state_wanted_upper_layers -----
+
+    #[test]
+    fn aggregate_projection_all_wanted_returns_top_and_mid() {
+        let top = SimulcastRid::full();
+        let mid = SimulcastRid::half();
+        for state in [
+            AggregateLayerCapacity::AllUpperWanted,
+            AggregateLayerCapacity::PendingPauseTop { since: t0() },
+        ] {
+            let wanted = aggregate_state_wanted_upper_layers(state, &top, &mid);
+            assert_eq!(wanted, HashSet::from([top.clone(), mid.clone()]));
+        }
+    }
+
+    #[test]
+    fn aggregate_projection_top_paused_returns_only_mid() {
+        let top = SimulcastRid::full();
+        let mid = SimulcastRid::half();
+        for state in [
+            AggregateLayerCapacity::TopPaused,
+            AggregateLayerCapacity::PendingPauseMid { since: t0() },
+            AggregateLayerCapacity::PendingResumeTop { since: t0() },
+        ] {
+            let wanted = aggregate_state_wanted_upper_layers(state, &top, &mid);
+            assert_eq!(wanted, HashSet::from([mid.clone()]));
+        }
+    }
+
+    #[test]
+    fn aggregate_projection_only_floor_returns_empty_upper() {
+        let top = SimulcastRid::full();
+        let mid = SimulcastRid::half();
+        for state in [
+            AggregateLayerCapacity::OnlyFloor,
+            AggregateLayerCapacity::PendingResumeMid { since: t0() },
+        ] {
+            let wanted = aggregate_state_wanted_upper_layers(state, &top, &mid);
+            assert_eq!(wanted, HashSet::new());
+        }
     }
 
     // ----- per_peer_wanted_layers -----
