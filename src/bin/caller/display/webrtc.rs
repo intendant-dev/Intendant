@@ -1400,11 +1400,33 @@ impl WebRtcPeer {
         // (which is layer order from `vp8_simulcast`: full / half /
         // quarter), so the answer's `a=rid` lines come out in
         // preference order.
-        let active_rids: Vec<SimulcastRid> = subscriptions
+        let mut active_rids: Vec<SimulcastRid> = subscriptions
             .iter()
             .filter(|s| s.id.codec == active_codec)
             .map(|s| s.id.rid.clone())
             .collect();
+        // [DIAGNOSTIC — to revert] #46 single-RID experiment. Force the
+        // peer-display answer to advertise exactly one encoding (full)
+        // regardless of what the encoder pool subscribed to. Tests
+        // whether the multi-RID-with-single-SSRC answer shape is what
+        // prevents browser decode (the suspicious pattern from #43's
+        // SDP dump: a=simulcast:send f;h;q + 3 a=rid lines but only
+        // one a=ssrc:945058356 for all of them). Frames from h/q
+        // forwarders will hit the existing "unknown rid" drop in
+        // write_video_frame — log noise but not a regression.
+        let derived_rids = active_rids.clone();
+        active_rids = vec![SimulcastRid::full()];
+        eprintln!(
+            "[diag/single-rid] derived_rids={:?} → forcing active_rids={:?}",
+            derived_rids
+                .iter()
+                .map(|r| r.as_str().to_string())
+                .collect::<Vec<_>>(),
+            active_rids
+                .iter()
+                .map(|r| r.as_str().to_string())
+                .collect::<Vec<_>>(),
+        );
         // Defensive — `active_codec_from_subscriptions` returned
         // Some, so at least one subscription has this codec.
         // Treating an empty active_rids as a bug rather than a soft
@@ -1572,6 +1594,12 @@ struct DriverState {
     /// All subsequent rtp_time values are relative to this.
     first_frame_at: Option<Instant>,
     rtp: RtpSendState,
+    // [DIAGNOSTIC — to revert] #46 RTP packet header dump — log the
+    // first ~5 packets per (rid, ssrc) showing PT, marker, seq, ts,
+    // SSRC, RID extension presence. Confirms the wire stream actually
+    // matches what the answer SDP advertised vs masquerades as a
+    // different SSRC / drops the RID extension.
+    diag_packet_dump_count: HashMap<(SimulcastRid, u32), u32>,
 }
 
 /// Per-RID send state — one entry per simulcast layer (or one entry
@@ -1698,6 +1726,8 @@ async fn driver(
             mid_ext_id: None,
             rid_ext_id: None,
         },
+        // [DIAGNOSTIC — to revert] #46 packet dump counter.
+        diag_packet_dump_count: HashMap::new(),
     };
 
     // Index sockets by their local address so we can route outbound writes
@@ -2564,6 +2594,27 @@ fn write_video_frame(
             let _ = packet
                 .header
                 .set_extension(id, Bytes::from(rid.as_str().as_bytes().to_vec()));
+        }
+
+        // [DIAGNOSTIC — to revert] Dump the first ~5 outbound RTP
+        // packet headers per (rid, ssrc). Confirms the wire stream
+        // actually carries the values that the SDP advertised — PT,
+        // SSRC, sequence, timestamp, marker bit, RID extension.
+        let dump_key = (rid.clone(), rid_ssrc);
+        let count = state.diag_packet_dump_count.entry(dump_key).or_insert(0);
+        if *count < 5 {
+            *count += 1;
+            eprintln!(
+                "[diag/rtp-out] #{count} rid={} ssrc={} pt={} marker={} seq={} ts={} rid_ext_id={:?} mid_ext_id={:?}",
+                rid.as_str(),
+                rid_ssrc,
+                packet.header.payload_type,
+                packet.header.marker,
+                packet.header.sequence_number,
+                packet.header.timestamp,
+                rid_ext_id,
+                mid_ext_id,
+            );
         }
 
         let Some(mut sender) = rtc.rtp_sender(state.rtp.sender_id) else {
