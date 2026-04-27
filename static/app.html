@@ -12105,18 +12105,31 @@ class PeerDisplayConnection {
     };
 
     try {
-      // Phase 4c follow-up: inject `a=rid:* recv` + `a=simulcast:recv`
-      // into the m=video section before setLocalDescription so the
-      // peer's answer can carry a multi-encoding sendonly track
-      // (VP8 simulcast f;h;q). Munge BEFORE setLocalDescription so
-      // the localDescription matches what's sent on the wire and
-      // server-side SDP validation sees the same simulcast hint.
+      // #46 fix: do NOT inject `a=simulcast:recv` for the federated
+      // peer-display path. When the offer carries a recv-simulcast
+      // hint and the peer's negotiated codec is single-encoding
+      // (H.264 over the TURN-relay path forced by #45), rtc 0.9's
+      // SDP generator emits an answer with three a=rid:* send lines
+      // + a=simulcast:send f;h;q but only ONE a=ssrc covering all
+      // three RIDs. The browser sees a malformed simulcast track and
+      // silently refuses to decode — DTLS healthy, ICE healthy, RTP
+      // flowing, video black.
+      //
+      // Empirical proof: #46's diagnostic (commit 3bc3b8e, reverted
+      // in edea37c) forced active_rids = [SimulcastRid::full()]
+      // server-side; the answer SDP shape did not change → the bug
+      // is in rtc-crate SDP emission, not active_rids derivation.
+      // Same diagnostic confirmed video renders end-to-end as soon
+      // as the offer requests a single-encoding track.
+      //
+      // Local DisplaySlot.connect (static/app.html:7808) STILL
+      // injects simulcast — its codec path (VP8 first) supports
+      // the multi-RID layout cleanly. This skip is federated-only.
+      //
+      // Long-term: patch rtc 0.9 SDP generator to emit per-RID
+      // SSRCs (or upgrade rtc), then restore the injection here.
       const offer = await this.pc.createOffer();
-      const munged = {
-        type: offer.type,
-        sdp: injectRecvSimulcastIntoVideoOffer(offer.sdp, DISPLAY_SIMULCAST_RIDS),
-      };
-      await this.pc.setLocalDescription(munged);
+      await this.pc.setLocalDescription(offer);
       const offerSignal = {
         kind: 'offer',
         sdp: this.pc.localDescription.sdp,
