@@ -246,6 +246,47 @@ fn apply_ws_close_input_authority(
     released
 }
 
+/// Phase 5a.1 / 5c.2: build the personalized
+/// `display_input_authority_state` snapshot a freshly-connecting browser
+/// needs to bootstrap its chip from `unknown` to the authoritative state.
+///
+/// One entry per active display id, with `state` resolved against this
+/// connection's id:
+/// - `"you"` if `connection_id` currently holds the slot;
+/// - `"other"` if some other connection holds it;
+/// - `"unclaimed"` if no one holds it.
+///
+/// Holder connection ids never leave the daemon — the caller serializes
+/// only the resolved `&'static str` into the `display_input_authority_state`
+/// frame.
+///
+/// The frames built from this snapshot must be sent to `direct_tx`
+/// **after** the `log_replay` block: replayed historical `display_ready` /
+/// `user_display_revoked` events re-trigger `addDisplaySlot` /
+/// `removeDisplaySlot` on the browser, which destroys the bootstrap slot
+/// and creates a fresh one whose chip starts at `unknown`. Sending the
+/// authority snapshot after replay guarantees it lands on the *final*
+/// slot, so a late-connecting browser never gets stranded at `unknown`
+/// for a display that already exists. See the
+/// `bootstrap_authority_snapshots_*` tests for the regression coverage.
+fn compute_bootstrap_authority_snapshots(
+    active_display_ids: impl IntoIterator<Item = u32>,
+    authority: &HashMap<u32, ActiveDisplayInput>,
+    connection_id: &str,
+) -> Vec<(u32, &'static str)> {
+    active_display_ids
+        .into_iter()
+        .map(|did| {
+            let state = match authority.get(&did) {
+                Some(holder) if holder.connection_id == connection_id => "you",
+                Some(_) => "other",
+                None => "unclaimed",
+            };
+            (did, state)
+        })
+        .collect()
+}
+
 pub const DEFAULT_PORT: u16 = 8765;
 
 /// Mint a short-lived vendor session token server-side so the browser
@@ -2910,52 +2951,70 @@ pub fn spawn_web_gateway(
                     // `unknown`.  Without this snapshot the chip would only
                     // resolve on the next authority transition, which may
                     // be never if no one ever takes control.
-                    if let Some(ref sr) = session_registry {
-                        let reg = sr.read().await;
-                        // Compute snapshots under the std lock, then drop the
-                        // guard before any direct_tx.send calls.
-                        let active_ids: Vec<u32> = reg.display_ids();
-                        let snapshots: Vec<(u32, (u32, u32), &'static str)> = {
-                            let auth = display_input_authority
-                                .read()
-                                .unwrap_or_else(|e| e.into_inner());
-                            active_ids.into_iter().filter_map(|did| {
-                                reg.get(did).map(|session| {
-                                    let (w, h) = session.resolution();
-                                    let state = match auth.get(&did) {
-                                        Some(holder) if holder.connection_id == connection_id => "you",
-                                        Some(_) => "other",
-                                        None => "unclaimed",
-                                    };
-                                    (did, (w, h), state)
+                    // Compute the bootstrap snapshot once.  display_ready
+                    // events go out now (so the slots exist before any log
+                    // replay happens); the per-display
+                    // `display_input_authority_state` frames are deferred
+                    // until *after* log_replay below.  Replayed historical
+                    // events (display_ready / user_display_revoked from
+                    // earlier grant cycles) re-trigger `addDisplaySlot` on
+                    // the browser, which destroys the bootstrap slot and
+                    // creates a fresh one whose chip starts at `unknown`.
+                    // Sending the authority frame after replay guarantees
+                    // it lands on the *final* slot, so the chip never
+                    // stays at `unknown` for a late-connecting browser.
+                    let bootstrap_authority_snapshots: Vec<(u32, &'static str)> =
+                        if let Some(ref sr) = session_registry {
+                            let reg = sr.read().await;
+                            let active_ids: Vec<u32> = reg.display_ids();
+                            // Snapshot resolutions + auth states under the
+                            // std lock, then drop the guard before any
+                            // direct_tx.send calls.
+                            let resolutions: Vec<(u32, u32, u32)> = active_ids
+                                .iter()
+                                .filter_map(|&did| {
+                                    reg.get(did).map(|session| {
+                                        let (w, h) = session.resolution();
+                                        (did, w, h)
+                                    })
                                 })
-                            }).collect()
-                        };
-                        for (did, (w, h), state) in snapshots {
-                            let ready = serde_json::json!({
-                                "event": "display_ready",
-                                "display_id": did,
-                                "width": w,
-                                "height": h,
-                            });
-                            let _ = direct_tx.send(ready.to_string());
-                            let auth_msg = serde_json::json!({
-                                "t": "display_input_authority_state",
-                                "display_id": did,
-                                "state": state,
-                            });
-                            let _ = direct_tx.send(auth_msg.to_string());
-                        }
-                    } else {
-                        // Fallback: use the broadcast-derived cache when no
-                        // session registry is available (shouldn't happen in
-                        // practice, but keeps the old behaviour as safety net).
-                        if let Ok(guard) = display_ready_cache.lock() {
-                            for display_json in guard.values() {
-                                let _ = direct_tx.send(display_json.clone());
+                                .collect();
+                            let auth_snapshots = {
+                                let auth = display_input_authority
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                compute_bootstrap_authority_snapshots(
+                                    resolutions.iter().map(|(did, _, _)| *did),
+                                    &auth,
+                                    &connection_id,
+                                )
+                            };
+                            // Send the display_ready frames now; defer the
+                            // authority frames until after log_replay.
+                            for (did, w, h) in resolutions {
+                                let ready = serde_json::json!({
+                                    "event": "display_ready",
+                                    "display_id": did,
+                                    "width": w,
+                                    "height": h,
+                                });
+                                let _ = direct_tx.send(ready.to_string());
                             }
-                        }
-                    }
+                            auth_snapshots
+                        } else {
+                            // Fallback: use the broadcast-derived cache when
+                            // no session registry is available (shouldn't
+                            // happen in practice, but keeps the old
+                            // behaviour as safety net).  No authority frame
+                            // to send in this branch — the cache only holds
+                            // display_ready JSON, no holder state.
+                            if let Ok(guard) = display_ready_cache.lock() {
+                                for display_json in guard.values() {
+                                    let _ = direct_tx.send(display_json.clone());
+                                }
+                            }
+                            Vec::new()
+                        };
 
                     // Replay session log so late-connecting browsers see
                     // historical events (not just real-time from now on).
@@ -2971,6 +3030,23 @@ pub fn spawn_web_gateway(
                             });
                             let _ = direct_tx.send(replay.to_string());
                         }
+                    }
+
+                    // Phase 5a.1: now that log_replay has finished
+                    // recreating display slots from historical events,
+                    // send the personalized `display_input_authority_state`
+                    // for each currently-active display.  Sending these
+                    // before log_replay would land the chip on a slot that
+                    // log_replay then destroys (see the slot lifecycle
+                    // bookkeeping in `addDisplaySlot` / `removeDisplaySlot`
+                    // on the browser side).
+                    for (did, state) in bootstrap_authority_snapshots {
+                        let auth_msg = serde_json::json!({
+                            "t": "display_input_authority_state",
+                            "display_id": did,
+                            "state": state,
+                        });
+                        let _ = direct_tx.send(auth_msg.to_string());
                     }
 
                     // Inbound: WebSocket → EventBus
@@ -10917,5 +10993,92 @@ mod tests {
                 .get(&1).unwrap().connection_id,
             "conn-other",
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 5c.2: bootstrap snapshot regression — late-second browser
+    // joining a daemon that already has an active display must end up
+    // with its chip resolved to `you`/`other`/`unclaimed`, never stuck
+    // at `unknown`.  The snapshot computation is the per-connection
+    // personalization pass (the holder-id never reaches the wire).
+    // ---------------------------------------------------------------
+
+    /// Active display, no holder → `unclaimed` for the connecting browser.
+    /// Covers the "fresh display granted before browser B connects, no one
+    /// has clicked Take Control yet" case.
+    #[test]
+    fn bootstrap_authority_snapshots_unclaimed_when_no_holder() {
+        let map = empty_authority_map();
+        let auth = map.read().unwrap_or_else(|e| e.into_inner());
+        let snaps =
+            compute_bootstrap_authority_snapshots([0u32], &auth, "conn-B");
+        assert_eq!(snaps, vec![(0, "unclaimed")]);
+    }
+
+    /// Active display, browser A holds → connecting browser B sees `other`.
+    /// This is the exact regression that left B's chip at `unknown`
+    /// before slice 5c.2 — the bootstrap was sent but landed on the
+    /// wrong slot, so this test pins the snapshot resolution.
+    #[test]
+    fn bootstrap_authority_snapshots_other_for_late_second_browser() {
+        let map = empty_authority_map();
+        seed_holder(&map, 0, "conn-A");
+        let auth = map.read().unwrap_or_else(|e| e.into_inner());
+        let snaps =
+            compute_bootstrap_authority_snapshots([0u32], &auth, "conn-B");
+        assert_eq!(
+            snaps,
+            vec![(0, "other")],
+            "browser B (different connection_id) must see `other` while A holds",
+        );
+    }
+
+    /// Active display, this connection IS the holder → `you`.
+    /// Covers a holder browser refresh: same `connection_id` (or
+    /// equivalent) reconnecting must see `you` so the chip stays
+    /// consistent with the server-side gate.
+    #[test]
+    fn bootstrap_authority_snapshots_you_when_self_is_holder() {
+        let map = empty_authority_map();
+        seed_holder(&map, 0, "conn-A");
+        let auth = map.read().unwrap_or_else(|e| e.into_inner());
+        let snaps =
+            compute_bootstrap_authority_snapshots([0u32], &auth, "conn-A");
+        assert_eq!(snaps, vec![(0, "you")]);
+    }
+
+    /// Multiple active displays, mixed holders → per-display
+    /// personalization is independent.  The connecting browser sees
+    /// `you` for its own holdings and `other`/`unclaimed` for the rest.
+    /// Locks in that the snapshot iterates per display, not per holder.
+    #[test]
+    fn bootstrap_authority_snapshots_resolve_per_display_independently() {
+        let map = empty_authority_map();
+        seed_holder(&map, 0, "conn-A"); // you
+        seed_holder(&map, 1, "conn-B"); // other
+        // display 2 unclaimed
+        let auth = map.read().unwrap_or_else(|e| e.into_inner());
+        let snaps = compute_bootstrap_authority_snapshots(
+            [0u32, 1, 2],
+            &auth,
+            "conn-A",
+        );
+        assert_eq!(
+            snaps,
+            vec![(0, "you"), (1, "other"), (2, "unclaimed")],
+            "each display's state resolves independently against this connection",
+        );
+    }
+
+    /// Empty session registry → no snapshots, no frames to send.
+    /// Matches the "browser connects to a daemon with no granted
+    /// display" path; bootstrap loop is a no-op.
+    #[test]
+    fn bootstrap_authority_snapshots_empty_when_no_active_displays() {
+        let map = empty_authority_map();
+        let auth = map.read().unwrap_or_else(|e| e.into_inner());
+        let snaps =
+            compute_bootstrap_authority_snapshots([] as [u32; 0], &auth, "conn-A");
+        assert!(snaps.is_empty());
     }
 }

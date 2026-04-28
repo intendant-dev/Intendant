@@ -8481,13 +8481,17 @@ class DisplaySlot {
     if (userInitiated) {
       this._releaseAuthority();
     }
+    // Flip `connected` BEFORE `_exitInteractive` so its status-text
+    // ternary writes 'Disconnected' (not the stale 'Connected (view-
+    // only)') on the way out — otherwise the chip flickers through
+    // the connected text for a microtask before the post-cleanup
+    // assignment overwrote it.
+    this.connected = false;
     this._exitInteractive(userInitiated);
     if (this.controlChannel) { this.controlChannel.close(); this.controlChannel = null; }
     if (this.pointerChannel) { this.pointerChannel.close(); this.pointerChannel = null; }
     if (this.clipboardChannel) { this.clipboardChannel.close(); this.clipboardChannel = null; }
     if (this.pc) { this.pc.close(); this.pc = null; }
-    this.connected = false;
-    this.statusEl.textContent = 'Disconnected';
     this.statusEl.className = 'display-status error';
   }
 }
