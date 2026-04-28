@@ -1,62 +1,72 @@
 //! Display-level layer-pool orchestration.
 //!
-//! ## Phase 4d.2: zero-peer gating
+//! ## Architecture
 //!
-//! Single responsibility: pause the always-on encoder pool's
-//! simulcast layers when no WebRTC peers are connected, resume
-//! them when the first peer arrives. **CPU saver only** — does
-//! not make per-peer or capacity-based layer decisions.
-//! Bandwidth-driven downgrade/upgrade is 4d.3's job, on a real
-//! receiver-feedback signal (RTCP RR `fraction_lost`, TWCC
-//! arrival feedback, browser-side `getStats`).
+//! One coordinator task per display owns
+//! [`crate::display::encode::pool::EncoderPool::pause_layer`] /
+//! [`crate::display::encode::pool::EncoderPool::resume_layer`]
+//! decisions. Three policies vote — presence, aggregate-TWCC, and
+//! per-RID RR — and the coordinator composes by intersection: a
+//! layer is wanted iff every active policy agrees. **Pause wins;
+//! resume requires consensus.** This replaces the previous
+//! one-task-per-policy design that produced opposite actions when
+//! one policy had signal and another defaulted to "Wanted."
 //!
 //! ## Why display-level, not encode-level
 //!
-//! This module owns the policy that ties **peer presence**
+//! This module ties **peer presence**
 //! ([`crate::display::webrtc::WebRtcPeer`]) to **encoder pool
 //! lifecycle** ([`crate::display::encode::pool::EncoderPool`]).
 //! Putting it under `encode/` would force `encode/` to depend
 //! upward on `webrtc` (a module that's `encode/`'s consumer, not
 //! its peer), inverting the dependency graph. Living at the
-//! display level lets the aggregator consume both cleanly without
-//! pushing webrtc-awareness down into the encoder primitive layer.
+//! display level lets the coordinator consume both cleanly
+//! without pushing webrtc-awareness down into the encoder
+//! primitive layer.
 //!
-//! ## State machine
+//! ## Policies
 //!
-//! Three states, one instance per display, ticks every 1s:
+//! - **Presence policy**: zero-peer pause-after-debounce + resume-
+//!   on-first-peer. State machine in [`transition`]; the
+//!   coordinator votes empty wanted set when in `Idle`, full set
+//!   otherwise. Same `IdlePending` debounce semantics as the
+//!   previous standalone zero-peer aggregator (5 s by default,
+//!   protects against browser-refresh / network-blip /
+//!   federation-rehandshake thrashing).
+//! - **Aggregate-TWCC policy**: per-peer cascaded loss-driven
+//!   pause via [`AggregateLayerCapacity`] + [`step_aggregate_layer_capacity`]
+//!   reading from [`crate::display::twcc_tap`]. Cascade pauses
+//!   top first, then mid, on sustained loss; reverse on
+//!   recovery. The actionable signal source on the rtc 0.9 +
+//!   WKWebView stack.
+//! - **Per-RID RR policy**: per-(peer, RID)
+//!   [`LayerCapacityState`] off `RTCRemoteInboundRtpStreamStats`
+//!   `fraction_lost`. Currently inert (rtc 0.9 doesn't populate
+//!   the stats accumulator) but stays warm for future stacks.
 //!
-//! - [`AggregatorState::Active`]: at least one WebRTC peer is
-//!   attached. Pool runs normally; aggregator does nothing.
-//! - [`AggregatorState::IdlePending`]: peers just dropped to zero,
-//!   debounce timer running. If a peer arrives before the debounce
-//!   expires, we go back to `Active` without ever pausing — protects
-//!   against thrashing on brief disconnect/reconnect cycles
-//!   (browser refresh, network blip, federation rehandshake).
-//! - [`AggregatorState::Idle`]: zero peers, all simulcast layers
-//!   paused. On first peer arrival we issue
-//!   [`AggregatorAction::ResumeAllSimulcast`] and go back to `Active`.
+//! Each policy votes the full current rid set when it has no
+//! useful signal — "no signal" means "no restriction," not "no
+//! recovery." Only sustained, real signals narrow the wanted set.
 //!
-//! ## Resume restores **all** layers (not just floor)
+//! ## State pruning on zero peers
 //!
-//! 4d.2 is CPU gating, not quality adaptation. Resuming only the
-//! floor layer would be a user-visible quality regression for any
-//! peer joining a session that was idle for ≥5s — that peer would
-//! see quarter-resolution video until 4d.3 lands and a real
-//! receiver-feedback signal can decide higher layers are
-//! sustainable. Resuming all layers preserves today's "all
-//! simulcast layers always active when peers are connected"
-//! behavior, just adding CPU savings during idle. 4d.3 will pause
-//! upper layers selectively based on per-peer link health.
+//! When `peers.is_empty()` the coordinator clears all per-peer
+//! subscriptions and policy state before the presence policy
+//! fires its zero-peer pause. Reconnects (same `PeerId`) start
+//! fresh: TWCC cascade at `AllUpperWanted`, per-RID at `Wanted`,
+//! RTT-measurement counts at zero. No stale signal can re-trigger
+//! a pause on a freshly-arrived peer.
 //!
 //! ## Action handling is injected (testability)
 //!
-//! [`spawn_zero_peer_aggregator`] takes a `Box<dyn Fn(AggregatorAction)>`
-//! closure rather than a direct [`crate::display::encode::pool::EncoderPool`]
-//! reference. The closure pattern keeps the aggregator's state machine
-//! pure (testable without spawning a real pool, capturing rids, or
-//! constructing fake encoder backends) and lets the production wiring
-//! at [`crate::display::DisplaySession::start`] capture the pool +
-//! layer-rid snapshot in one place.
+//! [`spawn_layer_policy_coordinator`] takes
+//! `Box<dyn Fn(CapacityAction)>` instead of a direct
+//! [`crate::display::encode::pool::EncoderPool`] reference. The
+//! closure pattern keeps the per-policy state machines pure
+//! (testable without spawning a real pool, capturing rids, or
+//! constructing fake encoder backends) and lets the production
+//! wiring at [`crate::display::DisplaySession::start`] capture the
+//! pool in one place.
 
 use crate::display::encode::pool::SimulcastRid;
 use crate::display::webrtc::{PeerLayerHealth, WebRtcPeer};
@@ -87,25 +97,12 @@ const PAUSE_DEBOUNCE: Duration = Duration::from_secs(5);
 /// microsecond and never contended.
 const TICK: Duration = Duration::from_secs(1);
 
-/// Side-effecting action the aggregator can request. Applied via
-/// the closure passed to [`spawn_zero_peer_aggregator`]; production
-/// wiring loops over the captured simulcast-layer rid set and calls
-/// [`crate::display::encode::pool::EncoderPool::pause_layer`] /
-/// [`crate::display::encode::pool::EncoderPool::resume_layer`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AggregatorAction {
-    /// Pause every always-on simulcast layer in the pool. Issued
-    /// once on transition into [`AggregatorState::Idle`].
-    PauseAllSimulcast,
-    /// Resume every always-on simulcast layer in the pool. Issued
-    /// once on transition out of [`AggregatorState::Idle`].
-    ///
-    /// Pool's `resume_layer` already forces a keyframe on the
-    /// paused→active edge (4d.0 review fix), so the joining peer
-    /// gets a decodable keyframe within one encode tick.
-    ResumeAllSimulcast,
-}
-
+/// Presence state for the layer-policy coordinator's presence
+/// policy: `Active` while peers are connected, `IdlePending`
+/// during the [`PAUSE_DEBOUNCE`] window after peers drop to zero,
+/// `Idle` after the debounce window has elapsed without peers
+/// returning. The coordinator votes "all current rids" in
+/// `Active` / `IdlePending` and "no rids" in `Idle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AggregatorState {
     Active,
@@ -113,89 +110,39 @@ enum AggregatorState {
     Idle,
 }
 
-/// Pure transition function — no side effects, no async, no I/O.
+/// Pure transition function for the presence state machine — no
+/// side effects, no async, no I/O.
 ///
-/// Returns `(next_state, optional_action)`. The caller (the spawn
-/// loop, or a test) is responsible for applying any returned action.
+/// Returns the next state given the current peer count and clock.
+/// The previous design also returned an `Option<AggregatorAction>`
+/// for direct pause/resume callbacks; with the layer-policy
+/// coordinator owning all pool actions, that information is
+/// derived from the state itself (Idle → empty wanted set, others
+/// → full wanted set) and the action enum has been removed.
 fn transition(
     prev: AggregatorState,
     peer_count: usize,
     now: Instant,
-) -> (AggregatorState, Option<AggregatorAction>) {
+) -> AggregatorState {
     match prev {
         AggregatorState::Active if peer_count == 0 => {
-            (AggregatorState::IdlePending { since: now }, None)
+            AggregatorState::IdlePending { since: now }
         }
-        AggregatorState::Active => (AggregatorState::Active, None),
+        AggregatorState::Active => AggregatorState::Active,
 
         AggregatorState::IdlePending { .. } if peer_count >= 1 => {
-            (AggregatorState::Active, None)
+            AggregatorState::Active
         }
         AggregatorState::IdlePending { since } if now >= since + PAUSE_DEBOUNCE => {
-            (
-                AggregatorState::Idle,
-                Some(AggregatorAction::PauseAllSimulcast),
-            )
+            AggregatorState::Idle
         }
         AggregatorState::IdlePending { since } => {
-            (AggregatorState::IdlePending { since }, None)
+            AggregatorState::IdlePending { since }
         }
 
-        AggregatorState::Idle if peer_count >= 1 => {
-            (
-                AggregatorState::Active,
-                Some(AggregatorAction::ResumeAllSimulcast),
-            )
-        }
-        AggregatorState::Idle => (AggregatorState::Idle, None),
+        AggregatorState::Idle if peer_count >= 1 => AggregatorState::Active,
+        AggregatorState::Idle => AggregatorState::Idle,
     }
-}
-
-/// Spawn the zero-peer aggregator task for one display.
-///
-/// `peers` is shared with the [`crate::display::DisplaySession`]
-/// peer registry — the aggregator only `read()`s it, never mutates,
-/// and only consults `len()`.
-///
-/// `on_action` applies the requested side effect. Production wiring
-/// captures `Arc<EncoderPool>` plus the `Vec<SimulcastRid>` snapshot
-/// taken at session start; tests pass a recording closure to
-/// observe the action sequence without constructing a pool.
-///
-/// The task exits cleanly on `shutdown.cancelled()`. The returned
-/// `JoinHandle` is awaited by [`crate::display::DisplaySession::stop`].
-pub fn spawn_zero_peer_aggregator(
-    peers: Arc<RwLock<HashMap<PeerId, Arc<WebRtcPeer>>>>,
-    on_action: Box<dyn Fn(AggregatorAction) + Send + Sync>,
-    shutdown: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut state = AggregatorState::Active;
-        let mut tick = tokio::time::interval(TICK);
-        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // We do NOT discard the immediate-first tick: `interval()`
-        // fires its first tick at construction (Burst), and we want
-        // the first observation to happen at spawn time so a session
-        // that starts with zero peers begins the debounce countdown
-        // immediately rather than wasting one TICK of idle CPU.
-        // Pool init and peer-registry init both complete before the
-        // aggregator is spawned (see `DisplaySession::start`), so
-        // there's no init race to wait out.
-
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tick.tick() => {
-                    let peer_count = peers.read().await.len();
-                    let (next, action) = transition(state, peer_count, Instant::now());
-                    state = next;
-                    if let Some(a) = action {
-                        on_action(a);
-                    }
-                }
-            }
-        }
-    })
 }
 
 // ===========================================================================
@@ -645,78 +592,74 @@ pub fn step_aggregate_layer_capacity(
 }
 
 /// Project an [`AggregateLayerCapacity`] state to the wanted-RID
-/// set, given the concrete RID identifiers for top and mid.
+/// set, given the cascade's upper layers in spec order (top first,
+/// then mid if present, etc.).
 ///
-/// Floor RID is always wanted while peers are present (4d.2 owns
-/// the zero-peer pause); this function returns only the *upper*
-/// layers and is meant to be unioned with `{floor}` at the caller.
+/// Floor RID is always wanted while peers are present (presence
+/// policy owns the zero-peer pause); this function returns only
+/// the *upper* layers and is meant to be unioned with `{floor}`
+/// at the caller.
 ///
 /// "Wanted" semantics: a layer is in the set iff the encoder pool
 /// should currently be producing it. Pending-pause states still
 /// produce (we haven't decided to pause yet); pending-resume
 /// states do not (we paused, and haven't decided to restart yet).
+///
+/// **Variable-arity cascade**: the state machine has 7 states
+/// designed for a top + mid cascade, but `upper_layers` may be
+/// shorter (e.g., 2-layer simulcast at very small dims, where
+/// `vp8_simulcast` emits only `full + half` with `half` as floor —
+/// only `full` remains as the upper layer). The projection
+/// handles all cases:
+///
+/// - `AllUpperWanted` / `PendingPauseTop` → all of `upper_layers`
+///   (cascade hasn't started pausing yet).
+/// - `TopPaused` / `PendingPauseMid` / `PendingResumeTop` → all
+///   of `upper_layers[1..]` (top dropped). For 1-layer cascades
+///   this is empty — equivalent to `OnlyFloor`.
+/// - `OnlyFloor` / `PendingResumeMid` → empty.
 pub fn aggregate_state_wanted_upper_layers(
     state: AggregateLayerCapacity,
-    top: &SimulcastRid,
-    mid: &SimulcastRid,
+    upper_layers: &[SimulcastRid],
 ) -> HashSet<SimulcastRid> {
-    let mut out = HashSet::new();
     match state {
         AggregateLayerCapacity::AllUpperWanted
         | AggregateLayerCapacity::PendingPauseTop { .. } => {
-            out.insert(top.clone());
-            out.insert(mid.clone());
+            upper_layers.iter().cloned().collect()
         }
         AggregateLayerCapacity::TopPaused
         | AggregateLayerCapacity::PendingPauseMid { .. }
-        | AggregateLayerCapacity::PendingResumeTop { .. } => {
-            out.insert(mid.clone());
-        }
+        | AggregateLayerCapacity::PendingResumeTop { .. } => upper_layers
+            .iter()
+            .skip(1)
+            .cloned()
+            .collect(),
         AggregateLayerCapacity::OnlyFloor
-        | AggregateLayerCapacity::PendingResumeMid { .. } => {}
+        | AggregateLayerCapacity::PendingResumeMid { .. } => HashSet::new(),
     }
-    out
 }
 
 // ===========================================================================
-// Phase 4d.3c: capacity aggregator wiring
+// Shared layer-action vocabulary + helpers
 // ===========================================================================
 //
-// Per-display task that subscribes to per-peer
-// `remote_inbound_health_rx` watches, maintains per-(peer,
-// non-floor-RID) capacity-policy state across ticks, and applies
-// pause/resume actions when the aggregate wanted-layer set changes.
-//
-// **Coexists with the 4d.2 zero-peer aggregator without fighting:**
-// the capacity aggregator skips its tick when `peers.is_empty()` —
-// 4d.2 owns the peer-presence transitions (pause-all-on-zero,
-// resume-all-on-first-peer), and the capacity aggregator only acts
-// while peers are present and have something to say about per-RID
-// link health. Pool methods are idempotent so any race is benign,
-// but skip-on-no-peers prevents the capacity aggregator from
-// firing redundant actions during 4d.2's pause windows.
-//
-// **Floor RID is excluded from capacity decisions** by construction:
-// `get_non_floor_rids` (production: derived from
-// `pool.always_on_ids()` minus the last entry, which `vp8_simulcast`
-// guarantees to be the smallest layer) defines the iteration set.
-// The floor stays unconditionally `Wanted` whenever any peer is
-// connected — its lifecycle is 4d.2's responsibility.
-//
-// **`last_applied` initialization**: the capacity aggregator
-// initializes `last_applied` to the full non-floor RID set on its
-// first tick, mirroring `EncoderPool::new`'s contract that
-// always-on layers start active. Without this, the first tick
-// would diff against an empty `last_applied` and fire
-// `ResumeLayer` for every wanted RID — redundant (the layers are
-// already active) and noisy in tests / logs.
+// `CapacityAction`, `fresh_health`, and `diff_wanted_aggregate`
+// are the cross-policy primitives the layer-policy coordinator
+// composes per tick. They were originally introduced for the
+// per-RID-RR `spawn_capacity_aggregator` (now subsumed by
+// [`spawn_layer_policy_coordinator`]) and remain useful as the
+// shared output type and pure diff/freshness helpers.
 
-/// Side-effecting action the capacity aggregator can request.
-/// Applied via the closure passed to [`spawn_capacity_aggregator`];
-/// production wiring at [`crate::display::DisplaySession::start`]
-/// maps each variant to [`crate::display::encode::pool::EncoderPool::pause_layer`]
-/// / [`crate::display::encode::pool::EncoderPool::resume_layer`]
-/// with `CodecKind::Vp8` (the always-on simulcast codec).
+/// Side-effecting action the layer-policy coordinator emits at the
+/// end of each tick. Production wiring at
+/// [`crate::display::DisplaySession::start`] maps each variant to
+/// [`crate::display::encode::pool::EncoderPool::pause_layer`] /
+/// [`crate::display::encode::pool::EncoderPool::resume_layer`]
+/// with `CodecKind::Vp8` (the always-on simulcast codec). The
+/// per-RID-RR and aggregate-TWCC policies vote for a wanted set;
+/// the coordinator composes via intersection and emits one
+/// `CapacityAction` per layer whose actual pool state diverges
+/// from the composed set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapacityAction {
     /// Pause one simulcast layer (a non-floor RID the aggregate no
@@ -786,69 +729,147 @@ pub fn diff_wanted_aggregate(
     out
 }
 
-/// Spawn the capacity aggregator for one display.
+// ===========================================================================
+// Phase 4d.3b: layer-policy composition
+// ===========================================================================
+//
+// **One coordinator owns pool.pause_layer / resume_layer.** The
+// presence policy (zero-peer debounce), aggregate-TWCC policy
+// (cascaded loss-driven pause), and per-RID RR policy (per-layer
+// fraction-lost) are composed by intersection: a layer is wanted
+// iff EVERY policy votes for it. Pause wins; resume requires every
+// active policy to agree.
+//
+// This replaces the previous design that ran each policy as an
+// independent task writing to the pool. With independent writers,
+// the per-RID policy's "no signal → default Wanted" semantic would
+// see a layer paused by the TWCC task and immediately resume it on
+// its next tick — idempotent pool methods don't make opposite
+// actions benign. The composer eliminates the conflict by
+// resolving policy votes before any pool action fires, so each tick
+// produces exactly one set of decisions.
+//
+// **Each policy votes the full current rid set when it has no
+// useful signal.** That way "no signal" means "no restriction" and
+// the intersection is unaffected. Policies only narrow the wanted
+// set when they have a real reason to (sustained loss, sustained
+// presence absence, etc.).
+//
+// **Per-peer state pruning on zero peers.** When `peers.is_empty()`
+// the coordinator clears all per-peer subscriptions and state
+// before the presence policy fires its zero-peer pause. Reconnects
+// (same `PeerId`) start fresh: TWCC state at `AllUpperWanted`,
+// per-RID state at `Wanted`, RTT-measurement counts at zero. No
+// stale signal can re-trigger a pause on a freshly-arrived peer.
+
+/// Compose the final wanted-layer set from per-policy wanted sets.
 ///
-/// `peers` is shared with the [`crate::display::DisplaySession`]
-/// peer registry — read-only iteration, never mutated. The
-/// aggregator subscribes to each peer's
+/// Intersection semantics: a layer is wanted iff EVERY input set
+/// contains it. Iterates `current_rids` (not the input sets) so
+/// the output is bounded to the current pool layout — a layer
+/// removed by `EncoderPool::on_resize` since the policy state was
+/// last refreshed never appears in the result.
+///
+/// `presence_active = false` short-circuits to empty (zero-peer
+/// idle pauses everything, regardless of what the per-peer
+/// policies might have voted before pruning).
+///
+/// `twcc_union` and `rr_union` are the union-across-peers wanted
+/// sets from the aggregate-TWCC and per-RID-RR policies
+/// respectively. Each policy returns the full `current_rids` set
+/// when it has no peers to evaluate (no restriction), so the
+/// intersection during a no-peers tick reduces to whatever the
+/// presence policy decided.
+pub fn compose_effective_wanted(
+    presence_active: bool,
+    twcc_union: &HashSet<SimulcastRid>,
+    rr_union: &HashSet<SimulcastRid>,
+    current_rids: &[SimulcastRid],
+) -> HashSet<SimulcastRid> {
+    if !presence_active {
+        return HashSet::new();
+    }
+    current_rids
+        .iter()
+        .filter(|rid| twcc_union.contains(*rid) && rr_union.contains(*rid))
+        .cloned()
+        .collect()
+}
+
+/// Spawn the single layer-policy coordinator for one display.
+///
+/// One task, three policies, one writer. Subscribes to each peer's
+/// [`crate::display::webrtc::WebRtcPeer::subscribe_twcc_health`]
+/// and
 /// [`crate::display::webrtc::WebRtcPeer::subscribe_remote_inbound_health`]
-/// watch lazily on first observation per peer, drops subscriptions
-/// for peers no longer present.
+/// watches lazily on first observation, advances per-peer state for
+/// each policy on every tick, composes via intersection through
+/// [`compose_effective_wanted`], diffs once against actual pool
+/// state via `is_layer_paused`, and emits exactly one set of
+/// pause/resume actions through `on_action`.
 ///
-/// `get_non_floor_rids` returns the non-floor simulcast RIDs to
-/// apply policy to. Production wiring captures
-/// `Arc<EncoderPool>` and returns `pool.always_on_ids()` minus the
-/// last entry (the floor); tests pass a fixed Vec.
+/// `get_current_rids` returns the pool's current VP8 simulcast
+/// layer set in spec order (descending bitrate; the last entry is
+/// the floor). Production wiring captures `Arc<EncoderPool>` and
+/// returns `pool.always_on_ids()` filtered to `CodecKind::Vp8`;
+/// the coordinator derives floor + upper-layers from this list on
+/// every tick, so a `pool.on_resize` that grows or shrinks the
+/// layer set takes effect at most one tick later.
 ///
 /// `is_layer_paused` queries the pool's actual current pause state
-/// for one RID — `Some(true)` if currently paused, `Some(false)` if
-/// active, `None` if no slot exists for that RID. Production wiring
-/// captures `Arc<EncoderPool>` and forwards to
-/// [`crate::display::encode::pool::EncoderPool::is_layer_paused`]
-/// with `CodecKind::Vp8`. Diffing the wanted set against actual
-/// pool state (rather than against an internally-tracked
-/// `last_applied`) handles the
-/// [`crate::display::encode::pool::EncoderPool::on_resize`] case:
-/// resize regenerates always-on handles ACTIVE, so a previously-
-/// paused upper layer would silently reactivate while a stale
-/// `last_applied` snapshot still believed it was paused. Querying
-/// actual state every tick ensures we re-pause on the very next
-/// tick after resize without needing a resize notification.
+/// — `Some(true)` if currently paused, `Some(false)` if active,
+/// `None` if no slot exists for that RID. Diffing against actual
+/// state (rather than an internal `last_applied`) handles
+/// `EncoderPool::on_resize` regenerating layers ACTIVE: the next
+/// tick's diff sees them active and re-pauses if the policy still
+/// excludes them.
 ///
-/// `on_action` applies the requested side effect. Production wiring
-/// captures `Arc<EncoderPool>` and routes `PauseLayer` /
-/// `ResumeLayer` to `pool.pause_layer` / `pool.resume_layer` with
-/// `CodecKind::Vp8`; tests pass a recording closure.
+/// `on_action` applies the requested side effect, mapping to
+/// `pool.pause_layer` / `pool.resume_layer` with `CodecKind::Vp8`.
 ///
-/// The task exits cleanly on `shutdown.cancelled()`. Returned
-/// `JoinHandle` is awaited by [`crate::display::DisplaySession::stop`].
-pub fn spawn_capacity_aggregator(
+/// `config` is shared across the aggregate-TWCC and per-RID-RR
+/// policies — both use the same threshold/debounce constants
+/// (default 0.05 / 0.02 / 5 s drop / 1 s restore).
+///
+/// Returned `JoinHandle` exits cleanly on `shutdown.cancelled()`.
+pub fn spawn_layer_policy_coordinator(
     peers: Arc<RwLock<HashMap<PeerId, Arc<WebRtcPeer>>>>,
-    get_non_floor_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync>,
+    get_current_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync>,
     is_layer_paused: Box<dyn Fn(&SimulcastRid) -> Option<bool> + Send + Sync>,
     on_action: Box<dyn Fn(CapacityAction) + Send + Sync>,
     config: CapacityPolicyConfig,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut state: HashMap<(PeerId, SimulcastRid), LayerCapacityState> =
+        // ---- Per-policy state ----
+
+        // Presence: same `transition`-driven debounce machine as the
+        // pre-composition zero-peer aggregator. Lives on the
+        // coordinator (not per-peer) because presence is a
+        // display-level property.
+        let mut presence_state = AggregatorState::Active;
+
+        // Aggregate TWCC: one cascade state per peer.
+        let mut twcc_state: HashMap<PeerId, AggregateLayerCapacity> = HashMap::new();
+        let mut twcc_subs: HashMap<
+            PeerId,
+            tokio::sync::watch::Receiver<Option<crate::display::twcc_tap::TwccHealth>>,
+        > = HashMap::new();
+
+        // Per-RID RR: one per-(peer, RID) state, plus the
+        // RTT-measurement-count snapshot the freshness filter
+        // uses. Layer-set changes (resize) are tolerated by
+        // pruning stale RID entries each tick — `current_rids`
+        // is the source of truth.
+        let mut rr_state: HashMap<(PeerId, SimulcastRid), LayerCapacityState> =
             HashMap::new();
-        let mut peer_subs: HashMap<
+        let mut rr_subs: HashMap<
             PeerId,
             tokio::sync::watch::Receiver<HashMap<SimulcastRid, PeerLayerHealth>>,
         > = HashMap::new();
-        // Phase 4d.3c review fix: per-(peer, RID) RTT-measurement
-        // count snapshot. Passed to `fresh_health` each tick to
-        // distinguish a freshly-arrived RR (count advanced) from a
-        // stale repeat of the previous RR's values (count
-        // unchanged). Updated AFTER each policy step using the
-        // count from the raw health entry, regardless of whether
-        // the entry was actually used by the policy — so a series
-        // of stale repeats doesn't drift the prev count and a
-        // genuinely-new RR after a stale window registers as
-        // fresh.
         let mut prev_measurement_count: HashMap<(PeerId, SimulcastRid), u64> =
             HashMap::new();
+
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -858,117 +879,170 @@ pub fn spawn_capacity_aggregator(
                 _ = tick.tick() => {
                     let now = Instant::now();
 
+                    // ---- Snapshot peers + advance presence ----
                     let current_peers = peers.read().await;
+                    let peer_count = current_peers.len();
 
-                    // Skip on zero peers: defer to 4d.2's zero-peer
-                    // aggregator. `last_applied` is preserved so when
-                    // peers return, the diff resumes exactly the
-                    // layers that were active before the idle window.
-                    if current_peers.is_empty() {
-                        continue;
+                    presence_state = transition(presence_state, peer_count, now);
+                    let presence_active = !matches!(
+                        presence_state,
+                        AggregatorState::Idle
+                    );
+
+                    // ---- Prune per-peer state on zero peers ----
+                    // Reconnects (same PeerId) start fresh: no stale
+                    // TWCC cascade or RR layer state can survive an
+                    // idle window.
+                    if peer_count == 0 {
+                        twcc_subs.clear();
+                        rr_subs.clear();
+                        twcc_state.clear();
+                        rr_state.clear();
+                        prev_measurement_count.clear();
+                    } else {
+                        twcc_subs.retain(|id, _| current_peers.contains_key(id));
+                        rr_subs.retain(|id, _| current_peers.contains_key(id));
+                        for (id, peer) in current_peers.iter() {
+                            twcc_subs
+                                .entry(id.clone())
+                                .or_insert_with(|| peer.subscribe_twcc_health());
+                            rr_subs
+                                .entry(id.clone())
+                                .or_insert_with(|| {
+                                    peer.subscribe_remote_inbound_health()
+                                });
+                        }
+                        twcc_state.retain(|pid, _| current_peers.contains_key(pid));
+                        rr_state
+                            .retain(|(pid, _), _| current_peers.contains_key(pid));
+                        prev_measurement_count
+                            .retain(|(pid, _), _| current_peers.contains_key(pid));
                     }
-
-                    // Sync subscriptions: drop for absent peers,
-                    // add for new peers.
-                    peer_subs.retain(|id, _| current_peers.contains_key(id));
-                    for (id, peer) in current_peers.iter() {
-                        peer_subs
-                            .entry(id.clone())
-                            .or_insert_with(|| peer.subscribe_remote_inbound_health());
-                    }
-
-                    // Drop state entries for peers no longer present.
-                    state.retain(|(pid, _), _| current_peers.contains_key(pid));
-                    // Phase 4d.3c review fix: drop freshness snapshot
-                    // entries for absent peers too, mirror state.retain.
-                    prev_measurement_count
-                        .retain(|(pid, _), _| current_peers.contains_key(pid));
 
                     let peer_ids: Vec<PeerId> =
                         current_peers.keys().cloned().collect();
                     drop(current_peers);
 
-                    let non_floor_rids = get_non_floor_rids();
-                    let mut per_peer_wanted: Vec<HashSet<SimulcastRid>> =
-                        Vec::with_capacity(peer_ids.len());
-
-                    for peer_id in &peer_ids {
-                        // SAFE: peer_id is in current_peers (we just
-                        // populated peer_subs from current_peers); the
-                        // `or_insert_with` above guarantees this entry
-                        // exists.
-                        let health_map =
-                            peer_subs.get(peer_id).unwrap().borrow().clone();
-                        let mut peer_wanted_rids: HashSet<SimulcastRid> =
-                            HashSet::new();
-
-                        for rid in &non_floor_rids {
-                            let key = (peer_id.clone(), rid.clone());
-                            // New (peer, RID) entries default to
-                            // Wanted — conservative, matches "no RR
-                            // yet → no signal" semantic from 4d.3a.
-                            let prev = state
-                                .get(&key)
-                                .copied()
-                                .unwrap_or(LayerCapacityState::Wanted);
-                            let raw_health = health_map.get(rid);
-                            // Phase 4d.3c review fix: filter stale
-                            // RRs through `fresh_health`. Only when
-                            // the RTT-measurement count strictly
-                            // exceeds the previously-observed count
-                            // do we treat the entry as a fresh
-                            // signal worth advancing the policy.
-                            let prev_count = prev_measurement_count
-                                .get(&key)
-                                .copied()
-                                .unwrap_or(0);
-                            let fresh = fresh_health(raw_health, prev_count);
-                            let next = step_layer_capacity_state(
-                                prev, fresh, &config, now,
-                            );
-                            state.insert(key.clone(), next);
-                            // Update the freshness snapshot to the
-                            // observed count regardless of whether
-                            // the policy used the entry — so a
-                            // stale repeat doesn't drift the prev
-                            // count, and a genuinely-new RR after
-                            // a stale window correctly registers
-                            // as fresh.
-                            if let Some(h) = raw_health {
-                                prev_measurement_count
-                                    .insert(key, h.round_trip_time_measurements);
-                            }
-                            if layer_state_is_wanted(&next) {
-                                peer_wanted_rids.insert(rid.clone());
-                            }
-                        }
-                        per_peer_wanted.push(peer_wanted_rids);
+                    // ---- Refresh current_rids; derive floor + upper ----
+                    let current_rids = get_current_rids();
+                    if current_rids.is_empty() {
+                        // No simulcast layers at all — nothing for the
+                        // pool actions to operate on. Per-peer state
+                        // would be meaningless without rids; advance
+                        // presence above and skip the rest.
+                        continue;
                     }
+                    // Spec order: descending bitrate, last entry is
+                    // floor. Upper = everything before floor.
+                    let floor = current_rids.last().unwrap().clone();
+                    let upper_layers: Vec<SimulcastRid> =
+                        current_rids[..current_rids.len() - 1].to_vec();
 
-                    let aggregate = aggregate_wanted_layers(per_peer_wanted);
-                    // 4d.3c review fix: diff against actual pool
-                    // state (queried this tick), not against an
-                    // internally-tracked `last_applied`. This way,
-                    // a `pool.on_resize` that regenerates always-on
-                    // handles ACTIVE doesn't leave stale layers
-                    // running because the aggregator believed it
-                    // had paused them — the next tick's diff sees
-                    // them active again and re-pauses if still
-                    // unwanted. Skip RIDs the pool has no slot
-                    // for (None from `is_layer_paused`) so a
-                    // mid-tick layer-set change doesn't produce
-                    // spurious actions for vanished RIDs.
-                    let actual_active: HashSet<SimulcastRid> = non_floor_rids
+                    // ---- Aggregate-TWCC vote ----
+                    // No peers → no restriction (full current set).
+                    // With peers → step each peer's cascade state
+                    // against its current TWCC health, project to
+                    // wanted upper layers, add floor, union across
+                    // peers.
+                    let twcc_union: HashSet<SimulcastRid> = if peer_ids.is_empty() {
+                        current_rids.iter().cloned().collect()
+                    } else {
+                        let mut per_peer: Vec<HashSet<SimulcastRid>> =
+                            Vec::with_capacity(peer_ids.len());
+                        for peer_id in &peer_ids {
+                            let prev = twcc_state
+                                .get(peer_id)
+                                .copied()
+                                .unwrap_or(AggregateLayerCapacity::AllUpperWanted);
+                            // SAFE: peer_subs populated from
+                            // current_peers above; entry exists.
+                            let health =
+                                twcc_subs.get(peer_id).unwrap().borrow().clone();
+                            let next = step_aggregate_layer_capacity(
+                                prev,
+                                health.as_ref(),
+                                &config,
+                                now,
+                            );
+                            twcc_state.insert(peer_id.clone(), next);
+                            let mut wanted = aggregate_state_wanted_upper_layers(
+                                next,
+                                &upper_layers,
+                            );
+                            wanted.insert(floor.clone());
+                            per_peer.push(wanted);
+                        }
+                        aggregate_wanted_layers(per_peer)
+                    };
+
+                    // ---- Per-RID RR vote ----
+                    // Same shape: no peers → no restriction. Per-peer
+                    // wanted = floor + per-RID Wanted-state-projection
+                    // for non-floor RIDs. Default per-RID state is
+                    // Wanted, so a peer with no RR ever yet votes for
+                    // every layer (no restriction).
+                    let rr_union: HashSet<SimulcastRid> = if peer_ids.is_empty() {
+                        current_rids.iter().cloned().collect()
+                    } else {
+                        let mut per_peer: Vec<HashSet<SimulcastRid>> =
+                            Vec::with_capacity(peer_ids.len());
+                        for peer_id in &peer_ids {
+                            let health_map =
+                                rr_subs.get(peer_id).unwrap().borrow().clone();
+                            let mut peer_wanted: HashSet<SimulcastRid> =
+                                HashSet::new();
+                            peer_wanted.insert(floor.clone());
+                            for rid in &upper_layers {
+                                let key = (peer_id.clone(), rid.clone());
+                                let prev = rr_state
+                                    .get(&key)
+                                    .copied()
+                                    .unwrap_or(LayerCapacityState::Wanted);
+                                let raw_health = health_map.get(rid);
+                                let prev_count = prev_measurement_count
+                                    .get(&key)
+                                    .copied()
+                                    .unwrap_or(0);
+                                let fresh = fresh_health(raw_health, prev_count);
+                                let next = step_layer_capacity_state(
+                                    prev, fresh, &config, now,
+                                );
+                                rr_state.insert(key.clone(), next);
+                                if let Some(h) = raw_health {
+                                    prev_measurement_count.insert(
+                                        key,
+                                        h.round_trip_time_measurements,
+                                    );
+                                }
+                                if layer_state_is_wanted(&next) {
+                                    peer_wanted.insert(rid.clone());
+                                }
+                            }
+                            per_peer.push(peer_wanted);
+                        }
+                        aggregate_wanted_layers(per_peer)
+                    };
+
+                    // ---- Compose + diff + apply ----
+                    let effective_wanted = compose_effective_wanted(
+                        presence_active,
+                        &twcc_union,
+                        &rr_union,
+                        &current_rids,
+                    );
+
+                    let actual_active: HashSet<SimulcastRid> = current_rids
                         .iter()
                         .filter(|rid| {
                             matches!(is_layer_paused(rid), Some(false))
                         })
                         .cloned()
                         .collect();
+
                     let actions = diff_wanted_aggregate(
                         &actual_active,
-                        &aggregate,
-                        &non_floor_rids,
+                        &effective_wanted,
+                        &current_rids,
                     );
                     for action in actions {
                         on_action(action);
@@ -991,17 +1065,15 @@ mod tests {
         // session starts in Active; peers stay >= 1; nothing fires.
         // Confirms 4d.2 doesn't perturb the "all simulcast layers
         // active by default" behavior the encoder pool starts in.
-        let (s, a) = transition(AggregatorState::Active, 3, Instant::now());
+        let s = transition(AggregatorState::Active, 3, Instant::now());
         assert_eq!(s, AggregatorState::Active);
-        assert_eq!(a, None);
     }
 
     #[test]
     fn active_zero_peers_enters_idle_pending_no_action() {
         let now = Instant::now();
-        let (s, a) = transition(AggregatorState::Active, 0, now);
+        let s = transition(AggregatorState::Active, 0, now);
         assert_eq!(s, AggregatorState::IdlePending { since: now });
-        assert_eq!(a, None, "no pause until debounce expires");
     }
 
     #[test]
@@ -1010,9 +1082,8 @@ mod tests {
         // gone, comes back well within PAUSE_DEBOUNCE.
         let t = Instant::now();
         let pending = AggregatorState::IdlePending { since: t };
-        let (s, a) = transition(pending, 2, t + Duration::from_secs(1));
+        let s = transition(pending, 2, t + Duration::from_secs(1));
         assert_eq!(s, AggregatorState::Active);
-        assert_eq!(a, None, "no pause issued; debounce protected");
     }
 
     #[test]
@@ -1020,9 +1091,8 @@ mod tests {
         let t = Instant::now();
         let pending = AggregatorState::IdlePending { since: t };
         let just_before = t + PAUSE_DEBOUNCE - Duration::from_millis(1);
-        let (s, a) = transition(pending, 0, just_before);
+        let s = transition(pending, 0, just_before);
         assert_eq!(s, AggregatorState::IdlePending { since: t });
-        assert_eq!(a, None);
     }
 
     #[test]
@@ -1030,16 +1100,14 @@ mod tests {
         let t = Instant::now();
         let pending = AggregatorState::IdlePending { since: t };
         let post = t + PAUSE_DEBOUNCE;
-        let (s, a) = transition(pending, 0, post);
+        let s = transition(pending, 0, post);
         assert_eq!(s, AggregatorState::Idle);
-        assert_eq!(a, Some(AggregatorAction::PauseAllSimulcast));
     }
 
     #[test]
     fn idle_zero_peers_stays_idle() {
-        let (s, a) = transition(AggregatorState::Idle, 0, Instant::now());
+        let s = transition(AggregatorState::Idle, 0, Instant::now());
         assert_eq!(s, AggregatorState::Idle);
-        assert_eq!(a, None);
     }
 
     #[test]
@@ -1049,15 +1117,8 @@ mod tests {
         // quarter-res regression. 4d.3 will pause upper layers
         // selectively based on per-peer link health, but until then
         // 4d.2 must NOT silently downgrade.
-        let (s, a) = transition(AggregatorState::Idle, 1, Instant::now());
+        let s = transition(AggregatorState::Idle, 1, Instant::now());
         assert_eq!(s, AggregatorState::Active);
-        assert_eq!(
-            a,
-            Some(AggregatorAction::ResumeAllSimulcast),
-            "4d.2 restores ALL simulcast layers — not just floor — \
-             so a peer joining post-idle gets full quality, not a \
-             quarter-res regression",
-        );
     }
 
     #[test]
@@ -1072,89 +1133,17 @@ mod tests {
         // edge — a previous pending epoch's `since` doesn't bleed
         // through to count down a later epoch's debounce.
         let t0 = Instant::now();
-        let (s, _) = transition(AggregatorState::Active, 0, t0);
-        let (s, _) = transition(s, 2, t0 + Duration::from_secs(1));
+        let s = transition(AggregatorState::Active, 0, t0);
+        let s = transition(s, 2, t0 + Duration::from_secs(1));
         assert_eq!(s, AggregatorState::Active, "blip resolved");
-        let (s, _) = transition(s, 0, t0 + Duration::from_secs(4));
+        let s = transition(s, 0, t0 + Duration::from_secs(4));
         assert!(matches!(s, AggregatorState::IdlePending { .. }));
-        let (s, a) = transition(s, 0, t0 + Duration::from_secs(8));
+        let s = transition(s, 0, t0 + Duration::from_secs(8));
         assert!(matches!(s, AggregatorState::IdlePending { .. }));
-        assert_eq!(a, None, "still 1s before debounce expires");
-        let (s, a) = transition(s, 0, t0 + Duration::from_secs(9));
+        let s = transition(s, 0, t0 + Duration::from_secs(9));
         assert_eq!(s, AggregatorState::Idle);
-        assert_eq!(a, Some(AggregatorAction::PauseAllSimulcast));
     }
 
-    // ----- Spawn-loop integration test --------------------------------------
-
-    /// Verify the spawn function actually issues `PauseAllSimulcast`
-    /// after `PAUSE_DEBOUNCE` at zero peers. Uses a recording
-    /// closure (no real `EncoderPool` required); pure transition
-    /// tests cover the resume edge, since synthesizing a
-    /// `WebRtcPeer` to bump `peers.len()` is heavyweight and the
-    /// spawn-site `DisplaySession::start` integration test covers
-    /// the resume wiring end-to-end.
-    ///
-    /// Polls with a generous timeout instead of a fixed sleep to
-    /// avoid flake on overloaded test runners — the action only has
-    /// to land *eventually* within the deadline, not at any
-    /// specific tick. `Instant::now()` reads inside the spawn loop
-    /// are real wallclock (Tokio's mock clock doesn't advance
-    /// Instant), so test runtimes under load can drift the action
-    /// past `PAUSE_DEBOUNCE` by a tick or two; the deadline
-    /// generously covers that.
-    #[tokio::test]
-    async fn spawn_records_pause_after_zero_peer_debounce() {
-        use std::sync::Mutex as StdMutex;
-
-        let peers: Arc<RwLock<HashMap<PeerId, Arc<WebRtcPeer>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-        let recorded: Arc<StdMutex<Vec<AggregatorAction>>> =
-            Arc::new(StdMutex::new(Vec::new()));
-        let recorded_for_closure = Arc::clone(&recorded);
-        let on_action: Box<dyn Fn(AggregatorAction) + Send + Sync> =
-            Box::new(move |a| {
-                recorded_for_closure.lock().unwrap().push(a);
-            });
-        let shutdown = CancellationToken::new();
-        let handle = spawn_zero_peer_aggregator(
-            Arc::clone(&peers),
-            on_action,
-            shutdown.clone(),
-        );
-
-        // Poll with a generous timeout. PAUSE_DEBOUNCE + 5s of
-        // tolerance handles tick drift on a loaded runtime; we exit
-        // the loop as soon as the action lands.
-        let deadline = Instant::now() + PAUSE_DEBOUNCE + Duration::from_secs(5);
-        loop {
-            if !recorded.lock().unwrap().is_empty() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                let actions = recorded.lock().unwrap().clone();
-                shutdown.cancel();
-                let _ = handle.await;
-                panic!(
-                    "no aggregator action recorded within \
-                     PAUSE_DEBOUNCE + 5s ({}s total); got {actions:?}",
-                    (PAUSE_DEBOUNCE + Duration::from_secs(5)).as_secs(),
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        let actions = recorded.lock().unwrap().clone();
-        assert_eq!(
-            actions,
-            vec![AggregatorAction::PauseAllSimulcast],
-            "expected exactly one PauseAllSimulcast within deadline; \
-             got {actions:?}",
-        );
-
-        shutdown.cancel();
-        let _ = handle.await;
-    }
 
     // -----------------------------------------------------------------
     // Phase 4d.3b: capacity-policy state-machine tests
@@ -1900,28 +1889,30 @@ mod tests {
     // ----- aggregate_state_wanted_upper_layers -----
 
     #[test]
-    fn aggregate_projection_all_wanted_returns_top_and_mid() {
+    fn aggregate_projection_all_wanted_returns_full_upper_set() {
         let top = SimulcastRid::full();
         let mid = SimulcastRid::half();
+        let upper = [top.clone(), mid.clone()];
         for state in [
             AggregateLayerCapacity::AllUpperWanted,
             AggregateLayerCapacity::PendingPauseTop { since: t0() },
         ] {
-            let wanted = aggregate_state_wanted_upper_layers(state, &top, &mid);
+            let wanted = aggregate_state_wanted_upper_layers(state, &upper);
             assert_eq!(wanted, HashSet::from([top.clone(), mid.clone()]));
         }
     }
 
     #[test]
-    fn aggregate_projection_top_paused_returns_only_mid() {
+    fn aggregate_projection_top_paused_drops_top_keeps_rest() {
         let top = SimulcastRid::full();
         let mid = SimulcastRid::half();
+        let upper = [top.clone(), mid.clone()];
         for state in [
             AggregateLayerCapacity::TopPaused,
             AggregateLayerCapacity::PendingPauseMid { since: t0() },
             AggregateLayerCapacity::PendingResumeTop { since: t0() },
         ] {
-            let wanted = aggregate_state_wanted_upper_layers(state, &top, &mid);
+            let wanted = aggregate_state_wanted_upper_layers(state, &upper);
             assert_eq!(wanted, HashSet::from([mid.clone()]));
         }
     }
@@ -1930,13 +1921,386 @@ mod tests {
     fn aggregate_projection_only_floor_returns_empty_upper() {
         let top = SimulcastRid::full();
         let mid = SimulcastRid::half();
+        let upper = [top.clone(), mid.clone()];
         for state in [
             AggregateLayerCapacity::OnlyFloor,
             AggregateLayerCapacity::PendingResumeMid { since: t0() },
         ] {
-            let wanted = aggregate_state_wanted_upper_layers(state, &top, &mid);
+            let wanted = aggregate_state_wanted_upper_layers(state, &upper);
             assert_eq!(wanted, HashSet::new());
         }
+    }
+
+    /// 1-upper-layer cascade — e.g., `vp8_simulcast` at very small
+    /// dims emits only `full + half` with `half` as floor, leaving
+    /// `full` as the sole upper layer. The state machine still has
+    /// 7 states (it doesn't care about layer count) but the
+    /// projection collapses gracefully:
+    ///
+    /// - `AllUpperWanted` / `PendingPauseTop` → {full}
+    /// - everything else → {} (no `mid` to keep)
+    #[test]
+    fn aggregate_projection_one_upper_layer_pauses_top_alone() {
+        let top = SimulcastRid::full();
+        let upper = [top.clone()];
+
+        // All-upper-wanted states: full set.
+        for state in [
+            AggregateLayerCapacity::AllUpperWanted,
+            AggregateLayerCapacity::PendingPauseTop { since: t0() },
+        ] {
+            let wanted = aggregate_state_wanted_upper_layers(state, &upper);
+            assert_eq!(
+                wanted,
+                HashSet::from([top.clone()]),
+                "1-layer cascade: pre-pause states must keep top",
+            );
+        }
+
+        // All other states: no mid to fall back on, everything past
+        // PendingPauseTop projects to empty.
+        for state in [
+            AggregateLayerCapacity::TopPaused,
+            AggregateLayerCapacity::PendingPauseMid { since: t0() },
+            AggregateLayerCapacity::PendingResumeTop { since: t0() },
+            AggregateLayerCapacity::OnlyFloor,
+            AggregateLayerCapacity::PendingResumeMid { since: t0() },
+        ] {
+            let wanted = aggregate_state_wanted_upper_layers(state, &upper);
+            assert_eq!(
+                wanted,
+                HashSet::new(),
+                "1-layer cascade: post-pause states must drop top: {state:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_projection_zero_upper_layers_always_empty() {
+        // Floor-only pool layout: nothing for the cascade to act on.
+        // Every state projects to empty regardless.
+        let upper: [SimulcastRid; 0] = [];
+        for state in [
+            AggregateLayerCapacity::AllUpperWanted,
+            AggregateLayerCapacity::PendingPauseTop { since: t0() },
+            AggregateLayerCapacity::TopPaused,
+            AggregateLayerCapacity::PendingPauseMid { since: t0() },
+            AggregateLayerCapacity::OnlyFloor,
+            AggregateLayerCapacity::PendingResumeMid { since: t0() },
+            AggregateLayerCapacity::PendingResumeTop { since: t0() },
+        ] {
+            let wanted = aggregate_state_wanted_upper_layers(state, &upper);
+            assert_eq!(wanted, HashSet::new());
+        }
+    }
+
+    // ----- compose_effective_wanted -----
+
+    fn vp8_three_layer_set() -> Vec<SimulcastRid> {
+        vec![
+            SimulcastRid::full(),
+            SimulcastRid::half(),
+            SimulcastRid::quarter(),
+        ]
+    }
+
+    fn full_three_layer_union() -> HashSet<SimulcastRid> {
+        vp8_three_layer_set().into_iter().collect()
+    }
+
+    /// User-listed test #1: TWCC says pause full, RR has no signal
+    /// → full stays paused; RR does not resume it.
+    ///
+    /// The intersection rule means RR's "no signal → vote for
+    /// everything" can't override TWCC's "pause this." Pause wins.
+    #[test]
+    fn compose_twcc_pauses_rr_no_signal_full_stays_paused() {
+        let current = vp8_three_layer_set();
+        // TWCC excludes `full` (sustained loss → TopPaused →
+        // projection drops top + floor union).
+        let twcc_union: HashSet<SimulcastRid> =
+            [SimulcastRid::half(), SimulcastRid::quarter()]
+                .into_iter()
+                .collect();
+        // RR has no signal: each peer's per-RID state defaults to
+        // Wanted, so peer wants all layers; union is the full set.
+        let rr_union = full_three_layer_union();
+
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current);
+
+        assert!(
+            !effective.contains(&SimulcastRid::full()),
+            "TWCC's pause must hold even when RR has no opinion; \
+             effective = {effective:?}",
+        );
+        assert!(effective.contains(&SimulcastRid::half()));
+        assert!(effective.contains(&SimulcastRid::quarter()));
+    }
+
+    /// User-listed test #2: presence zero-peer debounce pauses
+    /// all layers even if TWCC/RR would otherwise want them.
+    ///
+    /// `presence_active = false` short-circuits to empty regardless
+    /// of the other unions — this is the post-debounce idle state.
+    #[test]
+    fn compose_presence_idle_pauses_everything() {
+        let current = vp8_three_layer_set();
+        // Both per-peer policies vote for everything (would be the
+        // case if TWCC and RR both saw healthy signals or no
+        // signals across all peers).
+        let twcc_union = full_three_layer_union();
+        let rr_union = full_three_layer_union();
+
+        let effective = compose_effective_wanted(false, &twcc_union, &rr_union, &current);
+
+        assert_eq!(
+            effective,
+            HashSet::new(),
+            "presence-idle must short-circuit to empty regardless \
+             of TWCC/RR votes; effective = {effective:?}",
+        );
+    }
+
+    /// User-listed test #3: peer returns after idle → effective
+    /// wanted resumes per fresh-default policy state, not stale.
+    ///
+    /// The pruning behaviour (clearing per-peer state when peers
+    /// become empty) lives in [`spawn_layer_policy_coordinator`].
+    /// At the composition layer, we verify the consequence: when
+    /// the per-policy unions reflect fresh-default state (full set
+    /// from each side, since `AggregateLayerCapacity::AllUpperWanted`
+    /// projects to all upper + floor, and `LayerCapacityState::Wanted`
+    /// keeps every RID), the effective wanted set is the full
+    /// current rid set — i.e., everything resumes.
+    #[test]
+    fn compose_fresh_default_state_resumes_all_layers() {
+        let current = vp8_three_layer_set();
+        let twcc_union = full_three_layer_union();
+        let rr_union = full_three_layer_union();
+
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current);
+
+        assert_eq!(
+            effective,
+            full_three_layer_union(),
+            "fresh-default state on both per-peer policies must \
+             resume every layer; effective = {effective:?}",
+        );
+    }
+
+    /// User-listed test #4: empty TWCC window votes "no
+    /// restriction / no transition," never recovery.
+    ///
+    /// Empty windows are short-circuited at two places: the
+    /// aggregator publishes `None` rather than `Some(empty_health)`,
+    /// and `step_aggregate_layer_capacity` guards on `batches == 0
+    /// || reported_packets == 0`. Both arms preserve the previous
+    /// state. At the composition layer, that surfaces as: the TWCC
+    /// union for the empty-window case equals the previous
+    /// non-empty-window union — silence doesn't drift the wanted
+    /// set toward recovery.
+    ///
+    /// This test verifies the consequence: if TWCC's union still
+    /// excludes `full` (state was TopPaused before silence) and
+    /// the silence doesn't change that, effective continues to
+    /// exclude `full`.
+    #[test]
+    fn compose_empty_twcc_window_does_not_resume_paused_layer() {
+        let current = vp8_three_layer_set();
+        // TWCC was at TopPaused; full is not in the wanted set.
+        // After an empty window, the state preserves (per existing
+        // empty-window guards), so the union still excludes full.
+        let twcc_union: HashSet<SimulcastRid> =
+            [SimulcastRid::half(), SimulcastRid::quarter()]
+                .into_iter()
+                .collect();
+        let rr_union = full_three_layer_union();
+
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current);
+
+        assert!(
+            !effective.contains(&SimulcastRid::full()),
+            "empty TWCC window must not resume a paused layer — \
+             silence is not recovery; effective = {effective:?}",
+        );
+    }
+
+    /// User-listed test #5: current rid changes after resize → diff
+    /// against actual pool state, regenerated layers are re-paused
+    /// if policy still excludes them.
+    ///
+    /// Composition is bounded by `current_rids`: a layer present
+    /// in the per-policy unions but absent from `current_rids`
+    /// (e.g., a layer the previous tick had, before the pool
+    /// regenerated to a different layout) does not appear in
+    /// `effective_wanted`. This is what makes the diff-against-
+    /// pool-state pattern correct: even if the policy state still
+    /// references a removed RID, the composition surfaces only
+    /// what `current_rids` says is live this tick.
+    #[test]
+    fn compose_bounded_by_current_rids_after_resize() {
+        // Resize shrunk the pool from {full, half, quarter} to
+        // {full, half} — `quarter` is no longer a current rid.
+        let current = vec![SimulcastRid::full(), SimulcastRid::half()];
+        // Per-policy unions still vote for `quarter` (stale state
+        // from before the resize). Composition must not include
+        // `quarter` in the effective set.
+        let twcc_union = full_three_layer_union();
+        let rr_union = full_three_layer_union();
+
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current);
+
+        assert!(
+            !effective.contains(&SimulcastRid::quarter()),
+            "compose must filter to current_rids; effective = {effective:?}",
+        );
+        assert!(effective.contains(&SimulcastRid::full()));
+        assert!(effective.contains(&SimulcastRid::half()));
+        assert_eq!(effective.len(), 2);
+    }
+
+    /// Intersection semantics: a layer must appear in BOTH unions
+    /// to land in effective. A layer in twcc_union but missing
+    /// from rr_union (e.g., a per-RID RR signal genuinely flagged
+    /// it as Dropped, hypothetically) is excluded.
+    #[test]
+    fn compose_intersection_excludes_layer_missing_from_either_union() {
+        let current = vp8_three_layer_set();
+        let twcc_union = full_three_layer_union();
+        // RR genuinely says half is Dropped (hypothetical — RR
+        // doesn't fire on the rtc 0.9 stack today, but the
+        // composition logic must still respect it).
+        let rr_union: HashSet<SimulcastRid> =
+            [SimulcastRid::full(), SimulcastRid::quarter()]
+                .into_iter()
+                .collect();
+
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current);
+
+        assert!(!effective.contains(&SimulcastRid::half()));
+        assert!(effective.contains(&SimulcastRid::full()));
+        assert!(effective.contains(&SimulcastRid::quarter()));
+    }
+
+    /// Both unions empty (e.g., no peers + per-policy "no signal"
+    /// fallbacks somehow disagree, defensively): effective is
+    /// empty when either union is empty, since intersection with
+    /// empty is empty. This is a defensive case — production
+    /// callers should always pass non-empty unions when peers
+    /// are present (each policy votes the full set when it has
+    /// no signal), but the function shape doesn't enforce that.
+    #[test]
+    fn compose_empty_union_yields_empty_effective() {
+        let current = vp8_three_layer_set();
+        let empty: HashSet<SimulcastRid> = HashSet::new();
+        let full = full_three_layer_union();
+
+        assert_eq!(
+            compose_effective_wanted(true, &empty, &full, &current),
+            HashSet::new(),
+        );
+        assert_eq!(
+            compose_effective_wanted(true, &full, &empty, &current),
+            HashSet::new(),
+        );
+    }
+
+    // ----- spawn_layer_policy_coordinator -----
+
+    /// **Spawn-loop smoke test**: drive the coordinator through one
+    /// `PAUSE_DEBOUNCE` window with no peers and verify it emits
+    /// the expected `PauseLayer` actions when the presence policy
+    /// transitions to `Idle`.
+    ///
+    /// What this proves end-to-end (beyond what the pure compose
+    /// tests cover):
+    ///
+    /// 1. `transition` actually advances inside the spawn loop —
+    ///    Active → IdlePending → Idle (presence policy fires).
+    /// 2. The diff is taken against `is_layer_paused`'s actual
+    ///    pool state (not against an internal `last_applied`).
+    /// 3. `on_action` is invoked once per layer the diff says
+    ///    needs to flip.
+    ///
+    /// Uses a recording closure on `on_action` instead of a real
+    /// `EncoderPool` — the spawn loop's own behaviour is what
+    /// we're validating, not the pool. Generous timeout matches
+    /// the deleted `spawn_zero_peer_aggregator` smoke test
+    /// pattern: the action only has to land *eventually* within
+    /// `PAUSE_DEBOUNCE + 5s`, not on any specific tick. Tokio's
+    /// mock clock doesn't advance `Instant`, so test runtimes
+    /// under load can drift past `PAUSE_DEBOUNCE` by a tick or
+    /// two; the deadline absorbs that.
+    #[tokio::test]
+    async fn spawn_coordinator_pauses_all_layers_after_zero_peer_debounce() {
+        use std::sync::Mutex as StdMutex;
+
+        let peers: Arc<RwLock<HashMap<PeerId, Arc<WebRtcPeer>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let recorded: Arc<StdMutex<Vec<CapacityAction>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let recorded_for_closure = Arc::clone(&recorded);
+        let on_action: Box<dyn Fn(CapacityAction) + Send + Sync> =
+            Box::new(move |a| {
+                recorded_for_closure.lock().unwrap().push(a);
+            });
+        let get_current_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync> =
+            Box::new(|| vp8_three_layer_set());
+        // Pool reports every layer ACTIVE — the diff after the
+        // presence policy fires Idle must produce a PauseLayer
+        // for each.
+        let is_layer_paused: Box<
+            dyn Fn(&SimulcastRid) -> Option<bool> + Send + Sync,
+        > = Box::new(|_| Some(false));
+
+        let shutdown = CancellationToken::new();
+        let handle = spawn_layer_policy_coordinator(
+            Arc::clone(&peers),
+            get_current_rids,
+            is_layer_paused,
+            on_action,
+            CapacityPolicyConfig::default(),
+            shutdown.clone(),
+        );
+
+        // Poll with a generous timeout. PAUSE_DEBOUNCE + 5s of
+        // tolerance handles tick drift on a loaded runtime; we
+        // exit the loop as soon as we see all three actions
+        // (or hit the deadline and panic).
+        let deadline = Instant::now() + PAUSE_DEBOUNCE + Duration::from_secs(5);
+        loop {
+            if recorded.lock().unwrap().len() >= 3 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let actions = recorded.lock().unwrap().clone();
+                shutdown.cancel();
+                let _ = handle.await;
+                panic!(
+                    "expected 3 PauseLayer actions within PAUSE_DEBOUNCE + 5s \
+                     ({}s total); got {actions:?}",
+                    (PAUSE_DEBOUNCE + Duration::from_secs(5)).as_secs(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let actions = recorded.lock().unwrap().clone();
+        // diff_wanted_aggregate iterates `current_rids` in spec
+        // order (descending bitrate: full, half, quarter), so the
+        // emitted action sequence is deterministic.
+        assert_eq!(
+            actions,
+            vec![
+                CapacityAction::PauseLayer(SimulcastRid::full()),
+                CapacityAction::PauseLayer(SimulcastRid::half()),
+                CapacityAction::PauseLayer(SimulcastRid::quarter()),
+            ],
+            "expected one PauseLayer per current_rid in spec order",
+        );
+
+        shutdown.cancel();
+        let _ = handle.await;
     }
 
     // ----- per_peer_wanted_layers -----
@@ -2114,64 +2478,6 @@ mod tests {
         );
     }
 
-    /// **Spawn smoke test**: with no peers, the capacity aggregator
-    /// produces NO actions even after several ticks. Confirms the
-    /// `peers.is_empty() → skip` guard prevents the aggregator from
-    /// fighting 4d.2's zero-peer pause/resume cycle.
-    ///
-    /// Pure-policy state-machine semantics are exhaustively covered
-    /// by the `capacity_step_*` tests; this smoke test exists to
-    /// pin the spawn-time wiring (init, tick, peer-empty guard,
-    /// closure invocation) without burning real-time on debounce
-    /// windows.
-    #[tokio::test]
-    async fn capacity_spawn_with_no_peers_records_no_actions() {
-        use std::sync::Mutex as StdMutex;
-
-        let peers: Arc<RwLock<HashMap<PeerId, Arc<WebRtcPeer>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-        let recorded: Arc<StdMutex<Vec<CapacityAction>>> =
-            Arc::new(StdMutex::new(Vec::new()));
-        let recorded_for_closure = Arc::clone(&recorded);
-        let on_action: Box<dyn Fn(CapacityAction) + Send + Sync> =
-            Box::new(move |a| {
-                recorded_for_closure.lock().unwrap().push(a);
-            });
-        let get_non_floor_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync> =
-            Box::new(|| vp8_non_floor_rids());
-        // For the no-peers smoke test the policy never runs, so
-        // is_layer_paused is never consulted; return Some(false)
-        // (active) defensively in case a future change makes it
-        // get called.
-        let is_layer_paused: Box<
-            dyn Fn(&SimulcastRid) -> Option<bool> + Send + Sync,
-        > = Box::new(|_| Some(false));
-
-        let shutdown = CancellationToken::new();
-        let handle = spawn_capacity_aggregator(
-            Arc::clone(&peers),
-            get_non_floor_rids,
-            is_layer_paused,
-            on_action,
-            CapacityPolicyConfig::default(),
-            shutdown.clone(),
-        );
-
-        // Wait through several ticks. With no peers, the capacity
-        // aggregator must skip and never call on_action.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        let actions = recorded.lock().unwrap().clone();
-        assert!(
-            actions.is_empty(),
-            "capacity aggregator must not fire actions when no peers \
-             are present (defers to 4d.2 zero-peer aggregator); \
-             got {actions:?}",
-        );
-
-        shutdown.cancel();
-        let _ = handle.await;
-    }
 
     // -----------------------------------------------------------------
     // Phase 4d.3c review fix: fresh_health + freshness composition tests

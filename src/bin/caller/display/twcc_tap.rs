@@ -86,14 +86,12 @@
 //! the rest of the display task tree.
 
 use rtc::interceptor::{Interceptor, Packet, StreamInfo, TaggedPacket, interceptor};
-// `rtc` re-exports `sansio` and `shared` from the webrtc-rs workspace
+// `rtc` re-exports `sansio` from the webrtc-rs workspace
 // (rtc/lib.rs:656-659). The `#[interceptor]` attribute macro from
-// rtc-interceptor-derive expands to code that references both via
-// bare paths (`sansio::Protocol`, `shared::error::Error`), so we
-// have to bring them into scope here at the call site for the macro
-// expansion to typecheck.
+// rtc-interceptor-derive expands to code that references it via
+// the bare path `sansio::Protocol`, so we have to bring it into
+// scope here at the call site for the macro expansion to typecheck.
 use rtc::sansio;
-use rtc::shared;
 // `#[interceptor]` emits `type Error = Error;` (rtc-interceptor-derive
 // 0.9 lib.rs:279) — that bare `Error` resolves at the call site, so we
 // need the concrete type imported with the unqualified name `Error`.

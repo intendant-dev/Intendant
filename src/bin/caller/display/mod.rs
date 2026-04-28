@@ -445,28 +445,37 @@ pub struct DisplaySession {
     /// BGRA→I420 conversion and `pool.push_i420_frame` loop. Drained
     /// on `stop()` for deterministic teardown ordering.
     pool_feed_bridge_handle: Mutex<Option<JoinHandle<()>>>,
-    /// **Phase 4d.2** zero-peer gating handle. `Some` for the
-    /// lifetime of a started session: spawned eagerly by
+    /// **Phase 4d.3b** layer-policy coordinator handle. `Some` for
+    /// the lifetime of a started session: spawned eagerly by
     /// [`Self::start`] after the pool-feed bridge, awaited in
-    /// [`Self::stop`] after the bridge is drained. Owns the
-    /// per-display state machine that pauses all always-on simulcast
-    /// layers after `PAUSE_DEBOUNCE` at zero peers and resumes them
-    /// on the first peer arrival. See [`crate::display::aggregator`]
-    /// for the policy. `None` before `start()` / after `stop()`.
-    aggregator_handle: Mutex<Option<JoinHandle<()>>>,
-    /// **Phase 4d.3c** capacity aggregator handle. `Some` for the
-    /// lifetime of a started session: spawned eagerly by
-    /// [`Self::start`] after the zero-peer aggregator, awaited in
-    /// [`Self::stop`] alongside it. Owns the per-(peer, non-floor-RID)
-    /// capacity-policy state machine that pauses individual upper
-    /// simulcast layers when a peer's RTCP-RR-derived `fraction_lost`
-    /// indicates the link can't sustain that layer, and resumes them
-    /// when the signal clearly recovers. Defers to the zero-peer
-    /// aggregator on peer-presence transitions (skips its tick when
-    /// `peers.is_empty()`); pool methods are idempotent so any
-    /// residual race is benign. See [`crate::display::aggregator`]
-    /// for the policy. `None` before `start()` / after `stop()`.
-    capacity_aggregator_handle: Mutex<Option<JoinHandle<()>>>,
+    /// [`Self::stop`] after the bridge is drained.
+    ///
+    /// The coordinator is the single owner of `pool.pause_layer` /
+    /// `pool.resume_layer` decisions for this display. It composes
+    /// three per-policy votes by intersection — pause wins; resume
+    /// requires every active policy to agree:
+    ///
+    /// - **Presence policy** (zero-peer debounce): votes empty
+    ///   when `presence_state` is Idle, full current rid set
+    ///   otherwise. Owns the pause-after-5s-at-zero-peers and
+    ///   resume-on-first-peer behaviour the original 4d.2
+    ///   `spawn_zero_peer_aggregator` provided.
+    /// - **Aggregate-TWCC policy** (per-peer cascaded loss):
+    ///   votes floor + cascade-projected upper layers. Active on
+    ///   the rtc 0.9 / WKWebView stack via
+    ///   [`crate::display::twcc_tap`].
+    /// - **Per-RID RR policy** (per-(peer, RID) `fraction_lost`):
+    ///   votes floor + per-RID Wanted-state-projection. Currently
+    ///   inert on the rtc 0.9 stack (RR stats never populate),
+    ///   stays warm so future stacks that surface fresh RR
+    ///   activate it without code changes.
+    ///
+    /// See [`crate::display::aggregator::spawn_layer_policy_coordinator`]
+    /// for the composition machinery and
+    /// [`crate::display::aggregator::compose_effective_wanted`]
+    /// for the intersection rule. `None` before `start()` / after
+    /// `stop()`.
+    layer_policy_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl DisplaySession {
@@ -488,8 +497,7 @@ impl DisplaySession {
             pool_feed_keyframe_tx: Mutex::new(None),
             pool: std::sync::OnceLock::new(),
             pool_feed_bridge_handle: Mutex::new(None),
-            aggregator_handle: Mutex::new(None),
-            capacity_aggregator_handle: Mutex::new(None),
+            layer_policy_handle: Mutex::new(None),
         }
     }
 
@@ -652,107 +660,77 @@ impl DisplaySession {
         self.spawn_pool_feed_bridge(Arc::clone(&pool_arc), fps, event_bus_for_encoder)
             .await;
 
-        // 4d.2: spawn the zero-peer aggregator. The closure queries
-        // `pool.always_on_ids()` on every action rather than
-        // snapshotting at spawn time so a session that begins with a
-        // small layer set (`vp8_simulcast` may drop `quarter` at very
-        // small source dims via `normalize_layer_dims`) and is then
-        // resized larger while idle still pauses / resumes the
-        // newly-spawned layers correctly. The pool's read lock is
-        // held only for the duration of the snapshot copy; the
-        // subsequent `pause_layer` / `resume_layer` calls reacquire.
-        let pool_for_aggregator = Arc::clone(&pool_arc);
-        let on_action: Box<dyn Fn(aggregator::AggregatorAction) + Send + Sync> =
-            Box::new(move |action| match action {
-                aggregator::AggregatorAction::PauseAllSimulcast => {
-                    for id in pool_for_aggregator.always_on_ids() {
-                        pool_for_aggregator.pause_layer(id.codec, id.rid);
-                    }
-                }
-                aggregator::AggregatorAction::ResumeAllSimulcast => {
-                    for id in pool_for_aggregator.always_on_ids() {
-                        pool_for_aggregator.resume_layer(id.codec, id.rid);
-                    }
-                }
-            });
-        let aggregator_task = aggregator::spawn_zero_peer_aggregator(
-            Arc::clone(&self.peers),
-            on_action,
-            self.shutdown.clone(),
-        );
-        *self.aggregator_handle.lock().await = Some(aggregator_task);
-
-        // 4d.3c: spawn the capacity aggregator. Two closures wired
-        // to the pool:
+        // 4d.3b: spawn the single layer-policy coordinator. One task
+        // owns `pool.pause_layer` / `pool.resume_layer` decisions
+        // for this display. Three policies vote (presence,
+        // aggregate-TWCC, per-RID-RR) and the coordinator composes
+        // by intersection — pause wins; resume requires every
+        // active policy to agree. Replaces the previous design that
+        // ran each policy as an independent task writing to the
+        // pool, which produced opposite actions when one policy had
+        // signal and another didn't (the per-RID "no signal →
+        // default Wanted" semantic would resume layers the TWCC
+        // policy had paused).
         //
-        //   - `get_non_floor_rids` queries `pool.always_on_ids()` at
-        //     action time and drops the last entry. `vp8_simulcast`
-        //     produces layers in descending bitrate order (full,
-        //     half, quarter), so `last()` is the floor. Querying
-        //     fresh each tick mirrors the zero-peer aggregator's
-        //     handling of post-resize layer-set changes.
-        //   - `on_action` routes `CapacityAction::PauseLayer(rid)` /
-        //     `ResumeLayer(rid)` to `pool.pause_layer` /
-        //     `pool.resume_layer` with `CodecKind::Vp8` (the always-
-        //     on simulcast codec).
+        // Three closures, all capturing `Arc<EncoderPool>` and
+        // querying it fresh each tick — `pool.on_resize` regenerates
+        // always-on layer handles, so snapshots taken at spawn time
+        // would go stale.
         //
-        // Both aggregators run as independent tasks; capacity
-        // skips its tick when `peers.is_empty()` so the zero-peer
-        // aggregator owns presence-transition behavior cleanly.
-        // Pool methods are idempotent — any residual race between
-        // the two is benign (extra encoder atomic flips at worst).
-        let pool_for_capacity_rids = Arc::clone(&pool_arc);
-        let get_non_floor_rids: Box<
+        //   - `get_current_rids` returns the pool's full VP8
+        //     simulcast layer set in spec order (descending
+        //     bitrate; last entry is floor). Coordinator derives
+        //     the floor + upper-layer split internally.
+        //   - `is_layer_paused` queries actual pool state for one
+        //     RID — diffing against actual (rather than against an
+        //     internal `last_applied`) handles the resize-
+        //     regenerates-active case correctly.
+        //   - `on_action` routes `CapacityAction::PauseLayer` /
+        //     `ResumeLayer` to `pool.pause_layer` /
+        //     `pool.resume_layer` with `CodecKind::Vp8`.
+        //
+        // The 5 s zero-peer pause debounce, the 5 s drop /
+        // 1 s restore debounces for both TWCC and RR, and the
+        // hysteresis between drop (0.05) and recovery (0.02)
+        // thresholds all live inside the coordinator and are
+        // configured via `CapacityPolicyConfig::default()`.
+        let pool_for_rids = Arc::clone(&pool_arc);
+        let get_current_rids: Box<
             dyn Fn() -> Vec<encode::pool::SimulcastRid> + Send + Sync,
         > = Box::new(move || {
-            let mut ids = pool_for_capacity_rids.always_on_ids();
-            // The floor (smallest layer, last in spec order) is
-            // unconditionally `Wanted` whenever any peer is
-            // connected — its lifecycle belongs to the zero-peer
-            // aggregator. Drop it from the capacity-policy
-            // iteration set.
-            ids.pop();
-            ids.into_iter()
+            pool_for_rids
+                .always_on_ids()
+                .into_iter()
                 .filter(|id| id.codec == encode::pool::CodecKind::Vp8)
                 .map(|id| id.rid)
                 .collect()
         });
-        let pool_for_capacity_action = Arc::clone(&pool_arc);
-        let on_capacity_action: Box<
-            dyn Fn(aggregator::CapacityAction) + Send + Sync,
-        > = Box::new(move |action| match action {
-            aggregator::CapacityAction::PauseLayer(rid) => {
-                pool_for_capacity_action
-                    .pause_layer(encode::pool::CodecKind::Vp8, rid);
-            }
-            aggregator::CapacityAction::ResumeLayer(rid) => {
-                pool_for_capacity_action
-                    .resume_layer(encode::pool::CodecKind::Vp8, rid);
-            }
-        });
-        // 4d.3c review fix: query actual pool pause state every
-        // tick so the diff handles `pool.on_resize` correctly
-        // (resize regenerates always-on handles ACTIVE, so a
-        // previously-paused layer would silently reactivate
-        // without re-querying). Forwards to
-        // `EncoderPool::is_layer_paused` with `CodecKind::Vp8`.
-        let pool_for_capacity_query = Arc::clone(&pool_arc);
+        let pool_for_query = Arc::clone(&pool_arc);
         let is_layer_paused: Box<
             dyn Fn(&encode::pool::SimulcastRid) -> Option<bool> + Send + Sync,
         > = Box::new(move |rid| {
-            pool_for_capacity_query
-                .is_layer_paused(encode::pool::CodecKind::Vp8, rid.clone())
+            pool_for_query.is_layer_paused(encode::pool::CodecKind::Vp8, rid.clone())
         });
-        let capacity_aggregator_task = aggregator::spawn_capacity_aggregator(
+        let pool_for_action = Arc::clone(&pool_arc);
+        let on_action: Box<
+            dyn Fn(aggregator::CapacityAction) + Send + Sync,
+        > = Box::new(move |action| match action {
+            aggregator::CapacityAction::PauseLayer(rid) => {
+                pool_for_action.pause_layer(encode::pool::CodecKind::Vp8, rid);
+            }
+            aggregator::CapacityAction::ResumeLayer(rid) => {
+                pool_for_action.resume_layer(encode::pool::CodecKind::Vp8, rid);
+            }
+        });
+        let layer_policy_task = aggregator::spawn_layer_policy_coordinator(
             Arc::clone(&self.peers),
-            get_non_floor_rids,
+            get_current_rids,
             is_layer_paused,
-            on_capacity_action,
+            on_action,
             aggregator::CapacityPolicyConfig::default(),
             self.shutdown.clone(),
         );
-        *self.capacity_aggregator_handle.lock().await =
-            Some(capacity_aggregator_task);
+        *self.layer_policy_handle.lock().await = Some(layer_policy_task);
 
         // --- Task 3: FrameRegistry sampler (1 Hz JPEG for model feeds) ---
         if let Some(registry) = frame_registry {
@@ -914,20 +892,12 @@ impl DisplaySession {
         if let Some(h) = self.pool_feed_bridge_handle.lock().await.take() {
             let _ = h.await;
         }
-        // 4d.2: aggregator observes the same `shutdown` token and
-        // exits its tick loop on its own. We take + await for
-        // deterministic teardown ordering (parity with the bridge
-        // and capture handles above) and so a follow-up `start()`
-        // doesn't leak the previous session's task.
-        if let Some(h) = self.aggregator_handle.lock().await.take() {
-            let _ = h.await;
-        }
-        // 4d.3c: capacity aggregator observes the same `shutdown`
-        // token and exits on its own. Take + await for
-        // deterministic teardown and to avoid leaking the task
-        // across re-`start()` cycles. Same pattern as the
-        // zero-peer aggregator handle above.
-        if let Some(h) = self.capacity_aggregator_handle.lock().await.take() {
+        // 4d.3b: layer-policy coordinator observes the same
+        // `shutdown` token and exits its tick loop on its own. Take
+        // + await for deterministic teardown ordering (parity with
+        // the bridge and capture handles above) and so a follow-up
+        // `start()` doesn't leak the previous session's task.
+        if let Some(h) = self.layer_policy_handle.lock().await.take() {
             let _ = h.await;
         }
 
