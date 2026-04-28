@@ -1001,6 +1001,17 @@ impl DisplaySession {
     /// clipboard monitoring, fires a peer-join keyframe + burst,
     /// and returns the SDP answer.
     #[allow(clippy::too_many_arguments)]
+    /// `input_authorized` is the per-peer gate the data-channel input
+    /// handler consults before forwarding events to [`DisplayBackend::inject_input`].
+    /// `display/mod.rs` deliberately does NOT know how authority is
+    /// stored — the closure is the entire boundary. Phase 5a.1.
+    ///
+    /// Callers that don't gate input (test harnesses, federated paths
+    /// that explicitly opt out of authority enforcement) pass
+    /// `Arc::new(|| true)` or `Arc::new(|| false)`. The local `/ws`
+    /// display-offer path in `web_gateway` builds a closure capturing
+    /// `(display_id, this_connection_id, authority_map)`; the federated
+    /// path passes deny-by-default until federation authority lands.
     pub async fn handle_offer(
         &self,
         peer_id: PeerId,
@@ -1009,6 +1020,7 @@ impl DisplaySession {
         tcp_peer_registry: Option<Arc<self::webrtc::TcpPeerRegistry>>,
         tcp_advertised_addr: Option<std::net::SocketAddr>,
         ice_tx: mpsc::Sender<(PeerId, String)>,
+        input_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<String, CallerError> {
         self.handle_offer_pool_mode(
             peer_id,
@@ -1017,6 +1029,7 @@ impl DisplaySession {
             tcp_peer_registry,
             tcp_advertised_addr,
             ice_tx,
+            input_authorized,
         )
         .await
     }
@@ -1060,6 +1073,7 @@ impl DisplaySession {
         tcp_peer_registry: Option<Arc<self::webrtc::TcpPeerRegistry>>,
         tcp_advertised_addr: Option<std::net::SocketAddr>,
         ice_tx: mpsc::Sender<(PeerId, String)>,
+        input_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<String, CallerError> {
         let pool = self.pool.get().ok_or_else(|| {
             CallerError::WebRtc(
@@ -1091,16 +1105,10 @@ impl DisplaySession {
             ))
         })?;
 
-        let backend = Arc::clone(&self.backend);
-        let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> =
-            Arc::new(move |event: InputEvent| {
-                let backend = Arc::clone(&backend);
-                tokio::spawn(async move {
-                    if let Err(e) = backend.inject_input(event).await {
-                        eprintln!("[display] input injection failed: {e}");
-                    }
-                });
-            });
+        let input_handler = gated_input_handler(
+            Arc::clone(&self.backend),
+            input_authorized.clone(),
+        );
 
         let clipboard_monitor = Arc::clone(&self.clipboard_monitor);
         let clipboard_handler: Arc<dyn Fn(clipboard::ClipboardContent) + Send + Sync> =
@@ -1654,6 +1662,49 @@ impl SessionRegistry {
     pub fn display_ids(&self) -> Vec<u32> {
         self.sessions.keys().copied().collect()
     }
+}
+
+/// Build the per-peer data-channel input handler used by
+/// [`DisplaySession::handle_offer_pool_mode`].  The handler:
+///
+/// 1. consults the `input_authorized` closure (Phase 5a.1 gate) and
+///    silently drops the event if it returns `false`;
+/// 2. otherwise spawns the existing async `inject_input` dispatch onto
+///    the tokio runtime.
+///
+/// Extracted so the gate logic is unit-testable without standing up a
+/// full `DisplaySession` + `WebRtcPeer` + offer.  Keeping it free-
+/// standing rather than a method on `DisplaySession` means tests can
+/// build it from any backend stub in the test module without going
+/// through the offer plumbing.
+///
+/// The closure is `Arc<dyn Fn(InputEvent) + Send + Sync>`, sync-callable
+/// from rtc's data-channel receive context (which is sync); the async
+/// injection is `tokio::spawn`-ed because `DisplayBackend::inject_input`
+/// is async.  This shape predates phase 5a.1 — the gate just sits in
+/// front of it.
+pub(crate) fn gated_input_handler(
+    backend: Arc<dyn DisplayBackend>,
+    input_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Arc<dyn Fn(InputEvent) + Send + Sync> {
+    Arc::new(move |event: InputEvent| {
+        // Phase 5a.1 authority gate: silent drop when the per-peer
+        // closure says no, matching the `/ws display_input` gate
+        // convention (no per-message denial feedback; the browser
+        // already learned it's not the holder via the
+        // `display_input_authority_state` notification).  Unclaimed
+        // and "this peer holds it" both resolve to `true` — see the
+        // closure builder in `web_gateway::spawn_web_gateway`.
+        if !input_authorized() {
+            return;
+        }
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move {
+            if let Err(e) = backend.inject_input(event).await {
+                eprintln!("[display] input injection failed: {e}");
+            }
+        });
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2873,6 +2924,171 @@ mod tests {
             "stop() must take + await the pool-feed bridge handle, \
              leaving the slot empty (parity with capture/encoder/\
              clipboard cleanup at display/mod.rs:792-800)"
+        );
+    }
+
+    // ---- Phase 5a.1 gated-input-handler tests ------------------------
+    //
+    // Per the slice spec: in display/mod.rs, test ONLY closure plumbing
+    // (true → backend gets called; false → backend doesn't).  Holder /
+    // non-holder authority semantics belong in `web_gateway` tests
+    // because that's where the closure is built from the authority map.
+
+    /// Backend stub that records `inject_input` invocations.  Differs
+    /// from `StubBackend` in that it counts; otherwise behaves the same
+    /// (no real capture, no real injection).
+    struct InjectCountingBackend {
+        width: u32,
+        height: u32,
+        inject_count: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[async_trait]
+    impl DisplayBackend for InjectCountingBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<mpsc::Receiver<Frame>, CallerError> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+        async fn stop_capture(&self) {}
+        async fn inject_input(&self, _event: InputEvent) -> Result<(), CallerError> {
+            self.inject_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn resolution(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+        fn kind(&self) -> &'static str {
+            "inject-counting"
+        }
+    }
+
+    /// Closure returns `true` → events reach `inject_input`.  This is
+    /// the unclaimed-or-this-peer-holds-it case from the per-`/ws`
+    /// closure builder; both resolve to `true` there.
+    #[tokio::test]
+    async fn gated_input_handler_passes_event_when_authorized() {
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let backend: Arc<dyn DisplayBackend> = Arc::new(InjectCountingBackend {
+            width: 64,
+            height: 64,
+            inject_count: Arc::clone(&counter),
+        });
+        let input_authorized: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| true);
+        let handler = super::gated_input_handler(Arc::clone(&backend), input_authorized);
+
+        handler(InputEvent::MouseMove {
+            x: 0.5,
+            y: 0.5,
+            buttons: 0,
+        });
+
+        // The handler `tokio::spawn`s the async injection — give the
+        // runtime a chance to run the spawned task before asserting.
+        // Yield twice to defeat the single-poll-then-check race that a
+        // single yield_now occasionally exhibits under heavy multi-test
+        // contention; if the spawned future has been polled to
+        // completion and pumped through any pending wakers, the counter
+        // increment is visible.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "authorized event should reach the backend"
+        );
+    }
+
+    /// Closure returns `false` → events are silently dropped, matching
+    /// the `/ws display_input` gate convention (no per-message denial
+    /// feedback).  This is the "another connection holds the slot"
+    /// case, plus the federated deny-by-default until federation
+    /// authority lands as its own slice.
+    #[tokio::test]
+    async fn gated_input_handler_drops_event_when_unauthorized() {
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let backend: Arc<dyn DisplayBackend> = Arc::new(InjectCountingBackend {
+            width: 64,
+            height: 64,
+            inject_count: Arc::clone(&counter),
+        });
+        let input_authorized: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| false);
+        let handler = super::gated_input_handler(Arc::clone(&backend), input_authorized);
+
+        handler(InputEvent::MouseMove {
+            x: 0.5,
+            y: 0.5,
+            buttons: 0,
+        });
+        handler(InputEvent::KeyDown {
+            code: "KeyA".into(),
+            key: "a".into(),
+            shift: false,
+            ctrl: false,
+            alt: false,
+            meta: false,
+        });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "unauthorized events must not reach the backend at all"
+        );
+    }
+
+    /// The closure can change its decision over time — required for
+    /// the live grant/release flow, where the same `WebRtcPeer` lives
+    /// across multiple authority transitions.  Verifies the gate reads
+    /// fresh state on each event, not a captured snapshot.
+    #[tokio::test]
+    async fn gated_input_handler_re_evaluates_authorization_per_event() {
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let backend: Arc<dyn DisplayBackend> = Arc::new(InjectCountingBackend {
+            width: 64,
+            height: 64,
+            inject_count: Arc::clone(&counter),
+        });
+        let allow = Arc::new(AtomicBool::new(true));
+        let allow_for_closure = Arc::clone(&allow);
+        let input_authorized: Arc<dyn Fn() -> bool + Send + Sync> =
+            Arc::new(move || allow_for_closure.load(std::sync::atomic::Ordering::SeqCst));
+        let handler = super::gated_input_handler(Arc::clone(&backend), input_authorized);
+
+        handler(InputEvent::MouseMove {
+            x: 0.0,
+            y: 0.0,
+            buttons: 0,
+        });
+        allow.store(false, std::sync::atomic::Ordering::SeqCst);
+        handler(InputEvent::MouseMove {
+            x: 0.1,
+            y: 0.1,
+            buttons: 0,
+        });
+        allow.store(true, std::sync::atomic::Ordering::SeqCst);
+        handler(InputEvent::MouseMove {
+            x: 0.2,
+            y: 0.2,
+            buttons: 0,
+        });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "gate must check authorization on every event, not at construction time"
         );
     }
 }

@@ -54,6 +54,7 @@ export const presenceweb_send_voice_tool_response: (a: number, b: any, c: any) =
 export const presenceweb_set_active_tab: (a: number, b: number, c: number) => any;
 export const presenceweb_set_on_active_granted: (a: number, b: any) => void;
 export const presenceweb_set_on_diagnostic: (a: number, b: any) => void;
+export const presenceweb_set_on_display_input_authority_change: (a: number, b: any) => void;
 export const presenceweb_set_on_error: (a: number, b: any) => void;
 export const presenceweb_set_on_force_disconnect: (a: number, b: any) => void;
 export const presenceweb_set_on_inject_voice_image: (a: number, b: any) => void;

@@ -211,6 +211,20 @@ export class PresenceWeb {
     set_active_tab(tab: string): any;
     set_on_active_granted(f: Function): void;
     set_on_diagnostic(f: Function): void;
+    /**
+     * Phase 5a.1: register a JS callback fired when the server reports
+     * this browser's input-authority state for a display.  Called with
+     * `(display_id: u32, state: "you" | "other" | "unclaimed")`.  The
+     * state strings are a closed set; the server only emits these three
+     * (forward-compat for future states would land as a new wire shape).
+     *
+     * The callback fires for both bootstrap snapshots (sent when this
+     * browser connects) and live transitions (Request/Release/WS-close
+     * elsewhere, plus DisplayReady for new sessions starting at
+     * unclaimed).  JS can treat each callback as authoritative and
+     * replace any previous state for the same display_id.
+     */
+    set_on_display_input_authority_change(f: Function): void;
     set_on_error(f: Function): void;
     set_on_force_disconnect(f: Function): void;
     set_on_inject_voice_image(f: Function): void;
@@ -371,6 +385,7 @@ export interface InitOutput {
     readonly presenceweb_set_active_tab: (a: number, b: number, c: number) => any;
     readonly presenceweb_set_on_active_granted: (a: number, b: any) => void;
     readonly presenceweb_set_on_diagnostic: (a: number, b: any) => void;
+    readonly presenceweb_set_on_display_input_authority_change: (a: number, b: any) => void;
     readonly presenceweb_set_on_error: (a: number, b: any) => void;
     readonly presenceweb_set_on_force_disconnect: (a: number, b: any) => void;
     readonly presenceweb_set_on_inject_voice_image: (a: number, b: any) => void;

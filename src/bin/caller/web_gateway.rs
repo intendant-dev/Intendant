@@ -7,6 +7,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+// Phase 5a.1: the display input authority map is read from a synchronous
+// `Fn() -> bool` closure on the WebRTC data-channel input hot path, so
+// it can't live behind a `tokio::sync::RwLock` (no `.read().await` from
+// sync code).  `StdRwLock` is the local alias to keep that map's type
+// distinct at every callsite from the unrelated `tokio::sync::RwLock`
+// uses in this file.  All access goes through `unwrap_or_else(|e| e.into_inner())`
+// to remain poison-tolerant, matching the rest of the file's std-lock idiom.
+use std::sync::RwLock as StdRwLock;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
@@ -45,6 +53,197 @@ struct ActivePresence {
 struct ActiveDisplayInput {
     connection_id: String,
     direct_tx: mpsc::UnboundedSender<String>,
+}
+
+/// Phase 5a.1: dedicated internal broadcast event for display input
+/// authority transitions.
+///
+/// Carries the holder's *server-internal* connection_id (or `None` for
+/// unclaimed) so each WS outbound task can personalize this for its own
+/// browser as `you | other | unclaimed` without ever shipping connection
+/// IDs to browsers.  Personalization happens in the per-connection
+/// outbound select arm where `connection_id_inbound` is in scope.
+///
+/// Distinct from [`AppEvent`] on purpose: the generic outbound
+/// broadcast carries already-serialized JSON strings, which would leak
+/// holder IDs if we routed authority through it.  A dedicated typed
+/// channel keeps the holder ID inside the gateway and forces every
+/// per-connection consumer to compute its own personalized state.
+#[derive(Clone, Debug)]
+struct DisplayInputAuthorityChange {
+    display_id: u32,
+    holder_connection_id: Option<String>,
+}
+
+/// Build the per-peer "may this connection inject input now?" closure
+/// for the local `/ws` display-offer path (Phase 5a.1).
+///
+/// Returns a closure that consults the live authority map every time
+/// it's called, so a grant or release elsewhere takes effect on the
+/// very next data-channel input event without needing to reconstruct
+/// the closure or rebuild the peer connection.
+///
+/// Semantics:
+/// - `auth.get(display_id) == Some(holder)` and `holder.connection_id == this_id`
+///   → `true`  (this connection holds authority)
+/// - `auth.get(display_id) == Some(holder)` and `holder.connection_id != this_id`
+///   → `false` (someone else holds it; silent drop)
+/// - `auth.get(display_id) == None`
+///   → `true`  (unclaimed = pre-phase-5 default; any connection can input)
+///
+/// The federated path does NOT call this; it passes
+/// `Arc::new(|| false)` inline — federated authority is a separate
+/// slice and we close the gap rather than inheriting an "any peer can
+/// input" hole there.
+fn build_local_ws_input_authorizer(
+    display_id: u32,
+    connection_id: String,
+    authority: Arc<StdRwLock<HashMap<u32, ActiveDisplayInput>>>,
+) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    Arc::new(move || {
+        let auth = authority.read().unwrap_or_else(|e| e.into_inner());
+        match auth.get(&display_id) {
+            Some(holder) => holder.connection_id == connection_id,
+            None => true,
+        }
+    })
+}
+
+/// Capacity of the [`DisplayInputAuthorityChange`] broadcast channel.
+///
+/// Sized to comfortably absorb a burst of grants/releases across a few
+/// dozen connected browsers — typically 1-3 events per user action,
+/// fanned out across all WS connections.  64 is plenty of headroom and
+/// cheap; lagged subscribers fall back to a fresh personalized snapshot
+/// path (see the `Lagged` arm in the outbound select).
+const AUTHORITY_CHANGE_CAPACITY: usize = 64;
+
+/// Federated path's input-authorization closure (Phase 5a.1).  Returns
+/// `false` unconditionally — federated remote control is out of scope
+/// until a federation authority protocol lands as its own slice (a
+/// `PeerOp::DisplayInputAuthorityChanged` event variant or similar).
+/// We name this rather than constructing `Arc::new(|| false)` inline at
+/// the federated callsite so the deny-by-default policy is searchable
+/// (`grep build_federated_input_authorizer`) and the test that pins it
+/// fires loudly if anyone weakens it to `|| true`.
+fn build_federated_input_authorizer() -> Arc<dyn Fn() -> bool + Send + Sync> {
+    Arc::new(|| false)
+}
+
+/// Apply a `RequestDisplayInputAuthority`.  Inserts the new holder,
+/// returns the prior holder if any, sends `display_input_authority_revoked`
+/// to the prior holder (if displaced), and emits the personalized
+/// authority change for fan-out.  Caller is responsible for the
+/// `display_input_authority_granted` confirm to `requester_direct_tx`
+/// and the bus log message — both stay at the call site to keep the
+/// helper's surface narrow (no logging dependency, no second send to
+/// the same channel).
+///
+/// Lock discipline: the `authority` write guard is dropped before any
+/// `direct_tx.send` or `authority_change_tx.send` call.
+fn apply_grant_input_authority(
+    display_id: u32,
+    requester_connection_id: String,
+    requester_direct_tx: mpsc::UnboundedSender<String>,
+    authority: &Arc<StdRwLock<HashMap<u32, ActiveDisplayInput>>>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> Option<ActiveDisplayInput> {
+    let new_holder = ActiveDisplayInput {
+        connection_id: requester_connection_id.clone(),
+        direct_tx: requester_direct_tx,
+    };
+    let prior = {
+        let mut map = authority
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        map.insert(display_id, new_holder)
+    };
+    if let Some(ref prior_holder) = prior {
+        if prior_holder.connection_id != requester_connection_id {
+            let notify = serde_json::json!({
+                "t": "display_input_authority_revoked",
+                "display_id": display_id,
+                "reason": "another connection requested control",
+            })
+            .to_string();
+            let _ = prior_holder.direct_tx.send(notify);
+        }
+    }
+    let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+        display_id,
+        holder_connection_id: Some(requester_connection_id),
+    });
+    prior
+}
+
+/// Apply a `ReleaseDisplayInputAuthority`.  No-op if the calling
+/// connection isn't the holder (prevents A from unclaiming B's slot).
+/// Returns `true` iff the slot was actually released.  Emits the
+/// personalized authority change with `None` only when the release
+/// took effect — a no-op release does not flip anyone's UI state.
+///
+/// Lock discipline: matches [`apply_grant_input_authority`].
+fn apply_release_input_authority(
+    display_id: u32,
+    releaser_connection_id: &str,
+    authority: &Arc<StdRwLock<HashMap<u32, ActiveDisplayInput>>>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> bool {
+    let removed = {
+        let mut map = authority
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        match map.get(&display_id) {
+            Some(holder) if holder.connection_id == releaser_connection_id => {
+                map.remove(&display_id);
+                true
+            }
+            _ => false,
+        }
+    };
+    if removed {
+        let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+            display_id,
+            holder_connection_id: None,
+        });
+    }
+    removed
+}
+
+/// Apply WS-close cleanup for a dropping connection.  Removes every
+/// authority entry held by `connection_id` and emits one `None`-holder
+/// authority change per affected display so observers move from
+/// `you/other` back to `unclaimed`.  Returns the list of released
+/// display ids for caller logging / tests.
+///
+/// Lock discipline: matches [`apply_grant_input_authority`].
+fn apply_ws_close_input_authority(
+    connection_id: &str,
+    authority: &Arc<StdRwLock<HashMap<u32, ActiveDisplayInput>>>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> Vec<u32> {
+    let released: Vec<u32> = {
+        let mut map = authority
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        map.retain(|did, holder| {
+            if holder.connection_id == connection_id {
+                out.push(*did);
+                false
+            } else {
+                true
+            }
+        });
+        out
+    };
+    for did in &released {
+        let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+            display_id: *did,
+            holder_connection_id: None,
+        });
+    }
+    released
 }
 
 pub const DEFAULT_PORT: u16 = 8765;
@@ -2154,8 +2353,63 @@ pub fn spawn_web_gateway(
     // Per-display input authority (phase 5).  Entry absence = unclaimed
     // (any connection can input — pre-phase-5 default); entry presence =
     // exclusive ownership by that one `connection_id`.
-    let display_input_authority: Arc<RwLock<HashMap<u32, ActiveDisplayInput>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    //
+    // Synchronous `StdRwLock` (5a.1): the WebRTC data-channel input
+    // handler in `display/mod.rs::handle_offer_pool_mode` is an
+    // `Arc<dyn Fn(InputEvent) + Send + Sync>` invoked from rtc's sync
+    // receive context, and reads this map through the per-peer
+    // `input_authorized` closure each time an event arrives.  Tokio's
+    // RwLock can't be read from sync code without `block_on`; std's
+    // can.  The map is small, write-rare (grant/release/WS-close only),
+    // read-frequent on the hot input path; std::sync::RwLock is the
+    // correct lock here.
+    let display_input_authority: Arc<StdRwLock<HashMap<u32, ActiveDisplayInput>>> =
+        Arc::new(StdRwLock::new(HashMap::new()));
+
+    // Phase 5a.1 authority transition channel.  Each per-connection
+    // outbound task subscribes; emit sites are the Request/Release
+    // ControlMsg handlers, the WS-close cleanup, and the DisplayReady
+    // listener that fires `holder_connection_id: None` for freshly
+    // created display sessions so already-connected browsers move
+    // from `unknown` to `unclaimed`.
+    let (authority_change_tx, _authority_change_rx0) =
+        broadcast::channel::<DisplayInputAuthorityChange>(AUTHORITY_CHANGE_CAPACITY);
+
+    // Spawn a listener that fires an "unclaimed" authority change for
+    // every newly-created display session so already-connected browsers'
+    // chips flip from `unknown` to `unclaimed` without waiting for the
+    // first Request/Release.  Subscribes to the broadcast_tx event
+    // stream (already serialized JSON) and pattern-matches on
+    // `display_ready` rather than the typed AppEvent — same source the
+    // existing `display_ready_cache` task uses, keeps the dependency
+    // surface small.
+    {
+        let authority_change_tx = authority_change_tx.clone();
+        let mut display_events_rx = broadcast_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match display_events_rx.recv().await {
+                    Ok(line) => {
+                        if line.contains("\"event\":\"display_ready\"") {
+                            if let Ok(parsed) =
+                                serde_json::from_str::<serde_json::Value>(&line)
+                            {
+                                let did = parsed["display_id"].as_u64().unwrap_or(0) as u32;
+                                let _ = authority_change_tx.send(
+                                    DisplayInputAuthorityChange {
+                                        display_id: did,
+                                        holder_connection_id: None,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+    }
 
     // Process-wide registry of standalone shell PTY sessions, keyed by
     // (host_id, terminal_id). Lives as long as the web gateway task and
@@ -2381,6 +2635,8 @@ pub fn spawn_web_gateway(
             let app_html = app_html.clone();
             let transcriber = transcriber.clone();
             let active_presence = active_presence.clone();
+            let display_input_authority = display_input_authority.clone();
+            let authority_change_tx = authority_change_tx.clone();
             let last_usage_json = last_usage_json.clone();
             let last_live_usage_json = last_live_usage_json.clone();
             let last_status_json = last_status_json.clone();
@@ -2393,7 +2649,6 @@ pub fn spawn_web_gateway(
             let mcp_server = mcp_server.clone();
             let terminal_registry = terminal_registry.clone();
             let inbound_bearer_token = inbound_bearer_token.clone();
-            let display_input_authority = display_input_authority.clone();
 
             tokio::spawn(async move {
                 // Snapshot session state at connection time
@@ -2648,19 +2903,48 @@ pub fn spawn_web_gateway(
                     // their DisplaySlots and initiate WebRTC.  Prefer the
                     // live session registry over the broadcast cache — it is
                     // authoritative and handles multiple concurrent displays.
+                    //
+                    // Phase 5a.1: alongside each display_ready, send a
+                    // personalized `display_input_authority_state` so the
+                    // browser starts at the authoritative state instead of
+                    // `unknown`.  Without this snapshot the chip would only
+                    // resolve on the next authority transition, which may
+                    // be never if no one ever takes control.
                     if let Some(ref sr) = session_registry {
                         let reg = sr.read().await;
-                        for did in reg.display_ids() {
-                            if let Some(session) = reg.get(did) {
-                                let (w, h) = session.resolution();
-                                let msg = serde_json::json!({
-                                    "event": "display_ready",
-                                    "display_id": did,
-                                    "width": w,
-                                    "height": h,
-                                });
-                                let _ = direct_tx.send(msg.to_string());
-                            }
+                        // Compute snapshots under the std lock, then drop the
+                        // guard before any direct_tx.send calls.
+                        let active_ids: Vec<u32> = reg.display_ids();
+                        let snapshots: Vec<(u32, (u32, u32), &'static str)> = {
+                            let auth = display_input_authority
+                                .read()
+                                .unwrap_or_else(|e| e.into_inner());
+                            active_ids.into_iter().filter_map(|did| {
+                                reg.get(did).map(|session| {
+                                    let (w, h) = session.resolution();
+                                    let state = match auth.get(&did) {
+                                        Some(holder) if holder.connection_id == connection_id => "you",
+                                        Some(_) => "other",
+                                        None => "unclaimed",
+                                    };
+                                    (did, (w, h), state)
+                                })
+                            }).collect()
+                        };
+                        for (did, (w, h), state) in snapshots {
+                            let ready = serde_json::json!({
+                                "event": "display_ready",
+                                "display_id": did,
+                                "width": w,
+                                "height": h,
+                            });
+                            let _ = direct_tx.send(ready.to_string());
+                            let auth_msg = serde_json::json!({
+                                "t": "display_input_authority_state",
+                                "display_id": did,
+                                "state": state,
+                            });
+                            let _ = direct_tx.send(auth_msg.to_string());
                         }
                     } else {
                         // Fallback: use the broadcast-derived cache when no
@@ -2712,6 +2996,7 @@ pub fn spawn_web_gateway(
                     let transcriber_inbound = transcriber.clone();
                     let active_presence_inbound = active_presence.clone();
                     let display_input_authority_inbound = display_input_authority.clone();
+                    let authority_change_tx_inbound = authority_change_tx.clone();
                     let connection_id_inbound = connection_id.clone();
                     let web_tui_tx_inbound = web_tui_tx.clone();
                     let frame_registry_inbound = frame_registry.clone();
@@ -3695,6 +3980,20 @@ pub fn spawn_web_gateway(
                                                             }
                                                             _ => None,
                                                         };
+                                                    // Phase 5a.1 input authority gate.  The closure
+                                                    // returns true when this connection is the
+                                                    // authority holder OR when the display has no
+                                                    // holder (unclaimed = pre-phase-5 default).
+                                                    // `display/mod.rs` only sees this boolean; it
+                                                    // never learns about ActiveDisplayInput, the
+                                                    // map, or connection IDs.  See
+                                                    // [`build_local_ws_input_authorizer`] for the
+                                                    // closure semantics + tests.
+                                                    let input_authorized = build_local_ws_input_authorizer(
+                                                        display_id,
+                                                        connection_id_inbound.clone(),
+                                                        Arc::clone(&display_input_authority_inbound),
+                                                    );
                                                     match session.handle_offer(
                                                         peer_id,
                                                         &sdp,
@@ -3702,6 +4001,7 @@ pub fn spawn_web_gateway(
                                                         Some(Arc::clone(&tcp_peer_registry)),
                                                         tcp_advertised_addr,
                                                         ice_tx,
+                                                        input_authorized,
                                                     ).await {
                                                         Ok(answer_sdp) => {
                                                             peer_display_ids.push(display_id);
@@ -3893,8 +4193,9 @@ pub fn spawn_web_gateway(
                                             // `ActiveDisplayInput` struct doc for the full
                                             // contract.
                                             let allowed = {
-                                                let authority =
-                                                    display_input_authority_inbound.read().await;
+                                                let authority = display_input_authority_inbound
+                                                    .read()
+                                                    .unwrap_or_else(|e| e.into_inner());
                                                 match authority.get(&display_id) {
                                                     Some(holder) => {
                                                         holder.connection_id == connection_id_inbound
@@ -3946,37 +4247,24 @@ pub fn spawn_web_gateway(
                                                     ).await;
                                                 }
                                                 Ok(ControlMsg::RequestDisplayInputAuthority { display_id }) => {
-                                                    // Grant this connection input authority for
-                                                    // `display_id`.  Auto-revokes any prior holder
-                                                    // (Zoom "grant auto-revokes prior controller"
-                                                    // pattern) and notifies both parties over
-                                                    // direct_tx.
-                                                    let new_holder = ActiveDisplayInput {
-                                                        connection_id: connection_id_inbound.clone(),
-                                                        direct_tx: direct_tx_inbound.clone(),
-                                                    };
-                                                    let prior = {
-                                                        let mut authority =
-                                                            display_input_authority_inbound.write().await;
-                                                        authority.insert(display_id, new_holder)
-                                                    };
-                                                    if let Some(prior_holder) = prior {
-                                                        if prior_holder.connection_id != connection_id_inbound {
-                                                            // Tell the prior holder they've been
-                                                            // revoked.  Send failure means the
-                                                            // holder's WebSocket is already gone —
-                                                            // the new claim stands regardless, and
-                                                            // the cleanup block at WS drop would
-                                                            // have eventually cleared the entry.
-                                                            let notify = serde_json::json!({
-                                                                "t": "display_input_authority_revoked",
-                                                                "display_id": display_id,
-                                                                "reason": "another connection requested control",
-                                                            }).to_string();
-                                                            let _ = prior_holder.direct_tx.send(notify);
-                                                        }
-                                                    }
-                                                    // Confirm to the new holder.
+                                                    // Phase 5a.1: handler body lives in
+                                                    // `apply_grant_input_authority` so the
+                                                    // authority-change emission is unit-testable
+                                                    // without standing up a WS lifecycle.  This
+                                                    // arm keeps the bus log + the per-connection
+                                                    // confirm message at the call site to avoid
+                                                    // baking logging dependencies into the helper.
+                                                    apply_grant_input_authority(
+                                                        display_id,
+                                                        connection_id_inbound.clone(),
+                                                        direct_tx_inbound.clone(),
+                                                        &display_input_authority_inbound,
+                                                        &authority_change_tx_inbound,
+                                                    );
+                                                    // Confirm to the new holder (kept here so the
+                                                    // helper has no dependency on the call site's
+                                                    // direct_tx — and so the failure-to-send case
+                                                    // doesn't bubble past the gate).
                                                     let granted = serde_json::json!({
                                                         "t": "display_input_authority_granted",
                                                         "display_id": display_id,
@@ -3992,20 +4280,12 @@ pub fn spawn_web_gateway(
                                                     });
                                                 }
                                                 Ok(ControlMsg::ReleaseDisplayInputAuthority { display_id }) => {
-                                                    // Release this connection's authority, IF it
-                                                    // actually holds it.  Prevents browser A from
-                                                    // unclaiming browser B's control by mistake.
-                                                    let removed = {
-                                                        let mut authority =
-                                                            display_input_authority_inbound.write().await;
-                                                        match authority.get(&display_id) {
-                                                            Some(holder) if holder.connection_id == connection_id_inbound => {
-                                                                authority.remove(&display_id);
-                                                                true
-                                                            }
-                                                            _ => false,
-                                                        }
-                                                    };
+                                                    let removed = apply_release_input_authority(
+                                                        display_id,
+                                                        connection_id_inbound.as_str(),
+                                                        &display_input_authority_inbound,
+                                                        &authority_change_tx_inbound,
+                                                    );
                                                     if removed {
                                                         bus_inbound.send(AppEvent::PresenceLog {
                                                             message: format!(
@@ -4061,13 +4341,18 @@ pub fn spawn_web_gateway(
                         // it — the `retain` below is the normal-drop
                         // cleanup that keeps the map consistent with
                         // live connections.
-                        {
-                            let mut authority =
-                                display_input_authority_inbound.write().await;
-                            authority.retain(|_, holder| {
-                                holder.connection_id != connection_id_inbound
-                            });
-                        }
+                        //
+                        // Phase 5a.1: helper handles map mutation + per-
+                        // display None-holder change emit so other
+                        // browsers don't stay stuck on `other` after the
+                        // holder's WS drops.  See
+                        // `apply_ws_close_input_authority` for the
+                        // semantics + tests.
+                        apply_ws_close_input_authority(
+                            connection_id_inbound.as_str(),
+                            &display_input_authority_inbound,
+                            &authority_change_tx_inbound,
+                        );
                         if is_presence_connected && is_active {
                             bus_inbound.send(AppEvent::PresenceDisconnected);
                         }
@@ -4089,6 +4374,18 @@ pub fn spawn_web_gateway(
                             });
                         }
                     });
+
+                    // Phase 5a.1 outbound personalization plumbing.  The
+                    // authority change channel carries the holder's
+                    // server-internal connection_id; this connection's
+                    // outbound task converts each incoming change into a
+                    // personalized `display_input_authority_state` wire
+                    // message.  Connection IDs never leave the daemon —
+                    // only the resolved `you|other|unclaimed` state does.
+                    let mut authority_change_rx = authority_change_tx.subscribe();
+                    let connection_id_outbound = connection_id.clone();
+                    let display_input_authority_outbound = display_input_authority.clone();
+                    let session_registry_outbound = session_registry.clone();
 
                     // Outbound: broadcast + direct responses → WebSocket
                     let outbound = tokio::spawn(async move {
@@ -4121,6 +4418,76 @@ pub fn spawn_web_gateway(
                                             }
                                         }
                                         None => break,
+                                    }
+                                }
+                                msg = authority_change_rx.recv() => {
+                                    match msg {
+                                        Ok(change) => {
+                                            // Personalize: never ship the holder's connection_id.
+                                            let state = match change.holder_connection_id.as_deref() {
+                                                Some(h) if h == connection_id_outbound.as_str() => "you",
+                                                Some(_) => "other",
+                                                None => "unclaimed",
+                                            };
+                                            let frame = serde_json::json!({
+                                                "t": "display_input_authority_state",
+                                                "display_id": change.display_id,
+                                                "state": state,
+                                            }).to_string();
+                                            if ws_tx
+                                                .send(Message::Text(frame.into()))
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        Err(broadcast::error::RecvError::Closed) => break,
+                                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                                            // Phase 5a.1: a lagged subscriber missed at least one
+                                            // authority transition.  Send a fresh personalized
+                                            // snapshot for every currently-active display so the
+                                            // browser's chip cannot be left stuck on stale state.
+                                            // Snapshot is computed under the std lock (held briefly,
+                                            // released before any send) plus the session registry's
+                                            // tokio lock for the active-display list — order
+                                            // matters: take the std lock LAST and drop it before
+                                            // awaiting the send to avoid awaiting under a sync guard.
+                                                            let display_ids: Vec<u32> = match session_registry_outbound.as_ref() {
+                                                Some(sr) => sr.read().await.display_ids(),
+                                                None => Vec::new(),
+                                            };
+                                            let snapshots: Vec<(u32, &'static str)> = {
+                                                let auth = display_input_authority_outbound
+                                                    .read()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                display_ids.into_iter().map(|did| {
+                                                    let state = match auth.get(&did) {
+                                                        Some(holder) if holder.connection_id == connection_id_outbound => "you",
+                                                        Some(_) => "other",
+                                                        None => "unclaimed",
+                                                    };
+                                                    (did, state)
+                                                }).collect()
+                                            };
+                                            let mut send_failed = false;
+                                            for (did, state) in snapshots {
+                                                let frame = serde_json::json!({
+                                                    "t": "display_input_authority_state",
+                                                    "display_id": did,
+                                                    "state": state,
+                                                }).to_string();
+                                                if ws_tx
+                                                    .send(Message::Text(frame.into()))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    send_failed = true;
+                                                    break;
+                                                }
+                                            }
+                                            if send_failed { break; }
+                                        }
                                     }
                                 }
                             }
@@ -6583,6 +6950,11 @@ async fn handle_federated_webrtc_signal(
             }
             let (ice_tx, mut ice_rx) =
                 tokio::sync::mpsc::channel::<(crate::display::PeerId, String)>(64);
+            // Phase 5a.1: federated paths deny WebRTC data-channel input
+            // by default until federation authority lands as its own slice.
+            // See [`build_federated_input_authorizer`] for the rationale +
+            // its dedicated test that pins the deny-by-default policy.
+            let input_authorized = build_federated_input_authorizer();
             let answer_result = session
                 .handle_offer(
                     peer_id,
@@ -6591,6 +6963,7 @@ async fn handle_federated_webrtc_signal(
                     Some(tcp_peer_registry.clone()),
                     tcp_advertised_addr,
                     ice_tx,
+                    input_authorized,
                 )
                 .await;
             match answer_result {
@@ -10262,5 +10635,287 @@ mod tests {
         assert!(result.is_err(), "should not emit duplicate PresenceConnected for already-active browser");
 
         handle.abort();
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 5a.1: input-authority closure semantics + emission tests
+    // ---------------------------------------------------------------
+
+    /// Build an empty `display_input_authority` map of the production
+    /// shape, for the helper-shape tests below.
+    fn empty_authority_map() -> Arc<StdRwLock<HashMap<u32, ActiveDisplayInput>>> {
+        Arc::new(StdRwLock::new(HashMap::new()))
+    }
+
+    /// Insert an `ActiveDisplayInput` directly into the map for tests
+    /// that need to seed a holder without going through the full
+    /// `apply_grant_input_authority` flow.  The inserted holder owns
+    /// a fresh dummy `direct_tx` whose receiver is dropped — sends to
+    /// it return `Err`, which the production code already tolerates
+    /// (the WS-close path would have cleared this entry in real life).
+    fn seed_holder(
+        map: &Arc<StdRwLock<HashMap<u32, ActiveDisplayInput>>>,
+        display_id: u32,
+        connection_id: &str,
+    ) {
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        map.write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                display_id,
+                ActiveDisplayInput {
+                    connection_id: connection_id.to_string(),
+                    direct_tx: tx,
+                },
+            );
+    }
+
+    /// Closure semantics: unclaimed map → authorized.  Matches the
+    /// pre-phase-5 backwards-compat default; without this, the gate
+    /// would block input on a fresh display that no one has claimed
+    /// yet (regression hazard).
+    #[test]
+    fn local_ws_authorizer_returns_true_when_unclaimed() {
+        let map = empty_authority_map();
+        let authz = build_local_ws_input_authorizer(0, "conn-A".to_string(), map);
+        assert!(authz(), "unclaimed display should authorize any connection");
+    }
+
+    /// Closure semantics: holder asks → authorized.  The on-going
+    /// holder's input keeps flowing without re-asking.
+    #[test]
+    fn local_ws_authorizer_returns_true_for_holder() {
+        let map = empty_authority_map();
+        seed_holder(&map, 0, "conn-A");
+        let authz = build_local_ws_input_authorizer(0, "conn-A".to_string(), map);
+        assert!(authz(), "holder must remain authorized");
+    }
+
+    /// Closure semantics: non-holder asks → denied.  This is the
+    /// silent-drop case — the closure returns false; the gate in
+    /// `display/mod.rs::gated_input_handler` then drops the event.
+    #[test]
+    fn local_ws_authorizer_returns_false_for_non_holder() {
+        let map = empty_authority_map();
+        seed_holder(&map, 0, "conn-A");
+        let authz = build_local_ws_input_authorizer(0, "conn-B".to_string(), map);
+        assert!(
+            !authz(),
+            "non-holder must be denied even though display is claimed"
+        );
+    }
+
+    /// Closure re-evaluates on every call — the gate must observe
+    /// live grant/release transitions for a long-lived `WebRtcPeer`.
+    /// Captured-snapshot semantics would freeze the gate at the value
+    /// at construction time, breaking the take-control flow mid-session.
+    #[test]
+    fn local_ws_authorizer_re_evaluates_on_each_call() {
+        let map = empty_authority_map();
+        let authz = build_local_ws_input_authorizer(0, "conn-A".to_string(), Arc::clone(&map));
+        assert!(authz(), "starts unclaimed → authorized");
+        seed_holder(&map, 0, "conn-B");
+        assert!(!authz(), "after seeding conn-B as holder → denied");
+        // Replace holder with self.
+        map.write().unwrap_or_else(|e| e.into_inner()).insert(
+            0,
+            ActiveDisplayInput {
+                connection_id: "conn-A".to_string(),
+                direct_tx: mpsc::unbounded_channel().0,
+            },
+        );
+        assert!(authz(), "after taking holder → re-authorized");
+        // Release.
+        map.write().unwrap_or_else(|e| e.into_inner()).remove(&0);
+        assert!(authz(), "after release back to unclaimed → authorized");
+    }
+
+    /// Federated path's authorization policy is deny-by-default.  This
+    /// pins the policy as a regression guard: if anyone weakens it to
+    /// `|| true` we want the test to fail loudly.
+    #[test]
+    fn federated_authorizer_denies_by_default() {
+        let authz = build_federated_input_authorizer();
+        assert!(
+            !authz(),
+            "federated path must deny WebRTC data-channel input until federation authority lands"
+        );
+        // Repeated calls all return false — no internal toggle.
+        for _ in 0..5 {
+            assert!(!authz());
+        }
+    }
+
+    /// `apply_grant_input_authority` emits a personalized authority
+    /// change carrying `Some(holder_connection_id)`.  The change flows
+    /// through the broadcast channel; per-connection outbound tasks
+    /// resolve `holder_connection_id` against their own id to produce
+    /// `you|other|unclaimed` for browsers — the authoritative state
+    /// the dashboard chip binds against.
+    #[test]
+    fn apply_grant_emits_authority_change_with_holder() {
+        let map = empty_authority_map();
+        let (auth_tx, mut auth_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (direct_tx, _direct_rx) = mpsc::unbounded_channel::<String>();
+        let prior = apply_grant_input_authority(
+            7,
+            "conn-A".to_string(),
+            direct_tx,
+            &map,
+            &auth_tx,
+        );
+        assert!(prior.is_none(), "no prior holder on first grant");
+        let change = auth_rx.try_recv().expect("authority change emitted");
+        assert_eq!(change.display_id, 7);
+        assert_eq!(change.holder_connection_id.as_deref(), Some("conn-A"));
+        // And the map records the new holder.
+        assert_eq!(
+            map.read().unwrap_or_else(|e| e.into_inner())
+                .get(&7).unwrap().connection_id,
+            "conn-A",
+        );
+    }
+
+    /// A second grant from a different connection must auto-revoke
+    /// the prior holder (matches Zoom's "granting auto-revokes prior"
+    /// UX).  The prior holder receives a `display_input_authority_revoked`
+    /// notification on its own direct_tx; the personalized change
+    /// emits with the new holder's id.
+    #[test]
+    fn apply_grant_auto_revokes_prior_holder() {
+        let map = empty_authority_map();
+        let (auth_tx, mut auth_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (direct_tx_a, mut direct_rx_a) = mpsc::unbounded_channel::<String>();
+        let (direct_tx_b, _direct_rx_b) = mpsc::unbounded_channel::<String>();
+
+        // First grant to A.
+        apply_grant_input_authority(
+            7, "conn-A".to_string(), direct_tx_a.clone(), &map, &auth_tx,
+        );
+        // Drain the first authority change.
+        let _ = auth_rx.try_recv().expect("first grant emitted");
+
+        // Second grant to B → A is auto-revoked.
+        let prior = apply_grant_input_authority(
+            7, "conn-B".to_string(), direct_tx_b, &map, &auth_tx,
+        );
+        let prior_holder = prior.expect("prior holder returned");
+        assert_eq!(prior_holder.connection_id, "conn-A");
+
+        // Authority change shows new holder.
+        let change = auth_rx.try_recv().expect("second grant emitted");
+        assert_eq!(change.holder_connection_id.as_deref(), Some("conn-B"));
+
+        // A receives a revoked notification on its direct_tx.
+        let notify = direct_rx_a
+            .try_recv()
+            .expect("prior holder gets display_input_authority_revoked");
+        assert!(notify.contains("display_input_authority_revoked"));
+        assert!(notify.contains("\"display_id\":7"));
+    }
+
+    /// `apply_release_input_authority` emits a `None`-holder change
+    /// only when the release actually took effect (caller is the
+    /// current holder).  No-op release does not emit.
+    #[test]
+    fn apply_release_emits_authority_change_with_none() {
+        let map = empty_authority_map();
+        seed_holder(&map, 7, "conn-A");
+        let (auth_tx, mut auth_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let removed = apply_release_input_authority(7, "conn-A", &map, &auth_tx);
+        assert!(removed, "holder's release should succeed");
+        let change = auth_rx.try_recv().expect("authority change emitted");
+        assert_eq!(change.display_id, 7);
+        assert!(
+            change.holder_connection_id.is_none(),
+            "release emits None holder"
+        );
+        assert!(map.read().unwrap_or_else(|e| e.into_inner()).get(&7).is_none());
+    }
+
+    /// Release attempted by a non-holder is a no-op — prevents A from
+    /// unclaiming B's slot.  No authority change is emitted.
+    #[test]
+    fn apply_release_is_noop_for_non_holder() {
+        let map = empty_authority_map();
+        seed_holder(&map, 7, "conn-A");
+        let (auth_tx, mut auth_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let removed = apply_release_input_authority(7, "conn-B", &map, &auth_tx);
+        assert!(!removed, "non-holder cannot unclaim");
+        // No change emitted.
+        assert!(
+            auth_rx.try_recv().is_err(),
+            "no authority change for no-op release"
+        );
+        // Original holder still in map.
+        assert_eq!(
+            map.read().unwrap_or_else(|e| e.into_inner())
+                .get(&7).unwrap().connection_id,
+            "conn-A",
+        );
+    }
+
+    /// WS-close cleanup releases every entry held by the dropping
+    /// connection and emits one `None`-holder change per affected
+    /// display.  Without this fan-out, browsers in `other` state
+    /// after the dropping connection had taken control would stay
+    /// stuck on stale UI.
+    #[test]
+    fn apply_ws_close_emits_authority_change_with_none_for_each_held_display() {
+        let map = empty_authority_map();
+        seed_holder(&map, 1, "conn-A");
+        seed_holder(&map, 2, "conn-A");
+        seed_holder(&map, 3, "conn-B");
+        let (auth_tx, mut auth_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let released = apply_ws_close_input_authority("conn-A", &map, &auth_tx);
+        // A's two holdings released; B untouched.
+        let mut released_sorted = released.clone();
+        released_sorted.sort();
+        assert_eq!(released_sorted, vec![1, 2]);
+        assert!(map.read().unwrap_or_else(|e| e.into_inner()).get(&1).is_none());
+        assert!(map.read().unwrap_or_else(|e| e.into_inner()).get(&2).is_none());
+        assert_eq!(
+            map.read().unwrap_or_else(|e| e.into_inner())
+                .get(&3).unwrap().connection_id,
+            "conn-B",
+            "other connections' holdings preserved",
+        );
+        // One change emitted per released display, both with None.
+        let mut events: Vec<DisplayInputAuthorityChange> = Vec::new();
+        while let Ok(change) = auth_rx.try_recv() {
+            events.push(change);
+        }
+        assert_eq!(events.len(), 2);
+        for change in &events {
+            assert!(change.holder_connection_id.is_none());
+            assert!(change.display_id == 1 || change.display_id == 2);
+        }
+    }
+
+    /// WS-close for a connection that holds no slots → no events,
+    /// empty release list.  Common case (non-controller dropping out).
+    #[test]
+    fn apply_ws_close_is_noop_when_no_slots_held() {
+        let map = empty_authority_map();
+        seed_holder(&map, 1, "conn-other");
+        let (auth_tx, mut auth_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let released = apply_ws_close_input_authority("conn-A", &map, &auth_tx);
+        assert!(released.is_empty(), "no slots held → no releases");
+        assert!(
+            auth_rx.try_recv().is_err(),
+            "no authority changes emitted"
+        );
+        // Other holder untouched.
+        assert_eq!(
+            map.read().unwrap_or_else(|e| e.into_inner())
+                .get(&1).unwrap().connection_id,
+            "conn-other",
+        );
     }
 }

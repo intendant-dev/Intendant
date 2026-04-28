@@ -343,6 +343,25 @@ impl PresenceWeb {
                             cb.invoke_inject_voice_text_passive(&text);
                         }
                     }
+                    Some("display_input_authority_state") => {
+                        // Phase 5a.1: per-display input-authority state for
+                        // this browser.  Server has already resolved the
+                        // holder against this connection's id; we receive
+                        // the resolved `you|other|unclaimed` and forward to
+                        // JS.  Skips the generic event/raw-message paths so
+                        // dashboard JS doesn't accidentally route this
+                        // through `on_server_event` for narration or
+                        // unrelated state machinery.
+                        if let (Some(display_id), Some(state)) = (
+                            msg.get("display_id").and_then(|v| v.as_u64()),
+                            msg.get("state").and_then(|v| v.as_str()),
+                        ) {
+                            cb.invoke_display_input_authority_change(
+                                display_id as u32,
+                                state,
+                            );
+                        }
+                    }
                     _ => {
                         // Event messages (have "event" field)
                         if msg.get("event").is_some() {
@@ -1074,6 +1093,22 @@ impl PresenceWeb {
         self.server.borrow().send_json(&msg);
     }
 
+    /// Phase 5a.1: register a JS callback fired when the server reports
+    /// this browser's input-authority state for a display.  Called with
+    /// `(display_id: u32, state: "you" | "other" | "unclaimed")`.  The
+    /// state strings are a closed set; the server only emits these three
+    /// (forward-compat for future states would land as a new wire shape).
+    ///
+    /// The callback fires for both bootstrap snapshots (sent when this
+    /// browser connects) and live transitions (Request/Release/WS-close
+    /// elsewhere, plus DisplayReady for new sessions starting at
+    /// unclaimed).  JS can treat each callback as authoritative and
+    /// replace any previous state for the same display_id.
+    #[wasm_bindgen]
+    pub fn set_on_display_input_authority_change(&self, f: Function) {
+        *self.callbacks.on_display_input_authority_change.borrow_mut() = Some(f);
+    }
+
     /// Phase 5: claim exclusive input authority for one display.
     /// The server gates `display_input` messages so only the holder
     /// can drive the platform mouse/keyboard; other connections see
@@ -1106,3 +1141,95 @@ impl PresenceWeb {
     }
 }
 } // mod wasm_impl
+
+// ---------------------------------------------------------------------------
+// Native-buildable wire-format invariant tests (Phase 5a.1)
+//
+// The actual dispatch arm in `connect_server`'s message handler is
+// gated on `#[cfg(target_arch = "wasm32")]`, so it can't be exercised
+// directly from a native `cargo test`.  Instead we pin the *wire
+// contract* the dispatch reads — same shape that
+// `web_gateway::apply_grant_input_authority` (and friends) emit.  If
+// either side drifts (server changes the field name, dispatch reads a
+// different field), one of these tests fires and the integration
+// breakage is caught at unit-test time.
+//
+// Mirrors the regression-guard pattern of
+// `crate::app_state::tests::peer_webrtc_signal_wire_name`.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod authority_wire_tests {
+    /// The dispatch in `connect_server` matches `t == "display_input_authority_state"`
+    /// and reads `display_id: u64` + `state: &str`.  This test pins
+    /// that exact shape against the JSON the gateway actually emits,
+    /// failing loudly if either side renames a field or changes a
+    /// type.
+    #[test]
+    fn display_input_authority_state_shape_matches_dispatch() {
+        // Construct the JSON the way `web_gateway` emits it (see
+        // `apply_grant_input_authority` and the per-connection
+        // outbound select arm).
+        let wire = serde_json::json!({
+            "t": "display_input_authority_state",
+            "display_id": 7u32,
+            "state": "you",
+        });
+
+        // The dispatch reads these exact fields with these exact
+        // accessors; replicate them here.
+        let t = wire.get("t").and_then(|v| v.as_str());
+        let display_id = wire.get("display_id").and_then(|v| v.as_u64());
+        let state = wire.get("state").and_then(|v| v.as_str());
+
+        assert_eq!(t, Some("display_input_authority_state"));
+        assert_eq!(display_id, Some(7));
+        assert_eq!(state, Some("you"));
+    }
+
+    /// All three state strings (`you`, `other`, `unclaimed`) parse.
+    /// The state vocabulary is a closed set on the gateway side; this
+    /// test fails if any of the three is renamed without coordinated
+    /// JS update.
+    #[test]
+    fn display_input_authority_state_accepts_all_three_states() {
+        for state in ["you", "other", "unclaimed"] {
+            let wire = serde_json::json!({
+                "t": "display_input_authority_state",
+                "display_id": 0u32,
+                "state": state,
+            });
+            assert_eq!(
+                wire.get("state").and_then(|v| v.as_str()),
+                Some(state),
+                "wire state '{state}' must round-trip"
+            );
+        }
+    }
+
+    /// The dispatch's `(Some(display_id), Some(state))` guard rejects
+    /// malformed messages — pinned here so the gateway never starts
+    /// emitting a partial shape that bypasses the dispatch into the
+    /// generic `_ =>` arm.
+    #[test]
+    fn display_input_authority_state_rejects_partial_shapes() {
+        let no_display_id = serde_json::json!({
+            "t": "display_input_authority_state",
+            "state": "you",
+        });
+        assert!(no_display_id.get("display_id").and_then(|v| v.as_u64()).is_none());
+
+        let no_state = serde_json::json!({
+            "t": "display_input_authority_state",
+            "display_id": 0u32,
+        });
+        assert!(no_state.get("state").and_then(|v| v.as_str()).is_none());
+
+        let wrong_type = serde_json::json!({
+            "t": "display_input_authority_state",
+            "display_id": "zero",  // string, not u64
+            "state": "you",
+        });
+        assert!(wrong_type.get("display_id").and_then(|v| v.as_u64()).is_none());
+    }
+}

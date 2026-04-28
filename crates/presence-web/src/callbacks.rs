@@ -56,6 +56,12 @@ pub struct Callbacks {
     pub on_raw_message: RefCell<Option<Function>>,
     /// Live model token usage update (provider-agnostic normalized struct).
     pub on_live_usage: RefCell<Option<Function>>,
+    /// Phase 5a.1: per-display input-authority state changed for this
+    /// browser.  Called with `(display_id: u32, state: &str)` where
+    /// `state` is one of `"you" | "other" | "unclaimed"`.  The server
+    /// resolves the holder ID against this connection before sending,
+    /// so connection IDs never reach JS.
+    pub on_display_input_authority_change: RefCell<Option<Function>>,
 }
 
 impl Callbacks {
@@ -195,6 +201,20 @@ impl Callbacks {
     pub fn invoke_live_usage(&self, usage: &JsValue) {
         if let Some(ref f) = *self.on_live_usage.borrow() {
             let _ = f.call1(&JsValue::NULL, usage);
+        }
+    }
+
+    /// Phase 5a.1.  Always called with a state from the closed set
+    /// `{"you", "other", "unclaimed"}` — JS dispatchers can switch on
+    /// these literals without worrying about future variants leaking
+    /// (the server's wire format only emits these three).
+    pub fn invoke_display_input_authority_change(&self, display_id: u32, state: &str) {
+        if let Some(ref f) = *self.on_display_input_authority_change.borrow() {
+            let _ = f.call2(
+                &JsValue::NULL,
+                &JsValue::from_f64(display_id as f64),
+                &JsValue::from_str(state),
+            );
         }
     }
 }

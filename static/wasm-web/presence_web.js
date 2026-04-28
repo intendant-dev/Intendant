@@ -551,6 +551,23 @@ export class PresenceWeb {
         wasm.presenceweb_set_on_diagnostic(this.__wbg_ptr, f);
     }
     /**
+     * Phase 5a.1: register a JS callback fired when the server reports
+     * this browser's input-authority state for a display.  Called with
+     * `(display_id: u32, state: "you" | "other" | "unclaimed")`.  The
+     * state strings are a closed set; the server only emits these three
+     * (forward-compat for future states would land as a new wire shape).
+     *
+     * The callback fires for both bootstrap snapshots (sent when this
+     * browser connects) and live transitions (Request/Release/WS-close
+     * elsewhere, plus DisplayReady for new sessions starting at
+     * unclaimed).  JS can treat each callback as authoritative and
+     * replace any previous state for the same display_id.
+     * @param {Function} f
+     */
+    set_on_display_input_authority_change(f) {
+        wasm.presenceweb_set_on_display_input_authority_change(this.__wbg_ptr, f);
+    }
+    /**
      * @param {Function} f
      */
     set_on_error(f) {
