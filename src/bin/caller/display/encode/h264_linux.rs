@@ -69,6 +69,36 @@ pub struct FfmpegH264Encoder {
     /// are Constrained Baseline, packetization-mode 1 (matches both the
     /// h264_vaapi config and libx264 `-profile:v baseline` above).
     payload_spec: PayloadSpec,
+
+    /// Most recently observed SPS NAL (type 7) from this encoder's output,
+    /// raw bytes without start code. Populated lazily as NALs flow through
+    /// `encode()`.
+    ///
+    /// Used by `build_packet` to guarantee SPS/PPS precede every IDR
+    /// access unit on the wire — WebRTC depacketizers (per RFC 6184)
+    /// require the parameter sets to repeat alongside each IDR, but
+    /// libx264's default behaviour with a long-lived stdin pipe is to
+    /// emit them only at stream start. Without this guarantee the
+    /// browser receives bare IDR slices that reference an SPS/PPS the
+    /// decoder never re-saw after a transport gap and produces no
+    /// frames despite RTP flowing healthily.
+    ///
+    /// Cache lifetime is per encoder instance: when the pool's
+    /// `on_resize` regenerates the encoder, the new instance starts
+    /// with an empty cache and re-populates it from the first
+    /// libx264 IDR (which always carries SPS+PPS at stream start).
+    /// So stale parameter sets cannot cross a resolution change.
+    cached_sps: Option<Vec<u8>>,
+
+    /// PPS counterpart to [`Self::cached_sps`]. Same lifetime + invariant.
+    cached_pps: Option<Vec<u8>>,
+
+    /// True after the encoder has logged a "no cached SPS/PPS at first
+    /// IDR" warning, so subsequent occurrences don't spam the log. In
+    /// practice this should never fire — libx264's first IDR always
+    /// includes parameter sets — but if it does, one diagnostic line
+    /// per encoder lifetime is enough to flag the anomaly.
+    warned_missing_params: bool,
 }
 
 impl FfmpegH264Encoder {
@@ -211,6 +241,15 @@ impl FfmpegH264Encoder {
                 "30",
                 "-bf",
                 "0",
+                // Tell libx264 to repeat SPS/PPS before every IDR. The
+                // load-bearing fix lives in `build_packet` (cached
+                // SPS/PPS daemon-side prepend), which catches encoders
+                // that ignore repeat-headers (and would also catch a
+                // future VAAPI swap whose behaviour differs); this
+                // flag is defense-in-depth so the byte stream is
+                // already correct at the source for libx264.
+                "-x264-params",
+                "repeat-headers=1",
                 // Output: raw H264 Annex-B to stdout
                 "-f",
                 "h264",
@@ -270,7 +309,65 @@ impl FfmpegH264Encoder {
             pending_frame_nals: Vec::new(),
             pending_frame_pts: 0,
             payload_spec: PayloadSpec::h264_constrained_baseline(),
+            cached_sps: None,
+            cached_pps: None,
+            warned_missing_params: false,
         })
+    }
+
+    /// Flush the currently-accumulated NALs (`pending_frame_nals`) into an
+    /// `EncodedPacket` and append it to `out`. Wraps `build_packet` with
+    /// the cached SPS/PPS values + the first-IDR-without-cache warning,
+    /// so each call site has one short helper instead of duplicating the
+    /// glue.
+    fn flush_pending_packet(
+        &mut self,
+        duration_ms: u64,
+        out: &mut Vec<EncodedPacket>,
+    ) {
+        if self.pending_frame_nals.is_empty() {
+            return;
+        }
+        let has_idr = self
+            .pending_frame_nals
+            .iter()
+            .any(|n| n.nal_type == 5);
+        let has_sps_in_au = self
+            .pending_frame_nals
+            .iter()
+            .any(|n| n.nal_type == 7);
+        let has_pps_in_au = self
+            .pending_frame_nals
+            .iter()
+            .any(|n| n.nal_type == 8);
+        // Warn at most once per encoder if we ever see a bare IDR before
+        // libx264 has shipped its first complete IDR. In practice this
+        // never fires on a well-behaved libx264 stdin pipe, but if a
+        // future encoder swap or codec misconfig produces this shape, the
+        // resulting black-video would otherwise be invisible at this
+        // layer. See `warned_missing_params` field doc.
+        if has_idr
+            && (!has_sps_in_au && self.cached_sps.is_none()
+                || !has_pps_in_au && self.cached_pps.is_none())
+            && !self.warned_missing_params
+        {
+            eprintln!(
+                "[display/h264_linux] WARN: IDR access unit missing SPS or \
+                 PPS and no cached parameter sets available — receiver \
+                 cannot decode. Should self-correct on next complete IDR.",
+            );
+            self.warned_missing_params = true;
+        }
+        if let Some(pkt) = Self::build_packet(
+            &self.pending_frame_nals,
+            self.cached_sps.as_deref(),
+            self.cached_pps.as_deref(),
+            self.pending_frame_pts,
+            duration_ms,
+            &self.payload_spec,
+        ) {
+            out.push(pkt);
+        }
     }
 
     /// Check whether a slice NAL starts a new access unit (frame).
@@ -290,8 +387,35 @@ impl FfmpegH264Encoder {
     /// start code. `payload_spec` is cloned in so the function stays a
     /// free-ish associated helper (no `&self`) while each emitted packet
     /// still carries the encoder's fmtp identity.
+    ///
+    /// **SPS/PPS guarantee for IDR access units.** WebRTC depacketizers
+    /// (RFC 6184) require parameter sets to repeat alongside every IDR
+    /// — without them the decoder cannot reinitialize after a transport
+    /// gap and no frames decode. libx264's long-lived stdin pipe emits
+    /// SPS/PPS only at stream start by default, so most natural-cadence
+    /// (`-g N`) IDRs arrive on the wire as bare slices that reference
+    /// parameter sets the receiver may never have seen.
+    ///
+    /// This function compensates: if `nals` contains an IDR (type 5)
+    /// but is missing SPS (type 7) or PPS (type 8), and the caller
+    /// supplied cached values from a prior access unit, the cached
+    /// parameter sets are inserted before the first non-AUD NAL.
+    /// AUD (type 9), if present, is preserved at the front so the
+    /// final order stays canonical (AUD → SPS → PPS → IDR).
+    ///
+    /// No fabrication: if the cache is empty AND the access unit lacks
+    /// parameter sets, the IDR is emitted unchanged. The caller is
+    /// expected to log that anomaly once per encoder; the function
+    /// itself stays pure and side-effect-free.
+    ///
+    /// Pure / idempotent on already-complete access units: an input
+    /// containing SPS+PPS+IDR (libx264's stream-start shape) emits
+    /// exactly the same bytes whether or not the cache is populated —
+    /// no duplicate parameter sets.
     fn build_packet(
         nals: &[Nal],
+        cached_sps: Option<&[u8]>,
+        cached_pps: Option<&[u8]>,
         pts_ms: u64,
         duration_ms: u64,
         payload_spec: &PayloadSpec,
@@ -299,9 +423,39 @@ impl FfmpegH264Encoder {
         if nals.is_empty() {
             return None;
         }
+
+        let has_idr = nals.iter().any(|n| n.nal_type == 5);
+        let has_sps = nals.iter().any(|n| n.nal_type == 7);
+        let has_pps = nals.iter().any(|n| n.nal_type == 8);
+        let prepend_sps = has_idr && !has_sps && cached_sps.is_some();
+        let prepend_pps = has_idr && !has_pps && cached_pps.is_some();
+
         let mut data = Vec::new();
         let mut is_keyframe = false;
+        // Emit cached parameter sets exactly once, immediately before the
+        // FIRST IDR slice in this access unit. Iterating in input order
+        // means anything preceding the IDR (AUD, an existing SPS, an
+        // existing PPS, SEI) is emitted before the prepend, giving the
+        // canonical AUD → SPS → PPS → IDR ordering whether the parameter
+        // sets came from input or cache. The "missing" branch only
+        // inserts the side that the AU lacks, so existing parameter
+        // sets are not duplicated.
+        let mut params_inserted = false;
         for nal in nals {
+            if !params_inserted
+                && nal.nal_type == 5
+                && (prepend_sps || prepend_pps)
+            {
+                if prepend_sps {
+                    data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                    data.extend_from_slice(cached_sps.unwrap());
+                }
+                if prepend_pps {
+                    data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                    data.extend_from_slice(cached_pps.unwrap());
+                }
+                params_inserted = true;
+            }
             data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
             data.extend_from_slice(&nal.data);
             if nal.nal_type == 5 {
@@ -375,17 +529,20 @@ impl Encoder for FfmpegH264Encoder {
                 Ok(n) => n,
                 Err(_) => break, // no more NALs right now
             };
+            // Cache parameter sets as they flow through. libx264 emits
+            // SPS+PPS at stream start (and on encoder resets), so the
+            // cache populates on the first complete IDR access unit and
+            // stays fresh thereafter. See `cached_sps` field doc for the
+            // RFC 6184 rationale.
+            match nal.nal_type {
+                7 => self.cached_sps = Some(nal.data.clone()),
+                8 => self.cached_pps = Some(nal.data.clone()),
+                _ => {}
+            }
             let is_slice = nal.nal_type == 1 || nal.nal_type == 5;
             if is_slice && have_slice && Self::is_first_slice(&nal) {
                 // New frame starts — flush what we have.
-                if let Some(pkt) = Self::build_packet(
-                    &self.pending_frame_nals,
-                    self.pending_frame_pts,
-                    duration_ms,
-                    &self.payload_spec,
-                ) {
-                    out_packets.push(pkt);
-                }
+                self.flush_pending_packet(duration_ms, &mut out_packets);
                 self.pending_frame_nals.clear();
                 self.pending_frame_nals.push(nal);
                 self.pending_frame_pts = input_pts;
@@ -750,5 +907,189 @@ mod tests {
         // first_mb = 1 → continuation slice
         let cont = Nal { data: vec![0x41, 0x40], nal_type: 1 };
         assert!(!FfmpegH264Encoder::is_first_slice(&cont));
+    }
+
+    /// Helper: Annex-B start code prepended to a NAL body, matching what
+    /// `build_packet` writes for each NAL it emits.
+    fn annexb(body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x00, 0x00, 0x00, 0x01];
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn build_packet_passes_through_complete_idr_unchanged() {
+        // libx264's stream-start shape: a single access unit containing
+        // SPS + PPS + IDR. Cache may or may not be populated; either way
+        // the output must be the canonical [SPS][PPS][IDR] byte sequence
+        // with no duplicate parameter sets.
+        let sps = vec![0x67, 0x42, 0x00, 0x0A];
+        let pps = vec![0x68, 0xCE, 0x38, 0x80];
+        let idr = vec![0x65, 0xAA, 0xBB];
+        let nals = vec![
+            Nal { data: sps.clone(), nal_type: 7 },
+            Nal { data: pps.clone(), nal_type: 8 },
+            Nal { data: idr.clone(), nal_type: 5 },
+        ];
+
+        // Cache populated case (the realistic path: cache was filled by
+        // an earlier IDR). Output must still be exactly SPS+PPS+IDR.
+        let pkt = FfmpegH264Encoder::build_packet(
+            &nals,
+            Some(&sps),
+            Some(&pps),
+            0,
+            33,
+            &PayloadSpec::h264_constrained_baseline(),
+        )
+        .unwrap();
+        assert!(pkt.is_keyframe);
+        let mut want = Vec::new();
+        want.extend_from_slice(&annexb(&sps));
+        want.extend_from_slice(&annexb(&pps));
+        want.extend_from_slice(&annexb(&idr));
+        assert_eq!(pkt.data, want, "complete IDR should not be modified");
+
+        // Empty cache case (first IDR, before cache is populated). Same
+        // expected output — no fabrication, but also no insertion since
+        // the access unit is already complete.
+        let pkt = FfmpegH264Encoder::build_packet(
+            &nals,
+            None,
+            None,
+            0,
+            33,
+            &PayloadSpec::h264_constrained_baseline(),
+        )
+        .unwrap();
+        assert_eq!(pkt.data, want, "empty cache must not change complete IDR");
+    }
+
+    #[test]
+    fn build_packet_prepends_cached_sps_pps_before_bare_idr() {
+        // Bare IDR access unit (the libx264 -g N cadence shape after the
+        // first keyframe): only an IDR slice, no SPS/PPS. Cached values
+        // from a prior keyframe should be inserted before the IDR.
+        let cached_sps = vec![0x67, 0x42, 0x00, 0x0A];
+        let cached_pps = vec![0x68, 0xCE, 0x38, 0x80];
+        let idr = vec![0x65, 0xAA, 0xBB];
+        let nals = vec![Nal { data: idr.clone(), nal_type: 5 }];
+
+        let pkt = FfmpegH264Encoder::build_packet(
+            &nals,
+            Some(&cached_sps),
+            Some(&cached_pps),
+            33,
+            33,
+            &PayloadSpec::h264_constrained_baseline(),
+        )
+        .unwrap();
+        assert!(pkt.is_keyframe);
+        let mut want = Vec::new();
+        want.extend_from_slice(&annexb(&cached_sps));
+        want.extend_from_slice(&annexb(&cached_pps));
+        want.extend_from_slice(&annexb(&idr));
+        assert_eq!(
+            pkt.data, want,
+            "bare IDR with cached SPS/PPS must come out as SPS+PPS+IDR"
+        );
+    }
+
+    #[test]
+    fn build_packet_prepends_only_missing_param() {
+        // Partial case: access unit has SPS but is missing PPS. The
+        // function must insert ONLY the cached PPS — not duplicate SPS.
+        let sps = vec![0x67, 0x42, 0x00, 0x0A];
+        let cached_pps = vec![0x68, 0xCE, 0x38, 0x80];
+        let idr = vec![0x65, 0xAA, 0xBB];
+        let nals = vec![
+            Nal { data: sps.clone(), nal_type: 7 },
+            Nal { data: idr.clone(), nal_type: 5 },
+        ];
+
+        let pkt = FfmpegH264Encoder::build_packet(
+            &nals,
+            Some(&sps),       // cache also has SPS, but it's already in AU
+            Some(&cached_pps),
+            33,
+            33,
+            &PayloadSpec::h264_constrained_baseline(),
+        )
+        .unwrap();
+        assert!(pkt.is_keyframe);
+        // Expected: input order preserved (SPS first since it was in the
+        // AU), cached PPS inserted before the IDR (the only NAL that
+        // would otherwise be missing it), then IDR.
+        let mut want = Vec::new();
+        want.extend_from_slice(&annexb(&sps));
+        want.extend_from_slice(&annexb(&cached_pps));
+        want.extend_from_slice(&annexb(&idr));
+        assert_eq!(
+            pkt.data, want,
+            "AU with SPS but no PPS must get only PPS prepended"
+        );
+        // Sanity: SPS appears exactly once in the output bytes.
+        let sps_count = pkt.data.windows(sps.len()).filter(|w| *w == sps.as_slice()).count();
+        assert_eq!(sps_count, 1, "SPS must not be duplicated");
+    }
+
+    #[test]
+    fn build_packet_preserves_aud_before_sps_pps() {
+        // If an AUD (NAL type 9) is present at the start of the access
+        // unit, the canonical RFC 6184 / H.264 ordering is
+        // AUD → SPS → PPS → IDR. The cache prepend must land between
+        // AUD and IDR, not before AUD.
+        let aud = vec![0x09, 0xF0];
+        let cached_sps = vec![0x67, 0x42, 0x00, 0x0A];
+        let cached_pps = vec![0x68, 0xCE, 0x38, 0x80];
+        let idr = vec![0x65, 0xAA, 0xBB];
+        let nals = vec![
+            Nal { data: aud.clone(), nal_type: 9 },
+            Nal { data: idr.clone(), nal_type: 5 },
+        ];
+
+        let pkt = FfmpegH264Encoder::build_packet(
+            &nals,
+            Some(&cached_sps),
+            Some(&cached_pps),
+            33,
+            33,
+            &PayloadSpec::h264_constrained_baseline(),
+        )
+        .unwrap();
+        assert!(pkt.is_keyframe);
+        let mut want = Vec::new();
+        want.extend_from_slice(&annexb(&aud));
+        want.extend_from_slice(&annexb(&cached_sps));
+        want.extend_from_slice(&annexb(&cached_pps));
+        want.extend_from_slice(&annexb(&idr));
+        assert_eq!(pkt.data, want, "AUD must precede the cached SPS/PPS prepend");
+    }
+
+    #[test]
+    fn build_packet_no_prepend_for_p_frame() {
+        // P-frames (non-IDR slice, NAL type 1) do not require parameter
+        // sets — the decoder still has them from the prior IDR. Cache
+        // population MUST NOT cause prepending on non-IDR access units.
+        let cached_sps = vec![0x67, 0x42, 0x00, 0x0A];
+        let cached_pps = vec![0x68, 0xCE, 0x38, 0x80];
+        let nidr = vec![0x41, 0x9A];
+        let nals = vec![Nal { data: nidr.clone(), nal_type: 1 }];
+
+        let pkt = FfmpegH264Encoder::build_packet(
+            &nals,
+            Some(&cached_sps),
+            Some(&cached_pps),
+            66,
+            33,
+            &PayloadSpec::h264_constrained_baseline(),
+        )
+        .unwrap();
+        assert!(!pkt.is_keyframe);
+        assert_eq!(
+            pkt.data,
+            annexb(&nidr),
+            "P-frame must not have parameter sets prepended"
+        );
     }
 }
