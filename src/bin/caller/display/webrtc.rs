@@ -899,6 +899,45 @@ impl WebRtcPeer {
         &self.active_rids
     }
 
+    /// Test-only: construct a `WebRtcPeer` with just `active_rids`
+    /// populated and dummy values for everything else. The dummy
+    /// channels are constructed but their senders are dropped so
+    /// any production caller that tries to use them will see closed-
+    /// channel errors — only the layer-policy coordinator (which
+    /// reads `active_rids()` and the watch channels' initial values)
+    /// is intended to interact with these stubs.
+    ///
+    /// Used by `display::tests::pool_feed_bridge_*` to register a
+    /// fake peer whose negotiated demand keeps all VP8 simulcast
+    /// layers active across the layer-policy's per-tick demanded-
+    /// bound check (#48). Without a registered peer, the policy
+    /// computes `demanded = empty` and pauses every encoder
+    /// immediately, which is correct production behavior but
+    /// breaks tests that exercise the bridge → encoder → consumer
+    /// pipeline directly.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        peer_id: PeerId,
+        active_rids: Vec<SimulcastRid>,
+    ) -> Self {
+        use std::collections::HashMap;
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (_obs_tx, observed_send_bitrate_rx) = watch::channel(None);
+        let (_ri_tx, remote_inbound_health_rx) =
+            watch::channel(HashMap::<SimulcastRid, PeerLayerHealth>::new());
+        let (_twcc_tx, twcc_health_rx) =
+            watch::channel::<Option<crate::display::twcc_tap::TwccHealth>>(None);
+        Self {
+            peer_id,
+            command_tx,
+            observed_send_bitrate_rx,
+            remote_inbound_health_rx,
+            twcc_health_rx,
+            active_rids,
+            shutdown: CancellationToken::new(),
+        }
+    }
+
     /// **Phase 4d.3b**: subscribe to this peer's aggregate TWCC
     /// health signal. Published once per second by the
     /// [`crate::display::twcc_tap::spawn_twcc_health_aggregator`]

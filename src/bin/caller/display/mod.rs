@@ -2052,6 +2052,37 @@ mod tests {
         }
     }
 
+    /// **#48 test helper**: register a fake peer in `session.peers`
+    /// whose negotiated `active_rids` is the full VP8 simulcast set
+    /// (`f`, `h`, `q`). Tests that exercise the pool-feed bridge →
+    /// encoder → consumer pipeline directly need this so the
+    /// per-tick layer-policy doesn't observe `current_peers.is_empty()`,
+    /// compute `demanded = empty`, and pause every encoder before the
+    /// test's first frame can flow.
+    ///
+    /// Pre-#48 the layer-policy's per-tick output during a no-peers
+    /// window stayed at `current_rids` (presence_active=true via
+    /// PAUSE_DEBOUNCE), so these tests implicitly relied on a 5s
+    /// window where all encoders ran. With #48 the demanded-bound
+    /// fires immediately on `current_peers.is_empty()` — correct
+    /// production behavior, but breaks tests that don't model peers.
+    ///
+    /// Insert the peer BEFORE `session.start()` so the layer-policy's
+    /// first tick (immediate after spawn) sees the peer.
+    async fn register_test_peer_demanding_all_layers(session: &DisplaySession) {
+        use crate::display::encode::pool::SimulcastRid;
+        use crate::display::webrtc::WebRtcPeer;
+        let peer = Arc::new(WebRtcPeer::new_for_test(
+            1u64,
+            vec![
+                SimulcastRid::full(),
+                SimulcastRid::half(),
+                SimulcastRid::quarter(),
+            ],
+        ));
+        session.peers.write().await.insert(1u64, peer);
+    }
+
     /// Before `start()` runs, the pool is uninitialized. `get()` returning
     /// `None` is the contract other phases rely on to know whether the
     /// session is hot (bridge running, pool ready) or still cold.
@@ -2512,6 +2543,7 @@ mod tests {
     async fn pool_feed_bridge_heartbeats_on_idle_capture() {
         let backend = Arc::new(StubBackend { width: 64, height: 64 });
         let session = DisplaySession::new(0, backend);
+        register_test_peer_demanding_all_layers(&session).await;
         session
             .start(30, None, None)
             .await
@@ -2595,6 +2627,7 @@ mod tests {
     async fn pool_feed_bridge_seeds_latest_i420_from_capture_snapshot() {
         let backend = Arc::new(StubBackend { width: 64, height: 64 });
         let session = DisplaySession::new(0, backend);
+        register_test_peer_demanding_all_layers(&session).await;
 
         // Pre-seed BEFORE start() so the bridge's eager-spawn
         // snapshot reads it on first scheduling. With StubBackend's
@@ -2778,6 +2811,7 @@ mod tests {
     async fn pool_feed_bridge_burst_clocks_encoder_at_tick_rate() {
         let backend = Arc::new(StubBackend { width: 64, height: 64 });
         let session = DisplaySession::new(0, backend);
+        register_test_peer_demanding_all_layers(&session).await;
 
         // Pre-seed `latest_frame` BEFORE `start()` so the bridge's
         // eager-spawn snapshot reliably reads it. The seed branch

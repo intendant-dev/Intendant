@@ -791,27 +791,34 @@ pub fn diff_wanted_aggregate(
 /// producing right now is silently dropped). Rationale: a peer that
 /// negotiated a single RID can't fall back to the floor — its
 /// WebRTC track only has one encoding, so pausing that layer
-/// starves the peer rather than degrading it. The pin is bounded
-/// per-peer (a multi-RID peer pins nothing) and per-tick (joins +
-/// disconnects re-derive the set), so a single-RID peer
-/// disconnecting immediately removes its pin and restores the
-/// policy's full pause authority. `presence_active = false` still
-/// short-circuits to empty — the pin only overrides loss-driven
-/// pauses, not the zero-peers idle case.
+/// starves the peer rather than degrading it.
 ///
-/// **The pin is intentionally narrow.** It does NOT override
-/// `presence_active=false` (idle-pause still wins; no peers means
-/// no pin anyway), and it does NOT introduce layers the pool isn't
-/// producing (the post-resize bounding by `current_rids` is the
-/// safety net). It only protects against *loss-driven* pauses
-/// starving a peer with no fallback — the exact case that
-/// triggered #46's federated post-fix freeze.
+/// **#48 — `demanded_layers` is the hard upper bound.** The union
+/// of all live peers' negotiated active RIDs
+/// ([`crate::display::webrtc::WebRtcPeer::active_rids`]) defines
+/// the set of RIDs ANY live peer can actually consume. Layers
+/// outside this set are wasted CPU — the encoder produces frames
+/// that no peer's WebRTC track can decode. The bound is applied
+/// LAST: `effective = ((twcc∩rr) ∪ pinned) ∩ demanded`. Local
+/// DisplaySlot demands `{f,h,q}` (multi-RID offer), so its
+/// behavior is unchanged. Federated `q`-only demands `{q}`, so
+/// `f`/`h` pause regardless of loss state. Mixed local+federated
+/// demands `{f,h,q}` (union) for as long as the local peer is
+/// live. Zero peers → demanded is empty → effective is empty
+/// (encoders pause immediately, no debounce-window-of-wasted-CPU).
+///
+/// The single-RID peer's pin is by construction ⊆ demanded
+/// (their pin is their only negotiated RID, which is in their
+/// own contribution to the union), so the demanded bound never
+/// strips a pinned RID. Both invariants — pin and demand — hold
+/// simultaneously.
 pub fn compose_effective_wanted(
     presence_active: bool,
     twcc_union: &HashSet<SimulcastRid>,
     rr_union: &HashSet<SimulcastRid>,
     current_rids: &[SimulcastRid],
     pinned_layers: &HashSet<SimulcastRid>,
+    demanded_layers: &HashSet<SimulcastRid>,
 ) -> HashSet<SimulcastRid> {
     if !presence_active {
         return HashSet::new();
@@ -830,6 +837,14 @@ pub fn compose_effective_wanted(
             effective.insert(rid.clone());
         }
     }
+    // #48: hard upper bound — keep only layers some live peer
+    // actually demands. Applied LAST so it wins over both the
+    // policy votes and the pin (though by construction pin ⊆
+    // demand, so this is a no-op for pinned layers). Empty
+    // demand (zero peers, or all peers somehow without RIDs)
+    // collapses to empty effective — encoders pause immediately
+    // rather than waiting for the presence-debounce.
+    effective.retain(|rid| demanded_layers.contains(rid));
     effective
 }
 
@@ -977,6 +992,19 @@ pub fn spawn_layer_policy_coordinator(
                             }
                         })
                         .collect();
+                    // #48: per-tick demanded-layer set (union of every
+                    // live peer's negotiated active_rids). The
+                    // composer uses this as a hard upper bound on the
+                    // effective wanted set — layers outside this set
+                    // produce frames no live peer can decode and are
+                    // pure CPU waste. Computed alongside pinned so we
+                    // walk peers once per tick. Zero peers ⇒ empty
+                    // demand ⇒ effective collapses to empty (encoders
+                    // pause immediately).
+                    let demanded_layers: HashSet<SimulcastRid> = current_peers
+                        .values()
+                        .flat_map(|peer| peer.active_rids().iter().cloned())
+                        .collect();
                     drop(current_peers);
 
                     // ---- Refresh current_rids; derive floor + upper ----
@@ -1086,6 +1114,7 @@ pub fn spawn_layer_policy_coordinator(
                         &rr_union,
                         &current_rids,
                         &pinned_layers,
+                        &demanded_layers,
                     );
 
                     let actual_active: HashSet<SimulcastRid> = current_rids
@@ -2083,7 +2112,7 @@ mod tests {
         // Wanted, so peer wants all layers; union is the full set.
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new());
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new(), &full_three_layer_union());
 
         assert!(
             !effective.contains(&SimulcastRid::full()),
@@ -2108,7 +2137,7 @@ mod tests {
         let twcc_union = full_three_layer_union();
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(false, &twcc_union, &rr_union, &current, &HashSet::new());
+        let effective = compose_effective_wanted(false, &twcc_union, &rr_union, &current, &HashSet::new(), &full_three_layer_union());
 
         assert_eq!(
             effective,
@@ -2135,7 +2164,7 @@ mod tests {
         let twcc_union = full_three_layer_union();
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new());
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new(), &full_three_layer_union());
 
         assert_eq!(
             effective,
@@ -2173,7 +2202,7 @@ mod tests {
                 .collect();
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new());
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new(), &full_three_layer_union());
 
         assert!(
             !effective.contains(&SimulcastRid::full()),
@@ -2205,7 +2234,7 @@ mod tests {
         let twcc_union = full_three_layer_union();
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new());
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new(), &full_three_layer_union());
 
         assert!(
             !effective.contains(&SimulcastRid::quarter()),
@@ -2232,7 +2261,7 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new());
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new(), &full_three_layer_union());
 
         assert!(!effective.contains(&SimulcastRid::half()));
         assert!(effective.contains(&SimulcastRid::full()));
@@ -2253,11 +2282,11 @@ mod tests {
         let full = full_three_layer_union();
 
         assert_eq!(
-            compose_effective_wanted(true, &empty, &full, &current, &HashSet::new()),
+            compose_effective_wanted(true, &empty, &full, &current, &HashSet::new(), &full_three_layer_union()),
             HashSet::new(),
         );
         assert_eq!(
-            compose_effective_wanted(true, &full, &empty, &current, &HashSet::new()),
+            compose_effective_wanted(true, &full, &empty, &current, &HashSet::new(), &full_three_layer_union()),
             HashSet::new(),
         );
     }
@@ -2285,7 +2314,7 @@ mod tests {
             std::iter::once(SimulcastRid::full()).collect();
 
         let effective = compose_effective_wanted(
-            true, &twcc_union, &rr_union, &current, &pinned,
+            true, &twcc_union, &rr_union, &current, &pinned, &full_three_layer_union(),
         );
         assert!(
             effective.contains(&SimulcastRid::full()),
@@ -2311,7 +2340,7 @@ mod tests {
         let no_pin: HashSet<SimulcastRid> = HashSet::new();
 
         let effective = compose_effective_wanted(
-            true, &twcc_union, &rr_union, &current, &no_pin,
+            true, &twcc_union, &rr_union, &current, &no_pin, &full_three_layer_union(),
         );
         let expected: HashSet<SimulcastRid> =
             std::iter::once(SimulcastRid::quarter()).collect();
@@ -2344,7 +2373,7 @@ mod tests {
         let with_pin: HashSet<SimulcastRid> =
             std::iter::once(SimulcastRid::full()).collect();
         let pinned_effective = compose_effective_wanted(
-            true, &twcc_union, &rr_union, &current, &with_pin,
+            true, &twcc_union, &rr_union, &current, &with_pin, &full_three_layer_union(),
         );
         assert!(pinned_effective.contains(&SimulcastRid::full()));
 
@@ -2355,7 +2384,7 @@ mod tests {
         // semantic explicit.
         let no_pin: HashSet<SimulcastRid> = HashSet::new();
         let unpinned_effective = compose_effective_wanted(
-            true, &twcc_union, &rr_union, &current, &no_pin,
+            true, &twcc_union, &rr_union, &current, &no_pin, &full_three_layer_union(),
         );
         assert!(
             !unpinned_effective.contains(&SimulcastRid::full()),
@@ -2385,7 +2414,7 @@ mod tests {
             std::iter::once(SimulcastRid::full()).collect();
 
         let effective = compose_effective_wanted(
-            true, &twcc_union, &rr_union, &current, &stale_pin,
+            true, &twcc_union, &rr_union, &current, &stale_pin, &full_three_layer_union(),
         );
         assert!(
             !effective.contains(&SimulcastRid::full()),
@@ -2414,12 +2443,122 @@ mod tests {
             std::iter::once(SimulcastRid::full()).collect();
 
         let effective = compose_effective_wanted(
-            false, &full_union, &full_union, &current, &pinned,
+            false, &full_union, &full_union, &current, &pinned, &full_three_layer_union(),
         );
         assert!(
             effective.is_empty(),
             "presence_active=false must short-circuit even with pin, \
              got {effective:?}",
+        );
+    }
+
+    // ----- #48: demanded-RID upper bound ---------------------------------
+
+    /// **#48 acceptance #1**: federated `q`-only peer demands `{q}`.
+    /// Even though no loss has been observed (TWCC + RR votes both
+    /// say "all layers wanted") and no pin is needed, `f` and `h`
+    /// MUST drop out of the effective set because no live peer
+    /// can decode them. CPU regression fix: 3-encoder waste was
+    /// the cause of the 358% CPU on the macOS primary.
+    #[test]
+    fn compose_demand_q_only_drops_unconsumed_f_and_h() {
+        let current = vp8_three_layer_set();
+        let no_loss = full_three_layer_union();
+        let pinned: HashSet<SimulcastRid> =
+            std::iter::once(SimulcastRid::quarter()).collect();
+        let demanded: HashSet<SimulcastRid> =
+            std::iter::once(SimulcastRid::quarter()).collect();
+
+        let effective = compose_effective_wanted(
+            true, &no_loss, &no_loss, &current, &pinned, &demanded,
+        );
+        assert_eq!(
+            effective,
+            std::iter::once(SimulcastRid::quarter()).collect::<HashSet<_>>(),
+            "q-only demand must drop f and h regardless of loss state",
+        );
+    }
+
+    /// **#48 acceptance #2**: local DisplaySlot demands `{f,h,q}`.
+    /// All three layers stay active (assuming no loss) — local
+    /// simulcast behavior unchanged.
+    #[test]
+    fn compose_demand_full_simulcast_keeps_all_layers() {
+        let current = vp8_three_layer_set();
+        let no_loss = full_three_layer_union();
+        let no_pin: HashSet<SimulcastRid> = HashSet::new();
+        let demanded = full_three_layer_union();
+
+        let effective = compose_effective_wanted(
+            true, &no_loss, &no_loss, &current, &no_pin, &demanded,
+        );
+        assert_eq!(effective, full_three_layer_union());
+    }
+
+    /// **#48 acceptance #3**: mixed local + federated peers.
+    /// Demand is the union: `{f,h,q}` (local) ∪ `{q}` (federated)
+    /// = `{f,h,q}`. Local gets all layers; federated gets q from
+    /// the same union. Single set, no per-peer routing needed at
+    /// the encoder level.
+    #[test]
+    fn compose_demand_mixed_local_and_federated_unions_to_full() {
+        let current = vp8_three_layer_set();
+        let no_loss = full_three_layer_union();
+        let pinned: HashSet<SimulcastRid> =
+            std::iter::once(SimulcastRid::quarter()).collect();
+        let mut demanded = full_three_layer_union();
+        demanded.insert(SimulcastRid::quarter());
+
+        let effective = compose_effective_wanted(
+            true, &no_loss, &no_loss, &current, &pinned, &demanded,
+        );
+        assert_eq!(effective, full_three_layer_union());
+    }
+
+    /// **#48 acceptance #4**: zero peers ⇒ empty demand ⇒ empty
+    /// effective. Encoders pause immediately, no debounce-window
+    /// of wasted CPU. The presence-policy short-circuit at
+    /// `presence_active=false` still applies, but the demanded
+    /// bound also independently fires — defense in depth.
+    #[test]
+    fn compose_zero_peers_empty_demand_pauses_all_layers() {
+        let current = vp8_three_layer_set();
+        let no_loss = full_three_layer_union();
+        let no_pin: HashSet<SimulcastRid> = HashSet::new();
+        let no_demand: HashSet<SimulcastRid> = HashSet::new();
+
+        let effective = compose_effective_wanted(
+            true, &no_loss, &no_loss, &current, &no_pin, &no_demand,
+        );
+        assert!(
+            effective.is_empty(),
+            "empty demand must pause all layers, got {effective:?}",
+        );
+    }
+
+    /// **#48 + #57 interplay**: demanded bound never strips a
+    /// pinned RID — by construction, a single-RID peer's pin IS
+    /// in their own contribution to the demand union. Pinned
+    /// `q` for federated; demanded includes `q` (same peer);
+    /// even under high loss the effective set keeps `q`.
+    #[test]
+    fn compose_pin_and_demand_invariants_compose_safely() {
+        let current = vp8_three_layer_set();
+        let twcc_union: HashSet<SimulcastRid> =
+            std::iter::once(SimulcastRid::quarter()).collect();
+        let rr_union = full_three_layer_union();
+        let pinned: HashSet<SimulcastRid> =
+            std::iter::once(SimulcastRid::quarter()).collect();
+        let demanded: HashSet<SimulcastRid> =
+            std::iter::once(SimulcastRid::quarter()).collect();
+
+        let effective = compose_effective_wanted(
+            true, &twcc_union, &rr_union, &current, &pinned, &demanded,
+        );
+        assert_eq!(
+            effective,
+            std::iter::once(SimulcastRid::quarter()).collect::<HashSet<_>>(),
+            "pin + demand must both leave q active",
         );
     }
 
