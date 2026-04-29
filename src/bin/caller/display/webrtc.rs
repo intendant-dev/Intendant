@@ -1909,11 +1909,28 @@ impl WebRtcPeer {
         // existing driver and exit when the peer is torn down. The
         // task owns the lease and resubscribes as needed (see
         // `pool_frame_intake` for the Closed-handling contract).
+        //
+        // #46 fix companion: filter the subscriptions handed to the
+        // intake down to the active RIDs. The driver was built with
+        // `active_rids` (intersected with the offer's
+        // `a=simulcast:recv`), so it knows about exactly those RIDs;
+        // forwarding frames for any other RID hits the driver's
+        // "frame for unknown rid" defensive return + log spam (see
+        // step 3b in the driver). The pool's full subscription set
+        // is preserved through `lease` (refcount + Drop semantics
+        // unchanged) so the always-on encoders keep producing for
+        // any other peer that wants those layers.
+        let active_rid_set: std::collections::HashSet<SimulcastRid> =
+            active_rids.iter().cloned().collect();
+        let intake_subscriptions: Vec<EncoderSubscription> = subscriptions
+            .into_iter()
+            .filter(|s| active_rid_set.contains(&s.id.rid))
+            .collect();
         let intake_shutdown = peer.shutdown.clone();
         tokio::spawn(pool_frame_intake(
             pool,
             negotiated_prefs,
-            subscriptions,
+            intake_subscriptions,
             lease,
             encoded_frame_tx,
             drops_counter,
