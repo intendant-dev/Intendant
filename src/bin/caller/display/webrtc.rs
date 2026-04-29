@@ -1066,6 +1066,177 @@ fn first_video_mid_from_offer(sdp: &str) -> Option<String> {
     None
 }
 
+/// Parse the offer SDP's `a=simulcast:recv <rid>;<rid>;...` line and return
+/// the RIDs the browser is willing to receive.
+///
+/// Returns:
+/// - `None` if the offer's video section has no `a=simulcast:recv`
+///   directive at all (the federated [`PeerDisplayConnection`] path post-#46
+///   diagnostic landed at `e815bac`, and any offerer that hasn't munged
+///   simulcast:recv into its track shape).
+/// - `Some(vec)` of `SimulcastRid`s, in offer order, when the directive is
+///   present (the local `DisplaySlot` path at `static/app.html:7808`,
+///   which injects `a=simulcast:recv full;half;quarter` before
+///   `setLocalDescription`).
+///
+/// The caller in [`WebRtcPeer::new`] uses this to **intersect** the
+/// peer's [`active_rids`] (derived from encoder pool subscriptions) with
+/// what the offer actually requested. Without the intersection, the peer
+/// would honestly answer with 3 RIDs even when the offer was
+/// single-encoding — and the browser would receive a multi-RID
+/// `a=simulcast:send full;half;quarter` answer with no `a=ssrc`
+/// declarations to pair RIDs with packets, drop every RTP packet, and
+/// stay at `framesDecoded=0`. Confirmed empirically against Chrome via
+/// `pliCount > 0`, `packetsReceived > 0`, `framesDecoded == 0`. See the
+/// `WebRtcPeer::new` callsite for the intersection logic and the
+/// `parse_offer_simulcast_recv_rids_*` tests below.
+///
+/// Section-aware: only the first `m=video` section is consulted. Audio
+/// `simulcast` lines (rare) are ignored. The function returns `None`
+/// for any offer without a video section, matching the existing
+/// `first_video_mid_from_offer` semantics.
+///
+/// Forward-compat: unknown / non-canonical RID names are passed through
+/// to [`SimulcastRid::from_str_loose`]. Tokens that don't parse to a
+/// known RID variant are silently dropped from the returned list rather
+/// than failing the whole parse — keeps the answer-side intersection
+/// useful even if a future browser advertises an unrecognized RID
+/// alongside known ones.
+fn parse_offer_simulcast_recv_rids(sdp: &str) -> Option<Vec<SimulcastRid>> {
+    let mut in_video = false;
+    for raw in sdp.lines() {
+        let line = raw.trim_end_matches('\r');
+        if line.starts_with("m=") {
+            if in_video {
+                // Past the first video section without finding it.
+                return None;
+            }
+            in_video = line.starts_with("m=video ");
+            continue;
+        }
+        if !in_video {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("a=simulcast:") else {
+            continue;
+        };
+        // Valid forms (RFC 8853):
+        //   a=simulcast:recv f;h;q
+        //   a=simulcast:send f;h;q recv x          (bidirectional)
+        // We only care about the recv side from the offerer's POV.
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        let mut i = 0;
+        while i + 1 < parts.len() {
+            if parts[i] == "recv" {
+                let rids: Vec<SimulcastRid> = parts[i + 1]
+                    .split(';')
+                    .filter_map(SimulcastRid::from_str_loose)
+                    .collect();
+                return Some(rids);
+            }
+            i += 2;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod parse_offer_simulcast_recv_rids_tests {
+    use super::*;
+
+    /// Federated `PeerDisplayConnection` path: offer has no
+    /// `a=simulcast:recv`. The fix-site uses the `None` return to
+    /// narrow active_rids to a single layer.
+    #[test]
+    fn federated_offer_without_simulcast_returns_none() {
+        let sdp = "v=0\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+                   a=mid:0\r\n\
+                   a=rtpmap:96 VP8/90000\r\n\
+                   a=recvonly\r\n";
+        assert_eq!(parse_offer_simulcast_recv_rids(sdp), None);
+    }
+
+    /// Local `DisplaySlot` path: offer contains `a=simulcast:recv f;h;q`.
+    /// Returns the three RIDs in offer order — the fix-site keeps all
+    /// three because the browser explicitly asked for them.
+    #[test]
+    fn local_offer_with_full_simulcast_returns_all_three() {
+        let sdp = "v=0\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+                   a=mid:0\r\n\
+                   a=rtpmap:96 VP8/90000\r\n\
+                   a=rid:f recv\r\n\
+                   a=rid:h recv\r\n\
+                   a=rid:q recv\r\n\
+                   a=simulcast:recv f;h;q\r\n\
+                   a=recvonly\r\n";
+        assert_eq!(
+            parse_offer_simulcast_recv_rids(sdp),
+            Some(vec![
+                SimulcastRid::full(),
+                SimulcastRid::half(),
+                SimulcastRid::quarter(),
+            ]),
+        );
+    }
+
+    /// Subset offer (e.g. a constrained-bandwidth browser asking for
+    /// half + quarter only). The fix-site intersects with the peer's
+    /// own active_rids and forwards the overlap.
+    #[test]
+    fn offer_with_subset_returns_subset_in_offer_order() {
+        let sdp = "v=0\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+                   a=simulcast:recv h;q\r\n";
+        assert_eq!(
+            parse_offer_simulcast_recv_rids(sdp),
+            Some(vec![SimulcastRid::half(), SimulcastRid::quarter()]),
+        );
+    }
+
+    /// Bidirectional `simulcast` line (`a=simulcast:send X recv Y`) —
+    /// uncommon but RFC 8853-valid. Parser must walk past the `send`
+    /// half and find the `recv` half.
+    #[test]
+    fn bidirectional_simulcast_picks_recv_half() {
+        let sdp = "v=0\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+                   a=simulcast:send x recv f;h\r\n";
+        assert_eq!(
+            parse_offer_simulcast_recv_rids(sdp),
+            Some(vec![SimulcastRid::full(), SimulcastRid::half()]),
+        );
+    }
+
+    /// `a=simulcast:` lines outside the video section are ignored
+    /// (defensive — audio sections never have simulcast in our setup,
+    /// but the section-awareness keeps a future audio simulcast from
+    /// confusing the parser).
+    #[test]
+    fn audio_simulcast_is_ignored() {
+        let sdp = "v=0\r\n\
+                   m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+                   a=simulcast:recv f;h\r\n";
+        assert_eq!(parse_offer_simulcast_recv_rids(sdp), None);
+    }
+
+    /// Forward-compat: unknown RID tokens silently drop, known ones
+    /// pass through. An offer mixing recognized + future RID names
+    /// must not break the intersection — it just narrows to the
+    /// intersection of (peer's RIDs) ∩ (recognized offer RIDs).
+    #[test]
+    fn unknown_rid_tokens_are_dropped_known_pass_through() {
+        let sdp = "v=0\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+                   a=simulcast:recv f;ultra;q\r\n";
+        assert_eq!(
+            parse_offer_simulcast_recv_rids(sdp),
+            Some(vec![SimulcastRid::full(), SimulcastRid::quarter()]),
+        );
+    }
+}
+
 impl WebRtcPeer {
     /// Create a new peer from an SDP offer, returning `(Self, answer_sdp)`.
     ///
@@ -1642,23 +1813,73 @@ impl WebRtcPeer {
         // (which is layer order from `vp8_simulcast`: full / half /
         // quarter), so the answer's `a=rid` lines come out in
         // preference order.
-        let active_rids: Vec<SimulcastRid> = subscriptions
+        let pool_rids: Vec<SimulcastRid> = subscriptions
             .iter()
             .filter(|s| s.id.codec == active_codec)
             .map(|s| s.id.rid.clone())
             .collect();
         // Defensive — `active_codec_from_subscriptions` returned
         // Some, so at least one subscription has this codec.
-        // Treating an empty active_rids as a bug rather than a soft
+        // Treating an empty pool_rids as a bug rather than a soft
         // failure: build_with_codec_set rejects empty too, so this
         // is a redundant guard with a more specific error message.
-        if active_rids.is_empty() {
+        if pool_rids.is_empty() {
             return Err(CallerError::WebRtc(format!(
                 "new: active_codec={active_codec:?} resolved but no \
                  subscriptions match it — internal pool/peer state \
                  divergence",
             )));
         }
+        // #46 fix: intersect the pool's RIDs with what the offer
+        // actually requested via `a=simulcast:recv`. The pool's
+        // always-on VP8 simulcast advertises 3 RIDs (f/h/q), but a
+        // federated [`PeerDisplayConnection`] offer post-`e815bac` no
+        // longer includes `a=simulcast:recv` — sending an answer
+        // declaring 3 RIDs against such an offer produces an
+        // `a=simulcast:send f;h;q` answer with no `a=ssrc` declarations
+        // (rtc 0.9 SDP-writer bug), which Chrome / WebKit silently
+        // refuse to decode. Empirical signature: `framesDecoded == 0`
+        // forever, `packetsReceived > 0`, `pliCount > 0`. The local
+        // [`DisplaySlot`] path injects `a=simulcast:recv f;h;q` before
+        // setLocalDescription so its offer keeps the multi-RID send
+        // path; the federated path narrows to `[full]`.
+        //
+        // Three branches:
+        //  - Offer has no `a=simulcast:recv` → narrow to a single
+        //    layer (the highest-priority one, layer order from
+        //    `vp8_simulcast`: full first).
+        //  - Offer has `a=simulcast:recv [...]` → intersect pool_rids
+        //    with the offer's recv list, preserving pool order. Empty
+        //    intersection is a hard error (no overlap = no codec).
+        //  - Offer requests RIDs the pool isn't producing right now
+        //    (e.g. an on-demand layer construction failure) → silently
+        //    drop those RIDs from the answer.
+        let active_rids: Vec<SimulcastRid> =
+            match parse_offer_simulcast_recv_rids(offer_sdp) {
+                None => {
+                    // Single-encoding offer → narrow to one layer. Pool
+                    // returns layers in priority order (full first), so
+                    // index 0 is the right pick. Cloning is cheap (a
+                    // String wrapper).
+                    vec![pool_rids[0].clone()]
+                }
+                Some(offer_rids) => {
+                    let intersected: Vec<SimulcastRid> = pool_rids
+                        .iter()
+                        .filter(|r| offer_rids.contains(r))
+                        .cloned()
+                        .collect();
+                    if intersected.is_empty() {
+                        return Err(CallerError::WebRtc(format!(
+                            "new: offer's a=simulcast:recv RIDs \
+                             {offer_rids:?} have no overlap with pool's \
+                             active RIDs {pool_rids:?} for codec \
+                             {active_codec:?}",
+                        )));
+                    }
+                    intersected
+                }
+            };
         // Phase 4e: keyframe-request channel from driver → intake.
         // Driver pushes a `SimulcastRid` to this channel for every
         // PLI / FIR whose target SSRC matches one of our outbound

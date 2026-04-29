@@ -299,6 +299,25 @@ impl SimulcastRid {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Parse a token as a known simulcast RID. Recognizes the three
+    /// canonical names ([`RID_FULL`] / [`RID_HALF`] / [`RID_QUARTER`])
+    /// and returns `Some` for them; returns `None` for any other token.
+    ///
+    /// Forward-compat: callers parsing offerer-supplied RID lists
+    /// (notably `parse_offer_simulcast_recv_rids` in
+    /// [`crate::display::webrtc`]) `filter_map` through this so unknown
+    /// future RID names silently drop while known ones pass through.
+    /// Strict variants that need to surface unknowns can match on the
+    /// raw `&str` directly before calling this.
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s {
+            RID_FULL => Some(Self::full()),
+            RID_HALF => Some(Self::half()),
+            RID_QUARTER => Some(Self::quarter()),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for SimulcastRid {
