@@ -291,6 +291,14 @@ html, body {
   overflow-y: auto;
   flex: 1;
 }
+/* Network pane needs more horizontal room than the text-input panes —
+   the .daemon-row flex children (label + URL + capability badges +
+   version + status chip + expand button + Remove button) only fit
+   above ~900px. Account / Agent / Debug stay at the readability-
+   optimised 640px. */
+.settings-pane-body--wide {
+  max-width: 1024px;
+}
 .settings-save-row {
   display: flex;
   gap: 8px;
@@ -4492,7 +4500,7 @@ html, body {
 
         <!-- Network pane: anything about how this daemon talks to others -->
         <div class="subtab-pane" id="settings-pane-network">
-          <div class="settings-pane-body">
+          <div class="settings-pane-body settings-pane-body--wide">
             <fieldset class="settings-group">
               <legend>Daemons</legend>
               <p style="color:var(--subtext0);font-size:12px;margin:0 0 10px">
