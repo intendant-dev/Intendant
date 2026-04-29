@@ -7776,50 +7776,30 @@ class DisplaySlot {
     // because the answerer can't introduce new media lines.
     const videoTransceiver = this.pc.addTransceiver('video', { direction: 'recvonly' });
 
-    // DisplaySlot is the VP8 simulcast path: we inject
-    // `a=simulcast:recv f;h;q` below, and only VP8 supports the
-    // multi-encoding RID layout cleanly. H.264 in our encoder pool is
-    // single-encoding; if the server picks H.264 it emits a malformed
-    // simulcast answer (`a=simulcast:send f;h;q` with a single ssrc
-    // covering all RIDs) and the browser decodes one keyframe then chokes.
+    // **#58**: NO `setCodecPreferences` reorder. WKWebView's default
+    // codec order puts H.264 PTs (96/98/100) before VP8 (107) — let
+    // it. On macOS the server then negotiates H.264, which spawns a
+    // hardware-accelerated VideoToolbox encoder
+    // ([`crate::display::encode::h264_macos`]) — single-encoding,
+    // single thread, ~5-10 % CPU at full resolution.
     //
-    // WKWebView's default offer order puts H.264 PTs (96/98/100) before
-    // VP8 (107), and the server picks the first-offered codec, so we
-    // explicitly reorder via setCodecPreferences to put VP8 first. This
-    // makes the offer honestly describe what this path wants —
-    // VP8 simulcast — instead of relying on the server to disambiguate.
-    if (typeof RTCRtpReceiver !== 'undefined' &&
-        typeof RTCRtpReceiver.getCapabilities === 'function' &&
-        typeof videoTransceiver.setCodecPreferences === 'function') {
-      try {
-        const caps = RTCRtpReceiver.getCapabilities('video');
-        if (caps && Array.isArray(caps.codecs)) {
-          const vp8 = caps.codecs.filter(c => c.mimeType === 'video/VP8');
-          const rtx = caps.codecs.filter(c => c.mimeType === 'video/rtx');
-          const others = caps.codecs.filter(c =>
-            c.mimeType !== 'video/VP8' && c.mimeType !== 'video/rtx');
-          const reordered = [...vp8, ...rtx, ...others];
-          videoTransceiver.setCodecPreferences(reordered);
-          console.info(
-            `[DisplaySlot ${this.displayId}] codec preferences set; first three: `
-              + reordered.slice(0, 3).map(c => c.mimeType).join(', ')
-          );
-        }
-      } catch (e) {
-        // If setCodecPreferences is unsupported or rejects the list, fall
-        // through to default ordering. The fallback (SDP munging to
-        // reorder PTs in the offer) lives at the createOffer call below
-        // and only fires when the codec preference path didn't take.
-        console.warn(
-          `[DisplaySlot ${this.displayId}] setCodecPreferences failed: ${e.message}`
-        );
-      }
-    } else {
-      console.warn(
-        `[DisplaySlot ${this.displayId}] setCodecPreferences not available; `
-          + `offer will use WKWebView default codec order (H.264 first).`
-      );
-    }
+    // Pre-#58 this path force-reordered VP8 first because the local
+    // DisplaySlot also injected `a=simulcast:recv f;h;q` for
+    // multi-encoding receive, and rtc 0.9's SDP writer mishandles
+    // multi-RID H.264 (single SSRC covering all RIDs → browser
+    // chokes). #58 also drops to `a=simulcast:recv f` (single-RID
+    // receive — see `DISPLAY_SIMULCAST_RIDS`), so the rtc 0.9
+    // multi-RID-H.264 bug is no longer reachable: with single-RID
+    // receive the answer is plain sendonly, identical for VP8 and
+    // H.264. Restoring default codec order = restoring the
+    // hardware-accelerated path the macOS UTM guest needs to stay
+    // usable. Pre-#58 idle dashboard pegged the guest at 245 %+
+    // CPU on three software VP8 encoders for one viewer.
+    //
+    // Chrome viewers on macOS still default VP8 first; they get
+    // single-encoding VP8 (libvpx software, 1 encoder) at ~80 % CPU
+    // — also a substantial drop from ~245 %, just less dramatic
+    // than WKWebView's hardware H.264 path.
 
     // Create data channels BEFORE offer (browser is the offerer)
     this.controlChannel = this.pc.createDataChannel('control', { ordered: true });
@@ -11454,7 +11434,19 @@ function isLoopbackUrl(url) {
 // (display/encode/pool.rs) — RIDs are part of the wire contract,
 // drift here vs the encoder pool means the answer SDP advertises
 // RIDs the browser doesn't recognize and the track never wires up.
-const DISPLAY_SIMULCAST_RIDS = ['f', 'h', 'q'];
+// **#58**: single-RID receive. Pre-#58 this was `['f', 'h', 'q']` —
+// three-layer simulcast receive — which forced the encoder pool to
+// run all three software VP8 encoders for any local DisplaySlot
+// viewer. Demanded-bound from #48 correctly registered that demand
+// and kept all three running, but with one local viewer the cost is
+// 245 %+ CPU on a UTM macOS guest (three full-resolution software
+// VP8 streams). Single-RID receive collapses this to one encoder
+// (hardware H.264 on macOS via VideoToolbox when WKWebView
+// negotiates H.264, or one software VP8 stream when the browser
+// prefers VP8). Multi-encoding receive is reintroducible behind a
+// per-deployment policy switch when adaptive bandwidth across
+// multiple viewers becomes a real concern again.
+const DISPLAY_SIMULCAST_RIDS = ['f'];
 
 // Inject `a=rid:<rid> recv` lines + `a=simulcast:recv <rids>` into
 // the m=video section of an Offer SDP. Mirrors the server-side

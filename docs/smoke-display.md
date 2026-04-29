@@ -108,17 +108,21 @@ killall intendant-bin 2>/dev/null
 
 ### 3.1 Browser console (DevTools)
 
-After WS connect (logged once per `DisplaySlot` lifetime):
+After WS connect (logged once per `DisplaySlot` lifetime). Exact
+codec depends on browser default order — WKWebView prefers H.264,
+Chrome prefers VP8:
 
 ```
-[DisplaySlot 0] codec preferences set; first three: video/VP8, video/rtx, video/H264
-[DisplaySlot 0] offer first codec: VP8/90000
-[DisplaySlot 0] answer negotiated codec: VP8/90000; a=simulcast:send f;h;q
+[DisplaySlot 0] offer first codec: <H264 or VP8>/90000
+[DisplaySlot 0] answer negotiated codec: <same>/90000; (no a=simulcast)
 ```
 
-`a=simulcast:send f;h;q` confirms three-layer simulcast (`f`=full,
-`h`=half, `q`=quarter). Anything else (single layer, missing simulcast
-attribute, codec other than VP8) → regression in the negotiation path.
+**#58**: local DisplaySlot is single-RID (`a=simulcast:recv f` only),
+so the answer is plain sendonly with no `a=simulcast:send` directive.
+WKWebView gets hardware-accelerated H.264 via VideoToolbox; Chrome
+gets one software VP8 encoder. Multi-encoding simulcast (`f;h;q`) is
+NOT expected on this path post-#58 — that signature would indicate a
+regression to the pre-#58 unconditional 3-encoder demand.
 
 ### 3.2 Authority chip (browser A and browser B)
 
