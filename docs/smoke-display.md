@@ -1,18 +1,20 @@
-# Local DisplaySlot smoke recipe
+# Display smoke recipe
 
-Canonical end-to-end smoke for the local display path: capture → VP8
-or H.264 (single-RID by default) → WebRTC → browser, plus the
-per-display input-authority chip. Run this after any change to
-`src/bin/caller/display/`, `src/bin/caller/web_gateway.rs`'s
-display/authority code, or `static/app.html`'s `DisplaySlot` /
-`pendingAuthorityStates` / `set_on_display_input_authority_change`.
+Canonical end-to-end smoke for the display paths:
 
-This is the local path only. Federated display (peer-to-peer over
-`PeerOp::WebRtcSignal`) is out of scope here — it has its own
-operational path with separate smoke coverage.
+- **Local DisplaySlot** (§1–5): macOS Mac viewing its own display via
+  the in-process WebRTC pipe. H.264 by default (WKWebView's hardware
+  VideoToolbox path); single-RID. Run this after any change to
+  `src/bin/caller/display/`, `src/bin/caller/web_gateway.rs`'s
+  display/authority code, or `static/app.html`'s `DisplaySlot` /
+  `pendingAuthorityStates` / `set_on_display_input_authority_change`.
+- **Federated path** (§6): browser → host coturn TURN → peer daemon
+  → peer's encoder. VP8 single-RID floor. Run this after any change to
+  `src/bin/caller/peer/`, `static/app.html`'s
+  `PeerDisplayConnection`, or peer-side encoder pool / layer policy.
 
-**Pass = every signal in §3 matches verbatim. Anything else is a
-regression in 5a.1 / 5c / 5c.1 / 5c.2.**
+**Pass = every signal in §3 (local) and §6.2 (federated) matches
+verbatim. Anything else is a regression in the implicated phase.**
 
 ## 1. Setup
 
@@ -195,3 +197,148 @@ Expect:
 | `Display :0 released` fires on transient disconnect | `disconnect()` invoked with `userInitiated:true` from a non-user-close path — check capture_lost / ICE retry handlers |
 | `a=simulcast:send` missing from answer | Per-peer Rtc codec negotiation broken (phase 2 / 3), or rtc 0.9 SDP-sanitizer regression |
 | `peers=N` doesn't match browser count | Encoder lifecycle leak — see `display/encode/pool.rs` refcounting |
+
+## 6. Federated path baseline
+
+Distinct from §1–5 above (local DisplaySlot). The federated path —
+browser → host coturn TURN → peer daemon → peer's encoder — is the
+operational target for cross-host display viewing. Baseline as of
+#67 / #70:
+
+**Federated baseline = VP8 single-RID floor over TURN relay.**
+
+- **Codec**: VP8, pinned in `PeerDisplayConnection.connect()`
+  via `setCodecPreferences` (#67). Distinct from local DisplaySlot's
+  H.264 default (#58); federation has no hardware-accel argument (peer
+  is libx264 software anyway) and the H.264 path is unusable in the
+  reference smoke topology — see "H.264 status" below.
+- **Layer**: `q` only. Peer's layer-policy starts with all three layers
+  paused (`PauseLayer(f)`, `PauseLayer(h)`, `PauseLayer(q)`) and
+  resumes only `q` after Connected. Browser SIZE = 1/4 native capture
+  (e.g. 224×150 from 896×600, or 340×192 from 1360×768).
+- **Wire**: TURN UDP relay forced via `iceTransportPolicy=relay` when
+  `[webrtc].ice_servers` lists a turn:/turns: URL (#45). rtc 0.9 does
+  not drive DTLS over ICE-TCP (#41–#44), so direct paths stall at
+  `dtlsState=connecting`; relay is the verified-working path.
+- **SDP**: single PT (107 = VP8/90000), no `a=simulcast:send`, no
+  `a=rid:`, single SSRC, single `cname:display-<sessionhash>` (the
+  20-digit federated form, distinct from local DisplaySlot's
+  autoincrement `display-N` form).
+
+### 6.1 Federated smoke recipe
+
+Mac primary + Debian/X11 peer over the existing SSH tunnel topology:
+
+```sh
+# Peer (SIGTERM, never -9 — SIGKILL skips X11 SHM detach)
+ssh -J user@<jump> vm@<peer> 'pkill -TERM -f target/release/intendant; sleep 3'
+ssh -J user@<jump> vm@<peer> 'cd /home/vm/projects/intendant && setsid -f env DISPLAY=:0 \
+  ./target/release/intendant --web --no-tui --no-presence </dev/null >/tmp/intendant.out 2>&1'
+
+# Mac primary
+killall Intendant 2>/dev/null; killall intendant-bin 2>/dev/null; sleep 2
+> ~/.intendant/app-backend.log
+open -b com.intendant.app
+
+# Verify peer reachable + tunnel listening on a non-loopback addr
+# (browsers silently drop remote loopback ICE candidates)
+lsof -nP -iTCP:<tunnel-port> -sTCP:LISTEN
+
+# Re-add peer with browser_tcp_via_url set to a NON-loopback URL the
+# browser's machine can dial (Mac LAN IP, not 127.0.0.1)
+curl -s -X POST -H 'Content-Type: application/json' http://127.0.0.1:8765/api/peers -d '{
+  "card_url":"http://<mac-lan-ip>:<tunnel-port>/.well-known/agent-card.json",
+  "via_urls":["ws://<mac-lan-ip>:<tunnel-port>/ws"],
+  "browser_tcp_via_url":"ws://<mac-lan-ip>:<tunnel-port>/ws"
+}'
+
+# Persistent grant (script must NOT exit — keeps capture alive)
+( python3 -c '
+import asyncio, json, websockets
+async def main():
+    async with websockets.connect("ws://<mac-lan-ip>:<tunnel-port>/ws") as ws:
+        await ws.send(json.dumps({"action": "grant_user_display"}))
+        try:
+            while True: await asyncio.wait_for(ws.recv(), timeout=900)
+        except: pass
+asyncio.run(main())
+' >/tmp/grant.log 2>&1 ) & disown
+```
+
+In Intendant.app: Settings → Network → expand peer row → click
+**View display**.
+
+### 6.2 Federated expected signals
+
+Browser-side (Web Inspector → Console — install monkey-patch BEFORE
+clicking View display so SDP gets captured):
+
+```js
+window.__cap = {pcs:[], offers:[], answers:[]};
+const __O = window.RTCPeerConnection;
+window.RTCPeerConnection = function(...a){
+  const pc = new __O(...a); window.__cap.pcs.push(pc);
+  const co = pc.createOffer.bind(pc);
+  pc.createOffer = async function(...x){ const o = await co(...x); window.__cap.offers.push(o.sdp); return o; };
+  const sr = pc.setRemoteDescription.bind(pc);
+  pc.setRemoteDescription = async function(d){ if (d?.type === 'answer') window.__cap.answers.push(d.sdp); return sr(d); };
+  return pc;
+};
+window.RTCPeerConnection.prototype = __O.prototype;
+```
+
+After 30s of streaming, expected shape:
+
+| Signal | Expected |
+|---|---|
+| `window.__cap.offers[0]` m=video | `m=video 9 UDP/TLS/RTP/SAVPF 107` (VP8 only, no H.264 PTs) |
+| `window.__cap.answers[0]` | `a=rtpmap:107 VP8/90000`, no `a=simulcast:send`, no `a=rid:`, single `a=ssrc:<id>` |
+| `pc.iceConnectionState` | `connected` |
+| inbound-rtp[0].framesDecoded | advancing every getStats poll |
+| inbound-rtp[0].keyFramesDecoded | > 0 |
+| inbound-rtp[0].frameWidth | = 1/4 of peer's display res |
+| inbound-rtp[0].pliCount | ~0 (small VP8 IDRs survive without retransmits) |
+| inbound-rtp[0].nackCount | ~0 |
+| video.videoWidth | matches inbound-rtp.frameWidth, readyState=4 |
+
+Peer-side (`/tmp/intendant.out`):
+
+```
+[display/x11] XShm available, using shared memory capture <W>x<H>
+[layer-policy] PauseLayer(SimulcastRid("f"))
+[layer-policy] PauseLayer(SimulcastRid("h"))
+[layer-policy] PauseLayer(SimulcastRid("q"))
+[display/webrtc] peer <session-hash-id>: ICE-TCP enabled on <ip>:<port>
+[display/webrtc] connection: Connected
+[layer-policy] ResumeLayer(SimulcastRid("q"))
+[twcc-health] reported=N received=N lost=0 loss_fraction=0.0000 ...
+```
+
+`PauseLayer(f|h|q)` then `ResumeLayer(q)` only is the load-bearing
+signal — multi-layer simulcast would show `ResumeLayer(f)` and/or
+`ResumeLayer(h)` too. **No `[encoder/pool] h264:*` lines in the
+session** — H.264 should not spawn for federation; if it does see #71.
+
+### 6.3 H.264 status on federation (do not enable)
+
+H.264 over the federated path is currently broken end-to-end in the
+reference smoke topology. Diagnosed in #65 + #67:
+
+- Topology: browser → host coturn at `192.168.1.223:3478` → Debian
+  UTM peer at `192.168.65.2:8765`, all on one MacBook. Per-packet
+  loss measured at 13–22% on this purely-local path (anomalous;
+  pending investigation in #69 — likely virtio-net config / coturn
+  buffer / MTU).
+- libx264 IDR sizes at 1360×768 → ~349 KB ≈ 291 RTP packets.
+- P(complete IDR delivery) at 13–22% loss = (0.78)^291 ≈ 1.5e-30.
+  Effectively impossible to reassemble even one IDR.
+- Result: browser sees packets flowing (e.g. 80 MB / 30 s) but
+  framesDecoded stays at 0 indefinitely; PLI storm (~30/sec) as the
+  decoder begs for keyframes that can never complete.
+
+The Bug-B SPS/PPS guarantee (`63facd5`) remains correct H.264 hygiene
+for paths that DO negotiate H.264 (macOS-to-macOS local DisplaySlot)
+but does not by itself unblock federation. VP8 single-RID floor (this
+section) is the working federated baseline until either (a) the local
+TURN/virtio loss is fixed at the network layer (#69) or (b) the H.264
+encoder produces small enough IDRs to survive the loss (#69 mitigation).
