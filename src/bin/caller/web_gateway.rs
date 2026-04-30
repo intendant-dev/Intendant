@@ -31,6 +31,37 @@ struct ActivePresence {
     direct_tx: mpsc::UnboundedSender<String>,
 }
 
+/// Identity of who currently holds input authority for one display.
+///
+/// First slice (F-1 of `docs/design-federated-input-authority.md`):
+/// only `LocalWs` is constructed. The `FederatedWebRtc` variant lands
+/// in the F-1 follow-up commits that wire federated authority over
+/// the new `display_input_authority` data channel.
+///
+/// Modelled as an enum from day one (rather than starting with a
+/// plain `String` and migrating later) so callers update once:
+/// arbitration code threads through the explicit type, and adding
+/// `FederatedWebRtc` is a one-arm addition rather than a re-touch
+/// of every match site.
+#[derive(Clone, Debug)]
+enum DisplayInputHolder {
+    LocalWs { connection_id: String },
+    // FederatedWebRtc { peer_id: PeerId, session_id: String } — F-1 follow-up
+}
+
+impl DisplayInputHolder {
+    /// True iff this holder is `LocalWs` with the given `connection_id`.
+    /// Convenience predicate so gate / personalization sites stay
+    /// readable without an inline pattern match. When `FederatedWebRtc`
+    /// lands, returns `false` for that variant — the federated input
+    /// gate gets its own predicate.
+    fn matches_local_ws(&self, connection_id: &str) -> bool {
+        match self {
+            Self::LocalWs { connection_id: c } => c == connection_id,
+        }
+    }
+}
+
 /// Tracks which WebSocket connection currently holds input authority for
 /// one display (phase 5 of the multi-viewer display redesign).  Distinct
 /// axis from [`ActivePresence`] — presence authority governs voice/model
@@ -51,28 +82,29 @@ struct ActivePresence {
 /// `direct_tx` is the same mechanism as `force_disconnect_voice` for
 /// the presence slot.
 struct ActiveDisplayInput {
-    connection_id: String,
+    holder: DisplayInputHolder,
     direct_tx: mpsc::UnboundedSender<String>,
 }
 
 /// Phase 5a.1: dedicated internal broadcast event for display input
 /// authority transitions.
 ///
-/// Carries the holder's *server-internal* connection_id (or `None` for
-/// unclaimed) so each WS outbound task can personalize this for its own
-/// browser as `you | other | unclaimed` without ever shipping connection
-/// IDs to browsers.  Personalization happens in the per-connection
-/// outbound select arm where `connection_id_inbound` is in scope.
+/// Carries the holder's *server-internal* identity (or `None` for
+/// unclaimed) so each WS outbound task can personalize this for its
+/// own browser as `you | other | unclaimed` without ever shipping
+/// holder IDs to browsers.  Personalization happens in the
+/// per-connection outbound select arm where `connection_id_outbound`
+/// is in scope.
 ///
 /// Distinct from [`AppEvent`] on purpose: the generic outbound
 /// broadcast carries already-serialized JSON strings, which would leak
 /// holder IDs if we routed authority through it.  A dedicated typed
-/// channel keeps the holder ID inside the gateway and forces every
-/// per-connection consumer to compute its own personalized state.
+/// channel keeps the holder identity inside the gateway and forces
+/// every per-connection consumer to compute its own personalized state.
 #[derive(Clone, Debug)]
 struct DisplayInputAuthorityChange {
     display_id: u32,
-    holder_connection_id: Option<String>,
+    holder: Option<DisplayInputHolder>,
 }
 
 /// Build the per-peer "may this connection inject input now?" closure
@@ -84,17 +116,20 @@ struct DisplayInputAuthorityChange {
 /// the closure or rebuild the peer connection.
 ///
 /// Semantics:
-/// - `auth.get(display_id) == Some(holder)` and `holder.connection_id == this_id`
-///   → `true`  (this connection holds authority)
-/// - `auth.get(display_id) == Some(holder)` and `holder.connection_id != this_id`
-///   → `false` (someone else holds it; silent drop)
+/// - `auth.get(display_id) == Some(entry)` and
+///   `entry.holder.matches_local_ws(this_id)` → `true`
+///   (this WS connection holds authority)
+/// - `auth.get(display_id) == Some(entry)` and
+///   `!entry.holder.matches_local_ws(this_id)` → `false`
+///   (someone else — local or, once the variant lands, federated —
+///   holds it; silent drop)
 /// - `auth.get(display_id) == None`
-///   → `true`  (unclaimed = pre-phase-5 default; any connection can input)
+///   → `true` (unclaimed = pre-phase-5 default; any connection can
+///   input)
 ///
-/// The federated path does NOT call this; it passes
-/// `Arc::new(|| false)` inline — federated authority is a separate
-/// slice and we close the gap rather than inheriting an "any peer can
-/// input" hole there.
+/// The federated path does NOT call this; it has its own deny-by-
+/// default authorizer that becomes a `FederatedWebRtc` registry
+/// lookup in F-1's later commits.
 fn build_local_ws_input_authorizer(
     display_id: u32,
     connection_id: String,
@@ -103,7 +138,7 @@ fn build_local_ws_input_authorizer(
     Arc::new(move || {
         let auth = authority.read().unwrap_or_else(|e| e.into_inner());
         match auth.get(&display_id) {
-            Some(holder) => holder.connection_id == connection_id,
+            Some(entry) => entry.holder.matches_local_ws(&connection_id),
             None => true,
         }
     })
@@ -149,7 +184,9 @@ fn apply_grant_input_authority(
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> Option<ActiveDisplayInput> {
     let new_holder = ActiveDisplayInput {
-        connection_id: requester_connection_id.clone(),
+        holder: DisplayInputHolder::LocalWs {
+            connection_id: requester_connection_id.clone(),
+        },
         direct_tx: requester_direct_tx,
     };
     let prior = {
@@ -158,20 +195,22 @@ fn apply_grant_input_authority(
             .unwrap_or_else(|e| e.into_inner());
         map.insert(display_id, new_holder)
     };
-    if let Some(ref prior_holder) = prior {
-        if prior_holder.connection_id != requester_connection_id {
+    if let Some(ref prior_entry) = prior {
+        if !prior_entry.holder.matches_local_ws(&requester_connection_id) {
             let notify = serde_json::json!({
                 "t": "display_input_authority_revoked",
                 "display_id": display_id,
                 "reason": "another connection requested control",
             })
             .to_string();
-            let _ = prior_holder.direct_tx.send(notify);
+            let _ = prior_entry.direct_tx.send(notify);
         }
     }
     let _ = authority_change_tx.send(DisplayInputAuthorityChange {
         display_id,
-        holder_connection_id: Some(requester_connection_id),
+        holder: Some(DisplayInputHolder::LocalWs {
+            connection_id: requester_connection_id,
+        }),
     });
     prior
 }
@@ -194,7 +233,7 @@ fn apply_release_input_authority(
             .write()
             .unwrap_or_else(|e| e.into_inner());
         match map.get(&display_id) {
-            Some(holder) if holder.connection_id == releaser_connection_id => {
+            Some(entry) if entry.holder.matches_local_ws(releaser_connection_id) => {
                 map.remove(&display_id);
                 true
             }
@@ -204,7 +243,7 @@ fn apply_release_input_authority(
     if removed {
         let _ = authority_change_tx.send(DisplayInputAuthorityChange {
             display_id,
-            holder_connection_id: None,
+            holder: None,
         });
     }
     removed
@@ -227,8 +266,8 @@ fn apply_ws_close_input_authority(
             .write()
             .unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
-        map.retain(|did, holder| {
-            if holder.connection_id == connection_id {
+        map.retain(|did, entry| {
+            if entry.holder.matches_local_ws(connection_id) {
                 out.push(*did);
                 false
             } else {
@@ -240,7 +279,7 @@ fn apply_ws_close_input_authority(
     for did in &released {
         let _ = authority_change_tx.send(DisplayInputAuthorityChange {
             display_id: *did,
-            holder_connection_id: None,
+            holder: None,
         });
     }
     released
@@ -278,7 +317,7 @@ fn compute_bootstrap_authority_snapshots(
         .into_iter()
         .map(|did| {
             let state = match authority.get(&did) {
-                Some(holder) if holder.connection_id == connection_id => "you",
+                Some(entry) if entry.holder.matches_local_ws(connection_id) => "you",
                 Some(_) => "other",
                 None => "unclaimed",
             };
@@ -2410,7 +2449,7 @@ pub fn spawn_web_gateway(
     // Phase 5a.1 authority transition channel.  Each per-connection
     // outbound task subscribes; emit sites are the Request/Release
     // ControlMsg handlers, the WS-close cleanup, and the DisplayReady
-    // listener that fires `holder_connection_id: None` for freshly
+    // listener that fires `holder: None` for freshly
     // created display sessions so already-connected browsers move
     // from `unknown` to `unclaimed`.
     let (authority_change_tx, _authority_change_rx0) =
@@ -2439,7 +2478,7 @@ pub fn spawn_web_gateway(
                                 let _ = authority_change_tx.send(
                                     DisplayInputAuthorityChange {
                                         display_id: did,
-                                        holder_connection_id: None,
+                                        holder: None,
                                     },
                                 );
                             }
@@ -4279,9 +4318,9 @@ pub fn spawn_web_gateway(
                                                     .read()
                                                     .unwrap_or_else(|e| e.into_inner());
                                                 match authority.get(&display_id) {
-                                                    Some(holder) => {
-                                                        holder.connection_id == connection_id_inbound
-                                                    }
+                                                    Some(entry) => entry
+                                                        .holder
+                                                        .matches_local_ws(&connection_id_inbound),
                                                     None => true,
                                                 }
                                             };
@@ -4505,9 +4544,9 @@ pub fn spawn_web_gateway(
                                 msg = authority_change_rx.recv() => {
                                     match msg {
                                         Ok(change) => {
-                                            // Personalize: never ship the holder's connection_id.
-                                            let state = match change.holder_connection_id.as_deref() {
-                                                Some(h) if h == connection_id_outbound.as_str() => "you",
+                                            // Personalize: never ship the holder's identity.
+                                            let state = match &change.holder {
+                                                Some(h) if h.matches_local_ws(&connection_id_outbound) => "you",
                                                 Some(_) => "other",
                                                 None => "unclaimed",
                                             };
@@ -4545,7 +4584,7 @@ pub fn spawn_web_gateway(
                                                     .unwrap_or_else(|e| e.into_inner());
                                                 display_ids.into_iter().map(|did| {
                                                     let state = match auth.get(&did) {
-                                                        Some(holder) if holder.connection_id == connection_id_outbound => "you",
+                                                        Some(entry) if entry.holder.matches_local_ws(&connection_id_outbound) => "you",
                                                         Some(_) => "other",
                                                         None => "unclaimed",
                                                     };
@@ -10746,7 +10785,9 @@ mod tests {
             .insert(
                 display_id,
                 ActiveDisplayInput {
-                    connection_id: connection_id.to_string(),
+                    holder: DisplayInputHolder::LocalWs {
+                        connection_id: connection_id.to_string(),
+                    },
                     direct_tx: tx,
                 },
             );
@@ -10802,7 +10843,9 @@ mod tests {
         map.write().unwrap_or_else(|e| e.into_inner()).insert(
             0,
             ActiveDisplayInput {
-                connection_id: "conn-A".to_string(),
+                holder: DisplayInputHolder::LocalWs {
+                    connection_id: "conn-A".to_string(),
+                },
                 direct_tx: mpsc::unbounded_channel().0,
             },
         );
@@ -10829,9 +10872,9 @@ mod tests {
     }
 
     /// `apply_grant_input_authority` emits a personalized authority
-    /// change carrying `Some(holder_connection_id)`.  The change flows
-    /// through the broadcast channel; per-connection outbound tasks
-    /// resolve `holder_connection_id` against their own id to produce
+    /// change carrying `Some(holder)`.  The change flows through the
+    /// broadcast channel; per-connection outbound tasks resolve the
+    /// holder against their own id (via `matches_local_ws`) to produce
     /// `you|other|unclaimed` for browsers — the authoritative state
     /// the dashboard chip binds against.
     #[test]
@@ -10850,12 +10893,19 @@ mod tests {
         assert!(prior.is_none(), "no prior holder on first grant");
         let change = auth_rx.try_recv().expect("authority change emitted");
         assert_eq!(change.display_id, 7);
-        assert_eq!(change.holder_connection_id.as_deref(), Some("conn-A"));
+        assert!(
+            change
+                .holder
+                .as_ref()
+                .map(|h| h.matches_local_ws("conn-A"))
+                .unwrap_or(false),
+            "broadcast holder must identify conn-A as the LocalWs holder"
+        );
         // And the map records the new holder.
-        assert_eq!(
-            map.read().unwrap_or_else(|e| e.into_inner())
-                .get(&7).unwrap().connection_id,
-            "conn-A",
+        let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            map_guard.get(&7).unwrap().holder.matches_local_ws("conn-A"),
+            "registry entry must identify conn-A as LocalWs holder"
         );
     }
 
@@ -10883,12 +10933,22 @@ mod tests {
         let prior = apply_grant_input_authority(
             7, "conn-B".to_string(), direct_tx_b, &map, &auth_tx,
         );
-        let prior_holder = prior.expect("prior holder returned");
-        assert_eq!(prior_holder.connection_id, "conn-A");
+        let prior_entry = prior.expect("prior holder returned");
+        assert!(
+            prior_entry.holder.matches_local_ws("conn-A"),
+            "prior holder must be conn-A"
+        );
 
         // Authority change shows new holder.
         let change = auth_rx.try_recv().expect("second grant emitted");
-        assert_eq!(change.holder_connection_id.as_deref(), Some("conn-B"));
+        assert!(
+            change
+                .holder
+                .as_ref()
+                .map(|h| h.matches_local_ws("conn-B"))
+                .unwrap_or(false),
+            "broadcast holder must identify conn-B"
+        );
 
         // A receives a revoked notification on its direct_tx.
         let notify = direct_rx_a
@@ -10911,10 +10971,7 @@ mod tests {
         assert!(removed, "holder's release should succeed");
         let change = auth_rx.try_recv().expect("authority change emitted");
         assert_eq!(change.display_id, 7);
-        assert!(
-            change.holder_connection_id.is_none(),
-            "release emits None holder"
-        );
+        assert!(change.holder.is_none(), "release emits None holder");
         assert!(map.read().unwrap_or_else(|e| e.into_inner()).get(&7).is_none());
     }
 
@@ -10934,10 +10991,10 @@ mod tests {
             "no authority change for no-op release"
         );
         // Original holder still in map.
-        assert_eq!(
-            map.read().unwrap_or_else(|e| e.into_inner())
-                .get(&7).unwrap().connection_id,
-            "conn-A",
+        let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            map_guard.get(&7).unwrap().holder.matches_local_ws("conn-A"),
+            "original holder conn-A must still be in registry after no-op release"
         );
     }
 
@@ -10961,12 +11018,12 @@ mod tests {
         assert_eq!(released_sorted, vec![1, 2]);
         assert!(map.read().unwrap_or_else(|e| e.into_inner()).get(&1).is_none());
         assert!(map.read().unwrap_or_else(|e| e.into_inner()).get(&2).is_none());
-        assert_eq!(
-            map.read().unwrap_or_else(|e| e.into_inner())
-                .get(&3).unwrap().connection_id,
-            "conn-B",
+        let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            map_guard.get(&3).unwrap().holder.matches_local_ws("conn-B"),
             "other connections' holdings preserved",
         );
+        drop(map_guard);
         // One change emitted per released display, both with None.
         let mut events: Vec<DisplayInputAuthorityChange> = Vec::new();
         while let Ok(change) = auth_rx.try_recv() {
@@ -10974,7 +11031,7 @@ mod tests {
         }
         assert_eq!(events.len(), 2);
         for change in &events {
-            assert!(change.holder_connection_id.is_none());
+            assert!(change.holder.is_none());
             assert!(change.display_id == 1 || change.display_id == 2);
         }
     }
@@ -10994,10 +11051,10 @@ mod tests {
             "no authority changes emitted"
         );
         // Other holder untouched.
-        assert_eq!(
-            map.read().unwrap_or_else(|e| e.into_inner())
-                .get(&1).unwrap().connection_id,
-            "conn-other",
+        let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            map_guard.get(&1).unwrap().holder.matches_local_ws("conn-other"),
+            "other holder untouched after no-op close",
         );
     }
 
