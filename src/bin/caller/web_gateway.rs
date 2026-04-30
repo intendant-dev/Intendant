@@ -33,57 +33,102 @@ struct ActivePresence {
 
 /// Identity of who currently holds input authority for one display.
 ///
-/// First slice (F-1 of `docs/design-federated-input-authority.md`):
-/// only `LocalWs` is constructed. The `FederatedWebRtc` variant lands
-/// in the F-1 follow-up commits that wire federated authority over
-/// the new `display_input_authority` data channel.
+/// Two provenance kinds, with explicit identity per kind so the
+/// arbitration / gate / cleanup paths can match on the source of the
+/// hold without resorting to string-shape inference:
 ///
-/// Modelled as an enum from day one (rather than starting with a
-/// plain `String` and migrating later) so callers update once:
-/// arbitration code threads through the explicit type, and adding
-/// `FederatedWebRtc` is a one-arm addition rather than a re-touch
-/// of every match site.
+/// - **`LocalWs`**: holder is a WebSocket connection on this gateway.
+///   Carries the WS connection id (identity) plus the connection's
+///   `direct_tx` for the local-only `display_input_authority_revoked`
+///   confirmation that fires when this holder is preempted by another
+///   grant. Federated holders do NOT get a direct revoke — federated
+///   state always flows through the personalized authority-state
+///   broadcast on each federated WebRtcPeer's `display_input_authority`
+///   data channel.
+///
+/// - **`FederatedWebRtc`**: holder is a federated `PeerDisplayConnection`
+///   on a peer primary. Identified by `(peer_id, session_id)` —
+///   `peer_id` scopes to the requesting primary (federation `PeerId`,
+///   e.g. `intendant:nicks-mac`); `session_id` distinguishes multiple
+///   `PeerDisplayConnection` tabs from the same primary.
+///
+/// The map is `HashMap<u32, DisplayInputHolder>` — no `Option`, no
+/// wrapper struct. Entry absence = unclaimed; that's the pre-phase-5
+/// backwards-compat state where every connection's input flowed
+/// through (now: only the holder's input flows through; everyone
+/// else's is dropped at the gate, federated input is dropped
+/// unconditionally until F-2 lights up the federated input gate).
 #[derive(Clone, Debug)]
 enum DisplayInputHolder {
-    LocalWs { connection_id: String },
-    // FederatedWebRtc { peer_id: PeerId, session_id: String } — F-1 follow-up
+    LocalWs {
+        connection_id: String,
+        /// Outbound channel for sending this WS connection's
+        /// `display_input_authority_revoked` confirmation when a
+        /// later grant preempts this holder. Local-only — the
+        /// federated path uses the personalized authority-state
+        /// broadcast for the same notification.
+        direct_tx: mpsc::UnboundedSender<String>,
+    },
+    FederatedWebRtc {
+        peer_id: crate::peer::PeerId,
+        session_id: String,
+    },
 }
 
 impl DisplayInputHolder {
     /// True iff this holder is `LocalWs` with the given `connection_id`.
-    /// Convenience predicate so gate / personalization sites stay
-    /// readable without an inline pattern match. When `FederatedWebRtc`
-    /// lands, returns `false` for that variant — the federated input
-    /// gate gets its own predicate.
+    /// Used by local gate / personalization sites; deliberately returns
+    /// false for `FederatedWebRtc` rather than panicking, so a future
+    /// caller that mistakenly passes a connection id from the federated
+    /// side gets a silent drop rather than mis-authorization.
     fn matches_local_ws(&self, connection_id: &str) -> bool {
         match self {
-            Self::LocalWs { connection_id: c } => c == connection_id,
+            Self::LocalWs { connection_id: c, .. } => c == connection_id,
+            Self::FederatedWebRtc { .. } => false,
         }
     }
-}
 
-/// Tracks which WebSocket connection currently holds input authority for
-/// one display (phase 5 of the multi-viewer display redesign).  Distinct
-/// axis from [`ActivePresence`] — presence authority governs voice/model
-/// ownership (single global slot), display-input authority governs which
-/// connection's `display_input` messages actually flow through to the
-/// platform backend (per-display slot).
-///
-/// The authority map (`Arc<RwLock<HashMap<u32, ActiveDisplayInput>>>`)
-/// uses entry absence to mean "unclaimed" — the pre-phase-5 backwards-
-/// compatible state where every connection's input flows through.  Once
-/// a connection claims via `RequestDisplayInputAuthority`, the entry
-/// exists and only that connection's input is honored; all others are
-/// silently dropped in the `display_input` handler gate.
-///
-/// Mirrors the `ActivePresence` shape so the handover protocol can
-/// reuse the "force-release old + grant new" pattern — sending a
-/// `display_input_authority_revoked` message to the prior holder over
-/// `direct_tx` is the same mechanism as `force_disconnect_voice` for
-/// the presence slot.
-struct ActiveDisplayInput {
-    holder: DisplayInputHolder,
-    direct_tx: mpsc::UnboundedSender<String>,
+    /// True iff this holder is `FederatedWebRtc` with the given
+    /// `(peer_id, session_id)` pair. Used by the federated input gate
+    /// (in F-2) and the federated close-cleanup path.
+    fn matches_federated(
+        &self,
+        peer_id: &crate::peer::PeerId,
+        session_id: &str,
+    ) -> bool {
+        match self {
+            Self::FederatedWebRtc { peer_id: p, session_id: s } => {
+                p == peer_id && s == session_id
+            }
+            Self::LocalWs { .. } => false,
+        }
+    }
+
+    /// True iff `self` and `other` identify the same holder
+    /// (provenance + identity). Used by release / preempt sites where
+    /// we need to compare the requesting holder against the current
+    /// one without unwrapping the variant manually. Deliberately
+    /// ignores `direct_tx` (which isn't equality-comparable and isn't
+    /// part of identity — it's a notification handle that can change
+    /// if the same WS connection rebuilds its outbound queue).
+    ///
+    /// Distinct from a `PartialEq` impl on purpose: spelled-out method
+    /// at call sites makes intent explicit and prevents accidental
+    /// equality-comparison pitfalls in collections / `.contains()` /
+    /// pattern guards.
+    fn same_identity(&self, other: &DisplayInputHolder) -> bool {
+        match (self, other) {
+            (
+                Self::LocalWs { connection_id: a, .. },
+                Self::LocalWs { connection_id: b, .. },
+            ) => a == b,
+            (
+                Self::FederatedWebRtc { peer_id: pa, session_id: sa },
+                Self::FederatedWebRtc { peer_id: pb, session_id: sb },
+            ) => pa == pb && sa == sb,
+            _ => false,
+        }
+    }
 }
 
 /// Phase 5a.1: dedicated internal broadcast event for display input
@@ -117,10 +162,10 @@ struct DisplayInputAuthorityChange {
 ///
 /// Semantics:
 /// - `auth.get(display_id) == Some(entry)` and
-///   `entry.holder.matches_local_ws(this_id)` → `true`
+///   `entry.matches_local_ws(this_id)` → `true`
 ///   (this WS connection holds authority)
 /// - `auth.get(display_id) == Some(entry)` and
-///   `!entry.holder.matches_local_ws(this_id)` → `false`
+///   `!entry.matches_local_ws(this_id)` → `false`
 ///   (someone else — local or, once the variant lands, federated —
 ///   holds it; silent drop)
 /// - `auth.get(display_id) == None`
@@ -133,12 +178,12 @@ struct DisplayInputAuthorityChange {
 fn build_local_ws_input_authorizer(
     display_id: u32,
     connection_id: String,
-    authority: Arc<StdRwLock<HashMap<u32, ActiveDisplayInput>>>,
+    authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
 ) -> Arc<dyn Fn() -> bool + Send + Sync> {
     Arc::new(move || {
         let auth = authority.read().unwrap_or_else(|e| e.into_inner());
         match auth.get(&display_id) {
-            Some(entry) => entry.holder.matches_local_ws(&connection_id),
+            Some(entry) => entry.matches_local_ws(&connection_id),
             None => true,
         }
     })
@@ -180,37 +225,47 @@ fn apply_grant_input_authority(
     display_id: u32,
     requester_connection_id: String,
     requester_direct_tx: mpsc::UnboundedSender<String>,
-    authority: &Arc<StdRwLock<HashMap<u32, ActiveDisplayInput>>>,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
-) -> Option<ActiveDisplayInput> {
-    let new_holder = ActiveDisplayInput {
-        holder: DisplayInputHolder::LocalWs {
-            connection_id: requester_connection_id.clone(),
-        },
+) -> Option<DisplayInputHolder> {
+    let new_holder = DisplayInputHolder::LocalWs {
+        connection_id: requester_connection_id.clone(),
         direct_tx: requester_direct_tx,
     };
+    // Clone for the broadcast — broadcast recipients personalize
+    // from holder identity (the channel-clone in LocalWs is unused
+    // downstream but cheap because mpsc::UnboundedSender is
+    // Arc-backed).
+    let broadcast_holder = new_holder.clone();
     let prior = {
         let mut map = authority
             .write()
             .unwrap_or_else(|e| e.into_inner());
         map.insert(display_id, new_holder)
     };
-    if let Some(ref prior_entry) = prior {
-        if !prior_entry.holder.matches_local_ws(&requester_connection_id) {
+    // Only `LocalWs` prior holders get the direct revoke confirmation
+    // — `direct_tx` is local-only by design (see `DisplayInputHolder`
+    // doc). A `FederatedWebRtc` prior holder learns of the preempt
+    // through the personalized authority-state broadcast on its own
+    // `display_input_authority` data channel.
+    if let Some(DisplayInputHolder::LocalWs {
+        connection_id: prior_id,
+        direct_tx: prior_tx,
+    }) = prior.as_ref()
+    {
+        if prior_id != &requester_connection_id {
             let notify = serde_json::json!({
                 "t": "display_input_authority_revoked",
                 "display_id": display_id,
                 "reason": "another connection requested control",
             })
             .to_string();
-            let _ = prior_entry.direct_tx.send(notify);
+            let _ = prior_tx.send(notify);
         }
     }
     let _ = authority_change_tx.send(DisplayInputAuthorityChange {
         display_id,
-        holder: Some(DisplayInputHolder::LocalWs {
-            connection_id: requester_connection_id,
-        }),
+        holder: Some(broadcast_holder),
     });
     prior
 }
@@ -225,7 +280,7 @@ fn apply_grant_input_authority(
 fn apply_release_input_authority(
     display_id: u32,
     releaser_connection_id: &str,
-    authority: &Arc<StdRwLock<HashMap<u32, ActiveDisplayInput>>>,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> bool {
     let removed = {
@@ -233,7 +288,7 @@ fn apply_release_input_authority(
             .write()
             .unwrap_or_else(|e| e.into_inner());
         match map.get(&display_id) {
-            Some(entry) if entry.holder.matches_local_ws(releaser_connection_id) => {
+            Some(entry) if entry.matches_local_ws(releaser_connection_id) => {
                 map.remove(&display_id);
                 true
             }
@@ -258,7 +313,7 @@ fn apply_release_input_authority(
 /// Lock discipline: matches [`apply_grant_input_authority`].
 fn apply_ws_close_input_authority(
     connection_id: &str,
-    authority: &Arc<StdRwLock<HashMap<u32, ActiveDisplayInput>>>,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> Vec<u32> {
     let released: Vec<u32> = {
@@ -267,7 +322,7 @@ fn apply_ws_close_input_authority(
             .unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         map.retain(|did, entry| {
-            if entry.holder.matches_local_ws(connection_id) {
+            if entry.matches_local_ws(connection_id) {
                 out.push(*did);
                 false
             } else {
@@ -310,14 +365,14 @@ fn apply_ws_close_input_authority(
 /// `bootstrap_authority_snapshots_*` tests for the regression coverage.
 fn compute_bootstrap_authority_snapshots(
     active_display_ids: impl IntoIterator<Item = u32>,
-    authority: &HashMap<u32, ActiveDisplayInput>,
+    authority: &HashMap<u32, DisplayInputHolder>,
     connection_id: &str,
 ) -> Vec<(u32, &'static str)> {
     active_display_ids
         .into_iter()
         .map(|did| {
             let state = match authority.get(&did) {
-                Some(entry) if entry.holder.matches_local_ws(connection_id) => "you",
+                Some(entry) if entry.matches_local_ws(connection_id) => "you",
                 Some(_) => "other",
                 None => "unclaimed",
             };
@@ -2443,7 +2498,7 @@ pub fn spawn_web_gateway(
     // can.  The map is small, write-rare (grant/release/WS-close only),
     // read-frequent on the hot input path; std::sync::RwLock is the
     // correct lock here.
-    let display_input_authority: Arc<StdRwLock<HashMap<u32, ActiveDisplayInput>>> =
+    let display_input_authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>> =
         Arc::new(StdRwLock::new(HashMap::new()));
 
     // Phase 5a.1 authority transition channel.  Each per-connection
@@ -4106,7 +4161,7 @@ pub fn spawn_web_gateway(
                                                     // authority holder OR when the display has no
                                                     // holder (unclaimed = pre-phase-5 default).
                                                     // `display/mod.rs` only sees this boolean; it
-                                                    // never learns about ActiveDisplayInput, the
+                                                    // never learns about DisplayInputHolder, the
                                                     // map, or connection IDs.  See
                                                     // [`build_local_ws_input_authorizer`] for the
                                                     // closure semantics + tests.
@@ -4311,7 +4366,7 @@ pub fn spawn_web_gateway(
                                             // connection's input flows through. Unclaimed
                                             // (no entry in the map) = pre-phase-5 default,
                                             // every connection can input. See the
-                                            // `ActiveDisplayInput` struct doc for the full
+                                            // `DisplayInputHolder` doc for the full
                                             // contract.
                                             let allowed = {
                                                 let authority = display_input_authority_inbound
@@ -4319,7 +4374,6 @@ pub fn spawn_web_gateway(
                                                     .unwrap_or_else(|e| e.into_inner());
                                                 match authority.get(&display_id) {
                                                     Some(entry) => entry
-                                                        .holder
                                                         .matches_local_ws(&connection_id_inbound),
                                                     None => true,
                                                 }
@@ -4584,7 +4638,7 @@ pub fn spawn_web_gateway(
                                                     .unwrap_or_else(|e| e.into_inner());
                                                 display_ids.into_iter().map(|did| {
                                                     let state = match auth.get(&did) {
-                                                        Some(entry) if entry.holder.matches_local_ws(&connection_id_outbound) => "you",
+                                                        Some(entry) if entry.matches_local_ws(&connection_id_outbound) => "you",
                                                         Some(_) => "other",
                                                         None => "unclaimed",
                                                     };
@@ -10764,18 +10818,18 @@ mod tests {
 
     /// Build an empty `display_input_authority` map of the production
     /// shape, for the helper-shape tests below.
-    fn empty_authority_map() -> Arc<StdRwLock<HashMap<u32, ActiveDisplayInput>>> {
+    fn empty_authority_map() -> Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>> {
         Arc::new(StdRwLock::new(HashMap::new()))
     }
 
-    /// Insert an `ActiveDisplayInput` directly into the map for tests
+    /// Insert a `DisplayInputHolder` directly into the map for tests
     /// that need to seed a holder without going through the full
     /// `apply_grant_input_authority` flow.  The inserted holder owns
     /// a fresh dummy `direct_tx` whose receiver is dropped — sends to
     /// it return `Err`, which the production code already tolerates
     /// (the WS-close path would have cleared this entry in real life).
     fn seed_holder(
-        map: &Arc<StdRwLock<HashMap<u32, ActiveDisplayInput>>>,
+        map: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
         display_id: u32,
         connection_id: &str,
     ) {
@@ -10784,10 +10838,8 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .insert(
                 display_id,
-                ActiveDisplayInput {
-                    holder: DisplayInputHolder::LocalWs {
-                        connection_id: connection_id.to_string(),
-                    },
+                DisplayInputHolder::LocalWs {
+                    connection_id: connection_id.to_string(),
                     direct_tx: tx,
                 },
             );
@@ -10842,10 +10894,8 @@ mod tests {
         // Replace holder with self.
         map.write().unwrap_or_else(|e| e.into_inner()).insert(
             0,
-            ActiveDisplayInput {
-                holder: DisplayInputHolder::LocalWs {
-                    connection_id: "conn-A".to_string(),
-                },
+            DisplayInputHolder::LocalWs {
+                connection_id: "conn-A".to_string(),
                 direct_tx: mpsc::unbounded_channel().0,
             },
         );
@@ -10904,7 +10954,7 @@ mod tests {
         // And the map records the new holder.
         let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
         assert!(
-            map_guard.get(&7).unwrap().holder.matches_local_ws("conn-A"),
+            map_guard.get(&7).unwrap().matches_local_ws("conn-A"),
             "registry entry must identify conn-A as LocalWs holder"
         );
     }
@@ -10935,7 +10985,7 @@ mod tests {
         );
         let prior_entry = prior.expect("prior holder returned");
         assert!(
-            prior_entry.holder.matches_local_ws("conn-A"),
+            prior_entry.matches_local_ws("conn-A"),
             "prior holder must be conn-A"
         );
 
@@ -10993,7 +11043,7 @@ mod tests {
         // Original holder still in map.
         let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
         assert!(
-            map_guard.get(&7).unwrap().holder.matches_local_ws("conn-A"),
+            map_guard.get(&7).unwrap().matches_local_ws("conn-A"),
             "original holder conn-A must still be in registry after no-op release"
         );
     }
@@ -11020,7 +11070,7 @@ mod tests {
         assert!(map.read().unwrap_or_else(|e| e.into_inner()).get(&2).is_none());
         let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
         assert!(
-            map_guard.get(&3).unwrap().holder.matches_local_ws("conn-B"),
+            map_guard.get(&3).unwrap().matches_local_ws("conn-B"),
             "other connections' holdings preserved",
         );
         drop(map_guard);
@@ -11053,7 +11103,7 @@ mod tests {
         // Other holder untouched.
         let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
         assert!(
-            map_guard.get(&1).unwrap().holder.matches_local_ws("conn-other"),
+            map_guard.get(&1).unwrap().matches_local_ws("conn-other"),
             "other holder untouched after no-op close",
         );
     }
