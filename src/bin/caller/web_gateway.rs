@@ -322,6 +322,153 @@ fn apply_release_input_authority(
     removed
 }
 
+/// F-1.3b: federated grant. Constructs a `FederatedWebRtc` holder
+/// from `(federation_connection_id, session_id)`, inserts it into
+/// the registry, returns the prior holder if any, and emits the
+/// personalized authority change for fan-out.
+///
+/// Mirrors [`apply_grant_input_authority`] for the local path but
+/// is provenance-distinct: federated holders carry no `direct_tx`
+/// (federated state always flows through the personalized
+/// authority-state broadcast on the federated WebRtcPeer's
+/// `display_input_authority` data channel — see the F-1 design
+/// note in `DisplayInputHolder`).
+///
+/// Prior holder revocation:
+/// - If prior is `LocalWs`, send the existing
+///   `display_input_authority_revoked` notification on the prior
+///   holder's `direct_tx`. Same protocol as a local→local handover.
+/// - If prior is `FederatedWebRtc` with a different identity, no
+///   direct revoke — the broadcast-driven personalized state
+///   `"other"` reaches that prior federated holder via its own
+///   authority data channel and updates its chip.
+///
+/// Lock discipline: matches [`apply_grant_input_authority`].
+fn apply_grant_input_authority_federated(
+    display_id: u32,
+    federation_connection_id: String,
+    session_id: String,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> Option<DisplayInputHolder> {
+    let new_holder = DisplayInputHolder::FederatedWebRtc {
+        federation_connection_id: federation_connection_id.clone(),
+        session_id: session_id.clone(),
+    };
+    let broadcast_holder = new_holder.clone();
+    let prior = {
+        let mut map = authority
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        map.insert(display_id, new_holder)
+    };
+    // Prior LocalWs holder gets the legacy direct revoke; prior
+    // FederatedWebRtc gets nothing here because the personalized
+    // broadcast below carries `"other"` to it on its own data channel.
+    if let Some(DisplayInputHolder::LocalWs {
+        direct_tx: prior_tx,
+        ..
+    }) = prior.as_ref()
+    {
+        let notify = serde_json::json!({
+            "t": "display_input_authority_revoked",
+            "display_id": display_id,
+            "reason": "another connection requested control",
+        })
+        .to_string();
+        let _ = prior_tx.send(notify);
+    }
+    let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+        display_id,
+        holder: Some(broadcast_holder),
+    });
+    prior
+}
+
+/// F-1.3b: federated release. No-op if the calling
+/// `(federation_connection_id, session_id)` doesn't match the
+/// current holder (prevents one federated session from unclaiming
+/// another's slot — even from the same primary, distinct
+/// `PeerDisplayConnection` tabs have distinct `session_id`s).
+/// Returns `true` iff the slot was actually released.
+///
+/// Lock discipline: matches [`apply_grant_input_authority_federated`].
+fn apply_release_input_authority_federated(
+    display_id: u32,
+    federation_connection_id: &str,
+    session_id: &str,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> bool {
+    let removed = {
+        let mut map = authority
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        match map.get(&display_id) {
+            Some(entry)
+                if entry.matches_federated(federation_connection_id, session_id) =>
+            {
+                map.remove(&display_id);
+                true
+            }
+            _ => false,
+        }
+    };
+    if removed {
+        let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+            display_id,
+            holder: None,
+        });
+    }
+    removed
+}
+
+/// F-1.3b: federated WS-close cleanup. Releases every
+/// `FederatedWebRtc` entry whose `federation_connection_id` matches
+/// the dropping federation transport, regardless of `session_id`
+/// (the WS drop kills every `PeerDisplayConnection` session multiplexed
+/// over that primary's federation transport). Emits one `None`-holder
+/// authority change per affected display so other viewers' chips
+/// flip back to `unclaimed`.
+///
+/// Distinct from [`apply_ws_close_input_authority`] which targets
+/// `LocalWs` entries: a single `connection_id` is either acting as
+/// a local browser or a federation transport but not both, so the
+/// two cleanup paths address disjoint registry entries. Both fire
+/// from the same WS-close hook (the gateway calls them in sequence).
+///
+/// Lock discipline: matches [`apply_grant_input_authority_federated`].
+fn apply_federated_ws_close_input_authority(
+    federation_connection_id: &str,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> Vec<u32> {
+    let released: Vec<u32> = {
+        let mut map = authority
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        map.retain(|did, entry| match entry {
+            DisplayInputHolder::FederatedWebRtc {
+                federation_connection_id: c,
+                ..
+            } if c == federation_connection_id => {
+                out.push(*did);
+                false
+            }
+            _ => true,
+        });
+        out
+    };
+    for did in &released {
+        let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+            display_id: *did,
+            holder: None,
+        });
+    }
+    released
+}
+
 /// Apply WS-close cleanup for a dropping connection.  Removes every
 /// authority entry held by `connection_id` and emits one `None`-holder
 /// authority change per affected display so observers move from
@@ -11124,6 +11271,387 @@ mod tests {
             map_guard.get(&1).unwrap().matches_local_ws("conn-other"),
             "other holder untouched after no-op close",
         );
+    }
+
+    // ===================================================================
+    // F-1.3b: federated authority registry helpers
+    // ===================================================================
+
+    /// Seed a `FederatedWebRtc` holder directly into the map for tests
+    /// that need to set up cross-provenance scenarios. Mirrors
+    /// `seed_holder` for `LocalWs`.
+    fn seed_federated_holder(
+        map: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+        display_id: u32,
+        federation_connection_id: &str,
+        session_id: &str,
+    ) {
+        map.write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                display_id,
+                DisplayInputHolder::FederatedWebRtc {
+                    federation_connection_id: federation_connection_id.to_string(),
+                    session_id: session_id.to_string(),
+                },
+            );
+    }
+
+    /// `matches_federated`: same `(federation_connection_id, session_id)`
+    /// pair matches; mismatched connection or mismatched session does
+    /// not. Pins the F-1 identity rule that one federation tab can't
+    /// pose as another (even from the same primary).
+    #[test]
+    fn matches_federated_identity_check() {
+        let h = DisplayInputHolder::FederatedWebRtc {
+            federation_connection_id: "fed-conn-1".to_string(),
+            session_id: "sess-A".to_string(),
+        };
+        assert!(h.matches_federated("fed-conn-1", "sess-A"));
+        assert!(
+            !h.matches_federated("fed-conn-1", "sess-B"),
+            "same connection + different session must not match"
+        );
+        assert!(
+            !h.matches_federated("fed-conn-2", "sess-A"),
+            "different connection + same session must not match"
+        );
+        assert!(
+            !h.matches_federated("fed-conn-2", "sess-B"),
+            "fully-different identity must not match"
+        );
+    }
+
+    /// `matches_federated` returns false for a `LocalWs` holder
+    /// regardless of inputs. Cross-provenance equality is impossible.
+    #[test]
+    fn matches_federated_false_for_local_ws() {
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        let h = DisplayInputHolder::LocalWs {
+            connection_id: "conn-A".to_string(),
+            direct_tx: tx,
+        };
+        assert!(!h.matches_federated("conn-A", "sess-A"));
+    }
+
+    /// `matches_local_ws` returns false for a `FederatedWebRtc`
+    /// holder regardless of inputs. Symmetric with the test above.
+    #[test]
+    fn matches_local_ws_false_for_federated() {
+        let h = DisplayInputHolder::FederatedWebRtc {
+            federation_connection_id: "fed-conn-1".to_string(),
+            session_id: "sess-A".to_string(),
+        };
+        assert!(!h.matches_local_ws("fed-conn-1"));
+    }
+
+    /// `same_identity` distinguishes provenance even when string
+    /// values collide. A `LocalWs { connection_id: "x" }` is NOT
+    /// `same_identity` as `FederatedWebRtc { federation_connection_id:
+    /// "x", session_id: "x" }` even though all the strings happen to
+    /// match.
+    #[test]
+    fn same_identity_does_not_cross_provenance() {
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        let local = DisplayInputHolder::LocalWs {
+            connection_id: "x".to_string(),
+            direct_tx: tx,
+        };
+        let federated = DisplayInputHolder::FederatedWebRtc {
+            federation_connection_id: "x".to_string(),
+            session_id: "x".to_string(),
+        };
+        assert!(!local.same_identity(&federated));
+        assert!(!federated.same_identity(&local));
+    }
+
+    /// `apply_grant_input_authority_federated` first call inserts a
+    /// `FederatedWebRtc` holder, returns no prior, emits the change
+    /// with the new holder.
+    #[test]
+    fn apply_grant_federated_first_grant_no_prior() {
+        let map = empty_authority_map();
+        let (auth_tx, mut auth_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let prior = apply_grant_input_authority_federated(
+            7,
+            "fed-conn-1".to_string(),
+            "sess-A".to_string(),
+            &map,
+            &auth_tx,
+        );
+        assert!(prior.is_none(), "no prior on first grant");
+        let change = auth_rx.try_recv().expect("change emitted");
+        assert_eq!(change.display_id, 7);
+        assert!(
+            change
+                .holder
+                .as_ref()
+                .map(|h| h.matches_federated("fed-conn-1", "sess-A"))
+                .unwrap_or(false),
+            "broadcast holder must be FederatedWebRtc(fed-conn-1, sess-A)"
+        );
+        let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            map_guard.get(&7).unwrap().matches_federated("fed-conn-1", "sess-A"),
+            "registry must record the federated holder"
+        );
+    }
+
+    /// **Cross-provenance handover**: a federated grant takes from a
+    /// local holder. The local holder's `direct_tx` receives the
+    /// `display_input_authority_revoked` notification (legacy local
+    /// protocol); the broadcast change carries the new federated
+    /// holder so other viewers personalize to "other".
+    #[test]
+    fn apply_grant_federated_takes_from_local_holder() {
+        let map = empty_authority_map();
+        let (auth_tx, mut auth_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (local_tx, mut local_rx) = mpsc::unbounded_channel::<String>();
+        // Local holder.
+        apply_grant_input_authority(
+            7, "conn-LOCAL".to_string(), local_tx, &map, &auth_tx,
+        );
+        let _ = auth_rx.try_recv().expect("local grant change");
+
+        // Federated takes.
+        let prior = apply_grant_input_authority_federated(
+            7,
+            "fed-conn-1".to_string(),
+            "sess-A".to_string(),
+            &map,
+            &auth_tx,
+        );
+        let prior_entry = prior.expect("prior holder returned");
+        assert!(
+            prior_entry.matches_local_ws("conn-LOCAL"),
+            "prior holder must be the local one"
+        );
+
+        // Local holder gets the legacy direct revoke.
+        let revoke = local_rx
+            .try_recv()
+            .expect("local prior holder must receive direct revoke");
+        assert!(revoke.contains("display_input_authority_revoked"));
+        assert!(revoke.contains("\"display_id\":7"));
+
+        // Broadcast carries the new federated holder.
+        let change = auth_rx.try_recv().expect("broadcast change after handover");
+        assert!(
+            change
+                .holder
+                .as_ref()
+                .map(|h| h.matches_federated("fed-conn-1", "sess-A"))
+                .unwrap_or(false),
+            "broadcast holder after handover must be the federated one"
+        );
+    }
+
+    /// **Cross-provenance handover (other direction)**: a local grant
+    /// takes from a federated holder. The federated holder gets NO
+    /// direct revoke (federated state always flows through the
+    /// personalized broadcast — see `DisplayInputHolder` doc).
+    #[test]
+    fn apply_grant_local_takes_from_federated_holder_no_direct_revoke() {
+        let map = empty_authority_map();
+        let (auth_tx, mut auth_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        // Federated holder.
+        apply_grant_input_authority_federated(
+            7,
+            "fed-conn-1".to_string(),
+            "sess-A".to_string(),
+            &map,
+            &auth_tx,
+        );
+        let _ = auth_rx.try_recv().expect("federated grant change");
+
+        // Local takes.
+        let (local_tx, _local_rx) = mpsc::unbounded_channel::<String>();
+        let prior = apply_grant_input_authority(
+            7, "conn-LOCAL".to_string(), local_tx, &map, &auth_tx,
+        );
+        let prior_entry = prior.expect("prior holder returned");
+        assert!(
+            prior_entry.matches_federated("fed-conn-1", "sess-A"),
+            "prior holder must be the federated one"
+        );
+
+        // Federated holder is informed via the broadcast (handler
+        // would compute "other" for this federated subscriber). The
+        // direct-revoke path is not used for federated prior holders.
+        let change = auth_rx.try_recv().expect("broadcast change after handover");
+        assert!(
+            change
+                .holder
+                .as_ref()
+                .map(|h| h.matches_local_ws("conn-LOCAL"))
+                .unwrap_or(false),
+            "broadcast holder after handover must be the local one"
+        );
+    }
+
+    /// Federated release succeeds only when the calling
+    /// `(federation_connection_id, session_id)` matches the current
+    /// holder. A different session on the same federation connection
+    /// cannot unclaim.
+    #[test]
+    fn apply_release_federated_only_on_matching_identity() {
+        let map = empty_authority_map();
+        seed_federated_holder(&map, 7, "fed-conn-1", "sess-A");
+        let (auth_tx, mut auth_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+
+        // Wrong session — no-op.
+        let removed = apply_release_input_authority_federated(
+            7, "fed-conn-1", "sess-B", &map, &auth_tx,
+        );
+        assert!(!removed, "wrong session must not unclaim");
+        assert!(auth_rx.try_recv().is_err(), "no change for no-op release");
+
+        // Wrong connection — no-op.
+        let removed = apply_release_input_authority_federated(
+            7, "fed-conn-2", "sess-A", &map, &auth_tx,
+        );
+        assert!(!removed, "wrong connection must not unclaim");
+        assert!(auth_rx.try_recv().is_err(), "no change for no-op release");
+
+        // Original holder still in map.
+        let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            map_guard.get(&7).unwrap().matches_federated("fed-conn-1", "sess-A"),
+            "original federated holder still in registry"
+        );
+        drop(map_guard);
+
+        // Correct identity — releases.
+        let removed = apply_release_input_authority_federated(
+            7, "fed-conn-1", "sess-A", &map, &auth_tx,
+        );
+        assert!(removed, "matching identity must release");
+        let change = auth_rx.try_recv().expect("change emitted on release");
+        assert!(change.holder.is_none(), "release emits None");
+        assert!(
+            map.read().unwrap_or_else(|e| e.into_inner()).get(&7).is_none(),
+            "registry empty after release"
+        );
+    }
+
+    /// Federated release is also no-op against a `LocalWs` holder —
+    /// federated session can't unclaim a local one even if the IDs
+    /// happen to collide.
+    #[test]
+    fn apply_release_federated_noop_on_local_holder() {
+        let map = empty_authority_map();
+        seed_holder(&map, 7, "conn-A");
+        let (auth_tx, mut auth_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let removed = apply_release_input_authority_federated(
+            7, "conn-A", "sess-X", &map, &auth_tx,
+        );
+        assert!(!removed, "federated release must not unclaim a LocalWs holder");
+        assert!(auth_rx.try_recv().is_err(), "no change emitted");
+        let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            map_guard.get(&7).unwrap().matches_local_ws("conn-A"),
+            "local holder still in registry"
+        );
+    }
+
+    /// Federated WS-close releases ALL `FederatedWebRtc` entries with
+    /// matching `federation_connection_id`, regardless of `session_id`
+    /// (the WS drop kills every session multiplexed over that primary's
+    /// federation transport). Other federation connections' entries
+    /// AND any local entries are untouched.
+    #[test]
+    fn apply_federated_ws_close_releases_all_sessions_on_dropping_connection() {
+        let map = empty_authority_map();
+        seed_federated_holder(&map, 1, "fed-conn-1", "sess-A");
+        seed_federated_holder(&map, 2, "fed-conn-1", "sess-B");
+        seed_federated_holder(&map, 3, "fed-conn-2", "sess-C");
+        seed_holder(&map, 4, "conn-LOCAL");
+
+        let (auth_tx, mut auth_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(16);
+        let released = apply_federated_ws_close_input_authority(
+            "fed-conn-1", &map, &auth_tx,
+        );
+        let mut released_sorted = released.clone();
+        released_sorted.sort();
+        assert_eq!(
+            released_sorted,
+            vec![1, 2],
+            "both sessions on fed-conn-1 must be released"
+        );
+
+        // Other federation connection's entry untouched.
+        let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            map_guard.get(&3).unwrap().matches_federated("fed-conn-2", "sess-C"),
+            "other federation connection's entry untouched"
+        );
+        // Local entry untouched.
+        assert!(
+            map_guard.get(&4).unwrap().matches_local_ws("conn-LOCAL"),
+            "local holder untouched"
+        );
+        drop(map_guard);
+
+        // One change emitted per affected display, all with None.
+        let mut events = Vec::new();
+        while let Ok(change) = auth_rx.try_recv() {
+            events.push(change);
+        }
+        assert_eq!(events.len(), 2);
+        for change in &events {
+            assert!(change.holder.is_none());
+            assert!(change.display_id == 1 || change.display_id == 2);
+        }
+    }
+
+    /// Federated WS-close with no matching entries → empty list, no
+    /// events. Local entries with the same `connection_id` value are
+    /// not touched (the function is provenance-scoped).
+    #[test]
+    fn apply_federated_ws_close_is_noop_with_no_matching_entries() {
+        let map = empty_authority_map();
+        seed_holder(&map, 1, "fed-conn-1");
+        let (auth_tx, mut auth_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let released = apply_federated_ws_close_input_authority(
+            "fed-conn-1", &map, &auth_tx,
+        );
+        assert!(
+            released.is_empty(),
+            "no FederatedWebRtc entries with this connection — no releases"
+        );
+        assert!(auth_rx.try_recv().is_err(), "no change emitted");
+        // Local entry with the same connection_id (rare but possible
+        // if a single connection_id value is reused across phases) is
+        // untouched by the federated cleanup.
+        let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            map_guard.get(&1).unwrap().matches_local_ws("fed-conn-1"),
+            "LocalWs entry with same id value untouched by federated cleanup"
+        );
+    }
+
+    /// **F-1 invariant pin**: federated input authorizer is
+    /// deny-by-default in F-1.3b. F-2 will replace this with a real
+    /// registry-backed predicate; this test exists so any premature
+    /// flip fires loudly.
+    #[test]
+    fn federated_input_still_deny_by_default_in_f1() {
+        let authz = build_federated_input_authorizer();
+        assert!(
+            !authz(),
+            "F-1 must keep federated input deny-by-default; \
+             F-2 is the slice that flips this gate"
+        );
+        for _ in 0..5 {
+            assert!(!authz(), "stable across calls");
+        }
     }
 
     // ---------------------------------------------------------------
