@@ -974,10 +974,53 @@ impl WebRtcPeer {
     }
 }
 
+/// Personalized display-input authority state for one viewer.
+///
+/// Wire vocabulary matches the local 5c data-channel protocol exactly
+/// (see `web_gateway.rs::compute_bootstrap_authority_snapshots`). Used
+/// by [`WebRtcPeer::send_authority_state`] for the federated path's
+/// `display_input_authority` data channel — peer broadcasts a
+/// personalized value to each subscribed federated browser.
+///
+/// Modelled as an enum (rather than passing `&str` through the API)
+/// so the wire vocabulary lives in exactly one place; adding a future
+/// state value is an explicit ABI change rather than a stringly-typed
+/// caller mistake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayInputAuthorityState {
+    You,
+    Other,
+    Unclaimed,
+}
+
+impl DisplayInputAuthorityState {
+    /// Wire string for the `state` field of
+    /// `display_input_authority_state` data-channel messages.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::You => "you",
+            Self::Other => "other",
+            Self::Unclaimed => "unclaimed",
+        }
+    }
+}
+
 /// Commands sent from the public `WebRtcPeer` handle to the driver task.
 enum Command {
     AddIceCandidate(String),
     SendClipboard(ClipboardContent),
+    /// F-1.2: federated authority state push to the
+    /// `display_input_authority` data channel. If the channel is not
+    /// yet open, the driver queues the message in
+    /// [`DriverState::pending_authority_state`] and flushes on
+    /// `OnDataChannel(OnOpen)` for that label. Without queueing, an
+    /// authority state computed before the browser's data channel
+    /// finishes negotiating would land on the floor and the browser's
+    /// chip would stall at `unknown` until the next state change.
+    SendAuthorityState {
+        display_id: u32,
+        state: DisplayInputAuthorityState,
+    },
 }
 
 struct RtpSendConfig {
@@ -2136,6 +2179,43 @@ impl WebRtcPeer {
         }
     }
 
+    /// F-1.2: push a personalized display-input authority state to the
+    /// browser over the federated `display_input_authority` data
+    /// channel. Used by the federated authority broadcast loop to
+    /// fan personalized `you | other | unclaimed` snapshots out to
+    /// each subscribed federated WebRtcPeer.
+    ///
+    /// If the data channel is not yet open at the time of the call,
+    /// the message is queued in the driver state and emitted on
+    /// `OnDataChannel(OnOpen)` for the matching label. This bootstrap
+    /// path is load-bearing: the broadcast loop registers a federated
+    /// WebRtcPeer as a subscriber the moment the federation registry
+    /// adds it, which can be — and usually is — before the browser's
+    /// data channels finish negotiating. Without queueing, the
+    /// browser's chip would stall at `unknown` until the next
+    /// authority transition.
+    ///
+    /// Returns `Ok(true)` if the command was queued for the driver,
+    /// `Ok(false)` if the driver is shutting down. Send-success at
+    /// the channel layer is best-effort and not surfaced; the
+    /// federated path tolerates dropped frames at this layer because
+    /// the broadcast loop is the primary state-of-truth source and
+    /// will re-broadcast on every transition.
+    pub async fn send_authority_state(
+        &self,
+        display_id: u32,
+        state: DisplayInputAuthorityState,
+    ) -> Result<bool, CallerError> {
+        match self
+            .command_tx
+            .send(Command::SendAuthorityState { display_id, state })
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
     /// Add a trickle ICE candidate from the remote peer.
     ///
     /// The browser sends `{candidate, sdpMid, sdpMLineIndex}`; we only need
@@ -2228,6 +2308,23 @@ struct DriverState {
     >,
     /// Map of channel label → DataChannelId for routing channel data and clipboard sends.
     channels: HashMap<String, RTCDataChannelId>,
+    /// F-1.2: queued `display_input_authority_state` messages awaiting
+    /// the data-channel's `OnOpen`. The federated authority broadcast
+    /// loop calls [`WebRtcPeer::send_authority_state`] as soon as a
+    /// federated WebRtcPeer is registered as a subscriber — which can
+    /// be (and usually is) before the browser's data channels finish
+    /// negotiating. Without queueing, that initial snapshot would land
+    /// on the floor and the browser's chip would stall at `unknown`.
+    /// Drained and emitted in order on `OnDataChannel(OnOpen)` for
+    /// label `display_input_authority`.
+    ///
+    /// Capacity-bounded by the producer side (the broadcast loop runs
+    /// at low frequency — one event per take/release/disconnect, not
+    /// per frame), so unbounded growth here is structurally
+    /// impossible. Uses `Vec` rather than a channel because the
+    /// producer side is not throttled by the channel's send-await
+    /// semantics.
+    pending_authority_state: Vec<(u32, DisplayInputAuthorityState)>,
     /// Wallclock anchor: Instant at which the first frame was emitted.
     /// All subsequent rtp_time values are relative to this.
     first_frame_at: Option<Instant>,
@@ -2349,6 +2446,7 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
     let mut state = DriverState {
         video_specs: HashMap::new(),
         channels: HashMap::new(),
+        pending_authority_state: Vec::new(),
         first_frame_at: None,
         rtp: RtpSendState {
             sender_id: rtp_config.sender_id,
@@ -2622,7 +2720,7 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
                 }
             }
             Some(cmd) = command_rx.recv() => {
-                handle_command(&mut rtc, &state, cmd);
+                handle_command(&mut rtc, &mut state, cmd);
                 if let Err(e) = rtc.handle_timeout(Instant::now()) {
                     eprintln!(
                         "[display/webrtc] peer {peer_id}: handle_timeout after command failed: {e:?}"
@@ -2814,7 +2912,30 @@ fn handle_event<I: rtc::interceptor::Interceptor>(
                 .map(|channel| channel.label().to_string())
                 .unwrap_or_else(|| format!("channel-{cid}"));
             eprintln!("[display/webrtc] data channel open: {label}");
+            let queued = drain_pending_authority_for_label(
+                &label,
+                &mut state.pending_authority_state,
+            );
             state.channels.insert(label, cid);
+            // F-1.2: flush any authority states queued before the
+            // `display_input_authority` channel opened. See
+            // `Command::SendAuthorityState` for why queueing exists —
+            // the federated authority broadcast can register a
+            // subscriber and emit its initial snapshot before the
+            // browser's channel finishes negotiating.
+            if !queued.is_empty() {
+                if let Some(mut channel) = rtc.data_channel(cid) {
+                    for (display_id, auth_state) in queued {
+                        let json = serialize_authority_state(display_id, auth_state);
+                        if let Err(e) = channel.send_text(json) {
+                            eprintln!(
+                                "[display/webrtc] authority channel \
+                                 queued write failed: {e:?}"
+                            );
+                        }
+                    }
+                }
+            }
         }
         RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(cid)) => {
             state.channels.retain(|_, v| *v != cid);
@@ -3299,7 +3420,7 @@ fn rtp_header_extension_ids<I: rtc::interceptor::Interceptor>(
 
 fn handle_command<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
-    state: &DriverState,
+    state: &mut DriverState,
     cmd: Command,
 ) {
     match cmd {
@@ -3325,6 +3446,34 @@ fn handle_command<I: rtc::interceptor::Interceptor>(
             let json = serialize_clipboard(&content);
             if let Err(e) = channel.send_text(json) {
                 eprintln!("[display/webrtc] clipboard channel write failed: {e:?}");
+            }
+        }
+        Command::SendAuthorityState { display_id, state: auth_state } => {
+            // F-1.2: queue-or-send. If the federated browser's
+            // `display_input_authority` data channel is open,
+            // serialize and write immediately. If not, queue for
+            // flush on `OnDataChannel(OnOpen)` for that label.
+            //
+            // Local DisplaySlot's WebRtcPeer doesn't create this
+            // channel (5a/5c uses the WS path), so the queue
+            // accumulates indefinitely there until the driver shuts
+            // down — which is fine because: (a) the broadcast loop
+            // currently only calls send_authority_state for federated
+            // subscribers, and (b) the queue is bounded by the
+            // low-frequency take/release event rate, not per-frame.
+            if let Some(cid) =
+                state.channels.get(AUTHORITY_CHANNEL_LABEL).copied()
+            {
+                if let Some(mut channel) = rtc.data_channel(cid) {
+                    let json = serialize_authority_state(display_id, auth_state);
+                    if let Err(e) = channel.send_text(json) {
+                        eprintln!(
+                            "[display/webrtc] authority channel write failed: {e:?}"
+                        );
+                    }
+                }
+            } else {
+                state.pending_authority_state.push((display_id, auth_state));
             }
         }
     }
@@ -3356,6 +3505,50 @@ fn parse_clipboard_set(text: &str) -> Option<ClipboardContent> {
     } else {
         let text = parsed.get("text").and_then(|v| v.as_str())?;
         Some(ClipboardContent::Text(text.to_string()))
+    }
+}
+
+/// F-1.2: data-channel label for federated authority state messages.
+/// Browsers create this channel from `PeerDisplayConnection.connect()`
+/// (added in the next F-1 commit). The peer's driver opens it
+/// passively via `OnDataChannel(OnOpen)` and registers it in
+/// `state.channels` keyed by this label.
+const AUTHORITY_CHANNEL_LABEL: &str = "display_input_authority";
+
+/// Serialize a `display_input_authority_state` frame for the
+/// `display_input_authority` data channel. Wire format matches the
+/// local 5c WS message exactly (same `t` discriminator, same `state`
+/// vocabulary) so browser handlers can stay symmetric.
+fn serialize_authority_state(
+    display_id: u32,
+    state: DisplayInputAuthorityState,
+) -> String {
+    serde_json::json!({
+        "t": "display_input_authority_state",
+        "display_id": display_id,
+        "state": state.as_wire_str(),
+    })
+    .to_string()
+}
+
+/// F-1.2: drain pending authority states queued before the
+/// `display_input_authority` data channel opened. Returns the queue
+/// in arrival order so the flush preserves send ordering. No-op
+/// (returns empty) for any other channel label, leaving `pending`
+/// untouched.
+///
+/// Extracted for testability: the queue/flush invariant
+/// (queued-before-open ⇒ flushed-on-open) lives here in pure-data
+/// form so a unit test can pin it without needing to fake an
+/// `rtc::data_channel`.
+fn drain_pending_authority_for_label(
+    label: &str,
+    pending: &mut Vec<(u32, DisplayInputAuthorityState)>,
+) -> Vec<(u32, DisplayInputAuthorityState)> {
+    if label == AUTHORITY_CHANNEL_LABEL {
+        std::mem::take(pending)
+    } else {
+        Vec::new()
     }
 }
 
@@ -6276,5 +6469,116 @@ mod tests {
             out.contains("a=simulcast:send f;h;q recv x"),
             "valid bidirectional simulcast must pass through; got:\n{out}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // F-1.2: federated authority state — passive server-side support
+    // for the `display_input_authority` data channel.
+    // -----------------------------------------------------------------
+
+    /// Wire vocabulary pin: `as_wire_str` matches the local 5c
+    /// data-channel state strings exactly. If anyone changes one
+    /// without the other, federated browsers' chip rendering desyncs
+    /// from local browsers' chip rendering — this test fires.
+    #[test]
+    fn authority_state_wire_strings_match_local_5c() {
+        assert_eq!(DisplayInputAuthorityState::You.as_wire_str(), "you");
+        assert_eq!(DisplayInputAuthorityState::Other.as_wire_str(), "other");
+        assert_eq!(
+            DisplayInputAuthorityState::Unclaimed.as_wire_str(),
+            "unclaimed"
+        );
+    }
+
+    /// `serialize_authority_state` produces the canonical
+    /// `display_input_authority_state` frame: `t` discriminator,
+    /// numeric `display_id`, string `state` from the wire vocabulary.
+    /// Browser handlers parse this exact shape; if it drifts, the
+    /// chip on the federated peer-display panel stops updating.
+    #[test]
+    fn serialize_authority_state_produces_canonical_frame() {
+        for (state, expected_state) in [
+            (DisplayInputAuthorityState::You, "you"),
+            (DisplayInputAuthorityState::Other, "other"),
+            (DisplayInputAuthorityState::Unclaimed, "unclaimed"),
+        ] {
+            let json = serialize_authority_state(7, state);
+            let parsed: serde_json::Value = serde_json::from_str(&json)
+                .expect("frame must parse as JSON");
+            assert_eq!(parsed["t"], "display_input_authority_state");
+            assert_eq!(parsed["display_id"], 7);
+            assert_eq!(parsed["state"], expected_state);
+        }
+    }
+
+    /// `drain_pending_authority_for_label` is a no-op (returns empty,
+    /// leaves `pending` untouched) for any channel label that isn't
+    /// `display_input_authority`. The OnDataChannel(OnOpen) handler
+    /// fires for every data channel — clipboard, control, pointer —
+    /// and must not consume the authority queue when an unrelated
+    /// channel opens.
+    #[test]
+    fn drain_pending_authority_skips_other_labels() {
+        let mut pending = vec![
+            (0, DisplayInputAuthorityState::You),
+            (1, DisplayInputAuthorityState::Other),
+        ];
+
+        for label in ["clipboard", "control", "pointer", "random"] {
+            let drained = drain_pending_authority_for_label(label, &mut pending);
+            assert!(drained.is_empty(), "non-authority label '{label}' must drain nothing");
+            assert_eq!(
+                pending.len(),
+                2,
+                "non-authority label '{label}' must leave queue intact",
+            );
+        }
+    }
+
+    /// `drain_pending_authority_for_label` consumes the entire queue
+    /// (in arrival order) when the channel label matches and resets
+    /// `pending` to empty. After draining, a second call returns an
+    /// empty vec — replays must come from a fresh push, not a
+    /// double-drain.
+    #[test]
+    fn drain_pending_authority_flushes_on_authority_label() {
+        let mut pending = vec![
+            (0, DisplayInputAuthorityState::You),
+            (1, DisplayInputAuthorityState::Other),
+            (2, DisplayInputAuthorityState::Unclaimed),
+        ];
+
+        let drained = drain_pending_authority_for_label(
+            AUTHORITY_CHANNEL_LABEL,
+            &mut pending,
+        );
+        assert_eq!(drained.len(), 3, "must drain all queued entries");
+        assert!(pending.is_empty(), "queue must be empty after drain");
+
+        // Order preserved.
+        assert_eq!(drained[0], (0, DisplayInputAuthorityState::You));
+        assert_eq!(drained[1], (1, DisplayInputAuthorityState::Other));
+        assert_eq!(drained[2], (2, DisplayInputAuthorityState::Unclaimed));
+
+        // Second drain returns empty (no double-flush).
+        let again = drain_pending_authority_for_label(
+            AUTHORITY_CHANNEL_LABEL,
+            &mut pending,
+        );
+        assert!(again.is_empty(), "second drain must be empty");
+    }
+
+    /// Empty queue → empty drain on the authority label. No panics,
+    /// no resource consumption when the broadcast loop hasn't pushed
+    /// anything yet.
+    #[test]
+    fn drain_pending_authority_empty_queue_is_noop() {
+        let mut pending: Vec<(u32, DisplayInputAuthorityState)> = Vec::new();
+        let drained = drain_pending_authority_for_label(
+            AUTHORITY_CHANNEL_LABEL,
+            &mut pending,
+        );
+        assert!(drained.is_empty());
+        assert!(pending.is_empty());
     }
 }
