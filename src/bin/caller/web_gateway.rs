@@ -4335,6 +4335,17 @@ pub fn spawn_web_gateway(
                                                         connection_id_inbound.clone(),
                                                         Arc::clone(&display_input_authority_inbound),
                                                     );
+                                                    // F-1.3b2 transport plumbing: local DisplaySlot's
+                                                    // browser doesn't create the
+                                                    // `display_input_authority` data channel
+                                                    // (5a/5c uses the WS path), so the handler is
+                                                    // never invoked here. The no-op keeps the
+                                                    // transport-layer signature uniform across
+                                                    // both peer kinds; the real federated handler
+                                                    // is wired by the federated path's caller in
+                                                    // a later slice.
+                                                    let authority_handler =
+                                                        crate::display::webrtc::noop_authority_handler();
                                                     match session.handle_offer(
                                                         peer_id,
                                                         &sdp,
@@ -4343,6 +4354,7 @@ pub fn spawn_web_gateway(
                                                         tcp_advertised_addr,
                                                         ice_tx,
                                                         input_authorized,
+                                                        authority_handler,
                                                     ).await {
                                                         Ok(answer_sdp) => {
                                                             peer_display_ids.push(display_id);
@@ -7295,6 +7307,15 @@ async fn handle_federated_webrtc_signal(
             // See [`build_federated_input_authorizer`] for the rationale +
             // its dedicated test that pins the deny-by-default policy.
             let input_authorized = build_federated_input_authorizer();
+            // F-1.3b2 transport plumbing: federated authority data channel
+            // handler. No-op for this slice — the federated wiring slice
+            // (next) replaces this single line with a real handler that
+            // consults the per-display authority registry via the helpers
+            // landed in F-1.3b1. Pinning the no-op here keeps
+            // deny-by-default unchanged (asserted by
+            // `federated_input_still_deny_by_default_in_f1`).
+            let authority_handler =
+                crate::display::webrtc::noop_authority_handler();
             let answer_result = session
                 .handle_offer(
                     peer_id,
@@ -7304,6 +7325,7 @@ async fn handle_federated_webrtc_signal(
                     tcp_advertised_addr,
                     ice_tx,
                     input_authorized,
+                    authority_handler,
                 )
                 .await;
             match answer_result {

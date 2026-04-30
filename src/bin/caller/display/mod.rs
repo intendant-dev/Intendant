@@ -1033,6 +1033,7 @@ impl DisplaySession {
         tcp_advertised_addr: Option<std::net::SocketAddr>,
         ice_tx: mpsc::Sender<(PeerId, String)>,
         input_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
+        authority_handler: self::webrtc::AuthorityChannelHandler,
     ) -> Result<String, CallerError> {
         self.handle_offer_pool_mode(
             peer_id,
@@ -1042,6 +1043,7 @@ impl DisplaySession {
             tcp_advertised_addr,
             ice_tx,
             input_authorized,
+            authority_handler,
         )
         .await
     }
@@ -1086,6 +1088,7 @@ impl DisplaySession {
         tcp_advertised_addr: Option<std::net::SocketAddr>,
         ice_tx: mpsc::Sender<(PeerId, String)>,
         input_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
+        authority_handler: self::webrtc::AuthorityChannelHandler,
     ) -> Result<String, CallerError> {
         let pool = self.pool.get().ok_or_else(|| {
             CallerError::WebRtc(
@@ -1155,6 +1158,7 @@ impl DisplaySession {
             tcp_advertised_addr,
             input_handler,
             clipboard_handler,
+            authority_handler,
             ice_tx,
             Arc::clone(pool),
             subs,

@@ -1005,6 +1005,60 @@ impl DisplayInputAuthorityState {
     }
 }
 
+/// F-1.3b2: Browser-originated authority message on the
+/// `display_input_authority` data channel.
+///
+/// Wire format from the federated authority design (see
+/// `docs/design-federated-input-authority.md` §Wire):
+///
+/// ```text
+/// { "t": "display_input_authority_request", "display_id": 0 }
+/// { "t": "display_input_authority_release", "display_id": 0 }
+/// ```
+///
+/// `display/webrtc.rs` parses these frames off the wire and hands
+/// them to an opaque [`AuthorityChannelHandler`] without applying any
+/// policy. The handler — built outside the transport in
+/// `web_gateway.rs` by the slice that wires the registry — consults
+/// the federated authority registry and decides whether to grant /
+/// release / no-op. Same separation as the existing
+/// `input_handler`: webrtc.rs parses the wire shape, the gate lives
+/// outside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorityChannelMessage {
+    Request { display_id: u32 },
+    Release { display_id: u32 },
+}
+
+/// F-1.3b2: opaque handler invoked on every parsed
+/// [`AuthorityChannelMessage`] received on the
+/// `display_input_authority` data channel.
+///
+/// Sibling to the existing `input_handler` constructor argument —
+/// same `Arc<dyn Fn(...) + Send + Sync>` shape, same no-op default
+/// for callers that don't gate authority. The closure runs on the
+/// driver task, so it must not block; production handlers (added by
+/// the federated wiring slice) push work to the federated authority
+/// registry via non-blocking channels or atomic ops.
+///
+/// Local DisplaySlot's `WebRtcPeer` passes a no-op (see
+/// [`noop_authority_handler`]) because the local browser doesn't
+/// create the `display_input_authority` channel (5a/5c uses the WS
+/// path); the federated `PeerDisplayConnection` does create it, and
+/// the federated wiring slice plugs the real registry-driven handler
+/// in there.
+pub type AuthorityChannelHandler = Arc<dyn Fn(AuthorityChannelMessage) + Send + Sync>;
+
+/// F-1.3b2: no-op [`AuthorityChannelHandler`] for callers that do not
+/// gate authority on this peer. Used by the local DisplaySlot path
+/// (browser doesn't create the channel) and as the placeholder on the
+/// federated path until the federated wiring slice replaces it. Kept
+/// as a single canonical source so future F-1.3b3 diffs against the
+/// federated callsite are isolated to one line.
+pub fn noop_authority_handler() -> AuthorityChannelHandler {
+    Arc::new(|_| {})
+}
+
 /// Commands sent from the public `WebRtcPeer` handle to the driver task.
 enum Command {
     AddIceCandidate(String),
@@ -1486,6 +1540,7 @@ impl WebRtcPeer {
         tcp_advertised_addr: Option<SocketAddr>,
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
+        authority_handler: AuthorityChannelHandler,
         _ice_tx: mpsc::Sender<(PeerId, String)>,
         keyframe_request_tx: mpsc::Sender<SimulcastRid>,
     ) -> Result<(Self, mpsc::Sender<OutboundEncodedFrame>, String), CallerError> {
@@ -1890,6 +1945,7 @@ impl WebRtcPeer {
             command_rx,
             input_handler,
             clipboard_handler,
+            authority_handler,
             keyframe_request_tx,
             observed_send_bitrate_tx,
             remote_inbound_health_tx,
@@ -1954,6 +2010,7 @@ impl WebRtcPeer {
         tcp_advertised_addr: Option<SocketAddr>,
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
+        authority_handler: AuthorityChannelHandler,
         ice_tx: mpsc::Sender<(PeerId, String)>,
         pool: Arc<EncoderPool>,
         subscriptions: Vec<EncoderSubscription>,
@@ -2122,6 +2179,7 @@ impl WebRtcPeer {
             tcp_advertised_addr,
             input_handler,
             clipboard_handler,
+            authority_handler,
             ice_tx,
             keyframe_request_tx,
         )
@@ -2393,6 +2451,7 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
     mut command_rx: mpsc::Receiver<Command>,
     input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
+    authority_handler: AuthorityChannelHandler,
     keyframe_request_tx: mpsc::Sender<SimulcastRid>,
     observed_send_bitrate_tx: watch::Sender<Option<u64>>,
     remote_inbound_health_tx: watch::Sender<HashMap<SimulcastRid, PeerLayerHealth>>,
@@ -2545,6 +2604,7 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
             &mut state,
             &input_handler,
             &clipboard_handler,
+            &authority_handler,
             &keyframe_request_tx,
         )
         .await
@@ -2818,6 +2878,7 @@ async fn drain_outputs<I: rtc::interceptor::Interceptor>(
     state: &mut DriverState,
     input_handler: &Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: &Arc<dyn Fn(ClipboardContent) + Send + Sync>,
+    authority_handler: &AuthorityChannelHandler,
     keyframe_request_tx: &mpsc::Sender<SimulcastRid>,
 ) -> Result<Instant, DriverExit> {
     while let Some(t) = rtc.poll_write() {
@@ -2872,6 +2933,7 @@ async fn drain_outputs<I: rtc::interceptor::Interceptor>(
             state,
             input_handler,
             clipboard_handler,
+            authority_handler,
             keyframe_request_tx,
         );
     }
@@ -3198,6 +3260,7 @@ fn handle_message(
     state: &mut DriverState,
     input_handler: &Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: &Arc<dyn Fn(ClipboardContent) + Send + Sync>,
+    authority_handler: &AuthorityChannelHandler,
     keyframe_request_tx: &mpsc::Sender<SimulcastRid>,
 ) {
     if let RTCMessage::RtcpPacket(_track_id, packets) = &message {
@@ -3232,6 +3295,19 @@ fn handle_message(
             if let Ok(text) = std::str::from_utf8(&data) {
                 if let Some(content) = parse_clipboard_set(text) {
                     clipboard_handler(content);
+                }
+            }
+        }
+        // F-1.3b2: federated authority channel — parse on the wire,
+        // hand off to the opaque handler. Match against the const
+        // (not a literal) via a guard arm so the channel-label
+        // identity is sourced from `AUTHORITY_CHANNEL_LABEL` only —
+        // same const that `Command::SendAuthorityState` uses for the
+        // outbound write. Any future rename touches one constant.
+        Some(label) if label == AUTHORITY_CHANNEL_LABEL => {
+            if let Ok(text) = std::str::from_utf8(&data) {
+                if let Some(msg) = parse_authority_channel_message(text) {
+                    authority_handler(msg);
                 }
             }
         }
@@ -3505,6 +3581,42 @@ fn parse_clipboard_set(text: &str) -> Option<ClipboardContent> {
     } else {
         let text = parsed.get("text").and_then(|v| v.as_str())?;
         Some(ClipboardContent::Text(text.to_string()))
+    }
+}
+
+/// F-1.3b2: parse a frame received on the `display_input_authority`
+/// data channel into an [`AuthorityChannelMessage`].
+///
+/// Wire format pinned by `parse_authority_channel_message_round_trip`:
+///
+/// ```text
+/// { "t": "display_input_authority_request", "display_id": 0 }
+/// { "t": "display_input_authority_release", "display_id": 0 }
+/// ```
+///
+/// Returns `None` for unrecognized `t` discriminators, missing or
+/// non-numeric `display_id`, or `display_id` values that don't fit
+/// in `u32`. Strict by design — silent drop on the receive side
+/// mirrors `parse_clipboard_set`'s contract: a malformed frame is
+/// the browser's bug to fix, not the peer's to recover from. The
+/// authority handler outside this module is the policy boundary;
+/// the wire parse is intentionally narrow.
+fn parse_authority_channel_message(text: &str) -> Option<AuthorityChannelMessage> {
+    let parsed: serde_json::Value = serde_json::from_str(text).ok()?;
+    let t = parsed.get("t").and_then(|v| v.as_str())?;
+    let display_id: u32 = parsed
+        .get("display_id")
+        .and_then(|v| v.as_u64())?
+        .try_into()
+        .ok()?;
+    match t {
+        "display_input_authority_request" => {
+            Some(AuthorityChannelMessage::Request { display_id })
+        }
+        "display_input_authority_release" => {
+            Some(AuthorityChannelMessage::Release { display_id })
+        }
+        _ => None,
     }
 }
 
@@ -5377,6 +5489,7 @@ mod tests {
             Arc::new(|_| {});
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
             Arc::new(|_| {});
+        let authority_handler = noop_authority_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
         let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
 
@@ -5390,6 +5503,7 @@ mod tests {
             None,
             input_handler,
             clipboard_handler,
+            authority_handler,
             ice_tx,
             kf_tx,
         )
@@ -5491,6 +5605,7 @@ mod tests {
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
             Arc::new(|_| {});
+        let authority_handler = noop_authority_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
         let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
 
@@ -5504,6 +5619,7 @@ mod tests {
             None,
             input_handler,
             clipboard_handler,
+            authority_handler,
             ice_tx,
             kf_tx,
         )
@@ -5546,6 +5662,7 @@ mod tests {
             Arc::new(|_| {});
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
             Arc::new(|_| {});
+        let authority_handler = noop_authority_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
         let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
 
@@ -5559,6 +5676,7 @@ mod tests {
             None,
             input_handler,
             clipboard_handler,
+            authority_handler,
             ice_tx,
             kf_tx,
         )
@@ -5600,6 +5718,7 @@ mod tests {
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
             Arc::new(|_| {});
+        let authority_handler = noop_authority_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
         let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
 
@@ -5613,6 +5732,7 @@ mod tests {
             None,
             input_handler,
             clipboard_handler,
+            authority_handler,
             ice_tx,
             kf_tx,
         )
@@ -6312,6 +6432,7 @@ mod tests {
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
             Arc::new(|_| {});
+        let authority_handler = noop_authority_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
         let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
 
@@ -6325,6 +6446,7 @@ mod tests {
             None,
             input_handler,
             clipboard_handler,
+            authority_handler,
             ice_tx,
             kf_tx,
         )
@@ -6509,6 +6631,89 @@ mod tests {
             assert_eq!(parsed["display_id"], 7);
             assert_eq!(parsed["state"], expected_state);
         }
+    }
+
+    /// F-1.3b2: `parse_authority_channel_message` round-trips the
+    /// canonical wire shape (`t` discriminator + numeric `display_id`)
+    /// to the right [`AuthorityChannelMessage`] variant. Pins the
+    /// browser↔peer wire vocabulary the federated authority data
+    /// channel uses; if browser-side serialization drifts, this test
+    /// fires.
+    #[test]
+    fn parse_authority_channel_message_round_trip() {
+        let req = parse_authority_channel_message(
+            r#"{ "t": "display_input_authority_request", "display_id": 7 }"#,
+        )
+        .expect("request frame must parse");
+        assert_eq!(req, AuthorityChannelMessage::Request { display_id: 7 });
+
+        let rel = parse_authority_channel_message(
+            r#"{ "t": "display_input_authority_release", "display_id": 0 }"#,
+        )
+        .expect("release frame must parse");
+        assert_eq!(rel, AuthorityChannelMessage::Release { display_id: 0 });
+    }
+
+    /// F-1.3b2: extra/unknown fields on a well-formed frame are
+    /// preserved-by-ignoring — the parser is strict on the
+    /// discriminator (`t`) and the typed field (`display_id`) but
+    /// tolerant of anything else. Mirrors `parse_clipboard_set`'s
+    /// loose-extras contract and leaves room for the browser to add
+    /// forward-compat metadata (request ids for ack tracking, actor
+    /// identity hints, timestamps) without forcing a peer-side
+    /// version bump.
+    #[test]
+    fn parse_authority_channel_message_tolerates_extra_fields() {
+        let msg = parse_authority_channel_message(
+            r#"{ "t": "display_input_authority_request",
+                 "display_id": 0,
+                 "request_id": "abc",
+                 "ts": 12345,
+                 "actor": { "kind": "operator" } }"#,
+        )
+        .expect("extra fields must not block parse");
+        assert_eq!(msg, AuthorityChannelMessage::Request { display_id: 0 });
+    }
+
+    /// F-1.3b2: malformed frames silently drop. Strict by design —
+    /// the authority handler should never see a frame the wire layer
+    /// couldn't validate. Mirrors `parse_clipboard_set`'s contract:
+    /// the browser is expected to send well-formed frames; recovery
+    /// from the malformed case lives outside the transport.
+    #[test]
+    fn parse_authority_channel_message_rejects_malformed() {
+        // Unknown `t` discriminator.
+        assert!(parse_authority_channel_message(
+            r#"{ "t": "display_input_authority_steal", "display_id": 0 }"#,
+        )
+        .is_none());
+
+        // Missing `display_id`.
+        assert!(parse_authority_channel_message(
+            r#"{ "t": "display_input_authority_request" }"#,
+        )
+        .is_none());
+
+        // Non-numeric `display_id`.
+        assert!(parse_authority_channel_message(
+            r#"{ "t": "display_input_authority_request", "display_id": "0" }"#,
+        )
+        .is_none());
+
+        // `display_id` outside u32 range.
+        assert!(parse_authority_channel_message(
+            r#"{ "t": "display_input_authority_request", "display_id": 4294967296 }"#,
+        )
+        .is_none());
+
+        // Not JSON.
+        assert!(parse_authority_channel_message("not json at all").is_none());
+
+        // Missing `t` discriminator.
+        assert!(parse_authority_channel_message(
+            r#"{ "display_id": 0 }"#,
+        )
+        .is_none());
     }
 
     /// `drain_pending_authority_for_label` is a no-op (returns empty,
