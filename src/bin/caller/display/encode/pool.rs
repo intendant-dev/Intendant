@@ -4364,6 +4364,59 @@ mod tests {
         );
     }
 
+    /// **#71 defensive coverage**: subscribe with H.264 in prefs,
+    /// drop the lease, assert the H.264 on-demand slot is torn down.
+    /// Guards against the encoder-pool stale-lifecycle scenario
+    /// observed during the #67 federated H.264 attempt: the original
+    /// symptom is no longer reachable via the federated path (#67's
+    /// VP8 codec preference pin in `PeerDisplayConnection.connect()`
+    /// blocks H.264 negotiation), but the local DisplaySlot path on
+    /// macOS still negotiates H.264 by default (#58), so this test
+    /// codifies the lifecycle invariant for any H.264 demand source
+    /// that lands in the future.
+    ///
+    /// Cross-platform: skips the full lifecycle assertion when the
+    /// host's H.264 backend is unavailable (e.g. CI without ffmpeg /
+    /// openh264 / VideoToolbox). When the backend works, asserts
+    /// `Some(1)` after subscribe and `None` after lease drop.
+    #[tokio::test]
+    async fn h264_on_demand_releases_at_refcount_zero() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8, CodecKind::H264]);
+        let (subs, lease) = pool.subscribe(&prefs).expect("subscribe must succeed");
+
+        let h264_in_subs = subs.iter().any(|s| s.id.codec == CodecKind::H264);
+        if !h264_in_subs {
+            // Backend unavailable on this host; skip the lifecycle
+            // assertion. The mixed-codec subscribe test
+            // (`pool_mixes_always_on_and_on_demand_subscriptions`)
+            // already covers the "skipped silently" contract.
+            return;
+        }
+
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::H264, SimulcastRid::full()),
+            Some(1),
+            "H.264 on-demand slot must show refcount 1 immediately after subscribe"
+        );
+
+        drop(lease);
+
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::H264, SimulcastRid::full()),
+            None,
+            "H.264 slot must be removed when refcount hits 0; if this fires, the \
+             encoder will keep running with no consumer (the #71 stale-encoder \
+             symptom — see commit message of the fix that lands here)"
+        );
+    }
+
     // -------------------------------------------------------------------
     // Phase 4d.0: pause_layer / resume_layer / is_layer_paused
     // -------------------------------------------------------------------
