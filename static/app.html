@@ -2507,7 +2507,9 @@ html, body {
 }
 .display-toolbar .take-control-btn,
 .display-toolbar .release-control-btn,
-.display-toolbar .stream-btn {
+.display-toolbar .stream-btn,
+.peer-display-controls .take-control-btn,
+.peer-display-controls .release-control-btn {
   padding: 3px 10px;
   border: 1px solid var(--surface1);
   border-radius: 4px;
@@ -12321,6 +12323,32 @@ class PeerDisplayConnection {
     this.stream = null;
     this._pendingCandidates = [];
     this._answerApplied = false;
+    // F-1.3c: federated input authority state for THIS browser's
+    // view of THIS peer-display. Mirrors local DisplaySlot's
+    // `authorityState` semantics ('unknown' | 'you' | 'other' |
+    // 'unclaimed') but rendered into the peer-display panel via
+    // [`_renderAuthorityChip`]. Source of truth is the peer's
+    // server-side gate; F-1 only renders the chip + Take/Release
+    // buttons. F-2 wires actual input on top of this same state.
+    this.peerAuthorityState = 'unknown';
+    // True after `takeControl()` clicks Request and is waiting for
+    // the peer's `'you'` confirmation; cleared on arrival in
+    // `setPeerAuthorityState('you')`. F-1 doesn't enter "interactive
+    // mode" the way local DisplaySlot does — that's F-2's job — so
+    // this flag is currently used only as a debug signal in logs
+    // and as the contract for how the chip transitions from "Take
+    // pressed" to "you holds it." Kept here so F-2's input wiring
+    // can reuse it without changing the F-1 wire surface.
+    this._takeControlPending = false;
+    // The browser-created `display_input_authority` data channel.
+    // Created BEFORE `createOffer()` in [`Self::connect`] so the
+    // channel appears in the SDP and the peer's
+    // `OnDataChannel(OnOpen)` handler registers the label. Used
+    // for both directions: outbound `display_input_authority_request` /
+    // `_release` from Take/Release clicks, inbound
+    // `display_input_authority_state` from the peer's per-subscriber
+    // fanout task.
+    this.authorityChannel = null;
   }
 
   sessionKey() {
@@ -12330,6 +12358,12 @@ class PeerDisplayConnection {
   // Attach to the DOM. Called on initial open AND after each
   // renderDaemonsList re-render so the live MediaStream (held on
   // `this.stream`) stays connected to the user-visible <video>.
+  //
+  // F-1.3c: the controls row also carries the federated input
+  // authority chip + Take Control / Release buttons. On re-render,
+  // the freshly-built pane needs to reflect the LATEST
+  // `peerAuthorityState`, not the default 'unknown' — so this
+  // function calls `_renderAuthorityChip()` after binding handlers.
   attachToDom() {
     const container = document.getElementById(`peer-display-${this.hostId}`);
     if (!container) return;
@@ -12339,6 +12373,17 @@ class PeerDisplayConnection {
           <video class="peer-display-video" autoplay playsinline muted></video>
           <div class="peer-display-controls">
             <span class="peer-display-status">Connecting…</span>
+            <span class="peer-display-authority display-input-authority"
+                  data-host-id="${escapeHtml(this.hostId)}"
+                  style="display:none"
+                  title="Federated input authority for this peer-display: who can drive keyboard/mouse. F-1 visibility-only; F-2 wires the actual input."></span>
+            <button class="take-control-btn"
+                    data-host-id="${escapeHtml(this.hostId)}"
+                    title="Take federated input control of this peer's display (F-1 visibility-only; input wiring lands in F-2)">Take Control</button>
+            <button class="release-control-btn"
+                    data-host-id="${escapeHtml(this.hostId)}"
+                    style="display:none"
+                    title="Release federated input control and return to view-only">Release</button>
             <button class="peer-display-close" data-host-id="${escapeHtml(this.hostId)}">Close</button>
           </div>
         </div>`;
@@ -12348,12 +12393,25 @@ class PeerDisplayConnection {
           closePeerDisplaysForHost(this.hostId)
         );
       }
+      const takeBtn = container.querySelector('.take-control-btn');
+      if (takeBtn) {
+        takeBtn.addEventListener('click', () => this.takeControl());
+      }
+      const releaseBtn = container.querySelector('.release-control-btn');
+      if (releaseBtn) {
+        releaseBtn.addEventListener('click', () => this.releaseControl());
+      }
     }
     container.style.display = 'block';
     const videoEl = container.querySelector('.peer-display-video');
     if (videoEl && this.stream) {
       videoEl.srcObject = this.stream;
     }
+    // F-1.3c: re-render the chip from the latest state so a daemons-
+    // list re-render that destroyed the prior pane doesn't reset the
+    // chip to 'unknown' — the live `peerAuthorityState` survives the
+    // DOM swap on the connection object.
+    this._renderAuthorityChip();
   }
 
   setStatus(text, kind) {
@@ -12448,6 +12506,50 @@ class PeerDisplayConnection {
       }
     }
     this._log('debug', `connect: sessionKey=${this.sessionKey()} advertiseTcpViaUrl=${this.advertiseTcpViaUrl || '(none)'}`);
+
+    // F-1.3c: federated authority data channel. MUST be created
+    // BEFORE `createOffer()` so the channel ends up in the SDP and
+    // the peer's `OnDataChannel(OnOpen)` handler registers the label
+    // when the answer applies. Without this, the peer's
+    // `display_input_authority_state` send path
+    // (`Command::SendAuthorityState`) queues forever in
+    // F-1.2's pending_authority_state buffer and the chip stays at
+    // `unknown` indefinitely.
+    //
+    // Channel name matches `AUTHORITY_CHANNEL_LABEL` on the peer
+    // side (see `display/webrtc.rs::AUTHORITY_CHANNEL_LABEL`). Wire
+    // format pinned by `parse_authority_channel_message_round_trip`:
+    //   { "t": "display_input_authority_request", "display_id": N }
+    //   { "t": "display_input_authority_release", "display_id": N }
+    //   { "t": "display_input_authority_state",   "display_id": N, "state": "you|other|unclaimed" }
+    //
+    // Default ordered+reliable — authority state must not be
+    // reordered (a `you → other → you` flap arriving as
+    // `you → you → other` would leave the chip on the wrong state).
+    this.authorityChannel = this.pc.createDataChannel('display_input_authority');
+    this.authorityChannel.onopen = () => {
+      this._log('info', 'authority data channel open');
+    };
+    this.authorityChannel.onclose = () => {
+      this._log('debug', 'authority data channel closed');
+    };
+    this.authorityChannel.onmessage = (e) => {
+      let frame;
+      try {
+        frame = JSON.parse(e.data);
+      } catch (err) {
+        this._log('warn', `authority frame JSON parse failed: ${err.message}`);
+        return;
+      }
+      if (frame && frame.t === 'display_input_authority_state'
+          && typeof frame.display_id === 'number'
+          && frame.display_id === this.displayId
+          && typeof frame.state === 'string') {
+        this.setPeerAuthorityState(frame.state);
+      } else {
+        this._log('debug', `unhandled authority frame: ${e.data && e.data.slice(0, 80)}`);
+      }
+    };
 
     this.pc.ontrack = (e) => {
       this.stream = e.streams[0];
@@ -12629,6 +12731,138 @@ class PeerDisplayConnection {
     }
   }
 
+  // F-1.3c: peer-side authority state callback. Called from the
+  // `authorityChannel.onmessage` parser with the resolved
+  // `'you' | 'other' | 'unclaimed'` for THIS browser's
+  // (federation_connection_id, session_id) — the peer personalizes
+  // server-side, so this code never sees holder identities.
+  //
+  // Mirrors local DisplaySlot's `setAuthority` semantics. F-1
+  // doesn't enter "interactive mode" (input wiring is F-2) so the
+  // promotion-on-`'you'` arm just clears `_takeControlPending`
+  // without installing pointer / keyboard listeners; F-2 will hook
+  // its `_enterInteractive` equivalent in here.
+  setPeerAuthorityState(state) {
+    if (state !== 'you' && state !== 'other' && state !== 'unclaimed') {
+      // Forward-compat: an unknown state string leaves the chip
+      // on its previous value rather than blanking it. Same
+      // policy as DisplaySlot's setAuthority.
+      this._log('debug', `unknown authority state '${state}' — keeping previous`);
+      return;
+    }
+    this.peerAuthorityState = state;
+    this._renderAuthorityChip();
+    if (state === 'you' && this._takeControlPending) {
+      this._takeControlPending = false;
+      this._log('info', 'authority granted: you');
+    } else if (state !== 'you') {
+      // Demoted (or never had it): clear pending so a stale
+      // 'you' arriving later doesn't promote us into a state the
+      // user no longer wants.
+      this._takeControlPending = false;
+    }
+  }
+
+  // F-1.3c: render the chip + Take/Release button visibility from
+  // `peerAuthorityState`. Mirrors local DisplaySlot's
+  // `_renderAuthority` exactly so the federated panel looks and
+  // behaves the same. Reuses the `display-input-authority` CSS
+  // classes (.you/.other/.unclaimed) defined for local 5c.
+  _renderAuthorityChip() {
+    const container = document.getElementById(`peer-display-${this.hostId}`);
+    if (!container) return;
+    const chip = container.querySelector('.peer-display-authority');
+    const takeBtn = container.querySelector('.take-control-btn');
+    const releaseBtn = container.querySelector('.release-control-btn');
+    if (chip) {
+      switch (this.peerAuthorityState) {
+        case 'you':
+          chip.style.display = '';
+          chip.textContent = 'Input: you';
+          chip.className = 'peer-display-authority display-input-authority you';
+          break;
+        case 'other':
+          chip.style.display = '';
+          chip.textContent = 'Input: another viewer';
+          chip.className = 'peer-display-authority display-input-authority other';
+          break;
+        case 'unclaimed':
+          chip.style.display = '';
+          chip.textContent = 'Input: shared';
+          chip.className = 'peer-display-authority display-input-authority unclaimed';
+          break;
+        default:
+          // 'unknown' — peer hasn't told us yet (snapshot in
+          // flight). Hide the chip rather than show 'unclaimed'
+          // speculatively, same convention as local 5c.
+          chip.style.display = 'none';
+          chip.textContent = '';
+          chip.className = 'peer-display-authority display-input-authority';
+          break;
+      }
+    }
+    if (takeBtn && releaseBtn) {
+      if (this.peerAuthorityState === 'you') {
+        takeBtn.style.display = 'none';
+        releaseBtn.style.display = '';
+      } else {
+        takeBtn.style.display = '';
+        releaseBtn.style.display = 'none';
+      }
+    }
+  }
+
+  // F-1.3c: user-intent claim. Sends Request on the authority
+  // channel and marks the take pending; the peer's per-subscriber
+  // fanout pushes `'you'` back when the registry has updated, and
+  // `setPeerAuthorityState('you')` clears the pending flag. F-1
+  // does NOT enter interactive input mode here — F-2 layers that
+  // on top.
+  takeControl() {
+    if (this.peerAuthorityState === 'you') {
+      // Already holding it — no-op. Same idempotency as local
+      // DisplaySlot.takeControl.
+      return;
+    }
+    this._takeControlPending = true;
+    this._sendAuthorityFrame('display_input_authority_request');
+  }
+
+  // F-1.3c: user-intent release. Sends Release on the authority
+  // channel; the peer's identity-matched
+  // `apply_release_input_authority_federated` removes the slot and
+  // the broadcast pushes `'unclaimed'` back. Idempotent on the
+  // peer side (release with no holder is a no-op there too).
+  releaseControl() {
+    this._sendAuthorityFrame('display_input_authority_release');
+    this._takeControlPending = false;
+  }
+
+  // F-1.3c: serialize and send a Request/Release frame on the
+  // authority data channel. Channel-readiness check is required
+  // because the user can click Take Control before the channel
+  // finishes negotiating; in that case we silently drop and let
+  // the user retry once the chip resolves out of 'unknown'. Same
+  // forgive-the-race policy as local DisplaySlot's
+  // `request_display_input_authority` WS path.
+  _sendAuthorityFrame(t) {
+    if (!this.authorityChannel || this.authorityChannel.readyState !== 'open') {
+      this._log('warn',
+        `${t} dropped — authority channel not open ` +
+        `(readyState=${this.authorityChannel ? this.authorityChannel.readyState : '(no channel)'})`);
+      return;
+    }
+    try {
+      this.authorityChannel.send(JSON.stringify({
+        t,
+        display_id: this.displayId,
+      }));
+      this._log('debug', `sent ${t} (display_id=${this.displayId})`);
+    } catch (err) {
+      this._log('warn', `${t} send failed: ${err.message}`);
+    }
+  }
+
   // Internal: scoped console logger. All diagnostic output from this
   // connection carries `[webrtc-peer ${hostId}]` so the Safari Web
   // Inspector filter can find everything from one peer session in
@@ -12664,6 +12898,11 @@ class PeerDisplayConnection {
       try { this.pc.close(); } catch {}
       this.pc = null;
     }
+    // F-1.3c: the authority data channel closes implicitly when
+    // `pc.close()` runs. Null the reference so a stale Take/Release
+    // click after close fails the readyState check rather than
+    // throwing on a freed channel.
+    this.authorityChannel = null;
     this.stream = null;
   }
 
