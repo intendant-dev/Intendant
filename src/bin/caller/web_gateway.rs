@@ -226,16 +226,40 @@ fn build_local_ws_input_authorizer(
 /// path (see the `Lagged` arm in the outbound select).
 const AUTHORITY_CHANGE_CAPACITY: usize = 64;
 
-/// Federated path's input-authorization closure (Phase 5a.1).  Returns
-/// `false` unconditionally — federated remote control is out of scope
-/// until a federation authority protocol lands as its own slice (a
-/// `PeerOp::DisplayInputAuthorityChanged` event variant or similar).
-/// We name this rather than constructing `Arc::new(|| false)` inline at
-/// the federated callsite so the deny-by-default policy is searchable
-/// (`grep build_federated_input_authorizer`) and the test that pins it
-/// fires loudly if anyone weakens it to `|| true`.
-fn build_federated_input_authorizer() -> Arc<dyn Fn() -> bool + Send + Sync> {
-    Arc::new(|| false)
+/// F-2: federated path's input-authorization closure. Returns `true`
+/// iff the current holder for `display_id` is `FederatedWebRtc` matching
+/// THIS peer's `(federation_connection_id, session_id)`. Anything else
+/// — no holder, a `LocalWs` holder, a `FederatedWebRtc` with a different
+/// session id (e.g. another tab from the same primary), or a different
+/// connection — returns `false` and the federated input handler drops
+/// the event silently.
+///
+/// Symmetric in shape to [`build_local_ws_input_authorizer`], but with
+/// strict deny-by-default for the unclaimed case: local 5c treats `None`
+/// as "anyone may input" for pre-phase-5 backwards compatibility, while
+/// the federated path has no such legacy and treats `None` as "nobody
+/// holds this — drop everything." A federated browser only sends input
+/// when its chip is `'you'` (UX-side guard); receiving input here under
+/// any other condition is a protocol bug or a stale post-release race
+/// and silent drop is correct.
+///
+/// The closure is the entire boundary: `display/mod.rs` invokes it per
+/// event and never sees the registry, the holder identity, or the
+/// connection/session IDs. F-2's gate flip is the single semantic change
+/// from F-1's `Arc::new(|| false)` deny-everything stub.
+fn build_federated_input_authorizer(
+    display_id: u32,
+    federation_connection_id: String,
+    session_id: String,
+    authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    Arc::new(move || {
+        let auth = authority.read().unwrap_or_else(|e| e.into_inner());
+        match auth.get(&display_id) {
+            Some(entry) => entry.matches_federated(&federation_connection_id, &session_id),
+            None => false,
+        }
+    })
 }
 
 /// Apply a `RequestDisplayInputAuthority`.  Inserts the new holder,
@@ -7790,14 +7814,21 @@ async fn handle_federated_webrtc_signal(
             }
             let (ice_tx, mut ice_rx) =
                 tokio::sync::mpsc::channel::<(crate::display::PeerId, String)>(64);
-            // Phase 5a.1: federated paths deny WebRTC data-channel input
-            // by default until F-2 lands the input gate. F-1.3b3 only
-            // wires the AUTHORITY data channel (claim/release + state
-            // broadcast); the input data channels (`control` /
-            // `pointer`) and the gate flip are F-2's job. Keeping the
-            // deny-by-default authorizer pinned here is asserted by
-            // `federated_input_still_deny_by_default_in_f1`.
-            let input_authorized = build_federated_input_authorizer();
+            // F-2: federated input gate. Replaces F-1's deny-everything
+            // stub with a registry lookup keyed on this peer's
+            // `(federation_connection_id, session_id)`. Symmetric in
+            // shape to the local 5c authorizer above — the closure is
+            // the entire boundary, `display/mod.rs` doesn't see the
+            // registry. Strict deny-by-default for unclaimed (no
+            // holder); only the matching federated holder identity
+            // returns true. See [`build_federated_input_authorizer`]
+            // for the matching positive/negative test cases.
+            let input_authorized = build_federated_input_authorizer(
+                display_id,
+                federation_connection_id.clone(),
+                session_id.clone(),
+                Arc::clone(&display_input_authority),
+            );
             // F-1.3b3: real federated authority handler. Identity is
             // captured at construction so messages from this peer
             // always arbitrate against this peer's
@@ -11633,22 +11664,6 @@ mod tests {
         assert!(authz(), "after release back to unclaimed → authorized");
     }
 
-    /// Federated path's authorization policy is deny-by-default.  This
-    /// pins the policy as a regression guard: if anyone weakens it to
-    /// `|| true` we want the test to fail loudly.
-    #[test]
-    fn federated_authorizer_denies_by_default() {
-        let authz = build_federated_input_authorizer();
-        assert!(
-            !authz(),
-            "federated path must deny WebRTC data-channel input until federation authority lands"
-        );
-        // Repeated calls all return false — no internal toggle.
-        for _ in 0..5 {
-            assert!(!authz());
-        }
-    }
-
     /// `apply_grant_input_authority` emits a personalized authority
     /// change carrying `Some(holder)`.  The change flows through the
     /// broadcast channel; per-connection outbound tasks resolve the
@@ -12205,16 +12220,121 @@ mod tests {
     /// registry-backed predicate; this test exists so any premature
     /// flip fires loudly.
     #[test]
-    fn federated_input_still_deny_by_default_in_f1() {
-        let authz = build_federated_input_authorizer();
+    /// F-2: positive — an authority entry of `FederatedWebRtc` matching
+    /// this closure's `(federation_connection_id, session_id)`
+    /// authorizes input. Mirrors the local 5c
+    /// `local_ws_authorizer_returns_true_for_holder` shape.
+    #[test]
+    fn federated_input_authorizer_returns_true_for_matching_holder() {
+        let map = empty_authority_map();
+        map.write().unwrap_or_else(|e| e.into_inner()).insert(
+            0,
+            DisplayInputHolder::FederatedWebRtc {
+                federation_connection_id: "fed-1".to_string(),
+                session_id: "sess-A".to_string(),
+            },
+        );
+        let authz = build_federated_input_authorizer(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            Arc::clone(&map),
+        );
+        assert!(authz(), "matching identity must authorize input");
+    }
+
+    /// F-2: negative — unclaimed (`None`) is strict deny on the
+    /// federated path. Different from local 5c (which treats `None`
+    /// as "anyone may input" for backwards compat); federated has no
+    /// such legacy.
+    #[test]
+    fn federated_input_authorizer_returns_false_when_no_holder() {
+        let map = empty_authority_map();
+        let authz = build_federated_input_authorizer(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            map,
+        );
         assert!(
             !authz(),
-            "F-1 must keep federated input deny-by-default; \
-             F-2 is the slice that flips this gate"
+            "unclaimed display must drop federated input — different \
+             from local 5c's pre-phase-5 default-allow"
         );
-        for _ in 0..5 {
-            assert!(!authz(), "stable across calls");
-        }
+    }
+
+    /// F-2: negative — a `LocalWs` holder denies federated input.
+    /// Mixed cross-provenance hold: local browser drives input; the
+    /// federated browser's events are dropped at the gate.
+    #[test]
+    fn federated_input_authorizer_returns_false_when_local_holder() {
+        let map = empty_authority_map();
+        seed_holder(&map, 0, "local-conn-A");
+        let authz = build_federated_input_authorizer(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            map,
+        );
+        assert!(
+            !authz(),
+            "LocalWs holder must drop federated input even though the \
+             registry is non-empty"
+        );
+    }
+
+    /// F-2: negative — same `federation_connection_id`, different
+    /// `session_id`. Two tabs from the same primary; only one holds.
+    /// The non-holding tab's events drop.
+    #[test]
+    fn federated_input_authorizer_returns_false_when_wrong_session() {
+        let map = empty_authority_map();
+        map.write().unwrap_or_else(|e| e.into_inner()).insert(
+            0,
+            DisplayInputHolder::FederatedWebRtc {
+                federation_connection_id: "fed-1".to_string(),
+                session_id: "sess-OTHER".to_string(),
+            },
+        );
+        let authz = build_federated_input_authorizer(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            map,
+        );
+        assert!(
+            !authz(),
+            "same connection + different session must deny — distinct \
+             tabs from the same primary don't share input authority"
+        );
+    }
+
+    /// F-2: negative — different `federation_connection_id` (different
+    /// primary). The federated holder belongs to a different primary's
+    /// transport; this primary's federated browser must not be able to
+    /// drive input on behalf of the other primary's session.
+    #[test]
+    fn federated_input_authorizer_returns_false_when_wrong_connection() {
+        let map = empty_authority_map();
+        map.write().unwrap_or_else(|e| e.into_inner()).insert(
+            0,
+            DisplayInputHolder::FederatedWebRtc {
+                federation_connection_id: "fed-OTHER".to_string(),
+                session_id: "sess-A".to_string(),
+            },
+        );
+        let authz = build_federated_input_authorizer(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            map,
+        );
+        assert!(
+            !authz(),
+            "different federation_connection_id must deny even when \
+             session_id matches — distinct primaries are distinct \
+             security boundaries"
+        );
     }
 
     // ---------------------------------------------------------------

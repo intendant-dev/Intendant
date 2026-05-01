@@ -12349,6 +12349,30 @@ class PeerDisplayConnection {
     // `display_input_authority_state` from the peer's per-subscriber
     // fanout task.
     this.authorityChannel = null;
+    // F-2: input data channels. Same wire format as the local
+    // DisplaySlot path — raw `InputEvent` JSON ({t:'kd', ...},
+    // {t:'mm', ...}, etc.) so the peer's existing
+    // `display/webrtc.rs::handle_message` parser dispatches them
+    // through one input handler regardless of whether they came from
+    // a local browser's WS or a federated peer's WebRTC. F-2's
+    // server-side gate
+    // ([`build_federated_input_authorizer`]) drops events that
+    // arrive without a matching federated holder.
+    //
+    // `control` is ordered + reliable (key events, mouse buttons —
+    // can't tolerate reorder or loss); `pointer` is unreliable +
+    // unordered (mouse-move, scroll — high-rate, latest-wins
+    // semantics, drop is preferable to head-of-line block).
+    this.controlChannel = null;
+    this.pointerChannel = null;
+    // F-2: interactive mode flag. True after `_enterInteractive`
+    // installs the pointer / keyboard listeners on the peer-display
+    // video element; cleared by `_exitInteractive`. Only flips to
+    // true when `peerAuthorityState === 'you'`. The peer-side gate
+    // is the security boundary; this flag is UX consistency only.
+    this.interactive = false;
+    this._boundHandlers = {};
+    this._heldModifiers = new Set();
   }
 
   sessionKey() {
@@ -12550,6 +12574,23 @@ class PeerDisplayConnection {
         this._log('debug', `unhandled authority frame: ${e.data && e.data.slice(0, 80)}`);
       }
     };
+
+    // F-2: input data channels. Same labels + reliability semantics
+    // as the local DisplaySlot path so the peer's existing
+    // `handle_message` parser dispatches both transports through
+    // one input handler. Created BEFORE `createOffer()` so the
+    // channels appear in the SDP. Channels open after the peer's
+    // answer; the input listeners installed by `_enterInteractive`
+    // gate-check `readyState === 'open'` before sending.
+    this.controlChannel = this.pc.createDataChannel('control', { ordered: true });
+    this.pointerChannel = this.pc.createDataChannel('pointer', {
+      ordered: false,
+      maxRetransmits: 0,
+    });
+    this.controlChannel.onopen = () =>
+      this._log('info', 'control data channel open');
+    this.pointerChannel.onopen = () =>
+      this._log('info', 'pointer data channel open');
 
     this.pc.ontrack = (e) => {
       this.stream = e.streams[0];
@@ -12761,6 +12802,167 @@ class PeerDisplayConnection {
       // user no longer wants.
       this._takeControlPending = false;
     }
+    // F-2: enter / exit interactive mode based on the authoritative
+    // state. Mirrors local DisplaySlot's `setAuthority` arms exactly:
+    //   - state == 'you' AND not yet interactive → install listeners.
+    //   - state != 'you' AND currently interactive → silently exit
+    //     (the user didn't ask to leave; another browser took
+    //     control or the peer revoked).
+    if (state === 'you' && !this.interactive) {
+      this._enterInteractive();
+    } else if (this.interactive && state !== 'you') {
+      this._exitInteractive();
+    }
+  }
+
+  // F-2: install pointer / keyboard listeners on the peer-display
+  // video element so user input flows over the `control` /
+  // `pointer` data channels as raw `InputEvent` JSON. Mirrors local
+  // DisplaySlot's `_enterInteractive` exactly except for what's
+  // out-of-scope for F-2: no `take_display` ControlMsg (peer's
+  // worker-agent coordination is future work), no clipboard
+  // (federated clipboard is a follow-up).
+  _enterInteractive() {
+    if (this.interactive) return;
+    this.interactive = true;
+    const container = document.getElementById(`peer-display-${this.hostId}`);
+    const vid = container && container.querySelector('.peer-display-video');
+    if (!vid) {
+      // Pane was destroyed between authority grant and entry — bail
+      // and let the next authority change retry. Setting
+      // `interactive = true` above is fine because `_exitInteractive`
+      // is idempotent: it'll find no listeners and clean up cheaply.
+      this._log('warn', 'enterInteractive: video element missing — pane torn down?');
+      return;
+    }
+    vid.tabIndex = 0;
+    vid.focus();
+    this._heldModifiers = new Set();
+
+    const normalize = (e) => {
+      // Same letterbox-aware normalization as local DisplaySlot —
+      // map screen-pixel cursor to logical (0..1) display coords
+      // accounting for the video element's preserved aspect ratio.
+      const rect = vid.getBoundingClientRect();
+      const vW = vid.videoWidth || rect.width;
+      const vH = vid.videoHeight || rect.height;
+      const videoAspect = vW / vH;
+      const elAspect = rect.width / rect.height;
+      let contentW, contentH, offsetX, offsetY;
+      if (elAspect > videoAspect) {
+        contentH = rect.height;
+        contentW = contentH * videoAspect;
+        offsetX = (rect.width - contentW) / 2;
+        offsetY = 0;
+      } else {
+        contentW = rect.width;
+        contentH = contentW / videoAspect;
+        offsetX = 0;
+        offsetY = (rect.height - contentH) / 2;
+      }
+      const relX = (e.clientX - rect.left - offsetX) / contentW;
+      const relY = (e.clientY - rect.top - offsetY) / contentH;
+      return {
+        x: Math.max(0, Math.min(relX, 0.9999)),
+        y: Math.max(0, Math.min(relY, 0.9999)),
+      };
+    };
+
+    // Wire format identical to local DisplaySlot's: raw `InputEvent`
+    // JSON. The peer's `display/webrtc.rs::handle_message` already
+    // dispatches `control` and `pointer` channels through the same
+    // `serde_json::from_str::<InputEvent>` parser. F-2 changes
+    // nothing about the wire shape — only the gate that decides
+    // whether the parsed event reaches `inject_input`.
+    const sendControl = (msg) => {
+      if (this.controlChannel && this.controlChannel.readyState === 'open') {
+        this.controlChannel.send(JSON.stringify(msg));
+      }
+    };
+    const sendPointer = (msg) => {
+      if (this.pointerChannel && this.pointerChannel.readyState === 'open') {
+        this.pointerChannel.send(JSON.stringify(msg));
+      }
+    };
+
+    this._boundHandlers.keydown = (e) => {
+      e.preventDefault();
+      if (['ShiftLeft','ShiftRight','ControlLeft','ControlRight','AltLeft','AltRight','MetaLeft','MetaRight'].includes(e.code)) {
+        this._heldModifiers.add(e.code);
+      }
+      sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
+    };
+    this._boundHandlers.keyup = (e) => {
+      e.preventDefault();
+      this._heldModifiers.delete(e.code);
+      sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
+    };
+    this._boundHandlers.pointerdown = (e) => {
+      e.preventDefault();
+      vid.focus();
+      vid.setPointerCapture(e.pointerId);
+      const { x, y } = normalize(e);
+      sendControl({ t: 'md', x, y, b: e.button });
+    };
+    this._boundHandlers.pointerup = (e) => {
+      e.preventDefault();
+      vid.releasePointerCapture(e.pointerId);
+      const { x, y } = normalize(e);
+      sendControl({ t: 'mu', x, y, b: e.button });
+    };
+    this._boundHandlers.pointermove = (e) => {
+      const { x, y } = normalize(e);
+      sendPointer({ t: 'mm', x, y, buttons: e.buttons });
+    };
+    this._boundHandlers.wheel = (e) => {
+      e.preventDefault();
+      const { x, y } = normalize(e);
+      let dx = e.deltaX, dy = e.deltaY;
+      if (e.deltaMode === 0) {
+        dx = Math.round(dx / 100) || (dx > 0 ? 1 : dx < 0 ? -1 : 0);
+        dy = Math.round(dy / 100) || (dy > 0 ? 1 : dy < 0 ? -1 : 0);
+      } else if (e.deltaMode === 2) {
+        dx *= 3; dy *= 3;
+      }
+      sendPointer({ t: 'sc', x, y, dx, dy });
+    };
+    this._boundHandlers.contextmenu = (e) => e.preventDefault();
+    this._boundHandlers.blur = () => {
+      // Release all held modifier keys when the video element loses
+      // focus — without this, the peer thinks Shift/Ctrl/Alt/Meta
+      // are still held because no keyup ever fires.
+      for (const code of this._heldModifiers) {
+        sendControl({ t: 'ku', code, key: '', shift: false, ctrl: false, alt: false, meta: false });
+      }
+      this._heldModifiers.clear();
+    };
+    this._boundHandlers.pointerenter = () => {
+      if (this.interactive) vid.focus();
+    };
+
+    for (const [evt, handler] of Object.entries(this._boundHandlers)) {
+      vid.addEventListener(evt, handler);
+    }
+    this._log('info', 'entered interactive mode — input listeners installed');
+  }
+
+  // F-2: tear down pointer / keyboard listeners. Idempotent so a
+  // race between user-driven Release and server-driven demotion
+  // doesn't double-fire. Called from `setPeerAuthorityState` on
+  // `state !== 'you'`, and from `close()` for cleanup.
+  _exitInteractive() {
+    if (!this.interactive) return;
+    this.interactive = false;
+    if (this._heldModifiers) this._heldModifiers.clear();
+    const container = document.getElementById(`peer-display-${this.hostId}`);
+    const vid = container && container.querySelector('.peer-display-video');
+    if (vid) {
+      for (const [evt, handler] of Object.entries(this._boundHandlers)) {
+        vid.removeEventListener(evt, handler);
+      }
+    }
+    this._boundHandlers = {};
+    this._log('debug', 'exited interactive mode — input listeners removed');
   }
 
   // F-1.3c: render the chip + Take/Release button visibility from
@@ -12892,17 +13094,24 @@ class PeerDisplayConnection {
   }
 
   async close() {
+    // F-2: tear down input listeners FIRST. The `pc.close()` chain
+    // below would close the data channels anyway, but uninstalling
+    // listeners eagerly prevents a final mousemove from racing the
+    // close and landing on a half-closed channel.
+    this._exitInteractive();
     // Best-effort tell peer to tear down its WebRtcPeer.
     await this._sendSignal({ kind: 'close' }).catch(() => {});
     if (this.pc) {
       try { this.pc.close(); } catch {}
       this.pc = null;
     }
-    // F-1.3c: the authority data channel closes implicitly when
-    // `pc.close()` runs. Null the reference so a stale Take/Release
-    // click after close fails the readyState check rather than
-    // throwing on a freed channel.
+    // F-1.3c + F-2: data channels close implicitly when `pc.close()`
+    // runs. Null the references so stale post-close calls fail the
+    // `readyState === 'open'` check rather than throwing on a freed
+    // channel.
     this.authorityChannel = null;
+    this.controlChannel = null;
+    this.pointerChannel = null;
     this.stream = null;
   }
 
