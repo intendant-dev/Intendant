@@ -342,3 +342,81 @@ but does not by itself unblock federation. VP8 single-RID floor (this
 section) is the working federated baseline until either (a) the local
 TURN/virtio loss is fixed at the network layer (#69) or (b) the H.264
 encoder produces small enough IDRs to survive the loss (#69 mitigation).
+
+## 7. Federated input authority chip — F-1.3c smoke
+
+**Goal.** Verify the browser-side authority chip + Take/Release
+buttons render and round-trip through the peer's authority registry.
+F-1 is visibility-only — input is still deny-by-default
+(`build_federated_input_authorizer() -> false`), so this smoke does
+NOT exercise actual mouse/keyboard injection.
+
+**Prereq.** §6 federated path is up (peer added with non-loopback
+`browser_tcp_via_url`, display granted, video stream rendering in
+the peer-display panel).
+
+### 7.1 Steps
+
+1. With the federated peer-display panel open and connected:
+   verify the chip in the panel's controls row resolves from
+   hidden (the `unknown` initial state) to grey **"Input: shared"**
+   within ~1s of `ontrack` firing. The transition is driven by the
+   peer's per-subscriber fanout sending the initial personalized
+   snapshot via `Command::SendAuthorityState` — F-1.2's pending
+   queue absorbs the case where the snapshot arrives before the
+   `display_input_authority` data channel finishes negotiating.
+2. Click **Take Control** in the controls row.
+3. Verify within ~1s: chip flips to green **"Input: you"**, button
+   row swaps to **Release** (Take Control hidden).
+4. Click **Release**.
+5. Verify within ~1s: chip flips back to grey **"Input: shared"**,
+   button row swaps back to **Take Control** (Release hidden).
+
+### 7.2 Expected signals
+
+In the browser console (`Develop → ... → Inspect`), filter for
+`webrtc-peer`:
+
+- `authority data channel open` — the `display_input_authority`
+  data channel negotiated successfully. Without this, the chip
+  stays at `unknown` and the buttons are non-functional.
+- `sent display_input_authority_request (display_id=N)` — emitted
+  by `_sendAuthorityFrame` on the Take Control click.
+- `authority granted: you` — emitted by `setPeerAuthorityState`
+  when the peer's broadcast confirms the grant.
+- `sent display_input_authority_release (display_id=N)` — emitted
+  on the Release click.
+
+A second federated browser (or a second tab from the same primary)
+attached to the same peer-display will see the chip transition to
+yellow **"Input: another viewer"** when this browser holds. F-1's
+fanout broadcasts personalized state to every subscribed peer.
+
+### 7.3 Failure modes
+
+- **Chip stuck at hidden / `unknown`.** The data channel didn't
+  open. Most likely the peer is on an old build that lacks F-1
+  (`apply_grant_input_authority_federated` etc.); check
+  `git_sha` on the peer-row badge in Settings → Network.
+- **Click on Take Control does nothing — chip and button stay.**
+  Check `_sendAuthorityFrame` warn in console (`dropped — authority
+  channel not open`). If channel is `connecting`, the snapshot
+  would also be queued — wait for the chip to resolve to "Input:
+  shared" first, then click. Click handler is bound at
+  `attachToDom` time on the elements present at that moment; if a
+  daemons-list re-render destroyed and rebuilt the panel,
+  `attachToDom` re-binds, so the second-or-later panel build still
+  works.
+- **Chip flips to "you" briefly then snaps back to "shared".** A
+  second federated subscriber on the same peer raced and took
+  authority. Last-writer-wins. Open both browsers' consoles to
+  see who clicked first.
+
+### 7.4 Out of scope (F-2 / F-3)
+
+- Actual keyboard / mouse / clipboard input on the federated path
+  (F-2 wires `control` / `pointer` data channels and flips the
+  authorizer).
+- Cross-primary handover (two Intendant.app instances both viewing
+  the same peer; F-3 verifies last-take-wins arbitrates correctly
+  across distinct primaries).
