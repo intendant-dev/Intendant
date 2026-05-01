@@ -12436,6 +12436,27 @@ class PeerDisplayConnection {
     // chip to 'unknown' — the live `peerAuthorityState` survives the
     // DOM swap on the connection object.
     this._renderAuthorityChip();
+    // F-2 lifecycle: if the panel was rebuilt while we still hold
+    // input authority, our `_boundHandlers` are bound to the
+    // now-detached prior video element. Force-clear interactive
+    // state and re-enter against the freshly-attached video so
+    // input keeps flowing across daemons-list re-renders.
+    //
+    // We can't just call `_exitInteractive()` then
+    // `_enterInteractive()` because exit's `removeEventListener`
+    // would target the old DOM node (harmless but pointless), and
+    // exit guards on `this.interactive` so it'd be a no-op anyway
+    // if the bind failed earlier (see the no-video bail-out doc).
+    // Direct field reset is the honest accounting: the bindings to
+    // the prior element are unrecoverable; let the new
+    // `_enterInteractive` install fresh bindings on the current
+    // video element.
+    if (this.peerAuthorityState === 'you') {
+      this.interactive = false;
+      this._boundHandlers = {};
+      if (this._heldModifiers) this._heldModifiers.clear();
+      this._enterInteractive();
+    }
   }
 
   setStatus(text, kind) {
@@ -12824,14 +12845,16 @@ class PeerDisplayConnection {
   // (federated clipboard is a follow-up).
   _enterInteractive() {
     if (this.interactive) return;
-    this.interactive = true;
     const container = document.getElementById(`peer-display-${this.hostId}`);
     const vid = container && container.querySelector('.peer-display-video');
     if (!vid) {
-      // Pane was destroyed between authority grant and entry — bail
-      // and let the next authority change retry. Setting
-      // `interactive = true` above is fine because `_exitInteractive`
-      // is idempotent: it'll find no listeners and clean up cheaply.
+      // Pane was destroyed between authority grant and entry. Bail
+      // WITHOUT flipping `interactive` so a subsequent
+      // `attachToDom` (which calls back into _enterInteractive when
+      // peerAuthorityState === 'you') can rebind cleanly. Earlier
+      // versions set the flag here and got stuck — `setPeerAuthorityState`
+      // would skip on the redundant `if (this.interactive) return`
+      // branch and the rebuilt pane never got listeners.
       this._log('warn', 'enterInteractive: video element missing — pane torn down?');
       return;
     }
@@ -12943,6 +12966,10 @@ class PeerDisplayConnection {
     for (const [evt, handler] of Object.entries(this._boundHandlers)) {
       vid.addEventListener(evt, handler);
     }
+    // Flag flips to `true` ONLY after the install succeeds — see
+    // the doc on the early-return-on-missing-video branch above for
+    // why this isn't moved earlier.
+    this.interactive = true;
     this._log('info', 'entered interactive mode — input listeners installed');
   }
 
