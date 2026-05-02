@@ -503,57 +503,19 @@ pub struct DisplaySession {
     layer_policy_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// Convert one BGRA frame to I420 and, when the Phase 0 visual-freshness
-/// diagnostic flag is set, stamp the lower 32 bits of the
-/// `arrived - session_epoch` millisecond delta into the top-left 128×64 px
-/// of the source Y plane. The returned marker value is also handed to the
-/// encoder pool so downscaled layers can re-stamp the same 128×64 marker in
-/// their own output resolution. Run from inside `spawn_blocking` on the pool-feed
-/// bridge's hot path so the CPU-bound `bgra_to_i420` (and the optional
-/// stamp pass) stays off the tokio executor.
+/// Convert one BGRA frame to I420 for the pool-feed bridge.
 ///
-/// When `marker_flag` is `false`, the function is exactly equivalent to a
-/// bare [`encode::bgra_to_i420`] call — the per-frame branch is one
-/// Relaxed atomic load, no allocations, no extra writes. When `true`, the
-/// stamp adds ~512 byte writes into the Y plane (32 tiles × 16 px wide),
-/// dominated by the existing Y-plane construction cost so the throughput
-/// hit on a busy stream is well under one percent.
-///
-/// Co-located with the bridge rather than in [`visual_marker`] because
-/// the helper is specific to this caller's BGRA→I420→optional-stamp
-/// shape; the marker module stays at the pure-data-stamp layer.
-fn convert_and_maybe_stamp(
+/// Phase 0 visual-freshness stamps are applied later, at pool send/encoder
+/// time, so heartbeat re-sends of a static desktop still carry a fresh marker
+/// timestamp and downscaled layers get a marker in their final output
+/// resolution.
+fn convert_for_pool_feed(
     bgra: &[u8],
     width: u32,
     height: u32,
     stride: u32,
-    marker_flag: &AtomicBool,
-    arrived: Instant,
-    session_epoch: Instant,
-) -> (Vec<u8>, Option<u32>) {
-    let mut i420 = encode::bgra_to_i420(bgra, width, height, stride);
-    let visual_marker_value = if marker_flag.load(Ordering::Relaxed) {
-        // Lower 32 bits of millis since session start. Wrap horizon is
-        // ~49.7 days — irrelevant for any realistic smoke run; the
-        // browser sampler treats it as a monotonic per-frame token, not
-        // a wall-clock value (clock-sync is Phase 0 Level 2).
-        let value = arrived
-            .saturating_duration_since(session_epoch)
-            .as_millis() as u32;
-        let y_len = (width as usize) * (height as usize);
-        if let Some(y) = i420.get_mut(0..y_len) {
-            visual_marker::stamp_y_plane(
-                y,
-                width as usize,
-                height as usize,
-                value,
-            );
-        }
-        Some(value)
-    } else {
-        None
-    };
-    (i420, visual_marker_value)
+) -> Vec<u8> {
+    encode::bgra_to_i420(bgra, width, height, stride)
 }
 
 impl DisplaySession {
@@ -1455,8 +1417,7 @@ impl DisplaySession {
             // `Arc` so `tick.tick()` re-pushes can clone cheaply
             // instead of the `Vec<u8>` clone the simpler
             // pre-3c.3b.3b-followup version did.
-            let mut latest_i420: Option<(Arc<Vec<u8>>, Instant, Option<u32>)> =
-                None;
+            let mut latest_i420: Option<(Arc<Vec<u8>>, Instant)> = None;
             // `generation` bumps on every replacement; `last_sent_gen`
             // is what we last forwarded. Mismatch = "buffer changed
             // since last send" (i.e. real damage on a damage-driven
@@ -1537,22 +1498,17 @@ impl DisplaySession {
                     // Cropping the rightmost column / bottom row at
                     // this stage is invisible at display.
                     let i420_result = tokio::task::spawn_blocking({
-                        let marker_flag = Arc::clone(&marker_flag);
-                        move || convert_and_maybe_stamp(
+                        move || convert_for_pool_feed(
                             &frame_arc.data,
                             frame_w,
                             frame_h,
                             frame_arc.stride,
-                            &marker_flag,
-                            arrived,
-                            session_epoch,
                         )
                     })
                     .await;
-                    if let Ok((i420, visual_marker_value)) = i420_result {
+                    if let Ok(i420) = i420_result {
                         generation = generation.wrapping_add(1);
-                        latest_i420 =
-                            Some((Arc::new(i420), arrived, visual_marker_value));
+                        latest_i420 = Some((Arc::new(i420), arrived));
                     }
                 }
             }
@@ -1631,22 +1587,17 @@ impl DisplaySession {
                         // `downscale_i420` and the pool's encoders
                         // expect.
                         let i420_result = tokio::task::spawn_blocking({
-                            let marker_flag = Arc::clone(&marker_flag);
-                            move || convert_and_maybe_stamp(
+                            move || convert_for_pool_feed(
                                 &frame_arc.data,
                                 frame_w,
                                 frame_h,
                                 frame_arc.stride,
-                                &marker_flag,
-                                arrived,
-                                session_epoch,
                             )
                         })
                         .await;
-                        if let Ok((i420, visual_marker_value)) = i420_result {
+                        if let Ok(i420) = i420_result {
                             generation = generation.wrapping_add(1);
-                            latest_i420 =
-                                Some((Arc::new(i420), arrived, visual_marker_value));
+                            latest_i420 = Some((Arc::new(i420), arrived));
                         }
                     }
                     _ = tick.tick() => {
@@ -1662,8 +1613,7 @@ impl DisplaySession {
                         // pipe (Linux ffmpeg H.264) hit a natural
                         // keyframe inside the burst window rather than
                         // waiting many seconds on heartbeat-only).
-                        let Some((ref i420, arrived, visual_marker_value)) =
-                            latest_i420 else {
+                        let Some((ref i420, arrived)) = latest_i420 else {
                             continue;
                         };
 
@@ -1676,6 +1626,22 @@ impl DisplaySession {
                             continue;
                         }
 
+                        let visual_marker_value =
+                            if marker_flag.load(Ordering::Relaxed) {
+                                // Lower 32 bits of millis since session start.
+                                // Wrap horizon is ~49.7 days — irrelevant for
+                                // any realistic smoke run; the browser sampler
+                                // treats it as a monotonic per-frame token, not
+                                // a wall-clock value.
+                                Some(
+                                    Instant::now()
+                                        .saturating_duration_since(session_epoch)
+                                        .as_millis()
+                                        as u32,
+                                )
+                            } else {
+                                None
+                            };
                         pool.push_i420_frame_with_visual_marker(
                             Arc::clone(i420),
                             arrived,

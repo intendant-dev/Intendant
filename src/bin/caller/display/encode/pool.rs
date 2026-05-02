@@ -2363,6 +2363,7 @@ fn spawn_encoder_thread_with(
             // for the source-dim layer (always-on full + every
             // on-demand on-source-dim layer) pays nothing.
             let mut scaled_buf;
+            let mut stamped_buf;
             let i420_for_encode: &[u8] = if needs_downscale {
                 scaled_buf = super::downscale_i420(
                     &frame.data,
@@ -2383,6 +2384,18 @@ fn spawn_encoder_thread_with(
                     }
                 }
                 &scaled_buf
+            } else if let Some(value) = frame.visual_marker_value {
+                stamped_buf = frame.data.as_ref().clone();
+                let y_len = (downscale_dst_w as usize) * (downscale_dst_h as usize);
+                if let Some(y) = stamped_buf.get_mut(0..y_len) {
+                    visual_marker::stamp_y_plane(
+                        y,
+                        downscale_dst_w as usize,
+                        downscale_dst_h as usize,
+                        value,
+                    );
+                }
+                &stamped_buf
             } else {
                 &frame.data
             };
