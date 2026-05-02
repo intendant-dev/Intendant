@@ -1973,6 +1973,15 @@ async fn handle_control_command_mcp(
             // caller here. Ignored.
             None
         }
+        ControlMsg::SetDiagnosticsVisualMarker { .. } => {
+            // Phase 0 visual-freshness diagnostic toggle (task #83).
+            // Handled inline by the web gateway's `/ws` dispatcher,
+            // which has direct access to the per-display
+            // `session_registry` to flip the matching DisplaySession's
+            // diagnostic flag. MCP doesn't drive display sessions and
+            // has no path to the registry from this dispatcher; no-op.
+            None
+        }
     }
 }
 

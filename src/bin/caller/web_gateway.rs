@@ -5033,6 +5033,46 @@ pub fn spawn_web_gateway(
                                                 }
                                             }
                                         }
+                                        Some("set_diagnostics_visual_marker") => {
+                                            // **Phase 0 visual-freshness diagnostic toggle**
+                                            // (task #83). Inline rather than going through
+                                            // the ControlMsg dispatch path because the
+                                            // effect is a single atomic store on the
+                                            // matching DisplaySession — no shared autonomy
+                                            // state, no event-bus side effects, no listener
+                                            // chain to wait on. Symmetric with the
+                                            // `display_input` arm above for the same reason
+                                            // (direct session access, no bus round-trip).
+                                            //
+                                            // No authority gate: diagnostics is operator-
+                                            // initiated and the marker affects every viewer
+                                            // of this display when on (it's stamped pre-
+                                            // encoder, lands in every encoded layer). An
+                                            // operator running a smoke run sets it, all
+                                            // viewers see the marker until they unset it.
+                                            // No covert-stamp scenario worth gating against.
+                                            let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
+                                            let enabled = json["enabled"].as_bool().unwrap_or(false);
+                                            let session: Option<Arc<crate::display::DisplaySession>> = match session_registry_inbound.as_ref() {
+                                                Some(sr) => sr.read().await.get(display_id),
+                                                None => None,
+                                            };
+                                            match session {
+                                                Some(session) => {
+                                                    session.set_diagnostics_visual_marker(enabled);
+                                                    eprintln!(
+                                                        "[web_gateway] phase-0 visual marker for display {} = {}",
+                                                        display_id, enabled,
+                                                    );
+                                                }
+                                                None => {
+                                                    eprintln!(
+                                                        "[web_gateway] phase-0 visual marker request for unknown display {} ({}); display not granted yet?",
+                                                        display_id, enabled,
+                                                    );
+                                                }
+                                            }
+                                        }
                                         _ => {
                                             // Fall through to ControlMsg parsing.
                                             // WebRtcSignal needs special handling because

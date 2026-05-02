@@ -878,6 +878,26 @@ pub enum ControlMsg {
         #[serde(default)]
         note: Option<String>,
     },
+    /// **Phase 0 visual-freshness diagnostic** (task #83). Toggle the
+    /// per-display marker overlay that the pool-feed bridge stamps into
+    /// the I420 Y plane. Off by default; operator flips it on for a
+    /// smoke run, off when the NDJSON transcript is collected. The
+    /// browser-side `PeerDisplayConnection` sampler reads the marker
+    /// per video frame to measure visual freshness without depending on
+    /// getStats counters that proved misleading on task #81.
+    ///
+    /// Visible to ALL viewers of the named display when on, since the
+    /// marker is stamped pre-encoder and lands in every encoded layer.
+    /// Acceptable for an opt-in diagnostic flag — see DisplaySession's
+    /// `diagnostics_visual_marker` field for the rationale.
+    SetDiagnosticsVisualMarker {
+        /// Optional display ID to toggle. When `None`, toggles the
+        /// primary display (id 0) — same convention as the other
+        /// display-scoped ControlMsg variants.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_id: Option<u32>,
+        enabled: bool,
+    },
     /// Claim input authority for one display (phase 5 of the multi-viewer
     /// redesign).  When granted, this WebSocket connection becomes the
     /// sole source of `display_input` events for `display_id`; other
@@ -2320,6 +2340,43 @@ mod tests {
             }
             _ => panic!("expected RevokeUserDisplay"),
         }
+    }
+
+    #[test]
+    fn control_msg_set_diagnostics_visual_marker_default_display() {
+        let json = r#"{"action":"set_diagnostics_visual_marker","enabled":true}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::SetDiagnosticsVisualMarker { display_id, enabled } => {
+                assert_eq!(display_id, None);
+                assert!(enabled);
+            }
+            _ => panic!("expected SetDiagnosticsVisualMarker"),
+        }
+    }
+
+    #[test]
+    fn control_msg_set_diagnostics_visual_marker_with_id_disable() {
+        let json =
+            r#"{"action":"set_diagnostics_visual_marker","display_id":2,"enabled":false}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::SetDiagnosticsVisualMarker { display_id, enabled } => {
+                assert_eq!(display_id, Some(2));
+                assert!(!enabled);
+            }
+            _ => panic!("expected SetDiagnosticsVisualMarker"),
+        }
+    }
+
+    #[test]
+    fn control_msg_set_diagnostics_visual_marker_missing_enabled_rejected() {
+        // `enabled` is required (no #[serde(default)]). Toggle requests
+        // without it are operator typos that would otherwise default to
+        // `false`, silently turning the marker off when an enable was
+        // intended. Better to fail loud at the wire-parse layer.
+        let json = r#"{"action":"set_diagnostics_visual_marker"}"#;
+        assert!(serde_json::from_str::<ControlMsg>(json).is_err());
     }
 
     #[test]

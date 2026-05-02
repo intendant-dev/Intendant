@@ -1566,6 +1566,12 @@ impl App {
                 // connection id as the authority holder). The TUI
                 // has no analogous notion; no-op.
             }
+            ControlMsg::SetDiagnosticsVisualMarker { .. } => {
+                // Phase 0 visual-freshness diagnostic toggle (task #83).
+                // Handled inline by the web gateway's `/ws` dispatcher
+                // against the per-display `session_registry`. The TUI
+                // doesn't drive display sessions; no-op.
+            }
         }
     }
 
