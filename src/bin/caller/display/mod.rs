@@ -506,7 +506,9 @@ pub struct DisplaySession {
 /// Convert one BGRA frame to I420 and, when the Phase 0 visual-freshness
 /// diagnostic flag is set, stamp the lower 32 bits of the
 /// `arrived - session_epoch` millisecond delta into the top-left 128×64 px
-/// of the Y plane. Run from inside `spawn_blocking` on the pool-feed
+/// of the source Y plane. The returned marker value is also handed to the
+/// encoder pool so downscaled layers can re-stamp the same 128×64 marker in
+/// their own output resolution. Run from inside `spawn_blocking` on the pool-feed
 /// bridge's hot path so the CPU-bound `bgra_to_i420` (and the optional
 /// stamp pass) stays off the tokio executor.
 ///
@@ -528,9 +530,9 @@ fn convert_and_maybe_stamp(
     marker_flag: &AtomicBool,
     arrived: Instant,
     session_epoch: Instant,
-) -> Vec<u8> {
+) -> (Vec<u8>, Option<u32>) {
     let mut i420 = encode::bgra_to_i420(bgra, width, height, stride);
-    if marker_flag.load(Ordering::Relaxed) {
+    let visual_marker_value = if marker_flag.load(Ordering::Relaxed) {
         // Lower 32 bits of millis since session start. Wrap horizon is
         // ~49.7 days — irrelevant for any realistic smoke run; the
         // browser sampler treats it as a monotonic per-frame token, not
@@ -547,8 +549,11 @@ fn convert_and_maybe_stamp(
                 value,
             );
         }
-    }
-    i420
+        Some(value)
+    } else {
+        None
+    };
+    (i420, visual_marker_value)
 }
 
 impl DisplaySession {
@@ -1450,7 +1455,8 @@ impl DisplaySession {
             // `Arc` so `tick.tick()` re-pushes can clone cheaply
             // instead of the `Vec<u8>` clone the simpler
             // pre-3c.3b.3b-followup version did.
-            let mut latest_i420: Option<(Arc<Vec<u8>>, Instant)> = None;
+            let mut latest_i420: Option<(Arc<Vec<u8>>, Instant, Option<u32>)> =
+                None;
             // `generation` bumps on every replacement; `last_sent_gen`
             // is what we last forwarded. Mismatch = "buffer changed
             // since last send" (i.e. real damage on a damage-driven
@@ -1543,9 +1549,10 @@ impl DisplaySession {
                         )
                     })
                     .await;
-                    if let Ok(i420) = i420_result {
+                    if let Ok((i420, visual_marker_value)) = i420_result {
                         generation = generation.wrapping_add(1);
-                        latest_i420 = Some((Arc::new(i420), arrived));
+                        latest_i420 =
+                            Some((Arc::new(i420), arrived, visual_marker_value));
                     }
                 }
             }
@@ -1636,9 +1643,10 @@ impl DisplaySession {
                             )
                         })
                         .await;
-                        if let Ok(i420) = i420_result {
+                        if let Ok((i420, visual_marker_value)) = i420_result {
                             generation = generation.wrapping_add(1);
-                            latest_i420 = Some((Arc::new(i420), arrived));
+                            latest_i420 =
+                                Some((Arc::new(i420), arrived, visual_marker_value));
                         }
                     }
                     _ = tick.tick() => {
@@ -1654,7 +1662,8 @@ impl DisplaySession {
                         // pipe (Linux ffmpeg H.264) hit a natural
                         // keyframe inside the burst window rather than
                         // waiting many seconds on heartbeat-only).
-                        let Some((ref i420, arrived)) = latest_i420 else {
+                        let Some((ref i420, arrived, visual_marker_value)) =
+                            latest_i420 else {
                             continue;
                         };
 
@@ -1667,7 +1676,11 @@ impl DisplaySession {
                             continue;
                         }
 
-                        pool.push_i420_frame(Arc::clone(i420), arrived);
+                        pool.push_i420_frame_with_visual_marker(
+                            Arc::clone(i420),
+                            arrived,
+                            visual_marker_value,
+                        );
                         last_sent_gen = Some(generation);
                         last_send_at = Instant::now();
                     }

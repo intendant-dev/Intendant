@@ -141,7 +141,7 @@
 //! This module currently establishes the type vocabulary and
 //! orchestration contract; subsequent phases fill in the bodies.
 
-use crate::display::EncodedFrame;
+use crate::display::{visual_marker, EncodedFrame};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -566,6 +566,7 @@ impl EncoderHandle {
 pub struct I420Frame {
     pub data: Arc<Vec<u8>>,
     pub arrived: Instant,
+    pub visual_marker_value: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1383,13 +1384,32 @@ impl EncoderPool {
     /// because backpressure here would stall every other encoder for
     /// one slow one.
     pub fn push_i420_frame(&self, data: Arc<Vec<u8>>, arrived: Instant) -> usize {
+        self.push_i420_frame_with_visual_marker(data, arrived, None)
+    }
+
+    /// Push one I420 frame with an optional diagnostic visual-marker value.
+    ///
+    /// The bridge stamps the source I420 frame before broadcasting to the pool.
+    /// Downscaled layers would otherwise shrink that marker, so encoder
+    /// threads re-stamp the same value after per-layer downscale when this is
+    /// `Some`.
+    pub fn push_i420_frame_with_visual_marker(
+        &self,
+        data: Arc<Vec<u8>>,
+        arrived: Instant,
+        visual_marker_value: Option<u32>,
+    ) -> usize {
         // broadcast::send returns the receiver count on success, or
         // SendError if there are zero receivers (no encoders running).
         // Both are normal: the bridge keeps feeding regardless of
         // whether anyone is listening.
         self.inner
             .i420_tx
-            .send(I420Frame { data, arrived })
+            .send(I420Frame {
+                data,
+                arrived,
+                visual_marker_value,
+            })
             .unwrap_or(0)
     }
 
@@ -2342,7 +2362,7 @@ fn spawn_encoder_thread_with(
             // check is computed once at thread spawn, so the hot path
             // for the source-dim layer (always-on full + every
             // on-demand on-source-dim layer) pays nothing.
-            let scaled_buf;
+            let mut scaled_buf;
             let i420_for_encode: &[u8] = if needs_downscale {
                 scaled_buf = super::downscale_i420(
                     &frame.data,
@@ -2351,6 +2371,17 @@ fn spawn_encoder_thread_with(
                     downscale_dst_w,
                     downscale_dst_h,
                 );
+                if let Some(value) = frame.visual_marker_value {
+                    let y_len = (downscale_dst_w as usize) * (downscale_dst_h as usize);
+                    if let Some(y) = scaled_buf.get_mut(0..y_len) {
+                        visual_marker::stamp_y_plane(
+                            y,
+                            downscale_dst_w as usize,
+                            downscale_dst_h as usize,
+                            value,
+                        );
+                    }
+                }
                 &scaled_buf
             } else {
                 &frame.data
