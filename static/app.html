@@ -12309,6 +12309,263 @@ function peerCanShareDisplay(d) {
   return d.capabilities.some(c => c && c.kind === 'display');
 }
 
+// **Phase 0 visual-freshness sampler** (task #83).
+//
+// Reads the diagnostic marker the peer's pool-feed bridge stamps into
+// the top-left 128x64 px of every captured frame, decodes the 32-bit
+// timestamp, tracks transitions, and POSTs an NDJSON transcript to
+// `/api/diagnostics/visual-freshness?session_id=<browser_uuid>`. Used
+// to measure visual freshness (effective fps + freeze intervals) without
+// depending on getStats packet counters that proved misleading on
+// task #81 (frozen viewer + jump-cut despite framesDecoded advancing).
+//
+// Activation: a `?diag=1` URL query param. The marker itself must be
+// independently enabled on the peer side -- send
+// `{"action":"set_diagnostics_visual_marker","display_id":<id>,"enabled":true}`
+// to the peer's /ws (e.g. via the operator script in
+// docs/smoke-display.md). When the marker isn't on, the sampler runs
+// happily but observes zero transitions; the resulting transcript is
+// the "no marker" baseline (useful as a control; obvious to spot).
+//
+// Geometry constants must match `src/bin/caller/display/visual_marker.rs`.
+// 8x4 tiles x 16 px = 128x64 px patch in the top-left; tile centers
+// sample at (col*16+8, row*16+8); luma threshold 128 splits the
+// limited-range 16/235 pair the peer writes.
+class VisualFreshnessSampler {
+  constructor(videoEl, hostId, displayId) {
+    this.videoEl = videoEl;
+    this.hostId = hostId;
+    this.displayId = displayId;
+    this.browserSessionId = (window.crypto && window.crypto.randomUUID)
+      ? window.crypto.randomUUID()
+      : `vf-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
+    // Marker geometry -- MUST match the peer-side visual_marker
+    // module's TILE_PX / COLS / ROWS / THRESHOLD constants.
+    this.MARKER_W = 128;
+    this.MARKER_H = 64;
+    this.TILE_PX = 16;
+    this.COLS = 8;
+    this.ROWS = 4;
+    this.THRESHOLD = 128;
+
+    // Offscreen canvas sized exactly to the marker patch. We draw only
+    // the top-left region of the source video into it so getImageData
+    // is bounded to ~32 KB per sample regardless of source resolution.
+    // willReadFrequently asks the browser to keep the backing buffer
+    // CPU-side rather than GPU-side; getImageData is then cheap.
+    this.canvas = document.createElement('canvas');
+    this.canvas.width = this.MARKER_W;
+    this.canvas.height = this.MARKER_H;
+    this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
+
+    this.startMs = performance.now();
+    this.lastValue = null;
+    this.lastTransitionMs = this.startMs;
+    this.firstTransitionAt = null;
+
+    // Buffered records. Flushed every FLUSH_INTERVAL_MS (5s) and on
+    // stop(); each flush also synthesizes a cumulative summary record
+    // so the transcript captures rolling stats even if the browser
+    // crashes before stop() runs.
+    this.records = [];
+    this.transitions = 0;
+    this.gaps = []; // for percentile computation across the session
+    this.longestFreezeMs = 0;
+
+    this.flushTimer = null;
+    this.stopped = false;
+
+    // Use rVFC where available (Safari 16+, Chrome 83+) so the
+    // callback fires once per actually-rendered frame instead of
+    // once per display refresh. On rVFC-less browsers we fall back to
+    // requestAnimationFrame which is good enough for Phase 0.
+    this._useRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+  }
+
+  start() {
+    this._enqueue({
+      t: 'session_start',
+      browser_ms: 0,
+      browser_session_id: this.browserSessionId,
+      host_id: this.hostId,
+      display_id: this.displayId,
+      video_width: this.videoEl.videoWidth || 0,
+      video_height: this.videoEl.videoHeight || 0,
+      ua: navigator.userAgent,
+      uses_rvfc: this._useRVFC,
+    });
+    this._scheduleFrame();
+    this.flushTimer = setInterval(() => this._flush(), 5000);
+  }
+
+  _scheduleFrame() {
+    if (this.stopped) return;
+    if (this._useRVFC) {
+      this.videoEl.requestVideoFrameCallback((now, meta) => this._onFrame(now, meta));
+    } else {
+      requestAnimationFrame(() => this._onFrame(performance.now(), null));
+    }
+  }
+
+  _onFrame(_now, _meta) {
+    if (this.stopped) return;
+    const w = this.videoEl.videoWidth || 0;
+    const h = this.videoEl.videoHeight || 0;
+    if (w < this.MARKER_W || h < this.MARKER_H) {
+      // Source too small -- peer-side stamp is also a no-op at these
+      // dims (see visual_marker::stamp_y_plane bounds check). Try
+      // again next frame.
+      this._scheduleFrame();
+      return;
+    }
+    try {
+      // Source rect: top-left MARKER_W x MARKER_H of the video frame
+      // in *frame* (not displayed) coordinates. Dest rect: full
+      // canvas (also MARKER_W x MARKER_H). One-to-one pixel copy --
+      // no scaling, so tile centers in the canvas match tile centers
+      // in the source frame exactly.
+      this.ctx.drawImage(
+        this.videoEl,
+        0, 0, this.MARKER_W, this.MARKER_H,
+        0, 0, this.MARKER_W, this.MARKER_H,
+      );
+      const img = this.ctx.getImageData(0, 0, this.MARKER_W, this.MARKER_H);
+      const value = this._decode(img);
+      if (this.lastValue !== null && value !== this.lastValue) {
+        const nowMs = performance.now();
+        const gap = nowMs - this.lastTransitionMs;
+        this.transitions += 1;
+        this.gaps.push(gap);
+        if (gap > this.longestFreezeMs) this.longestFreezeMs = gap;
+        if (this.firstTransitionAt === null) this.firstTransitionAt = nowMs;
+        this._enqueue({
+          t: 'transition',
+          browser_ms: nowMs - this.startMs,
+          value: value,
+          gap_ms: Math.round(gap),
+        });
+        this.lastTransitionMs = nowMs;
+      }
+      this.lastValue = value;
+    } catch (e) {
+      // CORS-tainted canvas would throw on getImageData. The video
+      // element is same-origin (intendant:// scheme handler proxies
+      // to local backend), so this shouldn't happen in production --
+      // but log loudly if it does.
+      console.warn('[diag-vf] sample failed:', e);
+    }
+    this._scheduleFrame();
+  }
+
+  // Decode the 32-bit marker by sampling each tile center pixel,
+  // computing BT.601 luminance, thresholding at 128. Bit layout:
+  // bit_idx = row * COLS + col, LSB at top-left tile, MSB at
+  // bottom-right -- matches `visual_marker::stamp_y_plane` exactly.
+  // Returns an unsigned 32-bit value (`>>> 0` coerces JS bitwise's
+  // signed-i32 result back to u32).
+  _decode(imageData) {
+    const { data, width } = imageData; // RGBA, 4 bytes per pixel
+    let v = 0;
+    for (let row = 0; row < this.ROWS; row++) {
+      const cy = row * this.TILE_PX + (this.TILE_PX >> 1);
+      for (let col = 0; col < this.COLS; col++) {
+        const cx = col * this.TILE_PX + (this.TILE_PX >> 1);
+        const idx = (cy * width + cx) * 4;
+        const r = data[idx];
+        const g = data[idx + 1];
+        const b = data[idx + 2];
+        // BT.601 luma matches what the peer's bgra_to_i420 produced
+        // (full-range Y = 0.299 R + 0.587 G + 0.114 B).
+        const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+        if (luma >= this.THRESHOLD) {
+          v |= 1 << (row * this.COLS + col);
+        }
+      }
+    }
+    return v >>> 0;
+  }
+
+  _enqueue(record) {
+    this.records.push(record);
+  }
+
+  _flush() {
+    if (this.stopped) return;
+    const summary = this._buildSummary();
+    this._enqueue(summary);
+    this._postBatch();
+  }
+
+  _buildSummary() {
+    const sorted = [...this.gaps].sort((a, b) => a - b);
+    const percentile = (q) => {
+      if (sorted.length === 0) return 0;
+      const idx = Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * q));
+      return Math.round(sorted[idx]);
+    };
+    const elapsedMs = performance.now() - this.startMs;
+    const fps = elapsedMs > 0
+      ? Math.round((this.transitions * 100000 / elapsedMs)) / 100
+      : 0;
+    return {
+      t: 'summary',
+      browser_ms: Math.round(elapsedMs),
+      transitions: this.transitions,
+      p50_gap_ms: percentile(0.5),
+      p95_gap_ms: percentile(0.95),
+      max_gap_ms: sorted.length ? Math.round(sorted[sorted.length - 1]) : 0,
+      longest_freeze_ms: Math.round(this.longestFreezeMs),
+      effective_fps: fps,
+    };
+  }
+
+  _postBatch() {
+    if (this.records.length === 0) return;
+    const ndjson = this.records.map(r => JSON.stringify(r)).join('\n') + '\n';
+    this.records = [];
+    const url = `/api/diagnostics/visual-freshness?session_id=${encodeURIComponent(this.browserSessionId)}`;
+    // authedFetch carries the session bearer if one is configured;
+    // diagnostics endpoint is not auth-gated today but going through
+    // the same wrapper keeps headers consistent and dodges any future
+    // gate.
+    authedFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-ndjson' },
+      body: ndjson,
+    }).catch(err => console.warn('[diag-vf] POST failed:', err));
+  }
+
+  stop() {
+    if (this.stopped) return;
+    this.stopped = true;
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this._enqueue({
+      t: 'session_end',
+      browser_ms: Math.round(performance.now() - this.startMs),
+    });
+    // Final summary gets emitted as part of _flush() called by the
+    // session_end record's flush path.
+    this._flush();
+  }
+}
+
+// True when the dashboard URL has `?diag=1` (or `?...&diag=1`). The
+// peer-display sampler activates automatically on connect when this
+// is true; otherwise no canvas / rVFC / fetch overhead. The flag is
+// read once per page load.
+function diagModeEnabled() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('diag') === '1';
+  } catch {
+    return false;
+  }
+}
+
 class PeerDisplayConnection {
   constructor(hostId, displayId, sessionId, advertiseTcpViaUrl) {
     this.hostId = hostId;
@@ -12373,6 +12630,12 @@ class PeerDisplayConnection {
     this.interactive = false;
     this._boundHandlers = {};
     this._heldModifiers = new Set();
+    // **Phase 0 visual-freshness sampler** (task #83). `null` unless
+    // the dashboard URL is opened with `?diag=1`. Activated in
+    // `ontrack` once the video stream is attached (so videoWidth /
+    // videoHeight report real numbers) and torn down by `close()`
+    // alongside the rest of the per-connection state.
+    this._diagSampler = null;
   }
 
   sessionKey() {
@@ -12620,6 +12883,23 @@ class PeerDisplayConnection {
       if (videoEl) videoEl.srcObject = this.stream;
       this.setStatus('Connected (view-only)', 'connected');
       this._log('info', 'ontrack fired — video stream attached');
+
+      // Phase 0 visual-freshness sampler. Wait one tick for videoWidth /
+      // videoHeight to populate (rVFC fires once the first frame is
+      // actually decoded; videoWidth is reliably non-zero by then). On
+      // browsers without rVFC the sampler tolerates 0x0 dims and skips
+      // until the next `requestAnimationFrame` finds real numbers.
+      if (videoEl && diagModeEnabled() && !this._diagSampler) {
+        this._diagSampler = new VisualFreshnessSampler(
+          videoEl, this.hostId, this.displayId,
+        );
+        this._diagSampler.start();
+        this._log(
+          'info',
+          `[diag-vf] sampler started (browser_session_id=${this._diagSampler.browserSessionId}); ` +
+          `confirm peer marker is enabled via /ws set_diagnostics_visual_marker`,
+        );
+      }
     };
 
     this.pc.onicecandidate = (e) => {
@@ -13126,6 +13406,20 @@ class PeerDisplayConnection {
     // listeners eagerly prevents a final mousemove from racing the
     // close and landing on a half-closed channel.
     this._exitInteractive();
+    // Phase 0: stop the freshness sampler (if active) BEFORE closing
+    // the pc / nulling the stream. stop() emits a `session_end`
+    // record + final summary and POSTs the last batch synchronously
+    // (via authedFetch which is best-effort — the caller doesn't
+    // await it). On unload-time close paths the in-flight POST may
+    // be cancelled by the browser; that's an acceptable Phase 0
+    // limitation. Future: switch to navigator.sendBeacon for the
+    // unload path.
+    if (this._diagSampler) {
+      try { this._diagSampler.stop(); } catch (e) {
+        this._log('warn', `[diag-vf] sampler stop failed: ${e.message}`);
+      }
+      this._diagSampler = null;
+    }
     // Best-effort tell peer to tear down its WebRtcPeer.
     await this._sendSignal({ kind: 'close' }).catch(() => {});
     if (this.pc) {
