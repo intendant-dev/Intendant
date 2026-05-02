@@ -7,6 +7,7 @@ mod control_plane;
 mod conversation;
 mod daemon_log_tee;
 mod debug;
+mod diagnostics;
 mod display;
 mod error;
 mod event;

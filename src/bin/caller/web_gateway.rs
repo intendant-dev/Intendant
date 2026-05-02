@@ -5564,6 +5564,93 @@ pub fn spawn_web_gateway(
                             result.len(), result
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST")
+                        && request_line.contains("/api/diagnostics/visual-freshness")
+                    {
+                        // **Phase 0 visual-freshness transcript sink** (task #83).
+                        // Body is browser-emitted NDJSON (one JSON record per
+                        // `\n`-terminated line); server appends verbatim to
+                        // `~/.intendant/diagnostics/visual-freshness/<session>.ndjson`.
+                        // No parsing or schema validation here — that's
+                        // browser-side or post-hoc analysis on the
+                        // transcript. Session id arrives via `?session_id=…`
+                        // query param; we sanitize aggressively (alnum + `-`
+                        // + `_` only) and reject anything that collapses
+                        // empty so a missing param can't accidentally
+                        // produce a bare-`.ndjson` write.
+                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                        let session_id_raw: String = request_line
+                            .split('?')
+                            .nth(1)
+                            .and_then(|qs| qs.split_whitespace().next())
+                            .map(|qs| {
+                                qs.split('&')
+                                    .find_map(|kv| {
+                                        let mut parts = kv.splitn(2, '=');
+                                        let k = parts.next()?;
+                                        let v = parts.next()?;
+                                        if k == "session_id" {
+                                            Some(v.to_string())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .unwrap_or_default();
+                        let content_length: usize = header_text
+                            .lines()
+                            .find(|l| l.to_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+                        let body_owned;
+                        let body_bytes: &[u8] = if peeked_body.len() >= content_length {
+                            &peeked_body.as_bytes()[..content_length]
+                        } else {
+                            let remaining =
+                                content_length.saturating_sub(peeked_body.len());
+                            let mut full: Vec<u8> = peeked_body.as_bytes().to_vec();
+                            if remaining > 0 {
+                                let mut rest = vec![0u8; remaining];
+                                if stream.read_exact(&mut rest).await.is_ok() {
+                                    full.extend_from_slice(&rest);
+                                }
+                            }
+                            body_owned = full;
+                            &body_owned
+                        };
+                        let (status_line, body) =
+                            match crate::diagnostics::append_visual_freshness_record(
+                                &session_id_raw,
+                                body_bytes,
+                            ) {
+                                Ok(written) => (
+                                    "HTTP/1.1 200 OK",
+                                    serde_json::json!({"ok": true, "written": written}).to_string(),
+                                ),
+                                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => (
+                                    "HTTP/1.1 400 Bad Request",
+                                    serde_json::json!({"error": e.to_string()}).to_string(),
+                                ),
+                                Err(e) => (
+                                    "HTTP/1.1 500 Internal Server Error",
+                                    serde_json::json!({"error": e.to_string()}).to_string(),
+                                ),
+                            };
+                        let response = format!(
+                            "{status_line}\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/api/settings") {
                         use tokio::io::AsyncWriteExt;
                         let body = match &project_root {
