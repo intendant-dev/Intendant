@@ -600,3 +600,217 @@ When driving from a CDP-style harness (Playwright,
 - Stuck-key proper fix: #79.
 - Federated clipboard sync: separate channel, not in F-2 / F-3
   scope.
+
+## 9. Phase 0 visual-freshness diagnostic — task #83
+
+**What it measures:** end-to-end visual update behaviour of a
+federated peer-display connection — effective fps (transitions
+per second), longest freeze interval, and the gap-between-
+transitions p50 / p95 / max distribution. The standing acceptance
+bar from #80 is **p50 ≤ 200ms / p95 ≤ 500ms / no freeze > 1s /
+effective fps ≥ 15** averaged over a 30s window with steady peer-
+side motion. Every #69 / #81 retest, future VP8 rate-control
+experiment, and #82 dirty-region work measures against this
+substrate instead of getStats packet counters (which proved
+misleading on #81 — counters said "bad fps" but the user-facing
+failure was a 30s freeze + jump-cut).
+
+**Level 1 (this slice):** transitions, freeze intervals, effective
+fps. **No absolute peer-to-browser latency** — that's Level 2 with
+a clock-sync round-trip endpoint. Level 1 numbers are sufficient
+to catch the #81 freeze-then-jump-cut signature (low effective
+fps + long longest_freeze_ms + bimodal gap distribution).
+
+### 9.1 Two pieces, two opt-ins
+
+The diagnostic has two independent activations because the marker
+is opt-in on the peer side (it overlays a 128×64 px tile in the
+top-left of every streamed frame and would interfere with future
+dirty-region/tile experiments otherwise) and the sampler is opt-in
+on the browser side. Both must be on for a useful transcript.
+
+1. **Peer marker** — operator sends a `set_diagnostics_visual_marker`
+   ControlMsg to the peer's /ws. Persist the WebSocket open if you
+   want the marker to stay on indefinitely; the peer's flag flips
+   immediately on receipt and stays set until you flip it back or
+   restart the daemon.
+
+2. **Browser sampler** — append `?diag=1` to the dashboard URL.
+   On every successful `PeerDisplayConnection.ontrack`, the
+   sampler instantiates with a fresh `browser_session_id` (UUID),
+   hooks `requestVideoFrameCallback`, decodes the marker per
+   frame, batches transition records, and POSTs to
+   `POST /api/diagnostics/visual-freshness?session_id=<uuid>`
+   every ~5s and on close.
+
+### 9.2 Recipe
+
+Setup is the same federated topology as §6 (peer daemon on the X11
+guest, SSH tunnel forwarding `*:18765` → peer's `8765`, primary
+Intendant.app + dashboard on the Mac). Then:
+
+```bash
+# 1. Enable the marker on the peer's /ws and HOLD the connection
+#    open. The marker stays on as long as this Python process is
+#    alive; flip enabled=false to turn it off, or just kill the
+#    process for the same effect (the flag isn't tied to the ws
+#    connection — only the explicit toggle is).
+python3 <<'EOF' &
+import asyncio, json, websockets
+async def main():
+    async with websockets.connect("ws://192.168.64.3:18765/ws") as ws:
+        await ws.send(json.dumps({
+            "action": "set_diagnostics_visual_marker",
+            "display_id": 0,
+            "enabled": True,
+        }))
+        # Hold the ws open — convenient for later flipping enabled=false
+        # without reopening. The toggle itself doesn't need this; the
+        # peer's flag persists until explicitly cleared or daemon restart.
+        try:
+            while True:
+                await asyncio.wait_for(ws.recv(), timeout=600)
+        except asyncio.TimeoutError:
+            pass
+asyncio.run(main())
+EOF
+echo "marker holder pid=$!"
+
+# Confirm peer accepted the toggle (check session.jsonl for the
+# `[ws] ControlMsg: "SetDiagnosticsVisualMarker { ... enabled: true }"`
+# line; the inline web_gateway handler also eprintln's
+# `[web_gateway] phase-0 visual marker for display 0 = true`).
+ssh user@192.168.1.223 'ssh vm@192.168.65.2 "tail -5 /tmp/intendant.out"'
+```
+
+Then in the dashboard:
+
+```
+# 2. Open the dashboard with diag mode enabled
+open -a "Intendant" 'intendant://backend/?diag=1'
+# (or equivalent for your launch path -- the marker overlay is
+# visible to the human eye too: a small black-and-white binary
+# grid in the top-left corner of every peer-display panel)
+
+# 3. Click "View display" on the federated peer row. The console
+#    of the dashboard's Web Inspector logs:
+#      [webrtc-peer intendant:host] [diag-vf] sampler started
+#        (browser_session_id=<UUID>); confirm peer marker ...
+#    Note the UUID -- it's the transcript filename.
+
+# 4. Drive 30s of steady peer-side motion. Move the mouse around
+#    on the X11 guest, scroll a window, anything that produces
+#    continuous frame change. The longer the steady-motion window,
+#    the better the percentile statistics.
+
+# 5. Close the peer-display panel. The sampler emits a final
+#    summary + session_end record on close.
+```
+
+### 9.3 Reading the transcript
+
+The transcript is `~/.intendant/diagnostics/visual-freshness/<browser_session_id>.ndjson`
+on the **primary** (the dashboard's host), not the peer. One JSON
+record per line. Schema:
+
+```jsonc
+{"t":"session_start", "browser_session_id":"...", "host_id":"intendant:host",
+ "display_id":0, "video_width":1360, "video_height":768,
+ "ua":"Mozilla/5.0 (Macintosh; …) Safari/…", "uses_rvfc":true}
+{"t":"transition", "browser_ms":34, "value":4283746128, "gap_ms":34}
+{"t":"transition", "browser_ms":67, "value":4283746161, "gap_ms":33}
+…
+{"t":"summary", "browser_ms":5004, "transitions":148,
+ "p50_gap_ms":33, "p95_gap_ms":65, "max_gap_ms":120,
+ "longest_freeze_ms":120, "effective_fps":29.58}
+…
+{"t":"session_end", "browser_ms":31250}
+{"t":"summary", …}  // final summary follows session_end
+```
+
+Quick consumption (no jq required, but jq is convenient):
+
+```bash
+# Final summary numbers for one run
+TRANSCRIPT=~/.intendant/diagnostics/visual-freshness/<UUID>.ndjson
+tail -1 "$TRANSCRIPT" | python3 -m json.tool
+
+# All summary records (rolling 5s windows)
+grep '"t":"summary"' "$TRANSCRIPT" | jq -c '
+  {browser_ms, transitions, p50_gap_ms, p95_gap_ms,
+   max_gap_ms, longest_freeze_ms, effective_fps}'
+
+# Distribution of inter-transition gaps -- spot bimodal jump-cut
+# signature (cluster near 33ms + cluster near 30000ms = freezes)
+grep '"t":"transition"' "$TRANSCRIPT" | jq -r '.gap_ms' | sort -n | uniq -c
+```
+
+### 9.4 Expected numbers
+
+**VP8-q baseline, single viewer, peer-side mouse motion** (the
+working path that ships today):
+
+```
+effective_fps      ≈ 25-30
+p50_gap_ms         ≈ 33-50 (1/30s capture cadence)
+p95_gap_ms         ≤ 100
+max_gap_ms         ≤ 200
+longest_freeze_ms  ≤ 200
+```
+
+**The #81 jump-cut signature** (full-res VP8-f under the current
+loss profile — what we're measuring against):
+
+```
+effective_fps      < 1  (a handful of jump-cuts over 7 minutes)
+p50_gap_ms         very high
+p95_gap_ms         tens of seconds
+max_gap_ms         tens of seconds (≈30s freezes)
+longest_freeze_ms  tens of seconds
+```
+
+**The "marker not on" failure** (operator forgot step 1, or the
+peer's flag didn't take):
+
+```
+session_start present, then:
+no transition records.
+summary: transitions=0, p50=0, ..., effective_fps=0
+```
+
+If you see this, re-check step 1's tail-of-`/tmp/intendant.out`
+output and look for the `[web_gateway] phase-0 visual marker for
+display 0 = true` line. If absent, the peer's federation /ws
+isn't reachable from the marker-holder script (jump host /
+tunnel down).
+
+### 9.5 What this scaffold unblocks
+
+- **#69 wire-loss diagnosis** — re-run with the marker on, capture
+  tcpdump on jump host outbound + Mac inbound, correlate
+  packet-loss bursts with transition gaps in the transcript. The
+  scaffold tells you whether a wire-level fix actually moves the
+  product-acceptable needle.
+- **#81 retest** — same recipe with the `select_single_rid_for_federated_offer`
+  swap (the kept-local `expt-81-federated-vp8-f-default` branch).
+  Compare freshness numbers head-to-head against VP8-q.
+- **#82 dirty-region** — success criterion is the same percentile
+  triple. Per-region updates should yield much better p50/p95
+  than whole-frame VP8-f.
+- **VP8 rate-control tuning** — bitrate / IDR-size knobs evaluated
+  against the same numbers, not against bytesReceived.
+
+### 9.6 Out of scope (Level 2 / later)
+
+- **Absolute end-to-end latency** (peer-frame-emit → browser-
+  observe) requires a clock-sync round-trip endpoint. Level 2.
+- **Cross-session aggregation** (multi-run statistics, regression
+  bench harness) — manual `cat | jq` for now; per-run percentile
+  triple is the unit.
+- **Local DisplaySlot path** (non-federated) — sampler hooks
+  `PeerDisplayConnection.ontrack` only; local DisplaySlot uses a
+  separate connection class. Adding the sampler there is a
+  one-line wiring once the federated path is validated.
+- **Sampler activation via the marker toggle's command itself**
+  (one ws message to enable both peer + browser) — operator
+  coordination is intentional in Phase 0; reduces blast radius.
