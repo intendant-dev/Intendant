@@ -244,8 +244,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         // macOS killed the web process (memory pressure). Reload the dashboard.
         NSLog("Web content process terminated — reloading")
-        let appURL = URL(string: "intendant://backend/")!
-        webView.load(URLRequest(url: appURL))
+        webView.load(URLRequest(url: intendantBackendURL()))
     }
 
     // MARK: - Backend
@@ -455,8 +454,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
             if let http = response as? HTTPURLResponse, http.statusCode == 200 {
                 DispatchQueue.main.async {
                     // Load via custom scheme for secure context
-                    let appURL = URL(string: "intendant://backend/")!
-                    self.webView.load(URLRequest(url: appURL))
+                    self.webView.load(URLRequest(url: intendantBackendURL()))
                     self.startHealthCheck()
                 }
             } else {
@@ -511,6 +509,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
             </html>
             """, baseURL: nil)
     }
+}
+
+// MARK: - Helpers
+
+/// Resolve the URL the WKWebView loads on initial entry and on
+/// web-content-process restart. Setting `INTENDANT_DIAG=1` in the
+/// environment appends `?diag=1` so the dashboard's visual-freshness
+/// sampler activates from page load. Off by default — used only for
+/// harness/smoke runs (see `docs/smoke-display.md` §9). Routes through
+/// the same `intendant://backend/` custom scheme so the WKWebView keeps
+/// its secure context (mic, custom URL scheme handler).
+func intendantBackendURL() -> URL {
+    let diag = ProcessInfo.processInfo.environment["INTENDANT_DIAG"] == "1"
+    let raw = diag ? "intendant://backend/?diag=1" : "intendant://backend/"
+    return URL(string: raw)!
 }
 
 // MARK: - Main
