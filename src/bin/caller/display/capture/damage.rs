@@ -1,0 +1,185 @@
+//! Damage-region tracking for tile-based display streaming (#82).
+//!
+//! [`DamageBackend`] is the abstraction every capture backend implements
+//! to report which screen regions changed since the last poll. The
+//! consumer (D-3+) feeds these rects into [`super::super::tile::grid::TileGrid`]
+//! to decide which tiles to re-encode.
+//!
+//! ## Capability tiers
+//!
+//! Damage backends advertise [`DamageCapability`] so the consumer can
+//! decide whether to trust per-tick dirty fractions or assume worst-case:
+//!
+//! - [`DamageCapability::OsLevel`] — backend uses real OS damage events
+//!   (X11 XDamage, macOS dirty rects when ScreenCaptureKit exposes them,
+//!   Wayland damage metadata). Dirty fraction is meaningful.
+//! - [`DamageCapability::FrameDiff`] — backend computes damage by hashing
+//!   tiles and diffing against last-frame hashes. CPU-bound but works
+//!   anywhere. Dirty fraction is approximate (false negatives possible
+//!   under hash collisions, false positives possible under animations
+//!   that happen to land identically).
+//! - [`DamageCapability::None`] — no damage information available. The
+//!   consumer must treat every tick as "everything dirty" (forces
+//!   fallback to full-frame video per the [`tile policy`](super::super::tile)
+//!   in D-4). Reported explicitly so the operator sees why tile mode
+//!   isn't engaging instead of silently doing nothing.
+//!
+//! D-1 ships only the X11 `OsLevel` backend; Wayland and macOS slot in
+//! later as additional implementations behind the same trait.
+
+use std::fmt;
+
+/// A rectangular damaged region in screen coordinates.
+///
+/// `x` and `y` are in pixels from the top-left corner of the screen.
+/// `width` and `height` are in pixels and may be zero (a degenerate
+/// "no area" rect — emitted by some backends as a heartbeat; the grid
+/// partitioner treats these as no-op).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Rect {
+    pub fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
+        Self { x, y, width, height }
+    }
+
+    /// True when the rect has zero area (and thus dirty no pixels).
+    pub fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+}
+
+impl fmt::Display for Rect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}x{}@({},{})", self.width, self.height, self.x, self.y)
+    }
+}
+
+/// Capability tier of a damage backend. See module docs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DamageCapability {
+    /// OS reports damage events directly (X11 XDamage, etc.). Dirty
+    /// fraction reported per poll is trustworthy.
+    OsLevel,
+    /// Damage computed from frame-diff (tile hashing). Approximate;
+    /// false negatives possible under hash collisions.
+    FrameDiff,
+    /// No damage info. Caller should assume every tick = everything dirty
+    /// and force the fallback video path. Used for non-X11 platforms in
+    /// D-1, frame-diff backend supersedes this in D-4 where applicable.
+    None,
+}
+
+/// Errors a damage backend can produce. Connection errors are fatal
+/// (caller should drop the backend); poll errors may be transient.
+#[derive(Debug)]
+pub enum DamageError {
+    /// Failed to connect to the display server.
+    Connect(String),
+    /// Required extension not available (e.g. XDamage missing on the
+    /// X server). The caller should fall back to a different backend
+    /// or report `DamageCapability::None` and route through video.
+    ExtensionMissing(&'static str),
+    /// Setup failed after extension was confirmed available
+    /// (e.g. damage_create call failed). Backend should be dropped.
+    Setup(String),
+    /// Polling failed transiently. Caller may retry or drop.
+    Poll(String),
+}
+
+impl fmt::Display for DamageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connect(s) => write!(f, "damage backend connect failed: {s}"),
+            Self::ExtensionMissing(ext) => {
+                write!(f, "damage backend requires X11 extension '{ext}' which is not available")
+            }
+            Self::Setup(s) => write!(f, "damage backend setup failed: {s}"),
+            Self::Poll(s) => write!(f, "damage backend poll failed: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for DamageError {}
+
+/// Damage-region tracking trait. Implementations must be `Send` so
+/// the per-display capture thread can own them; not required to be
+/// `Sync` (each thread holds its own backend).
+pub trait DamageBackend: Send {
+    /// Non-blocking poll: returns rects damaged since the last call.
+    /// Empty `Vec` is normal (no damage in the window) — not an error.
+    /// Caller drives the polling rate (typically tied to the capture
+    /// frame interval).
+    fn poll_damage(&mut self) -> Result<Vec<Rect>, DamageError>;
+
+    /// Capability tier. Stable for the lifetime of the backend.
+    fn capability(&self) -> DamageCapability;
+
+    /// Screen geometry the backend was initialized with. Returned as
+    /// `(width_px, height_px)`. Used by the grid partitioner to size
+    /// the tile grid; may go stale on resize, in which case the
+    /// caller should rebuild the backend (D-4 wires resize handling).
+    fn screen_geometry(&self) -> (u32, u32);
+}
+
+/// Always-empty backend reporting [`DamageCapability::None`]. Used as
+/// the explicit fallback when no real backend is available, so the
+/// consumer's degradation path is the same shape ("ask for damage,
+/// got nothing, go to video") regardless of platform. Returning a real
+/// backend here would mask the absence; returning Result::Err would
+/// force every consumer to write its own fallback.
+pub struct NullDamageBackend {
+    geometry: (u32, u32),
+}
+
+impl NullDamageBackend {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self { geometry: (width, height) }
+    }
+}
+
+impl DamageBackend for NullDamageBackend {
+    fn poll_damage(&mut self) -> Result<Vec<Rect>, DamageError> {
+        Ok(Vec::new())
+    }
+    fn capability(&self) -> DamageCapability {
+        DamageCapability::None
+    }
+    fn screen_geometry(&self) -> (u32, u32) {
+        self.geometry
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rect_empty_detection() {
+        assert!(Rect::new(0, 0, 0, 10).is_empty());
+        assert!(Rect::new(0, 0, 10, 0).is_empty());
+        assert!(Rect::new(5, 5, 0, 0).is_empty());
+        assert!(!Rect::new(0, 0, 1, 1).is_empty());
+        assert!(!Rect::new(-10, -20, 100, 200).is_empty());
+    }
+
+    #[test]
+    fn null_backend_reports_none_capability() {
+        let mut b = NullDamageBackend::new(1920, 1080);
+        assert_eq!(b.capability(), DamageCapability::None);
+        assert_eq!(b.screen_geometry(), (1920, 1080));
+        assert!(b.poll_damage().unwrap().is_empty());
+    }
+
+    #[test]
+    fn damage_error_display_includes_extension_name() {
+        let e = DamageError::ExtensionMissing("DAMAGE");
+        let s = format!("{e}");
+        assert!(s.contains("DAMAGE"), "got: {s}");
+    }
+}

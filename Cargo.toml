@@ -73,7 +73,7 @@ sha2 = "0.10"
 landlock = "0.4"
 ashpd = { version = "0.11", features = ["tokio"] }
 pipewire = "0.8"
-x11rb = { version = "0.13", features = ["shm"] }
+x11rb = { version = "0.13", features = ["shm", "damage", "xfixes"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = "1.5"

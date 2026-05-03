@@ -33,10 +33,12 @@ use tokio_util::sync::CancellationToken;
 use crate::error::CallerError;
 
 pub mod aggregator;
+pub mod capture;
 pub mod clipboard;
 pub mod encode;
 pub mod forward;
 pub mod keymap;
+pub mod tile;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "macos")]
