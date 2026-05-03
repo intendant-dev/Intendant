@@ -12,11 +12,14 @@
 //!   the visual-freshness diagnostic marker).
 //! - [`transport`] — D-3a binary wire-frame encode/decode helpers for
 //!   snapshot chunks, tile updates, and control frames.
+//! - [`backpressure`] — D-4c event-driven watermarks for supersedable
+//!   tile-delta frames.
 //!
 //! D-3 wires these into the encode + transport path; D-1 stays
 //! consumable only via direct calls (and the trace-only example
 //! binary `examples/damage-trace.rs`).
 
+pub mod backpressure;
 pub mod grid;
 pub mod encode;
 pub mod policy;

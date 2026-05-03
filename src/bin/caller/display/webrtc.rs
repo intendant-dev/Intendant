@@ -46,6 +46,7 @@ use super::encode::pool::{
     CodecKind, EncoderId, EncoderPool, EncoderSubscription, PeerCodecPreferences, PoolLease,
     SimulcastRid,
 };
+use super::tile::backpressure::{TileDeltaBackpressure, TileDeltaSendDecision};
 use super::{EncodedFrame, IceConfig, InputEvent, PeerId};
 use crate::error::CallerError;
 use bytes::{Bytes, BytesMut};
@@ -2457,6 +2458,10 @@ struct DriverState {
     /// open. Reliable snapshot delivery is allowed to delay rather
     /// than drop. Tile deltas intentionally have no queue.
     pending_tile_snapshot: Vec<Vec<u8>>,
+    /// D-4c: event-driven backpressure state for the supersedable
+    /// `tile-deltas` channel. Control and snapshot channels are
+    /// reliable and never use this drop policy.
+    tile_delta_backpressure: TileDeltaBackpressure,
     /// Wallclock anchor: Instant at which the first frame was emitted.
     /// All subsequent rtp_time values are relative to this.
     first_frame_at: Option<Instant>,
@@ -2582,6 +2587,7 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
         pending_authority_state: Vec::new(),
         pending_tile_control: Vec::new(),
         pending_tile_snapshot: Vec::new(),
+        tile_delta_backpressure: TileDeltaBackpressure::new(),
         first_frame_at: None,
         rtp: RtpSendState {
             sender_id: rtp_config.sender_id,
@@ -3056,6 +3062,18 @@ fn handle_event<I: rtc::interceptor::Interceptor>(
             );
             let queued_tile = drain_pending_tile_for_label(state, &label);
             state.channels.insert(label.clone(), cid);
+            if label == TILE_DELTAS_CHANNEL_LABEL {
+                state.tile_delta_backpressure.reset();
+                if let Some(mut channel) = rtc.data_channel(cid) {
+                    let cfg = state.tile_delta_backpressure.config();
+                    channel.set_buffered_amount_high_threshold(
+                        watermark_to_u32(cfg.high_watermark_bytes),
+                    );
+                    channel.set_buffered_amount_low_threshold(
+                        watermark_to_u32(cfg.low_watermark_bytes),
+                    );
+                }
+            }
             // F-1.2: flush any authority states queued before the
             // `display_input_authority` channel opened. See
             // `Command::SendAuthorityState` for why queueing exists —
@@ -3089,7 +3107,42 @@ fn handle_event<I: rtc::interceptor::Interceptor>(
             }
         }
         RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(cid)) => {
+            let was_tile_deltas =
+                state.channels.get(TILE_DELTAS_CHANNEL_LABEL).copied() == Some(cid);
             state.channels.retain(|_, v| *v != cid);
+            if was_tile_deltas {
+                state.tile_delta_backpressure.reset();
+            }
+        }
+        RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountHigh(
+            cid,
+        )) => {
+            if state.channels.get(TILE_DELTAS_CHANNEL_LABEL).copied() == Some(cid)
+                && state
+                    .tile_delta_backpressure
+                    .on_buffered_amount_high()
+            {
+                let stats = state.tile_delta_backpressure.stats();
+                eprintln!(
+                    "[display/webrtc] tile-deltas backpressure high: \
+                     pausing supersedable deltas (sent={} dropped={})",
+                    stats.sent_frames, stats.dropped_frames
+                );
+            }
+        }
+        RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountLow(
+            cid,
+        )) => {
+            if state.channels.get(TILE_DELTAS_CHANNEL_LABEL).copied() == Some(cid)
+                && state.tile_delta_backpressure.on_buffered_amount_low()
+            {
+                let stats = state.tile_delta_backpressure.stats();
+                eprintln!(
+                    "[display/webrtc] tile-deltas backpressure low: \
+                     resuming supersedable deltas (sent={} dropped={})",
+                    stats.sent_frames, stats.dropped_frames
+                );
+            }
         }
         _ => {}
     }
@@ -3643,6 +3696,13 @@ fn handle_command<I: rtc::interceptor::Interceptor>(
         }
         Command::SendTileFrame { channel, data } => {
             let label = channel.label();
+            let data_len = data.len();
+            if channel == TileDataChannel::Deltas
+                && state.tile_delta_backpressure.decide_delta(data_len)
+                    == TileDeltaSendDecision::Drop
+            {
+                return;
+            }
             if let Some(cid) = state.channels.get(label).copied() {
                 if let Some(mut dc) = rtc.data_channel(cid) {
                     if let Err(e) = dc.send(BytesMut::from(&data[..])) {
@@ -3650,6 +3710,10 @@ fn handle_command<I: rtc::interceptor::Interceptor>(
                             "[display/webrtc] tile channel write failed on \
                              {label}: {e:?}"
                         );
+                    } else if channel == TileDataChannel::Deltas {
+                        state
+                            .tile_delta_backpressure
+                            .record_delta_sent(data_len);
                     }
                 }
             } else if channel.queues_before_open() {
@@ -3785,6 +3849,10 @@ fn drain_pending_tile_for_label(state: &mut DriverState, label: &str) -> Vec<Vec
         TILE_SNAPSHOT_CHANNEL_LABEL => std::mem::take(&mut state.pending_tile_snapshot),
         _ => Vec::new(),
     }
+}
+
+fn watermark_to_u32(bytes: usize) -> u32 {
+    bytes.min(u32::MAX as usize) as u32
 }
 
 /// Serialize a `ClipboardContent` for sending over the clipboard data channel.
@@ -6923,5 +6991,13 @@ mod tests {
         assert!(TileDataChannel::Control.queues_before_open());
         assert!(TileDataChannel::Snapshot.queues_before_open());
         assert!(!TileDataChannel::Deltas.queues_before_open());
+    }
+
+    #[test]
+    fn tile_watermark_threshold_conversion_saturates_to_u32() {
+        assert_eq!(watermark_to_u32(0), 0);
+        assert_eq!(watermark_to_u32(1024), 1024);
+        assert_eq!(watermark_to_u32(u32::MAX as usize), u32::MAX);
+        assert_eq!(watermark_to_u32(u32::MAX as usize + 1), u32::MAX);
     }
 }
