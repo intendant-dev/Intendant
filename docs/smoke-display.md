@@ -813,7 +813,8 @@ the same packet-capture geometry.
 | Path | Result | p50 | p95 | Max / longest freeze | Effective fps |
 |------|--------|----:|----:|---------------------:|--------------:|
 | VP8-q baseline | Pass | 50ms | 68ms | 446ms | 20.28 |
-| VP8-f full-res | Fail | 34ms | 5048ms | 38385ms | 0.68 |
+| VP8-f full-res, 2.5 Mbps | Fail | 34ms | 5048ms | 38385ms | 0.68 |
+| VP8-f full-res, 800 kbps | Fail | 35ms | 1083ms | 1136ms | 2.85 |
 
 Artifact locations from the reference runs:
 
@@ -823,6 +824,8 @@ Artifact locations from the reference runs:
 - VP8-f report: `/tmp/p1-vp8f-20260502T230857/REPORT.md`
 - VP8-f transcript:
   `/Users/vm/.intendant/diagnostics/visual-freshness/49b84e18-09bc-470e-b320-1c31ac7d71cc.ndjson`
+- VP8-f 800 kbps visual-only transcript:
+  `/Users/vm/.intendant/diagnostics/visual-freshness/14967266-9a63-4e35-bc7d-7f7b0fa2f751.ndjson`
 
 The VP8-f experiment was not CPU-bound. During the failure, the
 peer kept capturing and encoding at about 27-29fps with
@@ -833,9 +836,14 @@ Packet timing showed peer-to-coturn delivery was comparatively
 continuous, while the coturn-to-Mac/browser side saw long stalls
 under the full-resolution load.
 
+The 800 kbps follow-up reduces the catastrophic tens-of-seconds
+freeze mode to roughly one-second gaps, but it still fails the #80
+bar and is not usable for remote desktop control.
+
 Conclusion: **do not promote federated VP8 from `q` to `f` as a
-simple default flip.** Full-resolution federation needs an
-efficiency or transport strategy first: rate shaping, smaller
+simple default flip, even with a lower full-layer bitrate.**
+Full-resolution federation needs an efficiency or transport
+strategy first: rate shaping beyond bitrate alone, smaller
 keyframes, region/tile updates, adaptive layer negotiation, or a
 loss/backpressure fix.
 
