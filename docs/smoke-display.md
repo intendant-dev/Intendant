@@ -330,7 +330,7 @@ session** — H.264 should not spawn for federation; if it does see #71.
 H.264 over the federated path is currently broken end-to-end in the
 reference smoke topology. Diagnosed in #65 + #67:
 
-- Topology: browser → host coturn at `192.168.1.223:3478` → Debian
+- Topology: browser → host coturn at `192.168.1.197:3478` → Debian
   UTM peer at `192.168.65.2:8765`, all on one MacBook. Per-packet
   loss measured at 13–22% on this purely-local path (anomalous;
   pending investigation in #69 — likely virtio-net config / coturn
@@ -680,7 +680,7 @@ echo "marker holder pid=$!"
 # `[ws] ControlMsg: "SetDiagnosticsVisualMarker { ... enabled: true }"`
 # line; the inline web_gateway handler also eprintln's
 # `[web_gateway] phase-0 visual marker for display 0 = true`).
-ssh user@192.168.1.223 'ssh vm@192.168.65.2 "tail -5 /tmp/intendant.out"'
+ssh user@192.168.1.197 'ssh vm@192.168.65.2 "tail -5 /tmp/intendant.out"'
 ```
 
 Then in the dashboard:
@@ -802,7 +802,44 @@ display 0 = true` line. If absent, the peer's federation /ws
 isn't reachable from the marker-holder script (jump host /
 tunnel down).
 
-### 9.5 What this scaffold unblocks
+### 9.5 Phase 1 reference runs
+
+The first fixed-harness #69 Phase 1 runs compared the current
+shipping federated baseline (VP8 single-RID `q`) against the #81
+experiment branch that promotes federated VP8 to full-resolution
+single-RID `f`. Both used the same visual-freshness sampler and
+the same packet-capture geometry.
+
+| Path | Result | p50 | p95 | Max / longest freeze | Effective fps |
+|------|--------|----:|----:|---------------------:|--------------:|
+| VP8-q baseline | Pass | 50ms | 68ms | 446ms | 20.28 |
+| VP8-f full-res | Fail | 34ms | 5048ms | 38385ms | 0.68 |
+
+Artifact locations from the reference runs:
+
+- VP8-q report: `/tmp/p1-20260502T215941/REPORT.md`
+- VP8-q transcript:
+  `/Users/vm/.intendant/diagnostics/visual-freshness/842047ec-2902-4845-b3e8-c046e2b5d8e4.ndjson`
+- VP8-f report: `/tmp/p1-vp8f-20260502T230857/REPORT.md`
+- VP8-f transcript:
+  `/Users/vm/.intendant/diagnostics/visual-freshness/49b84e18-09bc-470e-b320-1c31ac7d71cc.ndjson`
+
+The VP8-f experiment was not CPU-bound. During the failure, the
+peer kept capturing and encoding at about 27-29fps with
+`drops=cap:0/enc:0/peer:0`, and layer policy resumed only `f`.
+The failure was visual and receiver-side: the stream became a
+jump-cut feed with multi-second to tens-of-seconds freezes.
+Packet timing showed peer-to-coturn delivery was comparatively
+continuous, while the coturn-to-Mac/browser side saw long stalls
+under the full-resolution load.
+
+Conclusion: **do not promote federated VP8 from `q` to `f` as a
+simple default flip.** Full-resolution federation needs an
+efficiency or transport strategy first: rate shaping, smaller
+keyframes, region/tile updates, adaptive layer negotiation, or a
+loss/backpressure fix.
+
+### 9.6 What this scaffold unblocks
 
 - **#69 wire-loss diagnosis** — re-run with the marker on, capture
   tcpdump on jump host outbound + Mac inbound, correlate
@@ -818,7 +855,7 @@ tunnel down).
 - **VP8 rate-control tuning** — bitrate / IDR-size knobs evaluated
   against the same numbers, not against bytesReceived.
 
-### 9.6 Out of scope (Level 2 / later)
+### 9.7 Out of scope (Level 2 / later)
 
 - **Absolute end-to-end latency** (peer-frame-emit → browser-
   observe) requires a clock-sync round-trip endpoint. Level 2.
