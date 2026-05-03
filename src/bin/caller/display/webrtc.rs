@@ -1059,6 +1059,32 @@ pub fn noop_authority_handler() -> AuthorityChannelHandler {
     Arc::new(|_| {})
 }
 
+/// D-3b: Tile-stream data-channel labels.
+///
+/// Browser-side `PeerDisplayConnection` creates these channels before
+/// `createOffer()`. The peer passively observes them through
+/// `OnDataChannel(OnOpen)` and writes binary tile frames by label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileDataChannel {
+    Control,
+    Snapshot,
+    Deltas,
+}
+
+impl TileDataChannel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Control => TILE_CONTROL_CHANNEL_LABEL,
+            Self::Snapshot => TILE_SNAPSHOT_CHANNEL_LABEL,
+            Self::Deltas => TILE_DELTAS_CHANNEL_LABEL,
+        }
+    }
+
+    fn queues_before_open(self) -> bool {
+        matches!(self, Self::Control | Self::Snapshot)
+    }
+}
+
 /// Commands sent from the public `WebRtcPeer` handle to the driver task.
 enum Command {
     AddIceCandidate(String),
@@ -1074,6 +1100,13 @@ enum Command {
     SendAuthorityState {
         display_id: u32,
         state: DisplayInputAuthorityState,
+    },
+    /// D-3b: binary tile-stream frame. Control/snapshot frames queue
+    /// until their reliable data channel opens; delta frames are
+    /// latest-wins and are dropped when the channel is unavailable.
+    SendTileFrame {
+        channel: TileDataChannel,
+        data: Vec<u8>,
     },
 }
 
@@ -2274,6 +2307,40 @@ impl WebRtcPeer {
         }
     }
 
+    /// D-3b: send a reliable tile-control binary frame to the browser.
+    /// Queues in the driver until `tile-control` opens.
+    pub async fn send_tile_control_frame(&self, data: Vec<u8>) -> Result<bool, CallerError> {
+        self.send_tile_frame(TileDataChannel::Control, data).await
+    }
+
+    /// D-3b: send a reliable tile-snapshot binary frame to the browser.
+    /// Queues in the driver until `tile-snapshot` opens.
+    pub async fn send_tile_snapshot_frame(&self, data: Vec<u8>) -> Result<bool, CallerError> {
+        self.send_tile_frame(TileDataChannel::Snapshot, data).await
+    }
+
+    /// D-3b: send an unreliable/supersedable tile-delta binary frame
+    /// to the browser. If the channel is not open, the driver drops
+    /// the frame rather than queueing stale deltas.
+    pub async fn send_tile_delta_frame(&self, data: Vec<u8>) -> Result<bool, CallerError> {
+        self.send_tile_frame(TileDataChannel::Deltas, data).await
+    }
+
+    async fn send_tile_frame(
+        &self,
+        channel: TileDataChannel,
+        data: Vec<u8>,
+    ) -> Result<bool, CallerError> {
+        match self
+            .command_tx
+            .send(Command::SendTileFrame { channel, data })
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
     /// Add a trickle ICE candidate from the remote peer.
     ///
     /// The browser sends `{candidate, sdpMid, sdpMLineIndex}`; we only need
@@ -2383,6 +2450,13 @@ struct DriverState {
     /// producer side is not throttled by the channel's send-await
     /// semantics.
     pending_authority_state: Vec<(u32, DisplayInputAuthorityState)>,
+    /// D-3b: queued tile control frames awaiting `tile-control`
+    /// channel open. Low-rate reliable control only; never per-frame.
+    pending_tile_control: Vec<Vec<u8>>,
+    /// D-3b: queued snapshot chunks awaiting `tile-snapshot` channel
+    /// open. Reliable snapshot delivery is allowed to delay rather
+    /// than drop. Tile deltas intentionally have no queue.
+    pending_tile_snapshot: Vec<Vec<u8>>,
     /// Wallclock anchor: Instant at which the first frame was emitted.
     /// All subsequent rtp_time values are relative to this.
     first_frame_at: Option<Instant>,
@@ -2506,6 +2580,8 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
         video_specs: HashMap::new(),
         channels: HashMap::new(),
         pending_authority_state: Vec::new(),
+        pending_tile_control: Vec::new(),
+        pending_tile_snapshot: Vec::new(),
         first_frame_at: None,
         rtp: RtpSendState {
             sender_id: rtp_config.sender_id,
@@ -2978,7 +3054,8 @@ fn handle_event<I: rtc::interceptor::Interceptor>(
                 &label,
                 &mut state.pending_authority_state,
             );
-            state.channels.insert(label, cid);
+            let queued_tile = drain_pending_tile_for_label(state, &label);
+            state.channels.insert(label.clone(), cid);
             // F-1.2: flush any authority states queued before the
             // `display_input_authority` channel opened. See
             // `Command::SendAuthorityState` for why queueing exists —
@@ -2993,6 +3070,18 @@ fn handle_event<I: rtc::interceptor::Interceptor>(
                             eprintln!(
                                 "[display/webrtc] authority channel \
                                  queued write failed: {e:?}"
+                            );
+                        }
+                    }
+                }
+            }
+            if !queued_tile.is_empty() {
+                if let Some(mut channel) = rtc.data_channel(cid) {
+                    for data in queued_tile {
+                        if let Err(e) = channel.send(BytesMut::from(&data[..])) {
+                            eprintln!(
+                                "[display/webrtc] tile channel queued write \
+                                 failed on {label}: {e:?}"
                             );
                         }
                     }
@@ -3552,6 +3641,29 @@ fn handle_command<I: rtc::interceptor::Interceptor>(
                 state.pending_authority_state.push((display_id, auth_state));
             }
         }
+        Command::SendTileFrame { channel, data } => {
+            let label = channel.label();
+            if let Some(cid) = state.channels.get(label).copied() {
+                if let Some(mut dc) = rtc.data_channel(cid) {
+                    if let Err(e) = dc.send(BytesMut::from(&data[..])) {
+                        eprintln!(
+                            "[display/webrtc] tile channel write failed on \
+                             {label}: {e:?}"
+                        );
+                    }
+                }
+            } else if channel.queues_before_open() {
+                match channel {
+                    TileDataChannel::Control => {
+                        state.pending_tile_control.push(data);
+                    }
+                    TileDataChannel::Snapshot => {
+                        state.pending_tile_snapshot.push(data);
+                    }
+                    TileDataChannel::Deltas => {}
+                }
+            }
+        }
     }
 }
 
@@ -3626,6 +3738,9 @@ fn parse_authority_channel_message(text: &str) -> Option<AuthorityChannelMessage
 /// passively via `OnDataChannel(OnOpen)` and registers it in
 /// `state.channels` keyed by this label.
 const AUTHORITY_CHANNEL_LABEL: &str = "display_input_authority";
+const TILE_CONTROL_CHANNEL_LABEL: &str = "tile-control";
+const TILE_SNAPSHOT_CHANNEL_LABEL: &str = "tile-snapshot";
+const TILE_DELTAS_CHANNEL_LABEL: &str = "tile-deltas";
 
 /// Serialize a `display_input_authority_state` frame for the
 /// `display_input_authority` data channel. Wire format matches the
@@ -3661,6 +3776,14 @@ fn drain_pending_authority_for_label(
         std::mem::take(pending)
     } else {
         Vec::new()
+    }
+}
+
+fn drain_pending_tile_for_label(state: &mut DriverState, label: &str) -> Vec<Vec<u8>> {
+    match label {
+        TILE_CONTROL_CHANNEL_LABEL => std::mem::take(&mut state.pending_tile_control),
+        TILE_SNAPSHOT_CHANNEL_LABEL => std::mem::take(&mut state.pending_tile_snapshot),
+        _ => Vec::new(),
     }
 }
 
@@ -6785,5 +6908,20 @@ mod tests {
         );
         assert!(drained.is_empty());
         assert!(pending.is_empty());
+    }
+
+    /// D-3b: tile data-channel labels and queue policy are part of
+    /// the browser<->peer contract. Control/snapshot are reliable
+    /// bootstrap channels and may queue before open; deltas are
+    /// supersedable and must not queue stale frames.
+    #[test]
+    fn tile_data_channel_labels_and_queue_policy_match_wire_contract() {
+        assert_eq!(TileDataChannel::Control.label(), "tile-control");
+        assert_eq!(TileDataChannel::Snapshot.label(), "tile-snapshot");
+        assert_eq!(TileDataChannel::Deltas.label(), "tile-deltas");
+
+        assert!(TileDataChannel::Control.queues_before_open());
+        assert!(TileDataChannel::Snapshot.queues_before_open());
+        assert!(!TileDataChannel::Deltas.queues_before_open());
     }
 }

@@ -13659,6 +13659,13 @@ class PeerDisplayConnection {
     // semantics, drop is preferable to head-of-line block).
     this.controlChannel = null;
     this.pointerChannel = null;
+    // D-3b: tile-stream data channels. D-3b only negotiates the
+    // channels and parses inbound binary frames; D-3c creates the
+    // real compositor for peer desktop tiles.
+    this.tileControlChannel = null;
+    this.tileSnapshotChannel = null;
+    this.tileDeltasChannel = null;
+    this.tileCompositor = null;
     // F-2: interactive mode flag. True after `_enterInteractive`
     // installs the pointer / keyboard listeners on the peer-display
     // video element; cleared by `_exitInteractive`. Only flips to
@@ -13913,6 +13920,28 @@ class PeerDisplayConnection {
     this.pointerChannel.onopen = () =>
       this._log('info', 'pointer data channel open');
 
+    // D-3b: tile-stream channels. The browser creates them before
+    // `createOffer()` so the peer can passively observe and write to
+    // them by label. D-3b does not enable real tile rendering yet;
+    // `_handleTileWireMessage` accepts frames so D-3c can attach the
+    // compositor without changing negotiation.
+    this.tileControlChannel = this.pc.createDataChannel('tile-control', { ordered: true });
+    this.tileSnapshotChannel = this.pc.createDataChannel('tile-snapshot', { ordered: true });
+    this.tileDeltasChannel = this.pc.createDataChannel('tile-deltas', {
+      ordered: false,
+      maxRetransmits: 0,
+    });
+    for (const [label, channel] of [
+      ['tile-control', this.tileControlChannel],
+      ['tile-snapshot', this.tileSnapshotChannel],
+      ['tile-deltas', this.tileDeltasChannel],
+    ]) {
+      channel.binaryType = 'arraybuffer';
+      channel.onopen = () => this._log('info', `${label} data channel open`);
+      channel.onclose = () => this._log('debug', `${label} data channel closed`);
+      channel.onmessage = (e) => this._handleTileWireMessage(label, e);
+    }
+
     this.pc.ontrack = (e) => {
       this.stream = e.streams[0];
       const container = document.getElementById(`peer-display-${this.hostId}`);
@@ -14107,6 +14136,27 @@ class PeerDisplayConnection {
       // can produce candidates as soon as handle_offer returns.
       this._log('debug', `buffering remote ICE candidate (answer not yet applied): ${this._describeCandidate(candidate)}`);
       this._pendingCandidates.push(candidate);
+    }
+  }
+
+  async _handleTileWireMessage(label, event) {
+    try {
+      let data = event.data;
+      if (data instanceof Blob) {
+        data = await data.arrayBuffer();
+      }
+      if (!this.tileCompositor) {
+        // D-3b only negotiates the channels. D-3c attaches the real
+        // compositor; until then, parse for early protocol smoke and
+        // drop successfully parsed frames.
+        const parsed = parseTileWireFrame(data);
+        this._log('debug', `${label} tile frame received before compositor: ${parsed.type}`);
+        return;
+      }
+      const parsed = this.tileCompositor.onWireFrame(data);
+      this._log('debug', `${label} tile frame applied: ${parsed.type}`);
+    } catch (err) {
+      this._log('warn', `${label} tile frame failed: ${err.message}`);
     }
   }
 
@@ -14470,6 +14520,10 @@ class PeerDisplayConnection {
     this.authorityChannel = null;
     this.controlChannel = null;
     this.pointerChannel = null;
+    this.tileControlChannel = null;
+    this.tileSnapshotChannel = null;
+    this.tileDeltasChannel = null;
+    this.tileCompositor = null;
     this.stream = null;
   }
 
