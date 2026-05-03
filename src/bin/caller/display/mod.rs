@@ -458,6 +458,11 @@ pub struct DisplaySession {
     /// over WebRTC data channels while leaving the VP8 video track alive
     /// as the current fallback.
     tile_stream_handle: Mutex<Option<JoinHandle<()>>>,
+    /// D-4d: bounded replay buffer for recently sent tile deltas.
+    /// Browser gap reports can be satisfied from this buffer when the
+    /// complete missing sequence range is still present; otherwise
+    /// recovery falls back to a fresh snapshot.
+    tile_replay: Arc<RwLock<tile::recovery::TileUpdateReplayBuffer>>,
     tile_epoch: Arc<AtomicU32>,
     tile_snapshot_id: Arc<AtomicU32>,
     /// **Phase 0 visual-freshness diagnostic marker.** When `true`, the
@@ -703,6 +708,7 @@ impl DisplaySession {
             pool_feed_bridge_handle: Mutex::new(None),
             tile_subscribers: Arc::new(RwLock::new(HashSet::new())),
             tile_stream_handle: Mutex::new(None),
+            tile_replay: Arc::new(RwLock::new(tile::recovery::TileUpdateReplayBuffer::new())),
             tile_epoch: Arc::new(AtomicU32::new(1)),
             tile_snapshot_id: Arc::new(AtomicU32::new(1)),
             diagnostics_visual_marker: Arc::new(AtomicBool::new(false)),
@@ -1501,6 +1507,7 @@ impl DisplaySession {
         let peers = Arc::clone(&self.peers);
         let subscribers = Arc::clone(&self.tile_subscribers);
         let shutdown = self.shutdown.clone();
+        let tile_replay = Arc::clone(&self.tile_replay);
         let tile_epoch = Arc::clone(&self.tile_epoch);
         let tile_snapshot_id = Arc::clone(&self.tile_snapshot_id);
         let display_id = self.display_id;
@@ -1714,15 +1721,26 @@ impl DisplaySession {
 
                         let mut encoded = Vec::with_capacity(frames.len());
                         for frame in frames {
+                            let frame_seq = match &frame {
+                                tile::transport::TileFrame::TileUpdate { seq, .. } => *seq,
+                                _ => continue,
+                            };
                             match tile::transport::encode_frame(&frame) {
-                                Ok(bytes) => encoded.push(bytes),
+                                Ok(bytes) => encoded.push((frame_seq, bytes)),
                                 Err(e) => eprintln!("[display/tile] update wire encode failed: {e}"),
+                            }
+                        }
+                        {
+                            let mut replay = tile_replay.write().await;
+                            let now = Instant::now();
+                            for (frame_seq, bytes) in &encoded {
+                                replay.push(epoch, *frame_seq, bytes.clone(), now);
                             }
                         }
 
                         let peers_now = tile_subscriber_peer_handles(&peers, &subscribers).await;
                         for peer in peers_now {
-                            for bytes in &encoded {
+                            for (_, bytes) in &encoded {
                                 if let Err(e) = peer.send_tile_delta_frame(bytes.clone()).await {
                                     eprintln!("[display/tile] delta send failed: {e}");
                                 }

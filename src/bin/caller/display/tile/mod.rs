@@ -14,6 +14,8 @@
 //!   snapshot chunks, tile updates, and control frames.
 //! - [`backpressure`] — D-4c event-driven watermarks for supersedable
 //!   tile-delta frames.
+//! - [`recovery`] — D-4d bounded replay buffer for recent tile
+//!   updates used by gap recovery.
 //!
 //! D-3 wires these into the encode + transport path; D-1 stays
 //! consumable only via direct calls (and the trace-only example
@@ -23,5 +25,6 @@ pub mod backpressure;
 pub mod grid;
 pub mod encode;
 pub mod policy;
+pub mod recovery;
 pub mod synthetic_dirty;
 pub mod transport;
