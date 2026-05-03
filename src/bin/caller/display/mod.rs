@@ -1487,6 +1487,8 @@ impl DisplaySession {
             let mut grid: Option<tile::grid::TileGrid> = None;
             let mut synthetic_dirty = tile::synthetic_dirty::SyntheticDirtySources::new();
             let mut last_cursor: Option<(i32, i32)> = None;
+            let snapshot_period = std::time::Duration::from_secs(30);
+            let mut next_snapshot_at = Instant::now() + snapshot_period;
             let mut seq: u32 = 1;
 
             loop {
@@ -1541,6 +1543,22 @@ impl DisplaySession {
                                     snapshot_id,
                                 ).await;
                             }
+                            next_snapshot_at = Instant::now() + snapshot_period;
+                            continue;
+                        }
+
+                        if Instant::now() >= next_snapshot_at {
+                            let epoch = tile_epoch.load(Ordering::Relaxed);
+                            let snapshot_id = tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
+                            for peer in peers_now {
+                                send_tile_snapshot_to_peer(
+                                    peer,
+                                    Arc::clone(&frame),
+                                    epoch,
+                                    snapshot_id,
+                                ).await;
+                            }
+                            next_snapshot_at = Instant::now() + snapshot_period;
                             continue;
                         }
 

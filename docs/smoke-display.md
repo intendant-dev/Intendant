@@ -877,3 +877,90 @@ loss/backpressure fix.
 - **Sampler activation via the marker toggle's command itself**
   (one ws message to enable both peer + browser) — operator
   coordination is intentional in Phase 0; reduces blast radius.
+
+## 10. Dirty-region tile stream smoke (#82 D-3)
+
+This smoke validates the D-3 tile path: the existing VP8-q video
+track still negotiates, but the federated browser switches to a
+canvas once it receives the first `TileSnapshot` over the tile data
+channels. The peer then sends XDamage-driven `TileUpdate` frames for
+window/content changes and `CursorState` frames for cursor-only
+motion.
+
+Prerequisites:
+
+- Mac app and X11 peer both built from the same D-3 commit.
+- Peer daemon running with `DISPLAY=:0`.
+- SSH tunnel from the Mac to the peer HTTP port:
+
+```bash
+ssh -f -N -o ExitOnForwardFailure=yes \
+  -L 0.0.0.0:18765:192.168.65.2:8765 user@<jump-host>
+```
+
+Add the peer to the primary dashboard:
+
+```bash
+curl -s -X POST -H 'Content-Type: application/json' \
+  http://127.0.0.1:8765/api/peers -d '{
+    "card_url":"http://127.0.0.1:18765/.well-known/agent-card.json",
+    "via_urls":["ws://127.0.0.1:18765/ws"],
+    "browser_tcp_via_url":"ws://<mac-vm-ip>:18765/ws"
+  }'
+```
+
+Hold the display grant open:
+
+```bash
+python3 - <<'PY'
+import asyncio, json, websockets
+async def main():
+    async with websockets.connect("ws://127.0.0.1:18765/ws") as ws:
+        await ws.send(json.dumps({"action": "grant_user_display"}))
+        while True:
+            try:
+                await asyncio.wait_for(ws.recv(), timeout=900)
+            except asyncio.TimeoutError:
+                await ws.ping()
+asyncio.run(main())
+PY
+```
+
+Open Settings → Network, expand the peer row, then click **View
+display**.
+
+Expected peer log:
+
+```text
+[display/tile] XDamage backend enabled on DISPLAY=:0
+[display/webrtc] data channel open: tile-control
+[display/webrtc] data channel open: tile-snapshot
+[display/webrtc] data channel open: tile-deltas
+```
+
+Motion checks:
+
+```bash
+# Cursor-only motion should move the browser overlay even though XDamage
+# does not fire for the X11 hardware cursor.
+ssh -J user@<jump-host> vm@192.168.65.2 \
+  'DISPLAY=:0 xdotool mousemove 120 120; sleep 0.5; \
+   DISPLAY=:0 xdotool mousemove 500 220; sleep 0.5; \
+   DISPLAY=:0 xdotool mousemove 760 500'
+
+# Window/content motion should update the canvas via XDamage tile deltas.
+ssh -J user@<jump-host> vm@192.168.65.2 \
+  'wid=$(DISPLAY=:0 xdotool search --onlyvisible --class xfce4-terminal | head -n1); \
+   DISPLAY=:0 xdotool windowmove "$wid" 250 140; sleep 0.5; \
+   DISPLAY=:0 xdotool windowmove "$wid" 70 90'
+```
+
+Acceptance:
+
+- Canvas renders the peer desktop at native grid resolution.
+- Cursor-only motion visibly follows through the overlay.
+- Window moves / terminal content updates visibly repaint through
+  tile deltas.
+- Peer log remains free of `display/tile` send/pack/encode errors.
+- WebRTC remains connected; `display/metrics` reports `peers=1`,
+  no capture/encoder/peer drops, and no sustained CPU spike.
