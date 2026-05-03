@@ -18,5 +18,6 @@
 //! binary `examples/damage-trace.rs`).
 
 pub mod grid;
+pub mod encode;
 pub mod synthetic_dirty;
 pub mod transport;
