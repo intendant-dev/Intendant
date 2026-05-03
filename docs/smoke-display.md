@@ -964,3 +964,54 @@ Acceptance:
 - Peer log remains free of `display/tile` send/pack/encode errors.
 - WebRTC remains connected; `display/metrics` reports `peers=1`,
   no capture/encoder/peer drops, and no sustained CPU spike.
+
+## 11. Tile/video fallback smoke (#82 D-4a/b)
+
+This smoke validates the first D-4 mixed-mode slice: sparse desktop
+damage stays on the native-resolution tile canvas, while broad
+OS-level damage temporarily switches the federated panel to the
+existing VP8-q video track. When the screen settles, the peer switches
+back to tiles and sends a fresh snapshot.
+
+Use the same setup as §10, with the peer and Mac app built from a
+D-4a/b commit or newer. Open the federated display and confirm the
+tile canvas is rendering. Then drive a real titlebar drag on the X11
+peer; `windowmove` is too pulse-like for this policy check, so use
+pointer drag events:
+
+```bash
+ssh -J user@<jump-host> vm@192.168.65.2 'bash -lc '"'"'
+DISPLAY=:0
+export DISPLAY
+wid=$(xdotool search --class xfce4-terminal | head -n1)
+xdotool windowactivate "$wid" || true
+eval "$(xdotool getwindowgeometry --shell "$wid")"
+sx=$((X + 120))
+sy=$((Y + 12))
+xdotool mousemove "$sx" "$sy" mousedown 1
+for i in $(seq 1 120); do
+  x=$((120 + (i % 30) * 18))
+  y=$((100 + (i % 20) * 10))
+  xdotool mousemove "$x" "$y"
+  sleep 0.025
+done
+xdotool mouseup 1
+'"'"'
+```
+
+Expected peer log:
+
+```text
+[display/tile] display 0 fallback_to_video dirty_fraction=1.000
+[display/tile] display 0 fallback_to_tile dirty_fraction=0.000
+```
+
+Acceptance:
+
+- The panel stays connected through both fallback transitions.
+- The browser returns to the tile canvas after the drag settles.
+- The peer sends a tile snapshot on return-to-tile, so the canvas is
+  immediately coherent instead of waiting for incidental damage.
+- `display/metrics` remains at drops `cap:0/enc:0/peer:0`.
+- Cursor-only motion does **not** trigger fallback; the policy is fed
+  by OS damage only, not synthetic cursor dirty rectangles.
