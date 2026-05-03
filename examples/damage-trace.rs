@@ -32,7 +32,7 @@ fn main() {
 fn main() {
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
-    use x11rb::connection::Connection;
+    use x11rb::connection::{Connection, RequestConnection};
     use x11rb::protocol::damage::{self, ConnectionExt as DamageExt, ReportLevel};
     use x11rb::protocol::xfixes::{self, ConnectionExt as XfixesExt};
     use x11rb::protocol::Event;
@@ -125,14 +125,22 @@ fn main() {
         std::process::exit(0);
     }
 
-    // Negotiate versions.
-    if let Err(e) = conn.damage_query_version(1, 1).and_then(|c| c.reply()) {
-        eprintln!("  fatal: damage_query_version: {e}");
-        std::process::exit(4);
+    // Negotiate versions. The .and_then(|c| c.reply()) idiom doesn't
+    // type-check because the cookie's send error and reply error are
+    // distinct types in x11rb; explicit match is cleaner here.
+    match conn.damage_query_version(1, 1) {
+        Err(e) => { eprintln!("  fatal: damage_query_version send: {e}"); std::process::exit(4); }
+        Ok(c) => if let Err(e) = c.reply() {
+            eprintln!("  fatal: damage_query_version reply: {e}");
+            std::process::exit(4);
+        }
     }
-    if let Err(e) = conn.xfixes_query_version(5, 0).and_then(|c| c.reply()) {
-        eprintln!("  fatal: xfixes_query_version: {e}");
-        std::process::exit(4);
+    match conn.xfixes_query_version(5, 0) {
+        Err(e) => { eprintln!("  fatal: xfixes_query_version send: {e}"); std::process::exit(4); }
+        Ok(c) => if let Err(e) = c.reply() {
+            eprintln!("  fatal: xfixes_query_version reply: {e}");
+            std::process::exit(4);
+        }
     }
 
     let root = screen.root;
@@ -143,12 +151,12 @@ fn main() {
             std::process::exit(4);
         }
     };
-    if let Err(e) = conn
-        .damage_create(damage_id, root, ReportLevel::BOUNDING_BOX)
-        .and_then(|c| c.check())
-    {
-        eprintln!("  fatal: damage_create: {e}");
-        std::process::exit(4);
+    match conn.damage_create(damage_id, root, ReportLevel::BOUNDING_BOX) {
+        Err(e) => { eprintln!("  fatal: damage_create send: {e}"); std::process::exit(4); }
+        Ok(c) => if let Err(e) = c.check() {
+            eprintln!("  fatal: damage_create check: {e}");
+            std::process::exit(4);
+        }
     }
     let _ = conn.flush();
 
