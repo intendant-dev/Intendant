@@ -21,6 +21,19 @@
 //! browser, no integration with the existing capture pipeline. This
 //! binary opens its own X11 connection to observe damage events
 //! independently of the production capture path.
+//!
+//! ## Cursor-only motion does not produce XDamage events
+//!
+//! Verified on the D-1 smoke peer: a 10-second `xdotool mousemove`
+//! sweep produced zero `DamageNotify` events because the X server
+//! renders the pointer as a hardware-cursor overlay and the
+//! underlying framebuffer doesn't change. This is the X11 quirk that
+//! [`super::super::tile::synthetic_dirty::SyntheticDirtySources`]
+//! exists to bridge — it injects synthetic dirty rects around the
+//! cursor on every observed move so the tile path sees cursor
+//! freshness even when XDamage doesn't. Don't re-discover this case
+//! as a backend bug; it's expected and addressed in D-3 integration
+//! (where capture wires the synthetic source alongside the OS damage).
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

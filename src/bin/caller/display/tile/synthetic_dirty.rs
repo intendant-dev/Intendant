@@ -7,7 +7,11 @@
 //!    sees a moved cursor but the underlying framebuffer didn't change
 //!    from the damage system's perspective. Without injection, the
 //!    cursor appears stuck at its last damage-reported position from
-//!    the browser's view.
+//!    the browser's view. **Verified during D-1 smoke**: a 10s
+//!    `xdotool mousemove` sweep on the smoke peer (Debian/X11 in UTM)
+//!    produced zero DamageNotify events. This injection is therefore
+//!    not optional for cursor freshness — it's the only path that
+//!    reports the cursor's position to the tile pipeline.
 //! 2. **Visual-freshness diagnostic marker.** The marker is drawn
 //!    INTO the captured frame buffer by Intendant code (not by the X
 //!    server), so XDamage doesn't see it. The marker tile must be
