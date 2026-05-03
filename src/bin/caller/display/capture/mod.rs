@@ -11,6 +11,7 @@
 //! dirty rects, bounded recovery).
 
 pub mod damage;
+pub mod frame_diff;
 
 #[cfg(target_os = "linux")]
 pub mod x11_damage;

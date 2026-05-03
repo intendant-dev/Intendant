@@ -597,7 +597,7 @@ fn make_damage_backend(width: u32, height: u32) -> Box<dyn capture::damage::Dama
             Err(e) => {
                 eprintln!(
                     "[display/tile] XDamage unavailable on DISPLAY={display}: {e}; \
-                     tile stream will snapshot-only until a damage backend is available"
+                     tile stream will use frame-diff fallback"
                 );
             }
         }
@@ -1629,6 +1629,8 @@ impl DisplaySession {
 
         let task = tokio::spawn(async move {
             let mut damage = make_damage_backend(initial_w, initial_h);
+            let mut frame_diff =
+                capture::frame_diff::FrameDiffDamageTracker::new(TILE_STREAM_TILE_SIZE_PX);
             let mut grid: Option<tile::grid::TileGrid> = None;
             let mut synthetic_dirty = tile::synthetic_dirty::SyntheticDirtySources::new();
             let mut last_cursor: Option<(i32, i32)> = None;
@@ -1710,13 +1712,29 @@ impl DisplaySession {
                             last_cursor = cursor_pos;
                         }
 
-                        let mut rects = match damage.poll_damage() {
-                            Ok(rects) => rects,
-                            Err(e) => {
-                                eprintln!(
-                                    "[display/tile] display {display_id} damage poll failed: {e}"
-                                );
-                                Vec::new()
+                        let mut rects = match damage.capability() {
+                            capture::damage::DamageCapability::OsLevel => {
+                                match damage.poll_damage() {
+                                    Ok(rects) => rects,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[display/tile] display {display_id} damage poll failed: {e}"
+                                        );
+                                        Vec::new()
+                                    }
+                                }
+                            }
+                            capture::damage::DamageCapability::FrameDiff
+                            | capture::damage::DamageCapability::None => {
+                                match frame_diff.diff_frame(&frame) {
+                                    Ok(rects) => rects,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[display/tile] display {display_id} frame-diff failed: {e}"
+                                        );
+                                        Vec::new()
+                                    }
+                                }
                             }
                         };
 
