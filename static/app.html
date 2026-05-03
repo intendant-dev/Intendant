@@ -12604,6 +12604,185 @@ function diagModeEnabled() {
 // See docs/design-tile-streaming.md for the full architecture.
 // =====================================================================
 
+const TILE_WIRE_VERSION = 0x01;
+const TILE_FRAME_SNAPSHOT_CHUNK = 0x01;
+const TILE_FRAME_TILE_UPDATE = 0x02;
+const TILE_FRAME_RESIZE = 0x03;
+const TILE_FRAME_EPOCH_ADVANCE = 0x04;
+const TILE_FRAME_FALLBACK_TO_VIDEO = 0x05;
+const TILE_FRAME_FALLBACK_TO_TILE = 0x06;
+const TILE_FRAME_CURSOR_STATE = 0x07;
+const TILE_FRAME_SUBSCRIBE = 0x10;
+const TILE_FRAME_SNAPSHOT_REQUEST = 0x11;
+const TILE_FRAME_GAP_REPORT = 0x12;
+const TILE_FRAME_ERROR = 0xff;
+
+class TileWireReader {
+  constructor(bytes) {
+    if (bytes instanceof ArrayBuffer) {
+      this.bytes = new Uint8Array(bytes);
+    } else if (ArrayBuffer.isView(bytes)) {
+      this.bytes = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    } else {
+      throw new Error('tile wire frame must be ArrayBuffer or typed-array view');
+    }
+    this.view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
+    this.pos = 0;
+  }
+
+  remaining() {
+    return this.bytes.length - this.pos;
+  }
+
+  take(n) {
+    if (this.remaining() < n) throw new Error('tile wire frame truncated');
+    const out = this.bytes.subarray(this.pos, this.pos + n);
+    this.pos += n;
+    return out;
+  }
+
+  u8() {
+    return this.take(1)[0];
+  }
+
+  u16() {
+    if (this.remaining() < 2) throw new Error('tile wire frame truncated');
+    const v = this.view.getUint16(this.pos, true);
+    this.pos += 2;
+    return v;
+  }
+
+  u32() {
+    if (this.remaining() < 4) throw new Error('tile wire frame truncated');
+    const v = this.view.getUint32(this.pos, true);
+    this.pos += 4;
+    return v;
+  }
+
+  i32() {
+    if (this.remaining() < 4) throw new Error('tile wire frame truncated');
+    const v = this.view.getInt32(this.pos, true);
+    this.pos += 4;
+    return v;
+  }
+
+  records(count) {
+    const records = [];
+    for (let i = 0; i < count; i++) {
+      const tile_x = this.u16();
+      const tile_y = this.u16();
+      const encoding = this.u8();
+      const payloadLen = this.u32();
+      if (encoding !== 0 && encoding !== 1) {
+        throw new Error(`unsupported tile encoding ${encoding}`);
+      }
+      records.push({
+        tile_x,
+        tile_y,
+        encoding,
+        payload: this.take(payloadLen),
+      });
+    }
+    return records;
+  }
+
+  finish() {
+    if (this.remaining() !== 0) {
+      throw new Error(`tile wire frame has ${this.remaining()} trailing bytes`);
+    }
+  }
+}
+
+function parseTileWireFrame(bytes) {
+  const r = new TileWireReader(bytes);
+  const version = r.u8();
+  if (version !== TILE_WIRE_VERSION) {
+    throw new Error(`unsupported tile wire version ${version}`);
+  }
+  const frameType = r.u8();
+  r.u16(); // flags, reserved for v1
+  let frame;
+  switch (frameType) {
+    case TILE_FRAME_SNAPSHOT_CHUNK:
+      frame = {
+        type: 'snapshot_chunk',
+        epoch: r.u32(),
+        snapshot_id: r.u32(),
+        chunk_index: r.u16(),
+        chunk_count: r.u16(),
+        grid_w_tiles: r.u16(),
+        grid_h_tiles: r.u16(),
+        tile_size_px: r.u16(),
+      };
+      frame.records = r.records(r.u32());
+      break;
+    case TILE_FRAME_TILE_UPDATE:
+      frame = {
+        type: 'tile_update',
+        epoch: r.u32(),
+        seq: r.u32(),
+      };
+      frame.records = r.records(r.u16());
+      break;
+    case TILE_FRAME_RESIZE:
+      frame = {
+        type: 'resize',
+        new_epoch: r.u32(),
+        grid_w_tiles: r.u16(),
+        grid_h_tiles: r.u16(),
+        tile_size_px: r.u16(),
+      };
+      break;
+    case TILE_FRAME_EPOCH_ADVANCE:
+      frame = { type: 'epoch_advance', new_epoch: r.u32() };
+      break;
+    case TILE_FRAME_FALLBACK_TO_VIDEO:
+      frame = { type: 'fallback_to_video', new_epoch: r.u32() };
+      break;
+    case TILE_FRAME_FALLBACK_TO_TILE:
+      frame = { type: 'fallback_to_tile', new_epoch: r.u32() };
+      break;
+    case TILE_FRAME_CURSOR_STATE:
+      frame = {
+        type: 'cursor_state',
+        epoch: r.u32(),
+        seq: r.u32(),
+        x_px: r.i32(),
+        y_px: r.i32(),
+        visible: r.u8() !== 0,
+      };
+      break;
+    case TILE_FRAME_SUBSCRIBE:
+      frame = { type: 'subscribe', client_id: r.u32() };
+      break;
+    case TILE_FRAME_SNAPSHOT_REQUEST:
+      frame = { type: 'snapshot_request', epoch: r.u32(), reason: r.u8() };
+      break;
+    case TILE_FRAME_GAP_REPORT:
+      frame = {
+        type: 'gap_report',
+        epoch: r.u32(),
+        last_seen_seq: r.u32(),
+        expected_seq: r.u32(),
+      };
+      break;
+    case TILE_FRAME_ERROR: {
+      const code = r.u16();
+      const msgLen = r.u16();
+      frame = {
+        type: 'error',
+        code,
+        message: new TextDecoder().decode(r.take(msgLen)),
+      };
+      break;
+    }
+    default:
+      throw new Error(`unsupported tile wire frame type 0x${frameType.toString(16)}`);
+  }
+  r.finish();
+  return frame;
+}
+
 class TileCompositor {
   constructor(container, { tileSize, gridW, gridH }) {
     this.canvas = document.createElement('canvas');
@@ -12632,6 +12811,39 @@ class TileCompositor {
       gapDetections: 0,
       resizes: 0,
     };
+  }
+
+  onWireFrame(bytes) {
+    const frame = parseTileWireFrame(bytes);
+    switch (frame.type) {
+      case 'snapshot_chunk':
+        this.onSnapshotChunk(frame);
+        break;
+      case 'tile_update':
+        this.onTileUpdate(frame);
+        break;
+      case 'resize':
+        this.onResize(frame);
+        break;
+      case 'epoch_advance':
+        this.epoch = frame.new_epoch;
+        this.tileMap.clear();
+        break;
+      case 'fallback_to_video':
+      case 'fallback_to_tile':
+      case 'cursor_state':
+      case 'subscribe':
+      case 'snapshot_request':
+      case 'gap_report':
+      case 'error':
+        // Parsed here so D-3b can route channels immediately. Most
+        // control semantics land in D-4; D-3 keeps TilePolicy forced
+        // to tile mode.
+        break;
+      default:
+        throw new Error(`unhandled tile wire frame ${frame.type}`);
+    }
+    return frame;
   }
 
   onSnapshotChunk(frame) {

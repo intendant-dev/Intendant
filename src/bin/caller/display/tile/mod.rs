@@ -10,6 +10,8 @@
 //! - [`synthetic_dirty::SyntheticDirtySources`] — injects synthetic
 //!   dirty rects for things OS damage doesn't cover (cursor moves,
 //!   the visual-freshness diagnostic marker).
+//! - [`transport`] — D-3a binary wire-frame encode/decode helpers for
+//!   snapshot chunks, tile updates, and control frames.
 //!
 //! D-3 wires these into the encode + transport path; D-1 stays
 //! consumable only via direct calls (and the trace-only example
@@ -17,3 +19,4 @@
 
 pub mod grid;
 pub mod synthetic_dirty;
+pub mod transport;
