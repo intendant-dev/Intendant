@@ -22,7 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -534,6 +534,13 @@ fn convert_for_pool_feed(
 
 const TILE_STREAM_TILE_SIZE_PX: u16 = 64;
 
+fn tile_snapshot_period(mode: tile::policy::TileMode) -> Duration {
+    match mode {
+        tile::policy::TileMode::Tiles => Duration::from_secs(30),
+        tile::policy::TileMode::Video => Duration::from_secs(60),
+    }
+}
+
 fn tile_pixel_format(format: FrameFormat) -> tile::encode::TilePixelFormat {
     match format {
         FrameFormat::Bgra => tile::encode::TilePixelFormat::Bgra,
@@ -641,6 +648,23 @@ async fn send_tile_snapshot_to_peer(
             }
             Err(e) => eprintln!("[display/tile] snapshot wire encode failed: {e}"),
         }
+    }
+}
+
+async fn send_tile_control_to_peers(
+    peers: &[Arc<webrtc::WebRtcPeer>],
+    frame: tile::transport::TileFrame,
+    context: &str,
+) {
+    match tile::transport::encode_frame(&frame) {
+        Ok(bytes) => {
+            for peer in peers {
+                if let Err(e) = peer.send_tile_control_frame(bytes.clone()).await {
+                    eprintln!("[display/tile] {context} send failed: {e}");
+                }
+            }
+        }
+        Err(e) => eprintln!("[display/tile] {context} encode failed: {e}"),
     }
 }
 
@@ -1487,8 +1511,9 @@ impl DisplaySession {
             let mut grid: Option<tile::grid::TileGrid> = None;
             let mut synthetic_dirty = tile::synthetic_dirty::SyntheticDirtySources::new();
             let mut last_cursor: Option<(i32, i32)> = None;
-            let snapshot_period = std::time::Duration::from_secs(30);
-            let mut next_snapshot_at = Instant::now() + snapshot_period;
+            let mut tile_policy = tile::policy::TilePolicy::new(Instant::now());
+            let mut tile_mode = tile::policy::TileMode::Tiles;
+            let mut next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
             let mut seq: u32 = 1;
 
             loop {
@@ -1508,6 +1533,9 @@ impl DisplaySession {
                         let peers_now = tile_subscriber_peer_handles(&peers, &subscribers).await;
                         if peers_now.is_empty() {
                             grid = Some(next_grid);
+                            tile_policy = tile::policy::TilePolicy::new(Instant::now());
+                            tile_mode = tile::policy::TileMode::Tiles;
+                            next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             continue;
                         }
 
@@ -1516,6 +1544,8 @@ impl DisplaySession {
                             let epoch = tile_epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                             seq = 1;
                             grid = Some(next_grid);
+                            tile_policy = tile::policy::TilePolicy::new(Instant::now());
+                            tile_mode = tile::policy::TileMode::Tiles;
                             synthetic_dirty.reset_cursor();
                             last_cursor = None;
                             let resize = tile::transport::TileFrame::Resize {
@@ -1524,16 +1554,7 @@ impl DisplaySession {
                                 grid_h_tiles: next_grid.height_tiles,
                                 tile_size_px: next_grid.tile_size_px,
                             };
-                            match tile::transport::encode_frame(&resize) {
-                                Ok(bytes) => {
-                                    for peer in &peers_now {
-                                        if let Err(e) = peer.send_tile_control_frame(bytes.clone()).await {
-                                            eprintln!("[display/tile] resize send failed: {e}");
-                                        }
-                                    }
-                                }
-                                Err(e) => eprintln!("[display/tile] resize encode failed: {e}"),
-                            }
+                            send_tile_control_to_peers(&peers_now, resize, "resize").await;
                             let snapshot_id = tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
                             for peer in peers_now {
                                 send_tile_snapshot_to_peer(
@@ -1543,7 +1564,7 @@ impl DisplaySession {
                                     snapshot_id,
                                 ).await;
                             }
-                            next_snapshot_at = Instant::now() + snapshot_period;
+                            next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             continue;
                         }
 
@@ -1558,7 +1579,7 @@ impl DisplaySession {
                                     snapshot_id,
                                 ).await;
                             }
-                            next_snapshot_at = Instant::now() + snapshot_period;
+                            next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             continue;
                         }
 
@@ -1577,6 +1598,62 @@ impl DisplaySession {
                                 Vec::new()
                             }
                         };
+
+                        let policy_dirty = next_grid.dirty_tiles(&rects);
+                        let dirty_fraction = next_grid.dirty_fraction(policy_dirty.len());
+                        let next_mode = tile_policy.evaluate(dirty_fraction, Instant::now());
+                        if next_mode != tile_mode {
+                            let epoch = tile_epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                            seq = 1;
+                            tile_mode = next_mode;
+                            next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
+                            match tile_mode {
+                                tile::policy::TileMode::Video => {
+                                    eprintln!(
+                                        "[display/tile] display {display_id} fallback_to_video \
+                                         dirty_fraction={dirty_fraction:.3}"
+                                    );
+                                    let fallback = tile::transport::TileFrame::FallbackToVideo {
+                                        new_epoch: epoch,
+                                    };
+                                    send_tile_control_to_peers(
+                                        &peers_now,
+                                        fallback,
+                                        "fallback-to-video",
+                                    ).await;
+                                }
+                                tile::policy::TileMode::Tiles => {
+                                    eprintln!(
+                                        "[display/tile] display {display_id} fallback_to_tile \
+                                         dirty_fraction={dirty_fraction:.3}"
+                                    );
+                                    let fallback = tile::transport::TileFrame::FallbackToTile {
+                                        new_epoch: epoch,
+                                    };
+                                    send_tile_control_to_peers(
+                                        &peers_now,
+                                        fallback,
+                                        "fallback-to-tile",
+                                    ).await;
+                                    let snapshot_id =
+                                        tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
+                                    for peer in peers_now {
+                                        send_tile_snapshot_to_peer(
+                                            peer,
+                                            Arc::clone(&frame),
+                                            epoch,
+                                            snapshot_id,
+                                        ).await;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        if tile_mode == tile::policy::TileMode::Video {
+                            continue;
+                        }
+
                         rects.extend(synthetic_dirty.collect(cursor_pos, false));
 
                         if cursor_changed {

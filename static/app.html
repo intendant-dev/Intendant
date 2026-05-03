@@ -12823,6 +12823,7 @@ function encodeTileSubscribeFrame(clientId) {
 
 class TileCompositor {
   constructor(container, { tileSize, gridW, gridH }) {
+    this.container = container;
     this.frameEl = document.createElement('div');
     this.frameEl.className = 'tile-compositor-frame';
     this.canvas = document.createElement('canvas');
@@ -12879,14 +12880,17 @@ class TileCompositor {
         this.tileMap.clear();
         break;
       case 'fallback_to_video':
+        this.onFallbackToVideo(frame);
+        break;
       case 'fallback_to_tile':
+        this.onFallbackToTile(frame);
+        break;
       case 'subscribe':
       case 'snapshot_request':
       case 'gap_report':
       case 'error':
-        // Parsed here so D-3b can route channels immediately. Most
-        // control semantics land in D-4; D-3 keeps TilePolicy forced
-        // to tile mode.
+        // Parsed here so the channel remains forward-compatible with
+        // recovery/control messages that are handled by later slices.
         break;
       case 'cursor_state':
         this.onCursorState(frame);
@@ -12998,6 +13002,27 @@ class TileCompositor {
     // snapshot itself.
   }
 
+  onFallbackToVideo({ new_epoch }) {
+    if (new_epoch >= this.epoch) {
+      this.epoch = new_epoch;
+      this.tileMap.clear();
+      this.snapshotChunkBuffers.clear();
+    }
+    if (this.cursorEl) this.cursorEl.style.display = 'none';
+    this._showVideoSurface();
+  }
+
+  onFallbackToTile({ new_epoch }) {
+    if (new_epoch >= this.epoch) {
+      this.epoch = new_epoch;
+      this.tileMap.clear();
+      this.snapshotChunkBuffers.clear();
+    }
+    this.ctx.fillStyle = '#222';
+    this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    this._showTileSurface();
+  }
+
   onCursorState(frame) {
     if (!this.cursorEl) return;
     if (frame.epoch < this.epoch) return;
@@ -13012,6 +13037,24 @@ class TileCompositor {
     this.cursorEl.style.left = `${x * 100}%`;
     this.cursorEl.style.top = `${y * 100}%`;
     this.cursorEl.style.display = 'block';
+  }
+
+  _videoElement() {
+    return this.container && this.container.querySelector
+      ? this.container.querySelector('.peer-display-video')
+      : null;
+  }
+
+  _showVideoSurface() {
+    const video = this._videoElement();
+    if (video) video.style.display = '';
+    this.frameEl.style.display = 'none';
+  }
+
+  _showTileSurface() {
+    const video = this._videoElement();
+    if (video) video.style.display = 'none';
+    this.frameEl.style.display = '';
   }
 
   _applyRecord(r, epoch, seq) {
