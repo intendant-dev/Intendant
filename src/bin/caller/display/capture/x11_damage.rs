@@ -28,6 +28,7 @@ use super::damage::{DamageBackend, DamageCapability, DamageError, Rect};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::damage::{self, ConnectionExt as DamageExt, ReportLevel};
 use x11rb::protocol::xfixes::{self, ConnectionExt as XfixesExt};
+use x11rb::protocol::xproto::{ConnectionExt as XprotoExt, Window};
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
@@ -35,6 +36,7 @@ use x11rb::rust_connection::RustConnection;
 pub struct X11DamageBackend {
     conn: RustConnection,
     damage_id: damage::Damage,
+    root: Window,
     geometry: (u32, u32),
 }
 
@@ -45,8 +47,8 @@ impl X11DamageBackend {
     /// unavailable on the X server — caller should fall back to a
     /// [`super::damage::NullDamageBackend`] in that case.
     pub fn new(display_str: &str) -> Result<Self, DamageError> {
-        let (conn, screen_num) = x11rb::connect(Some(display_str))
-            .map_err(|e| DamageError::Connect(e.to_string()))?;
+        let (conn, screen_num) =
+            x11rb::connect(Some(display_str)).map_err(|e| DamageError::Connect(e.to_string()))?;
 
         // Verify both required extensions are present BEFORE making any
         // protocol-specific calls. This is the explicit-degradation
@@ -102,7 +104,12 @@ impl X11DamageBackend {
         // Flush so the subscription is live before the first poll.
         let _ = conn.flush();
 
-        Ok(Self { conn, damage_id, geometry })
+        Ok(Self {
+            conn,
+            damage_id,
+            root,
+            geometry,
+        })
     }
 }
 
@@ -156,6 +163,15 @@ impl DamageBackend for X11DamageBackend {
 
     fn screen_geometry(&self) -> (u32, u32) {
         self.geometry
+    }
+
+    fn cursor_position(&self) -> Option<(i32, i32)> {
+        self.conn
+            .query_pointer(self.root)
+            .ok()?
+            .reply()
+            .ok()
+            .map(|r| (r.root_x as i32, r.root_y as i32))
     }
 }
 

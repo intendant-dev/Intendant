@@ -45,7 +45,12 @@ pub struct Rect {
 
 impl Rect {
     pub fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     /// True when the rect has zero area (and thus dirty no pixels).
@@ -97,7 +102,10 @@ impl fmt::Display for DamageError {
         match self {
             Self::Connect(s) => write!(f, "damage backend connect failed: {s}"),
             Self::ExtensionMissing(ext) => {
-                write!(f, "damage backend requires X11 extension '{ext}' which is not available")
+                write!(
+                    f,
+                    "damage backend requires X11 extension '{ext}' which is not available"
+                )
             }
             Self::Setup(s) => write!(f, "damage backend setup failed: {s}"),
             Self::Poll(s) => write!(f, "damage backend poll failed: {s}"),
@@ -125,6 +133,16 @@ pub trait DamageBackend: Send {
     /// the tile grid; may go stale on resize, in which case the
     /// caller should rebuild the backend (D-4 wires resize handling).
     fn screen_geometry(&self) -> (u32, u32);
+
+    /// Best-effort cursor position in screen coordinates.
+    ///
+    /// Default is `None` so non-X11 backends can opt in later without
+    /// blocking tile streaming. X11 implements this via QueryPointer;
+    /// hardware-cursor moves do not generate XDamage events, so D-3
+    /// uses this side channel to keep the browser overlay fresh.
+    fn cursor_position(&self) -> Option<(i32, i32)> {
+        None
+    }
 }
 
 /// Always-empty backend reporting [`DamageCapability::None`]. Used as
@@ -139,7 +157,9 @@ pub struct NullDamageBackend {
 
 impl NullDamageBackend {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { geometry: (width, height) }
+        Self {
+            geometry: (width, height),
+        }
     }
 }
 

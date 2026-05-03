@@ -590,12 +590,33 @@ html, body {
   border-radius: 3px;
   object-fit: contain;
 }
+.tile-compositor-frame {
+  position: relative;
+  width: 100%;
+  max-height: 480px;
+  background: black;
+  border-radius: 3px;
+  overflow: hidden;
+  line-height: 0;
+}
 .tile-compositor-canvas {
   width: 100%;
   max-height: 480px;
   background: black;
   border-radius: 3px;
   object-fit: contain;
+}
+.tile-compositor-cursor {
+  position: absolute;
+  display: none;
+  width: 14px;
+  height: 20px;
+  pointer-events: none;
+  background: white;
+  clip-path: polygon(0 0, 0 16px, 4px 12px, 8px 20px, 11px 18px, 7px 11px, 14px 11px);
+  filter: drop-shadow(0 0 1px black) drop-shadow(1px 1px 0 black);
+  transform: translate(-1px, -1px);
+  z-index: 2;
 }
 .peer-display-controls {
   display: flex;
@@ -12802,17 +12823,23 @@ function encodeTileSubscribeFrame(clientId) {
 
 class TileCompositor {
   constructor(container, { tileSize, gridW, gridH }) {
+    this.frameEl = document.createElement('div');
+    this.frameEl.className = 'tile-compositor-frame';
     this.canvas = document.createElement('canvas');
     this.canvas.className = 'tile-compositor-canvas';
     this.canvas.style.cssText =
       'display:block; image-rendering:pixelated; background:#222;';
     this.canvas.width = tileSize * gridW;
     this.canvas.height = tileSize * gridH;
+    this.cursorEl = document.createElement('div');
+    this.cursorEl.className = 'tile-compositor-cursor';
+    this.frameEl.appendChild(this.canvas);
+    this.frameEl.appendChild(this.cursorEl);
     const controls = container.querySelector && container.querySelector('.peer-display-controls');
     if (controls) {
-      container.insertBefore(this.canvas, controls);
+      container.insertBefore(this.frameEl, controls);
     } else {
-      container.appendChild(this.canvas);
+      container.appendChild(this.frameEl);
     }
     this.ctx = this.canvas.getContext('2d', { alpha: false, willReadFrequently: true });
     this.tileSize = tileSize;
@@ -12853,7 +12880,6 @@ class TileCompositor {
         break;
       case 'fallback_to_video':
       case 'fallback_to_tile':
-      case 'cursor_state':
       case 'subscribe':
       case 'snapshot_request':
       case 'gap_report':
@@ -12861,6 +12887,9 @@ class TileCompositor {
         // Parsed here so D-3b can route channels immediately. Most
         // control semantics land in D-4; D-3 keeps TilePolicy forced
         // to tile mode.
+        break;
+      case 'cursor_state':
+        this.onCursorState(frame);
         break;
       default:
         throw new Error(`unhandled tile wire frame ${frame.type}`);
@@ -12967,6 +12996,22 @@ class TileCompositor {
     // Real client emits SnapshotRequest here. In D-2 the synthetic
     // stream is the source of resize events and emits the followup
     // snapshot itself.
+  }
+
+  onCursorState(frame) {
+    if (!this.cursorEl) return;
+    if (frame.epoch < this.epoch) return;
+    if (!frame.visible) {
+      this.cursorEl.style.display = 'none';
+      return;
+    }
+    const width = this.canvas.width || 1;
+    const height = this.canvas.height || 1;
+    const x = Math.max(0, Math.min(frame.x_px / width, 1));
+    const y = Math.max(0, Math.min(frame.y_px / height, 1));
+    this.cursorEl.style.left = `${x * 100}%`;
+    this.cursorEl.style.top = `${y * 100}%`;
+    this.cursorEl.style.display = 'block';
   }
 
   _applyRecord(r, epoch, seq) {
@@ -14242,8 +14287,8 @@ class PeerDisplayConnection {
     }
   }
 
-  // F-2: install pointer / keyboard listeners on the peer-display
-  // video element so user input flows over the `control` /
+  // F-2: install pointer / keyboard listeners on the visible peer-display
+  // surface so user input flows over the `control` /
   // `pointer` data channels as raw `InputEvent` JSON. Mirrors local
   // DisplaySlot's `_enterInteractive` exactly except for what's
   // out-of-scope for F-2: no `take_display` ControlMsg (peer's
@@ -14252,8 +14297,11 @@ class PeerDisplayConnection {
   _enterInteractive() {
     if (this.interactive) return;
     const container = document.getElementById(`peer-display-${this.hostId}`);
-    const vid = container && container.querySelector('.peer-display-video');
-    if (!vid) {
+    const target = container && (
+      container.querySelector('.tile-compositor-canvas') ||
+      container.querySelector('.peer-display-video')
+    );
+    if (!target) {
       // Pane was destroyed between authority grant and entry. Bail
       // WITHOUT flipping `interactive` so a subsequent
       // `attachToDom` (which calls back into _enterInteractive when
@@ -14261,21 +14309,23 @@ class PeerDisplayConnection {
       // versions set the flag here and got stuck — `setPeerAuthorityState`
       // would skip on the redundant `if (this.interactive) return`
       // branch and the rebuilt pane never got listeners.
-      this._log('warn', 'enterInteractive: video element missing — pane torn down?');
+      this._log('warn', 'enterInteractive: display surface missing — pane torn down?');
       return;
     }
-    vid.tabIndex = 0;
-    vid.focus();
+    target.tabIndex = 0;
+    target.focus();
+    this._interactiveTarget = target;
     this._heldModifiers = new Set();
 
     const normalize = (e) => {
       // Same letterbox-aware normalization as local DisplaySlot —
       // map screen-pixel cursor to logical (0..1) display coords
-      // accounting for the video element's preserved aspect ratio.
-      const rect = vid.getBoundingClientRect();
-      const vW = vid.videoWidth || rect.width;
-      const vH = vid.videoHeight || rect.height;
-      const videoAspect = vW / vH;
+      // accounting for the rendered surface's preserved aspect ratio.
+      const rect = target.getBoundingClientRect();
+      const isCanvas = target instanceof HTMLCanvasElement;
+      const surfaceW = isCanvas ? (target.width || rect.width) : (target.videoWidth || rect.width);
+      const surfaceH = isCanvas ? (target.height || rect.height) : (target.videoHeight || rect.height);
+      const videoAspect = surfaceW / surfaceH;
       const elAspect = rect.width / rect.height;
       let contentW, contentH, offsetX, offsetY;
       if (elAspect > videoAspect) {
@@ -14328,14 +14378,14 @@ class PeerDisplayConnection {
     };
     this._boundHandlers.pointerdown = (e) => {
       e.preventDefault();
-      vid.focus();
-      vid.setPointerCapture(e.pointerId);
+      target.focus();
+      target.setPointerCapture(e.pointerId);
       const { x, y } = normalize(e);
       sendControl({ t: 'md', x, y, b: e.button });
     };
     this._boundHandlers.pointerup = (e) => {
       e.preventDefault();
-      vid.releasePointerCapture(e.pointerId);
+      target.releasePointerCapture(e.pointerId);
       const { x, y } = normalize(e);
       sendControl({ t: 'mu', x, y, b: e.button });
     };
@@ -14366,11 +14416,11 @@ class PeerDisplayConnection {
       this._heldModifiers.clear();
     };
     this._boundHandlers.pointerenter = () => {
-      if (this.interactive) vid.focus();
+      if (this.interactive) target.focus();
     };
 
     for (const [evt, handler] of Object.entries(this._boundHandlers)) {
-      vid.addEventListener(evt, handler);
+      target.addEventListener(evt, handler);
     }
     // Flag flips to `true` ONLY after the install succeeds — see
     // the doc on the early-return-on-missing-video branch above for
@@ -14387,13 +14437,13 @@ class PeerDisplayConnection {
     if (!this.interactive) return;
     this.interactive = false;
     if (this._heldModifiers) this._heldModifiers.clear();
-    const container = document.getElementById(`peer-display-${this.hostId}`);
-    const vid = container && container.querySelector('.peer-display-video');
-    if (vid) {
+    const target = this._interactiveTarget;
+    if (target) {
       for (const [evt, handler] of Object.entries(this._boundHandlers)) {
-        vid.removeEventListener(evt, handler);
+        target.removeEventListener(evt, handler);
       }
     }
+    this._interactiveTarget = null;
     this._boundHandlers = {};
     this._log('debug', 'exited interactive mode — input listeners removed');
   }

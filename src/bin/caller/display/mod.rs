@@ -1485,6 +1485,8 @@ impl DisplaySession {
         let task = tokio::spawn(async move {
             let mut damage = make_damage_backend(initial_w, initial_h);
             let mut grid: Option<tile::grid::TileGrid> = None;
+            let mut synthetic_dirty = tile::synthetic_dirty::SyntheticDirtySources::new();
+            let mut last_cursor: Option<(i32, i32)> = None;
             let mut seq: u32 = 1;
 
             loop {
@@ -1512,6 +1514,8 @@ impl DisplaySession {
                             let epoch = tile_epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                             seq = 1;
                             grid = Some(next_grid);
+                            synthetic_dirty.reset_cursor();
+                            last_cursor = None;
                             let resize = tile::transport::TileFrame::Resize {
                                 new_epoch: epoch,
                                 grid_w_tiles: next_grid.width_tiles,
@@ -1540,7 +1544,13 @@ impl DisplaySession {
                             continue;
                         }
 
-                        let rects = match damage.poll_damage() {
+                        let cursor_pos = damage.cursor_position();
+                        let cursor_changed = cursor_pos.is_some() && cursor_pos != last_cursor;
+                        if cursor_changed {
+                            last_cursor = cursor_pos;
+                        }
+
+                        let mut rects = match damage.poll_damage() {
                             Ok(rects) => rects,
                             Err(e) => {
                                 eprintln!(
@@ -1549,6 +1559,36 @@ impl DisplaySession {
                                 Vec::new()
                             }
                         };
+                        rects.extend(synthetic_dirty.collect(cursor_pos, false));
+
+                        if cursor_changed {
+                            if let Some((x_px, y_px)) = cursor_pos {
+                                let cursor = tile::transport::TileFrame::CursorState {
+                                    epoch: tile_epoch.load(Ordering::Relaxed),
+                                    seq,
+                                    x_px,
+                                    y_px,
+                                    visible: true,
+                                };
+                                match tile::transport::encode_frame(&cursor) {
+                                    Ok(bytes) => {
+                                        let peers_now =
+                                            tile_subscriber_peer_handles(&peers, &subscribers).await;
+                                        for peer in peers_now {
+                                            if let Err(e) =
+                                                peer.send_tile_control_frame(bytes.clone()).await
+                                            {
+                                                eprintln!("[display/tile] cursor send failed: {e}");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[display/tile] cursor encode failed: {e}");
+                                    }
+                                }
+                            }
+                        }
+
                         if rects.is_empty() {
                             continue;
                         }
