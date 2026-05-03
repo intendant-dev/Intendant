@@ -44,6 +44,7 @@ const TYPE_ERROR: u8 = 0xff;
 pub enum TileEncoding {
     RawBgra = 0,
     RleBgra = 1,
+    WebpLossless = 2,
 }
 
 impl TileEncoding {
@@ -51,6 +52,7 @@ impl TileEncoding {
         match v {
             0 => Ok(Self::RawBgra),
             1 => Ok(Self::RleBgra),
+            2 => Ok(Self::WebpLossless),
             other => Err(TileWireError::UnsupportedEncoding(other)),
         }
     }
@@ -575,7 +577,10 @@ mod tests {
         let frame = TileFrame::TileUpdate {
             epoch: 5,
             seq: 42,
-            records: vec![record(0, 0, 16)],
+            records: vec![
+                record(0, 0, 16),
+                TileRecord::new(1, 1, TileEncoding::WebpLossless, vec![82, 73, 70, 70]),
+            ],
         };
         assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
     }

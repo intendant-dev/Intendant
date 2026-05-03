@@ -12648,6 +12648,9 @@ const TILE_SNAPSHOT_REASON_STARTUP = 0;
 const TILE_SNAPSHOT_REASON_RESIZE = 1;
 const TILE_SNAPSHOT_REASON_GAP = 2;
 const TILE_SNAPSHOT_REASON_MANUAL = 3;
+const TILE_ENCODING_RAW_BGRA = 0;
+const TILE_ENCODING_RLE_BGRA = 1;
+const TILE_ENCODING_WEBP_LOSSLESS = 2;
 
 class TileWireReader {
   constructor(bytes) {
@@ -12705,7 +12708,11 @@ class TileWireReader {
       const tile_y = this.u16();
       const encoding = this.u8();
       const payloadLen = this.u32();
-      if (encoding !== 0 && encoding !== 1) {
+      if (
+        encoding !== TILE_ENCODING_RAW_BGRA &&
+        encoding !== TILE_ENCODING_RLE_BGRA &&
+        encoding !== TILE_ENCODING_WEBP_LOSSLESS
+      ) {
         throw new Error(`unsupported tile encoding ${encoding}`);
       }
       records.push({
@@ -13118,17 +13125,44 @@ class TileCompositor {
   _applyRecord(r, epoch, seq) {
     const px = r.tile_x * this.tileSize;
     const py = r.tile_y * this.tileSize;
-    let imageData;
-    if (r.encoding === 0) {
-      imageData = this._decodeRawBgra(r.payload);
-    } else if (r.encoding === 1) {
-      imageData = this._decodeRleBgra(r.payload);
+    if (r.encoding === TILE_ENCODING_RAW_BGRA) {
+      this._drawImageDataRecord(r, epoch, seq, this._decodeRawBgra(r.payload), px, py);
+    } else if (r.encoding === TILE_ENCODING_RLE_BGRA) {
+      this._drawImageDataRecord(r, epoch, seq, this._decodeRleBgra(r.payload), px, py);
+    } else if (r.encoding === TILE_ENCODING_WEBP_LOSSLESS) {
+      this._decodeWebpLossless(r.payload)
+        .then((decoded) => {
+          this._drawBitmapRecord(r, epoch, seq, decoded, px, py);
+        })
+        .catch((err) => {
+          console.warn('[tile-compositor] WebP tile decode failed', err);
+        });
     } else {
       console.warn('[tile-compositor] unknown encoding', r.encoding);
-      return;
     }
+  }
+
+  _recordIsStale(r, epoch, seq) {
+    if (epoch < this.epoch) return true;
+    const prev = this.tileMap.get((r.tile_y << 16) | r.tile_x);
+    return !!(prev && prev.epoch === epoch && prev.seq >= seq);
+  }
+
+  _drawImageDataRecord(r, epoch, seq, imageData, px, py) {
+    if (this._recordIsStale(r, epoch, seq)) return;
     this.ctx.putImageData(imageData, px, py);
     this.tileMap.set((r.tile_y << 16) | r.tile_x, { epoch, seq });
+    this.metrics.tilesApplied++;
+  }
+
+  _drawBitmapRecord(r, epoch, seq, decoded, px, py) {
+    try {
+      if (this._recordIsStale(r, epoch, seq)) return;
+      this.ctx.drawImage(decoded, px, py, this.tileSize, this.tileSize);
+      this.tileMap.set((r.tile_y << 16) | r.tile_x, { epoch, seq });
+    } finally {
+      if (decoded && typeof decoded.close === 'function') decoded.close();
+    }
     this.metrics.tilesApplied++;
   }
 
@@ -13176,6 +13210,26 @@ class TileCompositor {
       }
     }
     return new ImageData(dst, ts, ts);
+  }
+
+  _decodeWebpLossless(payload) {
+    const blob = new Blob([payload], { type: 'image/webp' });
+    if (typeof createImageBitmap === 'function') {
+      return createImageBitmap(blob);
+    }
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(blob);
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        resolve(img);
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('image/webp decode failed'));
+      };
+      img.src = url;
+    });
   }
 }
 
