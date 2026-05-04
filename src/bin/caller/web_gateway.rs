@@ -5053,21 +5053,24 @@ pub fn spawn_web_gateway(
                                             // No covert-stamp scenario worth gating against.
                                             let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
                                             let enabled = json["enabled"].as_bool().unwrap_or(false);
-                                            let session: Option<Arc<crate::display::DisplaySession>> = match session_registry_inbound.as_ref() {
-                                                Some(sr) => sr.read().await.get(display_id),
-                                                None => None,
-                                            };
-                                            match session {
-                                                Some(session) => {
-                                                    session.set_diagnostics_visual_marker(enabled);
+                                            match session_registry_inbound.as_ref() {
+                                                Some(sr) => {
+                                                    let applied = sr
+                                                        .write()
+                                                        .await
+                                                        .set_diagnostics_visual_marker(
+                                                            display_id, enabled,
+                                                        );
                                                     eprintln!(
-                                                        "[web_gateway] phase-0 visual marker for display {} = {}",
-                                                        display_id, enabled,
+                                                        "[web_gateway] phase-0 visual marker for display {} = {}{}",
+                                                        display_id,
+                                                        enabled,
+                                                        if applied { "" } else { " (pending)" },
                                                     );
                                                 }
                                                 None => {
                                                     eprintln!(
-                                                        "[web_gateway] phase-0 visual marker request for unknown display {} ({}); display not granted yet?",
+                                                        "[web_gateway] phase-0 visual marker request for display {} ({}) ignored; no session registry",
                                                         display_id, enabled,
                                                     );
                                                 }
@@ -5164,21 +5167,24 @@ pub fn spawn_web_gateway(
                                                     // the generic bus path, where this variant is
                                                     // intentionally a no-op for TUI/MCP parity.
                                                     let display_id = display_id.unwrap_or(0);
-                                                    let session: Option<Arc<crate::display::DisplaySession>> = match session_registry_inbound.as_ref() {
-                                                        Some(sr) => sr.read().await.get(display_id),
-                                                        None => None,
-                                                    };
-                                                    match session {
-                                                        Some(session) => {
-                                                            session.set_diagnostics_visual_marker(enabled);
+                                                    match session_registry_inbound.as_ref() {
+                                                        Some(sr) => {
+                                                            let applied = sr
+                                                                .write()
+                                                                .await
+                                                                .set_diagnostics_visual_marker(
+                                                                    display_id, enabled,
+                                                                );
                                                             eprintln!(
-                                                                "[web_gateway] phase-0 visual marker for display {} = {}",
-                                                                display_id, enabled,
+                                                                "[web_gateway] phase-0 visual marker for display {} = {}{}",
+                                                                display_id,
+                                                                enabled,
+                                                                if applied { "" } else { " (pending)" },
                                                             );
                                                         }
                                                         None => {
                                                             eprintln!(
-                                                                "[web_gateway] phase-0 visual marker request for unknown display {} ({}); display not granted yet?",
+                                                                "[web_gateway] phase-0 visual marker request for display {} ({}) ignored; no session registry",
                                                                 display_id, enabled,
                                                             );
                                                         }

@@ -14390,6 +14390,23 @@ class PeerDisplayConnection {
             sendControlFrame: (bytes) => this._sendTileControlFrame(bytes),
           },
         );
+        if (diagModeEnabled()) {
+          if (this._diagSampler) {
+            try { this._diagSampler.stop(); } catch (e) {
+              this._log('warn', `[diag-vf] video sampler stop before tile sampler failed: ${e.message}`);
+            }
+          }
+          this._diagSampler = new CanvasFreshnessSampler(
+            this.tileCompositor.canvas,
+            this.hostId,
+            this.displayId,
+          );
+          this._diagSampler.start();
+          this._log(
+            'info',
+            `[diag-vf canvas] sampler started (browser_session_id=${this._diagSampler.browserSessionId})`,
+          );
+        }
         const video = container.querySelector('.peer-display-video');
         if (video) video.style.display = 'none';
       }

@@ -51,6 +51,18 @@ impl std::error::Error for TileEncodeError {}
 pub fn encode_tile(src: &TileSource<'_>, tile: TileId) -> Result<TileRecord, TileEncodeError> {
     validate_source(src)?;
     let raw = raw_bgra_tile(src, tile)?;
+    encode_raw_bgra_payload(tile, raw, src.tile_size_px)
+}
+
+pub fn encode_raw_bgra_payload(
+    tile: TileId,
+    raw: Vec<u8>,
+    tile_size_px: u16,
+) -> Result<TileRecord, TileEncodeError> {
+    let expected = tile_size_px as usize * tile_size_px as usize * 4;
+    if tile_size_px == 0 || raw.len() != expected {
+        return Err(TileEncodeError::InvalidGeometry);
+    }
     let rle = rle_bgra(&raw);
 
     let (mut encoding, mut payload) = if rle.len() < raw.len() {
@@ -60,7 +72,7 @@ pub fn encode_tile(src: &TileSource<'_>, tile: TileId) -> Result<TileRecord, Til
     };
 
     if should_try_webp_lossless(payload.len(), raw.len()) {
-        match webp_lossless_bgra(&raw, src.tile_size_px as u32, src.tile_size_px as u32) {
+        match webp_lossless_bgra(&raw, tile_size_px as u32, tile_size_px as u32) {
             Ok(webp) if webp.len() < payload.len() => {
                 encoding = TileEncoding::WebpLossless;
                 payload = webp;

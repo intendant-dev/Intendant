@@ -815,6 +815,7 @@ the same packet-capture geometry.
 | VP8-q baseline | Pass | 50ms | 68ms | 446ms | 20.28 |
 | VP8-f full-res, 2.5 Mbps | Fail | 34ms | 5048ms | 38385ms | 0.68 |
 | VP8-f full-res, 800 kbps | Fail | 35ms | 1083ms | 1136ms | 2.85 |
+| Tile-mode full-res, raw/RLE/WebP tiles | Pass | 34ms | 51ms | 69ms | 28.15 |
 
 Artifact locations from the reference runs:
 
@@ -826,6 +827,8 @@ Artifact locations from the reference runs:
   `/Users/vm/.intendant/diagnostics/visual-freshness/49b84e18-09bc-470e-b320-1c31ac7d71cc.ndjson`
 - VP8-f 800 kbps visual-only transcript:
   `/Users/vm/.intendant/diagnostics/visual-freshness/14967266-9a63-4e35-bc7d-7f7b0fa2f751.ndjson`
+- Tile-mode full-res transcript:
+  `/Users/vm/.intendant/diagnostics/visual-freshness/5b7abe59-8c22-4dd5-9b5d-e15e6ac01b71.ndjson`
 
 The VP8-f experiment was not CPU-bound. During the failure, the
 peer kept capturing and encoding at about 27-29fps with
@@ -839,6 +842,13 @@ under the full-resolution load.
 The 800 kbps follow-up reduces the catastrophic tens-of-seconds
 freeze mode to roughly one-second gaps, but it still fails the #80
 bar and is not usable for remote desktop control.
+
+The tile-mode full-resolution run validates the #82 direction against
+the same visual-freshness harness. The browser sampled the compositor
+canvas (`source:"canvas"`) rather than the hidden VP8 video element, and
+the marker was armed before display creation via the pending marker
+default path. During a peer-side motion sweep, the canvas stayed within
+the #80 bar with no freeze-class interval.
 
 Conclusion: **do not promote federated VP8 from `q` to `f` as a
 simple default flip, even with a lower full-layer bitrate.**

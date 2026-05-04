@@ -570,6 +570,7 @@ fn all_tile_ids(grid: &tile::grid::TileGrid) -> Vec<tile::grid::TileId> {
 fn encode_tile_records(
     frame: &Frame,
     tiles: Vec<tile::grid::TileId>,
+    visual_marker_value: Option<u32>,
 ) -> Result<Vec<tile::transport::TileRecord>, tile::encode::TileEncodeError> {
     let src = tile::encode::TileSource {
         data: &frame.data,
@@ -581,8 +582,85 @@ fn encode_tile_records(
     };
     tiles
         .into_iter()
-        .map(|tile| tile::encode::encode_tile(&src, tile))
+        .map(|tile| {
+            let mut raw = tile::encode::raw_bgra_tile(&src, tile)?;
+            if let Some(value) = visual_marker_value {
+                stamp_visual_marker_bgra_tile(&mut raw, tile, src.tile_size_px, value);
+            }
+            tile::encode::encode_raw_bgra_payload(tile, raw, src.tile_size_px)
+        })
         .collect()
+}
+
+fn current_visual_marker_value(marker_flag: &AtomicBool, session_epoch: Instant) -> Option<u32> {
+    if marker_flag.load(Ordering::Relaxed) {
+        Some(
+            Instant::now()
+                .saturating_duration_since(session_epoch)
+                .as_millis() as u32,
+        )
+    } else {
+        None
+    }
+}
+
+fn stamp_visual_marker_bgra_tile(
+    raw_bgra: &mut [u8],
+    tile: tile::grid::TileId,
+    tile_size_px: u16,
+    value: u32,
+) {
+    let tile_size = tile_size_px as usize;
+    if tile_size == 0 || raw_bgra.len() < tile_size * tile_size * 4 {
+        return;
+    }
+
+    let tile_x0 = tile.x as usize * tile_size;
+    let tile_y0 = tile.y as usize * tile_size;
+    let tile_x1 = tile_x0 + tile_size;
+    let tile_y1 = tile_y0 + tile_size;
+
+    if tile_x0 >= visual_marker::MARKER_W || tile_y0 >= visual_marker::MARKER_H {
+        return;
+    }
+
+    for row in 0..visual_marker::ROWS {
+        for col in 0..visual_marker::COLS {
+            let bit_idx = row * visual_marker::COLS + col;
+            let bit = (value >> bit_idx) & 1;
+            let luma = if bit == 1 {
+                visual_marker::LUMA_HIGH
+            } else {
+                visual_marker::LUMA_LOW
+            };
+            let marker_x0 = col * visual_marker::TILE_PX;
+            let marker_y0 = row * visual_marker::TILE_PX;
+            let marker_x1 = marker_x0 + visual_marker::TILE_PX;
+            let marker_y1 = marker_y0 + visual_marker::TILE_PX;
+
+            let x0 = marker_x0.max(tile_x0);
+            let y0 = marker_y0.max(tile_y0);
+            let x1 = marker_x1.min(tile_x1);
+            let y1 = marker_y1.min(tile_y1);
+            if x0 >= x1 || y0 >= y1 {
+                continue;
+            }
+
+            for y in y0..y1 {
+                let local_y = y - tile_y0;
+                for x in x0..x1 {
+                    let local_x = x - tile_x0;
+                    let idx = (local_y * tile_size + local_x) * 4;
+                    if idx + 3 < raw_bgra.len() {
+                        raw_bgra[idx] = luma;
+                        raw_bgra[idx + 1] = luma;
+                        raw_bgra[idx + 2] = luma;
+                        raw_bgra[idx + 3] = 255;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn make_damage_backend(width: u32, height: u32) -> Box<dyn capture::damage::DamageBackend> {
@@ -611,6 +689,7 @@ async fn send_tile_snapshot_to_peer(
     frame: Arc<Frame>,
     epoch: u32,
     snapshot_id: u32,
+    visual_marker_value: Option<u32>,
 ) {
     let Some(grid) = tile_grid_for_frame(&frame) else {
         return;
@@ -618,7 +697,7 @@ async fn send_tile_snapshot_to_peer(
     let encode_result = tokio::task::spawn_blocking({
         let frame = Arc::clone(&frame);
         move || {
-            let records = encode_tile_records(&frame, all_tile_ids(&grid))?;
+            let records = encode_tile_records(&frame, all_tile_ids(&grid), visual_marker_value)?;
             Ok::<_, tile::encode::TileEncodeError>((grid, records))
         }
     })
@@ -678,6 +757,8 @@ async fn send_latest_tile_snapshot_to_peer_id(
     latest_frame: Arc<RwLock<Option<Arc<Frame>>>>,
     tile_epoch: Arc<AtomicU32>,
     tile_snapshot_id: Arc<AtomicU32>,
+    marker_flag: Arc<AtomicBool>,
+    session_epoch: Instant,
     peer_id: PeerId,
     context: &'static str,
 ) {
@@ -692,7 +773,8 @@ async fn send_latest_tile_snapshot_to_peer_id(
     };
     let epoch = tile_epoch.load(Ordering::Relaxed);
     let snapshot_id = tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
-    send_tile_snapshot_to_peer(peer, frame, epoch, snapshot_id).await;
+    let visual_marker_value = current_visual_marker_value(&marker_flag, session_epoch);
+    send_tile_snapshot_to_peer(peer, frame, epoch, snapshot_id, visual_marker_value).await;
 }
 
 async fn tile_subscriber_peer_handles(
@@ -1219,7 +1301,9 @@ impl DisplaySession {
         };
         let epoch = self.tile_epoch.load(Ordering::Relaxed);
         let snapshot_id = self.tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
-        send_tile_snapshot_to_peer(peer, frame, epoch, snapshot_id).await;
+        let visual_marker_value =
+            current_visual_marker_value(&self.diagnostics_visual_marker, self.session_epoch);
+        send_tile_snapshot_to_peer(peer, frame, epoch, snapshot_id, visual_marker_value).await;
     }
 
     /// D-3c: unregister a tile subscriber. Safe to call even when the
@@ -1235,6 +1319,8 @@ impl DisplaySession {
         let tile_epoch = Arc::clone(&self.tile_epoch);
         let tile_snapshot_id = Arc::clone(&self.tile_snapshot_id);
         let tile_replay = Arc::clone(&self.tile_replay);
+        let marker_flag = Arc::clone(&self.diagnostics_visual_marker);
+        let session_epoch = self.session_epoch;
 
         Arc::new(move |msg| {
             let peers = Arc::clone(&peers);
@@ -1243,6 +1329,7 @@ impl DisplaySession {
             let tile_epoch = Arc::clone(&tile_epoch);
             let tile_snapshot_id = Arc::clone(&tile_snapshot_id);
             let tile_replay = Arc::clone(&tile_replay);
+            let marker_flag = Arc::clone(&marker_flag);
 
             tokio::spawn(async move {
                 match msg {
@@ -1253,6 +1340,8 @@ impl DisplaySession {
                             latest_frame,
                             tile_epoch,
                             tile_snapshot_id,
+                            Arc::clone(&marker_flag),
+                            session_epoch,
                             peer_id,
                             "subscribe",
                         )
@@ -1264,6 +1353,8 @@ impl DisplaySession {
                             latest_frame,
                             tile_epoch,
                             tile_snapshot_id,
+                            Arc::clone(&marker_flag),
+                            session_epoch,
                             peer_id,
                             "snapshot-request",
                         )
@@ -1305,6 +1396,8 @@ impl DisplaySession {
                                     latest_frame,
                                     tile_epoch,
                                     tile_snapshot_id,
+                                    Arc::clone(&marker_flag),
+                                    session_epoch,
                                     peer_id,
                                     "gap-recovery",
                                 )
@@ -1625,6 +1718,8 @@ impl DisplaySession {
         let tile_epoch = Arc::clone(&self.tile_epoch);
         let tile_snapshot_id = Arc::clone(&self.tile_snapshot_id);
         let display_id = self.display_id;
+        let marker_flag = Arc::clone(&self.diagnostics_visual_marker);
+        let session_epoch = self.session_epoch;
         let (initial_w, initial_h) = self.backend.resolution();
 
         let task = tokio::spawn(async move {
@@ -1632,7 +1727,8 @@ impl DisplaySession {
             let mut frame_diff =
                 capture::frame_diff::FrameDiffDamageTracker::new(TILE_STREAM_TILE_SIZE_PX);
             let mut grid: Option<tile::grid::TileGrid> = None;
-            let mut synthetic_dirty = tile::synthetic_dirty::SyntheticDirtySources::new();
+            let mut synthetic_dirty = tile::synthetic_dirty::SyntheticDirtySources::new()
+                .with_marker((0, 0), visual_marker::MARKER_W as u32);
             let mut last_cursor: Option<(i32, i32)> = None;
             let mut tile_policy = tile::policy::TilePolicy::new(Instant::now());
             let mut tile_mode = tile::policy::TileMode::Tiles;
@@ -1662,6 +1758,9 @@ impl DisplaySession {
                             continue;
                         }
 
+                        let visual_marker_value =
+                            current_visual_marker_value(&marker_flag, session_epoch);
+
                         let resized = grid.map_or(true, |g| g != next_grid);
                         if resized {
                             let epoch = tile_epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
@@ -1685,6 +1784,7 @@ impl DisplaySession {
                                     Arc::clone(&frame),
                                     epoch,
                                     snapshot_id,
+                                    visual_marker_value,
                                 ).await;
                             }
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
@@ -1700,6 +1800,7 @@ impl DisplaySession {
                                     Arc::clone(&frame),
                                     epoch,
                                     snapshot_id,
+                                    visual_marker_value,
                                 ).await;
                             }
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
@@ -1782,6 +1883,7 @@ impl DisplaySession {
                                             Arc::clone(&frame),
                                             epoch,
                                             snapshot_id,
+                                            visual_marker_value,
                                         ).await;
                                     }
                                 }
@@ -1793,7 +1895,10 @@ impl DisplaySession {
                             continue;
                         }
 
-                        rects.extend(synthetic_dirty.collect(cursor_pos, false));
+                        synthetic_dirty.set_marker_enabled(visual_marker_value.is_some());
+                        rects.extend(
+                            synthetic_dirty.collect(cursor_pos, visual_marker_value.is_some()),
+                        );
 
                         if cursor_changed {
                             if let Some((x_px, y_px)) = cursor_pos {
@@ -1834,7 +1939,7 @@ impl DisplaySession {
                         let epoch = tile_epoch.load(Ordering::Relaxed);
                         let encode_result = tokio::task::spawn_blocking({
                             let frame = Arc::clone(&frame);
-                            move || encode_tile_records(&frame, dirty)
+                            move || encode_tile_records(&frame, dirty, visual_marker_value)
                         }).await;
 
                         let Ok(Ok(records)) = encode_result else {
@@ -2349,6 +2454,7 @@ impl DisplaySession {
 /// Registry of active display sessions, keyed by display ID.
 pub struct SessionRegistry {
     sessions: HashMap<u32, Arc<DisplaySession>>,
+    diagnostics_visual_marker_defaults: HashMap<u32, bool>,
 }
 
 pub type SharedSessionRegistry = Arc<RwLock<SessionRegistry>>;
@@ -2357,6 +2463,7 @@ impl SessionRegistry {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            diagnostics_visual_marker_defaults: HashMap::new(),
         }
     }
 
@@ -2365,6 +2472,13 @@ impl SessionRegistry {
     }
 
     pub fn insert(&mut self, display_id: u32, session: Arc<DisplaySession>) {
+        if let Some(enabled) = self
+            .diagnostics_visual_marker_defaults
+            .get(&display_id)
+            .copied()
+        {
+            session.set_diagnostics_visual_marker(enabled);
+        }
         self.sessions.insert(display_id, session);
     }
 
@@ -2375,6 +2489,24 @@ impl SessionRegistry {
     /// All active display IDs.
     pub fn display_ids(&self) -> Vec<u32> {
         self.sessions.keys().copied().collect()
+    }
+
+    /// Set the Phase 0 visual-freshness marker for an active display, or
+    /// remember the desired state for the next session created for that
+    /// display. The smoke harness intentionally arms the marker before
+    /// opening the federated display; applying the pending default here
+    /// makes that ordering reliable.
+    ///
+    /// Returns `true` when an active session was updated immediately.
+    pub fn set_diagnostics_visual_marker(&mut self, display_id: u32, enabled: bool) -> bool {
+        self.diagnostics_visual_marker_defaults
+            .insert(display_id, enabled);
+        if let Some(session) = self.sessions.get(&display_id) {
+            session.set_diagnostics_visual_marker(enabled);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -2722,6 +2854,118 @@ mod tests {
         fn kind(&self) -> &'static str {
             "stub"
         }
+    }
+
+    #[test]
+    fn tile_bgra_visual_marker_stamp_writes_expected_marker_pixels() {
+        let tile_size = TILE_STREAM_TILE_SIZE_PX as usize;
+        let sample = |buf: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let i = (y * tile_size + x) * 4;
+            [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+        };
+
+        let mut tile0 = vec![0u8; tile_size * tile_size * 4];
+        let value = (1u32 << 0) | (1u32 << 9);
+        stamp_visual_marker_bgra_tile(
+            &mut tile0,
+            tile::grid::TileId::new(0, 0),
+            TILE_STREAM_TILE_SIZE_PX,
+            value,
+        );
+        assert_eq!(
+            sample(&tile0, 8, 8),
+            [
+                visual_marker::LUMA_HIGH,
+                visual_marker::LUMA_HIGH,
+                visual_marker::LUMA_HIGH,
+                255,
+            ],
+            "bit 0 center should stamp high luma in tile 0"
+        );
+        assert_eq!(
+            sample(&tile0, 24, 8),
+            [
+                visual_marker::LUMA_LOW,
+                visual_marker::LUMA_LOW,
+                visual_marker::LUMA_LOW,
+                255,
+            ],
+            "bit 1 center should stamp low luma in tile 0"
+        );
+        assert_eq!(
+            sample(&tile0, 24, 24),
+            [
+                visual_marker::LUMA_HIGH,
+                visual_marker::LUMA_HIGH,
+                visual_marker::LUMA_HIGH,
+                255,
+            ],
+            "bit 9 center should stamp high luma in tile 0"
+        );
+
+        let mut tile1 = vec![0u8; tile_size * tile_size * 4];
+        stamp_visual_marker_bgra_tile(
+            &mut tile1,
+            tile::grid::TileId::new(1, 0),
+            TILE_STREAM_TILE_SIZE_PX,
+            1u32 << 4,
+        );
+        assert_eq!(
+            sample(&tile1, 8, 8),
+            [
+                visual_marker::LUMA_HIGH,
+                visual_marker::LUMA_HIGH,
+                visual_marker::LUMA_HIGH,
+                255,
+            ],
+            "bit 4 center should stamp high luma in tile 1"
+        );
+
+        let mut tile2 = vec![0u8; tile_size * tile_size * 4];
+        stamp_visual_marker_bgra_tile(
+            &mut tile2,
+            tile::grid::TileId::new(2, 0),
+            TILE_STREAM_TILE_SIZE_PX,
+            u32::MAX,
+        );
+        assert!(
+            tile2.iter().all(|&b| b == 0),
+            "tile outside marker bounds should remain untouched"
+        );
+    }
+
+    #[test]
+    fn session_registry_applies_pending_visual_marker_default_on_insert() {
+        let mut reg = SessionRegistry::new();
+        assert!(
+            !reg.set_diagnostics_visual_marker(7, true),
+            "setting marker before display exists should be recorded as pending"
+        );
+
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
+        let session = Arc::new(DisplaySession::new(7, backend));
+        assert!(
+            !session.diagnostics_visual_marker_enabled(),
+            "new sessions start with marker disabled before registry insertion"
+        );
+
+        reg.insert(7, Arc::clone(&session));
+        assert!(
+            session.diagnostics_visual_marker_enabled(),
+            "registry insertion should apply the pending marker default"
+        );
+
+        assert!(
+            reg.set_diagnostics_visual_marker(7, false),
+            "setting marker after display exists should update active session"
+        );
+        assert!(
+            !session.diagnostics_visual_marker_enabled(),
+            "active session should reflect updated marker default"
+        );
     }
 
     /// `DisplayBackend` that records whether `stop_capture` was called.
