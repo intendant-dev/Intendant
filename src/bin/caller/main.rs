@@ -7347,8 +7347,9 @@ async fn activate_user_display(
             display_id,
             backend: "wayland",
         });
+        const WAYLAND_PORTAL_APPROVAL_TIMEOUT_SECS: u64 = 300;
         match tokio::time::timeout(
-            std::time::Duration::from_secs(45),
+            std::time::Duration::from_secs(WAYLAND_PORTAL_APPROVAL_TIMEOUT_SECS),
             session.start(30, frame_registry.clone(), Some(bus.clone())),
         )
         .await
@@ -7367,7 +7368,8 @@ async fn activate_user_display(
             }
             Err(_) => {
                 eprintln!(
-                    "[user_display] Wayland portal timed out after 45s \
+                    "[user_display] Wayland portal timed out after \
+                     {WAYLAND_PORTAL_APPROVAL_TIMEOUT_SECS}s \
                      (screen-sharing dialog was not approved), trying X11"
                 );
             }
