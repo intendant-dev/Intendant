@@ -280,8 +280,16 @@ pub struct DisplayMetricsCounters {
     pub encode_frames: AtomicU64,
     /// I420 buffers dropped by try_send to the encoder thread.
     pub encode_drops: AtomicU64,
-    /// Cumulative encode latency in microseconds (capture-to-encoded-output).
-    pub encode_latency_us_sum: AtomicU64,
+    /// Cumulative time from frame arrival in the encoder queue to encoded
+    /// output, in microseconds. **NOT** a measure of encoder processing time
+    /// alone — includes the wait the frame did in the encoder's input queue
+    /// before it was picked up. On an idle Wayland desktop where the only
+    /// thing that fires the encoder is the 30-second periodic snapshot,
+    /// this can climb to 30+ seconds even though the actual encode pass
+    /// took milliseconds. Reported by `DisplayMetricsSnapshot` as
+    /// `encode_freshness_avg_ms`; the metric tells you how stale the
+    /// emitted frames are at output time, not how slow the encoder is.
+    pub encode_freshness_us_sum: AtomicU64,
 
     /// Total per-peer try_send failures in the fan-out task.
     ///
@@ -327,7 +335,7 @@ impl DisplayMetricsCounters {
             capture_drops: AtomicU64::new(0),
             encode_frames: AtomicU64::new(0),
             encode_drops: AtomicU64::new(0),
-            encode_latency_us_sum: AtomicU64::new(0),
+            encode_freshness_us_sum: AtomicU64::new(0),
             peer_drops: Arc::new(AtomicU64::new(0)),
             peer_count: AtomicU64::new(0),
             tile_damage_samples: AtomicU64::new(0),
@@ -393,7 +401,7 @@ pub struct DisplayMetricsSnapshot {
     pub capture_fps: f64,
     pub capture_drops: u64,
     pub encode_fps: f64,
-    pub encode_latency_avg_ms: f64,
+    pub encode_freshness_avg_ms: f64,
     pub encode_drops: u64,
     pub peer_count: u64,
     pub peer_drops: u64,
@@ -424,7 +432,7 @@ impl DisplayMetricsSnapshot {
         let capture_drops = counters.capture_drops.swap(0, Ordering::Relaxed);
         let encode_frames = counters.encode_frames.swap(0, Ordering::Relaxed);
         let encode_drops = counters.encode_drops.swap(0, Ordering::Relaxed);
-        let encode_latency_us = counters.encode_latency_us_sum.swap(0, Ordering::Relaxed);
+        let encode_freshness_us = counters.encode_freshness_us_sum.swap(0, Ordering::Relaxed);
         let peer_drops = counters.peer_drops.swap(0, Ordering::Relaxed);
         let peer_count = counters.peer_count.load(Ordering::Relaxed);
         let tile_damage_samples = counters.tile_damage_samples.swap(0, Ordering::Relaxed);
@@ -445,8 +453,8 @@ impl DisplayMetricsSnapshot {
 
         let elapsed_secs = elapsed.elapsed().as_secs_f64().max(0.001);
 
-        let encode_latency_avg_ms = if encode_frames > 0 {
-            (encode_latency_us as f64 / encode_frames as f64) / 1000.0
+        let encode_freshness_avg_ms = if encode_frames > 0 {
+            (encode_freshness_us as f64 / encode_frames as f64) / 1000.0
         } else {
             0.0
         };
@@ -461,7 +469,7 @@ impl DisplayMetricsSnapshot {
             capture_fps: capture_frames as f64 / elapsed_secs,
             capture_drops,
             encode_fps: encode_frames as f64 / elapsed_secs,
-            encode_latency_avg_ms,
+            encode_freshness_avg_ms,
             encode_drops,
             peer_count,
             peer_drops,
@@ -1380,7 +1388,7 @@ impl DisplaySession {
                         let m = session.metrics().await;
                         eprintln!(
                             "[display/metrics] id={} capture={:.1}fps encode={:.1}fps \
-                             drops=cap:{}/enc:{}/peer:{} peers={} latency_avg={:.1}ms res={}x{} \
+                             drops=cap:{}/enc:{}/peer:{} peers={} freshness_avg={:.1}ms res={}x{} \
                              tile=dirty:{}r/{}t/{:.3} delta={:.1}fps/{:.1}kbps/{}rec/skips:{} \
                              snap={}f/{:.1}kbps/{}rec",
                             m.display_id,
@@ -1390,7 +1398,7 @@ impl DisplaySession {
                             m.encode_drops,
                             m.peer_drops,
                             m.peer_count,
-                            m.encode_latency_avg_ms,
+                            m.encode_freshness_avg_ms,
                             m.resolution.0,
                             m.resolution.1,
                             m.tile_dirty_rects,
@@ -2979,7 +2987,7 @@ mod tests {
         assert_eq!(c.capture_drops.load(Ordering::Relaxed), 0);
         assert_eq!(c.encode_frames.load(Ordering::Relaxed), 0);
         assert_eq!(c.encode_drops.load(Ordering::Relaxed), 0);
-        assert_eq!(c.encode_latency_us_sum.load(Ordering::Relaxed), 0);
+        assert_eq!(c.encode_freshness_us_sum.load(Ordering::Relaxed), 0);
         assert_eq!(c.peer_drops.load(Ordering::Relaxed), 0);
         assert_eq!(c.peer_count.load(Ordering::Relaxed), 0);
     }
@@ -2994,7 +3002,7 @@ mod tests {
         c.encode_frames.store(140, Ordering::Relaxed);
         c.encode_drops.store(1, Ordering::Relaxed);
         // 140 frames * 5000us avg = 700_000us total
-        c.encode_latency_us_sum.store(700_000, Ordering::Relaxed);
+        c.encode_freshness_us_sum.store(700_000, Ordering::Relaxed);
         c.peer_drops.store(3, Ordering::Relaxed);
         c.peer_count.store(2, Ordering::Relaxed);
         c.record_tile_damage_sample(2, 5, 0.25);
@@ -3016,7 +3024,7 @@ mod tests {
         assert!((snap.encode_fps - 28.0).abs() < 1.0);
         assert_eq!(snap.encode_drops, 1);
         // 700_000us / 140 frames = 5000us = 5.0ms avg
-        assert!((snap.encode_latency_avg_ms - 5.0).abs() < 0.01);
+        assert!((snap.encode_freshness_avg_ms - 5.0).abs() < 0.01);
         assert_eq!(snap.peer_count, 2);
         assert_eq!(snap.peer_drops, 3);
         assert_eq!(snap.tile_damage_samples, 2);
@@ -3046,7 +3054,7 @@ mod tests {
         let snap = DisplayMetricsSnapshot::from_counters(&c, 0, (640, 480), &epoch);
         assert!((snap.capture_fps - 0.0).abs() < f64::EPSILON);
         assert!((snap.encode_fps - 0.0).abs() < f64::EPSILON);
-        assert!((snap.encode_latency_avg_ms - 0.0).abs() < f64::EPSILON);
+        assert!((snap.encode_freshness_avg_ms - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -3056,7 +3064,7 @@ mod tests {
             capture_fps: 30.0,
             capture_drops: 5,
             encode_fps: 28.5,
-            encode_latency_avg_ms: 4.2,
+            encode_freshness_avg_ms: 4.2,
             encode_drops: 2,
             peer_count: 1,
             peer_drops: 0,

@@ -16827,7 +16827,7 @@ function updateDisplayMetrics(d) {
       '<tbody>' +
       '<tr><td>Capture</td><td class="dm-value" id="' + sectionId + '-capture-fps">&mdash;</td><td class="dm-unit">fps</td></tr>' +
       '<tr><td>Encode</td><td class="dm-value" id="' + sectionId + '-encode-fps">&mdash;</td><td class="dm-unit">fps</td></tr>' +
-      '<tr><td>Encode latency</td><td class="dm-value" id="' + sectionId + '-encode-latency">&mdash;</td><td class="dm-unit">ms avg</td></tr>' +
+      '<tr><td>Encode freshness</td><td class="dm-value" id="' + sectionId + '-encode-freshness">&mdash;</td><td class="dm-unit">ms avg</td></tr>' +
       '<tr><td>Peers</td><td class="dm-value" id="' + sectionId + '-peer-count">&mdash;</td><td class="dm-unit"></td></tr>' +
       '<tr><td>Resolution</td><td class="dm-value" id="' + sectionId + '-resolution">&mdash;</td><td class="dm-unit"></td></tr>' +
       '<tr><td>Drops</td><td class="dm-value" id="' + sectionId + '-drops">&mdash;</td><td class="dm-unit">cap / enc / peer</td></tr>' +
@@ -16845,7 +16845,7 @@ function updateDisplayMetrics(d) {
   }
   document.getElementById(sectionId + '-capture-fps').textContent = d.capture_fps.toFixed(1);
   document.getElementById(sectionId + '-encode-fps').textContent = d.encode_fps.toFixed(1);
-  document.getElementById(sectionId + '-encode-latency').textContent = d.encode_latency_avg_ms.toFixed(1);
+  document.getElementById(sectionId + '-encode-freshness').textContent = d.encode_freshness_avg_ms.toFixed(1);
   document.getElementById(sectionId + '-peer-count').textContent = d.peer_count;
   document.getElementById(sectionId + '-resolution').textContent = d.resolution_width + '\u00d7' + d.resolution_height;
   document.getElementById(sectionId + '-drops').textContent = d.capture_drops + ' / ' + d.encode_drops + ' / ' + d.peer_drops;
