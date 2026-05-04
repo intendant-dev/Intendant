@@ -1093,12 +1093,16 @@ Representative transcripts:
 | 64px tiles + 15fps cadence | `dde93509-65c2-469a-8976-bcf17a3e8988` @ 75s | 83ms | 146ms | 2068ms | 9.87 | Fail |
 | 48px tiles experiment | `b4fc0921-385d-4287-8faa-b97ba0f7be8f` @ 75s | 83ms | 121ms | 2943ms | 10.30 | Fail |
 | 80px tiles experiment | `fa430e1e-3244-4c29-8737-d7612d26ce72` @ 75s | 83ms | 191ms | 2157ms | 9.06 | Fail |
+| 8-record source-side delta cap experiment | `074662c5-4e77-4a50-abff-c52f56ff3ae9` @ 80s | 221ms | 442ms | 1799ms | 4.21 | Fail |
 
 Tile-size tuning alone is not sufficient. Smaller tiles increase tile
 count and message overhead; larger tiles reduce record count but
-over-include more unchanged pixels and still hit backpressure. The next
-Wayland hardening slice should be byte/backpressure-aware, not another
-constant tweak. Candidate directions:
+over-include more unchanged pixels and still hit backpressure. A naive
+source-side record cap avoids the largest bursts but starves visible
+updates and the marker, dropping effective fps below the previous
+baseline. The next Wayland hardening slice should be
+byte/backpressure-aware, not another constant tweak. Candidate
+directions:
 
 - prioritize marker/cursor/control state separately from bulk dirty
   tiles so diagnostics and pointer feedback do not freeze under tile
