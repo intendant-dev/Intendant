@@ -292,6 +292,29 @@ pub struct DisplayMetricsCounters {
     /// Current number of connected WebRTC peers.
     pub peer_count: AtomicU64,
 
+    /// Tile-stream damage samples processed in the current metrics window.
+    pub tile_damage_samples: AtomicU64,
+    /// Total dirty rects reported by the damage source in the current window.
+    pub tile_dirty_rects: AtomicU64,
+    /// Total dirty tiles selected in the current window.
+    pub tile_dirty_tiles: AtomicU64,
+    /// Sum of dirty fractions in parts-per-million for averaging.
+    pub tile_dirty_fraction_ppm_sum: AtomicU64,
+    /// Dirty tile updates skipped by the source cadence cap.
+    pub tile_delta_cadence_skips: AtomicU64,
+    /// Tile records packed into delta frames.
+    pub tile_delta_records: AtomicU64,
+    /// Tile delta wire frames generated.
+    pub tile_delta_frames: AtomicU64,
+    /// Tile delta wire bytes generated.
+    pub tile_delta_bytes: AtomicU64,
+    /// Tile records packed into snapshot frames.
+    pub tile_snapshot_records: AtomicU64,
+    /// Tile snapshot wire frames generated.
+    pub tile_snapshot_frames: AtomicU64,
+    /// Tile snapshot wire bytes generated.
+    pub tile_snapshot_bytes: AtomicU64,
+
     /// Monotonic microsecond timestamp of the last metrics reset.
     pub epoch_us: AtomicU64,
 }
@@ -307,8 +330,58 @@ impl DisplayMetricsCounters {
             encode_latency_us_sum: AtomicU64::new(0),
             peer_drops: Arc::new(AtomicU64::new(0)),
             peer_count: AtomicU64::new(0),
+            tile_damage_samples: AtomicU64::new(0),
+            tile_dirty_rects: AtomicU64::new(0),
+            tile_dirty_tiles: AtomicU64::new(0),
+            tile_dirty_fraction_ppm_sum: AtomicU64::new(0),
+            tile_delta_cadence_skips: AtomicU64::new(0),
+            tile_delta_records: AtomicU64::new(0),
+            tile_delta_frames: AtomicU64::new(0),
+            tile_delta_bytes: AtomicU64::new(0),
+            tile_snapshot_records: AtomicU64::new(0),
+            tile_snapshot_frames: AtomicU64::new(0),
+            tile_snapshot_bytes: AtomicU64::new(0),
             epoch_us: AtomicU64::new(now_us),
         }
+    }
+
+    fn record_tile_damage_sample(
+        &self,
+        rect_count: usize,
+        tile_count: usize,
+        dirty_fraction: f32,
+    ) {
+        self.tile_damage_samples.fetch_add(1, Ordering::Relaxed);
+        self.tile_dirty_rects
+            .fetch_add(rect_count as u64, Ordering::Relaxed);
+        self.tile_dirty_tiles
+            .fetch_add(tile_count as u64, Ordering::Relaxed);
+        let ppm = (dirty_fraction.clamp(0.0, 1.0) * 1_000_000.0).round() as u64;
+        self.tile_dirty_fraction_ppm_sum
+            .fetch_add(ppm, Ordering::Relaxed);
+    }
+
+    fn record_tile_delta_cadence_skip(&self) {
+        self.tile_delta_cadence_skips
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_tile_delta_source(&self, records: usize, frames: usize, bytes: usize) {
+        self.tile_delta_records
+            .fetch_add(records as u64, Ordering::Relaxed);
+        self.tile_delta_frames
+            .fetch_add(frames as u64, Ordering::Relaxed);
+        self.tile_delta_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn record_tile_snapshot_source(&self, records: usize, frames: usize, bytes: usize) {
+        self.tile_snapshot_records
+            .fetch_add(records as u64, Ordering::Relaxed);
+        self.tile_snapshot_frames
+            .fetch_add(frames as u64, Ordering::Relaxed);
+        self.tile_snapshot_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 }
 
@@ -325,6 +398,17 @@ pub struct DisplayMetricsSnapshot {
     pub peer_count: u64,
     pub peer_drops: u64,
     pub resolution: (u32, u32),
+    pub tile_damage_samples: u64,
+    pub tile_dirty_rects: u64,
+    pub tile_dirty_tiles: u64,
+    pub tile_dirty_fraction_avg: f64,
+    pub tile_delta_cadence_skips: u64,
+    pub tile_delta_records: u64,
+    pub tile_delta_fps: f64,
+    pub tile_delta_kbps: f64,
+    pub tile_snapshot_records: u64,
+    pub tile_snapshot_frames: u64,
+    pub tile_snapshot_kbps: f64,
 }
 
 impl DisplayMetricsSnapshot {
@@ -343,11 +427,31 @@ impl DisplayMetricsSnapshot {
         let encode_latency_us = counters.encode_latency_us_sum.swap(0, Ordering::Relaxed);
         let peer_drops = counters.peer_drops.swap(0, Ordering::Relaxed);
         let peer_count = counters.peer_count.load(Ordering::Relaxed);
+        let tile_damage_samples = counters.tile_damage_samples.swap(0, Ordering::Relaxed);
+        let tile_dirty_rects = counters.tile_dirty_rects.swap(0, Ordering::Relaxed);
+        let tile_dirty_tiles = counters.tile_dirty_tiles.swap(0, Ordering::Relaxed);
+        let tile_dirty_fraction_ppm_sum = counters
+            .tile_dirty_fraction_ppm_sum
+            .swap(0, Ordering::Relaxed);
+        let tile_delta_cadence_skips =
+            counters.tile_delta_cadence_skips.swap(0, Ordering::Relaxed);
+        let tile_delta_records = counters.tile_delta_records.swap(0, Ordering::Relaxed);
+        let tile_delta_frames = counters.tile_delta_frames.swap(0, Ordering::Relaxed);
+        let tile_delta_bytes = counters.tile_delta_bytes.swap(0, Ordering::Relaxed);
+        let tile_snapshot_records =
+            counters.tile_snapshot_records.swap(0, Ordering::Relaxed);
+        let tile_snapshot_frames = counters.tile_snapshot_frames.swap(0, Ordering::Relaxed);
+        let tile_snapshot_bytes = counters.tile_snapshot_bytes.swap(0, Ordering::Relaxed);
 
         let elapsed_secs = elapsed.elapsed().as_secs_f64().max(0.001);
 
         let encode_latency_avg_ms = if encode_frames > 0 {
             (encode_latency_us as f64 / encode_frames as f64) / 1000.0
+        } else {
+            0.0
+        };
+        let tile_dirty_fraction_avg = if tile_damage_samples > 0 {
+            (tile_dirty_fraction_ppm_sum as f64 / tile_damage_samples as f64) / 1_000_000.0
         } else {
             0.0
         };
@@ -362,6 +466,17 @@ impl DisplayMetricsSnapshot {
             peer_count,
             peer_drops,
             resolution,
+            tile_damage_samples,
+            tile_dirty_rects,
+            tile_dirty_tiles,
+            tile_dirty_fraction_avg,
+            tile_delta_cadence_skips,
+            tile_delta_records,
+            tile_delta_fps: tile_delta_frames as f64 / elapsed_secs,
+            tile_delta_kbps: (tile_delta_bytes as f64 * 8.0) / elapsed_secs / 1000.0,
+            tile_snapshot_records,
+            tile_snapshot_frames,
+            tile_snapshot_kbps: (tile_snapshot_bytes as f64 * 8.0) / elapsed_secs / 1000.0,
         }
     }
 }
@@ -723,6 +838,7 @@ async fn send_tile_snapshot_to_peer(
     epoch: u32,
     snapshot_id: u32,
     visual_marker_value: Option<u32>,
+    counters: Arc<DisplayMetricsCounters>,
 ) {
     let Some(grid) = tile_grid_for_frame(&frame) else {
         return;
@@ -741,6 +857,7 @@ async fn send_tile_snapshot_to_peer(
         return;
     };
 
+    let record_count = records.len();
     let frames = match tile::transport::pack_snapshot_chunks(
         epoch,
         snapshot_id,
@@ -756,9 +873,12 @@ async fn send_tile_snapshot_to_peer(
         }
     };
 
+    let frame_count = frames.len();
+    let mut byte_count = 0usize;
     for frame in frames {
         match tile::transport::encode_frame(&frame) {
             Ok(bytes) => {
+                byte_count = byte_count.saturating_add(bytes.len());
                 if let Err(e) = peer.send_tile_snapshot_frame(bytes).await {
                     eprintln!("[display/tile] send snapshot failed: {e}");
                 }
@@ -766,6 +886,7 @@ async fn send_tile_snapshot_to_peer(
             Err(e) => eprintln!("[display/tile] snapshot wire encode failed: {e}"),
         }
     }
+    counters.record_tile_snapshot_source(record_count, frame_count, byte_count);
 }
 
 async fn send_tile_control_to_peers(
@@ -791,6 +912,7 @@ async fn send_latest_tile_snapshot_to_peer_id(
     tile_epoch: Arc<AtomicU32>,
     tile_snapshot_id: Arc<AtomicU32>,
     marker_flag: Arc<AtomicBool>,
+    counters: Arc<DisplayMetricsCounters>,
     session_epoch: Instant,
     peer_id: PeerId,
     context: &'static str,
@@ -807,7 +929,15 @@ async fn send_latest_tile_snapshot_to_peer_id(
     let epoch = tile_epoch.load(Ordering::Relaxed);
     let snapshot_id = tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
     let visual_marker_value = current_visual_marker_value(&marker_flag, session_epoch);
-    send_tile_snapshot_to_peer(peer, frame, epoch, snapshot_id, visual_marker_value).await;
+    send_tile_snapshot_to_peer(
+        peer,
+        frame,
+        epoch,
+        snapshot_id,
+        visual_marker_value,
+        counters,
+    )
+    .await;
 }
 
 async fn tile_subscriber_peer_handles(
@@ -1250,7 +1380,9 @@ impl DisplaySession {
                         let m = session.metrics().await;
                         eprintln!(
                             "[display/metrics] id={} capture={:.1}fps encode={:.1}fps \
-                             drops=cap:{}/enc:{}/peer:{} peers={} latency_avg={:.1}ms res={}x{}",
+                             drops=cap:{}/enc:{}/peer:{} peers={} latency_avg={:.1}ms res={}x{} \
+                             tile=dirty:{}r/{}t/{:.3} delta={:.1}fps/{:.1}kbps/{}rec/skips:{} \
+                             snap={}f/{:.1}kbps/{}rec",
                             m.display_id,
                             m.capture_fps,
                             m.encode_fps,
@@ -1261,6 +1393,16 @@ impl DisplaySession {
                             m.encode_latency_avg_ms,
                             m.resolution.0,
                             m.resolution.1,
+                            m.tile_dirty_rects,
+                            m.tile_dirty_tiles,
+                            m.tile_dirty_fraction_avg,
+                            m.tile_delta_fps,
+                            m.tile_delta_kbps,
+                            m.tile_delta_records,
+                            m.tile_delta_cadence_skips,
+                            m.tile_snapshot_frames,
+                            m.tile_snapshot_kbps,
+                            m.tile_snapshot_records,
                         );
                         if let Some(ref bus) = event_bus {
                             bus.send(crate::event::AppEvent::DisplayMetrics {
@@ -1336,7 +1478,15 @@ impl DisplaySession {
         let snapshot_id = self.tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
         let visual_marker_value =
             current_visual_marker_value(&self.diagnostics_visual_marker, self.session_epoch);
-        send_tile_snapshot_to_peer(peer, frame, epoch, snapshot_id, visual_marker_value).await;
+        send_tile_snapshot_to_peer(
+            peer,
+            frame,
+            epoch,
+            snapshot_id,
+            visual_marker_value,
+            Arc::clone(&self.counters),
+        )
+        .await;
     }
 
     /// D-3c: unregister a tile subscriber. Safe to call even when the
@@ -1353,6 +1503,7 @@ impl DisplaySession {
         let tile_snapshot_id = Arc::clone(&self.tile_snapshot_id);
         let tile_replay = Arc::clone(&self.tile_replay);
         let marker_flag = Arc::clone(&self.diagnostics_visual_marker);
+        let counters = Arc::clone(&self.counters);
         let session_epoch = self.session_epoch;
 
         Arc::new(move |msg| {
@@ -1363,6 +1514,7 @@ impl DisplaySession {
             let tile_snapshot_id = Arc::clone(&tile_snapshot_id);
             let tile_replay = Arc::clone(&tile_replay);
             let marker_flag = Arc::clone(&marker_flag);
+            let counters = Arc::clone(&counters);
 
             tokio::spawn(async move {
                 match msg {
@@ -1374,6 +1526,7 @@ impl DisplaySession {
                             tile_epoch,
                             tile_snapshot_id,
                             Arc::clone(&marker_flag),
+                            Arc::clone(&counters),
                             session_epoch,
                             peer_id,
                             "subscribe",
@@ -1387,6 +1540,7 @@ impl DisplaySession {
                             tile_epoch,
                             tile_snapshot_id,
                             Arc::clone(&marker_flag),
+                            Arc::clone(&counters),
                             session_epoch,
                             peer_id,
                             "snapshot-request",
@@ -1430,6 +1584,7 @@ impl DisplaySession {
                                     tile_epoch,
                                     tile_snapshot_id,
                                     Arc::clone(&marker_flag),
+                                    Arc::clone(&counters),
                                     session_epoch,
                                     peer_id,
                                     "gap-recovery",
@@ -1752,6 +1907,7 @@ impl DisplaySession {
         let tile_snapshot_id = Arc::clone(&self.tile_snapshot_id);
         let display_id = self.display_id;
         let marker_flag = Arc::clone(&self.diagnostics_visual_marker);
+        let counters = Arc::clone(&self.counters);
         let session_epoch = self.session_epoch;
         let (initial_w, initial_h) = self.backend.resolution();
         let backend_kind = self.backend.kind();
@@ -1822,6 +1978,7 @@ impl DisplaySession {
                                     epoch,
                                     snapshot_id,
                                     visual_marker_value,
+                                    Arc::clone(&counters),
                                 ).await;
                             }
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
@@ -1838,6 +1995,7 @@ impl DisplaySession {
                                     epoch,
                                     snapshot_id,
                                     visual_marker_value,
+                                    Arc::clone(&counters),
                                 ).await;
                             }
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
@@ -1922,6 +2080,7 @@ impl DisplaySession {
                                             epoch,
                                             snapshot_id,
                                             visual_marker_value,
+                                            Arc::clone(&counters),
                                         ).await;
                                     }
                                 }
@@ -1974,6 +2133,11 @@ impl DisplaySession {
                         if dirty.is_empty() {
                             continue;
                         }
+                        counters.record_tile_damage_sample(
+                            rects.len(),
+                            dirty.len(),
+                            next_grid.dirty_fraction(dirty.len()),
+                        );
 
                         let now = Instant::now();
                         if !should_emit_tile_delta(
@@ -1981,6 +2145,7 @@ impl DisplaySession {
                             last_delta_sent_at,
                             tile_delta_min_interval(),
                         ) {
+                            counters.record_tile_delta_cadence_skip();
                             continue;
                         }
                         last_delta_sent_at = Some(now);
@@ -1995,6 +2160,7 @@ impl DisplaySession {
                             eprintln!("[display/tile] update tile encode failed");
                             continue;
                         };
+                        let record_count = records.len();
 
                         let frames = match tile::transport::pack_tile_updates(epoch, seq, records) {
                             Ok(frames) => frames,
@@ -2006,16 +2172,22 @@ impl DisplaySession {
                         seq = seq.wrapping_add(frames.len() as u32);
 
                         let mut encoded = Vec::with_capacity(frames.len());
+                        let frame_count = frames.len();
+                        let mut byte_count = 0usize;
                         for frame in frames {
                             let frame_seq = match &frame {
                                 tile::transport::TileFrame::TileUpdate { seq, .. } => *seq,
                                 _ => continue,
                             };
                             match tile::transport::encode_frame(&frame) {
-                                Ok(bytes) => encoded.push((frame_seq, bytes)),
+                                Ok(bytes) => {
+                                    byte_count = byte_count.saturating_add(bytes.len());
+                                    encoded.push((frame_seq, bytes));
+                                }
                                 Err(e) => eprintln!("[display/tile] update wire encode failed: {e}"),
                             }
                         }
+                        counters.record_tile_delta_source(record_count, frame_count, byte_count);
                         {
                             let mut replay = tile_replay.write().await;
                             let now = Instant::now();
@@ -2825,6 +2997,11 @@ mod tests {
         c.encode_latency_us_sum.store(700_000, Ordering::Relaxed);
         c.peer_drops.store(3, Ordering::Relaxed);
         c.peer_count.store(2, Ordering::Relaxed);
+        c.record_tile_damage_sample(2, 5, 0.25);
+        c.record_tile_damage_sample(4, 7, 0.50);
+        c.record_tile_delta_cadence_skip();
+        c.record_tile_delta_source(12, 3, 15_000);
+        c.record_tile_snapshot_source(20, 4, 30_000);
 
         // Pretend the window started 5 seconds ago.
         let epoch = Instant::now() - std::time::Duration::from_secs(5);
@@ -2842,10 +3019,23 @@ mod tests {
         assert!((snap.encode_latency_avg_ms - 5.0).abs() < 0.01);
         assert_eq!(snap.peer_count, 2);
         assert_eq!(snap.peer_drops, 3);
+        assert_eq!(snap.tile_damage_samples, 2);
+        assert_eq!(snap.tile_dirty_rects, 6);
+        assert_eq!(snap.tile_dirty_tiles, 12);
+        assert!((snap.tile_dirty_fraction_avg - 0.375).abs() < 0.001);
+        assert_eq!(snap.tile_delta_cadence_skips, 1);
+        assert_eq!(snap.tile_delta_records, 12);
+        assert!((snap.tile_delta_fps - 0.6).abs() < 0.1);
+        assert!((snap.tile_delta_kbps - 24.0).abs() < 1.0);
+        assert_eq!(snap.tile_snapshot_records, 20);
+        assert_eq!(snap.tile_snapshot_frames, 4);
+        assert!((snap.tile_snapshot_kbps - 48.0).abs() < 1.0);
 
         // Counters should be reset after snapshot (except peer_count which is gauge).
         assert_eq!(c.capture_frames.load(Ordering::Relaxed), 0);
         assert_eq!(c.encode_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tile_delta_records.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tile_snapshot_records.load(Ordering::Relaxed), 0);
         assert_eq!(c.peer_count.load(Ordering::Relaxed), 2); // gauge, not reset
     }
 
@@ -2871,11 +3061,23 @@ mod tests {
             peer_count: 1,
             peer_drops: 0,
             resolution: (1920, 1080),
+            tile_damage_samples: 3,
+            tile_dirty_rects: 4,
+            tile_dirty_tiles: 5,
+            tile_dirty_fraction_avg: 0.25,
+            tile_delta_cadence_skips: 6,
+            tile_delta_records: 7,
+            tile_delta_fps: 8.0,
+            tile_delta_kbps: 9.0,
+            tile_snapshot_records: 10,
+            tile_snapshot_frames: 11,
+            tile_snapshot_kbps: 12.0,
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"display_id\":1"));
         assert!(json.contains("\"capture_fps\":30.0"));
         assert!(json.contains("\"encode_drops\":2"));
+        assert!(json.contains("\"tile_delta_records\":7"));
     }
 
     // -----------------------------------------------------------------------

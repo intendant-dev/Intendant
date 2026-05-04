@@ -1367,6 +1367,17 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             peer_drops: snapshot.peer_drops,
             resolution_width: snapshot.resolution.0,
             resolution_height: snapshot.resolution.1,
+            tile_damage_samples: snapshot.tile_damage_samples,
+            tile_dirty_rects: snapshot.tile_dirty_rects,
+            tile_dirty_tiles: snapshot.tile_dirty_tiles,
+            tile_dirty_fraction_avg: snapshot.tile_dirty_fraction_avg,
+            tile_delta_cadence_skips: snapshot.tile_delta_cadence_skips,
+            tile_delta_records: snapshot.tile_delta_records,
+            tile_delta_fps: snapshot.tile_delta_fps,
+            tile_delta_kbps: snapshot.tile_delta_kbps,
+            tile_snapshot_records: snapshot.tile_snapshot_records,
+            tile_snapshot_frames: snapshot.tile_snapshot_frames,
+            tile_snapshot_kbps: snapshot.tile_snapshot_kbps,
         }),
         AppEvent::DisplayCaptureLost { display_id, reason } => {
             Some(OutboundEvent::DisplayCaptureLost {

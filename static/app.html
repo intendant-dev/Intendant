@@ -16831,6 +16831,7 @@ function updateDisplayMetrics(d) {
       '<tr><td>Peers</td><td class="dm-value" id="' + sectionId + '-peer-count">&mdash;</td><td class="dm-unit"></td></tr>' +
       '<tr><td>Resolution</td><td class="dm-value" id="' + sectionId + '-resolution">&mdash;</td><td class="dm-unit"></td></tr>' +
       '<tr><td>Drops</td><td class="dm-value" id="' + sectionId + '-drops">&mdash;</td><td class="dm-unit">cap / enc / peer</td></tr>' +
+      '<tr><td>Tiles</td><td class="dm-value" id="' + sectionId + '-tiles">&mdash;</td><td class="dm-unit">dirty / delta / snap</td></tr>' +
       '</tbody>';
     section.appendChild(table);
     container.appendChild(section);
@@ -16848,6 +16849,12 @@ function updateDisplayMetrics(d) {
   document.getElementById(sectionId + '-peer-count').textContent = d.peer_count;
   document.getElementById(sectionId + '-resolution').textContent = d.resolution_width + '\u00d7' + d.resolution_height;
   document.getElementById(sectionId + '-drops').textContent = d.capture_drops + ' / ' + d.encode_drops + ' / ' + d.peer_drops;
+  const dirtyPct = ((d.tile_dirty_fraction_avg || 0) * 100).toFixed(1) + '%';
+  const deltaFps = (d.tile_delta_fps || 0).toFixed(1) + 'fps';
+  const deltaKbps = (d.tile_delta_kbps || 0).toFixed(0) + 'kbps';
+  const snapKbps = (d.tile_snapshot_kbps || 0).toFixed(0) + 'kbps';
+  document.getElementById(sectionId + '-tiles').textContent =
+    `${dirtyPct} (${d.tile_dirty_tiles || 0}t) / ${deltaFps} ${deltaKbps} / ${d.tile_snapshot_frames || 0}f ${snapKbps}`;
 }
 
 // ── User display access toggle ──
