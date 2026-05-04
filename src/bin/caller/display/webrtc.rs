@@ -4668,7 +4668,7 @@ mod tests {
     fn inject_relay_tcp_candidate_adds_line_after_first_existing() {
         use std::net::{Ipv4Addr, SocketAddr};
         let original = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=candidate:1 1 tcp 2113937151 10.0.0.1 8765 typ host tcptype passive\r\na=end-of-candidates\r\n";
-        let addr = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 197).into(), 8765);
+        let addr = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
         let rewritten = inject_relay_tcp_candidate(original, addr);
         assert!(
             rewritten.contains("a=candidate:1 1 tcp 2113937151 10.0.0.1 8765"),
@@ -4679,7 +4679,7 @@ mod tests {
             "injected relay candidate present (foundation 9001): {rewritten}"
         );
         assert!(
-            rewritten.contains("192.168.1.197 8765"),
+            rewritten.contains("192.168.1.42 8765"),
             "injected candidate carries primary address: {rewritten}"
         );
         assert!(

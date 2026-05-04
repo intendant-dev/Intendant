@@ -714,7 +714,7 @@ mod tests {
             capabilities: vec![],
             auth: AuthRequirements::none(),
         };
-        let browser_url = "ws://192.168.1.197:8766/ws".to_string();
+        let browser_url = "ws://192.168.1.42:8766/ws".to_string();
         let url_for_closure = ws_url.clone();
         let handle = spawn_peer(
             initial_card.id.clone(),

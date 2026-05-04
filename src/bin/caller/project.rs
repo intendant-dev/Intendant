@@ -612,7 +612,7 @@ pub struct PeerConfig {
     /// # Primary reaches the peer via this (loopback on the primary VM):
     /// # — via_urls are CLI / dashboard-add-time only; this config
     /// #   key is for the browser-side URL specifically.
-    /// browser_tcp_via_url = "ws://192.168.1.197:8766/ws"
+    /// browser_tcp_via_url = "ws://192.168.1.42:8766/ws"
     /// ```
     ///
     /// `None` (the default) means "use the primary-side via URL" —
@@ -852,7 +852,7 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                         "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
                     ],
                     browser_tcp_via_url: Some(
-                        "ws://192.168.1.197:8766/ws".into(),
+                        "ws://192.168.1.42:8766/ws".into(),
                     ),
                 },
             ],
@@ -890,7 +890,7 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
         );
         assert_eq!(
             parsed.peers[1].browser_tcp_via_url.as_deref(),
-            Some("ws://192.168.1.197:8766/ws"),
+            Some("ws://192.168.1.42:8766/ws"),
         );
     }
 

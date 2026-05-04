@@ -330,8 +330,9 @@ session** — H.264 should not spawn for federation; if it does see #71.
 H.264 over the federated path is currently broken end-to-end in the
 reference smoke topology. Diagnosed in #65 + #67:
 
-- Topology: browser → host coturn at `192.168.1.197:3478` → Debian
-  UTM peer at `192.168.65.2:8765`, all on one MacBook. Per-packet
+- Topology: browser → host coturn at `<jump-host-lan-ip>:3478`
+  (`192.168.1.223` in the current lab) → Debian UTM peer at
+  `192.168.65.2:8765`, all on one MacBook. Per-packet
   loss measured at 13–22% on this purely-local path (anomalous;
   pending investigation in #69 — likely virtio-net config / coturn
   buffer / MTU).
@@ -680,7 +681,7 @@ echo "marker holder pid=$!"
 # `[ws] ControlMsg: "SetDiagnosticsVisualMarker { ... enabled: true }"`
 # line; the inline web_gateway handler also eprintln's
 # `[web_gateway] phase-0 visual marker for display 0 = true`).
-ssh user@192.168.1.197 'ssh vm@192.168.65.2 "tail -5 /tmp/intendant.out"'
+ssh user@<jump-host-lan-ip> 'ssh vm@192.168.65.2 "tail -5 /tmp/intendant.out"'
 ```
 
 Then in the dashboard:
@@ -1035,7 +1036,13 @@ canvas rendering, and the visual-freshness sampler on the canvas path.
 Setup used for the May 3 Wayland runs:
 
 - Wayland peer: `user@192.168.64.2`, reached through
-  `ssh -J user@192.168.1.197`.
+  `ssh -J user@<jump-host-lan-ip>` (`192.168.1.223` in the current
+  lab).
+- TURN must match the jump-host LAN address in both places before the
+  smoke starts: primary `[webrtc].ice_servers` should serve
+  `turn:<jump-host-lan-ip>:3478?transport=tcp`, and host coturn should
+  have `external-ip=<jump-host-lan-ip>` plus
+  `relay-ip=<jump-host-lan-ip>`.
 - Peer daemon launched inside the graphical session:
   `XDG_RUNTIME_DIR=/run/user/1000`, `WAYLAND_DISPLAY=wayland-0`,
   `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus`,
@@ -1055,7 +1062,7 @@ python3 /tmp/wayland-grant-marker.py
 # Then open Settings -> Network -> View display on the primary.
 
 # Drive terminal/content motion in the Wayland session.
-ssh -J user@192.168.1.197 user@192.168.64.2 'bash -lc '"'"'
+ssh -J user@<jump-host-lan-ip> user@192.168.64.2 'bash -lc '"'"'
 export XDG_RUNTIME_DIR=/run/user/1000
 export WAYLAND_DISPLAY=wayland-0
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
