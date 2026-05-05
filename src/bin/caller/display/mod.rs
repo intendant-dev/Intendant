@@ -568,6 +568,10 @@ pub struct DisplaySession {
     /// channels yet, so subscribers are registered explicitly by the
     /// federated offer path instead of inferred from `peers`.
     tile_subscribers: Arc<RwLock<HashSet<PeerId>>>,
+    /// True only while the tile transport has intentionally switched
+    /// back to video fallback. When false, federated peers with an open
+    /// tile-deltas channel should not keep software VP8 encoders awake.
+    tile_video_fallback_active: Arc<AtomicBool>,
     /// D-3c: capture-damage-to-tile bridge task. Sends initial
     /// snapshots and XDamage-driven tile updates to `tile_subscribers`
     /// over WebRTC data channels while leaving the VP8 video track alive
@@ -1022,6 +1026,7 @@ impl DisplaySession {
             pool: std::sync::OnceLock::new(),
             pool_feed_bridge_handle: Mutex::new(None),
             tile_subscribers: Arc::new(RwLock::new(HashSet::new())),
+            tile_video_fallback_active: Arc::new(AtomicBool::new(false)),
             tile_stream_handle: Mutex::new(None),
             tile_replay: Arc::new(RwLock::new(tile::recovery::TileUpdateReplayBuffer::new())),
             tile_epoch: Arc::new(AtomicU32::new(1)),
@@ -1301,11 +1306,19 @@ impl DisplaySession {
                 }
             }
         });
+        let tile_video_fallback_active = Arc::clone(&self.tile_video_fallback_active);
+        let video_demand_suppressed: Box<
+            dyn Fn(&webrtc::WebRtcPeer) -> bool + Send + Sync,
+        > = Box::new(move |peer| {
+            peer.tile_delta_channel_open()
+                && !tile_video_fallback_active.load(Ordering::SeqCst)
+        });
         let layer_policy_task = aggregator::spawn_layer_policy_coordinator(
             Arc::clone(&self.peers),
             get_current_rids,
             is_layer_paused,
             on_action,
+            video_demand_suppressed,
             aggregator::CapacityPolicyConfig::default(),
             self.shutdown.clone(),
         );
@@ -1959,6 +1972,7 @@ impl DisplaySession {
         let session_epoch = self.session_epoch;
         let (initial_w, initial_h) = self.backend.resolution();
         let backend_kind = self.backend.kind();
+        let tile_video_fallback_active = Arc::clone(&self.tile_video_fallback_active);
 
         let task = tokio::spawn(async move {
             let mut damage = make_damage_backend(initial_w, initial_h, backend_kind);
@@ -1994,6 +2008,7 @@ impl DisplaySession {
                             grid = Some(next_grid);
                             tile_policy = tile::policy::TilePolicy::new(Instant::now());
                             tile_mode = tile::policy::TileMode::Tiles;
+                            tile_video_fallback_active.store(false, Ordering::SeqCst);
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             last_delta_sent_at = None;
                             pending_dirty_tiles.clear();
@@ -2010,6 +2025,7 @@ impl DisplaySession {
                             grid = Some(next_grid);
                             tile_policy = tile::policy::TilePolicy::new(Instant::now());
                             tile_mode = tile::policy::TileMode::Tiles;
+                            tile_video_fallback_active.store(false, Ordering::SeqCst);
                             last_delta_sent_at = None;
                             pending_dirty_tiles.clear();
                             synthetic_dirty.reset_cursor();
@@ -2116,6 +2132,7 @@ impl DisplaySession {
                             pending_dirty_tiles.clear();
                             match tile_mode {
                                 tile::policy::TileMode::Video => {
+                                    tile_video_fallback_active.store(true, Ordering::SeqCst);
                                     eprintln!(
                                         "[display/tile] display {display_id} fallback_to_video \
                                          dirty_fraction={dirty_fraction:.3}"
@@ -2130,6 +2147,7 @@ impl DisplaySession {
                                     ).await;
                                 }
                                 tile::policy::TileMode::Tiles => {
+                                    tile_video_fallback_active.store(false, Ordering::SeqCst);
                                     eprintln!(
                                         "[display/tile] display {display_id} fallback_to_tile \
                                          dirty_fraction={dirty_fraction:.3}"

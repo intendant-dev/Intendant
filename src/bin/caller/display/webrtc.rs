@@ -724,6 +724,10 @@ pub struct WebRtcPeer {
     /// encoding while every federated tile subscriber is already
     /// throttled and would drop supersedable deltas anyway.
     tile_delta_throttled: Arc<AtomicBool>,
+    /// Source-side visibility into whether the browser's tile-deltas
+    /// data channel is open. While this is true, the tile stream can
+    /// satisfy the peer without also running a video encoder.
+    tile_delta_channel_open: Arc<AtomicBool>,
     shutdown: CancellationToken,
 }
 
@@ -916,6 +920,10 @@ impl WebRtcPeer {
         self.tile_delta_throttled.load(Ordering::SeqCst)
     }
 
+    pub fn tile_delta_channel_open(&self) -> bool {
+        self.tile_delta_channel_open.load(Ordering::SeqCst)
+    }
+
     /// Test-only: construct a `WebRtcPeer` with just `active_rids`
     /// populated and dummy values for everything else. The dummy
     /// channels are constructed but their senders are dropped so
@@ -952,6 +960,7 @@ impl WebRtcPeer {
             twcc_health_rx,
             active_rids,
             tile_delta_throttled: Arc::new(AtomicBool::new(false)),
+            tile_delta_channel_open: Arc::new(AtomicBool::new(false)),
             shutdown: CancellationToken::new(),
         }
     }
@@ -1996,6 +2005,7 @@ impl WebRtcPeer {
         let (twcc_health_tx, twcc_health_rx) =
             watch::channel::<Option<crate::display::twcc_tap::TwccHealth>>(None);
         let tile_delta_throttled = Arc::new(AtomicBool::new(false));
+        let tile_delta_channel_open = Arc::new(AtomicBool::new(false));
         let shutdown = CancellationToken::new();
         // Aggregator task drains `twcc_tap_rx` and publishes one
         // `TwccHealth` per second. Exits on `shutdown.cancelled()`,
@@ -2030,6 +2040,7 @@ impl WebRtcPeer {
             encoded_frame_rx,
             command_rx,
             Arc::clone(&tile_delta_throttled),
+            Arc::clone(&tile_delta_channel_open),
             input_handler,
             clipboard_handler,
             authority_handler,
@@ -2049,6 +2060,7 @@ impl WebRtcPeer {
                 twcc_health_rx,
                 active_rids: active_rids.to_vec(),
                 tile_delta_throttled,
+                tile_delta_channel_open,
                 shutdown,
             },
             encoded_frame_tx,
@@ -2523,6 +2535,9 @@ struct DriverState {
     /// from `tile_delta_backpressure` transitions so the source can
     /// coalesce rather than encode deltas that the driver would drop.
     tile_delta_throttled: Arc<AtomicBool>,
+    /// Shared read-only hint for layer policy. Set while the browser's
+    /// supersedable tile-delta channel is open.
+    tile_delta_channel_open: Arc<AtomicBool>,
     /// Wallclock anchor: Instant at which the first frame was emitted.
     /// All subsequent rtp_time values are relative to this.
     first_frame_at: Option<Instant>,
@@ -2590,6 +2605,7 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
     mut frame_rx: mpsc::Receiver<OutboundEncodedFrame>,
     mut command_rx: mpsc::Receiver<Command>,
     tile_delta_throttled: Arc<AtomicBool>,
+    tile_delta_channel_open: Arc<AtomicBool>,
     input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
     authority_handler: AuthorityChannelHandler,
@@ -2652,6 +2668,7 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
         pending_tile_snapshot: Vec::new(),
         tile_delta_backpressure: TileDeltaBackpressure::new(),
         tile_delta_throttled,
+        tile_delta_channel_open,
         first_frame_at: None,
         rtp: RtpSendState {
             sender_id: rtp_config.sender_id,
@@ -3134,6 +3151,9 @@ fn handle_event<I: rtc::interceptor::Interceptor>(
                 state
                     .tile_delta_throttled
                     .store(false, Ordering::SeqCst);
+                state
+                    .tile_delta_channel_open
+                    .store(true, Ordering::SeqCst);
                 if let Some(mut channel) = rtc.data_channel(cid) {
                     let cfg = state.tile_delta_backpressure.config();
                     channel.set_buffered_amount_high_threshold(
@@ -3184,6 +3204,9 @@ fn handle_event<I: rtc::interceptor::Interceptor>(
                 state.tile_delta_backpressure.reset();
                 state
                     .tile_delta_throttled
+                    .store(false, Ordering::SeqCst);
+                state
+                    .tile_delta_channel_open
                     .store(false, Ordering::SeqCst);
             }
         }

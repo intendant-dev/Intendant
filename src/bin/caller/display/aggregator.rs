@@ -879,6 +879,11 @@ pub fn compose_effective_wanted(
 /// `on_action` applies the requested side effect, mapping to
 /// `pool.pause_layer` / `pool.resume_layer` with `CodecKind::Vp8`.
 ///
+/// `video_demand_suppressed` returns true for peers whose video RIDs
+/// should not count toward the demanded/pinned layer sets for this
+/// tick. Production uses this for federated tile viewers while the
+/// tile stream is active, so the software video encoder can sleep.
+///
 /// `config` is shared across the aggregate-TWCC and per-RID-RR
 /// policies — both use the same threshold/debounce constants
 /// (default 0.05 / 0.02 / 5 s drop / 1 s restore).
@@ -889,6 +894,7 @@ pub fn spawn_layer_policy_coordinator(
     get_current_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync>,
     is_layer_paused: Box<dyn Fn(&SimulcastRid) -> Option<bool> + Send + Sync>,
     on_action: Box<dyn Fn(CapacityAction) + Send + Sync>,
+    video_demand_suppressed: Box<dyn Fn(&WebRtcPeer) -> bool + Send + Sync>,
     config: CapacityPolicyConfig,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
@@ -981,17 +987,18 @@ pub fn spawn_layer_policy_coordinator(
                     // they have the floor as fallback. Computed before
                     // `drop(current_peers)` so we don't re-acquire the
                     // peers lock just to read this.
-                    let pinned_layers: HashSet<SimulcastRid> = current_peers
-                        .values()
-                        .filter_map(|peer| {
-                            let rids = peer.active_rids();
-                            if rids.len() == 1 {
-                                Some(rids[0].clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
+                    let mut pinned_layers: HashSet<SimulcastRid> = HashSet::new();
+                    let mut demanded_layers: HashSet<SimulcastRid> = HashSet::new();
+                    for peer in current_peers.values() {
+                        if video_demand_suppressed(peer.as_ref()) {
+                            continue;
+                        }
+                        let rids = peer.active_rids();
+                        if rids.len() == 1 {
+                            pinned_layers.insert(rids[0].clone());
+                        }
+                        demanded_layers.extend(rids.iter().cloned());
+                    }
                     // #48: per-tick demanded-layer set (union of every
                     // live peer's negotiated active_rids). The
                     // composer uses this as a hard upper bound on the
@@ -1001,10 +1008,6 @@ pub fn spawn_layer_policy_coordinator(
                     // walk peers once per tick. Zero peers ⇒ empty
                     // demand ⇒ effective collapses to empty (encoders
                     // pause immediately).
-                    let demanded_layers: HashSet<SimulcastRid> = current_peers
-                        .values()
-                        .flat_map(|peer| peer.active_rids().iter().cloned())
-                        .collect();
                     drop(current_peers);
 
                     // ---- Refresh current_rids; derive floor + upper ----
@@ -2150,6 +2153,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compose_empty_demand_strips_single_rid_pin() {
+        let current = vp8_three_layer_set();
+        let twcc_union = full_three_layer_union();
+        let rr_union = full_three_layer_union();
+        let pinned_layers: HashSet<SimulcastRid> =
+            [SimulcastRid::quarter()].into_iter().collect();
+        let demanded_layers = HashSet::new();
+
+        let effective = compose_effective_wanted(
+            true,
+            &twcc_union,
+            &rr_union,
+            &current,
+            &pinned_layers,
+            &demanded_layers,
+        );
+
+        assert!(
+            effective.is_empty(),
+            "tile-suppressed peers contribute no video demand; \
+             demanded bound must still win over the single-rid pin"
+        );
+    }
+
     /// User-listed test #3: peer returns after idle → effective
     /// wanted resumes per fresh-default policy state, not stale.
     ///
@@ -2622,6 +2650,7 @@ mod tests {
             get_current_rids,
             is_layer_paused,
             on_action,
+            Box::new(|_| false),
             CapacityPolicyConfig::default(),
             shutdown.clone(),
         );
