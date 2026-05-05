@@ -26,6 +26,19 @@ pub struct TileSource<'a> {
     pub tile_size_px: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileEncodeOptions {
+    pub allow_webp_lossless: bool,
+}
+
+impl Default for TileEncodeOptions {
+    fn default() -> Self {
+        Self {
+            allow_webp_lossless: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TileEncodeError {
     InvalidGeometry,
@@ -49,15 +62,32 @@ impl std::error::Error for TileEncodeError {}
 /// full tile with opaque black pixels so the browser compositor can
 /// treat every payload as `tile_size_px * tile_size_px`.
 pub fn encode_tile(src: &TileSource<'_>, tile: TileId) -> Result<TileRecord, TileEncodeError> {
+    encode_tile_with_options(src, tile, TileEncodeOptions::default())
+}
+
+pub fn encode_tile_with_options(
+    src: &TileSource<'_>,
+    tile: TileId,
+    options: TileEncodeOptions,
+) -> Result<TileRecord, TileEncodeError> {
     validate_source(src)?;
     let raw = raw_bgra_tile(src, tile)?;
-    encode_raw_bgra_payload(tile, raw, src.tile_size_px)
+    encode_raw_bgra_payload_with_options(tile, raw, src.tile_size_px, options)
 }
 
 pub fn encode_raw_bgra_payload(
     tile: TileId,
     raw: Vec<u8>,
     tile_size_px: u16,
+) -> Result<TileRecord, TileEncodeError> {
+    encode_raw_bgra_payload_with_options(tile, raw, tile_size_px, TileEncodeOptions::default())
+}
+
+pub fn encode_raw_bgra_payload_with_options(
+    tile: TileId,
+    raw: Vec<u8>,
+    tile_size_px: u16,
+    options: TileEncodeOptions,
 ) -> Result<TileRecord, TileEncodeError> {
     let expected = tile_size_px as usize * tile_size_px as usize * 4;
     if tile_size_px == 0 || raw.len() != expected {
@@ -71,7 +101,7 @@ pub fn encode_raw_bgra_payload(
         (TileEncoding::RawBgra, raw.clone())
     };
 
-    if should_try_webp_lossless(payload.len(), raw.len()) {
+    if options.allow_webp_lossless && should_try_webp_lossless(payload.len(), raw.len()) {
         match webp_lossless_bgra(&raw, tile_size_px as u32, tile_size_px as u32) {
             Ok(webp) if webp.len() < payload.len() => {
                 encoding = TileEncoding::WebpLossless;
@@ -318,6 +348,38 @@ mod tests {
         let rec = encode_tile(&src, TileId::new(0, 0)).unwrap();
         assert_eq!(rec.encoding, TileEncoding::WebpLossless);
         assert!(rec.payload.len() < data.len());
+    }
+
+    #[test]
+    fn encode_tile_options_can_disable_webp_lossless() {
+        let tile_size = 64u16;
+        let mut data = Vec::with_capacity(tile_size as usize * tile_size as usize * 4);
+        for y in 0..tile_size {
+            for x in 0..tile_size {
+                data.extend_from_slice(&[
+                    ((x as u32 * 3 + y as u32 * 5) % 256) as u8,
+                    ((x as u32 * 7 + y as u32 * 2) % 256) as u8,
+                    ((x as u32 + y as u32 * 11) % 256) as u8,
+                    255,
+                ]);
+            }
+        }
+        let src = bgra_src(
+            &data,
+            tile_size as u32,
+            tile_size as u32,
+            tile_size as u32 * 4,
+            tile_size,
+        );
+        let rec = encode_tile_with_options(
+            &src,
+            TileId::new(0, 0),
+            TileEncodeOptions {
+                allow_webp_lossless: false,
+            },
+        )
+        .unwrap();
+        assert_ne!(rec.encoding, TileEncoding::WebpLossless);
     }
 
     #[test]

@@ -745,16 +745,22 @@ fn run_pipewire_capture(
         )
         .expect("pipewire stream connect");
 
-    // Idle callback: check shutdown flag periodically.
+    // Timer callback: check shutdown periodically without keeping the
+    // PipeWire loop permanently runnable. A continuously-enabled idle
+    // source spins when the compositor is quiet and burns a core.
     let shutdown_check = shutdown.clone();
     let mainloop_weak = mainloop.downgrade();
-    let _idle = mainloop.loop_().add_idle(true, move || {
+    let shutdown_timer = mainloop.loop_().add_timer(move |_| {
         if shutdown_check.load(Ordering::SeqCst) {
             if let Some(ml) = mainloop_weak.upgrade() {
                 ml.quit();
             }
         }
     });
+    let _ = shutdown_timer.update_timer(
+        Some(std::time::Duration::from_millis(100)),
+        Some(std::time::Duration::from_millis(100)),
+    );
 
     // Run until shutdown or error.
     mainloop.run();

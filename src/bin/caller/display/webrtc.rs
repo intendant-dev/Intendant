@@ -81,7 +81,7 @@ use rtc::sansio::Protocol as RtcProtocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -718,6 +718,12 @@ pub struct WebRtcPeer {
     /// `active_rids` snapshot is always in lockstep with the
     /// negotiated answer SDP.
     active_rids: Vec<SimulcastRid>,
+    /// Source-side visibility into the driver's tile-delta SCTP
+    /// backpressure state. The driver owns the actual send/drop policy;
+    /// this atomic lets the display tile source avoid expensive delta
+    /// encoding while every federated tile subscriber is already
+    /// throttled and would drop supersedable deltas anyway.
+    tile_delta_throttled: Arc<AtomicBool>,
     shutdown: CancellationToken,
 }
 
@@ -901,6 +907,15 @@ impl WebRtcPeer {
         &self.active_rids
     }
 
+    /// Returns true while the browser's `tile-deltas` data channel is
+    /// above its high-watermark and has not yet drained below the low
+    /// watermark. Source-side producers use this as an optimization
+    /// hint only; the WebRTC driver remains authoritative and still
+    /// drops supersedable deltas if a race occurs.
+    pub fn tile_delta_throttled(&self) -> bool {
+        self.tile_delta_throttled.load(Ordering::SeqCst)
+    }
+
     /// Test-only: construct a `WebRtcPeer` with just `active_rids`
     /// populated and dummy values for everything else. The dummy
     /// channels are constructed but their senders are dropped so
@@ -936,8 +951,15 @@ impl WebRtcPeer {
             remote_inbound_health_rx,
             twcc_health_rx,
             active_rids,
+            tile_delta_throttled: Arc::new(AtomicBool::new(false)),
             shutdown: CancellationToken::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_tile_delta_throttled_for_test(&self, throttled: bool) {
+        self.tile_delta_throttled
+            .store(throttled, Ordering::SeqCst);
     }
 
     /// **Phase 4d.3b**: subscribe to this peer's aggregate TWCC
@@ -1973,6 +1995,7 @@ impl WebRtcPeer {
         // [`WebRtcPeer::subscribe_twcc_health`].
         let (twcc_health_tx, twcc_health_rx) =
             watch::channel::<Option<crate::display::twcc_tap::TwccHealth>>(None);
+        let tile_delta_throttled = Arc::new(AtomicBool::new(false));
         let shutdown = CancellationToken::new();
         // Aggregator task drains `twcc_tap_rx` and publishes one
         // `TwccHealth` per second. Exits on `shutdown.cancelled()`,
@@ -2006,6 +2029,7 @@ impl WebRtcPeer {
             peer_registration,
             encoded_frame_rx,
             command_rx,
+            Arc::clone(&tile_delta_throttled),
             input_handler,
             clipboard_handler,
             authority_handler,
@@ -2024,6 +2048,7 @@ impl WebRtcPeer {
                 remote_inbound_health_rx,
                 twcc_health_rx,
                 active_rids: active_rids.to_vec(),
+                tile_delta_throttled,
                 shutdown,
             },
             encoded_frame_tx,
@@ -2494,6 +2519,10 @@ struct DriverState {
     /// `tile-deltas` channel. Control and snapshot channels are
     /// reliable and never use this drop policy.
     tile_delta_backpressure: TileDeltaBackpressure,
+    /// Shared read-only hint for source-side tile production. Mirrored
+    /// from `tile_delta_backpressure` transitions so the source can
+    /// coalesce rather than encode deltas that the driver would drop.
+    tile_delta_throttled: Arc<AtomicBool>,
     /// Wallclock anchor: Instant at which the first frame was emitted.
     /// All subsequent rtp_time values are relative to this.
     first_frame_at: Option<Instant>,
@@ -2560,6 +2589,7 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
     _tcp_registration: Option<PeerRegistration>,
     mut frame_rx: mpsc::Receiver<OutboundEncodedFrame>,
     mut command_rx: mpsc::Receiver<Command>,
+    tile_delta_throttled: Arc<AtomicBool>,
     input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
     authority_handler: AuthorityChannelHandler,
@@ -2621,6 +2651,7 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
         pending_tile_control: Vec::new(),
         pending_tile_snapshot: Vec::new(),
         tile_delta_backpressure: TileDeltaBackpressure::new(),
+        tile_delta_throttled,
         first_frame_at: None,
         rtp: RtpSendState {
             sender_id: rtp_config.sender_id,
@@ -3100,6 +3131,9 @@ fn handle_event<I: rtc::interceptor::Interceptor>(
             state.channels.insert(label.clone(), cid);
             if label == TILE_DELTAS_CHANNEL_LABEL {
                 state.tile_delta_backpressure.reset();
+                state
+                    .tile_delta_throttled
+                    .store(false, Ordering::SeqCst);
                 if let Some(mut channel) = rtc.data_channel(cid) {
                     let cfg = state.tile_delta_backpressure.config();
                     channel.set_buffered_amount_high_threshold(
@@ -3148,6 +3182,9 @@ fn handle_event<I: rtc::interceptor::Interceptor>(
             state.channels.retain(|_, v| *v != cid);
             if was_tile_deltas {
                 state.tile_delta_backpressure.reset();
+                state
+                    .tile_delta_throttled
+                    .store(false, Ordering::SeqCst);
             }
         }
         RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountHigh(
@@ -3158,6 +3195,9 @@ fn handle_event<I: rtc::interceptor::Interceptor>(
                     .tile_delta_backpressure
                     .on_buffered_amount_high()
             {
+                state
+                    .tile_delta_throttled
+                    .store(true, Ordering::SeqCst);
                 let stats = state.tile_delta_backpressure.stats();
                 eprintln!(
                     "[display/webrtc] tile-deltas backpressure high: \
@@ -3172,6 +3212,9 @@ fn handle_event<I: rtc::interceptor::Interceptor>(
             if state.channels.get(TILE_DELTAS_CHANNEL_LABEL).copied() == Some(cid)
                 && state.tile_delta_backpressure.on_buffered_amount_low()
             {
+                state
+                    .tile_delta_throttled
+                    .store(false, Ordering::SeqCst);
                 let stats = state.tile_delta_backpressure.stats();
                 eprintln!(
                     "[display/webrtc] tile-deltas backpressure low: \

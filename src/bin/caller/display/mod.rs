@@ -19,7 +19,7 @@
 //! - Per-peer encoded frame queue: `mpsc(8)`, encoder drops via `try_send`.
 //! - `latest_frame`: always overwritten, latest-wins.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -654,9 +654,39 @@ fn convert_for_pool_feed(
 
 const TILE_STREAM_TILE_SIZE_PX: u16 = 64;
 const TILE_DELTA_TARGET_FPS: u32 = 15;
+const TILE_DELTA_FRAME_DIFF_TARGET_FPS: u32 = 8;
 
 fn tile_delta_min_interval() -> Duration {
     Duration::from_millis(1_000 / TILE_DELTA_TARGET_FPS as u64)
+}
+
+fn tile_delta_min_interval_for_damage(capability: capture::damage::DamageCapability) -> Duration {
+    match capability {
+        capture::damage::DamageCapability::OsLevel => tile_delta_min_interval(),
+        capture::damage::DamageCapability::FrameDiff
+        | capture::damage::DamageCapability::None => {
+            Duration::from_millis(1_000 / TILE_DELTA_FRAME_DIFF_TARGET_FPS as u64)
+        }
+    }
+}
+
+fn tile_delta_encode_options_for_damage(
+    capability: capture::damage::DamageCapability,
+) -> tile::encode::TileEncodeOptions {
+    match capability {
+        capture::damage::DamageCapability::OsLevel => tile::encode::TileEncodeOptions::default(),
+        capture::damage::DamageCapability::FrameDiff
+        | capture::damage::DamageCapability::None => tile::encode::TileEncodeOptions {
+            allow_webp_lossless: false,
+        },
+    }
+}
+
+fn damage_uses_frame_diff(capability: capture::damage::DamageCapability) -> bool {
+    matches!(
+        capability,
+        capture::damage::DamageCapability::FrameDiff | capture::damage::DamageCapability::None
+    )
 }
 
 fn should_emit_tile_delta(
@@ -703,6 +733,20 @@ fn encode_tile_records(
     tiles: Vec<tile::grid::TileId>,
     visual_marker_value: Option<u32>,
 ) -> Result<Vec<tile::transport::TileRecord>, tile::encode::TileEncodeError> {
+    encode_tile_records_with_options(
+        frame,
+        tiles,
+        visual_marker_value,
+        tile::encode::TileEncodeOptions::default(),
+    )
+}
+
+fn encode_tile_records_with_options(
+    frame: &Frame,
+    tiles: Vec<tile::grid::TileId>,
+    visual_marker_value: Option<u32>,
+    options: tile::encode::TileEncodeOptions,
+) -> Result<Vec<tile::transport::TileRecord>, tile::encode::TileEncodeError> {
     let src = tile::encode::TileSource {
         data: &frame.data,
         width: frame.width,
@@ -718,7 +762,7 @@ fn encode_tile_records(
             if let Some(value) = visual_marker_value {
                 stamp_visual_marker_bgra_tile(&mut raw, tile, src.tile_size_px, value);
             }
-            tile::encode::encode_raw_bgra_payload(tile, raw, src.tile_size_px)
+            tile::encode::encode_raw_bgra_payload_with_options(tile, raw, src.tile_size_px, options)
         })
         .collect()
 }
@@ -952,6 +996,10 @@ async fn tile_subscriber_peer_handles(
     ids.into_iter()
         .filter_map(|id| peers.get(&id).cloned())
         .collect()
+}
+
+fn all_tile_delta_peers_throttled(peers: &[Arc<webrtc::WebRtcPeer>]) -> bool {
+    !peers.is_empty() && peers.iter().all(|peer| peer.tile_delta_throttled())
 }
 
 impl DisplaySession {
@@ -1925,6 +1973,7 @@ impl DisplaySession {
             let mut next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
             let mut last_delta_sent_at: Option<Instant> = None;
             let mut seq: u32 = 1;
+            let mut pending_dirty_tiles: BTreeSet<tile::grid::TileId> = BTreeSet::new();
 
             loop {
                 tokio::select! {
@@ -1947,6 +1996,7 @@ impl DisplaySession {
                             tile_mode = tile::policy::TileMode::Tiles;
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             last_delta_sent_at = None;
+                            pending_dirty_tiles.clear();
                             continue;
                         }
 
@@ -1961,6 +2011,7 @@ impl DisplaySession {
                             tile_policy = tile::policy::TilePolicy::new(Instant::now());
                             tile_mode = tile::policy::TileMode::Tiles;
                             last_delta_sent_at = None;
+                            pending_dirty_tiles.clear();
                             synthetic_dirty.reset_cursor();
                             last_cursor = None;
                             let resize = tile::transport::TileFrame::Resize {
@@ -1981,6 +2032,7 @@ impl DisplaySession {
                                     Arc::clone(&counters),
                                 ).await;
                             }
+                            pending_dirty_tiles.clear();
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             continue;
                         }
@@ -1998,8 +2050,26 @@ impl DisplaySession {
                                     Arc::clone(&counters),
                                 ).await;
                             }
+                            pending_dirty_tiles.clear();
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             continue;
+                        }
+
+                        let damage_capability = damage.capability();
+                        let delta_min_interval =
+                            tile_delta_min_interval_for_damage(damage_capability);
+                        let frame_diff_damage = damage_uses_frame_diff(damage_capability);
+                        if frame_diff_damage {
+                            if all_tile_delta_peers_throttled(&peers_now) {
+                                continue;
+                            }
+                            let now = Instant::now();
+                            if !should_emit_tile_delta(now, last_delta_sent_at, delta_min_interval)
+                            {
+                                counters.record_tile_delta_cadence_skip();
+                                continue;
+                            }
+                            last_delta_sent_at = Some(now);
                         }
 
                         let cursor_pos = damage.cursor_position();
@@ -2008,7 +2078,7 @@ impl DisplaySession {
                             last_cursor = cursor_pos;
                         }
 
-                        let mut rects = match damage.capability() {
+                        let mut rects = match damage_capability {
                             capture::damage::DamageCapability::OsLevel => {
                                 match damage.poll_damage() {
                                     Ok(rects) => rects,
@@ -2043,6 +2113,7 @@ impl DisplaySession {
                             tile_mode = next_mode;
                             last_delta_sent_at = None;
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
+                            pending_dirty_tiles.clear();
                             match tile_mode {
                                 tile::policy::TileMode::Video => {
                                     eprintln!(
@@ -2125,35 +2196,66 @@ impl DisplaySession {
                             }
                         }
 
-                        if rects.is_empty() {
+                        if rects.is_empty() && pending_dirty_tiles.is_empty() {
                             continue;
                         }
 
-                        let dirty: Vec<_> = next_grid.dirty_tiles(&rects).into_iter().collect();
+                        let dirty_now = if rects.is_empty() {
+                            BTreeSet::new()
+                        } else {
+                            next_grid.dirty_tiles(&rects)
+                        };
+                        if dirty_now.is_empty() && pending_dirty_tiles.is_empty() {
+                            continue;
+                        }
+                        if !dirty_now.is_empty() {
+                            counters.record_tile_damage_sample(
+                                rects.len(),
+                                dirty_now.len(),
+                                next_grid.dirty_fraction(dirty_now.len()),
+                            );
+                        }
+
+                        if all_tile_delta_peers_throttled(&peers_now) {
+                            pending_dirty_tiles.extend(dirty_now);
+                            continue;
+                        }
+
+                        if !frame_diff_damage {
+                            let now = Instant::now();
+                            if !should_emit_tile_delta(
+                                now,
+                                last_delta_sent_at,
+                                delta_min_interval,
+                            ) {
+                                pending_dirty_tiles.extend(dirty_now);
+                                counters.record_tile_delta_cadence_skip();
+                                continue;
+                            }
+                            last_delta_sent_at = Some(now);
+                        }
+
+                        pending_dirty_tiles.extend(dirty_now);
+                        let dirty: Vec<_> = std::mem::take(&mut pending_dirty_tiles)
+                            .into_iter()
+                            .collect();
                         if dirty.is_empty() {
                             continue;
                         }
-                        counters.record_tile_damage_sample(
-                            rects.len(),
-                            dirty.len(),
-                            next_grid.dirty_fraction(dirty.len()),
-                        );
-
-                        let now = Instant::now();
-                        if !should_emit_tile_delta(
-                            now,
-                            last_delta_sent_at,
-                            tile_delta_min_interval(),
-                        ) {
-                            counters.record_tile_delta_cadence_skip();
-                            continue;
-                        }
-                        last_delta_sent_at = Some(now);
 
                         let epoch = tile_epoch.load(Ordering::Relaxed);
+                        let encode_options =
+                            tile_delta_encode_options_for_damage(damage_capability);
                         let encode_result = tokio::task::spawn_blocking({
                             let frame = Arc::clone(&frame);
-                            move || encode_tile_records(&frame, dirty, visual_marker_value)
+                            move || {
+                                encode_tile_records_with_options(
+                                    &frame,
+                                    dirty,
+                                    visual_marker_value,
+                                    encode_options,
+                                )
+                            }
                         }).await;
 
                         let Ok(Ok(records)) = encode_result else {
@@ -3238,6 +3340,64 @@ mod tests {
             Some(now),
             min
         ));
+    }
+
+    #[test]
+    fn frame_diff_tile_deltas_use_software_budget() {
+        assert_eq!(
+            tile_delta_min_interval_for_damage(capture::damage::DamageCapability::OsLevel),
+            Duration::from_millis(66)
+        );
+        assert_eq!(
+            tile_delta_min_interval_for_damage(capture::damage::DamageCapability::FrameDiff),
+            Duration::from_millis(125)
+        );
+        assert!(
+            tile_delta_encode_options_for_damage(capture::damage::DamageCapability::OsLevel)
+                .allow_webp_lossless
+        );
+        assert!(
+            !tile_delta_encode_options_for_damage(capture::damage::DamageCapability::FrameDiff)
+                .allow_webp_lossless
+        );
+        assert!(damage_uses_frame_diff(
+            capture::damage::DamageCapability::FrameDiff
+        ));
+        assert!(damage_uses_frame_diff(capture::damage::DamageCapability::None));
+        assert!(!damage_uses_frame_diff(
+            capture::damage::DamageCapability::OsLevel
+        ));
+    }
+
+    #[test]
+    fn tile_delta_backpressure_hint_requires_every_peer_throttled() {
+        use crate::display::encode::pool::SimulcastRid;
+        use crate::display::webrtc::WebRtcPeer;
+
+        assert!(!all_tile_delta_peers_throttled(&[]));
+
+        let peer_a = Arc::new(WebRtcPeer::new_for_test(
+            1,
+            vec![SimulcastRid::quarter()],
+        ));
+        let peer_b = Arc::new(WebRtcPeer::new_for_test(
+            2,
+            vec![SimulcastRid::quarter()],
+        ));
+
+        assert!(!all_tile_delta_peers_throttled(&[
+            Arc::clone(&peer_a),
+            Arc::clone(&peer_b),
+        ]));
+
+        peer_a.set_tile_delta_throttled_for_test(true);
+        assert!(!all_tile_delta_peers_throttled(&[
+            Arc::clone(&peer_a),
+            Arc::clone(&peer_b),
+        ]));
+
+        peer_b.set_tile_delta_throttled_for_test(true);
+        assert!(all_tile_delta_peers_throttled(&[peer_a, peer_b]));
     }
 
     #[test]
