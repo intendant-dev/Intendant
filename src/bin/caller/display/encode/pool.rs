@@ -1846,6 +1846,27 @@ impl EncoderPool {
             .collect()
     }
 
+    /// Returns true when at least one encoder layer is currently able
+    /// to consume pool input. The display bridge uses this to avoid
+    /// BGRA->I420 conversion work while layer policy has paused every
+    /// video layer, such as during lossless tile-only viewing.
+    pub fn has_unpaused_layers(&self) -> bool {
+        {
+            let always_on = self.inner.always_on.read().unwrap();
+            if always_on
+                .iter()
+                .any(|h| !h.paused.load(Ordering::SeqCst))
+            {
+                return true;
+            }
+        }
+
+        let on_demand = self.inner.on_demand.lock().unwrap();
+        on_demand
+            .values()
+            .any(|slot| !slot.handle.paused.load(Ordering::SeqCst))
+    }
+
     /// **Phase 4d.0**: pause one encoder slot, identified by
     /// `(codec, rid)`. The slot's encoder thread keeps running and
     /// keeps draining its `i420_rx` broadcast subscription (so the
@@ -4488,6 +4509,35 @@ mod tests {
                 rid.as_str(),
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pool_has_unpaused_layers_tracks_pause_state() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
+            None,
+        );
+
+        assert!(pool.has_unpaused_layers());
+
+        pool.pause_layer(CodecKind::Vp8, SimulcastRid::full());
+        pool.pause_layer(CodecKind::Vp8, SimulcastRid::half());
+        assert!(
+            pool.has_unpaused_layers(),
+            "one unpaused simulcast layer should keep the feed bridge active"
+        );
+
+        pool.pause_layer(CodecKind::Vp8, SimulcastRid::quarter());
+        assert!(
+            !pool.has_unpaused_layers(),
+            "all paused layers should let the feed bridge skip video input work"
+        );
+
+        pool.resume_layer(CodecKind::Vp8, SimulcastRid::half());
+        assert!(pool.has_unpaused_layers());
     }
 
     /// `pause_layer` flips the slot's atomic flag; `resume_layer`

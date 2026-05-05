@@ -658,32 +658,13 @@ fn convert_for_pool_feed(
 
 const TILE_STREAM_TILE_SIZE_PX: u16 = 64;
 const TILE_DELTA_TARGET_FPS: u32 = 15;
-const TILE_DELTA_FRAME_DIFF_TARGET_FPS: u32 = 8;
 
 fn tile_delta_min_interval() -> Duration {
     Duration::from_millis(1_000 / TILE_DELTA_TARGET_FPS as u64)
 }
 
-fn tile_delta_min_interval_for_damage(capability: capture::damage::DamageCapability) -> Duration {
-    match capability {
-        capture::damage::DamageCapability::OsLevel => tile_delta_min_interval(),
-        capture::damage::DamageCapability::FrameDiff
-        | capture::damage::DamageCapability::None => {
-            Duration::from_millis(1_000 / TILE_DELTA_FRAME_DIFF_TARGET_FPS as u64)
-        }
-    }
-}
-
-fn tile_delta_encode_options_for_damage(
-    capability: capture::damage::DamageCapability,
-) -> tile::encode::TileEncodeOptions {
-    match capability {
-        capture::damage::DamageCapability::OsLevel => tile::encode::TileEncodeOptions::default(),
-        capture::damage::DamageCapability::FrameDiff
-        | capture::damage::DamageCapability::None => tile::encode::TileEncodeOptions {
-            allow_webp_lossless: false,
-        },
-    }
+fn tile_delta_min_interval_for_damage(_capability: capture::damage::DamageCapability) -> Duration {
+    tile_delta_min_interval()
 }
 
 fn damage_uses_frame_diff(capability: capture::damage::DamageCapability) -> bool {
@@ -737,20 +718,6 @@ fn encode_tile_records(
     tiles: Vec<tile::grid::TileId>,
     visual_marker_value: Option<u32>,
 ) -> Result<Vec<tile::transport::TileRecord>, tile::encode::TileEncodeError> {
-    encode_tile_records_with_options(
-        frame,
-        tiles,
-        visual_marker_value,
-        tile::encode::TileEncodeOptions::default(),
-    )
-}
-
-fn encode_tile_records_with_options(
-    frame: &Frame,
-    tiles: Vec<tile::grid::TileId>,
-    visual_marker_value: Option<u32>,
-    options: tile::encode::TileEncodeOptions,
-) -> Result<Vec<tile::transport::TileRecord>, tile::encode::TileEncodeError> {
     let src = tile::encode::TileSource {
         data: &frame.data,
         width: frame.width,
@@ -766,7 +733,7 @@ fn encode_tile_records_with_options(
             if let Some(value) = visual_marker_value {
                 stamp_visual_marker_bgra_tile(&mut raw, tile, src.tile_size_px, value);
             }
-            tile::encode::encode_raw_bgra_payload_with_options(tile, raw, src.tile_size_px, options)
+            tile::encode::encode_raw_bgra_payload(tile, raw, src.tile_size_px)
         })
         .collect()
 }
@@ -2262,18 +2229,9 @@ impl DisplaySession {
                         }
 
                         let epoch = tile_epoch.load(Ordering::Relaxed);
-                        let encode_options =
-                            tile_delta_encode_options_for_damage(damage_capability);
                         let encode_result = tokio::task::spawn_blocking({
                             let frame = Arc::clone(&frame);
-                            move || {
-                                encode_tile_records_with_options(
-                                    &frame,
-                                    dirty,
-                                    visual_marker_value,
-                                    encode_options,
-                                )
-                            }
+                            move || encode_tile_records(&frame, dirty, visual_marker_value)
                         }).await;
 
                         let Ok(Ok(records)) = encode_result else {
@@ -2612,6 +2570,10 @@ impl DisplaySession {
                             last_sent_gen = None;
                         }
 
+                        if !pool.has_unpaused_layers() {
+                            continue;
+                        }
+
                         let frame_arc = Arc::clone(&frame);
                         let arrived = Instant::now();
                         // Same normalized-dims rationale as the seed
@@ -2635,6 +2597,10 @@ impl DisplaySession {
                         }
                     }
                     _ = tick.tick() => {
+                        if !pool.has_unpaused_layers() {
+                            continue;
+                        }
+
                         // Forward latest_i420 if anything's worth
                         // forwarding. "Worth forwarding" = a fresher
                         // buffer than last sent, OR the heartbeat is
@@ -3361,22 +3327,18 @@ mod tests {
     }
 
     #[test]
-    fn frame_diff_tile_deltas_use_software_budget() {
+    fn frame_diff_tile_deltas_keep_default_cadence() {
         assert_eq!(
             tile_delta_min_interval_for_damage(capture::damage::DamageCapability::OsLevel),
             Duration::from_millis(66)
         );
         assert_eq!(
             tile_delta_min_interval_for_damage(capture::damage::DamageCapability::FrameDiff),
-            Duration::from_millis(125)
+            Duration::from_millis(66)
         );
-        assert!(
-            tile_delta_encode_options_for_damage(capture::damage::DamageCapability::OsLevel)
-                .allow_webp_lossless
-        );
-        assert!(
-            !tile_delta_encode_options_for_damage(capture::damage::DamageCapability::FrameDiff)
-                .allow_webp_lossless
+        assert_eq!(
+            tile_delta_min_interval_for_damage(capture::damage::DamageCapability::None),
+            Duration::from_millis(66)
         );
         assert!(damage_uses_frame_diff(
             capture::damage::DamageCapability::FrameDiff
