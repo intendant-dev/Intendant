@@ -533,7 +533,7 @@ pub struct EncoderHandle {
     ///   would trip the silent-output threshold and trigger an
     ///   unnecessary H.264 fallback on resume).
     /// - Metrics: encoder doesn't count `encode_frames` /
-    ///   `encode_latency_us_sum` while paused (no work was done).
+    ///   `encode_freshness_us_sum` while paused (no work was done).
     ///   `encode_drops` from broadcast lag still counts (lag reflects
     ///   subscriber slowness, not pause state).
     pub paused: Arc<AtomicBool>,
@@ -1006,7 +1006,7 @@ struct EncoderPoolInner {
 
     /// Shared metrics counters. Every encoder thread holds an
     /// `Arc::clone` of this and bumps `encode_frames` +
-    /// `encode_latency_us_sum` per encoded packet, plus
+    /// `encode_freshness_us_sum` per encoded packet, plus
     /// `encode_drops` on broadcast lag. The pool is the sole
     /// producer of these counters since 3c.4b deleted the legacy
     /// fan-out, so [`crate::display::DisplayMetricsSnapshot`]
@@ -1104,7 +1104,7 @@ impl EncoderPool {
         counters: Option<Arc<crate::display::DisplayMetricsCounters>>,
     ) -> Self {
         // Every pool encoder thread bumps these counters on each
-        // encoded packet (encode_frames, encode_latency_us_sum) and
+        // encoded packet (encode_frames, encode_freshness_us_sum) and
         // on broadcast lag (encode_drops). DisplayMetricsSnapshot
         // reflects the pool's total throughput. Tests that don't
         // care about metrics pass `None`; production passes
@@ -2267,7 +2267,7 @@ fn spawn_encoder_thread_with(
     let downscale_dst_w = layer.width;
     let downscale_dst_h = layer.height;
     // 3c.3b.4h: per-encoder metrics. Bumped per encoded packet
-    // (encode_frames + encode_latency_us_sum) and on broadcast lag
+    // (encode_frames + encode_freshness_us_sum) and on broadcast lag
     // (encode_drops). Counter is shared with DisplaySession via Arc.
     let counters_for_thread = Arc::clone(counters);
 
@@ -2353,6 +2353,15 @@ fn spawn_encoder_thread_with(
                 continue;
             }
 
+            // No peer is currently reading this encoder's output. Keep draining
+            // the shared I420 broadcast so the receiver stays current, but skip
+            // all expensive per-layer work (downscale + codec encode). The next
+            // subscribed frame will still honor any pending force-keyframe flag
+            // because we intentionally check demand before swapping it below.
+            if frames_tx_for_thread.receiver_count() == 0 {
+                continue;
+            }
+
             let force_kf = force_kf_for_thread.swap(false, Ordering::SeqCst);
 
             // Phase 4a: per-layer downscale. The bridge pushes I420
@@ -2406,30 +2415,22 @@ fn spawn_encoder_thread_with(
                     // 3c.3b.4h: latency from capture-arrival to
                     // encoded-packet-emission. Mirrors the legacy
                     // mod.rs::start_encoder_pipeline arithmetic
-                    // (one latency value computed per encode call,
+                    // (one freshness value computed per encode call,
                     // summed in once per packet — multi-packet
-                    // outputs accumulate the same latency value
-                    // per packet, matching legacy semantics so
-                    // average rates compose cleanly when both
-                    // Only count metrics when this encoder has at
-                    // least one consumer subscribed. An H.264-only
-                    // session leaves the always-on VP8 producing
-                    // into a void — bumping counters there inflates
-                    // dashboard fps/latency by the unconsumed work.
-                    // Receiver-count is an atomic load on the
-                    // broadcast::Sender, cheap enough to sample once
-                    // per encode call.
-                    let has_consumer = frames_tx_for_thread.receiver_count() > 0;
-                    let latency_us = frame.arrived.elapsed().as_micros() as u64;
+                    // outputs accumulate the same value per packet,
+                    // matching legacy semantics so average rates
+                    // compose cleanly across codecs.
+                    // A zero-consumer encoder never reaches this
+                    // block; it drains I420 and skips the encode
+                    // earlier in the loop.
+                    let freshness_us = frame.arrived.elapsed().as_micros() as u64;
                     for pkt in packets {
-                        if has_consumer {
-                            counters_for_thread
-                                .encode_frames
-                                .fetch_add(1, Ordering::Relaxed);
-                            counters_for_thread
-                                .encode_latency_us_sum
-                                .fetch_add(latency_us, Ordering::Relaxed);
-                        }
+                        counters_for_thread
+                            .encode_frames
+                            .fetch_add(1, Ordering::Relaxed);
+                        counters_for_thread
+                            .encode_freshness_us_sum
+                            .fetch_add(freshness_us, Ordering::Relaxed);
                         let ef = Arc::new(pkt.into_encoded_frame());
                         // Lossy broadcast: returns Err only if there
                         // are zero subscribers, which is fine.
@@ -3889,7 +3890,7 @@ mod tests {
 
     /// **3c.3b.4h regression test.** When `EncoderPool::new` is
     /// passed an explicit metrics counters Arc, the pool's encoder
-    /// thread bumps `encode_frames` and `encode_latency_us_sum` per
+    /// thread bumps `encode_frames` and `encode_freshness_us_sum` per
     /// emitted packet. Without this wiring the dashboard's
     /// fps/latency metrics would read zero (pool is the sole
     /// producer since 3c.4b). Pins the wiring end-to-end: explicit
@@ -3943,7 +3944,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let frames_encoded = counters.encode_frames.load(Ordering::SeqCst);
-        let latency_sum = counters.encode_latency_us_sum.load(Ordering::SeqCst);
+        let freshness_sum = counters.encode_freshness_us_sum.load(Ordering::SeqCst);
 
         assert!(
             frames_encoded > 0,
@@ -3952,14 +3953,14 @@ mod tests {
              (pool is the sole producer since 3c.4b).",
         );
         assert!(
-            latency_sum > 0,
-            "encode_latency_us_sum must accumulate from frame.arrived → \
-             encoded packet emission; got {latency_sum}",
+            freshness_sum > 0,
+            "encode_freshness_us_sum must accumulate from frame.arrived → \
+             encoded packet emission; got {freshness_sum}",
         );
     }
 
     /// **3c.3b.4i regression test.** Pool encoder must NOT bump
-    /// `encode_frames` / `encode_latency_us_sum` / `encode_drops`
+    /// `encode_frames` / `encode_freshness_us_sum` / `encode_drops`
     /// when its `frames_tx` has zero subscribers. The production
     /// scenario this protects: an H.264-only session leaves the
     /// always-on VP8 encoder alive (it always spawns) even though
@@ -4001,7 +4002,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         let frames_no_sub = counters.encode_frames.load(Ordering::SeqCst);
-        let latency_no_sub = counters.encode_latency_us_sum.load(Ordering::SeqCst);
+        let freshness_no_sub = counters.encode_freshness_us_sum.load(Ordering::SeqCst);
         assert_eq!(
             frames_no_sub, 0,
             "encode_frames must NOT increment when encoder has zero \
@@ -4010,9 +4011,9 @@ mod tests {
              on VP8 counted alongside the legacy encoder.",
         );
         assert_eq!(
-            latency_no_sub, 0,
-            "encode_latency_us_sum must NOT accumulate when encoder \
-             has zero subscribers; got {latency_no_sub}",
+            freshness_no_sub, 0,
+            "encode_freshness_us_sum must NOT accumulate when encoder \
+             has zero subscribers; got {freshness_no_sub}",
         );
 
         // Phase 2: subscribe and push more. Counters MUST start

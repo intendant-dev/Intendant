@@ -553,59 +553,88 @@ pub fn bgra_to_i420(bgra: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8
     let (y_plane, uv_planes) = out.split_at_mut(y_size);
     let (u_plane, v_plane) = uv_planes.split_at_mut(uv_size);
 
-    // Compute Y for every pixel.
+    // Compute luma in row-major order. This is the largest plane and the
+    // most cache-sensitive loop; fixed-point math avoids the old per-pixel
+    // floating-point conversions while preserving the BT.601 coefficients.
     for row in 0..h {
         let row_start = row * s;
+        let y_row_start = row * w;
         for col in 0..w {
             let px = row_start + col * 4;
-            let b = bgra[px] as f32;
-            let g = bgra[px + 1] as f32;
-            let r = bgra[px + 2] as f32;
-            let y = (0.299 * r + 0.587 * g + 0.114 * b).round();
-            y_plane[row * w + col] = y.clamp(0.0, 255.0) as u8;
+            y_plane[y_row_start + col] = rgb_to_y(
+                bgra[px + 2] as i32,
+                bgra[px + 1] as i32,
+                bgra[px] as i32,
+            );
         }
     }
 
     // Compute U, V by averaging 2x2 blocks.
     for uv_row in 0..uv_h {
         for uv_col in 0..uv_w {
-            let mut sum_r: f32 = 0.0;
-            let mut sum_g: f32 = 0.0;
-            let mut sum_b: f32 = 0.0;
-            let mut count: f32 = 0.0;
+            let mut sum_r: i32 = 0;
+            let mut sum_g: i32 = 0;
+            let mut sum_b: i32 = 0;
+            let mut count: i32 = 0;
 
-            for dy in 0..2u32 {
-                let row = uv_row * 2 + dy as usize;
+            for dy in 0..2usize {
+                let row = uv_row * 2 + dy;
                 if row >= h {
                     continue;
                 }
-                for dx in 0..2u32 {
-                    let col = uv_col * 2 + dx as usize;
+                let row_start = row * s;
+                for dx in 0..2usize {
+                    let col = uv_col * 2 + dx;
                     if col >= w {
                         continue;
                     }
-                    let px = row * s + col * 4;
-                    sum_b += bgra[px] as f32;
-                    sum_g += bgra[px + 1] as f32;
-                    sum_r += bgra[px + 2] as f32;
-                    count += 1.0;
+                    let px = row_start + col * 4;
+                    let b = bgra[px] as i32;
+                    let g = bgra[px + 1] as i32;
+                    let r = bgra[px + 2] as i32;
+                    sum_b += b;
+                    sum_g += g;
+                    sum_r += r;
+                    count += 1;
                 }
             }
 
-            let r = sum_r / count;
-            let g = sum_g / count;
-            let b = sum_b / count;
-
-            let u = (-0.169 * r - 0.331 * g + 0.500 * b + 128.0).round();
-            let v = (0.500 * r - 0.419 * g - 0.081 * b + 128.0).round();
-
             let idx = uv_row * uv_w + uv_col;
-            u_plane[idx] = u.clamp(0.0, 255.0) as u8;
-            v_plane[idx] = v.clamp(0.0, 255.0) as u8;
+            u_plane[idx] = rgb_sum_to_u(sum_r, sum_g, sum_b, count);
+            v_plane[idx] = rgb_sum_to_v(sum_r, sum_g, sum_b, count);
         }
     }
 
     out
+}
+
+#[inline]
+fn rgb_to_y(r: i32, g: i32, b: i32) -> u8 {
+    // 0.299, 0.587, 0.114 in 16.16 fixed point. Coefficients sum to
+    // exactly 65536, so white maps to 255 without an explicit clamp.
+    (((19_595 * r + 38_470 * g + 7_471 * b + 32_768) >> 16).clamp(0, 255)) as u8
+}
+
+#[inline]
+fn rgb_sum_to_u(sum_r: i32, sum_g: i32, sum_b: i32, count: i32) -> u8 {
+    // -0.169, -0.331, 0.500 + 128 in 16.16 fixed point.
+    let n = -11_076 * sum_r - 21_692 * sum_g + 32_768 * sum_b
+        + 8_388_608 * count;
+    rounded_fixed_avg_clamped_u8(n, count)
+}
+
+#[inline]
+fn rgb_sum_to_v(sum_r: i32, sum_g: i32, sum_b: i32, count: i32) -> u8 {
+    // 0.500, -0.419, -0.081 + 128 in 16.16 fixed point.
+    let n = 32_768 * sum_r - 27_460 * sum_g - 5_308 * sum_b
+        + 8_388_608 * count;
+    rounded_fixed_avg_clamped_u8(n, count)
+}
+
+#[inline]
+fn rounded_fixed_avg_clamped_u8(n: i32, count: i32) -> u8 {
+    let denom = count << 16;
+    ((n + denom / 2) / denom).clamp(0, 255) as u8
 }
 
 /// Bilinear downscale an I420 frame from `(src_w, src_h)` to `(dst_w, dst_h)`.
@@ -752,6 +781,7 @@ impl EncodedPacket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     /// Build a 2x2 BGRA image with known pixel values.
     fn make_2x2_bgra() -> Vec<u8> {
@@ -766,6 +796,87 @@ mod tests {
             255, 0, 0, 255, // blue
             255, 255, 255, 255, // white
         ]
+    }
+
+    fn make_pattern_bgra(width: u32, height: u32) -> Vec<u8> {
+        let mut bgra = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                bgra.push(((x * 3 + y * 5) & 0xff) as u8);
+                bgra.push(((x * 7 + y * 11) & 0xff) as u8);
+                bgra.push(((x * 13 + y * 17) & 0xff) as u8);
+                bgra.push(255);
+            }
+        }
+        bgra
+    }
+
+    fn bgra_to_i420_reference(bgra: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8> {
+        let w = width as usize;
+        let h = height as usize;
+        let s = stride as usize;
+
+        let uv_w = (w + 1) / 2;
+        let uv_h = (h + 1) / 2;
+
+        let y_size = w * h;
+        let uv_size = uv_w * uv_h;
+        let mut out = vec![0u8; y_size + 2 * uv_size];
+
+        let (y_plane, uv_planes) = out.split_at_mut(y_size);
+        let (u_plane, v_plane) = uv_planes.split_at_mut(uv_size);
+
+        for row in 0..h {
+            let row_start = row * s;
+            for col in 0..w {
+                let px = row_start + col * 4;
+                let b = bgra[px] as f32;
+                let g = bgra[px + 1] as f32;
+                let r = bgra[px + 2] as f32;
+                let y = (0.299 * r + 0.587 * g + 0.114 * b).round();
+                y_plane[row * w + col] = y.clamp(0.0, 255.0) as u8;
+            }
+        }
+
+        for uv_row in 0..uv_h {
+            for uv_col in 0..uv_w {
+                let mut sum_r: f32 = 0.0;
+                let mut sum_g: f32 = 0.0;
+                let mut sum_b: f32 = 0.0;
+                let mut count: f32 = 0.0;
+
+                for dy in 0..2u32 {
+                    let row = uv_row * 2 + dy as usize;
+                    if row >= h {
+                        continue;
+                    }
+                    for dx in 0..2u32 {
+                        let col = uv_col * 2 + dx as usize;
+                        if col >= w {
+                            continue;
+                        }
+                        let px = row * s + col * 4;
+                        sum_b += bgra[px] as f32;
+                        sum_g += bgra[px + 1] as f32;
+                        sum_r += bgra[px + 2] as f32;
+                        count += 1.0;
+                    }
+                }
+
+                let r = sum_r / count;
+                let g = sum_g / count;
+                let b = sum_b / count;
+
+                let u = (-0.169 * r - 0.331 * g + 0.500 * b + 128.0).round();
+                let v = (0.500 * r - 0.419 * g - 0.081 * b + 128.0).round();
+
+                let idx = uv_row * uv_w + uv_col;
+                u_plane[idx] = u.clamp(0.0, 255.0) as u8;
+                v_plane[idx] = v.clamp(0.0, 255.0) as u8;
+            }
+        }
+
+        out
     }
 
     #[test]
@@ -810,6 +921,62 @@ mod tests {
         assert_eq!(i420[1], 255);
         assert_eq!(i420[2], 0);
         assert_eq!(i420[3], 0);
+    }
+
+    #[test]
+    fn bgra_to_i420_matches_reference_pattern() {
+        let width = 17;
+        let height = 13;
+        let stride = 80;
+        let mut bgra = vec![0u8; height as usize * stride as usize];
+        let compact = make_pattern_bgra(width, height);
+        for row in 0..height as usize {
+            let src = row * width as usize * 4;
+            let dst = row * stride as usize;
+            bgra[dst..dst + width as usize * 4]
+                .copy_from_slice(&compact[src..src + width as usize * 4]);
+        }
+
+        assert_eq!(
+            bgra_to_i420(&bgra, width, height, stride),
+            bgra_to_i420_reference(&bgra, width, height, stride)
+        );
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark for local encoder hot-path tuning"]
+    fn bgra_to_i420_perf_1080p() {
+        let width = 1920;
+        let height = 1080;
+        let stride = width * 4;
+        let bgra = make_pattern_bgra(width, height);
+        let iterations = 30;
+
+        let mut reference_checksum = 0u64;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let i420 = bgra_to_i420_reference(&bgra, width, height, stride);
+            reference_checksum = reference_checksum.wrapping_add(i420[0] as u64);
+            reference_checksum = reference_checksum.wrapping_add(i420[i420.len() / 2] as u64);
+        }
+        let reference_elapsed = start.elapsed();
+
+        let mut checksum = 0u64;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let i420 = bgra_to_i420(&bgra, width, height, stride);
+            checksum = checksum.wrapping_add(i420[0] as u64);
+            checksum = checksum.wrapping_add(i420[i420.len() / 2] as u64);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "bgra_to_i420 reference 1080p: {:.3} ms/frame (checksum={reference_checksum})",
+            reference_elapsed.as_secs_f64() * 1000.0 / iterations as f64,
+        );
+        eprintln!(
+            "bgra_to_i420 optimized 1080p: {:.3} ms/frame (checksum={checksum})",
+            elapsed.as_secs_f64() * 1000.0 / iterations as f64,
+        );
     }
 
     #[test]

@@ -398,7 +398,7 @@ pub enum OutboundEvent {
         capture_fps: f64,
         capture_drops: u64,
         encode_fps: f64,
-        encode_latency_avg_ms: f64,
+        encode_freshness_avg_ms: f64,
         encode_drops: u64,
         peer_count: u64,
         peer_drops: u64,

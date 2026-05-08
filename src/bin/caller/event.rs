@@ -1361,7 +1361,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             capture_fps: snapshot.capture_fps,
             capture_drops: snapshot.capture_drops,
             encode_fps: snapshot.encode_fps,
-            encode_latency_avg_ms: snapshot.encode_latency_avg_ms,
+            encode_freshness_avg_ms: snapshot.encode_freshness_avg_ms,
             encode_drops: snapshot.encode_drops,
             peer_count: snapshot.peer_count,
             peer_drops: snapshot.peer_drops,
