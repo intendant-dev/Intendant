@@ -2353,6 +2353,15 @@ fn spawn_encoder_thread_with(
                 continue;
             }
 
+            // No peer is currently reading this encoder's output. Keep draining
+            // the shared I420 broadcast so the receiver stays current, but skip
+            // all expensive per-layer work (downscale + codec encode). The next
+            // subscribed frame will still honor any pending force-keyframe flag
+            // because we intentionally check demand before swapping it below.
+            if frames_tx_for_thread.receiver_count() == 0 {
+                continue;
+            }
+
             let force_kf = force_kf_for_thread.swap(false, Ordering::SeqCst);
 
             // Phase 4a: per-layer downscale. The bridge pushes I420
@@ -2406,30 +2415,22 @@ fn spawn_encoder_thread_with(
                     // 3c.3b.4h: latency from capture-arrival to
                     // encoded-packet-emission. Mirrors the legacy
                     // mod.rs::start_encoder_pipeline arithmetic
-                    // (one latency value computed per encode call,
+                    // (one freshness value computed per encode call,
                     // summed in once per packet — multi-packet
-                    // outputs accumulate the same latency value
-                    // per packet, matching legacy semantics so
-                    // average rates compose cleanly when both
-                    // Only count metrics when this encoder has at
-                    // least one consumer subscribed. An H.264-only
-                    // session leaves the always-on VP8 producing
-                    // into a void — bumping counters there inflates
-                    // dashboard fps/latency by the unconsumed work.
-                    // Receiver-count is an atomic load on the
-                    // broadcast::Sender, cheap enough to sample once
-                    // per encode call.
-                    let has_consumer = frames_tx_for_thread.receiver_count() > 0;
+                    // outputs accumulate the same value per packet,
+                    // matching legacy semantics so average rates
+                    // compose cleanly across codecs.
+                    // A zero-consumer encoder never reaches this
+                    // block; it drains I420 and skips the encode
+                    // earlier in the loop.
                     let freshness_us = frame.arrived.elapsed().as_micros() as u64;
                     for pkt in packets {
-                        if has_consumer {
-                            counters_for_thread
-                                .encode_frames
-                                .fetch_add(1, Ordering::Relaxed);
-                            counters_for_thread
-                                .encode_freshness_us_sum
-                                .fetch_add(freshness_us, Ordering::Relaxed);
-                        }
+                        counters_for_thread
+                            .encode_frames
+                            .fetch_add(1, Ordering::Relaxed);
+                        counters_for_thread
+                            .encode_freshness_us_sum
+                            .fetch_add(freshness_us, Ordering::Relaxed);
                         let ef = Arc::new(pkt.into_encoded_frame());
                         // Lossy broadcast: returns Err only if there
                         // are zero subscribers, which is fine.
