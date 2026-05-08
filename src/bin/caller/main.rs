@@ -770,6 +770,22 @@ async fn drain_external_agent_events(
                     source: config.agent_source.clone(),
                 });
             }
+            external_agent::AgentEvent::Log { level, message } => {
+                slog(config.session_log, |l| match level.as_str() {
+                    "warn" => l.warn(&message),
+                    "error" => l.error(&message),
+                    _ => l.info(&message),
+                });
+                config.bus.send(AppEvent::LogEntry {
+                    level,
+                    source: config
+                        .agent_source
+                        .clone()
+                        .unwrap_or_else(|| "worker".to_string()),
+                    content: message,
+                    turn: None,
+                });
+            }
             external_agent::AgentEvent::ToolStarted {
                 preview,
                 tool_name,

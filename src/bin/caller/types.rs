@@ -219,8 +219,8 @@ pub enum OutboundEvent {
         agent: Option<String>,
     },
     /// Delivered to browsers when a Codex thread-level action finishes
-    /// (compact, fork, rollback, review, init, memory-reset). `success`
-    /// + `message` are surfaced as a dashboard toast and logged.
+    /// (compact, fork, rollback, review, rename, goal, init, memory-reset).
+    /// `success` + `message` are surfaced as a dashboard toast and logged.
     CodexThreadActionResult {
         action: String,
         success: bool,

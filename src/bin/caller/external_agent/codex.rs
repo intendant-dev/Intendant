@@ -21,7 +21,8 @@ use super::{
 
 /// Codex-specific thread-action helpers. Each wraps one of Codex's app-server
 /// JSON-RPC methods (`thread/compact/start`, `thread/fork`, `thread/rollback`,
-/// `review/start`, `memory/reset`) with the `threadId` lookup boilerplate.
+/// `review/start`, `thread/name/set`, `thread/goal/*`, `memory/reset`) with the
+/// `threadId` lookup boilerplate where the upstream method requires it.
 /// All return a short human-readable status string on success for the
 /// dashboard toast.
 impl CodexAgent {
@@ -54,6 +55,19 @@ impl CodexAgent {
                     .and_then(|v| v.as_str())
                     .map(String::from);
                 self.start_review(prompt).await
+            }
+            "rename" | "name-set" | "name_set" | "thread-name-set" | "thread_name_set" => {
+                self.set_thread_name(params).await
+            }
+            "goal" | "goal-set" | "goal_get" | "goal-get" | "goal-status" => {
+                self.dispatch_goal_action(op, params).await
+            }
+            "goal-clear" | "goal_clear" => self.clear_goal().await,
+            "goal-pause" | "goal_pause" => self.update_goal_status("paused").await,
+            "goal-resume" | "goal_resume" => self.update_goal_status("active").await,
+            "goal-complete" | "goal_complete" => self.update_goal_status("complete").await,
+            "goal-budget-limited" | "goal_budget_limited" => {
+                self.update_goal_status("budgetLimited").await
             }
             "memory-reset" | "memory_reset" => self.reset_memory().await,
             other => Err(CallerError::ExternalAgent(format!(
@@ -145,13 +159,243 @@ impl CodexAgent {
     }
 
     async fn reset_memory(&mut self) -> Result<String, CallerError> {
-        let thread_id = self.require_active_thread().await?;
-        let params = serde_json::json!({ "threadId": thread_id });
         let _ = self
-            .send_request("memory/reset", Some(params))
+            .send_request("memory/reset", None)
             .await
             .map_err(|e| CallerError::ExternalAgent(format!("memory/reset: {e}")))?;
         Ok("Codex memory reset".to_string())
+    }
+
+    async fn set_thread_name(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
+        let thread_id = self.require_active_thread().await?;
+        let name = params
+            .get("name")
+            .or_else(|| params.get("threadName"))
+            .or_else(|| params.get("thread_name"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| CallerError::ExternalAgent("thread name cannot be empty".into()))?;
+        let request = serde_json::json!({ "threadId": thread_id, "name": name });
+        let _ = self
+            .send_request("thread/name/set", Some(request))
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/name/set: {e}")))?;
+        Ok(format!("Codex thread renamed to {}", name))
+    }
+
+    async fn dispatch_goal_action(
+        &mut self,
+        op: &str,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
+        if params
+            .get("clear")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return self.clear_goal().await;
+        }
+
+        let status = params
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(normalize_goal_status)
+            .transpose()?;
+        let objective = params
+            .get("objective")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(objective) = objective {
+            validate_goal_objective(objective)?;
+        }
+        let token_budget = parse_goal_token_budget(params)?;
+
+        if objective.is_some()
+            || status.is_some()
+            || token_budget.is_some()
+            || matches!(op, "goal-set")
+        {
+            return self.set_goal(objective, status.as_deref(), token_budget).await;
+        }
+
+        self.get_goal().await
+    }
+
+    async fn set_goal(
+        &mut self,
+        objective: Option<&str>,
+        status: Option<&str>,
+        token_budget: Option<Option<u64>>,
+    ) -> Result<String, CallerError> {
+        let thread_id = self.require_active_thread().await?;
+        let mut obj = serde_json::Map::new();
+        obj.insert("threadId".into(), serde_json::Value::String(thread_id));
+        if let Some(objective) = objective {
+            obj.insert(
+                "objective".into(),
+                serde_json::Value::String(objective.to_string()),
+            );
+        }
+        if let Some(status) = status {
+            obj.insert(
+                "status".into(),
+                serde_json::Value::String(status.to_string()),
+            );
+        }
+        if let Some(token_budget) = token_budget {
+            obj.insert(
+                "tokenBudget".into(),
+                token_budget
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+
+        let response = self
+            .send_request("thread/goal/set", Some(serde_json::Value::Object(obj)))
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/goal/set: {e}")))?;
+        Ok(format_goal_response("goal updated", &response))
+    }
+
+    async fn get_goal(&mut self) -> Result<String, CallerError> {
+        let thread_id = self.require_active_thread().await?;
+        let params = serde_json::json!({ "threadId": thread_id });
+        let response = self
+            .send_request("thread/goal/get", Some(params))
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/goal/get: {e}")))?;
+        Ok(format_goal_response("current goal", &response))
+    }
+
+    async fn clear_goal(&mut self) -> Result<String, CallerError> {
+        let thread_id = self.require_active_thread().await?;
+        let params = serde_json::json!({ "threadId": thread_id });
+        let response = self
+            .send_request("thread/goal/clear", Some(params))
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/goal/clear: {e}")))?;
+        let cleared = response
+            .get("cleared")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok(if cleared {
+            "goal cleared".to_string()
+        } else {
+            "no goal to clear".to_string()
+        })
+    }
+
+    async fn update_goal_status(&mut self, status: &str) -> Result<String, CallerError> {
+        self.set_goal(None, Some(status), None).await
+    }
+}
+
+const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 4_000;
+
+fn validate_goal_objective(objective: &str) -> Result<(), CallerError> {
+    let chars = objective.chars().count();
+    if chars <= MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+        return Ok(());
+    }
+    Err(CallerError::ExternalAgent(format!(
+        "goal objective is too long: {} characters; limit is {}",
+        chars, MAX_THREAD_GOAL_OBJECTIVE_CHARS
+    )))
+}
+
+fn normalize_goal_status(status: &str) -> Result<String, CallerError> {
+    let normalized = match status.trim() {
+        "active" | "resume" | "resumed" => "active",
+        "paused" | "pause" => "paused",
+        "budgetLimited" | "budget-limited" | "budget_limited" => "budgetLimited",
+        "complete" | "completed" | "done" => "complete",
+        other => {
+            return Err(CallerError::ExternalAgent(format!(
+                "unsupported Codex goal status: {}",
+                other
+            )))
+        }
+    };
+    Ok(normalized.to_string())
+}
+
+fn parse_goal_token_budget(
+    params: &serde_json::Value,
+) -> Result<Option<Option<u64>>, CallerError> {
+    let Some(value) = params.get("tokenBudget").or_else(|| params.get("token_budget")) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(None));
+    }
+    let Some(budget) = value.as_u64() else {
+        return Err(CallerError::ExternalAgent(
+            "goal token budget must be a positive integer or null".into(),
+        ));
+    };
+    if budget == 0 {
+        return Err(CallerError::ExternalAgent(
+            "goal token budget must be a positive integer".into(),
+        ));
+    }
+    Ok(Some(Some(budget)))
+}
+
+fn format_goal_response(prefix: &str, response: &serde_json::Value) -> String {
+    match response.get("goal") {
+        Some(serde_json::Value::Null) | None => "no goal set".to_string(),
+        Some(goal) => format!("{}: {}", prefix, format_goal(goal)),
+    }
+}
+
+fn format_goal(goal: &serde_json::Value) -> String {
+    let objective = goal
+        .get("objective")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unknown objective>");
+    let status = goal
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let tokens_used = goal.get("tokensUsed").and_then(|v| v.as_u64());
+    let token_budget = goal.get("tokenBudget").and_then(|v| v.as_u64());
+    let time_used = goal.get("timeUsedSeconds").and_then(|v| v.as_u64());
+
+    let mut details = vec![format!("status {}", status)];
+    if let Some(tokens_used) = tokens_used {
+        match token_budget {
+            Some(budget) => details.push(format!("{} / {} tokens", tokens_used, budget)),
+            None => details.push(format!("{} tokens", tokens_used)),
+        }
+    } else if let Some(budget) = token_budget {
+        details.push(format!("budget {} tokens", budget));
+    }
+    if let Some(seconds) = time_used {
+        details.push(format!("elapsed {}", format_duration_short(seconds)));
+    }
+
+    format!("{} ({})", objective, details.join(", "))
+}
+
+fn format_duration_short(seconds: u64) -> String {
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let secs = seconds % 60;
+    if days > 0 {
+        format!("{}d {}h", days, hours)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, minutes)
+    } else if minutes > 0 {
+        format!("{}m {}s", minutes, secs)
+    } else {
+        format!("{}s", secs)
     }
 }
 
@@ -872,6 +1116,35 @@ fn translate_notification(
             });
         }
 
+        "thread/goal/updated" => {
+            let goal = params.get("goal").unwrap_or(params);
+            let _ = event_tx.send(AgentEvent::Log {
+                level: "info".to_string(),
+                message: format!("Codex goal updated: {}", format_goal(goal)),
+            });
+        }
+
+        "thread/goal/cleared" => {
+            let _ = event_tx.send(AgentEvent::Log {
+                level: "info".to_string(),
+                message: "Codex goal cleared".to_string(),
+            });
+        }
+
+        "thread/name/updated" => {
+            let name = params
+                .get("threadName")
+                .or_else(|| params.get("thread_name"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("<unnamed>");
+            let _ = event_tx.send(AgentEvent::Log {
+                level: "info".to_string(),
+                message: format!("Codex thread renamed: {}", name),
+            });
+        }
+
         // Informational Codex v2 notifications — no action needed.
         "turn/started" | "thread/started" | "thread/tokenUsage/updated"
         | "account/rateLimits/updated" | "configWarning" => {}
@@ -1139,9 +1412,12 @@ impl ExternalAgent for CodexAgent {
         let init_params = serde_json::json!({
             "clientInfo": {
                 "name": "intendant",
+                "title": "Intendant",
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "capabilities": {},
+            "capabilities": {
+                "experimentalApi": true,
+            },
         });
 
         let init_future = self.send_request("initialize", Some(init_params));
@@ -2314,7 +2590,7 @@ mod tests {
         assert_eq!(input[0]["text"], text);
     }
 
-    // ── Thread actions (compact / fork / undo / review / memory-reset) ──
+    // ── Thread actions (compact / fork / undo / review / rename / goal / memory-reset) ──
     //
     // These tests assert the error-handling contract (no active thread →
     // typed error) and the dispatcher routing (/op → right method). The
@@ -2337,14 +2613,29 @@ mod tests {
         // Each action needs an active thread; without one the dispatcher
         // returns a clear error rather than hanging on the pending-request
         // oneshot.
-        for op in ["compact", "fork", "undo", "review", "memory-reset"] {
+        for op in [
+            "compact",
+            "fork",
+            "undo",
+            "review",
+            "rename",
+            "goal",
+            "goal-set",
+            "goal-clear",
+            "goal-pause",
+            "goal-resume",
+            "memory-reset",
+        ] {
             let mut agent = test_agent();
             let err = agent
                 .thread_action(op, &serde_json::Value::Null)
                 .await
                 .unwrap_err();
-            match err {
-                CallerError::ExternalAgent(msg) => {
+            match (op, err) {
+                ("memory-reset", CallerError::ExternalAgent(msg)) => {
+                    assert!(msg.contains("Not initialized"), "got: {}", msg);
+                }
+                (_, CallerError::ExternalAgent(msg)) => {
                     assert!(
                         msg.contains("no active Codex thread"),
                         "op /{}: expected 'no active Codex thread' error, got: {}",
@@ -2352,7 +2643,7 @@ mod tests {
                         msg,
                     );
                 }
-                other => panic!("op /{}: expected ExternalAgent error, got {:?}", op, other),
+                (_, other) => panic!("op /{}: expected ExternalAgent error, got {:?}", op, other),
             }
         }
     }
@@ -2443,6 +2734,153 @@ mod tests {
         let params = serde_json::Value::Object(obj);
         assert_eq!(params["threadId"], "thread-abc");
         assert_eq!(params["name"], "feature-x");
+    }
+
+    #[test]
+    fn codex_initialize_opts_into_experimental_api() {
+        let init_params = serde_json::json!({
+            "clientInfo": {
+                "name": "intendant",
+                "title": "Intendant",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "capabilities": {
+                "experimentalApi": true,
+            },
+        });
+        assert_eq!(init_params["clientInfo"]["name"], "intendant");
+        assert_eq!(init_params["capabilities"]["experimentalApi"], true);
+    }
+
+    #[test]
+    fn goal_set_wire_format_matches_codex_protocol() {
+        let params = serde_json::json!({
+            "threadId": "thread-abc",
+            "objective": "Ship feature parity",
+            "status": "active",
+            "tokenBudget": 200000_u64,
+        });
+        assert_eq!(params["threadId"], "thread-abc");
+        assert_eq!(params["objective"], "Ship feature parity");
+        assert_eq!(params["status"], "active");
+        assert_eq!(params["tokenBudget"], 200000);
+    }
+
+    #[test]
+    fn thread_name_set_wire_format_matches_codex_protocol() {
+        let params = serde_json::json!({
+            "threadId": "thread-abc",
+            "name": "Ship feature parity",
+        });
+        assert_eq!(params["threadId"], "thread-abc");
+        assert_eq!(params["name"], "Ship feature parity");
+    }
+
+    #[test]
+    fn goal_status_normalization_accepts_cli_style_aliases() {
+        assert_eq!(normalize_goal_status("pause").unwrap(), "paused");
+        assert_eq!(normalize_goal_status("resume").unwrap(), "active");
+        assert_eq!(
+            normalize_goal_status("budget-limited").unwrap(),
+            "budgetLimited"
+        );
+        assert_eq!(normalize_goal_status("done").unwrap(), "complete");
+        assert!(normalize_goal_status("stalled").is_err());
+    }
+
+    #[test]
+    fn goal_validation_matches_upstream_limit() {
+        let allowed = "x".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS);
+        validate_goal_objective(&allowed).expect("limit should be allowed");
+        let too_long = "x".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS + 1);
+        let err = validate_goal_objective(&too_long).unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(msg.contains("too long"), "got: {}", msg);
+                assert!(msg.contains("4000"), "got: {}", msg);
+            }
+            other => panic!("expected ExternalAgent error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn goal_token_budget_parser_distinguishes_set_clear_and_omit() {
+        assert_eq!(
+            parse_goal_token_budget(&serde_json::json!({"tokenBudget": 123})).unwrap(),
+            Some(Some(123))
+        );
+        assert_eq!(
+            parse_goal_token_budget(&serde_json::json!({"token_budget": null})).unwrap(),
+            Some(None)
+        );
+        assert_eq!(parse_goal_token_budget(&serde_json::json!({})).unwrap(), None);
+        assert!(parse_goal_token_budget(&serde_json::json!({"tokenBudget": 0})).is_err());
+    }
+
+    #[test]
+    fn goal_response_format_includes_status_usage_and_elapsed() {
+        let response = serde_json::json!({
+            "goal": {
+                "threadId": "thread-abc",
+                "objective": "Reduce p95 latency",
+                "status": "active",
+                "tokenBudget": 200000,
+                "tokensUsed": 1200,
+                "timeUsedSeconds": 125,
+                "createdAt": 1776272400,
+                "updatedAt": 1776272525
+            }
+        });
+        let formatted = format_goal_response("goal updated", &response);
+        assert!(formatted.contains("Reduce p95 latency"), "{}", formatted);
+        assert!(formatted.contains("status active"), "{}", formatted);
+        assert!(formatted.contains("1200 / 200000 tokens"), "{}", formatted);
+        assert!(formatted.contains("2m 5s"), "{}", formatted);
+    }
+
+    #[test]
+    fn goal_notifications_emit_log_events() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "threadId": "thread-abc",
+            "turnId": null,
+            "goal": {
+                "threadId": "thread-abc",
+                "objective": "Ship feature parity",
+                "status": "paused",
+                "tokenBudget": null,
+                "tokensUsed": 10,
+                "timeUsedSeconds": 2,
+                "createdAt": 1776272400,
+                "updatedAt": 1776272402
+            }
+        });
+        translate_notification("thread/goal/updated", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::Log { level, message } => {
+                assert_eq!(level, "info");
+                assert!(message.contains("Ship feature parity"));
+                assert!(message.contains("paused"));
+            }
+            other => panic!("expected Log, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn thread_name_notifications_emit_log_events() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "threadId": "thread-abc",
+            "threadName": "Ship feature parity"
+        });
+        translate_notification("thread/name/updated", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::Log { level, message } => {
+                assert_eq!(level, "info");
+                assert!(message.contains("Ship feature parity"));
+            }
+            other => panic!("expected Log, got {:?}", other),
+        }
     }
 
     #[test]

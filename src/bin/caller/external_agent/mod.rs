@@ -199,6 +199,11 @@ pub enum AgentEvent {
     PlanUpdate {
         entries: Vec<(String, String, String)>,
     },
+    /// Informational backend event that should be written to the activity log.
+    Log {
+        level: String,
+        message: String,
+    },
     /// A tool/command execution has started.
     ToolStarted {
         item_id: String,

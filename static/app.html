@@ -3845,11 +3845,17 @@ html, body {
                   <button class="control-action-btn" data-codex-action="undo" data-turns="1" title="Roll back the last turn (/undo)">Undo</button>
                   <button class="control-action-btn" data-codex-action="fork" data-prompt-name="1" title="Fork the current thread into a new branch (/fork)">Fork…</button>
                   <button class="control-action-btn" data-codex-action="review" data-prompt-review="1" title="Review pending changes (/review)">Review…</button>
+                  <button class="control-action-btn" data-codex-action="rename" data-prompt-rename="1" title="Rename the current Codex thread (/rename)">Rename…</button>
+                  <button class="control-action-btn" data-codex-action="goal" data-prompt-goal="1" title="Create or update the persisted Codex thread goal (/goal)">Goal…</button>
+                  <button class="control-action-btn" data-codex-action="goal-get" title="Fetch the current persisted Codex thread goal (/goal)">Goal status</button>
+                  <button class="control-action-btn" data-codex-action="goal-pause" title="Pause the current Codex thread goal (/goal pause)">Pause goal</button>
+                  <button class="control-action-btn" data-codex-action="goal-resume" title="Resume the current Codex thread goal (/goal resume)">Resume goal</button>
+                  <button class="control-action-btn" data-codex-action="goal-clear" data-confirm="Clear the current Codex goal?" title="Clear the current persisted Codex thread goal (/goal clear)">Clear goal</button>
                   <button class="control-action-btn" data-codex-action="init" title="Create an AGENTS.md for this project (/init)">Init AGENTS.md</button>
                   <button class="control-action-btn" data-codex-action="memory-reset" title="Reset Codex's thread memory (/memory reset)">Reset memory</button>
                 </div>
                 <div class="control-hint">
-                  Actions dispatch to the live Codex thread. <strong>New thread</strong> is the only one that takes effect without an active task — the rest require an already-running Codex session (start any task first). Errors surface as a toast + Activity log entry.
+                  Actions dispatch to the live Codex thread. <strong>New thread</strong> is the only one that takes effect without an active task — the rest require an already-running Codex session (start any task first). Goal actions use Codex's experimental persisted goal API. Errors surface as a toast + Activity log entry.
                 </div>
               </fieldset>
               <fieldset class="control-group">
@@ -6721,9 +6727,8 @@ function onControlActionBtnClick(ev) {
   const op = btn.dataset.codexAction;
   if (!op) return;
   let params = {};
-  // Prompt for the one action that needs a name (/fork) and the one that
-  // takes a free-form prompt (/review). Plain confirms keep the UI light —
-  // a dedicated modal can come later if someone wants better UX.
+  // Prompt for actions that need extra input. Plain prompts keep this control
+  // pane dependency-free; a dedicated modal can come later if needed.
   if (btn.dataset.promptName) {
     const name = window.prompt('Fork name (leave empty for auto):', '');
     if (name === null) return; // user cancelled
@@ -6735,10 +6740,41 @@ function onControlActionBtnClick(ev) {
     );
     if (prompt === null) return;
     if (prompt.trim()) params.prompt = prompt.trim();
+  } else if (btn.dataset.promptRename) {
+    const name = window.prompt('Thread name:', '');
+    if (name === null) return;
+    if (!name.trim()) {
+      showControlToast('error', '/rename failed: thread name is required');
+      return;
+    }
+    params.name = name.trim();
+  } else if (btn.dataset.promptGoal) {
+    const objective = window.prompt('Goal objective:', '');
+    if (objective === null) return;
+    if (!objective.trim()) {
+      showControlToast('error', '/goal failed: objective is required');
+      return;
+    }
+    if ([...objective.trim()].length > 4000) {
+      showControlToast('error', '/goal failed: objective must be 4000 characters or fewer');
+      return;
+    }
+    params.objective = objective.trim();
+    const budget = window.prompt('Token budget (optional):', '');
+    if (budget === null) return;
+    if (budget.trim()) {
+      const parsed = parseInt(budget.trim(), 10);
+      if (isNaN(parsed) || parsed <= 0) {
+        showControlToast('error', '/goal failed: token budget must be a positive integer');
+        return;
+      }
+      params.tokenBudget = parsed;
+    }
   } else if (btn.dataset.turns) {
     const n = parseInt(btn.dataset.turns, 10);
     if (!isNaN(n) && n > 0) params.turns = n;
   }
+  if (btn.dataset.confirm && !window.confirm(btn.dataset.confirm)) return;
   // Init is a task dispatch, not an RPC: send as a regular task instead so
   // the agent loop picks it up and AGENTS.md flows through the normal
   // approval path. The backend dispatcher also accepts /init and will
