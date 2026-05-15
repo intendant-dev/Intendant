@@ -255,16 +255,40 @@ install_vortex_audio() {
     script_dir="$(cd "$(dirname "$0")" && pwd)"
     local vortex_tools="$script_dir/../vendor/vortex-guest-tools"
     local pkg="$vortex_tools/VortexGuestTools.pkg"
+    local manifest="$vortex_tools/VortexGuestTools.pkg.manifest"
 
-    if [[ -f "$pkg" ]]; then
-        info "installing Vortex guest tools..."
-        sudo installer -pkg "$pkg" -target /
-        NEEDS_REBOOT=true
-    else
+    if [[ ! -f "$pkg" ]]; then
         warn "Vortex guest tools not found at $pkg"
         warn "Audio routing will fall back to BlackHole."
-        warn "To install Vortex: place VortexGuestTools.pkg in vendor/vortex-guest-tools/"
+        warn "To install Vortex: run scripts/update-vortex-pkg.sh"
+        return
     fi
+
+    # Verify the vendored pkg matches its committed integrity manifest before
+    # we hand it to `sudo installer`. The pkg installs a LaunchDaemon and a
+    # CoreAudio HAL plugin that run as root — any tamper here is full machine
+    # compromise. Manifest is refreshed atomically by update-vortex-pkg.sh.
+    if [[ ! -f "$manifest" ]]; then
+        die "Vortex pkg present but manifest missing: $manifest"
+    fi
+
+    local expected actual
+    expected="$(awk -F': ' '$1 == "pkg_sha256" { print $2; exit }' "$manifest")"
+    [[ -n "$expected" ]] || die "manifest is missing pkg_sha256: $manifest"
+
+    actual="$(shasum -a 256 "$pkg" | awk '{print $1}')"
+    if [[ "$actual" != "$expected" ]]; then
+        warn "Vortex pkg sha256 mismatch — refusing to install."
+        warn "  expected: $expected"
+        warn "  actual:   $actual"
+        warn "  manifest: $manifest"
+        die "Refresh via scripts/update-vortex-pkg.sh or verify the pkg manually."
+    fi
+    ok "Vortex pkg integrity verified ($expected)"
+
+    info "installing Vortex guest tools..."
+    sudo installer -pkg "$pkg" -target /
+    NEEDS_REBOOT=true
 }
 
 set_vortex_defaults() {
