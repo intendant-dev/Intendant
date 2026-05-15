@@ -85,6 +85,8 @@ The `UserAction` enum in `frontend.rs` forms a **compile-time contract** — the
 
 **Client**: Connects to external MCP servers configured in `intendant.toml`. Tools registered as `mcp__<server>_<tool>`.
 
+**Trust model for the client**: each MCP server entry is spawned as a child process with the user's full privileges (`Command::new(&config.command).args(&config.args)` in `mcp_client.rs`). Intendant performs **no checksum verification, no signature check, and no sandboxing** of MCP server binaries — adding one is equivalent to adding a line to your `~/.zshrc` that runs a binary. Default is `mcp_servers = []`, and `intendant.toml` is git-ignored, so the repo ships no MCP servers. Treat copying an `intendant.toml` between machines like copying shell rc files: read it before sourcing.
+
 ## Repository Layout
 
 ```
