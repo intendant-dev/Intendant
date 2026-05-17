@@ -1584,8 +1584,8 @@ fn print_help() {
     println!("    --sandbox             Enable Landlock filesystem sandboxing for the runtime");
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
-    println!("    --web [PORT]          Web dashboard (default: on, port 8765). Use --no-web to disable");
-    println!("    --no-web              Disable web dashboard");
+    println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle starts daemon/no TUI)");
+    println!("    --no-web              Disable web dashboard; use terminal TUI when interactive");
     println!("    --transcription       Enable user speech transcription");
     println!("    --record-display <ID> Record an existing X11 display (e.g. 50 for :50, repeatable)");
     println!("    --agent <BACKEND>     Use external agent backend (codex, claude-code)");
@@ -1850,8 +1850,9 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
             }
             "--web" => {
                 flags.web = true;
-                // --web serves the TUI via web (xterm.js). Use --web --mcp
-                // for voice-only MCP mode without the web TUI.
+                // --web enables the dashboard. Idle web startup uses the
+                // daemon/no-terminal-TUI path; a task still runs through the
+                // normal frontend selection below.
                 // Optional port argument (next arg if it's numeric)
                 if i + 1 < args.len() && args[i + 1].parse::<u16>().is_ok() {
                     flags.web_port = args[i + 1].parse().unwrap();
@@ -1928,6 +1929,16 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
     }
 
     Ok(flags)
+}
+
+fn should_start_idle_web_daemon(use_web: bool, flags: &CliFlags) -> bool {
+    use_web
+        && !flags.mcp
+        && flags
+            .task
+            .as_ref()
+            .map(|task| task.trim().is_empty())
+            .unwrap_or(true)
 }
 
 fn extract_json(text: &str) -> Option<&str> {
@@ -3124,6 +3135,48 @@ Also: {"source": "bare"}"#;
     #[test]
     fn is_simple_task_multiline() {
         assert!(!is_simple_task("line1\nline2\nline3\nline4"));
+    }
+
+    fn cli_flags_for_tests() -> CliFlags {
+        CliFlags {
+            task: None,
+            provider: None,
+            model: None,
+            verbose: false,
+            no_tui: false,
+            mcp: false,
+            autonomy: AutonomyLevel::Medium,
+            log_file: None,
+            continue_last: false,
+            resume_id: None,
+            control_socket: false,
+            json_output: false,
+            sandbox: false,
+            direct: false,
+            no_presence: false,
+            web: false,
+            web_port: web_gateway::DEFAULT_PORT,
+            transcription: false,
+            record_displays: Vec::new(),
+            agent_backend: None,
+            no_web: false,
+            advertise_urls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn idle_web_defaults_to_daemon_without_no_tui() {
+        let flags = cli_flags_for_tests();
+        assert!(should_start_idle_web_daemon(true, &flags));
+    }
+
+    #[test]
+    fn idle_web_daemon_requires_web_and_no_task() {
+        let mut flags = cli_flags_for_tests();
+        assert!(!should_start_idle_web_daemon(false, &flags));
+
+        flags.task = Some("do the thing".to_string());
+        assert!(!should_start_idle_web_daemon(true, &flags));
     }
 
     #[test]
@@ -8495,12 +8548,10 @@ async fn main() -> Result<(), CallerError> {
     }
 
     // Determine whether to use TUI (needed early for task resolution).
-    // `--web --no-tui` without an initial task is a true daemon: start the
-    // dashboard idle and let the session supervisor own all launches.
-    let web_daemon_requested = use_web
-        && flags.no_tui
-        && !flags.mcp
-        && flags.task.as_ref().map(|t| t.is_empty()).unwrap_or(true);
+    // Idle web/dashboard startup defaults to the daemon path: no terminal TUI,
+    // and the session supervisor owns all launches. `--no-web` keeps the
+    // terminal TUI available for interactive local use.
+    let web_daemon_requested = should_start_idle_web_daemon(use_web, &flags);
     let use_tui = !web_daemon_requested
         && (use_web
             || (!flags.no_tui
