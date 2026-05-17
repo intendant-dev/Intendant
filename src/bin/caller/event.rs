@@ -206,6 +206,10 @@ pub enum AppEvent {
         session_id: String,
         task: Option<String>,
     },
+    SessionAttached {
+        session_id: String,
+        source: String,
+    },
     SessionEnded {
         session_id: String,
         reason: String,
@@ -902,7 +906,8 @@ pub enum ControlMsg {
         /// resolve session history relative to their project roots.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_root: Option<String>,
-        /// Prompt to send after the session is attached.
+        /// Optional prompt to send after the session is attached. When omitted,
+        /// the session is only opened/attached and no agent turn is started.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task: Option<String>,
         /// Bypass presence/orchestration, matching StartTask.direct.
@@ -1182,6 +1187,12 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             Some(OutboundEvent::SessionStarted {
                 session_id: session_id.clone(),
                 task: task.clone(),
+            })
+        }
+        AppEvent::SessionAttached { session_id, source } => {
+            Some(OutboundEvent::SessionAttached {
+                session_id: session_id.clone(),
+                source: source.clone(),
             })
         }
         AppEvent::SessionEnded { session_id, reason } => {
@@ -1649,6 +1660,9 @@ fn write_event_to_session_log(
         }
         AppEvent::SessionStarted { session_id, task } => {
             log.session_started(session_id, task.as_deref());
+        }
+        AppEvent::SessionAttached { session_id, source } => {
+            log.info(&format!("Session attached: {} ({})", session_id, source));
         }
         AppEvent::SessionEnded { session_id, reason } => {
             log.session_ended(session_id, reason);

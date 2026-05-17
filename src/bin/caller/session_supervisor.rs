@@ -270,8 +270,14 @@ impl SessionSupervisor {
         direct: Option<bool>,
     ) {
         let source_norm = source.trim().to_lowercase();
-        let resume_task =
-            task.unwrap_or_else(|| format!("Continue the resumed {} session.", source_norm));
+        let resume_task = task.and_then(|task| {
+            let trimmed = task.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
         let project_root = project_root
             .map(PathBuf::from)
             .unwrap_or_else(|| self.config.project_root.clone());
@@ -286,6 +292,42 @@ impl SessionSupervisor {
                 }
             }
         };
+        let resume_token = resume_id.unwrap_or_else(|| session_id.clone());
+
+        if resume_task.is_none() {
+            if let Some(existing_id) = self
+                .find_managed_session_id(&source_norm, &session_id, &resume_token)
+                .await
+            {
+                let mut state = self.state.lock().await;
+                state.active_session_id = Some(existing_id);
+            } else if external_backend.is_none() {
+                match session_log::SessionLog::find_session_by_id(&session_id) {
+                    Some(dir) => match session_log::SessionLog::open(dir) {
+                        Ok(log) => self.activate_shared_session(Arc::new(Mutex::new(log))).await,
+                        Err(e) => {
+                            self.loop_error(format!("Session open failed: {}", e));
+                            return;
+                        }
+                    },
+                    None => {
+                        self.loop_error(format!("Session '{}' was not found", session_id));
+                        return;
+                    }
+                }
+            }
+
+            self.config.bus.send(AppEvent::SessionAttached {
+                session_id: if external_backend.is_some() {
+                    resume_token
+                } else {
+                    session_id
+                },
+                source: source_norm,
+            });
+            return;
+        }
+        let resume_task = resume_task.expect("checked above");
 
         let log_dir = if external_backend.is_none() {
             match session_log::SessionLog::find_session_by_id(&session_id) {
@@ -309,7 +351,6 @@ impl SessionSupervisor {
             .lock()
             .map(|log| log.session_id().to_string())
             .unwrap_or_else(|_| path_file_name(&log_dir));
-        let resume_token = resume_id.unwrap_or_else(|| session_id.clone());
         let live_session_id = if external_backend.is_some() {
             resume_token.clone()
         } else {
@@ -346,6 +387,23 @@ impl SessionSupervisor {
             Some(resume_token),
         )
         .await;
+    }
+
+    async fn find_managed_session_id(
+        &self,
+        source: &str,
+        session_id: &str,
+        resume_token: &str,
+    ) -> Option<String> {
+        let state = self.state.lock().await;
+        state
+            .sessions
+            .values()
+            .find(|session| {
+                session.source == source
+                    && (session.session_id == session_id || session.session_id == resume_token)
+            })
+            .map(|session| session.session_id.clone())
     }
 
     async fn spawn_agent_session(

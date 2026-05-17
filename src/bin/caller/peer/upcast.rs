@@ -560,6 +560,12 @@ impl AppEventUpcaster {
                 }]
             }
 
+            AppEvent::SessionAttached { session_id, source } => vec![log_event(
+                LogLevel::Info,
+                "session",
+                format!("session attached: {} ({})", session_id, source),
+            )],
+
             AppEvent::SessionEnded { session_id, reason } => vec![PeerEvent::SessionEnded {
                 session_id: session_id.clone(),
                 reason: reason.clone(),
@@ -1518,6 +1524,12 @@ impl WireEventUpcaster {
                     },
                 }]
             }
+
+            OutboundEvent::SessionAttached { session_id, source } => vec![log_event(
+                LogLevel::Info,
+                "session",
+                format!("session attached: {} ({})", session_id, source),
+            )],
 
             OutboundEvent::SessionEnded { session_id, reason } => {
                 vec![PeerEvent::SessionEnded {

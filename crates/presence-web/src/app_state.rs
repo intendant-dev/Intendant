@@ -90,6 +90,10 @@ pub enum UiCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         task: Option<String>,
     },
+    SessionAttached {
+        session_id: String,
+        source: String,
+    },
     SessionEnded {
         session_id: String,
         reason: String,
@@ -1354,6 +1358,13 @@ impl AppState {
                 let task = msg["task"].as_str().map(|s| s.to_string());
                 cmds.extend(self.add_log("info", &format!("Session started: {}", session_id), None, "system"));
                 cmds.push(UiCommand::SessionStarted { session_id, task });
+            }
+
+            "session_attached" => {
+                let session_id = msg["session_id"].as_str().unwrap_or("").to_string();
+                let source = msg["source"].as_str().unwrap_or("").to_string();
+                cmds.extend(self.add_log("info", &format!("Session attached: {} ({})", session_id, source), None, "system"));
+                cmds.push(UiCommand::SessionAttached { session_id, source });
             }
 
             "session_ended" => {
@@ -2638,6 +2649,28 @@ mod tests {
         assert_eq!(s.known_displays.len(), 1);
         assert_eq!(s.known_displays[0], 99);
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::AddDisplay { display_id: 99, .. })));
+    }
+
+    #[test]
+    fn handle_event_session_attached() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "session_attached",
+            "session_id": "session-1",
+            "source": "codex"
+        });
+        let cmds = s.handle_message(&msg);
+
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::SessionAttached { session_id, source }
+                if session_id == "session-1" && source == "codex"
+        )));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, .. }
+                if content == "Session attached: session-1 (codex)"
+        )));
     }
 
     #[test]

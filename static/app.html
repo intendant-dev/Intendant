@@ -6061,6 +6061,7 @@ function processCommands(cmds) {
       case 'remove_recording': removeRecordingStream(c.stream_name); break;
       case 'recording_error': /* logged via add_log_entry */ break;
       case 'session_started': onSessionStarted(c.session_id, c.task); break;
+      case 'session_attached': onSessionAttached(c.session_id, c.source); break;
       case 'session_ended': onSessionEnded(c.session_id, c.reason); break;
       case 'debug_screen_ready': onDebugScreenReady(c.display_id); break;
       case 'debug_screen_torn_down': onDebugScreenTornDown(); break;
@@ -16130,6 +16131,13 @@ function onSessionStarted(sessionId, task) {
   if (typeof refreshHistory === 'function') refreshHistory();
 }
 
+function onSessionAttached(sessionId, source) {
+  currentSessionFullId = sessionId || '';
+  document.getElementById('sb-session').textContent = sessionId ? sessionId.slice(0, 8) : '';
+  switchTab('activity');
+  if (typeof refreshHistory === 'function') refreshHistory();
+}
+
 function onSessionEnded(sessionId, reason) {
   if (!sessionId || sessionId === currentSessionFullId) {
     currentSessionFullId = '';
@@ -16662,7 +16670,7 @@ function renderSessionsList(sessions, el) {
       if (s.can_resume !== false) {
         const resumeBtn = document.createElement('button');
         resumeBtn.className = 'sc-resume-btn';
-        resumeBtn.textContent = 'Resume';
+        resumeBtn.textContent = 'Open';
         resumeBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           resumeSession(s);
@@ -16728,14 +16736,12 @@ function renderSessionsList(sessions, el) {
 function resumeSession(s) {
   if (!app || !s || !s.session_id) return;
   const source = s.source || 'intendant';
-  const task = 'Continue where this session left off.';
   app.send_server_action({
     action: 'resume_session',
     source,
     session_id: s.session_id,
     resume_id: s.resume_id || s.session_id,
     project_root: s.project_root || null,
-    task,
     direct: true,
   });
   switchTab('activity');

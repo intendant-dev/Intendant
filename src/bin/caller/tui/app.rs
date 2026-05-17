@@ -1349,14 +1349,21 @@ impl App {
                 self.current_phase = Phase::Thinking;
                 self.round += 1;
             }
-            ControlMsg::ResumeSession { ref source, ref session_id, .. } => {
+            ControlMsg::ResumeSession { ref source, ref session_id, ref task, .. } => {
                 self.follow_up_textarea = None;
                 self.mode = AppMode::Normal;
-                self.current_phase = Phase::Thinking;
-                self.round += 1;
+                if task.as_ref().map(|t| t.trim()).filter(|t| !t.is_empty()).is_some() {
+                    self.current_phase = Phase::Thinking;
+                    self.round += 1;
+                }
+                let verb = if task.as_ref().map(|t| t.trim()).filter(|t| !t.is_empty()).is_some() {
+                    "Resume"
+                } else {
+                    "Open"
+                };
                 self.log(
                     LogLevel::Info,
-                    format!("Resume {} session {}", source, truncate_str(session_id, 12)),
+                    format!("{} {} session {}", verb, source, truncate_str(session_id, 12)),
                 );
             }
             ControlMsg::ScheduleControllerRestart { .. }
@@ -2233,6 +2240,14 @@ impl App {
                 self.log_local_only(
                     LogLevel::Info,
                     format!("Session started: {} — {}", session_id, task.as_deref().unwrap_or("(idle)")),
+                    LogSource::System,
+                    None,
+                );
+            }
+            AppEvent::SessionAttached { ref session_id, ref source } => {
+                self.log_local_only(
+                    LogLevel::Info,
+                    format!("Session attached: {} ({})", session_id, source),
                     LogSource::System,
                     None,
                 );

@@ -1777,12 +1777,17 @@ async fn handle_control_command_mcp(
             }
             Some(RESOURCE_STATUS_URI)
         }
-        ControlMsg::ResumeSession { source, session_id, .. } => {
+        ControlMsg::ResumeSession { source, session_id, task, .. } => {
+            let action = if task.as_ref().map(|t| t.trim()).filter(|t| !t.is_empty()).is_some() {
+                "resume dispatched"
+            } else {
+                "session attach requested"
+            };
             emit_control_result(
                 control_tx,
                 "resume_session",
                 true,
-                format!("resume dispatched: {} {}", source, session_id),
+                format!("{}: {} {}", action, source, session_id),
                 None,
             );
             Some(RESOURCE_STATUS_URI)
@@ -2464,6 +2469,9 @@ pub fn spawn_event_listener(
                     }
                     AppEvent::SessionStarted { ref session_id, ref task } => {
                         s.push_log(LogLevel::Info, format!("Session started: {} — {}", session_id, task.as_deref().unwrap_or("(no task)")));
+                    }
+                    AppEvent::SessionAttached { ref session_id, ref source } => {
+                        s.push_log(LogLevel::Info, format!("Session attached: {} ({})", session_id, source));
                     }
                     AppEvent::SessionEnded { ref session_id, ref reason } => {
                         s.push_log(LogLevel::Info, format!("Session ended: {} — {}", session_id, reason));
