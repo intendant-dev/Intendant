@@ -45,6 +45,9 @@ pub struct Dispatcher {
     /// Follow-up channel consumed by `run_direct_mode` /
     /// `run_external_agent_mode` in non-presence mode.
     pub follow_up_tx: Option<mpsc::Sender<FollowUpMessage>>,
+    /// Session id owned by the legacy single-session loop. When set, targeted
+    /// commands for any other session are left for the session supervisor.
+    pub primary_session_id: Option<String>,
 }
 
 impl Dispatcher {
@@ -75,6 +78,12 @@ impl Dispatcher {
     }
 
     async fn route(&self, msg: ControlMsg, bus: &EventBus) {
+        if let Some(target_session_id) = control_target_session_id(&msg) {
+            if !self.handles_target_session(target_session_id) {
+                return;
+            }
+        }
+
         match msg {
             ControlMsg::StartTask {
                 session_id: _,
@@ -211,6 +220,29 @@ impl Dispatcher {
             turn: None,
         });
     }
+
+    fn handles_target_session(&self, session_id: &str) -> bool {
+        self.primary_session_id
+            .as_deref()
+            .map(|primary| primary == session_id)
+            .unwrap_or(true)
+    }
+}
+
+fn control_target_session_id(msg: &ControlMsg) -> Option<&str> {
+    match msg {
+        ControlMsg::Status { session_id }
+        | ControlMsg::Approve { session_id, .. }
+        | ControlMsg::Deny { session_id, .. }
+        | ControlMsg::Skip { session_id, .. }
+        | ControlMsg::ApproveAll { session_id, .. }
+        | ControlMsg::Interrupt { session_id, .. }
+        | ControlMsg::Steer { session_id, .. }
+        | ControlMsg::StartTask { session_id, .. }
+        | ControlMsg::FollowUp { session_id, .. } => session_id.as_deref(),
+        ControlMsg::ResumeSession { .. } => None,
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -233,6 +265,7 @@ mod tests {
             presence_tx: Some(presence_tx),
             task_tx: Some(task_tx),
             follow_up_tx: Some(follow_up_tx),
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -271,6 +304,7 @@ mod tests {
             presence_tx: Some(presence_tx),
             task_tx: Some(task_tx),
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -304,6 +338,7 @@ mod tests {
             presence_tx: Some(presence_tx),
             task_tx: Some(task_tx),
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -338,6 +373,7 @@ mod tests {
             presence_tx: Some(presence_tx),
             task_tx: Some(task_tx),
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -366,6 +402,7 @@ mod tests {
             presence_tx: None,
             task_tx: None,
             follow_up_tx: Some(follow_up_tx),
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -386,6 +423,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn targeted_task_for_non_primary_session_is_left_to_supervisor() {
+        let (follow_up_tx, mut follow_up_rx) = mpsc::channel::<FollowUpMessage>(4);
+        let bus = make_test_bus();
+
+        let dispatcher = Dispatcher {
+            presence_tx: None,
+            task_tx: None,
+            follow_up_tx: Some(follow_up_tx),
+            primary_session_id: Some("primary".to_string()),
+        };
+        let _h = dispatcher.spawn(bus.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+            session_id: Some("external".into()),
+            task: "continue there".into(),
+            orchestrate: None,
+            direct: Some(true),
+            reference_frame_ids: vec![],
+            display_target: None,
+            attachments: vec![],
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(follow_up_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn orchestrate_false_implies_direct() {
         let (task_tx, mut task_rx) = mpsc::channel::<presence_core::TaskEnvelope>(4);
         let (presence_tx, mut presence_rx) = mpsc::channel::<String>(4);
@@ -395,6 +459,7 @@ mod tests {
             presence_tx: Some(presence_tx),
             task_tx: Some(task_tx),
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -427,6 +492,7 @@ mod tests {
             presence_tx: None,
             task_tx: Some(task_tx),
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -447,6 +513,7 @@ mod tests {
             presence_tx: None,
             task_tx: None,
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -490,6 +557,7 @@ mod tests {
             presence_tx: None,
             task_tx: None,
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -533,6 +601,7 @@ mod tests {
             presence_tx: None,
             task_tx: None,
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;

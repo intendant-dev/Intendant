@@ -2235,6 +2235,18 @@ impl App {
                 self.log(LogLevel::Info, format!("Recording deleted: {}", stream_name));
             }
             AppEvent::SessionStarted { ref session_id, ref task } => {
+                self.session_id = session_id.clone();
+                if let Some(task) = task {
+                    self.task_description = task.clone();
+                }
+                self.current_phase = Phase::Thinking;
+                derived.push(AppEvent::StatusUpdate {
+                    turn: self.turn,
+                    phase: format!("{:?}", self.current_phase).to_lowercase(),
+                    autonomy: self.autonomy_display.clone(),
+                    session_id: self.session_id.clone(),
+                    task: self.task_description.clone(),
+                });
                 // Local-only: OutboundEvent::SessionStarted already reaches
                 // external consumers.
                 self.log_local_only(
@@ -2245,6 +2257,17 @@ impl App {
                 );
             }
             AppEvent::SessionAttached { ref session_id, ref source } => {
+                self.session_id = session_id.clone();
+                let short_id: String = session_id.chars().take(8).collect();
+                self.task_description = format!("Open {} session {}", source, short_id);
+                self.current_phase = Phase::WaitingFollowUp;
+                derived.push(AppEvent::StatusUpdate {
+                    turn: self.turn,
+                    phase: format!("{:?}", self.current_phase).to_lowercase(),
+                    autonomy: self.autonomy_display.clone(),
+                    session_id: self.session_id.clone(),
+                    task: self.task_description.clone(),
+                });
                 self.log_local_only(
                     LogLevel::Info,
                     format!("Session attached: {} ({})", session_id, source),

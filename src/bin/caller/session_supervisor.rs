@@ -73,6 +73,24 @@ impl SessionSupervisor {
         })
     }
 
+    pub fn spawn_resume_listener(self) -> JoinHandle<()> {
+        let mut rx = self.config.bus.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(AppEvent::ControlCommand(msg)) => {
+                        if self.should_handle_session_control(&msg).await {
+                            self.handle_control_msg(msg).await;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    }
+
     pub async fn run(self) {
         let handle = self.spawn();
         let _ = handle.await;
@@ -169,6 +187,19 @@ impl SessionSupervisor {
                 .await;
             }
             _ => {}
+        }
+    }
+
+    async fn should_handle_session_control(&self, msg: &event::ControlMsg) -> bool {
+        match msg {
+            event::ControlMsg::ResumeSession { .. } => true,
+            _ => {
+                if let Some(session_id) = control_target_session_id(msg) {
+                    self.session_is_managed(session_id).await
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -308,6 +339,7 @@ impl SessionSupervisor {
                 }
             }
         };
+        let is_external = external_backend.is_some();
         let resume_token = resume_id.unwrap_or_else(|| session_id.clone());
 
         if resume_task.is_none() {
@@ -317,6 +349,7 @@ impl SessionSupervisor {
             {
                 let mut state = self.state.lock().await;
                 state.active_session_id = Some(existing_id);
+                self.emit_attached_status(&resume_token, &source_norm).await;
             } else if external_backend.is_none() {
                 match session_log::SessionLog::find_session_by_id(&session_id) {
                     Some(dir) => match session_log::SessionLog::open(dir) {
@@ -331,10 +364,46 @@ impl SessionSupervisor {
                         return;
                     }
                 }
+                self.emit_attached_status(&session_id, &source_norm).await;
+            } else {
+                let log_dir = session_log::SessionLog::resolve_path(None);
+                let session_log = match session_log::SessionLog::open(log_dir.clone()) {
+                    Ok(log) => Arc::new(Mutex::new(log)),
+                    Err(e) => {
+                        self.loop_error(format!("Session open failed: {}", e));
+                        return;
+                    }
+                };
+                let project = match self
+                    .project_with_runtime_config(project_root.clone(), external_backend.as_ref())
+                    .await
+                {
+                    Ok(project) => project,
+                    Err(e) => {
+                        self.loop_error(format!("Project load failed: {}", e));
+                        return;
+                    }
+                };
+
+                self.activate_shared_session(session_log.clone()).await;
+                self.spawn_agent_session(
+                    resume_token.clone(),
+                    source_norm.clone(),
+                    String::new(),
+                    project,
+                    session_log,
+                    log_dir,
+                    external_backend.clone(),
+                    direct.unwrap_or(true),
+                    UserAttachments::default(),
+                    Some(resume_token.clone()),
+                )
+                .await;
+                self.emit_attached_status(&resume_token, &source_norm).await;
             }
 
             self.config.bus.send(AppEvent::SessionAttached {
-                session_id: if external_backend.is_some() {
+                session_id: if is_external {
                     resume_token
                 } else {
                     session_id
@@ -905,6 +974,17 @@ impl SessionSupervisor {
             turn: None,
         });
     }
+
+    async fn emit_attached_status(&self, session_id: &str, source: &str) {
+        let autonomy = self.config.autonomy.read().await.level.to_string();
+        self.config.bus.send(AppEvent::StatusUpdate {
+            turn: 0,
+            phase: "waiting-follow-up".to_string(),
+            autonomy,
+            session_id: session_id.to_string(),
+            task: format!("Open {} session {}", source, short_session(session_id)),
+        });
+    }
 }
 
 fn path_file_name(path: &std::path::Path) -> String {
@@ -912,6 +992,22 @@ fn path_file_name(path: &std::path::Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+fn control_target_session_id(msg: &event::ControlMsg) -> Option<&str> {
+    match msg {
+        event::ControlMsg::Status { session_id }
+        | event::ControlMsg::Approve { session_id, .. }
+        | event::ControlMsg::Deny { session_id, .. }
+        | event::ControlMsg::Skip { session_id, .. }
+        | event::ControlMsg::ApproveAll { session_id, .. }
+        | event::ControlMsg::Interrupt { session_id, .. }
+        | event::ControlMsg::Steer { session_id, .. }
+        | event::ControlMsg::StartTask { session_id, .. }
+        | event::ControlMsg::FollowUp { session_id, .. } => session_id.as_deref(),
+        event::ControlMsg::ResumeSession { .. } => None,
+        _ => None,
+    }
 }
 
 fn short_session(session_id: &str) -> String {

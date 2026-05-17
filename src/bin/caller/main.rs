@@ -6898,7 +6898,11 @@ async fn run_external_agent_mode(
     });
     if headless {
         println!("External agent: {}", backend);
-        println!("Task: {}", task);
+        if task.trim().is_empty() {
+            println!("Attached session; waiting for input");
+        } else {
+            println!("Task: {}", task);
+        }
         println!("---");
     }
 
@@ -6906,28 +6910,15 @@ async fn run_external_agent_mode(
     let (mut agent, thread, mut event_rx) =
         create_external_agent(&backend, &project, &session_log, web_port, resume_session).await?;
 
-    emit_user_message_log(&bus, &session_log, &task);
-    if attachments.is_empty() {
-        agent.send_message(&thread, &task).await?;
-    } else {
-        agent
-            .send_message_with_attachments(&thread, &task, &attachments.items)
-            .await?;
-        slog(&session_log, |l| {
-            l.info(&format!(
-                "Initial task sent to external agent with {} attachment(s)",
-                attachments.len()
-            ))
-        });
-    }
-    if attachments.is_empty() {
-        slog(&session_log, |l| l.info("Initial task sent to external agent"));
-    }
-
     // Event loop
-    let mut round = 1usize;
+    let mut round = 0usize;
     let mut stats = LoopStats::default();
     let live_session_id = control_session_id.or_else(|| session_log_id(&session_log));
+    let mut next_turn = if task.trim().is_empty() {
+        None
+    } else {
+        Some((task, attachments))
+    };
 
     let drain_config = DrainConfig {
         bus: &bus,
@@ -6944,6 +6935,71 @@ async fn run_external_agent_mode(
     };
 
     loop {
+        let (turn_text, attachments) = match next_turn.take() {
+            Some(turn) => turn,
+            None => match follow_up_rx.recv().await {
+                Some(followup) => (followup.text, followup.attachments),
+                None => {
+                    slog(&session_log, |l| {
+                        l.info("Follow-up channel closed, exiting")
+                    });
+                    break;
+                }
+            },
+        };
+
+        round += 1;
+        stats.turns = 0;
+        let attachment_count = attachments.len();
+        emit_user_message_log(&bus, &session_log, &turn_text);
+        let merged = drain_steer_queue_as_followup(
+            &context_injection,
+            &turn_text,
+            &bus,
+            live_session_id.as_deref(),
+        )
+        .unwrap_or_else(|| turn_text.clone());
+        slog(&session_log, |l| {
+            if round == 1 {
+                l.info(&format!(
+                    "Initial task sent to external agent{}",
+                    if attachment_count == 0 {
+                        String::new()
+                    } else {
+                        format!(" with {} attachment(s)", attachment_count)
+                    }
+                ));
+            } else {
+                l.info(&format!(
+                    "Follow-up round {}: {}{}",
+                    round,
+                    merged,
+                    if attachment_count == 0 {
+                        String::new()
+                    } else {
+                        format!(" ({} attachment(s))", attachment_count)
+                    }
+                ));
+            }
+        });
+        let send_result = if attachments.is_empty() {
+            agent.send_message(&thread, &merged).await
+        } else {
+            agent
+                .send_message_with_attachments(&thread, &merged, &attachments.items)
+                .await
+        };
+        if let Err(e) = send_result {
+            if round == 1 {
+                return Err(e);
+            }
+            bus.send(AppEvent::LoopError(format!(
+                "Failed to send follow-up: {}",
+                e
+            )));
+            break;
+        }
+
         match drain_external_agent_events(&mut agent, &mut event_rx, &drain_config, &mut stats)
             .await
         {
@@ -6962,59 +7018,6 @@ async fn run_external_agent_mode(
                     native_message_count: None,
                 });
                 slog(&session_log, |l| l.round_complete(round, turns_in_round));
-
-                // Wait for follow-up or channel close
-                match follow_up_rx.recv().await {
-                    Some(followup) => {
-                        round += 1;
-                        stats.turns = 0;
-                        let attachment_count = followup.attachments.len();
-                        emit_user_message_log(&bus, &session_log, &followup.text);
-                        let merged = drain_steer_queue_as_followup(
-                            &context_injection,
-                            &followup.text,
-                            &bus,
-                            live_session_id.as_deref(),
-                        )
-                        .unwrap_or_else(|| followup.text.clone());
-                        slog(&session_log, |l| {
-                            l.info(&format!(
-                                "Follow-up round {}: {}{}",
-                                round,
-                                merged,
-                                if attachment_count == 0 {
-                                    String::new()
-                                } else {
-                                    format!(" ({} attachment(s))", attachment_count)
-                                }
-                            ));
-                        });
-                        let send_result = if followup.attachments.is_empty() {
-                            agent.send_message(&thread, &merged).await
-                        } else {
-                            agent
-                                .send_message_with_attachments(
-                                    &thread,
-                                    &merged,
-                                    &followup.attachments.items,
-                                )
-                                .await
-                        };
-                        if let Err(e) = send_result {
-                            bus.send(AppEvent::LoopError(format!(
-                                "Failed to send follow-up: {}",
-                                e
-                            )));
-                            break;
-                        }
-                    }
-                    None => {
-                        slog(&session_log, |l| {
-                            l.info("Follow-up channel closed, exiting")
-                        });
-                        break;
-                    }
-                }
             }
             DrainOutcome::Interrupted { reason } => {
                 // User-requested interrupt. Emit RoundComplete so the
@@ -7030,57 +7033,6 @@ async fn run_external_agent_mode(
                     turns_in_round: stats.turns,
                     native_message_count: None,
                 });
-                match follow_up_rx.recv().await {
-                    Some(followup) => {
-                        round += 1;
-                        stats.turns = 0;
-                        let attachment_count = followup.attachments.len();
-                        emit_user_message_log(&bus, &session_log, &followup.text);
-                        let merged = drain_steer_queue_as_followup(
-                            &context_injection,
-                            &followup.text,
-                            &bus,
-                            session_log_id(&session_log).as_deref(),
-                        )
-                        .unwrap_or_else(|| followup.text.clone());
-                        slog(&session_log, |l| {
-                            l.info(&format!(
-                                "Follow-up round {}: {}{}",
-                                round,
-                                merged,
-                                if attachment_count == 0 {
-                                    String::new()
-                                } else {
-                                    format!(" ({} attachment(s))", attachment_count)
-                                }
-                            ));
-                        });
-                        let send_result = if followup.attachments.is_empty() {
-                            agent.send_message(&thread, &merged).await
-                        } else {
-                            agent
-                                .send_message_with_attachments(
-                                    &thread,
-                                    &merged,
-                                    &followup.attachments.items,
-                                )
-                                .await
-                        };
-                        if let Err(e) = send_result {
-                            bus.send(AppEvent::LoopError(format!(
-                                "Failed to send follow-up: {}",
-                                e
-                            )));
-                            break;
-                        }
-                    }
-                    None => {
-                        slog(&session_log, |l| {
-                            l.info("Follow-up channel closed after interrupt, exiting")
-                        });
-                        break;
-                    }
-                }
             }
             DrainOutcome::Terminated { reason, exit_code } => {
                 stats.rounds = round;
@@ -9349,6 +9301,10 @@ async fn main() -> Result<(), CallerError> {
             presence_tx: presence_tx_for_dispatch,
             task_tx: task_tx.clone(),
             follow_up_tx: Some(follow_up_tx.clone()),
+            primary_session_id: session_log
+                .lock()
+                .map(|log| log.session_id().to_string())
+                .ok(),
         }
         .spawn(bus.clone());
 
@@ -9359,6 +9315,7 @@ async fn main() -> Result<(), CallerError> {
         // injections still reach the agent loop in --no-presence mode.
         // When presence is disabled, agent_state is a fresh empty snapshot
         // (no live updates), but context_injection is still wired through.
+        let mut web_shared_session_for_supervisor: Option<web_gateway::SharedActiveSession> = None;
         let _web_handle = if let Some(broadcast_tx) = web_broadcast_tx {
             let query_ctx_agent_state = presence_agent_state
                 .clone()
@@ -9402,6 +9359,7 @@ async fn main() -> Result<(), CallerError> {
                     file_watcher: shared_file_watcher.clone(),
                 },
             ));
+            web_shared_session_for_supervisor = Some(shared_session.clone());
             // Create MCP server for HTTP transport (display/CU tools for external agents)
             let mut mcp_http_state = mcp::McpAppState::new(
                 "none".into(), "none".into(), autonomy.clone(), log_dir.clone(),
@@ -9514,6 +9472,27 @@ async fn main() -> Result<(), CallerError> {
                 project_root: Some(project.root.clone()),
             },
         );
+        let _resume_listener_handle = if use_web {
+            Some(
+                session_supervisor::SessionSupervisor::new(
+                    session_supervisor::SessionSupervisorConfig {
+                        bus: bus.clone(),
+                        project_root: project.root.clone(),
+                        autonomy: autonomy.clone(),
+                        shared_external_agent: shared_external_agent.clone(),
+                        shared_codex_config: shared_codex_config.clone(),
+                        shared_gemini_config: shared_gemini_config.clone(),
+                        frame_registry: frame_registry.clone(),
+                        web_port: web_port_for_agent,
+                        flags_direct: flags.direct,
+                        shared_session: web_shared_session_for_supervisor.clone(),
+                    },
+                )
+                .spawn_resume_listener(),
+            )
+        } else {
+            None
+        };
         let mut loop_handle = if use_presence {
             // Presence mode: the presence layer mediates between user and agent
             let presence_user_rx = presence_user_rx.unwrap();
