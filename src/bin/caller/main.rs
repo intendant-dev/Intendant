@@ -287,6 +287,20 @@ fn emit_task_dispatched_log(
     });
 }
 
+fn emit_user_message_log(bus: &EventBus, session_log: &SharedSessionLog, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    slog(session_log, |l| l.info(&format!("[user] {}", text)));
+    bus.send(AppEvent::LogEntry {
+        level: "info".to_string(),
+        source: "User".to_string(),
+        content: text.to_string(),
+        turn: None,
+    });
+}
+
 /// Resolve external agent backend from an explicit override, falling back to
 /// the project config's `agent.default_backend` setting.
 fn resolve_agent_backend_from_config(
@@ -6657,6 +6671,7 @@ async fn run_external_agent_mode(
     let (mut agent, thread, mut event_rx) =
         create_external_agent(&backend, &project, &session_log, web_port, resume_session).await?;
 
+    emit_user_message_log(&bus, &session_log, &task);
     if attachment_images.is_empty() {
         agent.send_message(&thread, &task).await?;
     } else {
@@ -6691,7 +6706,7 @@ async fn run_external_agent_mode(
         log_dir: &_log_dir,
         approval_registry: &approval_registry,
         json_approval: json_approval.as_ref(),
-        agent_source: None,
+        agent_source: Some(backend.to_string()),
         suppress_agent_started: false,
         headless,
         context_injection: &context_injection,
@@ -6722,6 +6737,7 @@ async fn run_external_agent_mode(
                     Some(followup) => {
                         round += 1;
                         stats.turns = 0;
+                        emit_user_message_log(&bus, &session_log, &followup);
                         let merged = drain_steer_queue_as_followup(
                             &context_injection,
                             &followup,
@@ -6766,6 +6782,7 @@ async fn run_external_agent_mode(
                     Some(followup) => {
                         round += 1;
                         stats.turns = 0;
+                        emit_user_message_log(&bus, &session_log, &followup);
                         let merged = drain_steer_queue_as_followup(
                             &context_injection,
                             &followup,

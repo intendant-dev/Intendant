@@ -2631,14 +2631,16 @@ pub fn session_log_entry_to_app_event(
         // "system".  `[model] Thinking` / `[model] Tool call:` are demoted
         // to "detail" so they only show under verbose verbosity.
         "info" | "warn" | "error" | "debug" => {
-            let source = if message.starts_with("[presence]")
+            let (source, content) = if let Some(rest) = message.strip_prefix("[user] ") {
+                ("User", rest.to_string())
+            } else if message.starts_with("[presence]")
                 || message.starts_with("[model]")
                 || message.starts_with("Presence")
                 || message.starts_with("[ws]")
             {
-                "server"
+                ("server", message.to_string())
             } else {
-                "system"
+                ("system", message.to_string())
             };
             let level = if event_type == "info"
                 && (message.starts_with("[model] Thinking")
@@ -2651,7 +2653,7 @@ pub fn session_log_entry_to_app_event(
             Some(AppEvent::LogEntry {
                 level: level.to_string(),
                 source: source.to_string(),
-                content: message.to_string(),
+                content,
                 turn,
             })
         }
@@ -4163,6 +4165,27 @@ mod tests {
         });
         match session_log_entry_to_app_event(&presence, dir.path()).unwrap() {
             AppEvent::LogEntry { source, .. } => assert_eq!(source, "server"),
+            other => panic!("expected LogEntry, got {:?}", other),
+        }
+
+        // "[user] ..." → user source with the storage prefix stripped.
+        let user = serde_json::json!({
+            "ts": "01:00:00.000",
+            "event": "info",
+            "level": "info",
+            "message": "[user] Continue fixing the activity log",
+        });
+        match session_log_entry_to_app_event(&user, dir.path()).unwrap() {
+            AppEvent::LogEntry {
+                level,
+                source,
+                content,
+                ..
+            } => {
+                assert_eq!(level, "info");
+                assert_eq!(source, "User");
+                assert_eq!(content, "Continue fixing the activity log");
+            }
             other => panic!("expected LogEntry, got {:?}", other),
         }
     }
