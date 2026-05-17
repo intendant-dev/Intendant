@@ -59,6 +59,7 @@ use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tool_batch::{assemble_batch_from_tool_calls, map_results_to_tool_responses};
 
 type SharedSessionLog = Arc<Mutex<session_log::SessionLog>>;
@@ -562,6 +563,14 @@ struct DrainConfig<'a> {
     context_injection: &'a event::ContextInjectionQueue,
 }
 
+const EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct ExternalContextSnapshotState {
+    last_key: Option<u64>,
+    last_error: Option<String>,
+}
+
 /// Result of draining one batch of external agent events.
 enum DrainOutcome {
     /// The agent's turn completed. The caller decides how to continue
@@ -585,13 +594,47 @@ enum DrainOutcome {
     Interrupted { reason: String },
 }
 
-async fn emit_external_context_snapshot(
+fn external_context_snapshot_key(snapshot: &external_agent::AgentContextSnapshot) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut h = DefaultHasher::new();
+    snapshot.source.hash(&mut h);
+    snapshot.label.hash(&mut h);
+    snapshot.format.hash(&mut h);
+    snapshot.token_count.hash(&mut h);
+    snapshot.context_window.hash(&mut h);
+    snapshot.item_count.hash(&mut h);
+    match serde_json::to_vec(&snapshot.raw) {
+        Ok(bytes) => bytes.hash(&mut h),
+        Err(_) => snapshot.raw.to_string().hash(&mut h),
+    }
+    h.finish()
+}
+
+fn external_context_snapshot_turn(stats: &LoopStats) -> Option<usize> {
+    if stats.turns > 0 {
+        Some(stats.turns)
+    } else {
+        None
+    }
+}
+
+async fn emit_external_context_snapshot_if_changed(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     config: &DrainConfig<'_>,
     turn: Option<usize>,
+    state: &mut ExternalContextSnapshotState,
 ) {
     match agent.context_snapshot().await {
         Ok(Some(snapshot)) => {
+            let key = external_context_snapshot_key(&snapshot);
+            if state.last_key == Some(key) {
+                state.last_error = None;
+                return;
+            }
+            state.last_key = Some(key);
+            state.last_error = None;
             config.bus.send(AppEvent::ContextSnapshot {
                 source: snapshot.source,
                 label: snapshot.label,
@@ -603,14 +646,18 @@ async fn emit_external_context_snapshot(
                 raw: snapshot.raw,
             });
         }
-        Ok(None) => {}
+        Ok(None) => {
+            state.last_error = None;
+        }
         Err(e) => {
-            slog(config.session_log, |l| {
-                l.warn(&format!(
-                    "Failed to read context snapshot from {}: {}",
-                    agent.name(), e
-                ))
-            });
+            let message = format!(
+                "Failed to read context snapshot from {}: {}",
+                agent.name(), e
+            );
+            if state.last_error.as_deref() != Some(message.as_str()) {
+                slog(config.session_log, |l| l.warn(&message));
+                state.last_error = Some(message);
+            }
         }
     }
 }
@@ -657,6 +704,12 @@ async fn drain_external_agent_events(
     // see 2-4 identical emissions per real file write. We dedupe on the
     // unified-diff bytes: if nothing changed, don't spam session.jsonl.
     let mut last_diff_hash: Option<u64> = None;
+    let mut context_snapshot_state = ExternalContextSnapshotState::default();
+    let mut context_snapshot_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL,
+        EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL,
+    );
+    context_snapshot_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Background watcher: if an interrupt arrives while an approval handler
     // below is blocked on `rx.await`, we need to drain the approval registry
@@ -811,6 +864,16 @@ async fn drain_external_agent_events(
                     }
                 }
             }
+            _ = context_snapshot_tick.tick() => {
+                emit_external_context_snapshot_if_changed(
+                    agent,
+                    config,
+                    external_context_snapshot_turn(stats),
+                    &mut context_snapshot_state,
+                )
+                .await;
+                continue;
+            }
             maybe_event = event_rx.recv() => {
                 match maybe_event {
                     Some(e) => e,
@@ -895,6 +958,13 @@ async fn drain_external_agent_events(
                         source: config.agent_source.clone(),
                     });
                 }
+                emit_external_context_snapshot_if_changed(
+                    agent,
+                    config,
+                    external_context_snapshot_turn(stats),
+                    &mut context_snapshot_state,
+                )
+                .await;
             }
             external_agent::AgentEvent::ToolOutputDelta { text, .. } => {
                 // Gemini CLI strips images from ACP, sending "[Image: image/png]".
@@ -942,6 +1012,13 @@ async fn drain_external_agent_events(
                 command,
                 category,
             } => {
+                emit_external_context_snapshot_if_changed(
+                    agent,
+                    config,
+                    external_context_snapshot_turn(stats),
+                    &mut context_snapshot_state,
+                )
+                .await;
                 let cat = match category {
                     external_agent::ApprovalCategory::CommandExecution => {
                         autonomy::ActionCategory::CommandExec
@@ -1201,12 +1278,13 @@ async fn drain_external_agent_events(
                 if let Some(ref msg) = message {
                     stats.last_response = Some(msg.clone());
                 }
-                let turn = if stats.turns > 0 {
-                    Some(stats.turns)
-                } else {
-                    None
-                };
-                emit_external_context_snapshot(agent, config, turn).await;
+                emit_external_context_snapshot_if_changed(
+                    agent,
+                    config,
+                    external_context_snapshot_turn(stats),
+                    &mut context_snapshot_state,
+                )
+                .await;
                 if interrupt_pending {
                     let reason = message
                         .clone()
