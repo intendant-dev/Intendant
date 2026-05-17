@@ -1769,7 +1769,7 @@ fn session_changed_sort_key(session: &serde_json::Value) -> i64 {
 }
 
 fn sort_sessions_newest_first(sessions: &mut Vec<serde_json::Value>) {
-    sessions.sort_by(|a, b| session_changed_sort_key(b).cmp(session_changed_sort_key(a)));
+    sessions.sort_by(|a, b| session_changed_sort_key(b).cmp(&session_changed_sort_key(a)));
 }
 
 fn session_source(session: &serde_json::Value) -> &str {
