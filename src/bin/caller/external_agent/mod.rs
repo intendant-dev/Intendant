@@ -290,6 +290,18 @@ pub struct AgentThread {
     pub thread_id: String,
 }
 
+/// Parsed raw context snapshot exposed by an external agent backend.
+#[derive(Debug, Clone)]
+pub struct AgentContextSnapshot {
+    pub source: String,
+    pub label: String,
+    pub format: String,
+    pub token_count: Option<u64>,
+    pub context_window: Option<u64>,
+    pub item_count: Option<usize>,
+    pub raw: serde_json::Value,
+}
+
 /// Trait for opaque external agent backends.
 ///
 /// Intendant supervises the agent, bridges approval requests to its
@@ -326,6 +338,13 @@ pub trait ExternalAgent: Send + Sync {
     ) -> Result<(), CallerError> {
         let _ = images;
         self.send_message(thread, message).await
+    }
+
+    /// Return the backend's current parsed raw model context when the
+    /// backend exposes a native read API. Backends without such an API
+    /// return `None` rather than synthesizing an inexact transcript.
+    async fn context_snapshot(&mut self) -> Result<Option<AgentContextSnapshot>, CallerError> {
+        Ok(None)
     }
 
     /// Send a user message with a heterogeneous list of attachments

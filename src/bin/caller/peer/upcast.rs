@@ -272,6 +272,7 @@ impl AppEventUpcaster {
             | AppEvent::Tick
             | AppEvent::ControlCommand(_)
             | AppEvent::DisplayMetrics { .. }
+            | AppEvent::ContextSnapshot { .. }
             | AppEvent::CodexThreadActionRequested { .. }
             | AppEvent::GeminiThreadActionRequested { .. }
             | AppEvent::FileChanged { .. }
@@ -1212,6 +1213,7 @@ impl WireEventUpcaster {
             // so they're intentionally absent from the peer event vocabulary.
             OutboundEvent::Unknown
             | OutboundEvent::DisplayMetrics { .. }
+            | OutboundEvent::ContextSnapshot { .. }
             | OutboundEvent::FileChanged { .. }
             | OutboundEvent::UploadReady { .. }
             | OutboundEvent::UploadDeleted { .. }

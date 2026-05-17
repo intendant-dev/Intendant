@@ -9396,6 +9396,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_replay_jsonl_includes_context_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        log.context_snapshot(
+            "native",
+            "Internal agent messages",
+            Some(1),
+            "intendant.conversation.messages.v1",
+            None,
+            Some(200_000),
+            Some(1),
+            &serde_json::json!([{"role": "user", "content": "hi"}]),
+        );
+        drop(log);
+
+        let contents =
+            std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let entries = replay_jsonl_to_outbound_entries(&contents, &log_dir);
+
+        let context = entries
+            .iter()
+            .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("context_snapshot"))
+            .expect("context_snapshot should replay");
+        assert_eq!(
+            context.get("format").and_then(|v| v.as_str()),
+            Some("intendant.conversation.messages.v1")
+        );
+        assert_eq!(
+            context
+                .pointer("/raw/0/role")
+                .and_then(|v| v.as_str()),
+            Some("user")
+        );
+    }
+
     #[tokio::test]
     async fn test_spawn_web_gateway_lifecycle() {
         let bus = EventBus::new();

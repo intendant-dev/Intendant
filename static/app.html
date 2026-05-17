@@ -907,6 +907,68 @@ html, body {
 .verbosity-select:focus,
 .host-filter-select:focus { outline: none; border-color: var(--blue); }
 
+.context-pane {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--base);
+}
+.context-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+.context-title {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.context-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--subtext1);
+  font-size: 11px;
+  white-space: nowrap;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+.context-meta strong {
+  color: var(--overlay2);
+  font-weight: 500;
+}
+.context-raw {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 14px 16px;
+  overflow: auto;
+  background: #151521;
+  color: var(--text);
+  border: none;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre;
+  tab-size: 2;
+}
+.json-key { color: var(--blue); }
+.json-string { color: var(--green); }
+.json-number { color: var(--peach); }
+.json-boolean { color: var(--mauve); font-weight: 600; }
+.json-null { color: var(--overlay1); font-style: italic; }
+.json-punctuation { color: var(--overlay1); }
+.json-error { color: var(--red); }
+
 /* Stop button — interrupt the current agent turn. Lives in the Activity
    toolbar and is shown only while a turn is in flight. */
 .stop-btn {
@@ -3728,6 +3790,7 @@ html, body {
     <div id="tab-activity" class="tab-pane active">
       <div class="subtabs" id="activity-subtabs">
         <button class="subtab-btn active" data-activity-tab="log">Log</button>
+        <button class="subtab-btn" data-activity-tab="context">Context</button>
         <button class="subtab-btn" data-activity-tab="changes">
           Changes <span class="badge" id="badge-changes" style="display:none"></span>
         </button>
@@ -3803,6 +3866,19 @@ html, body {
 
           <!-- Follow-up is handled by the always-visible activity-task-input
                at the top of this pane. No separate follow-up panel needed. -->
+        </div>
+        <div class="subtab-pane" id="activity-context-pane">
+          <div class="context-pane">
+            <div class="context-toolbar">
+              <span class="context-title" id="context-title">Context</span>
+              <span class="context-meta"><strong>Source</strong><span id="context-source">--</span></span>
+              <span class="context-meta"><strong>Turn</strong><span id="context-turn">--</span></span>
+              <span class="context-meta"><strong>Items</strong><span id="context-items">--</span></span>
+              <span class="context-meta"><strong>Tokens</strong><span id="context-tokens">--</span></span>
+              <span class="context-meta"><strong>Format</strong><span id="context-format">--</span></span>
+            </div>
+            <pre class="context-raw" id="context-raw">No context snapshot yet</pre>
+          </div>
         </div>
         <div class="subtab-pane" id="activity-changes-pane">
           <div class="changes-timeline" id="changes-timeline" style="display:none">
@@ -5385,6 +5461,27 @@ async function main() {
     // msg is a JS object (from WASM serde), not a raw string.
     try {
       const d = typeof msg === 'string' ? JSON.parse(msg) : msg;
+      if (d.event === 'context_snapshot') {
+        handleContextSnapshot(d);
+        return;
+      }
+      if (d.t === 'log_replay' && Array.isArray(d.entries)) {
+        const snapshots = d.entries
+          .filter(entry => entry && entry.event === 'context_snapshot');
+        const latest = snapshots.length ? snapshots[snapshots.length - 1] : null;
+        if (latest) handleContextSnapshot(latest);
+        const filtered = {
+          ...d,
+          entries: d.entries.filter(entry => !entry || entry.event !== 'context_snapshot'),
+        };
+        const cmds = app.handle_server_message(filtered);
+        if (cmds) processCommands(cmds);
+        // Historical replay can emit lifecycle commands such as session_ended
+        // that move the live dashboard to Sessions. The URL remains the
+        // navigation source of truth, so re-apply it after replay settles.
+        applyCurrentRoute();
+        return;
+      }
       if (d.t === 'annotation_saved' && d.path) {
         showAnnotationResult(d.path);
         return;
@@ -11186,7 +11283,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 // (verbosity, direct-mode, host filter, sessions filters).
 
 const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'sessions', 'settings'];
-const VALID_ACTIVITY_SUBTABS = ['log', 'changes', 'control'];
+const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['tui', 'shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
 
@@ -11308,6 +11405,86 @@ function switchTab(tabId) {
 // Remember the last active sub-tab across page reloads so users don't
 // lose their place when the page auto-refreshes.
 let activeActivitySubtab = 'log';
+let latestContextSnapshot = null;
+
+function contextValueText(value) {
+  if (value === null || value === undefined) return '--';
+  if (typeof value === 'number') return value.toLocaleString();
+  return String(value);
+}
+
+function escapeContextHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function highlightJson(jsonText) {
+  const tokenRe = /("(?:\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*"\s*:)|("(?:\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*")|\b(true|false)\b|\bnull\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[{}\[\],]/g;
+  let html = '';
+  let lastIndex = 0;
+  let match;
+  while ((match = tokenRe.exec(jsonText)) !== null) {
+    const token = match[0];
+    html += escapeContextHtml(jsonText.slice(lastIndex, match.index));
+    let cls = 'json-number';
+    if (match[1]) {
+      cls = 'json-key';
+    } else if (match[2]) {
+      cls = 'json-string';
+    } else if (token === 'true' || token === 'false') {
+      cls = 'json-boolean';
+    } else if (token === 'null') {
+      cls = 'json-null';
+    } else if (/^[{}\[\],]$/.test(token)) {
+      cls = 'json-punctuation';
+    }
+    html += `<span class="${cls}">${escapeContextHtml(token)}</span>`;
+    lastIndex = tokenRe.lastIndex;
+  }
+  html += escapeContextHtml(jsonText.slice(lastIndex));
+  return html;
+}
+
+function handleContextSnapshot(snapshot) {
+  latestContextSnapshot = snapshot;
+  renderContextPane();
+}
+
+function renderContextPane() {
+  const rawEl = document.getElementById('context-raw');
+  if (!rawEl) return;
+  const set = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = contextValueText(value);
+  };
+  if (!latestContextSnapshot) {
+    set('context-source', '--');
+    set('context-turn', '--');
+    set('context-items', '--');
+    set('context-tokens', '--');
+    set('context-format', '--');
+    rawEl.innerHTML = '<span class="json-null">No context snapshot yet</span>';
+    return;
+  }
+  const d = latestContextSnapshot;
+  set('context-source', d.label || d.source || 'model');
+  set('context-turn', d.turn);
+  set('context-items', d.item_count);
+  const tokens = d.token_count && d.context_window
+    ? `${Number(d.token_count).toLocaleString()} / ${Number(d.context_window).toLocaleString()}`
+    : d.token_count;
+  set('context-tokens', tokens);
+  set('context-format', d.format || '--');
+  const raw = Object.prototype.hasOwnProperty.call(d, 'raw') ? d.raw : d;
+  const rawText = typeof raw === 'string'
+    ? raw
+    : JSON.stringify(raw, null, 2);
+  rawEl.innerHTML = highlightJson(rawText);
+}
 
 function switchActivitySubtab(name) {
   if (activeActivitySubtab === name) return;
@@ -11316,8 +11493,12 @@ function switchActivitySubtab(name) {
     btn.classList.toggle('active', btn.dataset.activityTab === name);
   });
   document.getElementById('activity-log-pane').classList.toggle('active', name === 'log');
+  document.getElementById('activity-context-pane').classList.toggle('active', name === 'context');
   document.getElementById('activity-changes-pane').classList.toggle('active', name === 'changes');
   document.getElementById('activity-control-pane').classList.toggle('active', name === 'control');
+  if (name === 'context') {
+    renderContextPane();
+  }
   if (name === 'changes') {
     const badge = document.getElementById('badge-changes');
     if (badge) { badge.style.display = 'none'; badge.textContent = ''; }

@@ -542,6 +542,36 @@ enum DrainOutcome {
     Interrupted { reason: String },
 }
 
+async fn emit_external_context_snapshot(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    config: &DrainConfig<'_>,
+    turn: Option<usize>,
+) {
+    match agent.context_snapshot().await {
+        Ok(Some(snapshot)) => {
+            config.bus.send(AppEvent::ContextSnapshot {
+                source: snapshot.source,
+                label: snapshot.label,
+                turn,
+                format: snapshot.format,
+                token_count: snapshot.token_count,
+                context_window: snapshot.context_window,
+                item_count: snapshot.item_count,
+                raw: snapshot.raw,
+            });
+        }
+        Ok(None) => {}
+        Err(e) => {
+            slog(config.session_log, |l| {
+                l.warn(&format!(
+                    "Failed to read context snapshot from {}: {}",
+                    agent.name(), e
+                ))
+            });
+        }
+    }
+}
+
 /// Drain external agent events until a turn completes, the agent terminates,
 /// or the channel closes.
 ///
@@ -1101,6 +1131,12 @@ async fn drain_external_agent_events(
                 if let Some(ref msg) = message {
                     stats.last_response = Some(msg.clone());
                 }
+                let turn = if stats.turns > 0 {
+                    Some(stats.turns)
+                } else {
+                    None
+                };
+                emit_external_context_snapshot(agent, config, turn).await;
                 if interrupt_pending {
                     let reason = message
                         .clone()
@@ -3824,18 +3860,31 @@ async fn run_agent_loop(
             remaining,
         });
 
+        // When CU is enabled, the OpenAI computer tool rejects multiple images.
+        // Strip all but the most recent screenshot before each API call so the
+        // logged context matches the payload sent to the model.
+        if provider.cu_enabled() {
+            conversation.strip_old_images();
+        }
+
         // Log the full messages array being sent to the API
         slog(&session_log, |l| {
             if let Ok(json) = serde_json::to_string_pretty(conversation.messages()) {
                 l.messages_input(&json);
             }
         });
-
-        // When CU is enabled, the OpenAI computer tool rejects multiple images.
-        // Strip all but the most recent screenshot before each API call.
-        if provider.cu_enabled() {
-            conversation.strip_old_images();
-        }
+        let raw_context = serde_json::to_value(conversation.messages())
+            .unwrap_or_else(|_| serde_json::json!([]));
+        bus.send(AppEvent::ContextSnapshot {
+            source: "native".to_string(),
+            label: "Internal agent messages".to_string(),
+            turn: Some(turn),
+            format: "intendant.conversation.messages.v1".to_string(),
+            token_count: conversation.last_usage().map(|u| u.total_tokens),
+            context_window: Some(conversation.context_window()),
+            item_count: Some(conversation.messages().len()),
+            raw: raw_context,
+        });
 
         // Streaming API call — wrapped in select! so an interrupt cancels
         // mid-stream without waiting for the provider to finish. The

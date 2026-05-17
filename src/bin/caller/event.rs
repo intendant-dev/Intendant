@@ -428,6 +428,17 @@ pub enum AppEvent {
         main: crate::frontend::ModelUsageSnapshot,
         presence: Option<crate::frontend::ModelUsageSnapshot>,
     },
+    /// Parsed, otherwise raw model-context snapshot for dashboard inspection.
+    ContextSnapshot {
+        source: String,
+        label: String,
+        turn: Option<usize>,
+        format: String,
+        token_count: Option<u64>,
+        context_window: Option<u64>,
+        item_count: Option<usize>,
+        raw: serde_json::Value,
+    },
 
     /// Proactive status broadcast (emitted on turn start, phase change, etc.)
     StatusUpdate {
@@ -1253,6 +1264,25 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             main: main.clone(),
             presence: presence.clone(),
         }),
+        AppEvent::ContextSnapshot {
+            source,
+            label,
+            turn,
+            format,
+            token_count,
+            context_window,
+            item_count,
+            raw,
+        } => Some(OutboundEvent::ContextSnapshot {
+            source: source.clone(),
+            label: label.clone(),
+            turn: *turn,
+            format: format.clone(),
+            token_count: *token_count,
+            context_window: *context_window,
+            item_count: *item_count,
+            raw: raw.clone(),
+        }),
         AppEvent::StatusUpdate {
             turn,
             phase,
@@ -1650,6 +1680,27 @@ fn write_event_to_session_log(
             provider, model, total_tokens, ..
         } => {
             log.live_usage_update(provider, model, *total_tokens);
+        }
+        AppEvent::ContextSnapshot {
+            source,
+            label,
+            turn,
+            format,
+            token_count,
+            context_window,
+            item_count,
+            raw,
+        } => {
+            log.context_snapshot(
+                source,
+                label,
+                *turn,
+                format,
+                *token_count,
+                *context_window,
+                *item_count,
+                raw,
+            );
         }
 
         // Live audio sub-agent lifecycle
@@ -2468,6 +2519,25 @@ mod tests {
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"agent_output\""));
         assert!(json.contains("\"hello\""));
+    }
+
+    #[test]
+    fn outbound_context_snapshot() {
+        let event = AppEvent::ContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex thread".to_string(),
+            turn: Some(3),
+            format: "codex.thread.read.v2".to_string(),
+            token_count: Some(1200),
+            context_window: Some(128000),
+            item_count: Some(2),
+            raw: serde_json::json!({"thread": {"turns": []}}),
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"context_snapshot\""));
+        assert!(json.contains("\"source\":\"codex\""));
+        assert!(json.contains("\"raw\""));
     }
 
     #[test]

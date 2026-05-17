@@ -1728,6 +1728,60 @@ impl SessionLog {
         });
     }
 
+    /// Log a parsed raw model-context snapshot for dashboard inspection.
+    pub fn context_snapshot(
+        &mut self,
+        source: &str,
+        label: &str,
+        turn: Option<usize>,
+        format: &str,
+        token_count: Option<u64>,
+        context_window: Option<u64>,
+        item_count: Option<usize>,
+        raw: &serde_json::Value,
+    ) {
+        let rendered = serde_json::to_string_pretty(raw)
+            .unwrap_or_else(|_| raw.to_string());
+        let effective_turn = turn.or_else(|| {
+            if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            }
+        });
+        let snapshot_id = Uuid::new_v4();
+        let relative = if let Some(file_turn) = effective_turn {
+            format!("turns/turn_{:03}_context_{}.json", file_turn, snapshot_id)
+        } else {
+            format!("turns/context_{}.json", snapshot_id)
+        };
+        let file = if fs::write(self.dir.join(&relative), &rendered).is_ok() {
+            Some(relative)
+        } else {
+            None
+        };
+        let item_suffix = item_count
+            .map(|n| format!(" ({} items)", n))
+            .unwrap_or_default();
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: effective_turn,
+            event: "context_snapshot".to_string(),
+            level: Some("debug".to_string()),
+            message: Some(format!("Context snapshot: {}{}", label, item_suffix)),
+            data: Some(serde_json::json!({
+                "source": source,
+                "label": label,
+                "format": format,
+                "token_count": token_count,
+                "context_window": context_window,
+                "item_count": item_count,
+            })),
+            file,
+            file2: None,
+        });
+    }
+
     /// Log the full model response. Content is written to a per-turn file.
     pub fn model_response(
         &mut self,
@@ -2151,6 +2205,46 @@ pub fn session_log_entry_to_app_event(
                 turn: turn?,
                 budget_pct,
                 remaining,
+            })
+        }
+        "context_snapshot" => {
+            let raw = read_file("file")
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let source = data
+                .and_then(|d| d.get("source"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("model")
+                .to_string();
+            let label = data
+                .and_then(|d| d.get("label"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Model context")
+                .to_string();
+            let format = data
+                .and_then(|d| d.get("format"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let token_count = data
+                .and_then(|d| d.get("token_count"))
+                .and_then(|v| v.as_u64());
+            let context_window = data
+                .and_then(|d| d.get("context_window"))
+                .and_then(|v| v.as_u64());
+            let item_count = data
+                .and_then(|d| d.get("item_count"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            Some(AppEvent::ContextSnapshot {
+                source,
+                label,
+                turn,
+                format,
+                token_count,
+                context_window,
+                item_count,
+                raw,
             })
         }
 
@@ -3150,6 +3244,60 @@ mod tests {
         let content = fs::read_to_string(&messages_file).unwrap();
         assert!(content.contains("system"));
         assert!(content.contains("Hello"));
+    }
+
+    #[test]
+    fn context_snapshot_writes_turn_file_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(2, 0.0, 200_000);
+        log.context_snapshot(
+            "codex",
+            "Codex thread",
+            Some(2),
+            "codex.thread.read.v2",
+            Some(42),
+            Some(128_000),
+            Some(1),
+            &serde_json::json!({"thread": {"turns": [{"items": [{"type": "userMessage"}]}]}}),
+        );
+        drop(log);
+
+        let contents = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let entry: serde_json::Value = contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("context_snapshot"))
+            .unwrap();
+        let context_file = entry.get("file").and_then(|v| v.as_str()).unwrap();
+        assert!(log_dir.join(context_file).exists());
+
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            crate::event::AppEvent::ContextSnapshot {
+                source,
+                label,
+                turn,
+                format,
+                token_count,
+                context_window,
+                item_count,
+                raw,
+            } => {
+                assert_eq!(source, "codex");
+                assert_eq!(label, "Codex thread");
+                assert_eq!(turn, Some(2));
+                assert_eq!(format, "codex.thread.read.v2");
+                assert_eq!(token_count, Some(42));
+                assert_eq!(context_window, Some(128_000));
+                assert_eq!(item_count, Some(1));
+                assert_eq!(
+                    raw.pointer("/thread/turns/0/items/0/type").and_then(|v| v.as_str()),
+                    Some("userMessage")
+                );
+            }
+            other => panic!("expected ContextSnapshot, got {:?}", other),
+        }
     }
 
     #[test]

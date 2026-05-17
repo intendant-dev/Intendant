@@ -2146,7 +2146,7 @@ impl App {
                 self.handle_key(key);
             }
             AppEvent::ApprovalResolved { .. }
-            | AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::LiveUsageUpdate { .. }
+            | AppEvent::UsageSnapshot { .. } | AppEvent::ContextSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::LiveUsageUpdate { .. }
             | AppEvent::DisplayMetrics { .. } | AppEvent::DisplayResize { .. }
             | AppEvent::ExternalAgentChanged { .. }
             | AppEvent::CodexConfigChanged { .. }

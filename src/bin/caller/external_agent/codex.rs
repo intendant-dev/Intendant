@@ -11,8 +11,8 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::error::CallerError;
 
 use super::{
-    AgentConfig, AgentEvent, AgentImageAttachment, AgentThread, ApprovalCategory,
-    ApprovalDecision, ExternalAgent, ToolCompletionStatus,
+    AgentConfig, AgentContextSnapshot, AgentEvent, AgentImageAttachment, AgentThread,
+    ApprovalCategory, ApprovalDecision, ExternalAgent, ToolCompletionStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -577,6 +577,9 @@ pub struct CodexAgent {
     /// as a fallback) and cleared on `turn/completed` / `turn/interrupted` /
     /// `Terminated`.
     active_turn_id: Arc<Mutex<Option<String>>>,
+    /// Latest token-usage notification from Codex app-server. Joined with
+    /// thread/read snapshots so the dashboard can show current context usage.
+    latest_token_usage: Arc<Mutex<Option<serde_json::Value>>>,
 }
 
 /// Knobs that vary per-session and feed into Codex `thread/start` or the
@@ -638,6 +641,7 @@ impl CodexAgent {
             reader_handle: None,
             active_thread_id: Arc::new(Mutex::new(None)),
             active_turn_id: Arc::new(Mutex::new(None)),
+            latest_token_usage: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -720,6 +724,90 @@ impl CodexAgent {
         writer.flush().await?;
         Ok(())
     }
+
+    async fn read_context_snapshot(&mut self) -> Result<AgentContextSnapshot, CallerError> {
+        let thread_id = self.require_active_thread().await?;
+        let response = self
+            .send_request(
+                "thread/read",
+                Some(serde_json::json!({
+                    "threadId": thread_id,
+                    "includeTurns": true,
+                })),
+            )
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/read: {e}")))?;
+        let thread = response
+            .get("thread")
+            .cloned()
+            .unwrap_or_else(|| response.clone());
+        let usage = self.latest_token_usage.lock().await.clone();
+        let token_count = usage.as_ref().and_then(codex_usage_total_tokens);
+        let context_window = usage.as_ref().and_then(codex_usage_context_window);
+        let item_count = codex_context_item_count(&thread);
+        Ok(AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex thread".to_string(),
+            format: "codex.thread.read.v2".to_string(),
+            token_count,
+            context_window,
+            item_count: Some(item_count),
+            raw: serde_json::json!({
+                "thread": thread,
+                "tokenUsage": usage,
+            }),
+        })
+    }
+}
+
+fn first_u64_at(value: &serde_json::Value, paths: &[&str]) -> Option<u64> {
+    paths
+        .iter()
+        .find_map(|path| value.pointer(path).and_then(|v| v.as_u64()))
+}
+
+fn codex_usage_total_tokens(value: &serde_json::Value) -> Option<u64> {
+    first_u64_at(
+        value,
+        &[
+            "/last/totalTokens",
+            "/last/total_tokens",
+            "/total/totalTokens",
+            "/total/total_tokens",
+            "/totalTokens",
+            "/total_tokens",
+        ],
+    )
+}
+
+fn codex_usage_context_window(value: &serde_json::Value) -> Option<u64> {
+    first_u64_at(
+        value,
+        &[
+            "/modelContextWindow",
+            "/model_context_window",
+            "/contextWindow",
+            "/context_window",
+        ],
+    )
+}
+
+fn codex_context_item_count(thread: &serde_json::Value) -> usize {
+    thread
+        .get("turns")
+        .and_then(|v| v.as_array())
+        .map(|turns| {
+            turns
+                .iter()
+                .map(|turn| {
+                    turn.get("items")
+                        .and_then(|v| v.as_array())
+                        .map(|items| items.len())
+                        .unwrap_or(0)
+                })
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +823,7 @@ async fn reader_task(
     pending_approvals: PendingApprovals,
     approval_counter: Arc<AtomicU64>,
     active_turn_id: Arc<Mutex<Option<String>>>,
+    latest_token_usage: Arc<Mutex<Option<serde_json::Value>>>,
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
@@ -845,6 +934,14 @@ async fn reader_task(
 
         // 3. Notification (has method, no id)
         let params = msg.params.unwrap_or(serde_json::Value::Null);
+
+        if method == "thread/tokenUsage/updated" {
+            let usage = params
+                .get("tokenUsage")
+                .cloned()
+                .unwrap_or_else(|| params.clone());
+            *latest_token_usage.lock().await = Some(usage);
+        }
 
         // Track active turn id so interrupt_turn() has a target to cancel.
         // Codex emits turn_id in several shapes across versions; accept any
@@ -1397,6 +1494,7 @@ impl ExternalAgent for CodexAgent {
         let pending_approvals = Arc::clone(&self.pending_approvals);
         let approval_counter = Arc::new(AtomicU64::new(1));
         let active_turn_id = Arc::clone(&self.active_turn_id);
+        let latest_token_usage = Arc::clone(&self.latest_token_usage);
 
         let handle = tokio::spawn(reader_task(
             stdout,
@@ -1405,6 +1503,7 @@ impl ExternalAgent for CodexAgent {
             pending_approvals,
             approval_counter,
             active_turn_id,
+            latest_token_usage,
         ));
         self.reader_handle = Some(handle);
 
@@ -1549,6 +1648,10 @@ impl ExternalAgent for CodexAgent {
         // any thread in principle).
         *self.active_thread_id.lock().await = Some(thread.thread_id.clone());
         Ok(())
+    }
+
+    async fn context_snapshot(&mut self) -> Result<Option<AgentContextSnapshot>, CallerError> {
+        self.read_context_snapshot().await.map(Some)
     }
 
     async fn resolve_approval(
@@ -1837,6 +1940,29 @@ mod tests {
             AgentEvent::MessageDelta { text } => assert_eq!(text, "Hello world"),
             other => panic!("expected MessageDelta, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn codex_context_item_count_counts_turn_items() {
+        let thread = serde_json::json!({
+            "turns": [
+                {"items": [{"type": "userMessage"}, {"type": "agentMessage"}]},
+                {"items": [{"type": "commandExecution"}]},
+                {"status": "completed"}
+            ]
+        });
+        assert_eq!(codex_context_item_count(&thread), 3);
+    }
+
+    #[test]
+    fn codex_token_usage_helpers_accept_app_server_shape() {
+        let usage = serde_json::json!({
+            "total": {"inputTokens": 1000, "outputTokens": 200, "totalTokens": 1200},
+            "last": {"inputTokens": 100, "outputTokens": 25, "totalTokens": 125},
+            "modelContextWindow": 128000
+        });
+        assert_eq!(codex_usage_total_tokens(&usage), Some(125));
+        assert_eq!(codex_usage_context_window(&usage), Some(128000));
     }
 
     #[test]
