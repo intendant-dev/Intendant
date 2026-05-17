@@ -158,9 +158,12 @@ pub enum AppEvent {
         summary: Option<String>,
     },
     /// User requested interruption; broadcast to agent loops so they can cancel.
-    InterruptRequested,
+    InterruptRequested {
+        session_id: Option<String>,
+    },
     /// The agent turn was interrupted. Emitted by the loop once cancellation completes.
     Interrupted {
+        session_id: Option<String>,
         reason: String,
     },
 
@@ -174,6 +177,7 @@ pub enum AppEvent {
     /// downstream consumers simple — they never need to deal with a
     /// missing id, and comparing `id.is_empty()` is cheap.
     SteerRequested {
+        session_id: Option<String>,
         text: String,
         id: String,
     },
@@ -182,6 +186,7 @@ pub enum AppEvent {
     /// after the fallback push to `context_injection`; paired with a later
     /// `SteerDelivered { mid_turn: false }` once the queue drains.
     SteerQueued {
+        session_id: Option<String>,
         id: String,
         /// Short human-readable explanation of why the queue fallback was
         /// used (e.g. "Claude Code doesn't support mid-turn steering;
@@ -193,6 +198,7 @@ pub enum AppEvent {
     /// fallback); `mid_turn = false` means a queued item was drained at
     /// turn boundary and delivered as part of the next user message.
     SteerDelivered {
+        session_id: Option<String>,
         id: String,
         mid_turn: bool,
     },
@@ -228,11 +234,13 @@ pub enum AppEvent {
 
     // Autonomy / approval
     ApprovalRequired {
+        session_id: Option<String>,
         id: u64,
         command_preview: String,
         category: ActionCategory,
     },
     ApprovalResolved {
+        session_id: Option<String>,
         id: u64,
         action: String,
     },
@@ -652,18 +660,29 @@ pub enum ApprovalResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ControlMsg {
-    Status,
+    Status {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
     Usage,
     Approve {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         id: u64,
     },
     Deny {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         id: u64,
     },
     Skip {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         id: u64,
     },
     ApproveAll {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         id: u64,
     },
     Input {
@@ -998,6 +1017,10 @@ pub enum ControlMsg {
     },
     /// Request interruption of the current agent turn.
     Interrupt {
+        /// Optional target session. Daemon supervisors use this to interrupt
+        /// one managed session instead of broadcasting to every session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         /// Optional precondition: only interrupt if this turn id is active.
         /// When None, interrupts whatever is currently running.
         #[serde(default)]
@@ -1010,6 +1033,10 @@ pub enum ControlMsg {
     /// shared `context_injection` queue so it's delivered at the start of
     /// the next turn.
     Steer {
+        /// Optional target session. Daemon supervisors use this to deliver
+        /// the steer to one managed session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         text: String,
         /// Optional correlation id supplied by the frontend. Frontends use
         /// it to track the lifecycle of one steer request across the
@@ -1124,19 +1151,25 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             reason: reason.clone(),
             summary: summary.clone(),
         }),
-        AppEvent::InterruptRequested => Some(OutboundEvent::InterruptRequested),
-        AppEvent::Interrupted { reason } => Some(OutboundEvent::Interrupted {
+        AppEvent::InterruptRequested { session_id } => Some(OutboundEvent::InterruptRequested {
+            session_id: session_id.clone(),
+        }),
+        AppEvent::Interrupted { session_id, reason } => Some(OutboundEvent::Interrupted {
+            session_id: session_id.clone(),
             reason: reason.clone(),
         }),
-        AppEvent::SteerRequested { text, id } => Some(OutboundEvent::SteerRequested {
+        AppEvent::SteerRequested { session_id, text, id } => Some(OutboundEvent::SteerRequested {
+            session_id: session_id.clone(),
             text: text.clone(),
             id: id.clone(),
         }),
-        AppEvent::SteerQueued { id, reason } => Some(OutboundEvent::SteerQueued {
+        AppEvent::SteerQueued { session_id, id, reason } => Some(OutboundEvent::SteerQueued {
+            session_id: session_id.clone(),
             id: id.clone(),
             reason: reason.clone(),
         }),
-        AppEvent::SteerDelivered { id, mid_turn } => Some(OutboundEvent::SteerDelivered {
+        AppEvent::SteerDelivered { session_id, id, mid_turn } => Some(OutboundEvent::SteerDelivered {
+            session_id: session_id.clone(),
             id: id.clone(),
             mid_turn: *mid_turn,
         }),
@@ -1163,17 +1196,20 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             })
         }
         AppEvent::ApprovalRequired {
+            session_id,
             id,
             command_preview,
             ..
         } => Some(OutboundEvent::ApprovalRequired {
+            session_id: session_id.clone(),
             id: *id,
             command: command_preview.clone(),
         }),
         AppEvent::AutoApproved { preview } => Some(OutboundEvent::AutoApproved {
             preview: preview.clone(),
         }),
-        AppEvent::ApprovalResolved { id, action } => Some(OutboundEvent::ApprovalResolved {
+        AppEvent::ApprovalResolved { session_id, id, action } => Some(OutboundEvent::ApprovalResolved {
+            session_id: session_id.clone(),
             id: *id,
             action: action.clone(),
         }),
@@ -1597,10 +1633,10 @@ fn write_event_to_session_log(
         AppEvent::TaskComplete { reason, summary } => {
             log.task_complete(reason, summary.as_deref());
         }
-        AppEvent::InterruptRequested => {
+        AppEvent::InterruptRequested { .. } => {
             log.info("Interrupt requested");
         }
-        AppEvent::Interrupted { reason } => {
+        AppEvent::Interrupted { reason, .. } => {
             log.info(&format!("Interrupted: {}", reason));
         }
         AppEvent::SessionStarted { session_id, task } => {
@@ -1626,7 +1662,7 @@ fn write_event_to_session_log(
         AppEvent::AutoApproved { preview } => {
             log.auto_approved(preview);
         }
-        AppEvent::ApprovalResolved { id, action } => {
+        AppEvent::ApprovalResolved { id, action, .. } => {
             log.approval_resolved(*id, action);
         }
         AppEvent::HumanQuestionDetected { question } => {
@@ -1922,7 +1958,7 @@ mod tests {
         let json = r#"{"action":"status"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ControlMsg::Status => {}
+            ControlMsg::Status { session_id } => assert!(session_id.is_none()),
             _ => panic!("expected Status"),
         }
     }
@@ -1932,7 +1968,10 @@ mod tests {
         let json = r#"{"action":"approve","id":42}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ControlMsg::Approve { id } => assert_eq!(id, 42),
+            ControlMsg::Approve { session_id, id } => {
+                assert!(session_id.is_none());
+                assert_eq!(id, 42);
+            }
             _ => panic!("expected Approve"),
         }
     }
@@ -1942,7 +1981,10 @@ mod tests {
         let json = r#"{"action":"deny","id":7}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ControlMsg::Deny { id } => assert_eq!(id, 7),
+            ControlMsg::Deny { session_id, id } => {
+                assert!(session_id.is_none());
+                assert_eq!(id, 7);
+            }
             _ => panic!("expected Deny"),
         }
     }
@@ -2057,14 +2099,26 @@ mod tests {
     #[test]
     fn control_msg_serialize_roundtrip() {
         let msgs = vec![
-            ControlMsg::Status,
-            ControlMsg::Approve { id: 1 },
-            ControlMsg::Deny { id: 2 },
+            ControlMsg::Status { session_id: None },
+            ControlMsg::Approve {
+                session_id: None,
+                id: 1,
+            },
+            ControlMsg::Deny {
+                session_id: None,
+                id: 2,
+            },
             ControlMsg::Input {
                 text: "hello".to_string(),
             },
-            ControlMsg::Skip { id: 3 },
-            ControlMsg::ApproveAll { id: 4 },
+            ControlMsg::Skip {
+                session_id: None,
+                id: 3,
+            },
+            ControlMsg::ApproveAll {
+                session_id: None,
+                id: 4,
+            },
             ControlMsg::SetAutonomy {
                 level: "low".to_string(),
             },
@@ -2139,12 +2193,17 @@ mod tests {
             },
             ControlMsg::Usage,
             ControlMsg::Quit,
-            ControlMsg::Interrupt { expected_turn: None },
+            ControlMsg::Interrupt {
+                session_id: None,
+                expected_turn: None,
+            },
             ControlMsg::Steer {
+                session_id: None,
                 text: "use Python".to_string(),
                 id: Some("s-1".to_string()),
             },
             ControlMsg::Steer {
+                session_id: None,
                 text: "never mind".to_string(),
                 id: None,
             },
@@ -2163,7 +2222,12 @@ mod tests {
         let json = r#"{"action":"steer","text":"switch to Python","id":"s-42"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ControlMsg::Steer { text, id } => {
+            ControlMsg::Steer {
+                session_id,
+                text,
+                id,
+            } => {
+                assert!(session_id.is_none());
                 assert_eq!(text, "switch to Python");
                 assert_eq!(id.as_deref(), Some("s-42"));
             }
@@ -2176,7 +2240,12 @@ mod tests {
         let json = r#"{"action":"steer","text":"never mind"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ControlMsg::Steer { text, id } => {
+            ControlMsg::Steer {
+                session_id,
+                text,
+                id,
+            } => {
+                assert!(session_id.is_none());
                 assert_eq!(text, "never mind");
                 assert_eq!(id, None);
             }
@@ -2196,7 +2265,10 @@ mod tests {
         let json = r#"{"action":"skip","id":5}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ControlMsg::Skip { id } => assert_eq!(id, 5),
+            ControlMsg::Skip { session_id, id } => {
+                assert!(session_id.is_none());
+                assert_eq!(id, 5);
+            }
             _ => panic!("expected Skip"),
         }
     }
@@ -2206,7 +2278,10 @@ mod tests {
         let json = r#"{"action":"approve_all","id":10}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ControlMsg::ApproveAll { id } => assert_eq!(id, 10),
+            ControlMsg::ApproveAll { session_id, id } => {
+                assert!(session_id.is_none());
+                assert_eq!(id, 10);
+            }
             _ => panic!("expected ApproveAll"),
         }
     }
@@ -2608,6 +2683,7 @@ mod tests {
     #[test]
     fn outbound_approval_required() {
         let event = AppEvent::ApprovalRequired {
+            session_id: Some("sess-1".to_string()),
             id: 42,
             command_preview: "rm -rf /tmp".to_string(),
             category: crate::autonomy::ActionCategory::Destructive,
@@ -2615,6 +2691,7 @@ mod tests {
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"approval_required\""));
+        assert!(json.contains("\"session_id\":\"sess-1\""));
         assert!(json.contains("\"id\":42"));
     }
 

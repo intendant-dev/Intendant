@@ -534,12 +534,22 @@ impl PeerTransport for IntendantWsTransport {
             } => {
                 let id = parse_request_id(&request_id)?;
                 let ctrl = match decision {
-                    ApprovalDecision::Accept => ControlMsg::Approve { id },
-                    ApprovalDecision::AcceptForSession => {
-                        ControlMsg::ApproveAll { id }
-                    }
-                    ApprovalDecision::Decline => ControlMsg::Deny { id },
-                    ApprovalDecision::Cancel => ControlMsg::Skip { id },
+                    ApprovalDecision::Accept => ControlMsg::Approve {
+                        session_id: None,
+                        id,
+                    },
+                    ApprovalDecision::AcceptForSession => ControlMsg::ApproveAll {
+                        session_id: None,
+                        id,
+                    },
+                    ApprovalDecision::Decline => ControlMsg::Deny {
+                        session_id: None,
+                        id,
+                    },
+                    ApprovalDecision::Cancel => ControlMsg::Skip {
+                        session_id: None,
+                        id,
+                    },
                 };
                 self.write_control_msg(&ctrl).await?;
                 Ok(PeerOpAck::Ok)
@@ -870,7 +880,7 @@ mod tests {
             .unwrap();
         assert!(wait_for_event(&mut bus_rx, |e| matches!(
             e,
-            AppEvent::ControlCommand(ControlMsg::Approve { id: 1 })
+            AppEvent::ControlCommand(ControlMsg::Approve { id: 1, .. })
         ))
         .await
         .is_some());
@@ -885,7 +895,7 @@ mod tests {
             .unwrap();
         assert!(wait_for_event(&mut bus_rx, |e| matches!(
             e,
-            AppEvent::ControlCommand(ControlMsg::ApproveAll { id: 2 })
+            AppEvent::ControlCommand(ControlMsg::ApproveAll { id: 2, .. })
         ))
         .await
         .is_some());
@@ -900,7 +910,7 @@ mod tests {
             .unwrap();
         assert!(wait_for_event(&mut bus_rx, |e| matches!(
             e,
-            AppEvent::ControlCommand(ControlMsg::Deny { id: 3 })
+            AppEvent::ControlCommand(ControlMsg::Deny { id: 3, .. })
         ))
         .await
         .is_some());
@@ -915,7 +925,7 @@ mod tests {
             .unwrap();
         assert!(wait_for_event(&mut bus_rx, |e| matches!(
             e,
-            AppEvent::ControlCommand(ControlMsg::Skip { id: 4 })
+            AppEvent::ControlCommand(ControlMsg::Skip { id: 4, .. })
         ))
         .await
         .is_some());

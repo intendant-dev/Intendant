@@ -165,20 +165,28 @@ impl Dispatcher {
                 self.warn_drop(bus, "FollowUp", &text);
             }
 
-            ControlMsg::Interrupt { expected_turn: _ } => {
+            ControlMsg::Interrupt {
+                session_id,
+                expected_turn: _,
+            } => {
                 // Re-emit as AppEvent::InterruptRequested so agent loops can subscribe
                 // and cancel their own work. The dispatcher itself doesn't hold loop
                 // handles — loops register interest via the bus.
-                bus.send(AppEvent::InterruptRequested);
+                bus.send(AppEvent::InterruptRequested { session_id });
             }
 
-            ControlMsg::Steer { text, id } => {
+            ControlMsg::Steer {
+                session_id,
+                text,
+                id,
+            } => {
                 // Re-emit as AppEvent::SteerRequested so agent loops can
                 // subscribe and either inject the text into the active turn
                 // (native mid-turn steering) or queue it onto
                 // `context_injection` for the next turn. `id` defaults to
                 // "" so downstream consumers never have to handle an Option.
                 bus.send(AppEvent::SteerRequested {
+                    session_id,
                     text,
                     id: id.unwrap_or_default(),
                 });
@@ -421,7 +429,9 @@ mod tests {
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        bus.send(AppEvent::ControlCommand(ControlMsg::Status));
+        bus.send(AppEvent::ControlCommand(ControlMsg::Status {
+            session_id: None,
+        }));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(task_rx.try_recv().is_err());
     }
@@ -440,6 +450,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::Interrupt {
+            session_id: Some("sess-a".into()),
             expected_turn: None,
         }));
 
@@ -449,7 +460,8 @@ mod tests {
         while std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(AppEvent::InterruptRequested)) => {
+                Ok(Ok(AppEvent::InterruptRequested { session_id })) => {
+                    assert_eq!(session_id.as_deref(), Some("sess-a"));
                     saw_interrupt_requested = true;
                     break;
                 }
@@ -481,17 +493,22 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::Steer {
+            session_id: Some("sess-b".into()),
             text: "use SQLite instead".into(),
             id: Some("s1".into()),
         }));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        let mut seen: Option<(String, String)> = None;
+        let mut seen: Option<(Option<String>, String, String)> = None;
         while std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(AppEvent::SteerRequested { text, id })) => {
-                    seen = Some((text, id));
+                Ok(Ok(AppEvent::SteerRequested {
+                    session_id,
+                    text,
+                    id,
+                })) => {
+                    seen = Some((session_id, text, id));
                     break;
                 }
                 Ok(Ok(_)) => continue,
@@ -499,7 +516,8 @@ mod tests {
                 Err(_) => break,
             }
         }
-        let (text, id) = seen.expect("expected AppEvent::SteerRequested");
+        let (session_id, text, id) = seen.expect("expected AppEvent::SteerRequested");
+        assert_eq!(session_id.as_deref(), Some("sess-b"));
         assert_eq!(text, "use SQLite instead");
         assert_eq!(id, "s1");
     }
@@ -518,6 +536,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::Steer {
+            session_id: None,
             text: "never mind".into(),
             id: None,
         }));

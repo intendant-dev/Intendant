@@ -42,15 +42,27 @@ pub fn action_to_control_msg(action: &PresenceAction) -> Option<(ControlMsg, Str
                 confirmation,
             ))
         }
-        PresenceAction::Approve { id } => {
-            Some((ControlMsg::Approve { id: *id }, confirmation))
-        }
-        PresenceAction::Deny { id } => {
-            Some((ControlMsg::Deny { id: *id }, confirmation))
-        }
-        PresenceAction::Skip { id } => {
-            Some((ControlMsg::Skip { id: *id }, confirmation))
-        }
+        PresenceAction::Approve { id } => Some((
+            ControlMsg::Approve {
+                session_id: None,
+                id: *id,
+            },
+            confirmation,
+        )),
+        PresenceAction::Deny { id } => Some((
+            ControlMsg::Deny {
+                session_id: None,
+                id: *id,
+            },
+            confirmation,
+        )),
+        PresenceAction::Skip { id } => Some((
+            ControlMsg::Skip {
+                session_id: None,
+                id: *id,
+            },
+            confirmation,
+        )),
         PresenceAction::Respond { text } => {
             Some((ControlMsg::Input { text: text.clone() }, confirmation))
         }
@@ -827,7 +839,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
                 category: format!("{:?}", category),
             })
         }
-        AppEvent::ApprovalResolved { id, action } => {
+        AppEvent::ApprovalResolved { id, action, .. } => {
             if action == "deny" {
                 *last_phase = "done".to_string();
             } else {
@@ -871,7 +883,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
                 message: "Safety cap reached (500 turns)".to_string(),
             })
         }
-        AppEvent::InterruptRequested => {
+        AppEvent::InterruptRequested { .. } => {
             let new_phase = "interrupting".to_string();
             let changed = *last_phase != new_phase;
             *last_phase = new_phase.clone();

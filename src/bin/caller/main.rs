@@ -83,6 +83,21 @@ fn slog(log: &SharedSessionLog, f: impl FnOnce(&mut session_log::SessionLog)) {
     }
 }
 
+fn session_log_id(session_log: &SharedSessionLog) -> Option<String> {
+    session_log
+        .lock()
+        .ok()
+        .map(|log| log.session_id().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+fn event_targets_session(target: &Option<String>, session_id: &Option<String>) -> bool {
+    match target {
+        Some(target) => session_id.as_deref() == Some(target.as_str()),
+        None => true,
+    }
+}
+
 /// Build the [`peer::AuthRequirements`] this daemon advertises in
 /// its own Agent Card from the project's `[server.auth]` config and
 /// the LAN cert dir.
@@ -513,6 +528,7 @@ async fn create_external_agent(
 /// Configuration for `drain_external_agent_events`.
 struct DrainConfig<'a> {
     bus: &'a EventBus,
+    session_id: Option<String>,
     autonomy: SharedAutonomy,
     session_log: &'a SharedSessionLog,
     log_dir: &'a Path,
@@ -615,6 +631,7 @@ async fn drain_external_agent_events(
     let approval_counter = std::sync::atomic::AtomicU64::new(1);
     let mut turns_in_round = 0usize;
     let mut bus_rx = config.bus.subscribe();
+    let local_session_id = config.session_id.clone();
     // Track whether we've been asked to interrupt this drain cycle. When the
     // agent finally emits TurnCompleted / Terminated we convert that into a
     // DrainOutcome::Interrupted + Interrupted event so the caller can choose
@@ -640,10 +657,13 @@ async fn drain_external_agent_events(
     let watcher_handle = {
         let mut watcher_rx = config.bus.subscribe();
         let registry = config.approval_registry.clone();
+        let watcher_session_id = local_session_id.clone();
         tokio::spawn(async move {
             loop {
                 match watcher_rx.recv().await {
-                    Ok(AppEvent::InterruptRequested) => {
+                    Ok(AppEvent::InterruptRequested { session_id })
+                        if event_targets_session(&session_id, &watcher_session_id) =>
+                    {
                         let pending: Vec<_> = {
                             let mut reg = registry.lock().unwrap();
                             reg.drain().collect()
@@ -682,7 +702,9 @@ async fn drain_external_agent_events(
             biased;
             bus_event = bus_rx.recv() => {
                 match bus_event {
-                    Ok(AppEvent::InterruptRequested) => {
+                    Ok(AppEvent::InterruptRequested { session_id })
+                        if event_targets_session(&session_id, &local_session_id) =>
+                    {
                         interrupt_pending = true;
                         // Approval registry is drained by the background
                         // watcher task above (so inner `rx.await` sites
@@ -718,7 +740,11 @@ async fn drain_external_agent_events(
                         }
                         continue;
                     }
-                    Ok(AppEvent::SteerRequested { text, id }) => {
+                    Ok(AppEvent::SteerRequested {
+                        session_id,
+                        text,
+                        id,
+                    }) if event_targets_session(&session_id, &local_session_id) => {
                         // Try native mid-turn steering first. On success the
                         // backend injects the text into the active turn and
                         // we're done. On failure (unsupported or no active
@@ -736,6 +762,7 @@ async fn drain_external_agent_events(
                                     ))
                                 });
                                 config.bus.send(AppEvent::SteerDelivered {
+                                    session_id: local_session_id.clone(),
                                     id,
                                     mid_turn: true,
                                 });
@@ -753,6 +780,7 @@ async fn drain_external_agent_events(
                                 }
                                 slog(config.session_log, |l| l.info(&reason));
                                 config.bus.send(AppEvent::SteerQueued {
+                                    session_id: local_session_id.clone(),
                                     id,
                                     reason,
                                 });
@@ -930,6 +958,7 @@ async fn drain_external_agent_events(
                         l.warn(&format!("Headless auto-deny: {}", command))
                     });
                     config.bus.send(AppEvent::ApprovalResolved {
+                        session_id: config.session_id.clone(),
                         id: 0,
                         action: "deny".to_string(),
                     });
@@ -942,6 +971,7 @@ async fn drain_external_agent_events(
                 } else {
                     let id = approval_counter.fetch_add(1, Ordering::Relaxed);
                     config.bus.send(AppEvent::ApprovalRequired {
+                        session_id: config.session_id.clone(),
                         id,
                         command_preview: command.clone(),
                         category: cat,
@@ -980,6 +1010,7 @@ async fn drain_external_agent_events(
                                 }
                             };
                             config.bus.send(AppEvent::ApprovalResolved {
+                                session_id: config.session_id.clone(),
                                 id,
                                 action: action_str.to_string(),
                             });
@@ -1034,6 +1065,7 @@ async fn drain_external_agent_events(
                         l.warn(&format!("Headless auto-deny: {}", preview))
                     });
                     config.bus.send(AppEvent::ApprovalResolved {
+                        session_id: config.session_id.clone(),
                         id: 0,
                         action: "deny".to_string(),
                     });
@@ -1046,6 +1078,7 @@ async fn drain_external_agent_events(
                 } else {
                     let id = approval_counter.fetch_add(1, Ordering::Relaxed);
                     config.bus.send(AppEvent::ApprovalRequired {
+                        session_id: config.session_id.clone(),
                         id,
                         command_preview: format!("{}\n{}", preview, diff),
                         category: cat,
@@ -1084,6 +1117,7 @@ async fn drain_external_agent_events(
                                 }
                             };
                             config.bus.send(AppEvent::ApprovalResolved {
+                                session_id: config.session_id.clone(),
                                 id,
                                 action: action_str.to_string(),
                             });
@@ -1164,6 +1198,7 @@ async fn drain_external_agent_events(
                         .clone()
                         .unwrap_or_else(|| "user requested".to_string());
                     config.bus.send(AppEvent::Interrupted {
+                        session_id: config.session_id.clone(),
                         reason: "user requested".into(),
                     });
                     return DrainOutcome::Interrupted { reason };
@@ -1176,6 +1211,7 @@ async fn drain_external_agent_events(
             external_agent::AgentEvent::Terminated { reason, exit_code } => {
                 if interrupt_pending {
                     config.bus.send(AppEvent::Interrupted {
+                        session_id: config.session_id.clone(),
                         reason: "user requested".into(),
                     });
                     return DrainOutcome::Interrupted {
@@ -1211,6 +1247,7 @@ fn drain_steer_queue_as_followup(
     context_injection: &event::ContextInjectionQueue,
     followup: &str,
     bus: &EventBus,
+    session_id: Option<&str>,
 ) -> Option<String> {
     let mut prefix_lines: Vec<String> = Vec::new();
     if let Ok(mut q) = context_injection.lock() {
@@ -1221,6 +1258,7 @@ fn drain_steer_queue_as_followup(
                 prefix_lines.push(format!("[User] {}", inj.text));
                 let id = inj.steer_id.clone().unwrap_or_default();
                 bus.send(AppEvent::SteerDelivered {
+                    session_id: session_id.map(str::to_string),
                     id,
                     mid_turn: false,
                 });
@@ -3414,7 +3452,7 @@ Also: {"source": "bare"}"#;
             ));
 
         let merged =
-            drain_steer_queue_as_followup(&queue, "original follow-up", &bus)
+            drain_steer_queue_as_followup(&queue, "original follow-up", &bus, None)
                 .expect("should produce a message");
 
         assert_eq!(merged, "[User] switch to Python\noriginal follow-up");
@@ -3424,7 +3462,7 @@ Also: {"source": "bare"}"#;
         // SteerDelivered emitted for the drained item.
         let ev = rx.try_recv().expect("SteerDelivered event");
         match ev {
-            AppEvent::SteerDelivered { id, mid_turn } => {
+            AppEvent::SteerDelivered { id, mid_turn, .. } => {
                 assert_eq!(id, "steer-1");
                 assert!(!mid_turn, "queued fallback should report mid_turn=false");
             }
@@ -3445,7 +3483,7 @@ Also: {"source": "bare"}"#;
             .push(event::ContextInjection::text("display grant".into()));
 
         let merged =
-            drain_steer_queue_as_followup(&queue, "follow-up", &bus)
+            drain_steer_queue_as_followup(&queue, "follow-up", &bus, None)
                 .expect("should produce a message");
         assert_eq!(merged, "follow-up");
         assert_eq!(queue.lock().unwrap().len(), 1, "non-steer entry preserved");
@@ -3458,7 +3496,7 @@ Also: {"source": "bare"}"#;
         // case doesn't produce an empty agent message.
         let bus = EventBus::new();
         let queue = event::ContextInjectionQueue::default();
-        assert!(drain_steer_queue_as_followup(&queue, "", &bus).is_none());
+        assert!(drain_steer_queue_as_followup(&queue, "", &bus, None).is_none());
     }
 
     #[tokio::test]
@@ -3479,12 +3517,12 @@ Also: {"source": "bare"}"#;
         }
 
         let merged =
-            drain_steer_queue_as_followup(&queue, "main", &bus).expect("merged");
+            drain_steer_queue_as_followup(&queue, "main", &bus, None).expect("merged");
         assert_eq!(merged, "[User] first\n[User] second\nmain");
 
         let mut delivered_ids: Vec<String> = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            if let AppEvent::SteerDelivered { id, mid_turn } = ev {
+            if let AppEvent::SteerDelivered { id, mid_turn, .. } = ev {
                 assert!(!mid_turn);
                 delivered_ids.push(id);
             }
@@ -3547,17 +3585,21 @@ async fn run_agent_loop(
     // that's mid-turn (no follow-up required from them). We keep the
     // watcher alive across multiple steers — unlike the interrupt branch
     // which exits after cancelling.
+    let local_session_id = session_log_id(&session_log);
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let cancel_watcher_handle = {
         let watcher_token = cancel_token.clone();
         let watcher_registry = approval_registry.clone();
         let watcher_injection = context_injection.clone();
         let watcher_bus = bus.clone();
+        let watcher_session_id = local_session_id.clone();
         let mut bus_rx = bus.subscribe();
         tokio::spawn(async move {
             loop {
                 match bus_rx.recv().await {
-                    Ok(AppEvent::InterruptRequested) => {
+                    Ok(AppEvent::InterruptRequested { session_id })
+                        if event_targets_session(&session_id, &watcher_session_id) =>
+                    {
                         // Drain pending approvals with Deny so their
                         // receivers unblock and the loop can reach its
                         // cancellation-check boundary.
@@ -3571,7 +3613,11 @@ async fn run_agent_loop(
                         watcher_token.cancel();
                         break;
                     }
-                    Ok(AppEvent::SteerRequested { text, id }) => {
+                    Ok(AppEvent::SteerRequested {
+                        session_id,
+                        text,
+                        id,
+                    }) if event_targets_session(&session_id, &watcher_session_id) => {
                         // Queue the steer for the next turn's drain. The
                         // native loop has no separate "mid-turn inject"
                         // hook — model calls are atomic — so this is as
@@ -3587,6 +3633,7 @@ async fn run_agent_loop(
                             );
                         }
                         watcher_bus.send(AppEvent::SteerDelivered {
+                            session_id: watcher_session_id.clone(),
                             id,
                             mid_turn: true,
                         });
@@ -3629,6 +3676,7 @@ async fn run_agent_loop(
                 let _ = sender.send(event::ApprovalResponse::Deny);
             }
             bus.send(AppEvent::Interrupted {
+                session_id: local_session_id.clone(),
                 reason: "user requested".into(),
             });
             slog(&session_log, |l| l.info("Agent loop interrupted"));
@@ -3806,6 +3854,7 @@ async fn run_agent_loop(
                     let _ = sender.send(event::ApprovalResponse::Deny);
                 }
                 bus.send(AppEvent::Interrupted {
+                    session_id: local_session_id.clone(),
                     reason: "user requested".into(),
                 });
                 slog(&session_log, |l| l.info("Agent loop interrupted mid-stream"));
@@ -4277,6 +4326,7 @@ async fn run_agent_loop(
                 if let Some(slot) = json_approval {
                     // JSON mode: emit approval event and wait for stdin response
                     bus.send(AppEvent::ApprovalRequired {
+                        session_id: local_session_id.clone(),
                         id: turn as u64,
                         command_preview: preview.clone(),
                         category: cat,
@@ -4291,7 +4341,11 @@ async fn run_agent_loop(
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "approved")
                             });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve".to_string() });
+                            bus.send(AppEvent::ApprovalResolved {
+                                session_id: local_session_id.clone(),
+                                id: turn as u64,
+                                action: "approve".to_string(),
+                            });
                             // Record approved command for dedup
                             autonomy.write().await.record_approved_command(&preview);
                             // Session-grant: first DisplayControl approval unlocks the session
@@ -4308,7 +4362,11 @@ async fn run_agent_loop(
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "approve-all")
                             });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve_all".to_string() });
+                            bus.send(AppEvent::ApprovalResolved {
+                                session_id: local_session_id.clone(),
+                                id: turn as u64,
+                                action: "approve_all".to_string(),
+                            });
                             let mut state = autonomy.write().await;
                             state.level = AutonomyLevel::Full;
                             // Session-grant: DisplayControl approval also unlocks user display
@@ -4324,14 +4382,22 @@ async fn run_agent_loop(
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "skipped")
                             });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "skip".to_string() });
+                            bus.send(AppEvent::ApprovalResolved {
+                                session_id: local_session_id.clone(),
+                                id: turn as u64,
+                                action: "skip".to_string(),
+                            });
                             should_skip = true;
                         }
                         Ok(event::ApprovalResponse::Deny) | Err(_) => {
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "denied")
                             });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "deny".to_string() });
+                            bus.send(AppEvent::ApprovalResolved {
+                                session_id: local_session_id.clone(),
+                                id: turn as u64,
+                                action: "deny".to_string(),
+                            });
                             bus.send(AppEvent::TaskComplete {
                                 reason: "Denied by user".to_string(),
                                 summary: None,
@@ -4356,6 +4422,7 @@ async fn run_agent_loop(
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     approval_registry.lock().unwrap().insert(turn as u64, tx);
                     bus.send(AppEvent::ApprovalRequired {
+                        session_id: local_session_id.clone(),
                         id: turn as u64,
                         command_preview: preview.clone(),
                         category: cat,
@@ -4387,6 +4454,7 @@ async fn run_agent_loop(
                             // reflects what actually happened.
                             if cancel_token.is_cancelled() {
                                 bus.send(AppEvent::Interrupted {
+                                    session_id: local_session_id.clone(),
                                     reason: "user requested".into(),
                                 });
                                 slog(&session_log, |l| {
@@ -4664,6 +4732,7 @@ Proceed with explicit assumptions and continue without additional questions."
                 if let Some(slot) = json_approval {
                     // JSON mode: emit approval event and wait for stdin response
                     bus.send(AppEvent::ApprovalRequired {
+                        session_id: local_session_id.clone(),
                         id: turn as u64,
                         command_preview: preview.clone(),
                         category: cat,
@@ -4678,7 +4747,11 @@ Proceed with explicit assumptions and continue without additional questions."
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "approved")
                             });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve".to_string() });
+                            bus.send(AppEvent::ApprovalResolved {
+                                session_id: local_session_id.clone(),
+                                id: turn as u64,
+                                action: "approve".to_string(),
+                            });
                             // Record approved command for dedup
                             autonomy.write().await.record_approved_command(&preview);
                             // Session-grant: first DisplayControl approval unlocks the session
@@ -4695,7 +4768,11 @@ Proceed with explicit assumptions and continue without additional questions."
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "approve-all")
                             });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve_all".to_string() });
+                            bus.send(AppEvent::ApprovalResolved {
+                                session_id: local_session_id.clone(),
+                                id: turn as u64,
+                                action: "approve_all".to_string(),
+                            });
                             let mut state = autonomy.write().await;
                             state.level = AutonomyLevel::Full;
                             // Session-grant: DisplayControl approval also unlocks user display
@@ -4711,14 +4788,22 @@ Proceed with explicit assumptions and continue without additional questions."
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "skipped")
                             });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "skip".to_string() });
+                            bus.send(AppEvent::ApprovalResolved {
+                                session_id: local_session_id.clone(),
+                                id: turn as u64,
+                                action: "skip".to_string(),
+                            });
                             should_skip = true;
                         }
                         Ok(event::ApprovalResponse::Deny) | Err(_) => {
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "denied")
                             });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "deny".to_string() });
+                            bus.send(AppEvent::ApprovalResolved {
+                                session_id: local_session_id.clone(),
+                                id: turn as u64,
+                                action: "deny".to_string(),
+                            });
                             bus.send(AppEvent::TaskComplete {
                                 reason: "Denied by user".to_string(),
                                 summary: None,
@@ -4743,6 +4828,7 @@ Proceed with explicit assumptions and continue without additional questions."
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     approval_registry.lock().unwrap().insert(turn as u64, tx);
                     bus.send(AppEvent::ApprovalRequired {
+                        session_id: local_session_id.clone(),
                         id: turn as u64,
                         command_preview: preview.clone(),
                         category: cat,
@@ -4774,6 +4860,7 @@ Proceed with explicit assumptions and continue without additional questions."
                             // reflects what actually happened.
                             if cancel_token.is_cancelled() {
                                 bus.send(AppEvent::Interrupted {
+                                    session_id: local_session_id.clone(),
                                     reason: "user requested".into(),
                                 });
                                 slog(&session_log, |l| {
@@ -5888,7 +5975,12 @@ async fn run_with_presence(
             let agent = persistent_agent.as_mut().unwrap();
             let thread = persistent_thread.as_ref().unwrap();
             let merged_text =
-                drain_steer_queue_as_followup(&context_injection, &task_text, &bus)
+                drain_steer_queue_as_followup(
+                    &context_injection,
+                    &task_text,
+                    &bus,
+                    session_log_id(&session_log).as_deref(),
+                )
                     .unwrap_or_else(|| task_text.clone());
             let send_result = if envelope.attachment_frame_ids.is_empty() {
                 agent.send_message(thread, &merged_text).await
@@ -5925,6 +6017,7 @@ async fn run_with_presence(
             let event_rx = persistent_event_rx.as_mut().unwrap();
             let drain_config = DrainConfig {
                 bus: &bus,
+                session_id: session_log_id(&session_log),
                 autonomy: autonomy.clone(),
                 session_log: &session_log,
                 log_dir: &log_dir,
@@ -6590,6 +6683,7 @@ async fn run_external_agent_mode(
 
     let drain_config = DrainConfig {
         bus: &bus,
+        session_id: session_log_id(&session_log),
         autonomy: autonomy.clone(),
         session_log: &session_log,
         log_dir: &_log_dir,
@@ -6630,6 +6724,7 @@ async fn run_external_agent_mode(
                             &context_injection,
                             &followup,
                             &bus,
+                            session_log_id(&session_log).as_deref(),
                         )
                         .unwrap_or(followup);
                         slog(&session_log, |l| {
@@ -6673,6 +6768,7 @@ async fn run_external_agent_mode(
                             &context_injection,
                             &followup,
                             &bus,
+                            session_log_id(&session_log).as_deref(),
                         )
                         .unwrap_or(followup);
                         slog(&session_log, |l| {

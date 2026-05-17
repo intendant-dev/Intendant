@@ -45,6 +45,7 @@ struct ManagedSession {
     source: String,
     project_root: PathBuf,
     follow_up_tx: mpsc::Sender<String>,
+    approval_registry: event::ApprovalRegistry,
 }
 
 impl SessionSupervisor {
@@ -134,6 +135,40 @@ impl SessionSupervisor {
                 direct,
             } => {
                 self.route_follow_up(session_id, text, direct).await;
+            }
+            event::ControlMsg::Interrupt {
+                session_id,
+                expected_turn: _,
+            } => {
+                self.route_interrupt(session_id).await;
+            }
+            event::ControlMsg::Steer {
+                session_id,
+                text,
+                id,
+            } => {
+                self.route_steer(session_id, text, id).await;
+            }
+            event::ControlMsg::Approve { session_id, id } => {
+                self.resolve_approval(session_id, id, event::ApprovalResponse::Approve, "approve")
+                    .await;
+            }
+            event::ControlMsg::Deny { session_id, id } => {
+                self.resolve_approval(session_id, id, event::ApprovalResponse::Deny, "deny")
+                    .await;
+            }
+            event::ControlMsg::Skip { session_id, id } => {
+                self.resolve_approval(session_id, id, event::ApprovalResponse::Skip, "skip")
+                    .await;
+            }
+            event::ControlMsg::ApproveAll { session_id, id } => {
+                self.resolve_approval(
+                    session_id,
+                    id,
+                    event::ApprovalResponse::ApproveAll,
+                    "approve_all",
+                )
+                .await;
             }
             _ => {}
         }
@@ -321,11 +356,14 @@ impl SessionSupervisor {
         resume_token: Option<String>,
     ) {
         let (follow_up_tx, follow_up_rx) = mpsc::channel::<String>(16);
+        let approval_registry = event::ApprovalRegistry::default();
+        let context_injection = event::ContextInjectionQueue::default();
         self.register_session(
             session_id.clone(),
             source.clone(),
             project.root.clone(),
             follow_up_tx,
+            approval_registry.clone(),
         )
         .await;
 
@@ -345,8 +383,8 @@ impl SessionSupervisor {
                     log_dir,
                     follow_up_rx,
                     None,
-                    event::ApprovalRegistry::default(),
-                    event::ContextInjectionQueue::default(),
+                    approval_registry,
+                    context_injection,
                     true,
                     web_port,
                     attachment_images,
@@ -374,8 +412,8 @@ impl SessionSupervisor {
                         None,
                         follow_up_rx,
                         None,
-                        event::ApprovalRegistry::default(),
-                        event::ContextInjectionQueue::default(),
+                        approval_registry,
+                        context_injection,
                         true,
                         attachment_images,
                     )
@@ -529,12 +567,104 @@ impl SessionSupervisor {
         }
     }
 
+    async fn route_interrupt(&self, session_id: Option<String>) {
+        let Some(target_id) = self.resolve_target_session_id(session_id).await else {
+            self.warn("Interrupt dropped: no active managed session");
+            return;
+        };
+        if !self.session_is_managed(&target_id).await {
+            self.warn(&format!(
+                "Interrupt dropped: session {} is not managed by this daemon",
+                short_session(&target_id)
+            ));
+            return;
+        }
+        self.config.bus.send(AppEvent::InterruptRequested {
+            session_id: Some(target_id),
+        });
+    }
+
+    async fn route_steer(&self, session_id: Option<String>, text: String, id: Option<String>) {
+        let Some(target_id) = self.resolve_target_session_id(session_id).await else {
+            self.warn("Steer dropped: no active managed session");
+            return;
+        };
+        if !self.session_is_managed(&target_id).await {
+            self.warn(&format!(
+                "Steer dropped: session {} is not managed by this daemon",
+                short_session(&target_id)
+            ));
+            return;
+        }
+        self.config.bus.send(AppEvent::SteerRequested {
+            session_id: Some(target_id),
+            text,
+            id: id.unwrap_or_default(),
+        });
+    }
+
+    async fn resolve_approval(
+        &self,
+        session_id: Option<String>,
+        approval_id: u64,
+        response: event::ApprovalResponse,
+        action: &str,
+    ) {
+        let Some(target_id) = self.resolve_target_session_id(session_id).await else {
+            self.warn("Approval response dropped: no active managed session");
+            return;
+        };
+        let registry = {
+            let state = self.state.lock().await;
+            state
+                .sessions
+                .get(&target_id)
+                .map(|session| session.approval_registry.clone())
+        };
+        let Some(registry) = registry else {
+            self.warn(&format!(
+                "Approval response dropped: session {} is not managed by this daemon",
+                short_session(&target_id)
+            ));
+            return;
+        };
+        let responder = registry.lock().unwrap().remove(&approval_id);
+        match responder {
+            Some(tx) => {
+                let _ = tx.send(response);
+                self.config.bus.send(AppEvent::ApprovalResolved {
+                    session_id: Some(target_id),
+                    id: approval_id,
+                    action: action.to_string(),
+                });
+            }
+            None => {
+                self.warn(&format!(
+                    "Approval response dropped: id {} is not pending for session {}",
+                    approval_id,
+                    short_session(&target_id)
+                ));
+            }
+        }
+    }
+
+    async fn resolve_target_session_id(&self, session_id: Option<String>) -> Option<String> {
+        let state = self.state.lock().await;
+        session_id.or_else(|| state.active_session_id.clone())
+    }
+
+    async fn session_is_managed(&self, session_id: &str) -> bool {
+        let state = self.state.lock().await;
+        state.sessions.contains_key(session_id)
+    }
+
     async fn register_session(
         &self,
         session_id: String,
         source: String,
         project_root: PathBuf,
         follow_up_tx: mpsc::Sender<String>,
+        approval_registry: event::ApprovalRegistry,
     ) {
         let mut state = self.state.lock().await;
         state.active_session_id = Some(session_id.clone());
@@ -545,6 +675,7 @@ impl SessionSupervisor {
                 source,
                 project_root,
                 follow_up_tx,
+                approval_registry,
             },
         );
     }

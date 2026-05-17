@@ -917,6 +917,7 @@ impl App {
             ApprovalResponse::ApproveAll => "approve_all",
         };
         self.pending_derived.push(AppEvent::ApprovalResolved {
+            session_id: Some(self.session_id.clone()).filter(|id| !id.is_empty()),
             id,
             action: action.to_string(),
         });
@@ -1083,7 +1084,7 @@ impl App {
 
     fn handle_control_command(&mut self, msg: ControlMsg) {
         match msg {
-            ControlMsg::Status => {
+            ControlMsg::Status { .. } => {
                 self.broadcast_control(OutboundEvent::Status {
                     turn: self.turn,
                     phase: format!("{:?}", self.current_phase).to_lowercase(),
@@ -1099,7 +1100,7 @@ impl App {
                     presence: self.presence_usage_snapshot(),
                 });
             }
-            ControlMsg::Approve { id } => {
+            ControlMsg::Approve { id, .. } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
                     self.pending_approvals.remove(pos);
                     let via = self.approval_source();
@@ -1111,7 +1112,7 @@ impl App {
                     }
                 }
             }
-            ControlMsg::Deny { id } => {
+            ControlMsg::Deny { id, .. } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
                     self.pending_approvals.remove(pos);
                     let via = self.approval_source();
@@ -1123,7 +1124,7 @@ impl App {
                     }
                 }
             }
-            ControlMsg::Skip { id } => {
+            ControlMsg::Skip { id, .. } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
                     self.pending_approvals.remove(pos);
                     let via = self.approval_source();
@@ -1135,7 +1136,7 @@ impl App {
                     }
                 }
             }
-            ControlMsg::ApproveAll { id } => {
+            ControlMsg::ApproveAll { id, .. } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
                     self.pending_approvals.remove(pos);
                     let via = self.approval_source();
@@ -1869,6 +1870,7 @@ impl App {
                 );
             }
             AppEvent::ApprovalRequired {
+                session_id: _,
                 id,
                 command_preview,
                 category,
@@ -2302,7 +2304,7 @@ impl App {
             AppEvent::DisplayApprovalPending { display_id, backend } => {
                 self.log(LogLevel::Info, format!("Display :{} waiting for OS screen-share approval ({backend} portal)", display_id));
             }
-            AppEvent::InterruptRequested => {
+            AppEvent::InterruptRequested { .. } => {
                 self.current_phase = Phase::Interrupting;
                 self.log(LogLevel::Info, "Interrupt requested".to_string());
                 derived.push(AppEvent::StatusUpdate {
@@ -2313,7 +2315,7 @@ impl App {
                     task: self.task_description.clone(),
                 });
             }
-            AppEvent::Interrupted { ref reason } => {
+            AppEvent::Interrupted { ref reason, .. } => {
                 self.current_phase = Phase::Interrupted;
                 self.log(LogLevel::Info, format!("Interrupted: {}", reason));
                 derived.push(AppEvent::StatusUpdate {
@@ -2324,7 +2326,7 @@ impl App {
                     task: self.task_description.clone(),
                 });
             }
-            AppEvent::SteerRequested { ref text, ref id } => {
+            AppEvent::SteerRequested { ref text, ref id, .. } => {
                 let preview: String = text.chars().take(80).collect();
                 let suffix = if text.chars().count() > 80 { "..." } else { "" };
                 let id_part = if id.is_empty() {
@@ -2337,7 +2339,7 @@ impl App {
                     format!("Steer requested{}: {}{}", id_part, preview, suffix),
                 );
             }
-            AppEvent::SteerQueued { ref id, ref reason } => {
+            AppEvent::SteerQueued { ref id, ref reason, .. } => {
                 let id_part = if id.is_empty() {
                     String::new()
                 } else {
@@ -2348,7 +2350,7 @@ impl App {
                     format!("Steer queued{}: {}", id_part, reason),
                 );
             }
-            AppEvent::SteerDelivered { ref id, mid_turn } => {
+            AppEvent::SteerDelivered { ref id, mid_turn, .. } => {
                 let id_part = if id.is_empty() {
                     String::new()
                 } else {
@@ -3241,6 +3243,7 @@ mod tests {
 
         // ApprovalRequired: outbound OutboundEvent::ApprovalRequired → no LogEntry
         let derived = app.handle_event(AppEvent::ApprovalRequired {
+            session_id: None,
             id: 1,
             command_preview: "ls".to_string(),
             category: crate::autonomy::ActionCategory::CommandExec,

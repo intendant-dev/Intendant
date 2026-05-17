@@ -10088,7 +10088,7 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
 
-            if matches!(event, AppEvent::ControlCommand(ControlMsg::Status)) {
+            if matches!(event, AppEvent::ControlCommand(ControlMsg::Status { .. })) {
                 found = true;
                 break;
             }
@@ -11843,7 +11843,7 @@ mod tests {
             .await
             .expect("timeout")
             .expect("channel closed");
-            if let AppEvent::ControlCommand(ControlMsg::Approve { id }) = event {
+            if let AppEvent::ControlCommand(ControlMsg::Approve { id, .. }) = event {
                 assert_eq!(id, 42);
                 found = true;
                 break;
@@ -11964,7 +11964,7 @@ mod tests {
             .await
             .expect("timeout")
             .expect("channel closed");
-            if matches!(event, AppEvent::ControlCommand(ControlMsg::Status)) {
+            if matches!(event, AppEvent::ControlCommand(ControlMsg::Status { .. })) {
                 found = true;
                 break;
             }

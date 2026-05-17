@@ -130,6 +130,8 @@ pub enum OutboundEvent {
         source: Option<String>,
     },
     ApprovalRequired {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         id: u64,
         command: String,
     },
@@ -338,6 +340,8 @@ pub enum OutboundEvent {
         preview: String,
     },
     ApprovalResolved {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         id: u64,
         action: String,
     },
@@ -476,13 +480,20 @@ pub enum OutboundEvent {
         backend: String,
         method: String,
     },
-    InterruptRequested,
+    InterruptRequested {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
     Interrupted {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         reason: String,
     },
     /// Mid-turn steering was requested by a user; surfaced so external
     /// consumers (dashboard) can show a pending steer row or toast.
     SteerRequested {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         text: String,
         id: String,
     },
@@ -490,12 +501,16 @@ pub enum OutboundEvent {
     /// text was queued for the next turn instead. Paired with a later
     /// `SteerDelivered { mid_turn: false }` once the queue drains.
     SteerQueued {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         id: String,
         reason: String,
     },
     /// Steer reached the agent — either mid-turn (native `turn/steer`) or
     /// as a follow-up injection at turn boundary.
     SteerDelivered {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         id: String,
         mid_turn: bool,
     },

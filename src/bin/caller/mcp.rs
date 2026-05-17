@@ -985,7 +985,7 @@ async fn handle_control_command_mcp(
     msg: ControlMsg,
 ) -> Option<&'static str> {
     match msg {
-        ControlMsg::Status => {
+        ControlMsg::Status { .. } => {
             emit_control_status(state, control_tx).await;
             None
         }
@@ -1000,11 +1000,15 @@ async fn handle_control_command_mcp(
             }
             None
         }
-        ControlMsg::Approve { id } => {
+        ControlMsg::Approve { id, .. } => {
             let mut s = state.write().await;
             let outcome = process_action_sync(&mut s, UserAction::Approve { id });
             if matches!(outcome, ActionOutcome::Ok) {
-                bus.send(AppEvent::ApprovalResolved { id, action: "approve".to_string() });
+                bus.send(AppEvent::ApprovalResolved {
+                    session_id: None,
+                    id,
+                    action: "approve".to_string(),
+                });
             }
             emit_control_result(
                 control_tx,
@@ -1015,11 +1019,15 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_APPROVAL_URI)
         }
-        ControlMsg::Deny { id } => {
+        ControlMsg::Deny { id, .. } => {
             let mut s = state.write().await;
             let outcome = process_action_sync(&mut s, UserAction::Deny { id });
             if matches!(outcome, ActionOutcome::Ok) {
-                bus.send(AppEvent::ApprovalResolved { id, action: "deny".to_string() });
+                bus.send(AppEvent::ApprovalResolved {
+                    session_id: None,
+                    id,
+                    action: "deny".to_string(),
+                });
             }
             emit_control_result(
                 control_tx,
@@ -1042,11 +1050,15 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_INPUT_URI)
         }
-        ControlMsg::Skip { id } => {
+        ControlMsg::Skip { id, .. } => {
             let mut s = state.write().await;
             let outcome = process_action_sync(&mut s, UserAction::Skip { id });
             if matches!(outcome, ActionOutcome::Ok) {
-                bus.send(AppEvent::ApprovalResolved { id, action: "skip".to_string() });
+                bus.send(AppEvent::ApprovalResolved {
+                    session_id: None,
+                    id,
+                    action: "skip".to_string(),
+                });
             }
             emit_control_result(
                 control_tx,
@@ -1057,11 +1069,15 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_APPROVAL_URI)
         }
-        ControlMsg::ApproveAll { id } => {
+        ControlMsg::ApproveAll { id, .. } => {
             let mut s = state.write().await;
             let outcome = process_action_sync(&mut s, UserAction::ApproveAll { id });
             if matches!(outcome, ActionOutcome::Ok) {
-                bus.send(AppEvent::ApprovalResolved { id, action: "approve_all".to_string() });
+                bus.send(AppEvent::ApprovalResolved {
+                    session_id: None,
+                    id,
+                    action: "approve_all".to_string(),
+                });
             }
             emit_control_result(
                 control_tx,
@@ -1950,17 +1966,25 @@ async fn handle_control_command_mcp(
             emit_control_result(control_tx, "delete_recording", true, format!("Deleting {}", stream_name), None);
             None
         }
-        ControlMsg::Interrupt { expected_turn: _ } => {
+        ControlMsg::Interrupt {
+            session_id,
+            expected_turn: _,
+        } => {
             // Re-broadcast as an AppEvent so the dispatcher / agent loops pick it up.
-            bus.send(AppEvent::InterruptRequested);
+            bus.send(AppEvent::InterruptRequested { session_id });
             emit_control_result(control_tx, "interrupt", true, "Interrupt requested".to_string(), None);
             Some(RESOURCE_STATUS_URI)
         }
-        ControlMsg::Steer { text, id } => {
+        ControlMsg::Steer {
+            session_id,
+            text,
+            id,
+        } => {
             // Mid-turn steering from an MCP client. Re-broadcast as an
             // `AppEvent::SteerRequested` so the running agent loop (if any)
             // decides whether to call `steer_turn` or fall back to queuing.
             bus.send(AppEvent::SteerRequested {
+                session_id,
                 text,
                 id: id.unwrap_or_default(),
             });
@@ -2249,6 +2273,7 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::ApprovalRequired {
+                        session_id: _,
                         id,
                         command_preview,
                         category,
@@ -2348,7 +2373,7 @@ pub fn spawn_event_listener(
                         resource_changed = Some("intendant://logs");
                     }
 
-                    AppEvent::ApprovalResolved { id, ref action } => {
+                    AppEvent::ApprovalResolved { id, ref action, .. } => {
                         s.pending_approval = None;
                         if action == "deny" {
                             s.set_phase(Phase::Done);
@@ -2477,17 +2502,17 @@ pub fn spawn_event_listener(
                     AppEvent::DisplayApprovalPending { display_id, backend } => {
                         s.push_log(LogLevel::Info, format!("Display :{} waiting for OS screen-share approval ({backend} portal)", display_id));
                     }
-                    AppEvent::InterruptRequested => {
+                    AppEvent::InterruptRequested { .. } => {
                         s.set_phase(Phase::Interrupting);
                         s.push_log(LogLevel::Info, "Interrupt requested".to_string());
                         resource_changed = Some("intendant://status");
                     }
-                    AppEvent::Interrupted { ref reason } => {
+                    AppEvent::Interrupted { ref reason, .. } => {
                         s.set_phase(Phase::Interrupted);
                         s.push_log(LogLevel::Info, format!("Interrupted: {}", reason));
                         resource_changed = Some("intendant://status");
                     }
-                    AppEvent::SteerRequested { ref text, ref id } => {
+                    AppEvent::SteerRequested { ref text, ref id, .. } => {
                         let preview: String = text.chars().take(80).collect();
                         let suffix = if text.chars().count() > 80 { "..." } else { "" };
                         let id_part = if id.is_empty() {
@@ -2501,7 +2526,7 @@ pub fn spawn_event_listener(
                         );
                         resource_changed = Some("intendant://logs");
                     }
-                    AppEvent::SteerQueued { ref id, ref reason } => {
+                    AppEvent::SteerQueued { ref id, ref reason, .. } => {
                         let id_part = if id.is_empty() {
                             String::new()
                         } else {
@@ -2513,7 +2538,7 @@ pub fn spawn_event_listener(
                         );
                         resource_changed = Some("intendant://logs");
                     }
-                    AppEvent::SteerDelivered { ref id, mid_turn } => {
+                    AppEvent::SteerDelivered { ref id, mid_turn, .. } => {
                         let id_part = if id.is_empty() {
                             String::new()
                         } else {
@@ -3231,7 +3256,11 @@ impl IntendantServer {
         let mut s = self.state.write().await;
         let outcome = process_action_sync(&mut s, action);
         if outcome == ActionOutcome::Ok {
-            self.bus.send(AppEvent::ApprovalResolved { id: params.id, action: "approve".to_string() });
+            self.bus.send(AppEvent::ApprovalResolved {
+                session_id: None,
+                id: params.id,
+                action: "approve".to_string(),
+            });
         }
         format_outcome(outcome)
     }
@@ -3244,7 +3273,11 @@ impl IntendantServer {
         let mut s = self.state.write().await;
         let outcome = process_action_sync(&mut s, action);
         if outcome == ActionOutcome::Ok {
-            self.bus.send(AppEvent::ApprovalResolved { id: params.id, action: "deny".to_string() });
+            self.bus.send(AppEvent::ApprovalResolved {
+                session_id: None,
+                id: params.id,
+                action: "deny".to_string(),
+            });
         }
         format_outcome(outcome)
     }
@@ -3257,7 +3290,11 @@ impl IntendantServer {
         let mut s = self.state.write().await;
         let outcome = process_action_sync(&mut s, action);
         if outcome == ActionOutcome::Ok {
-            self.bus.send(AppEvent::ApprovalResolved { id: params.id, action: "skip".to_string() });
+            self.bus.send(AppEvent::ApprovalResolved {
+                session_id: None,
+                id: params.id,
+                action: "skip".to_string(),
+            });
         }
         format_outcome(outcome)
     }
@@ -3270,7 +3307,11 @@ impl IntendantServer {
         let mut s = self.state.write().await;
         let outcome = process_action_sync(&mut s, action);
         if outcome == ActionOutcome::Ok {
-            self.bus.send(AppEvent::ApprovalResolved { id: params.id, action: "approve_all".to_string() });
+            self.bus.send(AppEvent::ApprovalResolved {
+                session_id: None,
+                id: params.id,
+                action: "approve_all".to_string(),
+            });
             let autonomy = s.autonomy.clone();
             drop(s);
             let mut a = autonomy.write().await;

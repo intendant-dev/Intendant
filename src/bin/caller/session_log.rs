@@ -2406,24 +2406,29 @@ pub fn session_log_entry_to_app_event(
                     let category = crate::autonomy::ActionCategory::from_str(category_str)
                         .unwrap_or(crate::autonomy::ActionCategory::CommandExec);
                     Some(AppEvent::ApprovalRequired {
+                        session_id: None,
                         id,
                         command_preview: preview,
                         category,
                     })
                 }
                 "approved" => Some(AppEvent::ApprovalResolved {
+                    session_id: None,
                     id,
                     action: "approve".to_string(),
                 }),
                 "approve-all" => Some(AppEvent::ApprovalResolved {
+                    session_id: None,
                     id,
                     action: "approve_all".to_string(),
                 }),
                 "skipped" => Some(AppEvent::ApprovalResolved {
+                    session_id: None,
                     id,
                     action: "skip".to_string(),
                 }),
                 "denied" => Some(AppEvent::ApprovalResolved {
+                    session_id: None,
                     id,
                     action: "deny".to_string(),
                 }),
@@ -2446,6 +2451,7 @@ pub fn session_log_entry_to_app_event(
                 .unwrap_or("")
                 .to_string();
             Some(AppEvent::ApprovalResolved {
+                session_id: None,
                 id: turn.unwrap_or(0) as u64,
                 action,
             })
@@ -3781,6 +3787,7 @@ mod tests {
                 id,
                 command_preview,
                 category,
+                ..
             } => {
                 assert_eq!(id, 7, "id should be synthesized from turn");
                 assert_eq!(command_preview, "exec: rm -rf /tmp/x");
@@ -3801,7 +3808,7 @@ mod tests {
 
         let entry = read_last_event(&log_dir, "approval");
         match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
-            AppEvent::ApprovalResolved { id, action } => {
+            AppEvent::ApprovalResolved { id, action, .. } => {
                 assert_eq!(id, 3);
                 assert_eq!(action, "approve");
             }

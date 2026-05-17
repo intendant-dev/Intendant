@@ -4989,6 +4989,10 @@ let autoScroll = true;
 let logEntryCount = 0;
 let currentPhase = 'idle';
 let currentSessionFullId = '';
+let pendingApprovalId = null;
+let pendingApprovalSessionId = '';
+let steerCounter = 0;
+const approvalSessionIds = new Map();
 let spinnerIdx = 0;
 let spinnerInterval = null;
 
@@ -5510,6 +5514,9 @@ async function main() {
         applyCurrentRoute();
         return;
       }
+      if (d.event === 'approval_required' && d.id !== undefined && d.session_id) {
+        approvalSessionIds.set(String(d.id), d.session_id);
+      }
       if (d.t === 'annotation_saved' && d.path) {
         showAnnotationResult(d.path);
         return;
@@ -6028,8 +6035,8 @@ function processCommands(cmds) {
       case 'add_turn_separator': renderTurnSeparator(c.turn); break;
       case 'update_status_bar': updateStatusBar(c); break;
       case 'set_phase': setPhase(c.phase); break;
-      case 'show_approval': showApproval(c.id, c.command, c.category); break;
-      case 'hide_approval': hidePanel('approval-panel'); break;
+      case 'show_approval': showApproval(c.id, c.command, c.category, c.session_id); break;
+      case 'hide_approval': clearPendingApproval(); hidePanel('approval-panel'); break;
       case 'show_human_input': showHumanInput(c.question); break;
       case 'hide_human_input': hidePanel('human-panel'); break;
       case 'hide_all_panels': hideAllPanels(); break;
@@ -7284,8 +7291,19 @@ function setPhase(phase) {
   }
 }
 
-function showApproval(id, command, category) {
+function clearPendingApproval() {
+  pendingApprovalId = null;
+  pendingApprovalSessionId = '';
+}
+
+function showApproval(id, command, category, sessionId) {
   hideAllPanels();
+  pendingApprovalId = id;
+  pendingApprovalSessionId =
+    sessionId
+    || approvalSessionIds.get(String(id))
+    || currentSessionFullId
+    || '';
   document.getElementById('approval-command').textContent = command;
   document.getElementById('approval-category').textContent = category ? 'Category: ' + category : '';
   document.getElementById('approval-panel').classList.add('visible');
@@ -7298,8 +7316,14 @@ function showHumanInput(question) {
 }
 
 function showPanel(id) { hideAllPanels(); document.getElementById(id).classList.add('visible'); }
-function hidePanel(id) { document.getElementById(id).classList.remove('visible'); }
-function hideAllPanels() { document.querySelectorAll('.bottom-panel').forEach(p => p.classList.remove('visible')); }
+function hidePanel(id) {
+  if (id === 'approval-panel') clearPendingApproval();
+  document.getElementById(id).classList.remove('visible');
+}
+function hideAllPanels() {
+  clearPendingApproval();
+  document.querySelectorAll('.bottom-panel').forEach(p => p.classList.remove('visible'));
+}
 
 function showBadge(tab, text) {
   const badge = document.getElementById('badge-' + tab);
@@ -16132,8 +16156,8 @@ window.submitActivityTask = function() {
 // click starts a new task (the existing submitActivityTask path).
 // When the agent is actively working (thinking / running / orchestrating /
 // waiting-approval / waiting-human / interrupting), the click injects a
-// mid-turn steer via WASM's send_steer, which round-trips through the
-// backend as ControlMsg::Steer and comes back as steer_requested /
+// mid-turn steer via a session-scoped server action, which round-trips
+// through the backend as ControlMsg::Steer and comes back as steer_requested /
 // steer_queued / steer_delivered events.
 //
 // The submit button's label tracks the phase (Send vs ↗ Steer) so the
@@ -16145,14 +16169,17 @@ window.submitActivityOrSteer = function() {
   const text = input.value.trim();
   if (!text) return;
   if (isAgentActivePhase(currentPhase)) {
-    // Mid-turn steer path. WASM generates the id locally and we render
-    // an optimistic pending row immediately — the backend round-trips a
+    // Mid-turn steer path. JS generates the id locally and we render an
+    // optimistic pending row immediately — the backend round-trips a
     // steer_requested echo that updates the same row by id (idempotent
     // onSteerStatusUpdate). If the echo never arrives (server dead /
     // WebSocket severed), the pending row remains visible as a signal
     // that something went wrong.
-    const idJs = app.send_steer(text);
-    const id = (typeof idJs === 'string') ? idJs : String(idJs);
+    steerCounter = (steerCounter + 1) >>> 0;
+    const id = 'steer-' + Date.now() + '-' + steerCounter;
+    const msg = { action: 'steer', text, id };
+    if (currentSessionFullId) msg.session_id = currentSessionFullId;
+    app.send_server_action(msg);
     onSteerStatusUpdate(id, text, 'pending', null);
     input.value = '';
   } else {
@@ -16182,7 +16209,7 @@ function updateSubmitButtonLabel(phase) {
 // ── Steer in-flight strip ──
 //
 // Renders one row per QueuedSteer. The backend flow is:
-//   1. User types + clicks Steer → WASM send_steer → server ControlMsg::Steer
+//   1. User types + clicks Steer → session-scoped server action → server ControlMsg::Steer
 //   2. Server emits steer_requested (echo) → WASM → SteerStatusUpdate(pending)
 //   3. Server emits steer_queued OR steer_delivered (possibly both)
 //   4. Delivered row fades and is removed; queued row stays until delivered.
@@ -17073,17 +17100,24 @@ function renderSessionDetailEntries(entries, el) {
 // ── Keyboard Shortcuts ──
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
-  if (activeTab === 'activity' && app && app.pending_approval_id() !== null) {
-    if (e.key === 'y') { processCommands(app.send_approval('approve')); e.preventDefault(); }
-    else if (e.key === 's') { processCommands(app.send_approval('skip')); e.preventDefault(); }
-    else if (e.key === 'a') { processCommands(app.send_approval('approve_all')); e.preventDefault(); }
-    else if (e.key === 'n') { processCommands(app.send_approval('deny')); e.preventDefault(); }
+  if (activeTab === 'activity' && app && pendingApprovalId !== null) {
+    if (e.key === 'y') { sendApproval('approve'); e.preventDefault(); }
+    else if (e.key === 's') { sendApproval('skip'); e.preventDefault(); }
+    else if (e.key === 'a') { sendApproval('approve_all'); e.preventDefault(); }
+    else if (e.key === 'n') { sendApproval('deny'); e.preventDefault(); }
   }
 });
 
 // ── Approval / Input / Follow-up actions (from HTML onclick) ──
 window.sendApproval = function(action) {
-  if (app) processCommands(app.send_approval(action));
+  if (!app || pendingApprovalId === null) return;
+  const msg = { action, id: pendingApprovalId };
+  if (pendingApprovalSessionId) msg.session_id = pendingApprovalSessionId;
+  app.send_server_action(msg);
+  approvalSessionIds.delete(String(pendingApprovalId));
+  clearPendingApproval();
+  hidePanel('approval-panel');
+  setPhase('running');
 };
 window.sendHumanResponse = function() {
   const input = document.getElementById('human-input');
@@ -17103,7 +17137,9 @@ window.sendInterrupt = function() {
     btn.disabled = true;
     btn.innerHTML = '\u23F9 Interrupting...';
   }
-  processCommands(app.send_interrupt());
+  const msg = { action: 'interrupt' };
+  if (currentSessionFullId) msg.session_id = currentSessionFullId;
+  app.send_server_action(msg);
 };
 
 // Show/hide the Stop button based on phase.

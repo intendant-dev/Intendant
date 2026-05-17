@@ -184,6 +184,7 @@ mod tests {
     #[test]
     fn outbound_event_approval_required_serialize() {
         let event = OutboundEvent::ApprovalRequired {
+            session_id: None,
             id: 42,
             command: "rm -rf /tmp".to_string(),
         };

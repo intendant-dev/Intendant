@@ -576,6 +576,7 @@ impl AppEventUpcaster {
                 id,
                 command_preview,
                 category,
+                ..
             } => vec![PeerEvent::ApprovalRequested {
                 request: ApprovalRequest {
                     request_id: id.to_string(),
@@ -585,7 +586,7 @@ impl AppEventUpcaster {
                 },
             }],
 
-            AppEvent::ApprovalResolved { id, action } => vec![PeerEvent::ApprovalResolved {
+            AppEvent::ApprovalResolved { id, action, .. } => vec![PeerEvent::ApprovalResolved {
                 request_id: id.to_string(),
                 decision: approval_decision_from_action(action),
             }],
@@ -1046,19 +1047,19 @@ impl AppEventUpcaster {
             }],
 
             // ---- Interruption ----
-            AppEvent::InterruptRequested => vec![log_event(
+            AppEvent::InterruptRequested { .. } => vec![log_event(
                 LogLevel::Info,
                 "agent",
                 "interrupt requested".to_string(),
             )],
-            AppEvent::Interrupted { reason } => vec![log_event(
+            AppEvent::Interrupted { reason, .. } => vec![log_event(
                 LogLevel::Info,
                 "agent",
                 format!("interrupted: {reason}"),
             )],
 
             // ---- Mid-turn steering ----
-            AppEvent::SteerRequested { text, id } => {
+            AppEvent::SteerRequested { text, id, .. } => {
                 let preview: String = text.chars().take(80).collect();
                 let suffix = if text.chars().count() > 80 { "..." } else { "" };
                 let id_part = if id.is_empty() {
@@ -1072,7 +1073,7 @@ impl AppEventUpcaster {
                     format!("steer requested{id_part}: {preview}{suffix}"),
                 )]
             }
-            AppEvent::SteerQueued { id, reason } => {
+            AppEvent::SteerQueued { id, reason, .. } => {
                 let id_part = if id.is_empty() {
                     String::new()
                 } else {
@@ -1084,7 +1085,7 @@ impl AppEventUpcaster {
                     format!("steer queued{id_part}: {reason}"),
                 )]
             }
-            AppEvent::SteerDelivered { id, mid_turn } => {
+            AppEvent::SteerDelivered { id, mid_turn, .. } => {
                 let id_part = if id.is_empty() {
                     String::new()
                 } else {
@@ -1528,7 +1529,7 @@ impl WireEventUpcaster {
             // this as intentional loss — non-command-exec categories
             // (file_write, destructive, etc.) lose their specific
             // category name on the wire path.
-            OutboundEvent::ApprovalRequired { id, command } => {
+            OutboundEvent::ApprovalRequired { id, command, .. } => {
                 vec![PeerEvent::ApprovalRequested {
                     request: ApprovalRequest {
                         request_id: id.to_string(),
@@ -1539,7 +1540,7 @@ impl WireEventUpcaster {
                 }]
             }
 
-            OutboundEvent::ApprovalResolved { id, action } => {
+            OutboundEvent::ApprovalResolved { id, action, .. } => {
                 vec![PeerEvent::ApprovalResolved {
                     request_id: id.to_string(),
                     decision: approval_decision_from_action(action),
@@ -1947,19 +1948,19 @@ impl WireEventUpcaster {
             }
 
             // ---- Interruption ----
-            OutboundEvent::InterruptRequested => vec![log_event(
+            OutboundEvent::InterruptRequested { .. } => vec![log_event(
                 LogLevel::Info,
                 "agent",
                 "interrupt requested".to_string(),
             )],
-            OutboundEvent::Interrupted { reason } => vec![log_event(
+            OutboundEvent::Interrupted { reason, .. } => vec![log_event(
                 LogLevel::Info,
                 "agent",
                 format!("interrupted: {reason}"),
             )],
 
             // ---- Mid-turn steering ----
-            OutboundEvent::SteerRequested { text, id } => {
+            OutboundEvent::SteerRequested { text, id, .. } => {
                 let preview: String = text.chars().take(80).collect();
                 let suffix = if text.chars().count() > 80 { "..." } else { "" };
                 let id_part = if id.is_empty() {
@@ -1973,7 +1974,7 @@ impl WireEventUpcaster {
                     format!("steer requested{id_part}: {preview}{suffix}"),
                 )]
             }
-            OutboundEvent::SteerQueued { id, reason } => {
+            OutboundEvent::SteerQueued { id, reason, .. } => {
                 let id_part = if id.is_empty() {
                     String::new()
                 } else {
@@ -1985,7 +1986,7 @@ impl WireEventUpcaster {
                     format!("steer queued{id_part}: {reason}"),
                 )]
             }
-            OutboundEvent::SteerDelivered { id, mid_turn } => {
+            OutboundEvent::SteerDelivered { id, mid_turn, .. } => {
                 let id_part = if id.is_empty() {
                     String::new()
                 } else {
@@ -2151,7 +2152,7 @@ mod tests {
         // a trivially-constructable one.
         assert!(u
             .upcast(&AppEvent::ControlCommand(
-                crate::event::ControlMsg::Status
+                crate::event::ControlMsg::Status { session_id: None }
             ))
             .is_empty());
     }
@@ -2252,6 +2253,7 @@ mod tests {
     fn approval_flow_maps_cleanly() {
         let mut u = AppEventUpcaster::new();
         let req = u.upcast(&AppEvent::ApprovalRequired {
+            session_id: None,
             id: 42,
             command_preview: "rm -rf /tmp/foo".into(),
             category: crate::autonomy::ActionCategory::FileDelete,
@@ -2265,6 +2267,7 @@ mod tests {
             _ => panic!("expected ApprovalRequested"),
         }
         let res = u.upcast(&AppEvent::ApprovalResolved {
+            session_id: None,
             id: 42,
             action: "approve".into(),
         });
@@ -3026,6 +3029,7 @@ mod tests {
     #[test]
     fn parity_steer_requested() {
         assert_parity(AppEvent::SteerRequested {
+            session_id: None,
             text: "look at tests/e2e/ first".into(),
             id: "steer-42".into(),
         });
@@ -3036,6 +3040,7 @@ mod tests {
         // Empty id is a valid "no correlation" sentinel; the log line
         // should simply omit the [id] part on both paths.
         assert_parity(AppEvent::SteerRequested {
+            session_id: None,
             text: "never mind".into(),
             id: String::new(),
         });
@@ -3044,6 +3049,7 @@ mod tests {
     #[test]
     fn parity_steer_queued() {
         assert_parity(AppEvent::SteerQueued {
+            session_id: None,
             id: "steer-7".into(),
             reason: "Claude Code doesn't support mid-turn steering".into(),
         });
@@ -3052,6 +3058,7 @@ mod tests {
     #[test]
     fn parity_steer_delivered_mid_turn() {
         assert_parity(AppEvent::SteerDelivered {
+            session_id: None,
             id: "steer-3".into(),
             mid_turn: true,
         });
@@ -3060,6 +3067,7 @@ mod tests {
     #[test]
     fn parity_steer_delivered_followup() {
         assert_parity(AppEvent::SteerDelivered {
+            session_id: None,
             id: "steer-3".into(),
             mid_turn: false,
         });
@@ -3121,6 +3129,7 @@ mod tests {
     #[test]
     fn drift_approval_required_category_is_dropped_on_wire() {
         let app_event = AppEvent::ApprovalRequired {
+            session_id: None,
             id: 42,
             command_preview: "rm -rf /tmp/foo".into(),
             category: crate::autonomy::ActionCategory::FileDelete,
