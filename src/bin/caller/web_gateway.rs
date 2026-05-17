@@ -4,7 +4,7 @@ use crate::types::LogLevel;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -2127,35 +2127,73 @@ fn list_gemini_sessions(home: &Path) -> Vec<serde_json::Value> {
     rows
 }
 
+fn codex_session_file_id(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).ok()?;
+        if bytes == 0 {
+            return None;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
+            return obj.get("payload").and_then(|payload| value_str(payload, "id"));
+        }
+    }
+}
+
+fn find_codex_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let mut files = Vec::new();
+    collect_files(&home.join(".codex").join("sessions"), ".jsonl", &mut files);
+    collect_files(&home.join(".codex").join("archived_sessions"), ".jsonl", &mut files);
+
+    files
+        .into_iter()
+        .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))
+}
+
 fn external_session_detail(source: &str, session_id: &str) -> Option<String> {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
+    external_session_detail_from_home(&home, source, session_id)
+}
+
+fn external_session_detail_from_home(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+) -> Option<String> {
     let mut entries = Vec::new();
 
     match source {
         "codex" => {
-            let mut files = Vec::new();
-            collect_files(&home.join(".codex").join("sessions"), ".jsonl", &mut files);
-            collect_files(&home.join(".codex").join("archived_sessions"), ".jsonl", &mut files);
-            for path in files {
-                let Ok(contents) = std::fs::read_to_string(&path) else { continue; };
-                if !contents.contains(session_id) {
+            let path = find_codex_session_file(home, session_id)?;
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                return None;
+            };
+            for line in contents.lines() {
+                let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
                     continue;
-                }
-                for line in contents.lines() {
-                    let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
-                    let ts = value_str(&obj, "timestamp").unwrap_or_default();
-                    if let Some(payload) = obj.get("payload") {
-                        if let Some((role, text)) = codex_payload_text(payload) {
-                            entries.push(serde_json::json!({
-                                "ts": ts,
-                                "level": if role == "assistant" { "model" } else { "info" },
-                                "source": "codex",
-                                "content": text,
-                            }));
-                        }
+                };
+                let ts = value_str(&obj, "timestamp").unwrap_or_default();
+                if let Some(payload) = obj.get("payload") {
+                    if let Some((role, text)) = codex_payload_text(payload) {
+                        entries.push(serde_json::json!({
+                            "ts": ts,
+                            "level": if role == "assistant" { "model" } else { "info" },
+                            "source": "codex",
+                            "content": text,
+                        }));
                     }
                 }
-                break;
             }
         }
         "claude-code" => {
@@ -9980,6 +10018,101 @@ mod tests {
             .collect();
 
         assert_eq!(ids, vec!["recently-changed", "newer-created", "fallback-created"]);
+    }
+
+    #[test]
+    fn codex_detail_uses_session_meta_id_not_substring_mentions() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let target_id = "019e36b9-fffa-7b42-9070-e06db38b2abd";
+        let other_id = "019e37ea-1ace-7091-ad2a-7805190330fa";
+
+        std::fs::write(
+            sessions_dir.join("a-other-session.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": "2026-05-17T21:49:12.197Z",
+                    "type": "session_meta",
+                    "payload": { "id": other_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T21:49:16.518Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": format!("mentions {target_id} but is the wrong file")
+                            }
+                        ]
+                    }
+                })
+            ),
+        )
+        .unwrap();
+
+        let target_path = sessions_dir.join("z-target-session.jsonl");
+        std::fs::write(
+            &target_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": "2026-05-17T18:16:59.898Z",
+                    "type": "session_meta",
+                    "payload": { "id": target_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T18:17:01.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "Implement a new subtab for the dashboard in the Activity tab"
+                            }
+                        ]
+                    }
+                })
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_codex_session_file(dir.path(), target_id).as_deref(),
+            Some(target_path.as_path())
+        );
+
+        let detail = external_session_detail_from_home(dir.path(), "codex", target_id)
+            .expect("target session should resolve");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let entries = detail
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .expect("entries should be present");
+        let contents: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| entry.get("content").and_then(|v| v.as_str()))
+            .collect();
+
+        assert!(
+            contents
+                .iter()
+                .any(|content| content.contains("Implement a new subtab")),
+            "target session content missing: {contents:?}"
+        );
+        assert!(
+            contents
+                .iter()
+                .all(|content| !content.contains("wrong file")),
+            "detail included content from a substring match: {contents:?}"
+        );
     }
 
     #[test]
