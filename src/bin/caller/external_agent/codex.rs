@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -738,13 +738,14 @@ impl CodexAgent {
                 "Codex request payload tracing was not configured".to_string(),
             )
         })?;
-        let trace = read_latest_codex_request_payload(root).await?;
+        let thread_id = self.active_thread_id.lock().await.clone();
+        let trace = read_latest_codex_context_payload(root, thread_id.as_deref()).await?;
         let usage = self.latest_token_usage.lock().await.clone();
         let token_count = usage.as_ref().and_then(codex_usage_total_tokens);
         let context_window = usage.as_ref().and_then(codex_usage_context_window);
         Ok(AgentContextSnapshot {
             source: "codex".to_string(),
-            label: "Codex request payload".to_string(),
+            label: trace.label,
             format: trace.format,
             token_count,
             context_window,
@@ -755,37 +756,86 @@ impl CodexAgent {
 }
 
 struct CodexRequestPayloadSnapshot {
+    label: String,
     format: String,
     payload: serde_json::Value,
 }
 
+#[derive(Clone)]
 struct CodexRequestPayloadRef {
     bundle_dir: PathBuf,
     relative_path: String,
+    inference_call_id: String,
+    thread_id: Option<String>,
     provider_name: Option<String>,
     order: (i64, u64),
+}
+
+#[derive(Clone)]
+struct CodexResponsePayloadRef {
+    bundle_dir: PathBuf,
+    relative_path: String,
+    inference_call_id: String,
+    response_id: String,
+}
+
+struct CodexTraceIndex {
+    requests: Vec<CodexRequestPayloadRef>,
+    requests_by_call: HashMap<String, CodexRequestPayloadRef>,
+    responses_by_id: HashMap<String, CodexResponsePayloadRef>,
 }
 
 async fn read_latest_codex_request_payload(
     root: &Path,
 ) -> Result<CodexRequestPayloadSnapshot, CallerError> {
-    let mut dirs = tokio::fs::read_dir(root).await.map_err(|e| {
-        CallerError::ExternalAgent(format!("read Codex request trace root {}: {e}", root.display()))
-    })?;
-    let mut latest: Option<CodexRequestPayloadRef> = None;
+    read_latest_codex_context_payload(root, None).await
+}
 
-    while let Some(entry) = dirs.next_entry().await.map_err(|e| {
-        CallerError::ExternalAgent(format!("read Codex request trace entry: {e}"))
-    })? {
-        let file_type = match entry.file_type().await {
-            Ok(file_type) => file_type,
-            Err(_) => continue,
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
+async fn read_latest_codex_context_payload(
+    root: &Path,
+    thread_id: Option<&str>,
+) -> Result<CodexRequestPayloadSnapshot, CallerError> {
+    let index = read_codex_trace_index(root, thread_id).await?;
+    let latest = index
+        .requests
+        .iter()
+        .max_by_key(|candidate| candidate.order)
+        .cloned()
+        .ok_or_else(|| {
+            CallerError::ExternalAgent(format!(
+                "no Codex inference request payload found in {}",
+                root.display()
+            ))
+        })?;
 
-        let bundle_dir = entry.path();
+    let payload = read_codex_json_payload(&latest.bundle_dir, &latest.relative_path).await?;
+    let format = codex_request_format(latest.provider_name.as_deref());
+    if format == "openai.responses.request.v1" {
+        let resolved = resolve_openai_responses_context_payload(&index, &latest, payload).await?;
+        return Ok(CodexRequestPayloadSnapshot {
+            label: "Codex resolved request payload".to_string(),
+            format: "openai.responses.resolved_request.v1".to_string(),
+            payload: resolved,
+        });
+    }
+
+    Ok(CodexRequestPayloadSnapshot {
+        label: "Codex request payload".to_string(),
+        format,
+        payload,
+    })
+}
+
+async fn read_codex_trace_index(
+    root: &Path,
+    thread_id: Option<&str>,
+) -> Result<CodexTraceIndex, CallerError> {
+    let bundle_dirs = collect_codex_trace_bundle_dirs(root, thread_id).await?;
+    let mut requests = Vec::new();
+    let mut requests_by_call = HashMap::new();
+    let mut responses_by_id = HashMap::new();
+
+    for bundle_dir in bundle_dirs {
         let trace_path = bundle_dir.join("trace.jsonl");
         let contents = match tokio::fs::read_to_string(&trace_path).await {
             Ok(contents) => contents,
@@ -799,40 +849,209 @@ async fn read_latest_codex_request_payload(
             let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            let Some(candidate) =
+            if let Some(candidate) =
                 codex_inference_request_ref(&bundle_dir, &event, line_idx as u64)
-            else {
-                continue;
-            };
-            if latest
-                .as_ref()
-                .map(|current| candidate.order > current.order)
-                .unwrap_or(true)
             {
-                latest = Some(candidate);
+                if thread_id
+                    .zip(candidate.thread_id.as_deref())
+                    .map(|(expected, actual)| expected != actual)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                requests_by_call.insert(codex_trace_call_key(&candidate), candidate.clone());
+                requests.push(candidate);
+                continue;
+            }
+            if let Some(response) = codex_inference_response_ref(&bundle_dir, &event) {
+                responses_by_id.insert(response.response_id.clone(), response);
             }
         }
     }
 
-    let latest = latest.ok_or_else(|| {
-        CallerError::ExternalAgent(format!(
-            "no Codex inference request payload found in {}",
-            root.display()
-        ))
-    })?;
-    let payload_path = latest.bundle_dir.join(&latest.relative_path);
+    Ok(CodexTraceIndex {
+        requests,
+        requests_by_call,
+        responses_by_id,
+    })
+}
+
+async fn collect_codex_trace_bundle_dirs(
+    root: &Path,
+    thread_id: Option<&str>,
+) -> Result<Vec<PathBuf>, CallerError> {
+    let mut trace_roots = vec![root.to_path_buf()];
+    if thread_id.is_some() {
+        if let Some(logs_root) = codex_logs_root_for_trace_root(root) {
+            if let Ok(mut sessions) = tokio::fs::read_dir(&logs_root).await {
+                while let Ok(Some(entry)) = sessions.next_entry().await {
+                    let file_type = match entry.file_type().await {
+                        Ok(file_type) => file_type,
+                        Err(_) => continue,
+                    };
+                    if file_type.is_dir() {
+                        let trace_root = entry.path().join("model-request-traces");
+                        if trace_root != root {
+                            trace_roots.push(trace_root);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut seen_roots = HashSet::new();
+    trace_roots.retain(|path| seen_roots.insert(path.clone()));
+
+    let mut bundle_dirs = Vec::new();
+    let mut seen_bundles = HashSet::new();
+    for trace_root in trace_roots {
+        let mut dirs = match tokio::fs::read_dir(&trace_root).await {
+            Ok(dirs) => dirs,
+            Err(e) if trace_root == root => {
+                return Err(CallerError::ExternalAgent(format!(
+                    "read Codex request trace root {}: {e}",
+                    root.display()
+                )));
+            }
+            Err(_) => continue,
+        };
+
+        while let Some(entry) = dirs.next_entry().await.map_err(|e| {
+            CallerError::ExternalAgent(format!("read Codex request trace entry: {e}"))
+        })? {
+            let file_type = match entry.file_type().await {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let bundle_dir = entry.path();
+            if let Some(thread_id) = thread_id {
+                let name = bundle_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                if !name.contains(thread_id) {
+                    continue;
+                }
+            }
+            if seen_bundles.insert(bundle_dir.clone()) {
+                bundle_dirs.push(bundle_dir);
+            }
+        }
+    }
+
+    Ok(bundle_dirs)
+}
+
+fn codex_logs_root_for_trace_root(root: &Path) -> Option<PathBuf> {
+    if root.file_name().and_then(|name| name.to_str()) != Some("model-request-traces") {
+        return None;
+    }
+    root.parent()?.parent().map(Path::to_path_buf)
+}
+
+async fn read_codex_json_payload(
+    bundle_dir: &Path,
+    relative_path: &str,
+) -> Result<serde_json::Value, CallerError> {
+    let payload_path = bundle_dir.join(relative_path);
     let contents = tokio::fs::read_to_string(&payload_path).await.map_err(|e| {
         CallerError::ExternalAgent(format!(
             "read Codex request payload {}: {e}",
             payload_path.display()
         ))
     })?;
-    let payload = serde_json::from_str::<serde_json::Value>(&contents)
-        .map_err(CallerError::Json)?;
-    Ok(CodexRequestPayloadSnapshot {
-        format: codex_request_format(latest.provider_name.as_deref()),
-        payload,
-    })
+    serde_json::from_str::<serde_json::Value>(&contents).map_err(CallerError::Json)
+}
+
+async fn resolve_openai_responses_context_payload(
+    index: &CodexTraceIndex,
+    latest_ref: &CodexRequestPayloadRef,
+    latest_payload: serde_json::Value,
+) -> Result<serde_json::Value, CallerError> {
+    let mut previous_pairs = Vec::new();
+    let mut unresolved_previous_response_id = None;
+    let mut seen_response_ids = HashSet::new();
+    let mut previous_response_id = codex_previous_response_id(&latest_payload).map(str::to_string);
+
+    while let Some(response_id) = previous_response_id {
+        if !seen_response_ids.insert(response_id.clone()) {
+            unresolved_previous_response_id = Some(response_id);
+            break;
+        }
+        let Some(response_ref) = index.responses_by_id.get(&response_id).cloned() else {
+            unresolved_previous_response_id = Some(response_id);
+            break;
+        };
+        let request_key =
+            codex_trace_call_key_parts(&response_ref.bundle_dir, &response_ref.inference_call_id);
+        let Some(request_ref) = index.requests_by_call.get(&request_key).cloned() else {
+            unresolved_previous_response_id = Some(response_id);
+            break;
+        };
+        let request_payload =
+            read_codex_json_payload(&request_ref.bundle_dir, &request_ref.relative_path).await?;
+        let response_payload =
+            read_codex_json_payload(&response_ref.bundle_dir, &response_ref.relative_path).await?;
+        previous_response_id = codex_previous_response_id(&request_payload).map(str::to_string);
+        previous_pairs.push((request_payload, response_payload));
+    }
+
+    previous_pairs.reverse();
+
+    let mut resolved_input = Vec::new();
+    for (request_payload, response_payload) in previous_pairs {
+        codex_extend_array_field(&mut resolved_input, &request_payload, "input");
+        codex_extend_array_field(&mut resolved_input, &response_payload, "output_items");
+    }
+    codex_extend_array_field(&mut resolved_input, &latest_payload, "input");
+
+    let latest_request_input_count = latest_payload
+        .get("input")
+        .and_then(|input| input.as_array())
+        .map(Vec::len)
+        .unwrap_or(0);
+    let mut resolved_payload = latest_payload;
+    if let serde_json::Value::Object(map) = &mut resolved_payload {
+        map.insert("input".to_string(), serde_json::Value::Array(resolved_input.clone()));
+        map.insert(
+            "_intendant_context".to_string(),
+            serde_json::json!({
+                "source": "codex_rollout_trace_payloads",
+                "thread_id": latest_ref.thread_id.clone(),
+                "latest_request_input_count": latest_request_input_count,
+                "resolved_input_count": resolved_input.len(),
+                "unresolved_previous_response_id": unresolved_previous_response_id,
+            }),
+        );
+    }
+
+    Ok(resolved_payload)
+}
+
+fn codex_previous_response_id(payload: &serde_json::Value) -> Option<&str> {
+    payload.get("previous_response_id").and_then(|value| value.as_str())
+}
+
+fn codex_extend_array_field(
+    target: &mut Vec<serde_json::Value>,
+    payload: &serde_json::Value,
+    field: &str,
+) {
+    if let Some(items) = payload.get(field).and_then(|value| value.as_array()) {
+        target.extend(items.iter().cloned());
+    }
+}
+
+fn codex_trace_call_key(request: &CodexRequestPayloadRef) -> String {
+    codex_trace_call_key_parts(&request.bundle_dir, &request.inference_call_id)
+}
+
+fn codex_trace_call_key_parts(bundle_dir: &Path, inference_call_id: &str) -> String {
+    format!("{}::{inference_call_id}", bundle_dir.display())
 }
 
 fn codex_inference_request_ref(
@@ -857,6 +1076,11 @@ fn codex_inference_request_ref(
     Some(CodexRequestPayloadRef {
         bundle_dir: bundle_dir.to_path_buf(),
         relative_path,
+        inference_call_id: payload.get("inference_call_id")?.as_str()?.to_string(),
+        thread_id: payload
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
         provider_name: payload
             .get("provider_name")
             .and_then(|v| v.as_str())
@@ -870,6 +1094,28 @@ fn codex_inference_request_ref(
                 .unwrap_or(0),
             line_idx,
         ),
+    })
+}
+
+fn codex_inference_response_ref(
+    bundle_dir: &Path,
+    event: &serde_json::Value,
+) -> Option<CodexResponsePayloadRef> {
+    let payload = event.get("payload")?;
+    if payload.get("type").and_then(|v| v.as_str()) != Some("inference_completed") {
+        return None;
+    }
+    let response_payload = payload.get("response_payload")?;
+    if response_payload.get("kind")?.get("type").and_then(|v| v.as_str())?
+        != "inference_response"
+    {
+        return None;
+    }
+    Some(CodexResponsePayloadRef {
+        bundle_dir: bundle_dir.to_path_buf(),
+        relative_path: response_payload.get("path")?.as_str()?.to_string(),
+        inference_call_id: payload.get("inference_call_id")?.as_str()?.to_string(),
+        response_id: payload.get("response_id")?.as_str()?.to_string(),
     })
 }
 
@@ -2099,6 +2345,7 @@ mod tests {
                 "ts": 1,
                 "payload": {
                     "type": "inference_started",
+                    "inference_call_id": "inference:old",
                     "request_payload": {
                         "kind": {"type": "inference_request"},
                         "provider_name": "OpenAI",
@@ -2123,6 +2370,7 @@ mod tests {
                 "ts": 2,
                 "payload": {
                     "type": "inference_started",
+                    "inference_call_id": "inference:middle",
                     "request_payload": {
                         "kind": {"type": "inference_request"},
                         "provider_name": "OpenAI",
@@ -2155,6 +2403,7 @@ mod tests {
                 "payload": {
                     "type": "inference_started",
                     "provider_name": "OpenAI",
+                    "inference_call_id": "inference:current",
                     "request_payload": {
                         "raw_payload_id": "raw_payload:2",
                         "kind": {"type": "inference_request"},
@@ -2167,8 +2416,125 @@ mod tests {
         .unwrap();
 
         let snapshot = read_latest_codex_request_payload(tmp.path()).await.unwrap();
-        assert_eq!(snapshot.format, "openai.responses.request.v1");
+        assert_eq!(snapshot.format, "openai.responses.resolved_request.v1");
         assert_eq!(snapshot.payload["input"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn codex_request_trace_resolves_openai_previous_response_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = tmp.path().join("trace-thread-abc");
+        std::fs::create_dir_all(trace.join("payloads")).unwrap();
+
+        std::fs::write(
+            trace.join("payloads/request-1.json"),
+            serde_json::json!({
+                "type": "response.create",
+                "model": "gpt-5.5",
+                "input": [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "first user message"}]}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            trace.join("payloads/response-1.json"),
+            serde_json::json!({
+                "response_id": "resp_1",
+                "output_items": [
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "first assistant reply"}]}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            trace.join("payloads/request-2.json"),
+            serde_json::json!({
+                "type": "response.create",
+                "model": "gpt-5.5",
+                "previous_response_id": "resp_1",
+                "input": [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "second user message"}]}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            trace.join("trace.jsonl"),
+            [
+                serde_json::json!({
+                    "schema_version": 1,
+                    "seq": 1,
+                    "wall_time_unix_ms": 1,
+                    "payload": {
+                        "type": "inference_started",
+                        "provider_name": "OpenAI",
+                        "thread_id": "thread-abc",
+                        "inference_call_id": "inference:1",
+                        "request_payload": {
+                            "kind": {"type": "inference_request"},
+                            "path": "payloads/request-1.json"
+                        }
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "seq": 2,
+                    "wall_time_unix_ms": 2,
+                    "payload": {
+                        "type": "inference_completed",
+                        "inference_call_id": "inference:1",
+                        "response_id": "resp_1",
+                        "response_payload": {
+                            "kind": {"type": "inference_response"},
+                            "path": "payloads/response-1.json"
+                        }
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "seq": 3,
+                    "wall_time_unix_ms": 3,
+                    "payload": {
+                        "type": "inference_started",
+                        "provider_name": "OpenAI",
+                        "thread_id": "thread-abc",
+                        "inference_call_id": "inference:2",
+                        "request_payload": {
+                            "kind": {"type": "inference_request"},
+                            "path": "payloads/request-2.json"
+                        }
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let snapshot = read_latest_codex_context_payload(tmp.path(), Some("thread-abc"))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.format, "openai.responses.resolved_request.v1");
+        let input = snapshot.payload["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        let rendered = serde_json::to_string(&snapshot.payload).unwrap();
+        assert!(rendered.contains("first user message"));
+        assert!(rendered.contains("first assistant reply"));
+        assert!(rendered.contains("second user message"));
+        assert_eq!(
+            snapshot.payload["_intendant_context"]["latest_request_input_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            snapshot.payload["_intendant_context"]["resolved_input_count"],
+            serde_json::json!(3)
+        );
     }
 
     #[test]
