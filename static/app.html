@@ -16357,8 +16357,10 @@ function loadAllSessionsUsage(hostId) {
 function renderAllSessionsUsageError(message) {
   const el = document.getElementById('all-sessions-usage');
   const grid = document.getElementById('all-sessions-grid');
+  const emptyEl = document.getElementById('usage-empty');
   const diskEl = document.getElementById('disk-usage-section');
   if (!el || !grid) return;
+  if (emptyEl) emptyEl.style.display = 'none';
   el.style.display = 'block';
   grid.style.gridTemplateColumns = '1fr';
   grid.innerHTML = `<span class="label" style="color:var(--red)">${escapeHtml(message)}</span>`;
@@ -16368,7 +16370,9 @@ function renderAllSessionsUsageError(message) {
 function renderAllSessionsUsage(sessions) {
   const el = document.getElementById('all-sessions-usage');
   const grid = document.getElementById('all-sessions-grid');
+  const emptyEl = document.getElementById('usage-empty');
   if (!el || !grid) return;
+  if (emptyEl) emptyEl.style.display = 'none';
 
   const now = new Date();
   const oneDayAgo = new Date(now - 24*60*60*1000);
