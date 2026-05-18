@@ -345,31 +345,47 @@ pub struct ModelPricing {
     pub output: f64,
 }
 
-/// Static pricing table. Searched by exact match then prefix/contains.
+/// Static pricing table. Searched by exact match then longest version-prefix match.
 const PRICING_TABLE: &[(&str, ModelPricing)] = &[
     // OpenAI
+    (
+        "gpt-5.5",
+        ModelPricing {
+            input: 5.0e-6,
+            cached: 0.5e-6,
+            output: 30.0e-6,
+        },
+    ),
     (
         "gpt-5.4",
         ModelPricing {
             input: 2.5e-6,
-            cached: 1.25e-6,
+            cached: 0.25e-6,
             output: 15.0e-6,
         },
     ),
     (
         "gpt-5.4-mini",
         ModelPricing {
-            input: 0.5e-6,
-            cached: 0.25e-6,
-            output: 3.0e-6,
+            input: 0.75e-6,
+            cached: 0.075e-6,
+            output: 4.5e-6,
         },
     ),
     (
         "gpt-5.4-nano",
         ModelPricing {
-            input: 0.15e-6,
-            cached: 0.075e-6,
-            output: 0.6e-6,
+            input: 0.2e-6,
+            cached: 0.02e-6,
+            output: 1.25e-6,
+        },
+    ),
+    (
+        "gpt-5.2",
+        ModelPricing {
+            input: 1.75e-6,
+            cached: 0.175e-6,
+            output: 14.0e-6,
         },
     ),
     (
@@ -377,14 +393,14 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         ModelPricing {
             input: 1.75e-6,
             cached: 0.175e-6,
-            output: 7.0e-6,
+            output: 14.0e-6,
         },
     ),
     (
         "gpt-5",
         ModelPricing {
             input: 1.25e-6,
-            cached: 0.625e-6,
+            cached: 0.125e-6,
             output: 10.0e-6,
         },
     ),
@@ -392,7 +408,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5-mini",
         ModelPricing {
             input: 0.25e-6,
-            cached: 0.125e-6,
+            cached: 0.025e-6,
             output: 2.0e-6,
         },
     ),
@@ -400,7 +416,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-4.1",
         ModelPricing {
             input: 2.0e-6,
-            cached: 1.0e-6,
+            cached: 0.5e-6,
             output: 8.0e-6,
         },
     ),
@@ -408,7 +424,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-4.1-mini",
         ModelPricing {
             input: 0.4e-6,
-            cached: 0.2e-6,
+            cached: 0.1e-6,
             output: 1.6e-6,
         },
     ),
@@ -416,7 +432,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-4.1-nano",
         ModelPricing {
             input: 0.1e-6,
-            cached: 0.05e-6,
+            cached: 0.025e-6,
             output: 0.4e-6,
         },
     ),
@@ -454,6 +470,14 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         },
     ),
     (
+        "claude-opus-4-7",
+        ModelPricing {
+            input: 5.0e-6,
+            cached: 0.5e-6,
+            output: 25.0e-6,
+        },
+    ),
+    (
         "claude-sonnet-4-6",
         ModelPricing {
             input: 3.0e-6,
@@ -472,17 +496,17 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
     (
         "claude-opus-4-5-20250929",
         ModelPricing {
-            input: 15.0e-6,
-            cached: 1.5e-6,
-            output: 75.0e-6,
+            input: 5.0e-6,
+            cached: 0.5e-6,
+            output: 25.0e-6,
         },
     ),
     (
         "claude-haiku-4-5",
         ModelPricing {
-            input: 0.25e-6,
-            cached: 0.025e-6,
-            output: 1.25e-6,
+            input: 1.0e-6,
+            cached: 0.1e-6,
+            output: 5.0e-6,
         },
     ),
     // Gemini
@@ -528,21 +552,23 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
     ),
 ];
 
-/// Find pricing for a model by exact match, then prefix/contains.
+fn model_key_matches(model: &str, key: &str) -> bool {
+    model == key || model.starts_with(&format!("{key}-"))
+}
+
+/// Find pricing for a model by exact match, then longest version-prefix match.
 pub fn find_pricing(model: &str) -> Option<ModelPricing> {
-    // Exact match
+    let model = model.rsplit('/').next().unwrap_or(model);
     for &(key, pricing) in PRICING_TABLE {
         if model == key {
             return Some(pricing);
         }
     }
-    // Prefix/contains match
-    for &(key, pricing) in PRICING_TABLE {
-        if model.starts_with(key) || model.contains(key) {
-            return Some(pricing);
-        }
-    }
-    None
+    PRICING_TABLE
+        .iter()
+        .filter(|(key, _)| model_key_matches(model, key))
+        .max_by_key(|(key, _)| key.len())
+        .map(|(_, pricing)| *pricing)
 }
 
 /// Calculate cost from token counts and pricing.

@@ -16662,7 +16662,7 @@ function renderAgentUsage(sessions) {
 
   for (const b of buckets) {
     const unpriced = b.unpricedTokens > 0
-      ? `<span style="display:block;font-size:10px;color:var(--yellow)">+ ${b.unpricedTokens.toLocaleString()} unpriced tok</span>`
+      ? `<span style="display:block;font-size:10px;color:var(--yellow)">+ ${b.unpricedTokens.toLocaleString()} tokens not priced</span>`
       : '';
     grid.innerHTML += `
       <span class="label">${escapeHtml(b.label)}</span>

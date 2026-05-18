@@ -10,27 +10,43 @@ struct Pricing {
 
 const TABLE: &[(&str, Pricing)] = &[
     (
+        "gpt-5.5",
+        Pricing {
+            input: 5.0e-6,
+            cached: 0.5e-6,
+            output: 30.0e-6,
+        },
+    ),
+    (
         "gpt-5.4",
         Pricing {
             input: 2.5e-6,
-            cached: 1.25e-6,
+            cached: 0.25e-6,
             output: 15.0e-6,
         },
     ),
     (
         "gpt-5.4-mini",
         Pricing {
-            input: 0.5e-6,
-            cached: 0.25e-6,
-            output: 3.0e-6,
+            input: 0.75e-6,
+            cached: 0.075e-6,
+            output: 4.5e-6,
         },
     ),
     (
         "gpt-5.4-nano",
         Pricing {
-            input: 0.15e-6,
-            cached: 0.075e-6,
-            output: 0.6e-6,
+            input: 0.2e-6,
+            cached: 0.02e-6,
+            output: 1.25e-6,
+        },
+    ),
+    (
+        "gpt-5.2",
+        Pricing {
+            input: 1.75e-6,
+            cached: 0.175e-6,
+            output: 14.0e-6,
         },
     ),
     (
@@ -38,14 +54,14 @@ const TABLE: &[(&str, Pricing)] = &[
         Pricing {
             input: 1.75e-6,
             cached: 0.175e-6,
-            output: 7.0e-6,
+            output: 14.0e-6,
         },
     ),
     (
         "gpt-5",
         Pricing {
             input: 1.25e-6,
-            cached: 0.625e-6,
+            cached: 0.125e-6,
             output: 10.0e-6,
         },
     ),
@@ -53,7 +69,7 @@ const TABLE: &[(&str, Pricing)] = &[
         "gpt-5-mini",
         Pricing {
             input: 0.25e-6,
-            cached: 0.125e-6,
+            cached: 0.025e-6,
             output: 2.0e-6,
         },
     ),
@@ -61,7 +77,7 @@ const TABLE: &[(&str, Pricing)] = &[
         "gpt-4.1",
         Pricing {
             input: 2.0e-6,
-            cached: 1.0e-6,
+            cached: 0.5e-6,
             output: 8.0e-6,
         },
     ),
@@ -69,7 +85,7 @@ const TABLE: &[(&str, Pricing)] = &[
         "gpt-4.1-mini",
         Pricing {
             input: 0.4e-6,
-            cached: 0.2e-6,
+            cached: 0.1e-6,
             output: 1.6e-6,
         },
     ),
@@ -77,7 +93,7 @@ const TABLE: &[(&str, Pricing)] = &[
         "gpt-4.1-nano",
         Pricing {
             input: 0.1e-6,
-            cached: 0.05e-6,
+            cached: 0.025e-6,
             output: 0.4e-6,
         },
     ),
@@ -114,6 +130,14 @@ const TABLE: &[(&str, Pricing)] = &[
         },
     ),
     (
+        "claude-opus-4-7",
+        Pricing {
+            input: 5.0e-6,
+            cached: 0.5e-6,
+            output: 25.0e-6,
+        },
+    ),
+    (
         "claude-sonnet-4-6",
         Pricing {
             input: 3.0e-6,
@@ -132,17 +156,17 @@ const TABLE: &[(&str, Pricing)] = &[
     (
         "claude-opus-4-5-20250929",
         Pricing {
-            input: 15.0e-6,
-            cached: 1.5e-6,
-            output: 75.0e-6,
+            input: 5.0e-6,
+            cached: 0.5e-6,
+            output: 25.0e-6,
         },
     ),
     (
         "claude-haiku-4-5",
         Pricing {
-            input: 0.25e-6,
-            cached: 0.025e-6,
-            output: 1.25e-6,
+            input: 1.0e-6,
+            cached: 0.1e-6,
+            output: 5.0e-6,
         },
     ),
     (
@@ -187,18 +211,22 @@ const TABLE: &[(&str, Pricing)] = &[
     ),
 ];
 
+fn model_key_matches(model: &str, key: &str) -> bool {
+    model == key || model.starts_with(&format!("{key}-"))
+}
+
 fn find_pricing(model: &str) -> Option<&'static Pricing> {
+    let model = model.rsplit('/').next().unwrap_or(model);
     for &(key, ref pricing) in TABLE {
         if model == key {
             return Some(pricing);
         }
     }
-    for &(key, ref pricing) in TABLE {
-        if model.starts_with(key) || model.contains(key) {
-            return Some(pricing);
-        }
-    }
-    None
+    TABLE
+        .iter()
+        .filter(|(key, _)| model_key_matches(model, key))
+        .max_by_key(|(key, _)| key.len())
+        .map(|(_, pricing)| pricing)
 }
 
 /// Estimate session cost from model name and token counts.

@@ -1767,6 +1767,34 @@ fn apply_session_usage(session: &mut serde_json::Value, usage: SessionUsage, mod
     }
 }
 
+fn session_usage_from_json(session: &serde_json::Value) -> SessionUsage {
+    SessionUsage {
+        total_tokens: session
+            .get("total_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        prompt_tokens: session
+            .get("prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        completion_tokens: session
+            .get("completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        cached_tokens: session
+            .get("cached_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+    }
+}
+
+fn apply_session_model_and_reprice(session: &mut serde_json::Value, model: &str) {
+    if let Some(obj) = session.as_object_mut() {
+        obj.insert("model".to_string(), serde_json::json!(model));
+    }
+    apply_session_usage(session, session_usage_from_json(session), Some(model));
+}
+
 fn external_session_json(
     source: &str,
     label: &str,
@@ -2037,8 +2065,27 @@ fn gemini_usage_from_tokens(tokens: &serde_json::Value) -> Option<SessionUsage> 
     })
 }
 
+fn resolve_codex_inherited_model(
+    session_id: &str,
+    model_by_id: &HashMap<String, String>,
+    parent_by_id: &HashMap<String, String>,
+) -> Option<String> {
+    let mut seen = HashSet::new();
+    let mut current = session_id.to_string();
+    while seen.insert(current.clone()) {
+        let parent = parent_by_id.get(&current)?;
+        if let Some(model) = model_by_id.get(parent) {
+            return Some(model.clone());
+        }
+        current = parent.clone();
+    }
+    None
+}
+
 fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
     let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut model_by_id: HashMap<String, String> = HashMap::new();
+    let mut parent_by_id: HashMap<String, String> = HashMap::new();
     let index_path = home.join(".codex").join("session_index.jsonl");
     if let Ok(contents) = std::fs::read_to_string(&index_path) {
         for line in contents.lines() {
@@ -2094,6 +2141,7 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
         let mut created_at = None;
         let mut cwd = None;
         let mut model = None;
+        let mut forked_from_id = None;
         let mut provider = Some("Codex".to_string());
         let mut usage = SessionUsage::default();
         let mut task_started_turns = 0u64;
@@ -2108,6 +2156,8 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
                 "session_meta" => {
                     if let Some(payload) = obj.get("payload") {
                         id = id.or_else(|| value_str(payload, "id"));
+                        forked_from_id =
+                            forked_from_id.or_else(|| value_str(payload, "forked_from_id"));
                         created_at = created_at.or_else(|| value_str(payload, "timestamp"));
                         cwd = cwd.or_else(|| value_str(payload, "cwd"));
                         model = model.or_else(|| value_str(payload, "model"));
@@ -2168,6 +2218,12 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
         let Some(id) = id else {
             continue;
         };
+        if let Some(model) = model.clone() {
+            model_by_id.insert(id.clone(), model);
+        }
+        if let Some(parent_id) = forked_from_id {
+            parent_by_id.insert(id.clone(), parent_id);
+        }
         let existing = rows.get(&id);
         let existing_task = existing
             .and_then(|v| value_str(v, "task"))
@@ -2208,6 +2264,25 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
         );
         apply_session_usage(&mut session, usage, model.as_deref());
         rows.insert(id, session);
+    }
+
+    let ids_missing_model = rows
+        .iter()
+        .filter_map(|(id, session)| {
+            if value_str(session, "model").is_none() {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    for id in ids_missing_model {
+        let Some(model) = resolve_codex_inherited_model(&id, &model_by_id, &parent_by_id) else {
+            continue;
+        };
+        if let Some(session) = rows.get_mut(&id) {
+            apply_session_model_and_reprice(session, &model);
+        }
     }
 
     rows.into_values().collect()
@@ -10905,7 +10980,99 @@ mod tests {
         assert_eq!(session["cached_tokens"].as_u64(), Some(400));
         assert_eq!(session["total_tokens"].as_u64(), Some(1250));
         let cost = session["estimated_cost"].as_f64().unwrap();
-        assert!((cost - 0.00575).abs() < 1e-12, "unexpected cost {cost}");
+        assert!((cost - 0.00535).abs() < 1e-12, "unexpected cost {cost}");
+    }
+
+    #[test]
+    fn list_codex_sessions_inherits_model_from_parent_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let parent_id = "019e37c5-parent-model-thread";
+        let child_id = "019e37c5-child-forked-thread";
+        let parent_lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:09:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": parent_id,
+                    "timestamp": "2026-05-17T21:09:00Z",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:09:01Z",
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.5"}
+            }),
+        ];
+        let child_lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": child_id,
+                    "forked_from_id": parent_id,
+                    "timestamp": "2026-05-17T21:10:00Z",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Use inherited model"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 400,
+                            "output_tokens": 250,
+                            "total_tokens": 1250
+                        }
+                    }
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-09-00-{parent_id}.jsonl")),
+            parent_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-10-00-{child_id}.jsonl")),
+            child_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(child_id))
+            .expect("child codex session should be listed");
+        assert_eq!(session["model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(session["pricing_known"].as_bool(), Some(true));
+        let cost = session["estimated_cost"].as_f64().unwrap();
+        assert!((cost - 0.0107).abs() < 1e-12, "unexpected cost {cost}");
     }
 
     #[test]
