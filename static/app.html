@@ -1161,11 +1161,18 @@ html, body {
 }
 .log-entry {
   display: flex;
-  padding: 2px 12px;
+  align-items: flex-start;
+  padding: 3px 12px 3px 10px;
   line-height: 1.5;
   font-size: 13px;
+  border-left: 2px solid transparent;
 }
 .log-entry:hover { background: var(--mantle); }
+.log-entry.level-model { border-left-color: rgba(137, 180, 250, 0.55); }
+.log-entry.level-agent { border-left-color: rgba(148, 226, 213, 0.55); }
+.log-entry.level-warn { border-left-color: rgba(249, 226, 175, 0.5); }
+.log-entry.level-error { border-left-color: rgba(243, 139, 168, 0.65); }
+.log-entry.source-user { border-left-color: rgba(250, 179, 135, 0.55); }
 .log-entry .log-icon {
   width: 20px;
   flex-shrink: 0;
@@ -1221,6 +1228,95 @@ html, body {
   white-space: pre-wrap;
   word-break: break-word;
 }
+.log-entry .log-content.log-markdown,
+.session-detail-logs .log-content.log-markdown {
+  white-space: normal;
+}
+.log-markdown p { margin: 0 0 6px; }
+.log-markdown p:last-child,
+.log-markdown ul:last-child,
+.log-markdown ol:last-child,
+.log-markdown blockquote:last-child,
+.log-markdown pre:last-child { margin-bottom: 0; }
+.log-markdown strong { font-weight: 700; color: var(--text); }
+.log-markdown em { color: var(--subtext1); }
+.log-markdown a { color: var(--sapphire); text-decoration: none; border-bottom: 1px solid rgba(116,199,236,0.45); }
+.log-markdown a:hover { color: var(--blue); border-bottom-color: var(--blue); }
+.log-markdown code {
+  font-family: inherit;
+  color: var(--peach);
+  background: rgba(250,179,135,0.12);
+  border: 1px solid rgba(250,179,135,0.18);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+.log-markdown pre,
+.log-command-code {
+  display: block;
+  margin: 4px 0 6px;
+  padding: 7px 9px;
+  color: var(--text);
+  background: rgba(17,17,27,0.78);
+  border: 1px solid var(--surface0);
+  border-radius: 5px;
+  overflow-x: auto;
+  white-space: pre;
+  word-break: normal;
+}
+.log-markdown pre code {
+  display: block;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+.log-markdown ul,
+.log-markdown ol {
+  margin: 2px 0 7px 20px;
+  padding: 0;
+}
+.log-markdown li { margin: 1px 0; }
+.log-markdown blockquote {
+  margin: 4px 0 7px;
+  padding: 2px 0 2px 10px;
+  color: var(--subtext0);
+  border-left: 2px solid var(--surface2);
+}
+.log-markdown h1,
+.log-markdown h2,
+.log-markdown h3 {
+  margin: 2px 0 6px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.35;
+}
+.log-command {
+  white-space: normal;
+}
+.log-command-label {
+  display: inline-block;
+  margin: 0 0 3px;
+  padding: 0 5px;
+  border-radius: 3px;
+  color: var(--base);
+  background: var(--teal);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.log-command-code {
+  margin-top: 2px;
+  white-space: pre-wrap;
+}
+.syntax-cmd { color: var(--blue); font-weight: 700; }
+.syntax-flag { color: var(--mauve); }
+.syntax-string { color: var(--green); }
+.syntax-var { color: var(--peach); }
+.syntax-op { color: var(--red); font-weight: 700; }
+.syntax-path { color: var(--sapphire); }
+.syntax-comment { color: var(--overlay1); font-style: italic; }
 /* Collapsible long entries */
 .log-entry.collapsible {
   cursor: pointer;
@@ -1705,7 +1801,14 @@ html, body {
 .sd-section-content { overflow: hidden; }
 .sd-section.collapsed .sd-section-content { display: none; }
 .session-detail-logs { padding: 4px 0; overflow-y: auto; flex: 1; }
-.session-detail-logs .log-entry { display: flex; padding: 2px 0; line-height: 1.5; font-size: 13px; }
+.session-detail-logs .log-entry {
+  display: flex;
+  align-items: flex-start;
+  padding: 3px 0 3px 8px;
+  line-height: 1.5;
+  font-size: 13px;
+  border-left: 2px solid transparent;
+}
 .session-detail-logs .log-entry:hover { background: var(--mantle); }
 .session-detail-logs .log-ts { color: var(--overlay1); width: 70px; flex-shrink: 0; font-size: 11px; }
 .session-detail-logs .log-level { width: 52px; flex-shrink: 0; font-weight: 600; font-size: 11px; text-transform: uppercase; }
@@ -7353,11 +7456,215 @@ function hostBadgeColor(hostId) {
   return `hsl(${hue}, 32%, 58%)`;
 }
 
+function renderInlineMarkdown(text) {
+  const codeSpans = [];
+  let escaped = escapeHtml(text || '').replace(/`([^`\n]+)`/g, (_, code) => {
+    const key = `\u0000CODE${codeSpans.length}\u0000`;
+    codeSpans.push(`<code>${code}</code>`);
+    return key;
+  });
+
+  escaped = escaped
+    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+|mailto:[^\s)]+|#[^\s)]+|\/[^\s)]+)\)/g,
+      '<a href="$2" target="_blank" rel="noreferrer">$1</a>')
+    .replace(/\*\*([^*\n][\s\S]*?[^*\n])\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+
+  return escaped.replace(/\u0000CODE(\d+)\u0000/g, (_, idx) => codeSpans[Number(idx)] || '');
+}
+
+function renderMarkdownBlocks(text) {
+  const lines = String(text || '').replace(/\r\n?/g, '\n').split('\n');
+  let html = '';
+  let i = 0;
+
+  const isListLine = line => /^\s*(?:[-*+]\s+|\d+\.\s+)/.test(line);
+  const isBlockStart = line => /^(#{1,3})\s+/.test(line) || isListLine(line) || /^\s*>/.test(line);
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) { i++; continue; }
+
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      const level = heading[1].length;
+      html += `<h${level}>${renderInlineMarkdown(heading[2].trim())}</h${level}>`;
+      i++;
+      continue;
+    }
+
+    if (/^\s*>/.test(line)) {
+      const quote = [];
+      while (i < lines.length && /^\s*>/.test(lines[i])) {
+        quote.push(lines[i].replace(/^\s*>\s?/, ''));
+        i++;
+      }
+      html += `<blockquote>${renderMarkdownBlocks(quote.join('\n'))}</blockquote>`;
+      continue;
+    }
+
+    if (isListLine(line)) {
+      const ordered = /^\s*\d+\.\s+/.test(line);
+      const tag = ordered ? 'ol' : 'ul';
+      html += `<${tag}>`;
+      while (i < lines.length && isListLine(lines[i])) {
+        const item = lines[i].replace(/^\s*(?:[-*+]\s+|\d+\.\s+)/, '');
+        html += `<li>${renderInlineMarkdown(item.trim())}</li>`;
+        i++;
+      }
+      html += `</${tag}>`;
+      continue;
+    }
+
+    const para = [];
+    while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])) {
+      para.push(lines[i]);
+      i++;
+    }
+    html += `<p>${renderInlineMarkdown(para.join('\n')).replace(/\n/g, '<br>')}</p>`;
+  }
+
+  return html;
+}
+
+function renderMarkdown(text) {
+  const src = String(text || '').replace(/\r\n?/g, '\n');
+  const parts = [];
+  let cursor = 0;
+  const fenceRe = /```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g;
+  let match;
+  while ((match = fenceRe.exec(src)) !== null) {
+    if (match.index > cursor) {
+      parts.push(renderMarkdownBlocks(src.slice(cursor, match.index)));
+    }
+    const lang = (match[1] || '').toLowerCase();
+    const code = match[2].replace(/\n$/, '');
+    const renderedCode = /^(sh|shell|bash|zsh|console)$/.test(lang)
+      ? highlightShellCommand(code)
+      : escapeHtml(code);
+    parts.push(`<pre><code>${renderedCode}</code></pre>`);
+    cursor = fenceRe.lastIndex;
+  }
+  if (cursor < src.length) {
+    parts.push(renderMarkdownBlocks(src.slice(cursor)));
+  }
+  return parts.join('');
+}
+
+function detectCommandLog(content) {
+  const text = String(content || '').trim();
+  const patterns = [
+    /^(Auto-approved:\s*)?(exec|pty):\s*([\s\S]+)$/i,
+    /^(Approval required:\s*)(exec|pty):\s*([\s\S]+)$/i,
+    /^(command:\s*)([\s\S]+)$/i,
+    /^(Run command:\s*)([\s\S]+)$/i,
+  ];
+  for (const pattern of patterns) {
+    const m = text.match(pattern);
+    if (!m) continue;
+    if (pattern === patterns[0]) {
+      return { label: `${m[1] || ''}${m[2]}`.trim(), command: m[3] };
+    }
+    if (pattern === patterns[1]) {
+      return { label: `${m[1]}${m[2]}`.trim(), command: m[3] };
+    }
+    return { label: m[1].replace(/:\s*$/, ''), command: m[2] };
+  }
+  return null;
+}
+
+function highlightShellCommand(command) {
+  const src = String(command || '');
+  let html = '';
+  let i = 0;
+  let expectCommand = true;
+
+  function span(cls, value) {
+    return `<span class="${cls}">${escapeHtml(value)}</span>`;
+  }
+
+  while (i < src.length) {
+    const ch = src[i];
+    if (/\s/.test(ch)) {
+      html += escapeHtml(ch);
+      i++;
+      continue;
+    }
+    if (ch === '#') {
+      const end = src.indexOf('\n', i);
+      const comment = end === -1 ? src.slice(i) : src.slice(i, end);
+      html += span('syntax-comment', comment);
+      i += comment.length;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      let j = i + 1;
+      while (j < src.length) {
+        if (src[j] === '\\') { j += 2; continue; }
+        if (src[j] === quote) { j++; break; }
+        j++;
+      }
+      html += span('syntax-string', src.slice(i, j));
+      i = j;
+      expectCommand = false;
+      continue;
+    }
+    if ('|&;()<>'.includes(ch)) {
+      html += span('syntax-op', ch);
+      expectCommand = !')<>'.includes(ch);
+      i++;
+      continue;
+    }
+
+    let j = i;
+    while (j < src.length && !/\s/.test(src[j]) && !'|&;()<>"\''.includes(src[j])) j++;
+    const token = src.slice(i, j);
+    let cls = '';
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token) || /^\$[{A-Za-z_]/.test(token)) cls = 'syntax-var';
+    else if (/^--?[A-Za-z0-9][\w-]*(?:=.*)?$/.test(token)) cls = 'syntax-flag';
+    else if (/^(?:\.{0,2}\/|~\/|\/|[A-Za-z0-9_.-]+\/)/.test(token)) cls = 'syntax-path';
+    else if (expectCommand) cls = 'syntax-cmd';
+    html += cls ? span(cls, token) : escapeHtml(token);
+    expectCommand = false;
+    i = j;
+  }
+  return html;
+}
+
+function shouldRenderMarkdownLog(c) {
+  const level = (c.level || '').toLowerCase();
+  const source = (c.source || '').toLowerCase();
+  if (level === 'model' || level === 'subagent' || level === 'presence') return true;
+  if (source === 'user' || source === 'model' || source === 'prsnc' || source === 'live') return true;
+  return false;
+}
+
+function renderLogContentElement(cnt, c) {
+  const content = c.content || '';
+  const command = detectCommandLog(content);
+  if (command) {
+    cnt.classList.add('log-command');
+    cnt.innerHTML =
+      `<span class="log-command-label">${escapeHtml(command.label || 'command')}</span>` +
+      `<code class="log-command-code">${highlightShellCommand(command.command)}</code>`;
+    return;
+  }
+  if (shouldRenderMarkdownLog(c)) {
+    cnt.classList.add('log-markdown');
+    cnt.innerHTML = renderMarkdown(content);
+    return;
+  }
+  cnt.textContent = content;
+}
+
 function renderLogEntry(c) {
   const stream = document.getElementById('log-stream');
   const entry = document.createElement('div');
   entry.className = 'log-entry level-' + c.level;
   entry.dataset.level = c.level;
+  const sourceClass = String(c.source || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  if (sourceClass) entry.classList.add('source-' + sourceClass);
 
   // Multi-host: tag entry with its source host so the host filter
   // dropdown can hide entries from other hosts. Primary entries get
@@ -7389,11 +7696,7 @@ function renderLogEntry(c) {
 
   const cnt = document.createElement('span');
   cnt.className = 'log-content';
-  // Render inline markdown (bold, italic, code) as HTML; escape first for safety
-  const raw = (c.content || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  cnt.innerHTML = raw
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>');
+  renderLogContentElement(cnt, c);
 
   const hasImages = c.images && c.images.length > 0;
   if (hasImages) {
@@ -17714,7 +18017,9 @@ function renderSessionDetailEntries(entries, el) {
     }
 
     const entry = document.createElement('div');
-    entry.className = 'log-entry';
+    entry.className = 'log-entry level-' + level;
+    const sourceClass = String(e.source || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+    if (sourceClass) entry.classList.add('source-' + sourceClass);
 
     const ts = document.createElement('span');
     ts.className = 'log-ts';
@@ -17727,7 +18032,11 @@ function renderSessionDetailEntries(entries, el) {
 
     const cnt = document.createElement('span');
     cnt.className = 'log-content';
-    cnt.textContent = e.content || '';
+    renderLogContentElement(cnt, {
+      level,
+      source: sourceLabels[e.source] || e.source || '\u2139',
+      content: e.content || ''
+    });
     if (levelColors[level]) cnt.style.color = levelColors[level];
 
     entry.appendChild(ts);
