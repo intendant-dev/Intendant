@@ -11759,8 +11759,8 @@ function switchTab(tabId) {
   if (tabId === 'sessions' && !sessionsLoaded) {
     loadSessions();
   }
-  if (tabId === 'stats' && !allSessionsUsageLoaded) {
-    loadAllSessionsUsage();
+  if (tabId === 'stats') {
+    renderStatsForActiveHost({ forceSessions: true });
   }
   if (tabId === 'settings' && !settingsLoaded) {
     loadSettings();
@@ -16024,7 +16024,7 @@ function switchStatsHost(hostId) {
 // cards. Display metrics stay primary-only for now — they come from
 // a display pipeline event stream, not an HTTP fetch, and the
 // secondary WS forwards them but we don't have per-host DOM targets.
-function renderStatsForActiveHost() {
+function renderStatsForActiveHost(options = {}) {
   const key = activeStatsHost || selfPeerId;
   const cached = hostStatsCache.get(key);
   if (cached) {
@@ -16039,7 +16039,7 @@ function renderStatsForActiveHost() {
   // /api/sessions. The loader caches per host so switching back is
   // instant, and guards against stale fetches winning a race against
   // the user switching away.
-  loadAllSessionsUsage(key);
+  loadAllSessionsUsage(key, { force: !!options.forceSessions });
 
   // Display metrics: primary-only for now. Hide when viewing a
   // secondary; restore when viewing self.
@@ -16293,12 +16293,144 @@ async function saveApiKeys() {
 document.getElementById('settings-save-keys').addEventListener('click', saveApiKeys);
 
 // ── All Sessions Usage (in Stats tab) ──
-let allSessionsUsageLoaded = false;
 
 // Per-host cache of the last `/api/sessions` response so switching
 // between hosts in the Stats picker is instant after first fetch.
 // Keyed by host_id; the primary is cached under selfPeerId.
 const sessionsListCache = new Map();
+
+function currentStatsHostKey() {
+  return activeStatsHost || selfPeerId;
+}
+
+function statsHostHasLiveUsage(hostId) {
+  const cached = hostStatsCache.get(hostId || selfPeerId);
+  return !!(cached && cached.main_json);
+}
+
+function sessionNumber(value) {
+  const n = Number(value || 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function sessionCost(value) {
+  const n = Number(value || 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function sessionDate(session) {
+  const raw = session && (session.created_at || session.updated_at);
+  if (!raw) return null;
+  const normalized = typeof raw === 'string' && raw.includes(' ') && !raw.includes('T')
+    ? raw.replace(' ', 'T')
+    : raw;
+  const parsed = Date.parse(normalized);
+  return Number.isNaN(parsed) ? null : new Date(parsed);
+}
+
+function summarizeSessionUsage(sessions) {
+  const now = new Date();
+  const oneDayAgo = new Date(now - 24*60*60*1000);
+  const oneWeekAgo = new Date(now - 7*24*60*60*1000);
+  const totals = {
+    sessions: sessions.length,
+    turns: 0,
+    allInput: 0,
+    allCached: 0,
+    allOutput: 0,
+    allTokens: 0,
+    allCost: 0,
+    todayCost: 0,
+    weekCost: 0,
+  };
+  for (const s of sessions) {
+    const input = sessionNumber(s.prompt_tokens);
+    const cached = sessionNumber(s.cached_tokens);
+    const output = sessionNumber(s.completion_tokens);
+    const total = sessionNumber(s.total_tokens) || input + output;
+    const cost = sessionCost(s.estimated_cost);
+    totals.turns += sessionNumber(s.turns);
+    totals.allInput += input;
+    totals.allCached += cached;
+    totals.allOutput += output;
+    totals.allTokens += total;
+    totals.allCost += cost;
+    const ts = sessionDate(s);
+    if (!ts) continue;
+    if (ts >= oneDayAgo) totals.todayCost += cost;
+    if (ts >= oneWeekAgo) totals.weekCost += cost;
+  }
+  return totals;
+}
+
+function renderStatsSummaryCard(title, subtitle, rows) {
+  const card = document.createElement('div');
+  card.className = 'usage-card';
+  const rowsHtml = rows.map(row => `
+    <span class="label">${escapeHtml(row.label)}</span>
+    <span class="value"${row.color ? ` style="color:${row.color}"` : ''}>${escapeHtml(row.value)}</span>
+  `).join('');
+  card.innerHTML = `
+    <div class="card-title">${escapeHtml(title)}</div>
+    <div class="card-model"><span class="provider">${escapeHtml(subtitle)}</span></div>
+    <div class="token-breakdown">${rowsHtml}</div>
+  `;
+  return card;
+}
+
+function renderSessionStatsFallback(sessions) {
+  if (statsHostHasLiveUsage(currentStatsHostKey())) return;
+  const cardsEl = document.getElementById('usage-cards');
+  const emptyEl = document.getElementById('usage-empty');
+  const costEl = document.getElementById('cost-section');
+  const historyEl = document.getElementById('token-history');
+  if (!cardsEl || !Array.isArray(sessions) || sessions.length === 0) return;
+
+  const totals = summarizeSessionUsage(sessions);
+  const latest = sessions.find(s => (sessionNumber(s.total_tokens) || sessionNumber(s.prompt_tokens) || sessionNumber(s.completion_tokens) || sessionCost(s.estimated_cost)) > 0) || sessions[0];
+
+  if (emptyEl) emptyEl.style.display = 'none';
+  if (historyEl) historyEl.style.display = 'none';
+  cardsEl.style.display = 'flex';
+  cardsEl.innerHTML = '';
+  cardsEl.appendChild(renderStatsSummaryCard('Session Usage', 'All sessions', [
+    { label: 'Sessions', value: totals.sessions.toLocaleString() },
+    { label: 'Turns', value: totals.turns.toLocaleString() },
+    { label: 'Input tokens', value: totals.allInput.toLocaleString() },
+    { label: 'Cached', value: totals.allCached.toLocaleString(), color: 'var(--green)' },
+    { label: 'Output tokens', value: totals.allOutput.toLocaleString() },
+    { label: 'Total tokens', value: totals.allTokens.toLocaleString() },
+  ]));
+
+  if (latest) {
+    const provider = latest.provider || latest.source_label || latest.source || 'Session';
+    const model = latest.model || 'unknown model';
+    const input = sessionNumber(latest.prompt_tokens);
+    const cached = sessionNumber(latest.cached_tokens);
+    const output = sessionNumber(latest.completion_tokens);
+    const total = sessionNumber(latest.total_tokens) || input + output;
+    cardsEl.appendChild(renderStatsSummaryCard('Latest Session', `${provider} / ${model}`, [
+      { label: 'Input tokens', value: input.toLocaleString() },
+      { label: 'Cached', value: cached.toLocaleString(), color: 'var(--green)' },
+      { label: 'Output tokens', value: output.toLocaleString() },
+      { label: 'Total tokens', value: total.toLocaleString() },
+      { label: 'Estimated cost', value: `$${sessionCost(latest.estimated_cost).toFixed(4)}`, color: 'var(--green)' },
+    ]));
+  }
+
+  if (costEl) {
+    costEl.style.display = 'block';
+    const grid = document.getElementById('cost-grid');
+    if (grid) {
+      grid.style.gridTemplateColumns = 'auto 1fr';
+      grid.innerHTML = `
+        <span class="label">Today</span><span class="value">$${totals.todayCost.toFixed(4)}</span>
+        <span class="label">This Week</span><span class="value">$${totals.weekCost.toFixed(4)}</span>
+        <span class="label" style="font-weight:600;color:var(--text)">All Time</span><span class="value">$${totals.allCost.toFixed(4)}</span>
+      `;
+    }
+  }
+}
 
 // Load and render the "All Sessions" + "Disk Usage" cards for a
 // specific host. Defaults to self (same-origin fetch). When `hostId`
@@ -16307,10 +16439,10 @@ const sessionsListCache = new Map();
 // `Access-Control-Allow-Origin: *` on that endpoint in web_gateway.rs)
 // and, for HTTPS primaries, the remote must also be HTTPS because of
 // mixed content. Same rules as fetching the remote's agent card on add.
-function loadAllSessionsUsage(hostId) {
+function loadAllSessionsUsage(hostId, options = {}) {
   hostId = hostId || selfPeerId;
   const cached = sessionsListCache.get(hostId);
-  if (cached) {
+  if (cached && !options.force) {
     renderAllSessionsUsage(cached);
     renderDiskUsage(cached);
     return;
@@ -16336,7 +16468,6 @@ function loadAllSessionsUsage(hostId) {
         throw new Error('/api/sessions returned a non-array payload');
       }
       sessionsListCache.set(hostId, sessions);
-      allSessionsUsageLoaded = true;
       // Only render if the user is still viewing this host. A slow
       // fetch that finishes after the user switched away would
       // otherwise stomp the current view.
@@ -16373,6 +16504,7 @@ function renderAllSessionsUsage(sessions) {
   const emptyEl = document.getElementById('usage-empty');
   if (!el || !grid) return;
   if (emptyEl) emptyEl.style.display = 'none';
+  renderSessionStatsFallback(sessions);
 
   const now = new Date();
   const oneDayAgo = new Date(now - 24*60*60*1000);
@@ -16442,7 +16574,11 @@ function renderDiskUsage(sessions) {
     totalBytes += s.total_bytes || 0;
   }
 
-  if (totalBytes === 0) return;
+  if (totalBytes === 0) {
+    el.style.display = 'none';
+    grid.innerHTML = '';
+    return;
+  }
 
   el.style.display = 'block';
   grid.innerHTML = '';
