@@ -6001,6 +6001,7 @@ async function main() {
     if (cfg.provider) document.getElementById('sb-provider').textContent = cfg.provider;
     if (cfg.model) document.getElementById('sb-model').textContent = cfg.model;
     if (card && card.id && card.label) {
+      const previousSelfPeerId = selfPeerId;
       // Stable host identity: shown in the status bar so the user
       // always knows which daemon the dashboard is primarily talking
       // to. The card's `label` is the display name; `id` is the full
@@ -6009,6 +6010,16 @@ async function main() {
       // stay distinct and a renamed daemon keeps the same routing
       // stability.
       selfPeerId = card.id;
+      if (previousSelfPeerId && previousSelfPeerId !== selfPeerId) {
+        const earlyUsage = hostStatsCache.get(previousSelfPeerId);
+        if (earlyUsage && !hostStatsCache.has(selfPeerId)) {
+          hostStatsCache.set(selfPeerId, earlyUsage);
+        }
+        const earlySessions = sessionsListCache.get(previousSelfPeerId);
+        if (earlySessions && !sessionsListCache.has(selfPeerId)) {
+          sessionsListCache.set(selfPeerId, earlySessions);
+        }
+      }
       selfHostLabel = card.label;
       const el = document.getElementById('sb-host-label');
       if (el) el.textContent = card.label;
@@ -16312,9 +16323,18 @@ function loadAllSessionsUsage(hostId) {
     baseUrl = d.url.replace(/\/$/, '');
   }
 
-  fetch(baseUrl + '/api/sessions')
-    .then(r => r.json())
+  const request = hostId === selfPeerId
+    ? authedFetch('/api/sessions')
+    : fetch(baseUrl + '/api/sessions');
+  request
+    .then(r => {
+      if (!r.ok) throw new Error(`/api/sessions returned ${r.status}`);
+      return r.json();
+    })
     .then(sessions => {
+      if (!Array.isArray(sessions)) {
+        throw new Error('/api/sessions returned a non-array payload');
+      }
       sessionsListCache.set(hostId, sessions);
       allSessionsUsageLoaded = true;
       // Only render if the user is still viewing this host. A slow
@@ -16326,7 +16346,23 @@ function loadAllSessionsUsage(hostId) {
         renderDiskUsage(sessions);
       }
     })
-    .catch(() => {});
+    .catch(err => {
+      const currentHost = activeStatsHost || selfPeerId;
+      if (currentHost === hostId) {
+        renderAllSessionsUsageError(err.message || 'Failed to load session usage');
+      }
+    });
+}
+
+function renderAllSessionsUsageError(message) {
+  const el = document.getElementById('all-sessions-usage');
+  const grid = document.getElementById('all-sessions-grid');
+  const diskEl = document.getElementById('disk-usage-section');
+  if (!el || !grid) return;
+  el.style.display = 'block';
+  grid.style.gridTemplateColumns = '1fr';
+  grid.innerHTML = `<span class="label" style="color:var(--red)">${escapeHtml(message)}</span>`;
+  if (diskEl) diskEl.style.display = 'none';
 }
 
 function renderAllSessionsUsage(sessions) {
