@@ -350,7 +350,7 @@ mod tests {
         app.current_phase = app::Phase::WaitingFollowUp;
         app.mode = app::AppMode::FollowUp;
         // Simulate RoundComplete setting up textarea
-        let textarea = tui_textarea::TextArea::default();
+        let textarea = ratatui_textarea::TextArea::default();
         app.follow_up_textarea = Some(textarea);
         app.round = 1;
 

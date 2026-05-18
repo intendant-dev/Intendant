@@ -462,7 +462,7 @@ pub struct App {
 
     // askHuman
     pub human_question: Option<String>,
-    pub human_textarea: Option<tui_textarea::TextArea<'static>>,
+    pub human_textarea: Option<ratatui_textarea::TextArea<'static>>,
 
     // Approval queue (FIFO)
     pub pending_approvals: VecDeque<PendingApproval>,
@@ -506,7 +506,7 @@ pub struct App {
 
     // Multi-round follow-up
     pub round: usize,
-    pub follow_up_textarea: Option<tui_textarea::TextArea<'static>>,
+    pub follow_up_textarea: Option<ratatui_textarea::TextArea<'static>>,
 
     // Vision display info (shown in status bar when active)
     pub display_info: Option<String>,
@@ -1886,7 +1886,7 @@ impl App {
                 // dispatcher is always running, so no channel-availability
                 // check is needed.
                 if self.follow_up_textarea.is_none() {
-                    let mut textarea = tui_textarea::TextArea::default();
+                    let mut textarea = ratatui_textarea::TextArea::default();
                     textarea.set_cursor_line_style(ratatui::style::Style::default());
                     self.follow_up_textarea = Some(textarea);
                 }
@@ -1947,7 +1947,7 @@ impl App {
                 self.human_question = Some(question.clone());
                 self.current_phase = Phase::WaitingHuman;
                 self.mode = AppMode::AskHuman;
-                let mut textarea = tui_textarea::TextArea::default();
+                let mut textarea = ratatui_textarea::TextArea::default();
                 textarea.set_cursor_line_style(ratatui::style::Style::default());
                 self.human_textarea = Some(textarea);
                 // Local-only: OutboundEvent::AskHuman already reaches
@@ -2018,7 +2018,7 @@ impl App {
                 self.round = round;
                 self.current_phase = Phase::WaitingFollowUp;
                 self.mode = AppMode::FollowUp;
-                let mut textarea = tui_textarea::TextArea::default();
+                let mut textarea = ratatui_textarea::TextArea::default();
                 textarea.set_cursor_line_style(ratatui::style::Style::default());
                 self.follow_up_textarea = Some(textarea);
                 // Local-only: OutboundEvent::RoundComplete already reaches
@@ -2137,7 +2137,7 @@ impl App {
                     self.current_phase = Phase::WaitingFollowUp;
                     self.mode = AppMode::FollowUp;
                     if self.follow_up_textarea.is_none() {
-                        let mut textarea = tui_textarea::TextArea::default();
+                        let mut textarea = ratatui_textarea::TextArea::default();
                         textarea.set_cursor_line_style(ratatui::style::Style::default());
                         self.follow_up_textarea = Some(textarea);
                     }

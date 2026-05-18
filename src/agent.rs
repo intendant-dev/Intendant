@@ -821,6 +821,7 @@ impl Agent {
 
         let content = if content_type.contains("text/html") {
             html2text::from_read(body.as_bytes(), 120)
+                .map_err(|e| AgentError::Process(format!("Failed to parse HTML response: {}", e)))?
         } else {
             body
         };

@@ -9622,7 +9622,7 @@ async fn main() -> Result<(), CallerError> {
         if task.is_none() {
             app.current_phase = types::Phase::WaitingFollowUp;
             app.mode = tui::app::AppMode::FollowUp;
-            let mut textarea = tui_textarea::TextArea::default();
+            let mut textarea = ratatui_textarea::TextArea::default();
             textarea.set_cursor_line_style(ratatui::style::Style::default());
             app.follow_up_textarea = Some(textarea);
             app.log(

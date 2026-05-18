@@ -20,11 +20,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
 chrono = "0.4"
-env_logger = "0.9"
+env_logger = "0.11"
 regex = "1.5"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream", "multipart"], default-features = false }
-html2text = "0.12"
-portable-pty = "0.8"
+html2text = "0.17"
+portable-pty = "0.9"
 dotenvy = "0.15"
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
@@ -32,17 +32,17 @@ uuid = { version = "1", features = ["v4"] }
 # store location, and by tests elsewhere as a dev-dep.
 tempfile = "3"
 async-trait = "0.1"
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
-tui-textarea = "0.7"
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+ratatui-textarea = "0.9"
 tokio-stream = "0.1"
 futures-util = "0.3"
 dirs = "6"
 rmcp = { version = "0.16", features = ["server", "transport-io", "client", "transport-child-process"] }
 schemars = "1"
 base64 = "0.22"
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
-# rustls dep (matched to tokio-tungstenite 0.24's transitive version) so
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
+# rustls dep (matched to tokio-tungstenite 0.29's transitive version) so
 # we can build a `ClientConfig` with a custom `ServerCertVerifier` for
 # the `PinnedMutualTls` transport-auth variant. Same `ClientConfig` is
 # also passed to reqwest via `use_preconfigured_tls` so the agent-card
@@ -65,7 +65,7 @@ agent-client-protocol-schema = "0.11.5"
 openssl = "0.10"
 openssl-sys = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 similar = "2"
 sha2 = "0.10"
 

@@ -188,7 +188,7 @@ impl LiveAudioSession {
             }),
         };
         let mut sink = self.ws_write.lock().await;
-        sink.send(WsMessage::Text(msg.to_string()))
+        sink.send(WsMessage::Text(msg.to_string().into()))
             .await
             .map_err(|e| CallerError::Agent(format!("WebSocket send error: {}", e)))?;
         Ok(())
@@ -214,15 +214,17 @@ impl LiveAudioSession {
         };
 
         let mut sink = self.ws_write.lock().await;
-        sink.send(WsMessage::Text(msg.to_string()))
+        sink.send(WsMessage::Text(msg.to_string().into()))
             .await
             .map_err(|e| CallerError::Agent(format!("WebSocket send error: {}", e)))?;
 
         // OpenAI requires an explicit response.create after sending content
         if self.provider == LiveAudioProvider::OpenAI {
-            sink.send(WsMessage::Text(r#"{"type":"response.create"}"#.to_string()))
-                .await
-                .map_err(|e| CallerError::Agent(format!("WebSocket send error: {}", e)))?;
+            sink.send(WsMessage::Text(
+                r#"{"type":"response.create"}"#.to_string().into(),
+            ))
+            .await
+            .map_err(|e| CallerError::Agent(format!("WebSocket send error: {}", e)))?;
         }
 
         Ok(())
@@ -289,7 +291,7 @@ pub async fn connect_gemini(
 
     {
         let mut sink = ws_write.lock().await;
-        sink.send(WsMessage::Text(setup.to_string()))
+        sink.send(WsMessage::Text(setup.to_string().into()))
             .await
             .map_err(|e| CallerError::Agent(format!("Gemini setup send failed: {}", e)))?;
     }
@@ -318,7 +320,7 @@ async fn gemini_read_loop(
 ) {
     while let Some(msg_result) = ws_read.next().await {
         let text = match msg_result {
-            Ok(WsMessage::Text(t)) => t,
+            Ok(WsMessage::Text(t)) => t.to_string(),
             Ok(WsMessage::Binary(b)) => match String::from_utf8(b.to_vec()) {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -507,7 +509,7 @@ pub async fn connect_openai(
 
     {
         let mut sink = ws_write.lock().await;
-        sink.send(WsMessage::Text(setup.to_string()))
+        sink.send(WsMessage::Text(setup.to_string().into()))
             .await
             .map_err(|e| CallerError::Agent(format!("OpenAI setup send failed: {}", e)))?;
     }
@@ -532,7 +534,7 @@ async fn openai_read_loop(
 ) {
     while let Some(msg_result) = ws_read.next().await {
         let text = match msg_result {
-            Ok(WsMessage::Text(t)) => t,
+            Ok(WsMessage::Text(t)) => t.to_string(),
             Ok(WsMessage::Close(_)) => {
                 let _ = event_tx.send(LiveAudioEvent::Disconnected("close frame".into()));
                 break;
@@ -930,7 +932,7 @@ async fn start_vortex_shm_bridge(
             }
             let mut sink = capture_write.lock().await;
             if sink
-                .send(WsMessage::Text(ws_msg.to_string()))
+                .send(WsMessage::Text(ws_msg.to_string().into()))
                 .await
                 .is_err()
             {
@@ -1089,7 +1091,7 @@ async fn start_vortex_audio_bridge(
             }
             let mut sink = capture_write.lock().await;
             if sink
-                .send(WsMessage::Text(ws_msg.to_string()))
+                .send(WsMessage::Text(ws_msg.to_string().into()))
                 .await
                 .is_err()
             {
@@ -1173,7 +1175,11 @@ async fn start_network_audio_bridge(
                         let _ = tee.send(buf.clone());
                     }
                     let mut sink = capture_write.lock().await;
-                    if sink.send(WsMessage::Text(msg.to_string())).await.is_err() {
+                    if sink
+                        .send(WsMessage::Text(msg.to_string().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -1268,7 +1274,11 @@ async fn start_local_audio_bridge(
                         let _ = tee.send(buf.clone());
                     }
                     let mut sink = capture_write.lock().await;
-                    if sink.send(WsMessage::Text(msg.to_string())).await.is_err() {
+                    if sink
+                        .send(WsMessage::Text(msg.to_string().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -1676,7 +1686,7 @@ pub async fn run_session(
                                 }
                             });
                             let mut sink = session.ws_write.lock().await;
-                            let _ = sink.send(WsMessage::Text(ack.to_string())).await;
+                            let _ = sink.send(WsMessage::Text(ack.to_string().into())).await;
                         }
                         // Drain: keep playing audio for up to 5s waiting for end_call
                         let drain_deadline = Instant::now() + Duration::from_secs(5);
