@@ -1405,10 +1405,22 @@ fn translate_notification(
                         preview: path,
                     });
                 }
-                "agentMessage" | "userMessage" | "reasoning" => {
+                "agentMessage" | "userMessage" | "reasoning" | "imageView" => {
                     // agentMessage: deltas will follow via item/agentMessage/delta.
                     // userMessage: echo of the user's input; nothing to emit.
                     // reasoning: model reasoning trace; nothing to emit.
+                    // imageView: Codex UI bookkeeping, not a tool.
+                }
+                "contextCompaction" => {
+                    let detail = if item_id.is_empty() {
+                        "Codex compacted context".to_string()
+                    } else {
+                        format!("Codex compacted context ({item_id})")
+                    };
+                    let _ = event_tx.send(AgentEvent::Log {
+                        level: "info".to_string(),
+                        message: detail,
+                    });
                 }
                 "mcpToolCall" => {
                     // Codex is calling an MCP tool (e.g. spawn_live_audio, take_screenshot).
@@ -1493,8 +1505,9 @@ fn translate_notification(
                 return;
             }
 
-            // userMessage items are echoes of the user's own input — ignore.
-            if item_type == "userMessage" {
+            // userMessage items are echoes of the user's own input. The
+            // remaining types are Codex UI/bookkeeping records, not tools.
+            if matches!(item_type, "userMessage" | "contextCompaction" | "imageView") {
                 return;
             }
 
@@ -1601,9 +1614,26 @@ fn translate_notification(
             });
         }
 
+        "thread/compacted" => {
+            let turn_id = params
+                .get("turnId")
+                .or_else(|| params.get("turn_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let message = if turn_id.is_empty() {
+                "Codex compacted context".to_string()
+            } else {
+                format!("Codex compacted context for turn {turn_id}")
+            };
+            let _ = event_tx.send(AgentEvent::Log {
+                level: "info".to_string(),
+                message,
+            });
+        }
+
         // Informational Codex v2 notifications — no action needed.
         "turn/started" | "thread/started" | "thread/tokenUsage/updated"
-        | "account/rateLimits/updated" | "configWarning" => {}
+        | "account/rateLimits/updated" | "configWarning" | "remoteControl/status/changed" => {}
 
         "mcpServer/startupStatus/updated" => {
             let status = params.get("status").and_then(|v| v.as_str()).unwrap_or("");
@@ -2603,6 +2633,47 @@ mod tests {
         });
         translate_notification("item/started", &params, &tx);
         assert!(rx.try_recv().is_err(), "agentMessage start should emit nothing");
+    }
+
+    #[test]
+    fn translate_codex_bookkeeping_items() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let started = serde_json::json!({
+            "itemId": "item-4",
+            "item": {"type": "contextCompaction"}
+        });
+        translate_notification("item/started", &started, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::Log { level, message } => {
+                assert_eq!(level, "info");
+                assert!(message.contains("compacted context"));
+            }
+            other => panic!("expected Log for contextCompaction, got {:?}", other),
+        }
+
+        let completed = serde_json::json!({
+            "item": {"id": "item-5", "type": "imageView", "status": "completed"}
+        });
+        translate_notification("item/completed", &completed, &tx);
+        assert!(rx.try_recv().is_err(), "imageView completion should emit nothing");
+    }
+
+    #[test]
+    fn translate_thread_compacted_logs_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1"
+        });
+        translate_notification("thread/compacted", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::Log { level, message } => {
+                assert_eq!(level, "info");
+                assert!(message.contains("compacted context"));
+                assert!(message.contains("turn-1"));
+            }
+            other => panic!("expected Log for thread/compacted, got {:?}", other),
+        }
     }
 
     #[test]

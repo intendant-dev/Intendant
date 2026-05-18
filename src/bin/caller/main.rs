@@ -565,11 +565,86 @@ struct DrainConfig<'a> {
 }
 
 const EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
+const EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT: usize = 64 * 1024;
 
 #[derive(Default)]
 struct ExternalContextSnapshotState {
     last_key: Option<u64>,
     last_error: Option<String>,
+}
+
+#[derive(Default)]
+struct ExternalToolOutputLimiter {
+    items: std::collections::HashMap<String, ExternalToolOutputState>,
+}
+
+#[derive(Default)]
+struct ExternalToolOutputState {
+    emitted_bytes: usize,
+    truncated: bool,
+}
+
+impl ExternalToolOutputLimiter {
+    fn filter(&mut self, item_id: &str, text: String) -> Option<String> {
+        if text.is_empty() {
+            return None;
+        }
+
+        let key = if item_id.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            item_id.to_string()
+        };
+        let state = self.items.entry(key).or_default();
+
+        if state.emitted_bytes >= EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT {
+            if state.truncated {
+                return None;
+            }
+            state.truncated = true;
+            return Some(external_tool_output_truncation_notice());
+        }
+
+        let remaining = EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT - state.emitted_bytes;
+        if text.len() <= remaining {
+            state.emitted_bytes += text.len();
+            return Some(text);
+        }
+
+        let split_at = char_boundary_at_or_before(&text, remaining);
+        let mut out = text[..split_at].to_string();
+        out.push_str(&external_tool_output_truncation_notice());
+        state.emitted_bytes = EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT;
+        state.truncated = true;
+        Some(out)
+    }
+
+    fn complete(&mut self, item_id: &str) {
+        let key = if item_id.is_empty() {
+            "<unknown>"
+        } else {
+            item_id
+        };
+        self.items.remove(key);
+    }
+}
+
+fn external_tool_output_truncation_notice() -> String {
+    format!(
+        "\n\n[output truncated by Intendant after {} KiB for this tool; further output is hidden from Activity]\n",
+        EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT / 1024
+    )
+}
+
+fn char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
+    if max_bytes >= text.len() {
+        return text.len();
+    }
+    let mut idx = max_bytes;
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
 }
 
 /// Result of draining one batch of external agent events.
@@ -706,6 +781,7 @@ async fn drain_external_agent_events(
     // unified-diff bytes: if nothing changed, don't spam session.jsonl.
     let mut last_diff_hash: Option<u64> = None;
     let mut context_snapshot_state = ExternalContextSnapshotState::default();
+    let mut tool_output_limiter = ExternalToolOutputLimiter::default();
     let mut context_snapshot_tick = tokio::time::interval_at(
         tokio::time::Instant::now() + EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL,
         EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL,
@@ -967,7 +1043,7 @@ async fn drain_external_agent_events(
                 )
                 .await;
             }
-            external_agent::AgentEvent::ToolOutputDelta { text, .. } => {
+            external_agent::AgentEvent::ToolOutputDelta { item_id, text } => {
                 // Gemini CLI strips images from ACP, sending "[Image: image/png]".
                 // Substitute with the latest screenshot from disk so the Activity
                 // tab can render it.
@@ -978,13 +1054,16 @@ async fn drain_external_agent_events(
                 } else {
                     text
                 };
-                config.bus.send(AppEvent::AgentOutput {
-                    stdout,
-                    stderr: String::new(),
-                    source: config.agent_source.clone(),
-                });
+                if let Some(stdout) = tool_output_limiter.filter(&item_id, stdout) {
+                    config.bus.send(AppEvent::AgentOutput {
+                        stdout,
+                        stderr: String::new(),
+                        source: config.agent_source.clone(),
+                    });
+                }
             }
             external_agent::AgentEvent::ToolCompleted { item_id, status } => {
+                tool_output_limiter.complete(&item_id);
                 // Success: nothing to emit.  The tool command was already
                 // shown via AgentStarted at start, and any output streamed
                 // via ToolOutputDelta → AgentOutput.  A completion marker
@@ -3714,6 +3793,35 @@ Also: {"source": "bare"}"#;
         let results = map_results_to_tool_responses(stdout, stderr, &nonce_map, &call_ids);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].2, "OK");
+    }
+
+    #[test]
+    fn external_tool_output_limiter_caps_each_tool() {
+        let mut limiter = ExternalToolOutputLimiter::default();
+        let first = "a".repeat(EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT - 2);
+        let out = limiter.filter("item-1", first.clone()).unwrap();
+        assert_eq!(out, first);
+
+        let out = limiter.filter("item-1", "bcdef".to_string()).unwrap();
+        assert!(out.starts_with("bc"));
+        assert!(out.contains("output truncated by Intendant"));
+        assert!(
+            limiter.filter("item-1", "more".to_string()).is_none(),
+            "further output after truncation should be suppressed"
+        );
+    }
+
+    #[test]
+    fn external_tool_output_limiter_resets_on_completion() {
+        let mut limiter = ExternalToolOutputLimiter::default();
+        let oversized = "a".repeat(EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT + 10);
+        let out = limiter.filter("item-1", oversized).unwrap();
+        assert!(out.contains("output truncated by Intendant"));
+
+        limiter.complete("item-1");
+
+        let out = limiter.filter("item-1", "fresh".to_string()).unwrap();
+        assert_eq!(out, "fresh");
     }
 
     // ── Steer fallback plumbing ──
