@@ -4268,6 +4268,10 @@ html, body {
           <div class="cost-title">All Sessions</div>
           <div class="cost-grid" id="all-sessions-grid"></div>
         </div>
+        <div class="cost-section" id="agent-usage-section" style="display:none">
+          <div class="cost-title">By Agent</div>
+          <div class="cost-grid" id="agent-usage-grid"></div>
+        </div>
         <div class="cost-section" id="disk-usage-section" style="display:none">
           <div class="cost-title">Disk Usage</div>
           <div class="cost-grid" id="disk-usage-grid"></div>
@@ -16363,6 +16367,75 @@ function summarizeSessionUsage(sessions) {
   return totals;
 }
 
+function agentUsageKey(session) {
+  const source = (session && session.source) || 'intendant';
+  if (source === 'claude-code') return 'claude';
+  if (source === 'codex' || source === 'gemini' || source === 'intendant') return source;
+  return 'other';
+}
+
+function agentUsageLabel(key) {
+  return {
+    codex: 'Codex',
+    claude: 'Claude Code',
+    gemini: 'Gemini CLI',
+    intendant: 'Intendant Internal',
+    other: 'Other',
+  }[key] || key;
+}
+
+function summarizeUsageByAgent(sessions) {
+  const order = ['codex', 'claude', 'gemini', 'intendant', 'other'];
+  const buckets = new Map(order.map(key => [key, {
+    key,
+    label: agentUsageLabel(key),
+    sessions: 0,
+    turns: 0,
+    input: 0,
+    cached: 0,
+    output: 0,
+    total: 0,
+    cost: 0,
+    unpricedTokens: 0,
+  }]));
+
+  for (const s of sessions) {
+    const key = agentUsageKey(s);
+    if (!buckets.has(key)) {
+      buckets.set(key, {
+        key,
+        label: agentUsageLabel(key),
+        sessions: 0,
+        turns: 0,
+        input: 0,
+        cached: 0,
+        output: 0,
+        total: 0,
+        cost: 0,
+        unpricedTokens: 0,
+      });
+    }
+    const b = buckets.get(key);
+    const input = sessionNumber(s.prompt_tokens);
+    const cached = sessionNumber(s.cached_tokens);
+    const output = sessionNumber(s.completion_tokens);
+    const total = sessionNumber(s.total_tokens) || input + output;
+    const cost = sessionCost(s.estimated_cost);
+    b.sessions += 1;
+    b.turns += sessionNumber(s.turns);
+    b.input += input;
+    b.cached += cached;
+    b.output += output;
+    b.total += total;
+    b.cost += cost;
+    if (total > 0 && cost === 0 && s.pricing_known !== true) {
+      b.unpricedTokens += total;
+    }
+  }
+
+  return Array.from(buckets.values()).filter(b => b.sessions > 0);
+}
+
 function renderStatsSummaryCard(title, subtitle, rows) {
   const card = document.createElement('div');
   card.className = 'usage-card';
@@ -16490,11 +16563,13 @@ function renderAllSessionsUsageError(message) {
   const grid = document.getElementById('all-sessions-grid');
   const emptyEl = document.getElementById('usage-empty');
   const diskEl = document.getElementById('disk-usage-section');
+  const agentEl = document.getElementById('agent-usage-section');
   if (!el || !grid) return;
   if (emptyEl) emptyEl.style.display = 'none';
   el.style.display = 'block';
   grid.style.gridTemplateColumns = '1fr';
   grid.innerHTML = `<span class="label" style="color:var(--red)">${escapeHtml(message)}</span>`;
+  if (agentEl) agentEl.style.display = 'none';
   if (diskEl) diskEl.style.display = 'none';
 }
 
@@ -16505,6 +16580,7 @@ function renderAllSessionsUsage(sessions) {
   if (!el || !grid) return;
   if (emptyEl) emptyEl.style.display = 'none';
   renderSessionStatsFallback(sessions);
+  renderAgentUsage(sessions);
 
   const now = new Date();
   const oneDayAgo = new Date(now - 24*60*60*1000);
@@ -16524,7 +16600,7 @@ function renderAllSessionsUsage(sessions) {
     allCached += cached;
     allCost += cost;
 
-    const ts = s.created_at ? new Date(s.created_at) : null;
+    const ts = sessionDate(s);
     if (!ts) continue;
     if (ts >= oneDayAgo) { todayInput += input; todayOutput += output; todayCached += cached; todayCost += cost; }
     if (ts >= oneWeekAgo) { weekInput += input; weekOutput += output; weekCached += cached; weekCost += cost; }
@@ -16556,6 +16632,46 @@ function renderAllSessionsUsage(sessions) {
       <span class="value" style="color:var(--green)">${cached.toLocaleString()}</span>
       <span class="value">${output.toLocaleString()}</span>
       <span class="value" style="color:var(--green)">$${cost.toFixed(2)}</span>
+    `;
+  }
+}
+
+function renderAgentUsage(sessions) {
+  const el = document.getElementById('agent-usage-section');
+  const grid = document.getElementById('agent-usage-grid');
+  if (!el || !grid) return;
+
+  const buckets = summarizeUsageByAgent(sessions);
+  if (buckets.length === 0) {
+    el.style.display = 'none';
+    grid.innerHTML = '';
+    return;
+  }
+
+  el.style.display = 'block';
+  grid.innerHTML = `
+    <span class="label" style="font-weight:600"></span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Sessions</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Total</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Input</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Cached</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Output</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Est. Cost</span>
+  `;
+  grid.style.gridTemplateColumns = 'auto 0.75fr 1fr 1fr 1fr 1fr 1fr';
+
+  for (const b of buckets) {
+    const unpriced = b.unpricedTokens > 0
+      ? `<span style="display:block;font-size:10px;color:var(--yellow)">+ ${b.unpricedTokens.toLocaleString()} unpriced tok</span>`
+      : '';
+    grid.innerHTML += `
+      <span class="label">${escapeHtml(b.label)}</span>
+      <span class="value">${b.sessions.toLocaleString()}</span>
+      <span class="value">${b.total.toLocaleString()}</span>
+      <span class="value">${b.input.toLocaleString()}</span>
+      <span class="value" style="color:var(--green)">${b.cached.toLocaleString()}</span>
+      <span class="value">${b.output.toLocaleString()}</span>
+      <span class="value" style="color:var(--green)">$${b.cost.toFixed(2)}${unpriced}</span>
     `;
   }
 }

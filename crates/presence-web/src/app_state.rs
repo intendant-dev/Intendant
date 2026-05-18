@@ -487,6 +487,14 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
     ),
     // Gemini
     (
+        "gemini-3-flash",
+        ModelPricing {
+            input: 0.5e-6,
+            cached: 0.05e-6,
+            output: 3.0e-6,
+        },
+    ),
+    (
         "gemini-2.5-pro",
         ModelPricing {
             input: 1.25e-6,

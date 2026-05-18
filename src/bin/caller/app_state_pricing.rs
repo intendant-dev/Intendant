@@ -146,6 +146,14 @@ const TABLE: &[(&str, Pricing)] = &[
         },
     ),
     (
+        "gemini-3-flash",
+        Pricing {
+            input: 0.5e-6,
+            cached: 0.05e-6,
+            output: 3.0e-6,
+        },
+    ),
+    (
         "gemini-2.5-pro",
         Pricing {
             input: 1.25e-6,

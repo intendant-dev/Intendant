@@ -25,10 +25,10 @@ use tokio_tungstenite::tungstenite::Message;
 /// stable identity within a display session.
 static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
 
-const EXTERNAL_SESSION_SCAN_LIMIT: usize = 100;
+const EXTERNAL_SESSION_SCAN_LIMIT: usize = 2_000;
 const EXTERNAL_SESSION_READ_LIMIT: u64 = 512 * 1024;
-const SESSION_LIST_LIMIT: usize = 500;
-const SESSION_SOURCE_FLOOR: usize = 25;
+const SESSION_LIST_LIMIT: usize = 5_000;
+const SESSION_SOURCE_FLOOR: usize = 100;
 
 /// Tracks which WebSocket connection currently owns the voice model (is "active").
 /// Only one connection can be active at a time; all others are "passive" (TUI-only).
@@ -1731,16 +1731,14 @@ fn apply_session_usage(session: &mut serde_json::Value, usage: SessionUsage, mod
     if usage.is_empty() {
         return;
     }
-    let estimated_cost = model
-        .and_then(|m| {
-            crate::app_state_pricing::estimate_session_cost(
-                m,
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                usage.cached_tokens,
-            )
-        })
-        .unwrap_or(0.0);
+    let estimated_cost = model.and_then(|m| {
+        crate::app_state_pricing::estimate_session_cost(
+            m,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cached_tokens,
+        )
+    });
     if let Some(obj) = session.as_object_mut() {
         obj.insert(
             "total_tokens".to_string(),
@@ -1760,7 +1758,11 @@ fn apply_session_usage(session: &mut serde_json::Value, usage: SessionUsage, mod
         );
         obj.insert(
             "estimated_cost".to_string(),
-            serde_json::json!(estimated_cost),
+            serde_json::json!(estimated_cost.unwrap_or(0.0)),
+        );
+        obj.insert(
+            "pricing_known".to_string(),
+            serde_json::json!(estimated_cost.is_some()),
         );
     }
 }
@@ -1799,6 +1801,7 @@ fn external_session_json(
         "completion_tokens": 0,
         "cached_tokens": 0,
         "estimated_cost": 0.0,
+        "pricing_known": false,
         "role": null,
         "recordings": 0,
         "recording_bytes": 0,
@@ -1972,6 +1975,65 @@ fn claude_usage_from_message_usage(usage: &serde_json::Value) -> Option<SessionU
         prompt_tokens,
         completion_tokens,
         cached_tokens: cache_read,
+    })
+}
+
+fn gemini_usage_from_tokens(tokens: &serde_json::Value) -> Option<SessionUsage> {
+    let prompt_tokens = value_u64_at(
+        tokens,
+        &[
+            "/input",
+            "/input_tokens",
+            "/inputTokens",
+            "/prompt",
+            "/prompt_tokens",
+            "/promptTokens",
+        ],
+    )?;
+    let output_tokens = value_u64_at(
+        tokens,
+        &[
+            "/output",
+            "/output_tokens",
+            "/outputTokens",
+            "/completion",
+            "/completion_tokens",
+            "/completionTokens",
+        ],
+    )
+    .unwrap_or(0);
+    let thinking_tokens = value_u64_at(
+        tokens,
+        &[
+            "/thoughts",
+            "/thought_tokens",
+            "/thoughtTokens",
+            "/thinking",
+            "/thinking_tokens",
+            "/thinkingTokens",
+        ],
+    )
+    .unwrap_or(0);
+    let tool_tokens = value_u64_at(tokens, &["/tool", "/tool_tokens", "/toolTokens"]).unwrap_or(0);
+    let cached_tokens = value_u64_at(
+        tokens,
+        &[
+            "/cached",
+            "/cached_tokens",
+            "/cachedTokens",
+            "/cached_input_tokens",
+            "/cachedInputTokens",
+        ],
+    )
+    .unwrap_or(0);
+    let completion_tokens = output_tokens + thinking_tokens + tool_tokens;
+    let total_tokens = value_u64_at(tokens, &["/total", "/total_tokens", "/totalTokens"])
+        .unwrap_or_else(|| prompt_tokens + completion_tokens);
+    Some(SessionUsage {
+        total_tokens,
+        prompt_tokens,
+        completion_tokens,
+        cached_tokens,
     })
 }
 
@@ -2293,8 +2355,14 @@ fn list_gemini_sessions(home: &Path) -> Vec<serde_json::Value> {
             .map(|s| s.to_string());
         let mut task = None;
         let mut turns = 0u64;
+        let mut model = value_str(&obj, "model");
+        let mut usage = SessionUsage::default();
         if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
             for msg in messages {
+                model = model.or_else(|| value_str(msg, "model"));
+                if let Some(parsed) = msg.get("tokens").and_then(gemini_usage_from_tokens) {
+                    usage.add(parsed);
+                }
                 let role = msg
                     .get("role")
                     .or_else(|| msg.get("type"))
@@ -2316,7 +2384,7 @@ fn list_gemini_sessions(home: &Path) -> Vec<serde_json::Value> {
             }
         }
         let project_root = alias.as_ref().and_then(|a| roots.get(a).cloned());
-        rows.push(external_session_json(
+        let mut session = external_session_json(
             "gemini",
             "Gemini CLI",
             session_id.clone(),
@@ -2325,12 +2393,14 @@ fn list_gemini_sessions(home: &Path) -> Vec<serde_json::Value> {
             file_mtime_string(&path),
             task,
             "Gemini CLI",
-            value_str(&obj, "model"),
+            model.clone(),
             turns,
             project_root,
             Some(path.to_string_lossy().to_string()),
             file_size(&path),
-        ));
+        );
+        apply_session_usage(&mut session, usage, model.as_deref());
+        rows.push(session);
     }
     rows
 }
@@ -2761,17 +2831,14 @@ fn list_sessions() -> String {
         }
 
         // Estimate cost using the model's pricing.
-        let estimated_cost = model
-            .as_deref()
-            .and_then(|m| {
-                crate::app_state_pricing::estimate_session_cost(
-                    m,
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                )
-            })
-            .unwrap_or(0.0);
+        let estimated_cost = model.as_deref().and_then(|m| {
+            crate::app_state_pricing::estimate_session_cost(
+                m,
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+            )
+        });
 
         let created_at = created_at.unwrap_or_default();
         let updated_at =
@@ -2793,7 +2860,8 @@ fn list_sessions() -> String {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "cached_tokens": cached_tokens,
-            "estimated_cost": estimated_cost,
+            "estimated_cost": estimated_cost.unwrap_or(0.0),
+            "pricing_known": estimated_cost.is_some(),
             "role": role,
             "recordings": recording_count,
             "recording_bytes": recording_bytes,
@@ -10900,6 +10968,65 @@ mod tests {
         assert_eq!(session["turns"].as_u64(), Some(1));
         let cost = session["estimated_cost"].as_f64().unwrap();
         assert!((cost - 0.000699).abs() < 1e-12, "unexpected cost {cost}");
+    }
+
+    #[test]
+    fn list_gemini_sessions_parses_token_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let chats_dir = home
+            .path()
+            .join(".gemini")
+            .join("tmp")
+            .join("sample-project")
+            .join("chats");
+        std::fs::create_dir_all(&chats_dir).unwrap();
+
+        let session_id = "session-2026-05-18T09-30-gemini";
+        let session = serde_json::json!({
+            "sessionId": session_id,
+            "startTime": "2026-05-18T09:30:00Z",
+            "messages": [
+                {
+                    "type": "user",
+                    "timestamp": "2026-05-18T09:30:01Z",
+                    "content": "Fix stats usage"
+                },
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-05-18T09:30:02Z",
+                    "model": "gemini-2.5-flash",
+                    "tokens": {
+                        "input": 1000,
+                        "cached": 100,
+                        "output": 20,
+                        "thoughts": 30,
+                        "tool": 5,
+                        "total": 1055
+                    },
+                    "content": "Done"
+                }
+            ]
+        });
+        std::fs::write(
+            chats_dir.join(format!("{session_id}.json")),
+            serde_json::to_string(&session).unwrap(),
+        )
+        .unwrap();
+
+        let sessions = list_gemini_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(session_id))
+            .expect("gemini session should be listed");
+        assert_eq!(session["prompt_tokens"].as_u64(), Some(1000));
+        assert_eq!(session["completion_tokens"].as_u64(), Some(55));
+        assert_eq!(session["cached_tokens"].as_u64(), Some(100));
+        assert_eq!(session["total_tokens"].as_u64(), Some(1055));
+        assert_eq!(session["turns"].as_u64(), Some(1));
+        assert_eq!(session["model"].as_str(), Some("gemini-2.5-flash"));
+        assert_eq!(session["pricing_known"].as_bool(), Some(true));
+        let cost = session["estimated_cost"].as_f64().unwrap();
+        assert!((cost - 0.0004105).abs() < 1e-12, "unexpected cost {cost}");
     }
 
     #[test]
