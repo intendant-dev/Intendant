@@ -8035,10 +8035,20 @@ function compactSessionText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
-function compactPathLabel(value) {
+function compactPathLabel(value, preserveAbsolute = false) {
   const path = compactSessionText(value);
   if (!path) return '';
+  const isUnixAbsolute = path.startsWith('/');
+  const isWindowsAbsolute = /^[A-Za-z]:[\\/]/.test(path);
   const parts = path.split(/[\\/]+/).filter(Boolean);
+  if (preserveAbsolute && isUnixAbsolute) {
+    if (parts.length <= 4) return path;
+    return `/${parts[0]}/${parts[1]}/.../${parts.slice(-2).join('/')}`;
+  }
+  if (preserveAbsolute && isWindowsAbsolute) {
+    if (parts.length <= 4) return path;
+    return `${parts[0]}\\${parts[1]}\\...\\${parts.slice(-2).join('\\')}`;
+  }
   if (parts.length >= 2) return parts.slice(-2).join('/');
   return path;
 }
@@ -8050,12 +8060,12 @@ function normalizeSessionWindowMeta(meta = {}) {
   const project = compactSessionText(meta.project_root || meta.projectRoot || meta.project_dir || meta.projectDir || meta.project);
   if (project) {
     out.projectRoot = project;
-    out.projectLabel = compactPathLabel(project);
+    out.projectLabel = compactPathLabel(project, true);
   }
   const cwd = compactSessionText(meta.cwd || meta.workdir || meta.workDir || meta.worktree || project);
   if (cwd) {
     out.cwd = cwd;
-    out.cwdLabel = compactPathLabel(cwd);
+    out.cwdLabel = compactPathLabel(cwd, true);
   }
   const source = compactSessionText(meta.source_label || meta.sourceLabel || meta.source);
   if (source) out.source = source;
@@ -8237,14 +8247,14 @@ function updateSessionWindow(sessionId, meta = {}) {
   }
   meta = { ...(sessionMetadataById.get(sid) || {}), ...normalized };
   if (meta.projectRoot) {
-    win.project.textContent = meta.projectLabel || compactPathLabel(meta.projectRoot);
+    win.project.textContent = meta.projectLabel || compactPathLabel(meta.projectRoot, true);
     win.project.title = meta.projectRoot;
   } else {
     win.project.textContent = 'unknown';
     win.project.title = 'Project directory not known yet';
   }
   if (meta.cwd) {
-    win.cwd.textContent = meta.cwdLabel || compactPathLabel(meta.cwd);
+    win.cwd.textContent = meta.cwdLabel || compactPathLabel(meta.cwd, true);
     win.cwd.title = meta.cwd;
   } else {
     win.cwd.textContent = 'unknown';
