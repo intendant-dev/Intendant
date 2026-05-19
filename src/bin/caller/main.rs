@@ -1073,11 +1073,20 @@ async fn drain_external_agent_events(
                     text
                 };
                 if let Some(stdout) = tool_output_limiter.filter(&item_id, stdout) {
+                    let output_id = event::next_agent_output_id();
+                    slog(config.session_log, |l| {
+                        l.agent_output_with_id(
+                            &stdout,
+                            "",
+                            config.agent_source.as_deref(),
+                            Some(&output_id),
+                        )
+                    });
                     config.bus.send(AppEvent::AgentOutput {
                         stdout,
                         stderr: String::new(),
                         source: config.agent_source.clone(),
-                        output_id: Some(event::next_agent_output_id()),
+                        output_id: Some(output_id),
                     });
                 }
             }

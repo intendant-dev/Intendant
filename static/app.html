@@ -7985,7 +7985,7 @@ async function toggleCommandOutputGroup(group) {
       group.body.textContent = 'Output is not available for lazy loading.';
       return;
     }
-    const resp = await fetch('/api/session/current/agent-output?ids=' + encodeURIComponent(group.outputIds.join(',')));
+    const resp = await authedFetch('/api/session/current/agent-output?ids=' + encodeURIComponent(group.outputIds.join(',')));
     const json = await resp.json();
     if (!resp.ok) throw new Error(json.error || resp.statusText);
     group.body.innerHTML = '';

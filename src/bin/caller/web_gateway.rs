@@ -1291,6 +1291,69 @@ fn session_log_replay_from_dir(log_dir: &std::path::Path) -> Option<String> {
     )
 }
 
+fn agent_output_chunks_with_fallback(
+    primary_log_dir: &Path,
+    ids: &[String],
+    fallback_logs_dir: Option<&Path>,
+) -> Vec<crate::session_log::AgentOutputChunk> {
+    let mut found: HashMap<String, crate::session_log::AgentOutputChunk> = HashMap::new();
+
+    for chunk in crate::session_log::agent_output_chunks_by_id(primary_log_dir, ids) {
+        found.entry(chunk.output_id.clone()).or_insert(chunk);
+    }
+
+    if found.len() < ids.len() {
+        if let Some(logs_dir) = fallback_logs_dir {
+            let mut dirs = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(logs_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir()
+                        && path.join("session.jsonl").is_file()
+                        && !same_path(&path, primary_log_dir)
+                    {
+                        dirs.push(path);
+                    }
+                }
+            }
+            dirs.sort_by(|a, b| session_log_mtime(b).cmp(&session_log_mtime(a)));
+
+            for dir in dirs {
+                let missing: Vec<String> = ids
+                    .iter()
+                    .filter(|id| !found.contains_key(id.as_str()))
+                    .cloned()
+                    .collect();
+                if missing.is_empty() {
+                    break;
+                }
+                for chunk in crate::session_log::agent_output_chunks_by_id(&dir, &missing) {
+                    found.entry(chunk.output_id.clone()).or_insert(chunk);
+                }
+            }
+        }
+    }
+
+    ids.iter().filter_map(|id| found.remove(id)).collect()
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn session_log_mtime(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path.join("session.jsonl"))
+        .or_else(|_| std::fs::metadata(path))
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH)
+}
+
 fn current_agent_output_response(request_line: &str, log_dir: &Path) -> String {
     let ids_param = query_param(request_line, "ids").unwrap_or_default();
     let ids: Vec<String> = ids_param
@@ -1309,8 +1372,14 @@ fn current_agent_output_response(request_line: &str, log_dir: &Path) -> String {
         return upload_error_response("400 Bad Request", "missing output ids");
     }
 
-    let chunks = crate::session_log::agent_output_chunks_by_id(log_dir, &ids);
-    let found: HashSet<&str> = chunks.iter().map(|chunk| chunk.output_id.as_str()).collect();
+    let fallback_logs_dir = std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".intendant").join("logs"));
+    let chunks = agent_output_chunks_with_fallback(log_dir, &ids, fallback_logs_dir.as_deref());
+    let found: HashSet<&str> = chunks
+        .iter()
+        .map(|chunk| chunk.output_id.as_str())
+        .collect();
     let missing: Vec<&str> = ids
         .iter()
         .map(String::as_str)
@@ -12515,6 +12584,34 @@ mod tests {
         assert!(replay["entries"].as_array().unwrap().iter().any(|entry| {
             entry["event"] == "model_response" && entry["summary"] == "still here after refresh"
         }));
+    }
+
+    #[test]
+    fn agent_output_chunks_falls_back_to_other_logs_by_output_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs_dir = dir.path().join("logs");
+        let primary_dir = logs_dir.join("primary");
+        let fallback_dir = logs_dir.join("fallback");
+
+        let mut primary = crate::session_log::SessionLog::open(primary_dir.clone()).unwrap();
+        primary.agent_output_with_id("primary output", "", Some("Codex"), Some("primary-out"));
+        drop(primary);
+
+        let mut fallback = crate::session_log::SessionLog::open(fallback_dir.clone()).unwrap();
+        fallback.agent_output_with_id("fallback output", "", Some("Codex"), Some("fallback-out"));
+        drop(fallback);
+
+        let chunks = agent_output_chunks_with_fallback(
+            &primary_dir,
+            &["fallback-out".to_string(), "primary-out".to_string()],
+            Some(&logs_dir),
+        );
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].output_id, "fallback-out");
+        assert_eq!(chunks[0].stdout, "fallback output");
+        assert_eq!(chunks[1].output_id, "primary-out");
+        assert_eq!(chunks[1].stdout, "primary output");
     }
 
     #[test]
