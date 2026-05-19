@@ -1482,6 +1482,10 @@ html, body {
   color: var(--base);
   background: var(--red);
 }
+.log-state-badge.turn {
+  color: var(--base);
+  background: var(--peach);
+}
 .log-state-badge.replacement {
   color: var(--base);
   background: var(--green);
@@ -8944,13 +8948,28 @@ function renderLogContentElement(cnt, c) {
   cnt.textContent = content;
 }
 
+function logUserTurnIndex(c) {
+  const source = String(c?.source || '').toLowerCase();
+  const turn = Number(c?.user_turn_index || 0);
+  if (source !== 'user' || !Number.isInteger(turn) || turn <= 0) return null;
+  return turn;
+}
+
 function appendLogStateBadges(cnt, c) {
   const badges = [];
+  const userTurn = logUserTurnIndex(c);
+  if (userTurn !== null) {
+    badges.push({ cls: 'turn', text: `T${userTurn}`, title: `user turn ${userTurn}` });
+  }
   if (c.kind === 'rollback_marker') badges.push({ cls: 'rewind', text: 'context rewind' });
   if (c.superseded) badges.push({ cls: 'overwritten', text: 'overwritten' });
   const replacementTurn = c.replacement_for_user_turn_index;
   if (replacementTurn !== undefined && replacementTurn !== null) {
-    badges.push({ cls: 'replacement', text: `replacement for turn ${replacementTurn}` });
+    badges.push({
+      cls: 'replacement',
+      text: `replaces T${replacementTurn}`,
+      title: `replacement for user turn ${replacementTurn}`,
+    });
   }
   if (!badges.length) return;
   const wrap = document.createElement('span');
@@ -8959,6 +8978,7 @@ function appendLogStateBadges(cnt, c) {
     const el = document.createElement('span');
     el.className = 'log-state-badge ' + badge.cls;
     el.textContent = badge.text;
+    if (badge.title) el.title = badge.title;
     wrap.appendChild(el);
   }
   cnt.appendChild(wrap);
@@ -8966,10 +8986,8 @@ function appendLogStateBadges(cnt, c) {
 
 function isEditableUserMessage(c) {
   if (c?.superseded) return false;
-  const source = String(c?.source || '').toLowerCase();
   const sid = String(c?.session_id || '').trim();
-  const turn = Number(c?.user_turn_index || 0);
-  return source === 'user' && !!sid && Number.isInteger(turn) && turn > 0;
+  return !!sid && logUserTurnIndex(c) !== null;
 }
 
 function appendEditUserMessageButton(entry, c) {
