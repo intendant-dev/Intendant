@@ -2878,6 +2878,11 @@ html, body {
 }
 .control-toast.error { border-left-color: var(--red); }
 .control-toast.success { border-left-color: var(--green); }
+.control-toast.global-command-toast {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+}
 @keyframes control-toast-in {
   from { transform: translateX(12px); opacity: 0; }
   to { transform: translateX(0); opacity: 1; }
@@ -7471,17 +7476,178 @@ function dispatchCodexThreadAction(op, params) {
 }
 
 function showControlToast(kind, text) {
-  const body = document.querySelector('#activity-control-pane .control-pane-body');
-  if (!body) return;
-  const existing = body.querySelector('.control-toast');
+  const controlBody = document.querySelector('#activity-control-pane .control-pane-body');
+  const host = controlBody && controlBody.offsetParent !== null ? controlBody : document.body;
+  if (!host) return;
+  const existing = host.querySelector('.control-toast');
   if (existing) existing.remove();
   const toast = document.createElement('div');
   toast.className = 'control-toast ' + (kind === 'error' ? 'error' : 'success');
+  if (host === document.body) toast.classList.add('global-command-toast');
   toast.textContent = text;
-  body.appendChild(toast);
+  host.appendChild(toast);
   setTimeout(() => {
     if (toast.parentNode) toast.remove();
   }, 4500);
+}
+
+function unquoteSlashValue(value) {
+  const s = String(value || '').trim();
+  if (s.length >= 2) {
+    const first = s[0];
+    const last = s[s.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return s.slice(1, -1).trim();
+    }
+  }
+  return s;
+}
+
+function takeGoalNumberOption(text, names) {
+  for (const name of names) {
+    const re = new RegExp(`(?:^|\\s)--${name}(?:=|\\s+)(\\d+)(?=\\s|$)`, 'i');
+    const match = text.match(re);
+    if (match) {
+      const value = parseInt(match[1], 10);
+      const nextText = (text.slice(0, match.index) + ' ' + text.slice(match.index + match[0].length)).replace(/\s+/g, ' ').trim();
+      return { found: true, value, text: nextText };
+    }
+  }
+  return { found: false, value: null, text };
+}
+
+function takeGoalFlag(text, names) {
+  for (const name of names) {
+    const re = new RegExp(`(?:^|\\s)--${name}(?=\\s|$)`, 'i');
+    const match = text.match(re);
+    if (match) {
+      const nextText = (text.slice(0, match.index) + ' ' + text.slice(match.index + match[0].length)).replace(/\s+/g, ' ').trim();
+      return { found: true, text: nextText };
+    }
+  }
+  return { found: false, text };
+}
+
+function takeGoalStringOption(text, names) {
+  for (const name of names) {
+    const re = new RegExp(`(?:^|\\s)--${name}(?:=|\\s+)(\\S+)(?=\\s|$)`, 'i');
+    const match = text.match(re);
+    if (match) {
+      const nextText = (text.slice(0, match.index) + ' ' + text.slice(match.index + match[0].length)).replace(/\s+/g, ' ').trim();
+      return { found: true, value: match[1], text: nextText };
+    }
+  }
+  return { found: false, value: null, text };
+}
+
+function parseGoalSlash(rest) {
+  let text = String(rest || '').trim();
+  if (!text) return { op: 'goal', params: {} };
+
+  const exact = text.toLowerCase();
+  const exactOps = {
+    clear: 'goal-clear',
+    reset: 'goal-clear',
+    pause: 'goal-pause',
+    paused: 'goal-pause',
+    resume: 'goal-resume',
+    active: 'goal-resume',
+    complete: 'goal-complete',
+    completed: 'goal-complete',
+    done: 'goal-complete',
+    'budget-limited': 'goal-budget-limited',
+    budget_limited: 'goal-budget-limited',
+    status: 'goal',
+    show: 'goal',
+    get: 'goal',
+  };
+  if (exactOps[exact]) return { op: exactOps[exact], params: {} };
+
+  const params = {};
+  let op = 'goal';
+
+  const clear = takeGoalFlag(text, ['clear']);
+  if (clear.found) {
+    return { op: 'goal-clear', params: {} };
+  }
+  text = clear.text;
+
+  for (const [flag, action] of [
+    ['pause', 'goal-pause'],
+    ['resume', 'goal-resume'],
+    ['complete', 'goal-complete'],
+    ['budget-limited', 'goal-budget-limited'],
+  ]) {
+    const taken = takeGoalFlag(text, [flag]);
+    if (taken.found) {
+      op = action;
+      text = taken.text;
+      break;
+    }
+  }
+
+  const status = takeGoalStringOption(text, ['status']);
+  if (status.found) {
+    params.status = status.value;
+    text = status.text;
+  }
+
+  const budget = takeGoalNumberOption(text, ['budget', 'token-budget', 'tokens']);
+  if (budget.found) {
+    if (!Number.isFinite(budget.value) || budget.value <= 0) {
+      return { error: '/goal failed: token budget must be a positive integer' };
+    }
+    params.tokenBudget = budget.value;
+    text = budget.text;
+  }
+
+  const clearBudget = takeGoalFlag(text, ['clear-budget', 'no-budget']);
+  if (clearBudget.found) {
+    params.tokenBudget = null;
+    text = clearBudget.text;
+  }
+
+  const objective = unquoteSlashValue(text);
+  if (objective) {
+    if ([...objective].length > 4000) {
+      return { error: '/goal failed: objective must be 4000 characters or fewer' };
+    }
+    params.objective = objective;
+  }
+
+  return { op, params };
+}
+
+function parseCodexSlashCommand(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed.startsWith('/')) return null;
+  const match = trimmed.match(/^\/([A-Za-z][\w-]*)(?:\s+([\s\S]*))?$/);
+  if (!match) return null;
+  const name = match[1].toLowerCase();
+  const rest = (match[2] || '').trim();
+  if (name === 'fork') {
+    const params = {};
+    const forkName = unquoteSlashValue(rest);
+    if (forkName) params.name = forkName;
+    return { op: 'fork', params };
+  }
+  if (name === 'goal') return parseGoalSlash(rest);
+  return null;
+}
+
+function dispatchCodexSlashCommand(parsed) {
+  if (!parsed || parsed.error) {
+    showControlToast('error', parsed?.error || 'Slash command failed');
+    return false;
+  }
+  const sid = resolvePromptTargetSessionId();
+  if (!sid) {
+    showControlToast('error', `/${parsed.op}: select a Codex session first`);
+    return false;
+  }
+  markActionPending(parsed.op);
+  dispatchCodexThreadAction(parsed.op, parsed.params || {});
+  return true;
 }
 
 function markActionPending(op) {
@@ -18006,6 +18172,13 @@ window.submitActivityOrSteer = function() {
   if (!input) return;
   const text = input.value.trim();
   if (!text) return;
+  const codexSlash = parseCodexSlashCommand(text);
+  if (codexSlash) {
+    if (dispatchCodexSlashCommand(codexSlash)) {
+      clearTaskTextarea(input);
+    }
+    return;
+  }
   const targetSessionId = resolvePromptTargetSessionId();
   const targetPhase = targetSessionId
     ? (sessionWindows.get(targetSessionId)?.phase || currentPhase)

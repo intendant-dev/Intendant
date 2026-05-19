@@ -106,6 +106,15 @@ impl SessionSupervisor {
                 display_target,
                 attachments,
             } => {
+                if parse_codex_slash_command(&task).is_some() {
+                    if !reference_frame_ids.is_empty() || display_target.is_some() {
+                        self.warn(
+                            "Slash command dropped reference frame/display metadata; routing to active Codex session",
+                        );
+                    }
+                    self.route_follow_up(None, task, direct, attachments).await;
+                    return;
+                }
                 self.start_new_session(
                     task,
                     orchestrate,
@@ -143,6 +152,15 @@ impl SessionSupervisor {
                 display_target,
                 attachments,
             } => {
+                if parse_codex_slash_command(&task).is_some() {
+                    if !reference_frame_ids.is_empty() || display_target.is_some() {
+                        self.warn(
+                            "Slash command dropped reference frame/display metadata; routing to active Codex session",
+                        );
+                    }
+                    self.route_follow_up(None, task, direct, attachments).await;
+                    return;
+                }
                 self.start_new_session(
                     task,
                     orchestrate,
@@ -731,6 +749,39 @@ impl SessionSupervisor {
 
         match entry {
             Some((managed_id, source, project_root, session_dir, tx)) => {
+                if let Some(parsed) = parse_codex_slash_command(&text) {
+                    match parsed {
+                        Ok(command) => {
+                            if source == "codex" {
+                                if !attachments.is_empty() {
+                                    self.warn(&format!(
+                                        "Slash command /{} for Codex session {} ignored {} attachment(s)",
+                                        command.op,
+                                        short_session(&managed_id),
+                                        attachments.len()
+                                    ));
+                                }
+                                self.config.bus.send(AppEvent::ControlCommand(
+                                    event::ControlMsg::CodexThreadAction {
+                                        session_id: Some(managed_id),
+                                        op: command.op,
+                                        params: command.params,
+                                    },
+                                ));
+                            } else {
+                                self.warn(&format!(
+                                    "Slash command /{} is only supported for Codex sessions; target {} session {}",
+                                    command.op,
+                                    source,
+                                    short_session(&managed_id)
+                                ));
+                            }
+                        }
+                        Err(message) => self.warn(&message),
+                    }
+                    return;
+                }
+
                 let resolved_attachments = if attachments.is_empty() {
                     Vec::new()
                 } else {
@@ -1083,6 +1134,166 @@ fn path_file_name(path: &std::path::Path) -> String {
         .to_string()
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct CodexSlashCommand {
+    op: String,
+    params: serde_json::Value,
+}
+
+fn parse_codex_slash_command(text: &str) -> Option<Result<CodexSlashCommand, String>> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix('/')?;
+    let mut split = rest.splitn(2, char::is_whitespace);
+    let name = split.next()?.trim().to_ascii_lowercase();
+    let args = split.next().unwrap_or("").trim();
+
+    match name.as_str() {
+        "fork" => {
+            let mut params = serde_json::Map::new();
+            let fork_name = unquote_slash_value(args);
+            if !fork_name.is_empty() {
+                params.insert("name".to_string(), serde_json::Value::String(fork_name));
+            }
+            Some(Ok(CodexSlashCommand {
+                op: "fork".to_string(),
+                params: serde_json::Value::Object(params),
+            }))
+        }
+        "goal" => Some(parse_goal_slash_command(args)),
+        _ => None,
+    }
+}
+
+fn parse_goal_slash_command(args: &str) -> Result<CodexSlashCommand, String> {
+    let exact = args.trim().to_ascii_lowercase();
+    let exact_op = match exact.as_str() {
+        "" | "status" | "show" | "get" => Some("goal"),
+        "clear" | "reset" => Some("goal-clear"),
+        "pause" | "paused" => Some("goal-pause"),
+        "resume" | "active" => Some("goal-resume"),
+        "complete" | "completed" | "done" => Some("goal-complete"),
+        "budget-limited" | "budget_limited" => Some("goal-budget-limited"),
+        _ => None,
+    };
+    if let Some(op) = exact_op {
+        return Ok(CodexSlashCommand {
+            op: op.to_string(),
+            params: serde_json::json!({}),
+        });
+    }
+
+    let mut op = "goal".to_string();
+    let mut params = serde_json::Map::new();
+    let mut objective_parts = Vec::new();
+    let mut parts = args.split_whitespace().peekable();
+
+    while let Some(part) = parts.next() {
+        match part {
+            "--clear" => {
+                return Ok(CodexSlashCommand {
+                    op: "goal-clear".to_string(),
+                    params: serde_json::json!({}),
+                });
+            }
+            "--pause" => op = "goal-pause".to_string(),
+            "--resume" => op = "goal-resume".to_string(),
+            "--complete" => op = "goal-complete".to_string(),
+            "--budget-limited" => op = "goal-budget-limited".to_string(),
+            "--clear-budget" | "--no-budget" => {
+                params.insert("tokenBudget".to_string(), serde_json::Value::Null);
+            }
+            "--status" => {
+                let Some(value) = parts.next() else {
+                    return Err("/goal failed: --status requires a value".to_string());
+                };
+                params.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+            }
+            "--budget" | "--token-budget" | "--tokens" => {
+                let Some(value) = parts.next() else {
+                    return Err("/goal failed: token budget must be a positive integer".to_string());
+                };
+                let budget = parse_positive_budget(value)?;
+                params.insert(
+                    "tokenBudget".to_string(),
+                    serde_json::Value::Number(budget.into()),
+                );
+            }
+            other if other.starts_with("--status=") => {
+                let value = other.trim_start_matches("--status=");
+                if value.is_empty() {
+                    return Err("/goal failed: --status requires a value".to_string());
+                }
+                params.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+            }
+            other if other.starts_with("--budget=") => {
+                let budget = parse_positive_budget(other.trim_start_matches("--budget="))?;
+                params.insert(
+                    "tokenBudget".to_string(),
+                    serde_json::Value::Number(budget.into()),
+                );
+            }
+            other if other.starts_with("--token-budget=") => {
+                let budget = parse_positive_budget(other.trim_start_matches("--token-budget="))?;
+                params.insert(
+                    "tokenBudget".to_string(),
+                    serde_json::Value::Number(budget.into()),
+                );
+            }
+            other if other.starts_with("--tokens=") => {
+                let budget = parse_positive_budget(other.trim_start_matches("--tokens="))?;
+                params.insert(
+                    "tokenBudget".to_string(),
+                    serde_json::Value::Number(budget.into()),
+                );
+            }
+            other => objective_parts.push(other),
+        }
+    }
+
+    let objective = unquote_slash_value(&objective_parts.join(" "));
+    if !objective.is_empty() {
+        let chars = objective.chars().count();
+        if chars > 4000 {
+            return Err("/goal failed: objective must be 4000 characters or fewer".to_string());
+        }
+        params.insert(
+            "objective".to_string(),
+            serde_json::Value::String(objective),
+        );
+    }
+
+    Ok(CodexSlashCommand {
+        op,
+        params: serde_json::Value::Object(params),
+    })
+}
+
+fn parse_positive_budget(value: &str) -> Result<u64, String> {
+    match value.parse::<u64>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err("/goal failed: token budget must be a positive integer".to_string()),
+    }
+}
+
+fn unquote_slash_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return trimmed[1..trimmed.len() - 1].trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 fn control_target_session_id(msg: &event::ControlMsg) -> Option<&str> {
     match msg {
         event::ControlMsg::Status { session_id }
@@ -1105,4 +1316,43 @@ fn short_session(session_id: &str) -> String {
 
 fn short_text(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slash(text: &str) -> CodexSlashCommand {
+        parse_codex_slash_command(text)
+            .expect("recognized slash command")
+            .expect("valid slash command")
+    }
+
+    #[test]
+    fn parses_fork_slash_command_with_name() {
+        let command = slash("/fork dashboard branch");
+        assert_eq!(command.op, "fork");
+        assert_eq!(command.params["name"], "dashboard branch");
+    }
+
+    #[test]
+    fn parses_goal_slash_command_with_objective_and_budget() {
+        let command = slash("/goal Ship multi-session UX --budget 200000");
+        assert_eq!(command.op, "goal");
+        assert_eq!(command.params["objective"], "Ship multi-session UX");
+        assert_eq!(command.params["tokenBudget"], 200000);
+    }
+
+    #[test]
+    fn parses_goal_status_aliases() {
+        assert_eq!(slash("/goal clear").op, "goal-clear");
+        assert_eq!(slash("/goal pause").op, "goal-pause");
+        assert_eq!(slash("/goal resume").op, "goal-resume");
+        assert_eq!(slash("/goal done").op, "goal-complete");
+    }
+
+    #[test]
+    fn ignores_non_codex_slash_commands() {
+        assert!(parse_codex_slash_command("/help").is_none());
+    }
 }
