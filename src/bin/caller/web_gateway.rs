@@ -1070,7 +1070,9 @@ const APP_HTML: &str = include_str!("../../../static/app.html");
 const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.js");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
-const EXTERNAL_ACTIVITY_REPLAY_LIMIT: usize = 80;
+// 0 means replay the full compact transcript. External activity replay
+// intentionally includes only user/assistant messages, not tool events or output.
+const EXTERNAL_ACTIVITY_REPLAY_LIMIT: usize = 0;
 
 /// Session-specific state that changes when a new agent session starts.
 /// Wrapped in `Arc<tokio::sync::RwLock<...>>` so the web gateway can observe
@@ -2838,6 +2840,15 @@ fn external_session_detail_from_home(
     )
 }
 
+fn external_transcript_source(provider_source: &str, role: &str) -> String {
+    let role = role.trim().to_lowercase();
+    if role == "user" {
+        "user".to_string()
+    } else {
+        provider_source.to_string()
+    }
+}
+
 fn external_session_entries_from_home(
     home: &Path,
     source: &str,
@@ -2861,7 +2872,7 @@ fn external_session_entries_from_home(
                         entries.push(serde_json::json!({
                             "ts": ts,
                             "level": if role == "assistant" { "model" } else { "info" },
-                            "source": "codex",
+                            "source": external_transcript_source("codex", &role),
                             "content": text,
                         }));
                     }
@@ -2897,7 +2908,7 @@ fn external_session_entries_from_home(
                     entries.push(serde_json::json!({
                         "ts": value_str(&obj, "timestamp").unwrap_or_default(),
                         "level": if typ == "assistant" { "model" } else { "info" },
-                        "source": "claude",
+                        "source": external_transcript_source("claude", typ),
                         "content": text,
                     }));
                 }
@@ -2944,7 +2955,7 @@ fn external_session_entries_from_home(
                         entries.push(serde_json::json!({
                             "ts": value_str(msg, "timestamp").unwrap_or_default(),
                             "level": if role == "assistant" || role == "model" { "model" } else { "info" },
-                            "source": "gemini",
+                            "source": external_transcript_source("gemini", role),
                             "content": text,
                         }));
                     }
@@ -11965,6 +11976,13 @@ mod tests {
                 .all(|content| !content.contains("wrong file")),
             "detail included content from a substring match: {contents:?}"
         );
+        assert!(entries.iter().any(|entry| {
+            entry.get("source").and_then(|v| v.as_str()) == Some("user")
+                && entry
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|content| content.contains("Implement a new subtab"))
+        }));
     }
 
     #[test]
@@ -12023,7 +12041,7 @@ mod tests {
         assert!(entries.iter().any(|entry| {
             entry["event"] == "log_entry"
                 && entry["level"] == "info"
-                && entry["source"] == "codex"
+                && entry["source"] == "user"
                 && entry["content"] == "What happens on refresh?"
         }));
         assert!(entries.iter().any(|entry| {
@@ -12032,6 +12050,62 @@ mod tests {
                 && entry["source"] == "codex"
                 && entry["content"] == "The task keeps running."
         }));
+    }
+
+    #[test]
+    fn resume_session_open_replays_full_external_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-full-activity-replay";
+        let mut lines = vec![serde_json::json!({
+            "timestamp": "2026-05-17T16:48:52Z",
+            "type": "session_meta",
+            "payload": { "id": session_id }
+        })];
+        for n in 1..=90 {
+            lines.push(serde_json::json!({
+                "timestamp": format!("2026-05-17T16:{:02}:00Z", 49 + (n / 60)),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": if n % 2 == 0 { "assistant" } else { "user" },
+                    "content": [{ "type": "text", "text": format!("turn message {n}") }]
+                }
+            }));
+        }
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            lines
+                .into_iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let replay = resume_session_activity_replay_from_home(
+            dir.path(),
+            "codex",
+            session_id,
+            None,
+            None,
+            EXTERNAL_ACTIVITY_REPLAY_LIMIT,
+        )
+        .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let contents: Vec<_> = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["event"] == "log_entry")
+            .filter_map(|entry| entry["content"].as_str())
+            .collect();
+
+        assert_eq!(contents.len(), 90);
+        assert_eq!(contents.first(), Some(&"turn message 1"));
+        assert_eq!(contents.last(), Some(&"turn message 90"));
     }
 
     #[test]
