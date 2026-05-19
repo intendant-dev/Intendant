@@ -1768,6 +1768,27 @@ fn value_str(v: &serde_json::Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
+fn codex_exec_command_workdir(payload: &serde_json::Value) -> Option<String> {
+    if payload.get("type").and_then(|v| v.as_str()) != Some("function_call")
+        || payload.get("name").and_then(|v| v.as_str()) != Some("exec_command")
+    {
+        return None;
+    }
+
+    let arguments = payload.get("arguments")?;
+    let parsed_arguments;
+    let arguments = if let Some(raw) = arguments.as_str() {
+        parsed_arguments = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+        &parsed_arguments
+    } else {
+        arguments
+    };
+
+    value_str(arguments, "workdir")
+        .or_else(|| value_str(arguments, "cwd"))
+        .filter(|value| !value.trim().is_empty())
+}
+
 fn compact_text(s: &str, max: usize) -> String {
     let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.chars().count() <= max {
@@ -2461,6 +2482,9 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
                 }
                 "response_item" => {
                     if let Some(payload) = obj.get("payload") {
+                        if let Some(value) = codex_exec_command_workdir(payload) {
+                            command_cwd = Some(value);
+                        }
                         if let Some((role, text)) = codex_payload_text(payload) {
                             if role == "user" && !is_codex_injected_user_text(&text) {
                                 fallback_user_turns.push(Some(compact_text(&text, 180)));
@@ -11327,6 +11351,82 @@ mod tests {
                 "payload": {
                     "type": "exec_command_end",
                     "cwd": command_cwd.to_string_lossy()
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:22Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Inspect cwd"}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        let expected_project_root = repo.to_string_lossy().to_string();
+        let expected_cwd = command_cwd.to_string_lossy().to_string();
+        assert_eq!(
+            session.get("project_root").and_then(|v| v.as_str()),
+            Some(expected_project_root.as_str())
+        );
+        assert_eq!(
+            session.get("cwd").and_then(|v| v.as_str()),
+            Some(expected_cwd.as_str())
+        );
+    }
+
+    #[test]
+    fn list_codex_sessions_uses_function_call_workdir_as_latest_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        let command_cwd = repo.join(".worktrees").join("live-cwd");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&command_cwd).unwrap();
+
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37ae-function-call-workdir";
+        let arguments = serde_json::json!({
+            "cmd": "pwd",
+            "workdir": command_cwd.to_string_lossy()
+        })
+        .to_string();
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": repo.to_string_lossy()
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": arguments
                 }
             }),
             serde_json::json!({

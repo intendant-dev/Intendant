@@ -5535,6 +5535,8 @@ const sessionUsageById = new Map();
 let latestGlobalUsage = null;
 const SESSION_WINDOW_LOG_LIMIT = 600;
 const SESSION_PENDING_ACTIVE_MS = 30000;
+const SESSION_METADATA_REFRESH_MS = 2500;
+let sessionMetadataRefreshTimer = null;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
 let steerCounter = 0;
@@ -8098,6 +8100,26 @@ function refreshSessionWindowMetadata(delay = 0) {
   else run();
 }
 
+function syncSessionWindowMetadataRefresh() {
+  if (sessionWindows.size > 0) {
+    if (!sessionMetadataRefreshTimer) {
+      refreshSessionWindowMetadata();
+      sessionMetadataRefreshTimer = setInterval(() => {
+        if (sessionWindows.size === 0) {
+          syncSessionWindowMetadataRefresh();
+          return;
+        }
+        refreshSessionWindowMetadata();
+      }, SESSION_METADATA_REFRESH_MS);
+    }
+    return;
+  }
+  if (sessionMetadataRefreshTimer) {
+    clearInterval(sessionMetadataRefreshTimer);
+    sessionMetadataRefreshTimer = null;
+  }
+}
+
 function ensureSessionWindow(sessionId, meta = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) return null;
@@ -8181,6 +8203,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
       }
     }
     if (grid.childElementCount === 0) grid.classList.add('hidden');
+    syncSessionWindowMetadataRefresh();
   });
 
   grid.appendChild(el);
@@ -8197,6 +8220,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     ended: false,
   };
   sessionWindows.set(sid, win);
+  syncSessionWindowMetadataRefresh();
   updateSessionWindow(sid, meta);
   return win;
 }
