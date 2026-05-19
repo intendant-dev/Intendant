@@ -1223,9 +1223,16 @@ html, body {
   flex-direction: column;
   gap: 2px;
 }
+.session-window-meta {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
 .session-window-id {
+  flex-shrink: 0;
   color: var(--text);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
 }
 .session-window-task {
@@ -1236,6 +1243,8 @@ html, body {
   white-space: nowrap;
 }
 .session-window-worktree {
+  min-width: 0;
+  flex: 1;
   color: var(--sapphire);
   font-size: 11px;
   overflow: hidden;
@@ -8062,16 +8071,20 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const id = document.createElement('div');
   id.className = 'session-window-id';
   id.textContent = shortSessionId(sid);
+  id.title = sid;
   const worktree = document.createElement('div');
   worktree.className = 'session-window-worktree';
   worktree.textContent = meta.worktreeLabel || meta.worktree || 'unknown';
   worktree.title = meta.worktree || 'Worktree not known yet';
+  const metaRow = document.createElement('div');
+  metaRow.className = 'session-window-meta';
+  metaRow.appendChild(id);
+  metaRow.appendChild(worktree);
   const task = document.createElement('div');
   task.className = 'session-window-task';
   task.textContent = meta.task || 'initial message pending';
   task.title = meta.task || 'Initial user message not known yet';
-  title.appendChild(id);
-  title.appendChild(worktree);
+  title.appendChild(metaRow);
   title.appendChild(task);
   const status = document.createElement('span');
   status.className = 'session-window-status';
