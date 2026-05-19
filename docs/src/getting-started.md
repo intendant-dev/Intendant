@@ -29,7 +29,7 @@ Both binaries are installed to `~/.cargo/bin/`. The `intendant` binary embeds de
 Manual Linux install if not using the setup script:
 
 ```bash
-sudo apt install build-essential pkg-config libclang-dev \
+sudo apt install build-essential binutils pkg-config libclang-dev \
   libvpx-dev libpipewire-0.3-dev libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
   xdotool x11-utils imagemagick ffmpeg xvfb pulseaudio-utils xdg-utils
 ```

@@ -1,8 +1,7 @@
-[target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+# Keep Linux on Cargo's default system linker. Forcing a project-wide
+# -fuse-ld=mold makes fresh Ubuntu builds fail when mold is absent, often as a
+# misleading "could not find `ld`" error. Developers can opt into mold locally
+# with RUSTFLAGS if they want faster links.
 
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]

@@ -99,10 +99,10 @@ ensure_sudo() {
 APT_PACKAGES=(
     # Build essentials
     build-essential
+    binutils
     pkg-config
     git
     curl
-    mold
 
     # ripgrep — used by external agents (Codex, Claude Code) for code search.
     # Missing `rg` causes agents to fall back to slower paths (targeted reads
@@ -169,6 +169,29 @@ check_apt_packages() {
             all_ok=false
         fi
     done
+
+    $all_ok
+}
+
+check_linker_tools() {
+    local all_ok=true
+
+    echo ""
+    info "native linker tools:"
+
+    if has_cmd cc; then
+        ok "$(cc --version 2>/dev/null | head -1)"
+    else
+        miss "cc" "apt install build-essential"
+        all_ok=false
+    fi
+
+    if has_cmd ld; then
+        ok "$(ld --version 2>/dev/null | head -1)"
+    else
+        miss "ld" "apt install binutils"
+        all_ok=false
+    fi
 
     $all_ok
 }
@@ -540,9 +563,10 @@ run_check() {
 
     detect_distro
 
-    local apt_ok rust_ok wasm_ok env_ok
+    local apt_ok linker_ok rust_ok wasm_ok env_ok
 
     check_apt_packages && apt_ok=true || apt_ok=false
+    check_linker_tools && linker_ok=true || linker_ok=false
     check_rust         && rust_ok=true || rust_ok=false
     check_wasm_pack    && wasm_ok=true || wasm_ok=false
     check_dotenv       && env_ok=true || env_ok=false
@@ -556,6 +580,12 @@ run_check() {
         echo "  System packages:  ready"
     else
         echo "  System packages:  missing (run without --check to install)"
+    fi
+
+    if $linker_ok; then
+        echo "  Native linker:    ready"
+    else
+        echo "  Native linker:    missing (install build-essential binutils)"
     fi
 
     if $rust_ok; then
@@ -599,6 +629,10 @@ run_install() {
     info "checking system packages..."
     install_apt_packages
     ok "system packages ready"
+
+    # Fail here with an actionable package name instead of a later rustc
+    # "could not find `ld`" error.
+    check_linker_tools || die "native linker tools missing after apt install -- run: sudo apt install build-essential binutils"
 
     # Phase 3: Rust
     echo ""
