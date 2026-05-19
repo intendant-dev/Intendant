@@ -1865,6 +1865,32 @@ fn collect_recent_files(root: &Path, suffix: &str, limit: usize) -> Vec<PathBuf>
     files
 }
 
+fn derive_project_root_from_cwd(cwd: Option<&str>) -> Option<String> {
+    let cwd = cwd?.trim();
+    if cwd.is_empty() {
+        return None;
+    }
+
+    let mut current = PathBuf::from(cwd);
+    if !current.is_absolute() {
+        return Some(cwd.to_string());
+    }
+    if current.is_file() {
+        current.pop();
+    }
+
+    loop {
+        if current.join(".git").exists() {
+            return Some(current.to_string_lossy().to_string());
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+
+    Some(cwd.to_string())
+}
+
 fn read_text_head_tail(path: &Path, head_bytes: u64, tail_bytes: u64) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
@@ -2015,11 +2041,13 @@ fn external_session_json(
     model: Option<String>,
     turns: u64,
     project_root: Option<String>,
+    cwd: Option<String>,
     path: Option<String>,
     bytes: u64,
 ) -> serde_json::Value {
     let created_at = created_at.unwrap_or_default();
     let updated_at = updated_at.unwrap_or_else(|| created_at.clone());
+    let cwd = cwd.or_else(|| project_root.clone());
     serde_json::json!({
         "source": source,
         "source_label": label,
@@ -2047,7 +2075,7 @@ fn external_session_json(
         "turns_bytes": bytes,
         "logs_bytes": bytes,
         "total_bytes": bytes,
-        "cwd": project_root.clone(),
+        "cwd": cwd,
         "project_root": project_root,
         "path": path,
         "can_delete": false,
@@ -2319,6 +2347,7 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
                     None,
                     0,
                     None,
+                    None,
                     Some(index_path.to_string_lossy().to_string()),
                     file_size(&index_path),
                 ),
@@ -2348,7 +2377,9 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
         };
         let mut id = None;
         let mut created_at = None;
-        let mut cwd = None;
+        let mut session_cwd = None;
+        let mut turn_cwd = None;
+        let mut command_cwd = None;
         let mut model = None;
         let mut forked_from_id = None;
         let mut provider = Some("Codex".to_string());
@@ -2368,20 +2399,36 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
                         forked_from_id =
                             forked_from_id.or_else(|| value_str(payload, "forked_from_id"));
                         created_at = created_at.or_else(|| value_str(payload, "timestamp"));
-                        cwd = cwd.or_else(|| value_str(payload, "cwd"));
+                        if let Some(value) = value_str(payload, "cwd") {
+                            if session_cwd.is_none() {
+                                session_cwd = Some(value);
+                            }
+                        }
                         model = model.or_else(|| value_str(payload, "model"));
                         provider = value_str(payload, "model_provider").or(provider);
                     }
                 }
                 "turn_context" => {
                     if let Some(payload) = obj.get("payload") {
-                        cwd = cwd.or_else(|| value_str(payload, "cwd"));
+                        if let Some(value) = value_str(payload, "cwd") {
+                            if session_cwd.is_none() {
+                                session_cwd = Some(value.clone());
+                            }
+                            turn_cwd = Some(value);
+                        }
                         model = model.or_else(|| value_str(payload, "model"));
                     }
                 }
                 "event_msg" => {
                     if let Some(payload) = obj.get("payload") {
-                        match payload.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                        let payload_type =
+                            payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if payload_type.starts_with("exec_command") {
+                            if let Some(value) = value_str(payload, "cwd") {
+                                command_cwd = Some(value);
+                            }
+                        }
+                        match payload_type {
                             "task_started" => {
                                 task_started_turns += 1;
                             }
@@ -2456,6 +2503,9 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
         } else {
             0
         };
+        let effective_cwd = command_cwd.or(turn_cwd).or_else(|| session_cwd.clone());
+        let project_root =
+            derive_project_root_from_cwd(session_cwd.as_deref().or(effective_cwd.as_deref()));
         let mut session = external_session_json(
             "codex",
             "Codex",
@@ -2467,7 +2517,8 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
             provider.as_deref().unwrap_or("Codex"),
             model.clone(),
             turns,
-            cwd,
+            project_root,
+            effective_cwd,
             Some(path.to_string_lossy().to_string()),
             file_size(&path),
         );
@@ -2522,6 +2573,7 @@ fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
         };
         let mut created_at = None;
         let mut updated_at = None;
+        let mut session_cwd = None;
         let mut cwd = None;
         let mut task = None;
         let mut model = None;
@@ -2534,7 +2586,12 @@ fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
             };
             created_at = created_at.or_else(|| value_str(&obj, "timestamp"));
             updated_at = value_str(&obj, "timestamp").or(updated_at);
-            cwd = cwd.or_else(|| value_str(&obj, "cwd"));
+            if let Some(value) = value_str(&obj, "cwd") {
+                if session_cwd.is_none() {
+                    session_cwd = Some(value.clone());
+                }
+                cwd = Some(value);
+            }
             if obj.get("type").and_then(|v| v.as_str()) == Some("user") {
                 turns += 1;
                 if task.is_none() {
@@ -2562,6 +2619,9 @@ fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
                 }
             }
         }
+        let effective_cwd = cwd.or_else(|| session_cwd.clone());
+        let project_root =
+            derive_project_root_from_cwd(session_cwd.as_deref().or(effective_cwd.as_deref()));
         let mut session = external_session_json(
             "claude-code",
             "Claude Code",
@@ -2575,7 +2635,8 @@ fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
             "Claude Code",
             model.clone(),
             turns,
-            cwd,
+            project_root,
+            effective_cwd,
             Some(path.to_string_lossy().to_string()),
             file_size(&path),
         );
@@ -2668,6 +2729,7 @@ fn list_gemini_sessions(home: &Path) -> Vec<serde_json::Value> {
             }
         }
         let project_root = alias.as_ref().and_then(|a| roots.get(a).cloned());
+        let cwd = project_root.clone();
         let mut session = external_session_json(
             "gemini",
             "Gemini CLI",
@@ -2680,6 +2742,7 @@ fn list_gemini_sessions(home: &Path) -> Vec<serde_json::Value> {
             model.clone(),
             turns,
             project_root,
+            cwd,
             Some(path.to_string_lossy().to_string()),
             file_size(&path),
         );
@@ -11134,6 +11197,7 @@ mod tests {
             1,
             None,
             None,
+            None,
             0,
         );
 
@@ -11227,6 +11291,76 @@ mod tests {
             Some("Fix the Sessions tab")
         );
         assert_eq!(session.get("turns").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    #[test]
+    fn list_codex_sessions_separates_project_root_from_latest_command_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        let command_cwd = repo.join(".worktrees").join("feature");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&command_cwd).unwrap();
+
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37ae-project-cwd-split";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": repo.to_string_lossy()
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "exec_command_end",
+                    "cwd": command_cwd.to_string_lossy()
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:22Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Inspect cwd"}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        let expected_project_root = repo.to_string_lossy().to_string();
+        let expected_cwd = command_cwd.to_string_lossy().to_string();
+        assert_eq!(
+            session.get("project_root").and_then(|v| v.as_str()),
+            Some(expected_project_root.as_str())
+        );
+        assert_eq!(
+            session.get("cwd").and_then(|v| v.as_str()),
+            Some(expected_cwd.as_str())
+        );
     }
 
     #[test]

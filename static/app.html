@@ -1242,19 +1242,22 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.session-window-project,
 .session-window-cwd {
   min-width: 0;
   flex: 1;
-  color: var(--sapphire);
   font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.session-window-project { color: var(--sapphire); }
+.session-window-cwd { color: var(--green); }
 .session-window-task::before,
+.session-window-project::before,
 .session-window-cwd::before {
   display: inline-block;
-  min-width: 24px;
+  min-width: 30px;
   margin-right: 4px;
   color: var(--overlay0);
   font-size: 10px;
@@ -1262,6 +1265,7 @@ html, body {
   text-transform: uppercase;
 }
 .session-window-task::before { content: "msg"; }
+.session-window-project::before { content: "proj"; }
 .session-window-cwd::before { content: "cwd"; }
 .session-window-status {
   flex-shrink: 0;
@@ -7998,7 +8002,12 @@ function normalizeSessionWindowMeta(meta = {}) {
   const out = {};
   const task = compactSessionText(meta.initial_message || meta.initialMessage || meta.task);
   if (task) out.task = task;
-  const cwd = compactSessionText(meta.cwd || meta.workdir || meta.workDir || meta.worktree || meta.project_root || meta.projectRoot);
+  const project = compactSessionText(meta.project_root || meta.projectRoot || meta.project_dir || meta.projectDir || meta.project);
+  if (project) {
+    out.projectRoot = project;
+    out.projectLabel = compactPathLabel(project);
+  }
+  const cwd = compactSessionText(meta.cwd || meta.workdir || meta.workDir || meta.worktree || project);
   if (cwd) {
     out.cwd = cwd;
     out.cwdLabel = compactPathLabel(cwd);
@@ -8073,6 +8082,10 @@ function ensureSessionWindow(sessionId, meta = {}) {
   id.className = 'session-window-id';
   id.textContent = shortSessionId(sid);
   id.title = sid;
+  const project = document.createElement('div');
+  project.className = 'session-window-project';
+  project.textContent = meta.projectLabel || meta.projectRoot || 'unknown';
+  project.title = meta.projectRoot || 'Project directory not known yet';
   const cwd = document.createElement('div');
   cwd.className = 'session-window-cwd';
   cwd.textContent = meta.cwdLabel || meta.cwd || 'unknown';
@@ -8080,12 +8093,13 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const metaRow = document.createElement('div');
   metaRow.className = 'session-window-meta';
   metaRow.appendChild(id);
-  metaRow.appendChild(cwd);
+  metaRow.appendChild(project);
   const task = document.createElement('div');
   task.className = 'session-window-task';
   task.textContent = meta.task || 'initial message pending';
   task.title = meta.task || 'Initial user message not known yet';
   title.appendChild(metaRow);
+  title.appendChild(cwd);
   title.appendChild(task);
   const status = document.createElement('span');
   status.className = 'session-window-status';
@@ -8131,6 +8145,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     el,
     log,
     id,
+    project,
     cwd,
     task,
     status,
@@ -8153,6 +8168,13 @@ function updateSessionWindow(sessionId, meta = {}) {
     sessionMetadataById.set(sid, { ...previous, ...normalized });
   }
   meta = { ...(sessionMetadataById.get(sid) || {}), ...normalized };
+  if (meta.projectRoot) {
+    win.project.textContent = meta.projectLabel || compactPathLabel(meta.projectRoot);
+    win.project.title = meta.projectRoot;
+  } else {
+    win.project.textContent = 'unknown';
+    win.project.title = 'Project directory not known yet';
+  }
   if (meta.cwd) {
     win.cwd.textContent = meta.cwdLabel || compactPathLabel(meta.cwd);
     win.cwd.title = meta.cwd;
