@@ -807,6 +807,11 @@ impl AppState {
         cmds
     }
 
+    /// Select which agent session should drive session-scoped UI updates.
+    pub fn select_session(&mut self, session_id: &str) {
+        self.session_id = session_id.to_string();
+    }
+
     /// Change verbosity and return commands to re-filter visible logs.
     pub fn set_verbosity(&mut self, level: &str) -> Vec<UiCommand> {
         self.verbosity = level.to_string();

@@ -997,6 +997,28 @@ html, body {
   flex-shrink: 0;
 }
 .global-task-bar .phase-banner { min-width: 160px; }
+.task-target-chip {
+  flex-shrink: 0;
+  max-width: 160px;
+  padding: 3px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--subtext1);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.task-target-chip.has-target {
+  color: var(--blue);
+  border-color: rgba(137, 180, 250, 0.45);
+  background: rgba(137, 180, 250, 0.08);
+}
+.task-target-chip:focus { outline: 1px solid var(--blue); outline-offset: 1px; }
 .global-task-input {
   flex: 1;
   min-width: 0;
@@ -1159,6 +1181,110 @@ html, body {
 .phase-banner.phase-idle .phase-text { color: var(--overlay1); }
 
 /* ── Log Stream ── */
+.session-window-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 10px;
+  padding: 8px;
+  max-height: 42vh;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--surface0);
+  background: var(--base);
+  flex-shrink: 0;
+}
+.session-window {
+  min-height: 180px;
+  max-height: 320px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--mantle);
+  overflow: hidden;
+  cursor: pointer;
+}
+.session-window.foreground {
+  border-color: var(--blue);
+  box-shadow: inset 0 0 0 1px rgba(137, 180, 250, 0.35);
+}
+.session-window-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--surface0);
+  background: var(--crust);
+  flex-shrink: 0;
+}
+.session-window-title {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.session-window-id {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+.session-window-task {
+  color: var(--overlay1);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-window-status {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface0);
+  color: var(--overlay1);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.session-window-status.active { color: var(--teal); }
+.session-window-status.waiting { color: var(--yellow); }
+.session-window-status.done { color: var(--green); }
+.session-window-close {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--overlay1);
+  font-size: 14px;
+  cursor: pointer;
+}
+.session-window-close:hover { background: var(--surface0); color: var(--text); }
+.session-window-log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 3px 0;
+}
+.session-window-log .log-entry {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+.session-window-log .log-icon,
+.session-window-log .log-host,
+.session-window-log .log-session {
+  display: none;
+}
+.session-window-log .log-ts { width: 58px; }
+.session-window-log .log-level { width: 46px; }
+.session-window-empty {
+  padding: 12px 10px;
+  color: var(--overlay0);
+  font-size: 12px;
+}
 .log-stream {
   flex: 1;
   overflow-y: auto;
@@ -4145,6 +4271,7 @@ html, body {
       <span class="phase-text" id="phase-text">Idle</span>
     </div>
     <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
+    <button id="task-target-chip" class="task-target-chip" onclick="focusForegroundSessionWindow()" title="Prompt target">New session</button>
     <textarea id="activity-task-input" class="global-task-input" rows="1" placeholder="Enter task..."></textarea>
     <!-- File upload: hidden input triggered by the Attach button. `multiple`
          lets the user pick several at once; we fire one POST per file
@@ -4223,6 +4350,7 @@ html, body {
                after the backend reports steer_delivered. -->
           <div class="steer-strip empty" id="steer-strip"></div>
 
+          <div class="session-window-grid hidden" id="session-window-grid"></div>
           <div class="log-stream" id="log-stream"></div>
           <button class="scroll-bottom-btn" id="scroll-bottom" title="Scroll to bottom">&#x2193;</button>
 
@@ -5363,6 +5491,9 @@ let activeCommandOutputGroup = null;
 const commandOutputGroups = new Map();
 let currentPhase = 'idle';
 let currentSessionFullId = '';
+let foregroundSessionFullId = '';
+const sessionWindows = new Map();
+const SESSION_WINDOW_LOG_LIMIT = 600;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
 let steerCounter = 0;
@@ -7584,6 +7715,9 @@ function clearLogs() {
   logEntryCount = 0;
   activeCommandOutputGroup = null;
   commandOutputGroups.clear();
+  for (const win of sessionWindows.values()) {
+    win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+  }
 }
 
 function renderTurnSeparator(turn) {
@@ -7610,6 +7744,192 @@ function hostBadgeColor(hostId) {
   }
   const hue = ((hash % 360) + 360) % 360;
   return `hsl(${hue}, 32%, 58%)`;
+}
+
+function shortSessionId(sessionId) {
+  return String(sessionId || '').slice(0, 8);
+}
+
+function normalizeSessionPhase(phase) {
+  const p = String(phase || 'idle').toLowerCase();
+  if (p === 'running_agent') return 'running';
+  if (p === 'waiting_followup') return 'idle';
+  return p || 'idle';
+}
+
+function sessionPhaseClass(phase) {
+  const p = normalizeSessionPhase(phase);
+  if (isAgentActivePhase(p)) return 'active';
+  if (p.startsWith('waiting')) return 'waiting';
+  if (p === 'done' || p === 'idle' || p === 'interrupted') return 'done';
+  return '';
+}
+
+function updateTaskTargetChip() {
+  const chip = document.getElementById('task-target-chip');
+  if (!chip) return;
+  const sid = resolvePromptTargetSessionId();
+  chip.classList.toggle('has-target', !!sid);
+  chip.textContent = sid ? `Target ${shortSessionId(sid)}` : 'New session';
+  chip.title = sid ? `Prompt target: ${sid}` : 'Prompt target: new session';
+}
+
+function resolvePromptTargetSessionId() {
+  const sid = foregroundSessionFullId || currentSessionFullId || '';
+  const win = sid ? sessionWindows.get(sid) : null;
+  return win && win.ended ? '' : sid;
+}
+
+function ensureSessionWindow(sessionId, meta = {}) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  let win = sessionWindows.get(sid);
+  if (win) {
+    updateSessionWindow(sid, meta);
+    return win;
+  }
+
+  const grid = document.getElementById('session-window-grid');
+  if (!grid) return null;
+  grid.classList.remove('hidden');
+
+  const el = document.createElement('div');
+  el.className = 'session-window';
+  el.dataset.sessionId = sid;
+  el.tabIndex = 0;
+
+  const header = document.createElement('div');
+  header.className = 'session-window-header';
+  const title = document.createElement('div');
+  title.className = 'session-window-title';
+  const id = document.createElement('div');
+  id.className = 'session-window-id';
+  id.textContent = shortSessionId(sid);
+  const task = document.createElement('div');
+  task.className = 'session-window-task';
+  task.textContent = meta.task || meta.source || 'session';
+  title.appendChild(id);
+  title.appendChild(task);
+  const status = document.createElement('span');
+  status.className = 'session-window-status';
+  status.textContent = normalizeSessionPhase(meta.phase || 'idle');
+  const close = document.createElement('button');
+  close.className = 'session-window-close';
+  close.type = 'button';
+  close.title = 'Close window';
+  close.textContent = '\u00d7';
+  header.appendChild(title);
+  header.appendChild(status);
+  header.appendChild(close);
+
+  const log = document.createElement('div');
+  log.className = 'session-window-log';
+  log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+
+  el.appendChild(header);
+  el.appendChild(log);
+  el.addEventListener('mousedown', () => focusSessionWindow(sid));
+  el.addEventListener('focus', () => focusSessionWindow(sid));
+  close.addEventListener('click', (e) => {
+    e.stopPropagation();
+    el.remove();
+    sessionWindows.delete(sid);
+    if (foregroundSessionFullId === sid) {
+      const next = sessionWindows.keys().next().value || '';
+      if (next) focusSessionWindow(next);
+      else {
+        foregroundSessionFullId = '';
+        if (currentSessionFullId === sid) {
+          currentSessionFullId = '';
+          document.getElementById('sb-session').textContent = '';
+        }
+        updateTaskTargetChip();
+      }
+    }
+    if (grid.childElementCount === 0) grid.classList.add('hidden');
+  });
+
+  grid.appendChild(el);
+  win = { el, log, id, task, status, phase: normalizeSessionPhase(meta.phase || 'idle'), ended: false };
+  sessionWindows.set(sid, win);
+  updateSessionWindow(sid, meta);
+  return win;
+}
+
+function updateSessionWindow(sessionId, meta = {}) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const win = sessionWindows.get(sid);
+  if (!win) return;
+  if (meta.task) win.task.textContent = meta.task;
+  else if (meta.source && win.task.textContent === 'session') win.task.textContent = meta.source;
+  if (meta.ended !== undefined) win.ended = !!meta.ended;
+  if (meta.phase) {
+    win.phase = normalizeSessionPhase(meta.phase);
+    win.status.textContent = win.phase;
+    win.status.className = 'session-window-status';
+    const cls = sessionPhaseClass(win.phase);
+    if (cls) win.status.classList.add(cls);
+  }
+}
+
+function focusSessionWindow(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const win = ensureSessionWindow(sid);
+  if (!win) return;
+  foregroundSessionFullId = sid;
+  currentSessionFullId = sid;
+  document.getElementById('sb-session').textContent = shortSessionId(sid);
+  if (app && typeof app.select_session === 'function') app.select_session(sid);
+  for (const [id, other] of sessionWindows) {
+    other.el.classList.toggle('foreground', id === sid);
+  }
+  updateTaskTargetChip();
+  if (win.phase) setPhase(win.phase);
+}
+
+window.focusForegroundSessionWindow = function() {
+  const sid = resolvePromptTargetSessionId();
+  if (!sid) return;
+  const win = sessionWindows.get(sid);
+  if (win) {
+    win.el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    win.el.focus();
+  }
+};
+
+function appendLogEntryToSessionWindow(entry) {
+  const sid = entry?.dataset?.sessionId || '';
+  if (!sid) return;
+  const win = ensureSessionWindow(sid);
+  if (!win) return;
+  const empty = win.log.querySelector('.session-window-empty');
+  if (empty) empty.remove();
+  const clone = entry.cloneNode(true);
+  clone.removeAttribute('id');
+  clone.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
+  win.log.appendChild(clone);
+  while (win.log.children.length > SESSION_WINDOW_LOG_LIMIT) {
+    win.log.removeChild(win.log.firstElementChild);
+  }
+  win.log.scrollTop = win.log.scrollHeight;
+}
+
+function inferSessionPhaseFromLog(c) {
+  const sid = c && c.session_id;
+  if (!sid) return;
+  const content = String(c.content || '');
+  const level = String(c.level || '').toLowerCase();
+  let phase = '';
+  if (content.startsWith('Turn ')) phase = 'thinking';
+  else if (level === 'agent' || content.startsWith('Running on display')) phase = 'running';
+  else if (content.startsWith('Approval required') || content.startsWith('Question:')) phase = 'waiting';
+  else if (content.startsWith('Task complete:')) phase = 'done';
+  else if (content.startsWith('Round ') && content.includes(' complete')) phase = 'idle';
+  else if (content.startsWith('Agent interrupted:')) phase = 'interrupted';
+  else if (content.startsWith('Session ended:')) phase = 'done';
+  if (phase) updateSessionWindow(sid, { phase });
 }
 
 function renderInlineMarkdown(text) {
@@ -7894,6 +8214,7 @@ function createLogScaffold(c, extraClass) {
 function appendLogEntryElement(entry) {
   const stream = document.getElementById('log-stream');
   stream.appendChild(entry);
+  appendLogEntryToSessionWindow(entry);
   logEntryCount++;
   if (logEntryCount > 10000) {
     const first = stream.querySelector('.log-entry, .log-turn-sep');
@@ -8060,11 +8381,13 @@ function renderLogContentElement(cnt, c) {
 
 function renderLogEntry(c) {
   if (isCommandOutputLog(c)) {
+    inferSessionPhaseFromLog(c);
     renderCommandOutputEntry(c);
     return;
   }
   finalizeActiveCommandOutputGroup();
   if (shouldSuppressAttachmentReceiptDuplicate(c)) return;
+  inferSessionPhaseFromLog(c);
 
   const { entry } = createLogScaffold(c, '');
 
@@ -8159,6 +8482,12 @@ function updateStatusBar(d) {
   if (d.session_id) {
     currentSessionFullId = d.session_id;
     document.getElementById('sb-session').textContent = d.session_id.substring(0, 8);
+    ensureSessionWindow(d.session_id, { ended: false });
+    if (!foregroundSessionFullId || foregroundSessionFullId === d.session_id) {
+      focusSessionWindow(d.session_id);
+    } else {
+      updateTaskTargetChip();
+    }
   }
   if (d.external_agent !== undefined) {
     const el = document.getElementById('sb-external-agent');
@@ -8227,6 +8556,8 @@ function normalizeAutonomyLabel(raw) {
 
 function setPhase(phase) {
   currentPhase = phase;
+  const phaseSessionId = resolvePromptTargetSessionId();
+  if (phaseSessionId) updateSessionWindow(phaseSessionId, { phase });
   const banner = document.getElementById('phase-banner');
   const text = document.getElementById('phase-text');
   banner.className = 'phase-banner';
@@ -8289,6 +8620,10 @@ function showApproval(id, command, category, sessionId) {
     || approvalSessionIds.get(String(id))
     || currentSessionFullId
     || '';
+  if (pendingApprovalSessionId) {
+    ensureSessionWindow(pendingApprovalSessionId, { phase: 'waiting' });
+    focusSessionWindow(pendingApprovalSessionId);
+  }
   document.getElementById('approval-command').textContent = command;
   document.getElementById('approval-category').textContent = category ? 'Category: ' + category : '';
   document.getElementById('approval-panel').classList.add('visible');
@@ -10984,7 +11319,7 @@ function shouldSuppressAttachmentReceiptDuplicate(c) {
   return true;
 }
 
-function renderAttachmentReceipt(text, attachments, verb) {
+function renderAttachmentReceipt(text, attachments, verb, sessionId) {
   if (!attachments || attachments.length === 0 || typeof renderLogEntry !== 'function') return;
   const previews = attachments.map((att) => ({
     frameId: att.frameId,
@@ -11000,6 +11335,7 @@ function renderAttachmentReceipt(text, attachments, verb) {
     level: 'info',
     source: 'user',
     content,
+    session_id: sessionId || undefined,
     attachment_previews: previews,
   });
   rememberAttachmentReceipt(text);
@@ -17472,6 +17808,12 @@ function renderDiskUsage(sessions) {
 function onSessionStarted(sessionId, task) {
   currentSessionFullId = sessionId || '';
   document.getElementById('sb-session').textContent = sessionId ? sessionId.slice(0, 8) : '';
+  if (sessionId) {
+    ensureSessionWindow(sessionId, { task: task || 'session', phase: 'thinking', ended: false });
+    focusSessionWindow(sessionId);
+  } else {
+    updateTaskTargetChip();
+  }
   resetChangesPane();
   switchTab('activity');
   refreshChangesList({ selectFirst: activeActivitySubtab === 'changes', quiet: true });
@@ -17485,6 +17827,12 @@ function onSessionStarted(sessionId, task) {
 function onSessionAttached(sessionId, source) {
   currentSessionFullId = sessionId || '';
   document.getElementById('sb-session').textContent = sessionId ? sessionId.slice(0, 8) : '';
+  if (sessionId) {
+    ensureSessionWindow(sessionId, { source: source || 'session', phase: 'idle', ended: false });
+    focusSessionWindow(sessionId);
+  } else {
+    updateTaskTargetChip();
+  }
   resetChangesPane();
   switchTab('activity');
   refreshChangesList({ selectFirst: activeActivitySubtab === 'changes', quiet: true });
@@ -17492,14 +17840,24 @@ function onSessionAttached(sessionId, source) {
 }
 
 function onSessionEnded(sessionId, reason) {
+  if (sessionId) updateSessionWindow(sessionId, { phase: 'done', ended: true });
   if (!sessionId || sessionId === currentSessionFullId) {
     currentSessionFullId = '';
     document.getElementById('sb-session').textContent = '';
   }
+  if (!sessionId || sessionId === foregroundSessionFullId) {
+    foregroundSessionFullId = '';
+    const next = Array.from(sessionWindows.entries())
+      .find(([id, win]) => id !== sessionId && win.phase !== 'done')?.[0] || '';
+    if (next) focusSessionWindow(next);
+    else {
+      for (const win of sessionWindows.values()) win.el.classList.remove('foreground');
+      setPhase('idle');
+      updateTaskTargetChip();
+    }
+  }
   // Refresh sessions list if already loaded
   if (sessionsLoaded) loadSessions();
-  // Switch to sessions tab so user sees past sessions + new session input
-  switchTab('sessions');
 }
 
 function resizeTaskTextarea(input) {
@@ -17542,13 +17900,15 @@ window.submitActivityTask = function() {
   const attachments = pendingAttachments.map(a => a.frameId);
   const attachmentReceipt = pendingAttachments.slice();
   const direct = document.getElementById('direct-mode-toggle')?.checked || false;
-  const msg = { action: 'start_task', task: text };
-  if (currentSessionFullId) msg.session_id = currentSessionFullId;
+  const targetSessionId = resolvePromptTargetSessionId();
+  const msg = targetSessionId
+    ? { action: 'start_task', task: text, session_id: targetSessionId }
+    : { action: 'create_session', task: text };
   if (direct) msg.direct = true;
   if (attachments.length > 0) msg.attachments = attachments;
   app.send_server_action(msg);
   if (attachments.length > 0) {
-    renderAttachmentReceipt(text, attachmentReceipt, 'Sent');
+    renderAttachmentReceipt(text, attachmentReceipt, 'Sent', targetSessionId);
     clearPendingAttachments();
   }
 };
@@ -17571,7 +17931,11 @@ window.submitActivityOrSteer = function() {
   if (!input) return;
   const text = input.value.trim();
   if (!text) return;
-  if (isAgentActivePhase(currentPhase)) {
+  const targetSessionId = resolvePromptTargetSessionId();
+  const targetPhase = targetSessionId
+    ? (sessionWindows.get(targetSessionId)?.phase || currentPhase)
+    : currentPhase;
+  if (targetSessionId && isAgentActivePhase(targetPhase)) {
     // Mid-turn steer path. JS generates the id locally and we render an
     // optimistic pending row immediately — the backend round-trips a
     // steer_requested echo that updates the same row by id (idempotent
@@ -17582,8 +17946,7 @@ window.submitActivityOrSteer = function() {
     const id = 'steer-' + Date.now() + '-' + steerCounter;
     const attachments = pendingAttachments.map(a => a.frameId);
     const attachmentReceipt = pendingAttachments.slice();
-    const msg = { action: 'steer', text, id };
-    if (currentSessionFullId) msg.session_id = currentSessionFullId;
+    const msg = { action: 'steer', text, id, session_id: targetSessionId };
     if (attachments.length > 0) msg.attachments = attachments;
     app.send_server_action(msg);
     onSteerStatusUpdate(
@@ -17593,7 +17956,7 @@ window.submitActivityOrSteer = function() {
       null
     );
     if (attachments.length > 0) {
-      renderAttachmentReceipt(text, attachmentReceipt, 'Steered');
+      renderAttachmentReceipt(text, attachmentReceipt, 'Steered', targetSessionId);
       clearPendingAttachments();
     }
     clearTaskTextarea(input);
@@ -18587,7 +18950,8 @@ window.sendInterrupt = function() {
     btn.innerHTML = '\u23F9 Interrupting...';
   }
   const msg = { action: 'interrupt' };
-  if (currentSessionFullId) msg.session_id = currentSessionFullId;
+  const targetSessionId = resolvePromptTargetSessionId();
+  if (targetSessionId) msg.session_id = targetSessionId;
   app.send_server_action(msg);
 };
 
@@ -18833,6 +19197,7 @@ document.querySelector('#human-input')?.addEventListener('keydown', (e) => {
 // textarea so multiline task instructions work naturally.
 wireTaskTextarea('activity-task-input', () => submitActivityOrSteer());
 wireTaskTextarea('new-session-input', () => startNewSession());
+updateTaskTargetChip();
 
 // Verbosity toggle
 document.getElementById('verbosity-select').addEventListener('change', (e) => {

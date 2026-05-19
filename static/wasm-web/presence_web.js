@@ -279,6 +279,15 @@ export class PresenceWeb {
         wasm.presenceweb_revoke_user_display_with_id(this.__wbg_ptr, display_id);
     }
     /**
+     * Select the session whose scoped events should update global UI state.
+     * @param {string} session_id
+     */
+    select_session(session_id) {
+        const ptr0 = passStringToWasm0(session_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.presenceweb_select_session(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
      * Approve/skip/deny/approve_all a pending action.
      * Returns `UiCommand[]` for UI updates. Sends the action to the server.
      * @param {string} action

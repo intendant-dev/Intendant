@@ -111,6 +111,10 @@ export class PresenceWeb {
      */
     revoke_user_display_with_id(display_id: number): void;
     /**
+     * Select the session whose scoped events should update global UI state.
+     */
+    select_session(session_id: string): void;
+    /**
      * Approve/skip/deny/approve_all a pending action.
      * Returns `UiCommand[]` for UI updates. Sends the action to the server.
      */
@@ -359,6 +363,7 @@ export interface InitOutput {
     readonly presenceweb_request_display_input_authority: (a: number, b: number) => void;
     readonly presenceweb_revoke_user_display: (a: number) => void;
     readonly presenceweb_revoke_user_display_with_id: (a: number, b: number) => void;
+    readonly presenceweb_select_session: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_approval: (a: number, b: number, c: number) => any;
     readonly presenceweb_send_audio: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_follow_up: (a: number, b: number, c: number, d: number) => any;
