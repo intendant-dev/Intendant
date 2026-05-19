@@ -6,7 +6,7 @@
 //! resources, and tracks the follow-up channel for each managed session.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
@@ -281,6 +281,7 @@ impl SessionSupervisor {
             }
         };
 
+        write_session_meta(&session_log, &project.root, Some(&task));
         self.activate_shared_session(session_log.clone()).await;
         self.config.bus.send(AppEvent::SessionStarted {
             session_id: session_id.clone(),
@@ -441,6 +442,7 @@ impl SessionSupervisor {
                     }
                 };
 
+                write_session_meta(&session_log, &project.root, None);
                 self.activate_shared_session(session_log.clone()).await;
                 self.spawn_agent_session(
                     resume_token.clone(),
@@ -508,6 +510,7 @@ impl SessionSupervisor {
             }
         };
 
+        write_session_meta(&session_log, &project.root, Some(&resume_task));
         self.activate_shared_session(session_log.clone()).await;
         self.config.bus.send(AppEvent::SessionStarted {
             session_id: live_session_id.clone(),
@@ -1224,6 +1227,16 @@ fn path_file_name(path: &std::path::Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+fn write_session_meta(
+    session_log: &Arc<std::sync::Mutex<session_log::SessionLog>>,
+    project_root: &Path,
+    task: Option<&str>,
+) {
+    if let Ok(log) = session_log.lock() {
+        log.write_meta(Some(project_root), task);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
