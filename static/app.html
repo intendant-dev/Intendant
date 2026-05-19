@@ -1235,6 +1235,25 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.session-window-worktree {
+  color: var(--sapphire);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-window-task::before,
+.session-window-worktree::before {
+  display: inline-block;
+  min-width: 24px;
+  margin-right: 4px;
+  color: var(--overlay0);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.session-window-task::before { content: "msg"; }
+.session-window-worktree::before { content: "wt"; }
 .session-window-status {
   flex-shrink: 0;
   padding: 1px 6px;
@@ -5498,6 +5517,7 @@ let currentPhase = 'idle';
 let currentSessionFullId = '';
 let foregroundSessionFullId = '';
 const sessionWindows = new Map();
+const sessionMetadataById = new Map();
 const sessionUsageById = new Map();
 let latestGlobalUsage = null;
 const SESSION_WINDOW_LOG_LIMIT = 600;
@@ -7953,9 +7973,73 @@ function resolvePromptTargetSessionId() {
   return win && win.ended ? '' : sid;
 }
 
+function compactSessionText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function compactWorktreePath(value) {
+  const path = compactSessionText(value);
+  if (!path) return '';
+  const parts = path.split(/[\\/]+/).filter(Boolean);
+  if (parts.length >= 2) return parts.slice(-2).join('/');
+  return path;
+}
+
+function normalizeSessionWindowMeta(meta = {}) {
+  const out = {};
+  const task = compactSessionText(meta.initial_message || meta.initialMessage || meta.task);
+  if (task) out.task = task;
+  const worktree = compactSessionText(meta.worktree || meta.project_root || meta.projectRoot);
+  if (worktree) {
+    out.worktree = worktree;
+    out.worktreeLabel = compactWorktreePath(worktree);
+  }
+  const source = compactSessionText(meta.source_label || meta.sourceLabel || meta.source);
+  if (source) out.source = source;
+  if (meta.phase) out.phase = meta.phase;
+  if (meta.ended !== undefined) out.ended = !!meta.ended;
+  return out;
+}
+
+function sessionWindowMetaFromSession(session) {
+  if (!session || typeof session !== 'object') return {};
+  return normalizeSessionWindowMeta({
+    task: session.task,
+    project_root: session.project_root,
+    source_label: session.source_label || prettyAgentName(session.source || '') || session.source,
+  });
+}
+
+function cacheSessionWindowMetadata(sessions) {
+  if (!Array.isArray(sessions)) return;
+  for (const session of sessions) {
+    if (!session || typeof session !== 'object') continue;
+    const meta = sessionWindowMetaFromSession(session);
+    const ids = [session.session_id, session.resume_id]
+      .map(id => String(id || '').trim())
+      .filter(Boolean);
+    for (const id of ids) {
+      sessionMetadataById.set(id, meta);
+      if (sessionWindows.has(id)) updateSessionWindow(id, meta);
+    }
+  }
+}
+
+function refreshSessionWindowMetadata(delay = 0) {
+  const run = () => {
+    authedFetch('/api/sessions')
+      .then(r => r.ok ? r.json() : Promise.reject(new Error(`/api/sessions returned ${r.status}`)))
+      .then(sessions => cacheSessionWindowMetadata(sessions))
+      .catch(() => {});
+  };
+  if (delay > 0) setTimeout(run, delay);
+  else run();
+}
+
 function ensureSessionWindow(sessionId, meta = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) return null;
+  meta = { ...(sessionMetadataById.get(sid) || {}), ...normalizeSessionWindowMeta(meta) };
   let win = sessionWindows.get(sid);
   if (win) {
     updateSessionWindow(sid, meta);
@@ -7978,10 +8062,16 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const id = document.createElement('div');
   id.className = 'session-window-id';
   id.textContent = shortSessionId(sid);
+  const worktree = document.createElement('div');
+  worktree.className = 'session-window-worktree';
+  worktree.textContent = meta.worktreeLabel || meta.worktree || 'unknown';
+  worktree.title = meta.worktree || 'Worktree not known yet';
   const task = document.createElement('div');
   task.className = 'session-window-task';
-  task.textContent = meta.task || meta.source || 'session';
+  task.textContent = meta.task || 'initial message pending';
+  task.title = meta.task || 'Initial user message not known yet';
   title.appendChild(id);
+  title.appendChild(worktree);
   title.appendChild(task);
   const status = document.createElement('span');
   status.className = 'session-window-status';
@@ -8023,7 +8113,16 @@ function ensureSessionWindow(sessionId, meta = {}) {
   });
 
   grid.appendChild(el);
-  win = { el, log, id, task, status, phase: normalizeSessionPhase(meta.phase || 'idle'), ended: false };
+  win = {
+    el,
+    log,
+    id,
+    worktree,
+    task,
+    status,
+    phase: normalizeSessionPhase(meta.phase || 'idle'),
+    ended: false,
+  };
   sessionWindows.set(sid, win);
   updateSessionWindow(sid, meta);
   return win;
@@ -8034,8 +8133,23 @@ function updateSessionWindow(sessionId, meta = {}) {
   if (!sid) return;
   const win = sessionWindows.get(sid);
   if (!win) return;
-  if (meta.task) win.task.textContent = meta.task;
-  else if (meta.source && win.task.textContent === 'session') win.task.textContent = meta.source;
+  const normalized = normalizeSessionWindowMeta(meta);
+  if (Object.keys(normalized).length > 0) {
+    const previous = sessionMetadataById.get(sid) || {};
+    sessionMetadataById.set(sid, { ...previous, ...normalized });
+  }
+  meta = { ...(sessionMetadataById.get(sid) || {}), ...normalized };
+  if (meta.worktree) {
+    win.worktree.textContent = meta.worktreeLabel || compactWorktreePath(meta.worktree);
+    win.worktree.title = meta.worktree;
+  } else {
+    win.worktree.textContent = 'unknown';
+    win.worktree.title = 'Worktree not known yet';
+  }
+  if (meta.task) {
+    win.task.textContent = meta.task;
+    win.task.title = meta.task;
+  }
   if (meta.ended !== undefined) win.ended = !!meta.ended;
   if (meta.phase) {
     win.phase = normalizeSessionPhase(meta.phase);
@@ -17858,6 +17972,7 @@ function loadAllSessionsUsage(hostId, options = {}) {
         throw new Error('/api/sessions returned a non-array payload');
       }
       sessionsListCache.set(hostId, sessions);
+      if (hostId === selfPeerId) cacheSessionWindowMetadata(sessions);
       // Only render if the user is still viewing this host. A slow
       // fetch that finishes after the user switched away would
       // otherwise stomp the current view.
@@ -18058,6 +18173,9 @@ function onSessionStarted(sessionId, task) {
   if (sessionsLoaded) {
     loadSessions();
     setTimeout(loadSessions, 1000);
+  } else if (sessionId) {
+    refreshSessionWindowMetadata(250);
+    refreshSessionWindowMetadata(1250);
   }
 }
 
@@ -18077,6 +18195,9 @@ function onSessionAttached(sessionId, source) {
   if (sessionsLoaded) {
     loadSessions();
     setTimeout(loadSessions, 1000);
+  } else if (sessionId) {
+    refreshSessionWindowMetadata(250);
+    refreshSessionWindowMetadata(1250);
   }
 }
 
@@ -18363,6 +18484,7 @@ function loadSessions() {
     .then(sessions => {
       sessionsLoaded = true;
       _cachedSessions = sessions;
+      cacheSessionWindowMetadata(sessions);
       renderSessionsAggregate(sessions, aggEl);
       renderSessionsList(sessions, listEl);
     })

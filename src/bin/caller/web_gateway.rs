@@ -2992,6 +2992,7 @@ fn list_sessions() -> String {
         let meta_path = dir.join("session_meta.json");
         let mut task: Option<String> = None;
         let mut created_at: Option<String> = None;
+        let mut project_root: Option<String> = None;
         let mut provider: Option<String> = None;
         let mut model: Option<String> = None;
         let mut status = "in_progress".to_string();
@@ -3011,6 +3012,10 @@ fn list_sessions() -> String {
                     .map(|s| s.to_string());
                 created_at = meta
                     .get("created_at")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                project_root = meta
+                    .get("project_root")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
                 if let Some(s) = meta.get("status").and_then(|v| v.as_str()) {
@@ -3251,7 +3256,7 @@ fn list_sessions() -> String {
             "turns_bytes": turns_bytes,
             "logs_bytes": logs_bytes,
             "total_bytes": total_bytes,
-            "project_root": null,
+            "project_root": project_root,
             "path": dir.to_string_lossy().to_string(),
             "can_delete": true,
             "can_resume": true,
