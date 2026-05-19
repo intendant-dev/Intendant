@@ -41,7 +41,7 @@ Three execution modes: *direct* (single agent), *user* (orchestrator + sub-agent
 - **wasm-pack** — `cargo install wasm-pack`
 - **ffmpeg** — display recording and H264 encoding
 - **macOS**: `./scripts/setup-macos.sh` installs everything (cliclick, ffmpeg, Vortex Audio, wasm-pack, app bundle)
-- **Linux**: `./scripts/setup-linux.sh` installs everything (libvpx, libxcb, xdotool, PipeWire, ffmpeg, PulseAudio, Xvfb)
+- **Linux**: `./scripts/setup-linux.sh` installs everything (build-essential/binutils, libvpx, libxcb, xdotool, PipeWire, ffmpeg, PulseAudio, Xvfb)
 
 ## Quick Start
 
