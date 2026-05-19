@@ -1242,7 +1242,7 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.session-window-worktree {
+.session-window-cwd {
   min-width: 0;
   flex: 1;
   color: var(--sapphire);
@@ -1252,7 +1252,7 @@ html, body {
   white-space: nowrap;
 }
 .session-window-task::before,
-.session-window-worktree::before {
+.session-window-cwd::before {
   display: inline-block;
   min-width: 24px;
   margin-right: 4px;
@@ -1262,7 +1262,7 @@ html, body {
   text-transform: uppercase;
 }
 .session-window-task::before { content: "msg"; }
-.session-window-worktree::before { content: "wt"; }
+.session-window-cwd::before { content: "cwd"; }
 .session-window-status {
   flex-shrink: 0;
   padding: 1px 6px;
@@ -7986,7 +7986,7 @@ function compactSessionText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
-function compactWorktreePath(value) {
+function compactPathLabel(value) {
   const path = compactSessionText(value);
   if (!path) return '';
   const parts = path.split(/[\\/]+/).filter(Boolean);
@@ -7998,10 +7998,10 @@ function normalizeSessionWindowMeta(meta = {}) {
   const out = {};
   const task = compactSessionText(meta.initial_message || meta.initialMessage || meta.task);
   if (task) out.task = task;
-  const worktree = compactSessionText(meta.worktree || meta.project_root || meta.projectRoot);
-  if (worktree) {
-    out.worktree = worktree;
-    out.worktreeLabel = compactWorktreePath(worktree);
+  const cwd = compactSessionText(meta.cwd || meta.workdir || meta.workDir || meta.worktree || meta.project_root || meta.projectRoot);
+  if (cwd) {
+    out.cwd = cwd;
+    out.cwdLabel = compactPathLabel(cwd);
   }
   const source = compactSessionText(meta.source_label || meta.sourceLabel || meta.source);
   if (source) out.source = source;
@@ -8014,6 +8014,7 @@ function sessionWindowMetaFromSession(session) {
   if (!session || typeof session !== 'object') return {};
   return normalizeSessionWindowMeta({
     task: session.task,
+    cwd: session.cwd || session.workdir || session.workDir,
     project_root: session.project_root,
     source_label: session.source_label || prettyAgentName(session.source || '') || session.source,
   });
@@ -8072,14 +8073,14 @@ function ensureSessionWindow(sessionId, meta = {}) {
   id.className = 'session-window-id';
   id.textContent = shortSessionId(sid);
   id.title = sid;
-  const worktree = document.createElement('div');
-  worktree.className = 'session-window-worktree';
-  worktree.textContent = meta.worktreeLabel || meta.worktree || 'unknown';
-  worktree.title = meta.worktree || 'Worktree not known yet';
+  const cwd = document.createElement('div');
+  cwd.className = 'session-window-cwd';
+  cwd.textContent = meta.cwdLabel || meta.cwd || 'unknown';
+  cwd.title = meta.cwd || 'Working directory not known yet';
   const metaRow = document.createElement('div');
   metaRow.className = 'session-window-meta';
   metaRow.appendChild(id);
-  metaRow.appendChild(worktree);
+  metaRow.appendChild(cwd);
   const task = document.createElement('div');
   task.className = 'session-window-task';
   task.textContent = meta.task || 'initial message pending';
@@ -8130,7 +8131,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     el,
     log,
     id,
-    worktree,
+    cwd,
     task,
     status,
     phase: normalizeSessionPhase(meta.phase || 'idle'),
@@ -8152,12 +8153,12 @@ function updateSessionWindow(sessionId, meta = {}) {
     sessionMetadataById.set(sid, { ...previous, ...normalized });
   }
   meta = { ...(sessionMetadataById.get(sid) || {}), ...normalized };
-  if (meta.worktree) {
-    win.worktree.textContent = meta.worktreeLabel || compactWorktreePath(meta.worktree);
-    win.worktree.title = meta.worktree;
+  if (meta.cwd) {
+    win.cwd.textContent = meta.cwdLabel || compactPathLabel(meta.cwd);
+    win.cwd.title = meta.cwd;
   } else {
-    win.worktree.textContent = 'unknown';
-    win.worktree.title = 'Worktree not known yet';
+    win.cwd.textContent = 'unknown';
+    win.cwd.title = 'Working directory not known yet';
   }
   if (meta.task) {
     win.task.textContent = meta.task;
