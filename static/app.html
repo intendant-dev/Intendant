@@ -1268,7 +1268,11 @@ html, body {
 }
 .session-window-id {
   flex-shrink: 0;
-  color: var(--text);
+  color: var(--session-badge-fg, var(--text));
+  background: var(--session-badge-bg, var(--surface0));
+  border: 1px solid var(--session-badge-border, transparent);
+  border-radius: 3px;
+  padding: 1px 5px;
   font-size: 11px;
   font-weight: 700;
 }
@@ -8398,6 +8402,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   id.className = 'session-window-id';
   id.textContent = shortSessionId(sid);
   id.title = sid;
+  applySessionBadgeStyle(id, sid);
   const project = document.createElement('div');
   project.className = 'session-window-project';
   project.textContent = meta.projectLabel || meta.projectRoot || 'unknown';
