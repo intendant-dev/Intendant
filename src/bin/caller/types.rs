@@ -120,10 +120,14 @@ impl Verbosity {
 #[allow(dead_code)]
 pub enum OutboundEvent {
     TurnStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         turn: usize,
         budget_pct: f64,
     },
     AgentOutput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         stdout: String,
         stderr: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,6 +143,8 @@ pub enum OutboundEvent {
         question: String,
     },
     TaskComplete {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         reason: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
@@ -157,6 +163,8 @@ pub enum OutboundEvent {
         reason: String,
     },
     RoundComplete {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         round: usize,
         turns_in_round: usize,
     },
@@ -332,9 +340,13 @@ pub enum OutboundEvent {
     },
     // --- New variants for broadcast decoupling ---
     ModelResponseDelta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         text: String,
     },
     AgentStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         turn: usize,
         commands_preview: String,
         /// When set, overrides the default "agent"/"Run" source label (e.g. "Codex").
@@ -374,6 +386,8 @@ pub enum OutboundEvent {
         status: String,
     },
     ModelResponse {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         turn: usize,
         summary: String,
         #[serde(skip_serializing_if = "Option::is_none")]

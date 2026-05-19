@@ -888,7 +888,9 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
                 None
             }
         }
-        AppEvent::TaskComplete { reason, summary } => {
+        AppEvent::TaskComplete {
+            reason, summary, ..
+        } => {
             *last_phase = "done".to_string();
             Some(PresenceEvent::TaskComplete {
                 reason: reason.clone(),
@@ -1176,7 +1178,9 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             };
             s.last_output_summary = truncate(&combined, 500);
         }
-        AppEvent::TaskComplete { reason, summary } => {
+        AppEvent::TaskComplete {
+            reason, summary, ..
+        } => {
             s.phase = format!("done: {}", reason);
             if let Some(text) = summary {
                 s.last_task_result = Some(text.clone());
@@ -1359,6 +1363,7 @@ mod tests {
         let mut last_phase = String::new();
 
         let event = AppEvent::TaskComplete {
+            session_id: None,
             reason: "done".to_string(),
             summary: None,
         };
@@ -1371,6 +1376,7 @@ mod tests {
         assert!(filter_event(&event, &mut last_phase).is_some());
 
         let event = AppEvent::RoundComplete {
+            session_id: None,
             round: 1,
             turns_in_round: 5,
             native_message_count: None,
@@ -1386,6 +1392,7 @@ mod tests {
         let mut last_phase = String::new();
 
         let event = AppEvent::AgentOutput {
+            session_id: None,
             stdout: "hello".to_string(),
             stderr: String::new(),
             source: None,
@@ -1395,6 +1402,7 @@ mod tests {
         assert!(filter_event(&AppEvent::Tick, &mut last_phase).is_none());
 
         let event = AppEvent::ModelResponseDelta {
+            session_id: None,
             text: "hi".to_string(),
         };
         assert!(filter_event(&event, &mut last_phase).is_none());
@@ -1407,6 +1415,7 @@ mod tests {
         assert!(filter_event(&AppEvent::PresenceReady, &mut last_phase).is_none());
 
         let event = AppEvent::RoundComplete {
+            session_id: None,
             round: 1,
             turns_in_round: 5,
             native_message_count: None,
@@ -1419,6 +1428,7 @@ mod tests {
         let mut last_phase = String::new();
 
         let event = AppEvent::ModelResponse {
+            session_id: None,
             turn: 1,
             content: "hi".to_string(),
             usage: provider::TokenUsage::default(),
@@ -1449,6 +1459,7 @@ mod tests {
 
         update_agent_state(
             &AppEvent::TurnStarted {
+                session_id: None,
                 turn: 5,
                 budget_pct: 0.42,
                 remaining: 50_000,
@@ -1464,6 +1475,7 @@ mod tests {
 
         update_agent_state(
             &AppEvent::AgentStarted {
+                session_id: None,
                 turn: 5,
                 commands_preview: "echo hello".to_string(),
                 source: None,
@@ -1478,6 +1490,7 @@ mod tests {
 
         update_agent_state(
             &AppEvent::AgentOutput {
+                session_id: None,
                 stdout: "hello world".to_string(),
                 stderr: String::new(),
                 source: None,
@@ -1505,6 +1518,7 @@ mod tests {
 
         update_agent_state(
             &AppEvent::TaskComplete {
+                session_id: None,
                 reason: "done_signal".to_string(),
                 summary: None,
             },

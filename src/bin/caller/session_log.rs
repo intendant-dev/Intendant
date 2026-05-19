@@ -2215,6 +2215,7 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             Some(AppEvent::TurnStarted {
+                session_id: None,
                 turn: turn?,
                 budget_pct,
                 remaining,
@@ -2288,6 +2289,7 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|v| v.as_str())
                 .map(String::from);
             Some(AppEvent::ModelResponse {
+                session_id: None,
                 turn: turn.unwrap_or(0),
                 content,
                 usage,
@@ -2312,6 +2314,7 @@ pub fn session_log_entry_to_app_event(
                 return None;
             }
             Some(AppEvent::ModelResponse {
+                session_id: None,
                 turn: turn.unwrap_or(0),
                 content: String::new(),
                 usage: TokenUsage::default(),
@@ -2330,6 +2333,7 @@ pub fn session_log_entry_to_app_event(
                 message.to_string()
             };
             Some(AppEvent::AgentStarted {
+                session_id: None,
                 turn: turn.unwrap_or(0),
                 commands_preview,
                 source: None,
@@ -2343,6 +2347,7 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|v| v.as_str())
                 .map(String::from);
             Some(AppEvent::AgentOutput {
+                session_id: None,
                 stdout,
                 stderr,
                 source,
@@ -2362,7 +2367,11 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|d| d.get("summary"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            Some(AppEvent::TaskComplete { reason, summary })
+            Some(AppEvent::TaskComplete {
+                session_id: None,
+                reason,
+                summary,
+            })
         }
         "session_started" => {
             let session_id = data
@@ -2481,6 +2490,7 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
             Some(AppEvent::RoundComplete {
+                session_id: None,
                 round,
                 turns_in_round,
                 native_message_count: None,
@@ -3725,6 +3735,7 @@ mod tests {
                 usage,
                 reasoning,
                 source,
+                ..
             } => {
                 assert_eq!(turn, 5);
                 // Verifies the full content was read from the turn file,
@@ -3889,6 +3900,7 @@ mod tests {
                 stdout,
                 stderr,
                 source,
+                ..
             } => {
                 // Full content read from turn file, not truncated preview.
                 assert_eq!(stdout.len(), 600);
@@ -3918,6 +3930,7 @@ mod tests {
                 turn,
                 commands_preview,
                 source,
+                ..
             } => {
                 assert_eq!(turn, 1);
                 // format_commands_preview normalized it.

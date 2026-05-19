@@ -1378,6 +1378,18 @@ impl App {
                 self.current_phase = Phase::Thinking;
                 self.round += 1;
             }
+            ControlMsg::CreateSession { ref task, .. } => {
+                // Routing is handled by `session_supervisor::SessionSupervisor`.
+                // The TUI only reflects that a new managed session was requested.
+                self.follow_up_textarea = None;
+                self.mode = AppMode::Normal;
+                self.current_phase = Phase::Thinking;
+                self.round += 1;
+                self.log(
+                    LogLevel::Info,
+                    format!("New session requested: {}", truncate_str(task, 80)),
+                );
+            }
             ControlMsg::ResumeSession {
                 ref source,
                 ref session_id,
@@ -1763,7 +1775,7 @@ impl App {
                     turn_opt,
                 );
             }
-            AppEvent::ModelResponseDelta { text } => {
+            AppEvent::ModelResponseDelta { text, .. } => {
                 // Accumulate streaming text; shown at Debug level to avoid noise
                 self.streaming_buffer.push_str(&text);
             }
@@ -1863,7 +1875,9 @@ impl App {
                     Some(turn),
                 );
             }
-            AppEvent::TaskComplete { reason, summary } => {
+            AppEvent::TaskComplete {
+                reason, summary, ..
+            } => {
                 self.current_phase = Phase::Done;
                 // Local-only: OutboundEvent::TaskComplete already reaches
                 // external consumers.
@@ -2802,6 +2816,7 @@ mod tests {
     fn handle_event_turn_started() {
         let mut app = test_app();
         app.handle_event(AppEvent::TurnStarted {
+            session_id: None,
             turn: 3,
             budget_pct: 25.0,
             remaining: 150_000,
@@ -2815,6 +2830,7 @@ mod tests {
     fn handle_event_agent_output() {
         let mut app = test_app();
         app.handle_event(AppEvent::AgentOutput {
+            session_id: None,
             stdout: "line1\nline2".to_string(),
             stderr: "warn".to_string(),
             source: None,
@@ -2830,6 +2846,7 @@ mod tests {
     fn handle_event_task_complete() {
         let mut app = test_app();
         app.handle_event(AppEvent::TaskComplete {
+            session_id: None,
             reason: "Task complete".to_string(),
             summary: None,
         });
@@ -3167,9 +3184,11 @@ mod tests {
     fn handle_event_streaming_delta_accumulates() {
         let mut app = test_app();
         app.handle_event(AppEvent::ModelResponseDelta {
+            session_id: None,
             text: "Hello ".to_string(),
         });
         app.handle_event(AppEvent::ModelResponseDelta {
+            session_id: None,
             text: "world".to_string(),
         });
         assert_eq!(app.streaming_buffer, "Hello world");
@@ -3180,6 +3199,7 @@ mod tests {
         let mut app = test_app();
         app.streaming_buffer = "partial text".to_string();
         app.handle_event(AppEvent::ModelResponse {
+            session_id: None,
             turn: 1,
             content: r#"{"commands":[]}"#.to_string(),
             usage: crate::provider::TokenUsage {
@@ -3368,6 +3388,7 @@ mod tests {
     fn model_response_tagged_as_agent_source() {
         let mut app = test_app();
         app.handle_event(AppEvent::ModelResponse {
+            session_id: None,
             turn: 2,
             content: r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}]}"#
                 .to_string(),
@@ -3440,6 +3461,7 @@ mod tests {
 
         // TurnStarted: outbound OutboundEvent::TurnStarted → no LogEntry
         let derived = app.handle_event(AppEvent::TurnStarted {
+            session_id: None,
             turn: 1,
             budget_pct: 5.0,
             remaining: 100,
@@ -3452,6 +3474,7 @@ mod tests {
 
         // ModelResponse: outbound OutboundEvent::ModelResponse → no LogEntry
         let derived = app.handle_event(AppEvent::ModelResponse {
+            session_id: None,
             turn: 1,
             content: r#"{"commands":[]}"#.to_string(),
             usage: crate::provider::TokenUsage::default(),
@@ -3466,6 +3489,7 @@ mod tests {
 
         // AgentOutput: outbound OutboundEvent::AgentOutput → no LogEntry
         let derived = app.handle_event(AppEvent::AgentOutput {
+            session_id: None,
             stdout: "hello".to_string(),
             stderr: String::new(),
             source: None,
@@ -3490,6 +3514,7 @@ mod tests {
 
         // TaskComplete: outbound OutboundEvent::TaskComplete → no LogEntry
         let derived = app.handle_event(AppEvent::TaskComplete {
+            session_id: None,
             reason: "done".to_string(),
             summary: Some("ok".to_string()),
         });
@@ -3512,6 +3537,7 @@ mod tests {
 
         // RoundComplete: outbound OutboundEvent::RoundComplete → no LogEntry
         let derived = app.handle_event(AppEvent::RoundComplete {
+            session_id: None,
             round: 1,
             turns_in_round: 3,
             native_message_count: None,
@@ -3547,6 +3573,7 @@ mod tests {
 
         // AgentStarted: outbound OutboundEvent::AgentStarted → no LogEntry
         let derived = app.handle_event(AppEvent::AgentStarted {
+            session_id: None,
             turn: 1,
             commands_preview: "ls".to_string(),
             source: None,

@@ -346,7 +346,7 @@ impl AppEventUpcaster {
                 out
             }
 
-            AppEvent::ModelResponseDelta { text } => {
+            AppEvent::ModelResponseDelta { text, .. } => {
                 let id = self.current_or_new_message_id();
                 vec![PeerEvent::Message {
                     id,
@@ -362,6 +362,7 @@ impl AppEventUpcaster {
                 usage,
                 reasoning,
                 source: _,
+                ..
             } => {
                 let msg_id = self.current_or_new_message_id();
                 let mut out = vec![PeerEvent::Message {
@@ -441,6 +442,7 @@ impl AppEventUpcaster {
                 turn,
                 commands_preview,
                 source,
+                ..
             } => {
                 let label = source.clone().unwrap_or_else(|| "agent".to_string());
                 // Close any previous agent activity (defensive: if the
@@ -464,6 +466,7 @@ impl AppEventUpcaster {
                 stdout,
                 stderr,
                 source: _,
+                ..
             } => {
                 let mut out = vec![];
                 if !stdout.is_empty() {
@@ -523,7 +526,9 @@ impl AppEventUpcaster {
                 format!("context management turn {turn}"),
             )],
 
-            AppEvent::TaskComplete { reason, summary } => {
+            AppEvent::TaskComplete {
+                reason, summary, ..
+            } => {
                 let outcome = match reason.as_str() {
                     "success" | "done" | "completed" => ActivityOutcome::Success,
                     "cancelled" | "canceled" => ActivityOutcome::Cancelled,
@@ -1334,7 +1339,7 @@ impl WireEventUpcaster {
                 out
             }
 
-            OutboundEvent::ModelResponseDelta { text } => {
+            OutboundEvent::ModelResponseDelta { text, .. } => {
                 let id = self.current_or_new_message_id();
                 vec![PeerEvent::Message {
                     id,
@@ -1358,6 +1363,7 @@ impl WireEventUpcaster {
                 summary,
                 reasoning_summary,
                 source: _,
+                ..
             } => {
                 let msg_id = self.current_or_new_message_id();
                 let mut out = vec![PeerEvent::Message {
@@ -1437,6 +1443,7 @@ impl WireEventUpcaster {
             OutboundEvent::RoundComplete {
                 round,
                 turns_in_round,
+                ..
             } => vec![log_event(
                 LogLevel::Info,
                 "agent",
@@ -1448,6 +1455,7 @@ impl WireEventUpcaster {
                 turn,
                 commands_preview,
                 source,
+                ..
             } => {
                 let label = source.clone().unwrap_or_else(|| "agent".to_string());
                 let mut out = vec![];
@@ -1467,6 +1475,7 @@ impl WireEventUpcaster {
                 stdout,
                 stderr,
                 source: _,
+                ..
             } => {
                 let mut out = vec![];
                 if !stdout.is_empty() {
@@ -1516,7 +1525,9 @@ impl WireEventUpcaster {
                 format!("context management turn {turn}"),
             )],
 
-            OutboundEvent::TaskComplete { reason, summary } => {
+            OutboundEvent::TaskComplete {
+                reason, summary, ..
+            } => {
                 let outcome = match reason.as_str() {
                     "success" | "done" | "completed" => ActivityOutcome::Success,
                     "cancelled" | "canceled" => ActivityOutcome::Cancelled,
@@ -2083,6 +2094,7 @@ mod tests {
     fn turn_started_emits_activity_started() {
         let mut u = AppEventUpcaster::new();
         let out = u.upcast(&AppEvent::TurnStarted {
+            session_id: None,
             turn: 3,
             budget_pct: 0.5,
             remaining: 1000,
@@ -2105,6 +2117,7 @@ mod tests {
         let mut u = AppEventUpcaster::new();
         // Open turn 5.
         let _ = u.upcast(&AppEvent::TurnStarted {
+            session_id: None,
             turn: 5,
             budget_pct: 0.5,
             remaining: 100,
@@ -2114,9 +2127,11 @@ mod tests {
         // prior ModelResponse synthesize a fresh ID that's stable
         // across subsequent deltas in the same conversation-turn.
         let a = u.upcast(&AppEvent::ModelResponseDelta {
+            session_id: None,
             text: "Hello ".into(),
         });
         let b = u.upcast(&AppEvent::ModelResponseDelta {
+            session_id: None,
             text: "world".into(),
         });
         let id_a = match &a[0] {
@@ -2143,11 +2158,13 @@ mod tests {
         let mut u = AppEventUpcaster::new();
         // Prime current_turn_message via a delta-first path.
         let _ = u.upcast(&AppEvent::TurnStarted {
+            session_id: None,
             turn: 7,
             budget_pct: 0.5,
             remaining: 100,
         });
         let delta = u.upcast(&AppEvent::ModelResponseDelta {
+            session_id: None,
             text: "Hello ".into(),
         });
         let delta_id = match &delta[0] {
@@ -2156,6 +2173,7 @@ mod tests {
         };
         // Now close the turn.
         let out = u.upcast(&AppEvent::ModelResponse {
+            session_id: None,
             turn: 7,
             content: "Hello world".into(),
             usage: token_usage(10, 20),
@@ -2185,6 +2203,7 @@ mod tests {
     fn model_response_with_reasoning_adds_reasoning_message() {
         let mut u = AppEventUpcaster::new();
         let out = u.upcast(&AppEvent::ModelResponse {
+            session_id: None,
             turn: 1,
             content: "final".into(),
             usage: token_usage(5, 5),
@@ -2406,6 +2425,7 @@ mod tests {
     fn model_turn_activity_ids_match_start_to_complete() {
         let mut u = AppEventUpcaster::new();
         let started = u.upcast(&AppEvent::TurnStarted {
+            session_id: None,
             turn: 7,
             budget_pct: 0.5,
             remaining: 100,
@@ -2439,12 +2459,14 @@ mod tests {
         // Open a turn so the agent has a parent context (matches
         // typical usage; not strictly required).
         let _ = u.upcast(&AppEvent::TurnStarted {
+            session_id: None,
             turn: 3,
             budget_pct: 0.5,
             remaining: 100,
         });
         // Start an agent activity.
         let started = u.upcast(&AppEvent::AgentStarted {
+            session_id: None,
             turn: 3,
             commands_preview: "ls -la".into(),
             source: None,
@@ -2462,6 +2484,7 @@ mod tests {
 
         // Stream some output.
         let output = u.upcast(&AppEvent::AgentOutput {
+            session_id: None,
             stdout: "file1\nfile2".into(),
             stderr: String::new(),
             source: None,
@@ -2500,6 +2523,7 @@ mod tests {
     fn wire_model_turn_activity_ids_match_start_to_complete() {
         let mut u = WireEventUpcaster::new();
         let started = u.upcast(&OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 7,
             budget_pct: 0.5,
         });
@@ -2527,10 +2551,12 @@ mod tests {
     fn wire_agent_activity_ids_match_start_progress_complete() {
         let mut u = WireEventUpcaster::new();
         let _ = u.upcast(&OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 3,
             budget_pct: 0.5,
         });
         let started = u.upcast(&OutboundEvent::AgentStarted {
+            session_id: None,
             turn: 3,
             commands_preview: "ls -la".into(),
             source: None,
@@ -2545,6 +2571,7 @@ mod tests {
         assert_eq!(start_id.0, "agent-3");
 
         let output = u.upcast(&OutboundEvent::AgentOutput {
+            session_id: None,
             stdout: "file1".into(),
             stderr: String::new(),
             source: None,
@@ -2574,16 +2601,19 @@ mod tests {
             let mut u = AppEventUpcaster::new();
             // Open turn + agent, then fail.
             let _ = u.upcast(&AppEvent::TurnStarted {
+                session_id: None,
                 turn: 4,
                 budget_pct: 0.5,
                 remaining: 100,
             });
             let _ = u.upcast(&AppEvent::AgentStarted {
+                session_id: None,
                 turn: 4,
                 commands_preview: "risky".into(),
                 source: None,
             });
             let out = u.upcast(&AppEvent::TaskComplete {
+                session_id: None,
                 reason: (*reason).to_string(),
                 summary: None,
             });
@@ -2622,15 +2652,18 @@ mod tests {
     fn wire_task_complete_failure_propagates_to_agent_and_turn() {
         let mut u = WireEventUpcaster::new();
         let _ = u.upcast(&OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 4,
             budget_pct: 0.5,
         });
         let _ = u.upcast(&OutboundEvent::AgentStarted {
+            session_id: None,
             turn: 4,
             commands_preview: "risky".into(),
             source: None,
         });
         let out = u.upcast(&OutboundEvent::TaskComplete {
+            session_id: None,
             reason: "failed".to_string(),
             summary: None,
         });
@@ -2667,11 +2700,13 @@ mod tests {
 
         // Seed both with TurnStarted turn=5.
         let _ = app.upcast(&AppEvent::TurnStarted {
+            session_id: None,
             turn: 5,
             budget_pct: 0.5,
             remaining: 100,
         });
         let _ = wire.upcast(&OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 5,
             budget_pct: 0.5,
         });
@@ -2750,6 +2785,7 @@ mod tests {
     fn wire_turn_started_emits_activity_started() {
         let mut u = WireEventUpcaster::new();
         let out = u.upcast(&OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 3,
             budget_pct: 0.5,
         });
@@ -2772,11 +2808,16 @@ mod tests {
     fn wire_streaming_deltas_share_id_with_final_response() {
         let mut u = WireEventUpcaster::new();
         let _ = u.upcast(&OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 5,
             budget_pct: 0.5,
         });
-        let delta = u.upcast(&OutboundEvent::ModelResponseDelta { text: "Hel".into() });
+        let delta = u.upcast(&OutboundEvent::ModelResponseDelta {
+            session_id: None,
+            text: "Hel".into(),
+        });
         let final_ = u.upcast(&OutboundEvent::ModelResponse {
+            session_id: None,
             turn: 5,
             summary: "Hello".into(),
             reasoning_summary: None,
@@ -2938,6 +2979,7 @@ mod tests {
     #[test]
     fn parity_turn_started() {
         assert_parity(AppEvent::TurnStarted {
+            session_id: None,
             turn: 7,
             budget_pct: 0.5,
             remaining: 100,
@@ -3010,6 +3052,7 @@ mod tests {
     #[test]
     fn parity_round_complete() {
         assert_parity(AppEvent::RoundComplete {
+            session_id: None,
             round: 3,
             turns_in_round: 7,
             native_message_count: None,
@@ -3135,6 +3178,7 @@ mod tests {
     #[test]
     fn drift_model_response_usage_is_separated_on_wire() {
         let app_event = AppEvent::ModelResponse {
+            session_id: None,
             turn: 1,
             content: "Hello world".into(),
             usage: crate::provider::TokenUsage {

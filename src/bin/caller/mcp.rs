@@ -1809,6 +1809,19 @@ async fn handle_control_command_mcp(
             }
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::CreateSession {
+            task, orchestrate, ..
+        } => {
+            match start_task_with_state(state, bus, task, "mcp", orchestrate).await {
+                Ok(()) => {
+                    emit_control_result(control_tx, "create_session", true, "ok".to_string(), None);
+                }
+                Err(e) => {
+                    emit_control_result(control_tx, "create_session", false, e, None);
+                }
+            }
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::ResumeSession {
             source,
             session_id,
@@ -2241,6 +2254,7 @@ pub fn spawn_event_listener(
                         turn,
                         budget_pct,
                         remaining: _,
+                        ..
                     } => {
                         s.turn = turn;
                         s.budget_pct = budget_pct;

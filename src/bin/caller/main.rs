@@ -962,11 +962,15 @@ async fn drain_external_agent_events(
 
         match event {
             external_agent::AgentEvent::MessageDelta { text } => {
-                config.bus.send(AppEvent::ModelResponseDelta { text });
+                config.bus.send(AppEvent::ModelResponseDelta {
+                    session_id: config.session_id.clone(),
+                    text,
+                });
             }
             external_agent::AgentEvent::Message { text } => {
                 stats.last_response = Some(text.clone());
                 config.bus.send(AppEvent::ModelResponse {
+                    session_id: config.session_id.clone(),
                     turn: stats.turns,
                     content: text,
                     usage: provider::TokenUsage::default(),
@@ -980,6 +984,7 @@ async fn drain_external_agent_events(
                 // (visible in Verbose + Debug, hidden in Normal) via the
                 // existing reasoning_summary path in app_state.rs.
                 config.bus.send(AppEvent::ModelResponse {
+                    session_id: config.session_id.clone(),
                     turn: stats.turns,
                     content: String::new(),
                     usage: provider::TokenUsage::default(),
@@ -998,6 +1003,7 @@ async fn drain_external_agent_events(
                     md.push_str(&format!("- {} {}\n", marker, content));
                 }
                 config.bus.send(AppEvent::ModelResponse {
+                    session_id: config.session_id.clone(),
                     turn: stats.turns,
                     content: md,
                     usage: provider::TokenUsage::default(),
@@ -1048,6 +1054,7 @@ async fn drain_external_agent_events(
                     stats.turns += 1;
                     let preview_text = format!("{}: {}", tool_name, preview);
                     config.bus.send(AppEvent::AgentStarted {
+                        session_id: config.session_id.clone(),
                         turn: stats.turns,
                         commands_preview: preview_text,
                         source: config.agent_source.clone(),
@@ -1074,6 +1081,7 @@ async fn drain_external_agent_events(
                 };
                 if let Some(stdout) = tool_output_limiter.filter(&item_id, stdout) {
                     config.bus.send(AppEvent::AgentOutput {
+                        session_id: config.session_id.clone(),
                         stdout,
                         stderr: String::new(),
                         source: config.agent_source.clone(),
@@ -4150,6 +4158,7 @@ async fn run_agent_loop(
         slog(&session_log, |l| l.turn_start(turn, budget_pct, remaining));
 
         bus.send(AppEvent::TurnStarted {
+            session_id: local_session_id.clone(),
             turn,
             budget_pct,
             remaining,
@@ -4202,9 +4211,13 @@ async fn run_agent_loop(
             let mut was_cancelled = false;
             for attempt in 0..=STREAM_RETRIES {
                 let stream_bus = bus.clone();
+                let stream_session_id = local_session_id.clone();
                 let on_stream_event = move |event: crate::provider::StreamEvent| {
                     if let crate::provider::StreamEvent::Delta(ref text) = event {
-                        stream_bus.send(AppEvent::ModelResponseDelta { text: text.clone() });
+                        stream_bus.send(AppEvent::ModelResponseDelta {
+                            session_id: stream_session_id.clone(),
+                            text: text.clone(),
+                        });
                     }
                 };
                 let stream_fut = provider.chat_stream(conversation.messages(), &on_stream_event);
@@ -4417,6 +4430,7 @@ async fn run_agent_loop(
         };
 
         bus.send(AppEvent::ModelResponse {
+            session_id: local_session_id.clone(),
             turn,
             content: display_content,
             usage: response.usage.clone(),
@@ -4748,6 +4762,7 @@ async fn run_agent_loop(
                             l.approval(&cat.to_string(), &preview, "denied-policy")
                         });
                         bus.send(AppEvent::TaskComplete {
+                            session_id: local_session_id.clone(),
                             reason: format!("Denied by policy ({})", cat),
                             summary: None,
                         });
@@ -4830,6 +4845,7 @@ async fn run_agent_loop(
                                     action: "deny".to_string(),
                                 });
                                 bus.send(AppEvent::TaskComplete {
+                                    session_id: local_session_id.clone(),
                                     reason: "Denied by user".to_string(),
                                     summary: None,
                                 });
@@ -4841,6 +4857,7 @@ async fn run_agent_loop(
                             l.approval(&cat.to_string(), &preview, "denied-no-approver")
                         });
                         bus.send(AppEvent::TaskComplete {
+                            session_id: local_session_id.clone(),
                             reason: format!("Approval required in headless mode ({})", cat),
                             summary: None,
                         });
@@ -4894,6 +4911,7 @@ async fn run_agent_loop(
                                     l.approval(&cat.to_string(), &preview, "denied")
                                 });
                                 bus.send(AppEvent::TaskComplete {
+                                    session_id: local_session_id.clone(),
                                     reason: "Denied by user".to_string(),
                                     summary: None,
                                 });
@@ -4931,6 +4949,7 @@ async fn run_agent_loop(
             .await;
             let preview = format_commands_preview(&json_str);
             bus.send(AppEvent::AgentStarted {
+                session_id: local_session_id.clone(),
                 turn,
                 commands_preview: preview.clone(),
                 source: None,
@@ -4944,6 +4963,7 @@ async fn run_agent_loop(
             });
 
             bus.send(AppEvent::AgentOutput {
+                session_id: local_session_id.clone(),
                 stdout: output.stdout.clone(),
                 stderr: output.stderr.clone(),
                 source: None,
@@ -5003,6 +5023,7 @@ async fn run_agent_loop(
                     });
                     let brief: String = response.content.chars().take(500).collect();
                     bus.send(AppEvent::TaskComplete {
+                        session_id: local_session_id.clone(),
                         reason: "Task complete".to_string(),
                         summary: if brief.is_empty() {
                             None
@@ -5071,6 +5092,7 @@ async fn run_agent_loop(
                         });
                         let brief: String = response.content.chars().take(500).collect();
                         bus.send(AppEvent::TaskComplete {
+                            session_id: local_session_id.clone(),
                             reason: "Task complete".to_string(),
                             summary: if brief.is_empty() {
                                 None
@@ -5162,6 +5184,7 @@ Proceed with explicit assumptions and continue without additional questions."
                             l.approval(&cat.to_string(), &preview, "denied-policy")
                         });
                         bus.send(AppEvent::TaskComplete {
+                            session_id: local_session_id.clone(),
                             reason: format!("Denied by policy ({})", cat),
                             summary: None,
                         });
@@ -5244,6 +5267,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                     action: "deny".to_string(),
                                 });
                                 bus.send(AppEvent::TaskComplete {
+                                    session_id: local_session_id.clone(),
                                     reason: "Denied by user".to_string(),
                                     summary: None,
                                 });
@@ -5255,6 +5279,7 @@ Proceed with explicit assumptions and continue without additional questions."
                             l.approval(&cat.to_string(), &preview, "denied-no-approver")
                         });
                         bus.send(AppEvent::TaskComplete {
+                            session_id: local_session_id.clone(),
                             reason: format!("Approval required in headless mode ({})", cat),
                             summary: None,
                         });
@@ -5308,6 +5333,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                     l.approval(&cat.to_string(), &preview, "denied")
                                 });
                                 bus.send(AppEvent::TaskComplete {
+                                    session_id: local_session_id.clone(),
                                     reason: "Denied by user".to_string(),
                                     summary: None,
                                 });
@@ -5344,6 +5370,7 @@ Proceed with explicit assumptions and continue without additional questions."
 
             let preview = format_commands_preview(&json_str);
             bus.send(AppEvent::AgentStarted {
+                session_id: local_session_id.clone(),
                 turn,
                 commands_preview: preview.clone(),
                 source: None,
@@ -5357,6 +5384,7 @@ Proceed with explicit assumptions and continue without additional questions."
             });
 
             bus.send(AppEvent::AgentOutput {
+                session_id: local_session_id.clone(),
                 stdout: output.stdout.clone(),
                 stderr: output.stderr.clone(),
                 source: None,
@@ -5474,6 +5502,7 @@ async fn run_round_loop(
                 let turns_in_round = stats.turns;
                 let native_message_count = Some(conversation.messages().len() as u32);
                 bus.send(AppEvent::RoundComplete {
+                    session_id: local_session_id.clone(),
                     round,
                     turns_in_round,
                     native_message_count,
@@ -6538,6 +6567,7 @@ async fn run_with_presence(
                     // mechanism (Codex thread/rollback) or fall back to a
                     // session reset (CC, Gemini).
                     bus.send(AppEvent::RoundComplete {
+                        session_id: session_log_id(&session_log),
                         round: cumulative_stats.rounds,
                         turns_in_round,
                         native_message_count: None,
@@ -7012,6 +7042,7 @@ async fn run_user_mode(
         sub_agent::SubAgentStatus::Failed(reason) => format!("Orchestrator failed: {}", reason),
     };
     bus.send(AppEvent::TaskComplete {
+        session_id: session_log_id(&session_log),
         reason: reason.clone(),
         summary: Some(result.brief.clone()),
     });
@@ -7288,6 +7319,7 @@ async fn run_external_agent_mode(
                     message: message.clone(),
                 });
                 bus.send(AppEvent::RoundComplete {
+                    session_id: live_session_id.clone(),
                     round,
                     turns_in_round,
                     native_message_count: None,
@@ -7304,6 +7336,7 @@ async fn run_external_agent_mode(
                     l.info(&format!("External agent interrupted: {}", reason))
                 });
                 bus.send(AppEvent::RoundComplete {
+                    session_id: live_session_id.clone(),
                     round,
                     turns_in_round: stats.turns,
                     native_message_count: None,
@@ -7318,6 +7351,7 @@ async fn run_external_agent_mode(
                     ));
                 });
                 bus.send(AppEvent::TaskComplete {
+                    session_id: live_session_id.clone(),
                     reason: reason.clone(),
                     summary: stats.last_response.clone(),
                 });
@@ -10016,6 +10050,7 @@ async fn main() -> Result<(), CallerError> {
                                 l.info(&format!("Task (from input): {}", first_task.text))
                             });
                             bus_clone.send(AppEvent::TurnStarted {
+                                session_id: session_log_id(&session_log_clone),
                                 turn: 0,
                                 budget_pct: 0.0,
                                 remaining: 0,

@@ -85,6 +85,13 @@ impl Dispatcher {
         }
 
         match msg {
+            ControlMsg::CreateSession { .. } => {
+                // New sessions are owned by SessionSupervisor. The legacy
+                // single-session dispatcher only routes work into channels it
+                // already owns, so accepting this here would collapse a
+                // parallel-session request back into the active session.
+            }
+
             ControlMsg::StartTask {
                 session_id: _,
                 task,

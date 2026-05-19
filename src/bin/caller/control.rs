@@ -160,6 +160,7 @@ mod tests {
     #[test]
     fn outbound_event_turn_started_serialize() {
         let event = OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 5,
             budget_pct: 12.3,
         };
@@ -171,6 +172,7 @@ mod tests {
     #[test]
     fn outbound_event_agent_output_serialize() {
         let event = OutboundEvent::AgentOutput {
+            session_id: None,
             stdout: "hello".to_string(),
             stderr: "".to_string(),
             source: None,
@@ -203,6 +205,7 @@ mod tests {
     #[test]
     fn outbound_event_task_complete_serialize() {
         let event = OutboundEvent::TaskComplete {
+            session_id: None,
             reason: "done signal".to_string(),
             summary: Some("files listed".to_string()),
         };
@@ -244,6 +247,7 @@ mod tests {
     fn broadcast_event_to_sender() {
         let (tx, mut rx) = broadcast::channel::<String>(16);
         let event = OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 1,
             budget_pct: 5.0,
         };

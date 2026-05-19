@@ -102,12 +102,14 @@ pub enum AppEvent {
 
     // Agent loop lifecycle
     TurnStarted {
+        session_id: Option<String>,
         turn: usize,
         budget_pct: f64,
         #[allow(dead_code)]
         remaining: u64,
     },
     ModelResponse {
+        session_id: Option<String>,
         turn: usize,
         content: String,
         usage: TokenUsage,
@@ -118,6 +120,7 @@ pub enum AppEvent {
     },
     /// Incremental text delta from streaming model response.
     ModelResponseDelta {
+        session_id: Option<String>,
         text: String,
     },
     JsonExtracted {
@@ -127,11 +130,13 @@ pub enum AppEvent {
         message: Option<String>,
     },
     AgentStarted {
+        session_id: Option<String>,
         turn: usize,
         commands_preview: String,
         source: Option<String>,
     },
     AgentOutput {
+        session_id: Option<String>,
         stdout: String,
         stderr: String,
         source: Option<String>,
@@ -153,6 +158,7 @@ pub enum AppEvent {
         turn: usize,
     },
     TaskComplete {
+        session_id: Option<String>,
         reason: String,
         summary: Option<String>,
     },
@@ -364,6 +370,7 @@ pub enum AppEvent {
 
     // Round lifecycle
     RoundComplete {
+        session_id: Option<String>,
         round: usize,
         turns_in_round: usize,
         /// Length of the native `Conversation.messages` at the end of this
@@ -869,6 +876,31 @@ pub enum ControlMsg {
         mode: String,
     },
     GetControllerLoopStatus,
+    /// Explicitly create a new managed session and submit its first task.
+    ///
+    /// This is the forward-compatible dashboard/control-plane primitive for
+    /// parallel local or external-agent sessions. `StartTask { session_id:
+    /// None }` remains accepted for older clients, but new clients should use
+    /// this variant when they intend to create a distinct session rather than
+    /// continue whichever session a legacy frontend considers active.
+    CreateSession {
+        task: String,
+        #[serde(default)]
+        orchestrate: Option<bool>,
+        /// Bypass presence/orchestration, matching StartTask.direct.
+        #[serde(default)]
+        direct: Option<bool>,
+        /// When present, routes to the ephemeral CU task runner instead of the
+        /// regular agent loop.
+        #[serde(default)]
+        reference_frame_ids: Vec<String>,
+        /// Explicit display target for CU actions (e.g. "user_session", ":99").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_target: Option<String>,
+        /// Frame/upload IDs attached via the dashboard.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<String>,
+    },
     StartTask {
         /// Optional target session. When omitted, daemon supervisors start a
         /// new managed session; when present, they route the text as a new
@@ -1131,12 +1163,17 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
 
     match event {
         AppEvent::TurnStarted {
-            turn, budget_pct, ..
+            session_id,
+            turn,
+            budget_pct,
+            ..
         } => Some(OutboundEvent::TurnStarted {
+            session_id: session_id.clone(),
             turn: *turn,
             budget_pct: *budget_pct,
         }),
         AppEvent::ModelResponse {
+            session_id,
             turn,
             content,
             reasoning,
@@ -1145,29 +1182,37 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         } => {
             let summary = crate::types::format_model_summary(content);
             Some(OutboundEvent::ModelResponse {
+                session_id: session_id.clone(),
                 turn: *turn,
                 summary,
                 reasoning_summary: reasoning.clone(),
                 source: source.clone(),
             })
         }
-        AppEvent::ModelResponseDelta { text } => {
-            Some(OutboundEvent::ModelResponseDelta { text: text.clone() })
+        AppEvent::ModelResponseDelta { session_id, text } => {
+            Some(OutboundEvent::ModelResponseDelta {
+                session_id: session_id.clone(),
+                text: text.clone(),
+            })
         }
         AppEvent::AgentStarted {
+            session_id,
             turn,
             commands_preview,
             source,
         } => Some(OutboundEvent::AgentStarted {
+            session_id: session_id.clone(),
             turn: *turn,
             commands_preview: commands_preview.clone(),
             source: source.clone(),
         }),
         AppEvent::AgentOutput {
+            session_id,
             stdout,
             stderr,
             source,
         } => Some(OutboundEvent::AgentOutput {
+            session_id: session_id.clone(),
             stdout: stdout.clone(),
             stderr: stderr.clone(),
             source: source.clone(),
@@ -1175,7 +1220,12 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::DoneSignal { message } => Some(OutboundEvent::DoneSignal {
             message: message.clone(),
         }),
-        AppEvent::TaskComplete { reason, summary } => Some(OutboundEvent::TaskComplete {
+        AppEvent::TaskComplete {
+            session_id,
+            reason,
+            summary,
+        } => Some(OutboundEvent::TaskComplete {
+            session_id: session_id.clone(),
             reason: reason.clone(),
             summary: summary.clone(),
         }),
@@ -1258,10 +1308,12 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         }),
         AppEvent::HumanResponseSent => Some(OutboundEvent::HumanResponseSent),
         AppEvent::RoundComplete {
+            session_id,
             round,
             turns_in_round,
             ..
         } => Some(OutboundEvent::RoundComplete {
+            session_id: session_id.clone(),
             round: *round,
             turns_in_round: *turns_in_round,
         }),
@@ -1681,7 +1733,9 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         AppEvent::DoneSignal { message } => {
             log.done_signal(message.as_deref());
         }
-        AppEvent::TaskComplete { reason, summary } => {
+        AppEvent::TaskComplete {
+            reason, summary, ..
+        } => {
             log.task_complete(reason, summary.as_deref());
         }
         AppEvent::InterruptRequested { .. } => {
@@ -1876,6 +1930,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             stdout,
             stderr,
             source,
+            ..
         } => {
             log.agent_output(stdout, stderr, source.as_deref());
         }
@@ -2270,6 +2325,14 @@ mod tests {
                 mode: "stop".to_string(),
             },
             ControlMsg::GetControllerLoopStatus,
+            ControlMsg::CreateSession {
+                task: "start fresh".to_string(),
+                orchestrate: Some(false),
+                direct: Some(true),
+                reference_frame_ids: vec!["display_99-f00001".to_string()],
+                display_target: Some("user_session".to_string()),
+                attachments: vec!["upload:u1".to_string()],
+            },
             ControlMsg::StartTask {
                 session_id: None,
                 task: "fix bug".to_string(),
@@ -2457,6 +2520,30 @@ mod tests {
                 assert!(display_target.is_none());
             }
             _ => panic!("expected StartTask"),
+        }
+    }
+
+    #[test]
+    fn control_msg_create_session_deserialize() {
+        let json = r#"{"action":"create_session","task":"fix bug","direct":true,"attachments":["upload:u1"]}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::CreateSession {
+                task,
+                orchestrate,
+                direct,
+                reference_frame_ids,
+                display_target,
+                attachments,
+            } => {
+                assert_eq!(task, "fix bug");
+                assert!(orchestrate.is_none());
+                assert_eq!(direct, Some(true));
+                assert!(reference_frame_ids.is_empty());
+                assert!(display_target.is_none());
+                assert_eq!(attachments, vec!["upload:u1"]);
+            }
+            _ => panic!("expected CreateSession"),
         }
     }
 
@@ -2788,6 +2875,7 @@ mod tests {
     #[test]
     fn outbound_turn_started() {
         let event = AppEvent::TurnStarted {
+            session_id: None,
             turn: 5,
             budget_pct: 42.0,
             remaining: 100_000,
@@ -2837,6 +2925,7 @@ mod tests {
     #[test]
     fn outbound_agent_output() {
         let event = AppEvent::AgentOutput {
+            session_id: None,
             stdout: "hello".to_string(),
             stderr: "".to_string(),
             source: None,
@@ -2895,6 +2984,7 @@ mod tests {
     #[test]
     fn outbound_model_response_delta() {
         let event = AppEvent::ModelResponseDelta {
+            session_id: None,
             text: "hello".to_string(),
         };
         let outbound = app_event_to_outbound(&event).unwrap();

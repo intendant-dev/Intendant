@@ -420,6 +420,7 @@ impl FileWatcher {
                             round,
                             turns_in_round,
                             native_message_count,
+                            ..
                         }) => {
                             let summary = format!("Round {}", round);
                             let mut w = shared.lock().await;

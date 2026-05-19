@@ -1213,6 +1213,20 @@ html, body {
   white-space: nowrap;
   margin-top: 2px;
 }
+.log-entry .log-session {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: var(--overlay1);
+  background: var(--surface0);
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 2px;
+}
 /* Hide host badges entirely when no secondaries are configured —
    keeps single-host dashboards visually clean. JS adds the
    `.show-host-badges` class to #log-stream when >=1 secondary exists. */
@@ -7690,6 +7704,13 @@ function renderLogEntry(c) {
   host.style.background = hostBadgeColor(hostId);
   host.title = `source host: ${hostId}`;
 
+  const session = document.createElement('span');
+  session.className = 'log-session';
+  const sid = c.session_id || '';
+  session.textContent = sid ? sid.substring(0, 8) : '';
+  session.title = sid ? `session: ${sid}` : '';
+  if (sid) entry.dataset.sessionId = sid;
+
   const lvl = document.createElement('span');
   lvl.className = 'log-level';
   lvl.textContent = c.source || '\u2139';
@@ -7709,6 +7730,7 @@ function renderLogEntry(c) {
   entry.appendChild(icon);
   entry.appendChild(ts);
   entry.appendChild(host);
+  if (sid) entry.appendChild(session);
   entry.appendChild(lvl);
   entry.appendChild(cnt);
 
@@ -17211,7 +17233,7 @@ function startNewSession() {
   if (app) {
     const direct = document.getElementById('direct-mode-toggle')?.checked || false;
     const attachments = pendingAttachments.map(a => a.frameId);
-    const msg = { action: 'start_task', task: task };
+    const msg = { action: 'create_session', task: task };
     if (direct) msg.direct = true;
     if (attachments.length > 0) msg.attachments = attachments;
     app.send_server_action(msg);

@@ -18,6 +18,8 @@ pub enum UiCommand {
         level: String,
         source: String,
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         #[serde(default)]
         collapsible: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -54,6 +56,8 @@ pub enum UiCommand {
         id: u64,
         command: String,
         category: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     HideApproval,
     ShowHumanInput {
@@ -697,6 +701,7 @@ struct LogEntry {
     level: String,
     source: String,
     content: String,
+    session_id: Option<String>,
     collapsible: bool,
     turn: Option<u64>,
 }
@@ -727,6 +732,7 @@ pub struct AppState {
     /// Set at the top of `handle_event` when the inbound message carries
     /// a `ts` field; cleared by the guard returned from `begin_replay_ts`.
     replay_ts: Option<String>,
+    event_session_id: Option<String>,
 
     // Usage
     main_usage: Option<UsageSnapshot>,
@@ -769,6 +775,7 @@ impl AppState {
             log_buffer: Vec::new(),
             verbosity: "normal".to_string(),
             replay_ts: None,
+            event_session_id: None,
             main_usage: None,
             presence_usage: None,
             live_usage: None,
@@ -818,6 +825,7 @@ impl AppState {
                 level: entry.level.clone(),
                 source: entry.source.clone(),
                 content: entry.content.clone(),
+                session_id: entry.session_id.clone(),
                 collapsible: entry.collapsible,
                 turn: None, // separator already handled
                 images: vec![],
@@ -942,6 +950,7 @@ impl AppState {
                         id,
                         command: command.clone(),
                         category,
+                        session_id: None,
                     });
                     cmds.extend(self.add_log(
                         "warn",
@@ -1026,14 +1035,18 @@ impl AppState {
         // Replay-path timestamp override: set for the duration of this call
         // so every add_log_with_images emission picks up the historical ts.
         self.replay_ts = msg.get("ts").and_then(|v| v.as_str()).map(String::from);
+        self.event_session_id = msg
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let current_session_event = self.current_event_matches_selected_session();
         let mut cmds = Vec::new();
 
         match event {
             "turn_started" => {
                 let turn = msg["turn"].as_u64().unwrap_or(0);
                 let budget = msg["budget_pct"].as_f64().unwrap_or(0.0);
-                self.turn = turn;
-                self.budget_pct = budget;
 
                 cmds.extend(self.add_log(
                     "info",
@@ -1041,29 +1054,33 @@ impl AppState {
                     Some(turn),
                     "system",
                 ));
-                cmds.push(UiCommand::UpdateStatusBar {
-                    provider: None,
-                    model: None,
-                    turn: Some(turn),
-                    budget_pct: Some(budget),
-                    autonomy: None,
-                    session_id: None,
-                    external_agent: None,
-                });
-                cmds.push(UiCommand::SetPhase {
-                    phase: "thinking".into(),
-                });
-                self.phase = "thinking".to_string();
+                if current_session_event {
+                    self.turn = turn;
+                    self.budget_pct = budget;
+                    cmds.push(UiCommand::UpdateStatusBar {
+                        provider: None,
+                        model: None,
+                        turn: Some(turn),
+                        budget_pct: Some(budget),
+                        autonomy: None,
+                        session_id: self.event_session_id.clone(),
+                        external_agent: None,
+                    });
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "thinking".into(),
+                    });
+                    self.phase = "thinking".to_string();
 
-                // Token history delta
-                if let Some(ref usage) = self.main_usage {
-                    if turn > 1 {
-                        let delta = usage.tokens_used.saturating_sub(self.last_total_tokens);
-                        self.token_history.push(TokenHistoryEntry {
-                            turn: turn - 1,
-                            tokens: delta,
-                        });
-                        self.last_total_tokens = usage.tokens_used;
+                    // Token history delta
+                    if let Some(ref usage) = self.main_usage {
+                        if turn > 1 {
+                            let delta = usage.tokens_used.saturating_sub(self.last_total_tokens);
+                            self.token_history.push(TokenHistoryEntry {
+                                turn: turn - 1,
+                                tokens: delta,
+                            });
+                            self.last_total_tokens = usage.tokens_used;
+                        }
                     }
                 }
             }
@@ -1107,10 +1124,12 @@ impl AppState {
                     cmds.extend(self.add_log("detail", "Running on display", None, source));
                 }
                 cmds.extend(self.add_log("agent", preview, None, source));
-                cmds.push(UiCommand::SetPhase {
-                    phase: "running".into(),
-                });
-                self.phase = "running".to_string();
+                if current_session_event {
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "running".into(),
+                    });
+                    self.phase = "running".to_string();
+                }
             }
 
             "agent_output" => {
@@ -1132,10 +1151,12 @@ impl AppState {
                         cmds.extend(self.add_log("warn", stderr, None, "agent"));
                     }
                 }
-                cmds.push(UiCommand::SetPhase {
-                    phase: "running".into(),
-                });
-                self.phase = "running".to_string();
+                if current_session_event {
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "running".into(),
+                    });
+                    self.phase = "running".to_string();
+                }
             }
 
             "auto_approved" => {
@@ -1214,6 +1235,7 @@ impl AppState {
                     id,
                     command: command.clone(),
                     category,
+                    session_id: self.event_session_id.clone(),
                 });
                 cmds.push(UiCommand::SetPhase {
                     phase: "waiting".into(),
@@ -1261,19 +1283,19 @@ impl AppState {
             "task_complete" => {
                 let reason = msg["reason"].as_str().unwrap_or("");
                 let summary = msg["summary"].as_str();
-                self.phase = "done".to_string();
-                self.pending_approval_id = None;
-
-                cmds.push(UiCommand::HideAllPanels);
-                cmds.push(UiCommand::SetPhase {
-                    phase: "done".into(),
-                });
-
                 let text = match summary {
                     Some(s) if !s.is_empty() => format!("Task complete: {} \u{2014} {}", reason, s),
                     _ => format!("Task complete: {}", reason),
                 };
                 cmds.extend(self.add_log("info", &text, None, "worker"));
+                if current_session_event {
+                    self.phase = "done".to_string();
+                    self.pending_approval_id = None;
+                    cmds.push(UiCommand::HideAllPanels);
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "done".into(),
+                    });
+                }
             }
 
             "interrupt_requested" => {
@@ -1288,19 +1310,20 @@ impl AppState {
                     .as_str()
                     .unwrap_or("user requested")
                     .to_string();
-                self.phase = "interrupted".to_string();
-                self.pending_approval_id = None;
-
-                cmds.push(UiCommand::HideAllPanels);
-                cmds.push(UiCommand::SetPhase {
-                    phase: "interrupted".into(),
-                });
                 cmds.extend(self.add_log(
                     "warn",
                     &format!("Agent interrupted: {}", reason),
                     None,
                     "system",
                 ));
+                if current_session_event {
+                    self.phase = "interrupted".to_string();
+                    self.pending_approval_id = None;
+                    cmds.push(UiCommand::HideAllPanels);
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "interrupted".into(),
+                    });
+                }
             }
 
             // ---- Mid-turn steering (interjection) ----
@@ -1396,20 +1419,26 @@ impl AppState {
             "round_complete" => {
                 let round = msg["round"].as_u64().unwrap_or(0);
                 let turns = msg["turns_in_round"].as_u64().unwrap_or(0);
-                self.phase = "idle".to_string();
-
-                cmds.push(UiCommand::SetPhase {
-                    phase: "idle".into(),
-                });
                 cmds.extend(self.add_log(
                     "info",
                     &format!("Round {} complete ({} turns)", round, turns),
                     None,
                     "system",
                 ));
+                if current_session_event {
+                    self.phase = "idle".to_string();
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "idle".into(),
+                    });
+                }
             }
 
             "status" => {
+                if !current_session_event {
+                    self.replay_ts = None;
+                    self.event_session_id = None;
+                    return cmds;
+                }
                 let sb = UiCommand::UpdateStatusBar {
                     provider: msg["provider"].as_str().map(String::from),
                     model: msg["model"].as_str().map(String::from),
@@ -1735,6 +1764,7 @@ impl AppState {
             "session_started" => {
                 let session_id = msg["session_id"].as_str().unwrap_or("").to_string();
                 let task = msg["task"].as_str().map(|s| s.to_string());
+                self.session_id = session_id.clone();
                 cmds.extend(self.add_log(
                     "info",
                     &format!("Session started: {}", session_id),
@@ -1747,6 +1777,7 @@ impl AppState {
             "session_attached" => {
                 let session_id = msg["session_id"].as_str().unwrap_or("").to_string();
                 let source = msg["source"].as_str().unwrap_or("").to_string();
+                self.session_id = session_id.clone();
                 cmds.extend(self.add_log(
                     "info",
                     &format!("Session attached: {} ({})", session_id, source),
@@ -1759,6 +1790,9 @@ impl AppState {
             "session_ended" => {
                 let session_id = msg["session_id"].as_str().unwrap_or("").to_string();
                 let reason = msg["reason"].as_str().unwrap_or("").to_string();
+                if self.session_id == session_id {
+                    self.session_id.clear();
+                }
                 cmds.extend(self.add_log(
                     "info",
                     &format!("Session ended: {} — {}", session_id, reason),
@@ -2072,7 +2106,15 @@ impl AppState {
         // Clear replay timestamp override so subsequent live calls revert
         // to wallclock.
         self.replay_ts = None;
+        self.event_session_id = None;
         cmds
+    }
+
+    fn current_event_matches_selected_session(&self) -> bool {
+        match self.event_session_id.as_deref() {
+            Some(sid) if !self.session_id.is_empty() => sid == self.session_id,
+            _ => true,
+        }
     }
 
     /// Add a log entry, respecting verbosity. Returns AddLogEntry command if visible.
@@ -2118,6 +2160,7 @@ impl AppState {
             level: level.to_string(),
             source: source_str.clone(),
             content: content.to_string(),
+            session_id: self.event_session_id.clone(),
             collapsible: is_collapsible,
             turn,
         };
@@ -2142,6 +2185,7 @@ impl AppState {
             level: level.to_string(),
             source: source_str,
             content: content.to_string(),
+            session_id: self.event_session_id.clone(),
             collapsible: is_collapsible,
             turn: None, // separator already emitted
             images,
@@ -2775,6 +2819,56 @@ mod tests {
     }
 
     #[test]
+    fn session_scoped_turn_started_tags_log_and_updates_matching_session() {
+        let mut s = AppState::new();
+        s.session_id = "sess-a".to_string();
+        let msg =
+            json!({"event": "turn_started", "turn": 4, "budget_pct": 22.5, "session_id": "sess-a"});
+        let cmds = s.handle_message(&msg);
+
+        assert_eq!(s.turn, 4);
+        assert_eq!(s.phase, "thinking");
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::UpdateStatusBar { session_id, .. }
+                if session_id.as_deref() == Some("sess-a")
+        )));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { session_id, content, .. }
+                if session_id.as_deref() == Some("sess-a")
+                    && content == "Turn 4 started"
+        )));
+    }
+
+    #[test]
+    fn session_scoped_background_turn_logs_without_switching_selected_session() {
+        let mut s = AppState::new();
+        s.session_id = "sess-a".to_string();
+        s.turn = 2;
+        s.phase = "running".to_string();
+        let msg =
+            json!({"event": "turn_started", "turn": 8, "budget_pct": 40.0, "session_id": "sess-b"});
+        let cmds = s.handle_message(&msg);
+
+        assert_eq!(s.session_id, "sess-a");
+        assert_eq!(s.turn, 2);
+        assert_eq!(s.phase, "running");
+        assert!(!cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "thinking")));
+        assert!(!cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::UpdateStatusBar { turn: Some(8), .. })));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { session_id, content, .. }
+                if session_id.as_deref() == Some("sess-b")
+                    && content == "Turn 8 started"
+        )));
+    }
+
+    #[test]
     fn handle_event_approval_required() {
         let mut s = AppState::new();
         let msg = json!({"event": "approval_required", "id": 7, "command": "echo hi", "category": "CommandExec"});
@@ -2783,6 +2877,25 @@ mod tests {
         assert!(cmds
             .iter()
             .any(|c| matches!(c, UiCommand::ShowApproval { id: 7, .. })));
+    }
+
+    #[test]
+    fn session_scoped_approval_carries_target_session() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "approval_required",
+            "id": 9,
+            "command": "echo scoped",
+            "category": "CommandExec",
+            "session_id": "sess-b"
+        });
+        let cmds = s.handle_message(&msg);
+
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::ShowApproval { id: 9, session_id, .. }
+                if session_id.as_deref() == Some("sess-b")
+        )));
     }
 
     #[test]
@@ -3498,6 +3611,7 @@ mod tests {
             level: "info".into(),
             source: "Agent".into(),
             content: "hello".into(),
+            session_id: None,
             collapsible: false,
             turn: None,
             images: vec![],

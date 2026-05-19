@@ -98,6 +98,24 @@ impl SessionSupervisor {
 
     async fn handle_control_msg(&self, msg: event::ControlMsg) {
         match msg {
+            event::ControlMsg::CreateSession {
+                task,
+                orchestrate,
+                direct,
+                reference_frame_ids,
+                display_target,
+                attachments,
+            } => {
+                self.start_new_session(
+                    task,
+                    orchestrate,
+                    direct,
+                    reference_frame_ids,
+                    display_target,
+                    attachments,
+                )
+                .await;
+            }
             event::ControlMsg::StartTask {
                 session_id: Some(session_id),
                 task,
@@ -194,6 +212,7 @@ impl SessionSupervisor {
 
     async fn should_handle_session_control(&self, msg: &event::ControlMsg) -> bool {
         match msg {
+            event::ControlMsg::CreateSession { .. } => true,
             event::ControlMsg::ResumeSession { .. } => true,
             _ => {
                 if let Some(session_id) = control_target_session_id(msg) {
@@ -293,10 +312,15 @@ impl SessionSupervisor {
         }
         let attachments_for_agent = UserAttachments::from_items(resolved_attachments);
 
+        let source = backend
+            .as_ref()
+            .map(|b| b.as_short_str().to_string())
+            .unwrap_or_else(|| "intendant".to_string());
+
         emit_task_dispatched_log(&self.config.bus, &session_log, &task, attachments.len());
         self.spawn_agent_session(
             session_id,
-            "intendant".to_string(),
+            source,
             task,
             project,
             session_log,
