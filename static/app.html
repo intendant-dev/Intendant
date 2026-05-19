@@ -1436,8 +1436,9 @@ html, body {
   font-weight: 600;
   padding: 1px 5px;
   border-radius: 3px;
-  color: var(--overlay1);
-  background: var(--surface0);
+  color: var(--session-badge-fg, var(--overlay1));
+  background: var(--session-badge-bg, var(--surface0));
+  border: 1px solid var(--session-badge-border, transparent);
   max-width: 72px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -8122,18 +8123,77 @@ function wireSessionWindowLogClone(clone, sourceEntry) {
   wireCollapsibleLogEntry(clone, clone.querySelector('.log-content'), sourceEntry);
 }
 
+function stableStringHash(value) {
+  let hash = 0;
+  const text = String(value || '');
+  for (let i = 0; i < text.length; i++) {
+    hash = ((hash << 5) - hash) + text.charCodeAt(i);
+    hash |= 0;
+  }
+  return hash;
+}
+
 // Stable hash-to-hue mapping so each host gets its own visually
 // distinct badge color. Saturation is intentionally low so the pills
 // recede as backgrounds next to the log-level colors (info/model/
 // agent/etc.) rather than competing with them for attention.
 function hostBadgeColor(hostId) {
-  let hash = 0;
-  for (let i = 0; i < hostId.length; i++) {
-    hash = ((hash << 5) - hash) + hostId.charCodeAt(i);
-    hash |= 0;
-  }
+  const hash = stableStringHash(hostId);
   const hue = ((hash % 360) + 360) % 360;
   return `hsl(${hue}, 32%, 58%)`;
+}
+
+const SESSION_BADGE_PALETTE = [
+  { bg: 'rgba(137, 180, 250, 0.20)', border: 'rgba(137, 180, 250, 0.65)', fg: '#b4c9ff' },
+  { bg: 'rgba(166, 227, 161, 0.18)', border: 'rgba(166, 227, 161, 0.62)', fg: '#b8efb3' },
+  { bg: 'rgba(249, 226, 175, 0.19)', border: 'rgba(249, 226, 175, 0.62)', fg: '#f6dfa8' },
+  { bg: 'rgba(245, 194, 231, 0.18)', border: 'rgba(245, 194, 231, 0.62)', fg: '#f2bfe3' },
+  { bg: 'rgba(148, 226, 213, 0.18)', border: 'rgba(148, 226, 213, 0.62)', fg: '#a7eee2' },
+  { bg: 'rgba(250, 179, 135, 0.19)', border: 'rgba(250, 179, 135, 0.62)', fg: '#f7b486' },
+  { bg: 'rgba(203, 166, 247, 0.18)', border: 'rgba(203, 166, 247, 0.62)', fg: '#d5b8ff' },
+  { bg: 'rgba(137, 220, 235, 0.18)', border: 'rgba(137, 220, 235, 0.62)', fg: '#9beaff' },
+  { bg: 'rgba(243, 139, 168, 0.18)', border: 'rgba(243, 139, 168, 0.62)', fg: '#f5a0bb' },
+  { bg: 'rgba(180, 190, 254, 0.18)', border: 'rgba(180, 190, 254, 0.62)', fg: '#c3caff' },
+  { bg: 'rgba(255, 213, 128, 0.18)', border: 'rgba(255, 213, 128, 0.62)', fg: '#ffd993' },
+  { bg: 'rgba(120, 220, 170, 0.18)', border: 'rgba(120, 220, 170, 0.62)', fg: '#94e8bd' },
+];
+const sessionBadgeStyles = new Map();
+const usedSessionBadgePaletteIndexes = new Set();
+
+function allocateSessionBadgeStyle(sessionId) {
+  const sid = String(sessionId || '');
+  if (sessionBadgeStyles.has(sid)) return sessionBadgeStyles.get(sid);
+  const hash = stableStringHash(sid);
+  const palette = SESSION_BADGE_PALETTE;
+  let style = null;
+  if (usedSessionBadgePaletteIndexes.size < palette.length) {
+    const start = ((hash % palette.length) + palette.length) % palette.length;
+    for (let i = 0; i < palette.length; i++) {
+      const idx = (start + i) % palette.length;
+      if (usedSessionBadgePaletteIndexes.has(idx)) continue;
+      usedSessionBadgePaletteIndexes.add(idx);
+      style = palette[idx];
+      break;
+    }
+  }
+  if (!style) {
+    const hue = ((hash % 360) + 360) % 360;
+    style = {
+      bg: `hsla(${hue}, 46%, 42%, 0.22)`,
+      border: `hsla(${hue}, 58%, 64%, 0.64)`,
+      fg: `hsl(${hue}, 76%, 78%)`,
+    };
+  }
+  sessionBadgeStyles.set(sid, style);
+  return style;
+}
+
+function applySessionBadgeStyle(el, sessionId) {
+  if (!el || !sessionId) return;
+  const style = allocateSessionBadgeStyle(sessionId);
+  el.style.setProperty('--session-badge-bg', style.bg);
+  el.style.setProperty('--session-badge-border', style.border);
+  el.style.setProperty('--session-badge-fg', style.fg);
 }
 
 function shortSessionId(sessionId) {
@@ -8803,7 +8863,10 @@ function createLogScaffold(c, extraClass) {
   const sid = c.session_id || '';
   session.textContent = sid ? sid.substring(0, 8) : '';
   session.title = sid ? `session: ${sid}` : '';
-  if (sid) entry.dataset.sessionId = sid;
+  if (sid) {
+    entry.dataset.sessionId = sid;
+    applySessionBadgeStyle(session, sid);
+  }
   if (c.user_turn_index !== undefined && c.user_turn_index !== null) {
     entry.dataset.userTurnIndex = String(c.user_turn_index);
   }
