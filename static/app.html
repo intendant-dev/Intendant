@@ -5593,6 +5593,7 @@ let currentPhase = 'idle';
 let currentSessionFullId = '';
 let foregroundSessionFullId = '';
 const sessionWindows = new Map();
+let processingLogReplay = false;
 const sessionMetadataById = new Map();
 const sessionUsageById = new Map();
 let latestGlobalUsage = null;
@@ -6119,8 +6120,15 @@ async function main() {
           ...d,
           entries: d.entries.filter(entry => !entry || entry.event !== 'context_snapshot'),
         };
-        const cmds = app.handle_server_message(filtered);
-        if (cmds) processCommands(cmds);
+        resetSessionWindowsForReplay(filtered.entries);
+        const wasProcessingLogReplay = processingLogReplay;
+        processingLogReplay = true;
+        try {
+          const cmds = app.handle_server_message(filtered);
+          if (cmds) processCommands(cmds);
+        } finally {
+          processingLogReplay = wasProcessingLogReplay;
+        }
         finalizeActiveCommandOutputGroup();
         // Historical replay can emit lifecycle commands such as session_ended
         // that move the live dashboard to Sessions. The URL remains the
@@ -6660,7 +6668,7 @@ function processCommands(cmds) {
   for (const c of cmds) {
     switch (c.cmd) {
       case 'add_log_entry': renderLogEntry(c); break;
-      case 'clear_logs': clearLogs(); break;
+      case 'clear_logs': clearLogs({ clearSessionWindows: !processingLogReplay }); break;
       case 'add_turn_separator': renderTurnSeparator(c.turn); break;
       case 'update_status_bar': updateStatusBar(c); break;
       case 'set_phase': setPhase(c.phase); break;
@@ -7983,13 +7991,33 @@ function renderDiffLines(diffText) {
   }).join('');
 }
 
-function clearLogs() {
+function resetSessionWindowLog(win) {
+  if (!win || !win.log) return;
+  win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+}
+
+function resetSessionWindowsForReplay(entries) {
+  const ids = new Set();
+  for (const entry of entries || []) {
+    const sid = entry && entry.session_id;
+    if (sid) ids.add(String(sid));
+  }
+  for (const sid of ids) {
+    const win = sessionWindows.get(sid);
+    if (win) resetSessionWindowLog(win);
+  }
+}
+
+function clearLogs(options = {}) {
+  const clearSessionWindows = options.clearSessionWindows !== false;
   document.getElementById('log-stream').innerHTML = '';
   logEntryCount = 0;
   activeCommandOutputGroup = null;
   commandOutputGroups.clear();
-  for (const win of sessionWindows.values()) {
-    win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+  if (clearSessionWindows) {
+    for (const win of sessionWindows.values()) {
+      resetSessionWindowLog(win);
+    }
   }
 }
 
