@@ -8042,6 +8042,7 @@ function renderLogEntry(c) {
     return;
   }
   finalizeActiveCommandOutputGroup();
+  if (shouldSuppressAttachmentReceiptDuplicate(c)) return;
 
   const { entry } = createLogScaffold(c, '');
 
@@ -10924,6 +10925,43 @@ function currentLogTime() {
   return new Date().toTimeString().slice(0, 8);
 }
 
+const pendingAttachmentLogReceipts = [];
+const ATTACHMENT_RECEIPT_DEDUPE_MS = 30000;
+
+function normalizeAttachmentReceiptText(text) {
+  return String(text || '').trim().replace(/\s+/g, ' ');
+}
+
+function pruneAttachmentReceiptDedupe(now = Date.now()) {
+  for (let i = pendingAttachmentLogReceipts.length - 1; i >= 0; i--) {
+    if (now - pendingAttachmentLogReceipts[i].createdAt > ATTACHMENT_RECEIPT_DEDUPE_MS) {
+      pendingAttachmentLogReceipts.splice(i, 1);
+    }
+  }
+  while (pendingAttachmentLogReceipts.length > 20) pendingAttachmentLogReceipts.shift();
+}
+
+function rememberAttachmentReceipt(text) {
+  const normalized = normalizeAttachmentReceiptText(text);
+  if (!normalized) return;
+  pruneAttachmentReceiptDedupe();
+  pendingAttachmentLogReceipts.push({ text: normalized, createdAt: Date.now() });
+}
+
+function shouldSuppressAttachmentReceiptDuplicate(c) {
+  const source = String(c && c.source || '').toLowerCase();
+  if (source !== 'user') return false;
+  if (Array.isArray(c.attachment_previews) && c.attachment_previews.length > 0) return false;
+  const text = normalizeAttachmentReceiptText(c.content);
+  if (!text) return false;
+  const now = Date.now();
+  pruneAttachmentReceiptDedupe(now);
+  const idx = pendingAttachmentLogReceipts.findIndex(receipt => receipt.text === text);
+  if (idx < 0) return false;
+  pendingAttachmentLogReceipts.splice(idx, 1);
+  return true;
+}
+
 function renderAttachmentReceipt(text, attachments, verb) {
   if (!attachments || attachments.length === 0 || typeof renderLogEntry !== 'function') return;
   const previews = attachments.map((att) => ({
@@ -10942,6 +10980,7 @@ function renderAttachmentReceipt(text, attachments, verb) {
     content,
     attachment_previews: previews,
   });
+  rememberAttachmentReceipt(text);
 }
 
 async function triggerUploadFlow(files) {
