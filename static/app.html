@@ -1375,6 +1375,21 @@ html, body {
 .log-entry.level-warn { border-left-color: rgba(249, 226, 175, 0.5); }
 .log-entry.level-error { border-left-color: rgba(243, 139, 168, 0.65); }
 .log-entry.source-user { border-left-color: rgba(250, 179, 135, 0.55); }
+.log-entry.superseded {
+  background: rgba(243, 139, 168, 0.08);
+  border-left-color: rgba(243, 139, 168, 0.85);
+}
+.log-entry.superseded:hover { background: rgba(243, 139, 168, 0.12); }
+.log-entry.superseded .log-content {
+  color: var(--red);
+}
+.log-entry.rollback-marker {
+  background: rgba(249, 226, 175, 0.06);
+  border-left-color: rgba(249, 226, 175, 0.75);
+}
+.log-entry.replacement-message {
+  border-left-color: rgba(166, 227, 161, 0.75);
+}
 .log-entry .log-icon {
   width: 20px;
   flex-shrink: 0;
@@ -1443,6 +1458,37 @@ html, body {
   min-width: 0;
   white-space: pre-wrap;
   word-break: break-word;
+}
+.log-state-badges {
+  display: inline-flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-left: 8px;
+  vertical-align: baseline;
+}
+.log-state-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 16px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.2;
+  text-transform: uppercase;
+  color: var(--base);
+}
+.log-state-badge.overwritten {
+  color: var(--base);
+  background: var(--red);
+}
+.log-state-badge.replacement {
+  color: var(--base);
+  background: var(--green);
+}
+.log-state-badge.rewind {
+  color: var(--base);
+  background: var(--yellow);
 }
 .log-edit-message {
   flex: 0 0 auto;
@@ -8672,6 +8718,18 @@ function createLogScaffold(c, extraClass) {
   const entry = document.createElement('div');
   entry.className = 'log-entry level-' + c.level + (extraClass ? ' ' + extraClass : '');
   entry.dataset.level = c.level;
+  if (c.kind) entry.dataset.kind = c.kind;
+  if (c.superseded) {
+    entry.classList.add('superseded');
+    entry.dataset.superseded = 'true';
+  }
+  if (c.kind === 'rollback_marker') {
+    entry.classList.add('rollback-marker');
+  }
+  if (c.replacement_for_user_turn_index !== undefined && c.replacement_for_user_turn_index !== null) {
+    entry.classList.add('replacement-message');
+    entry.dataset.replacementForUserTurnIndex = String(c.replacement_for_user_turn_index);
+  }
   const sourceClass = String(c.source || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
   if (sourceClass) entry.classList.add('source-' + sourceClass);
 
@@ -8886,7 +8944,28 @@ function renderLogContentElement(cnt, c) {
   cnt.textContent = content;
 }
 
+function appendLogStateBadges(cnt, c) {
+  const badges = [];
+  if (c.kind === 'rollback_marker') badges.push({ cls: 'rewind', text: 'context rewind' });
+  if (c.superseded) badges.push({ cls: 'overwritten', text: 'overwritten' });
+  const replacementTurn = c.replacement_for_user_turn_index;
+  if (replacementTurn !== undefined && replacementTurn !== null) {
+    badges.push({ cls: 'replacement', text: `replacement for turn ${replacementTurn}` });
+  }
+  if (!badges.length) return;
+  const wrap = document.createElement('span');
+  wrap.className = 'log-state-badges';
+  for (const badge of badges) {
+    const el = document.createElement('span');
+    el.className = 'log-state-badge ' + badge.cls;
+    el.textContent = badge.text;
+    wrap.appendChild(el);
+  }
+  cnt.appendChild(wrap);
+}
+
 function isEditableUserMessage(c) {
+  if (c?.superseded) return false;
   const source = String(c?.source || '').toLowerCase();
   const sid = String(c?.session_id || '').trim();
   const turn = Number(c?.user_turn_index || 0);
@@ -8922,6 +9001,7 @@ function renderLogEntry(c) {
   const cnt = document.createElement('span');
   cnt.className = 'log-content';
   renderLogContentElement(cnt, c);
+  appendLogStateBadges(cnt, c);
 
   const hasImages = c.images && c.images.length > 0;
   const attachmentPreviews = Array.isArray(c.attachment_previews) ? c.attachment_previews : [];

@@ -6,6 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 // ── UiCommand ──────────────────────────────────────────────────────
 
 /// Commands sent from WASM to JS for DOM updates.
@@ -30,6 +34,10 @@ pub enum UiCommand {
         turn: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_turn_index: Option<u32>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        superseded: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacement_for_user_turn_index: Option<u32>,
         /// Base64-encoded images (screenshots) associated with this entry.
         /// Sent separately from content so JS can lazy-load them on expand.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -715,6 +723,8 @@ struct LogEntry {
     collapsible: bool,
     turn: Option<u64>,
     user_turn_index: Option<u32>,
+    superseded: bool,
+    replacement_for_user_turn_index: Option<u32>,
 }
 
 // ── AppState ───────────────────────────────────────────────────────
@@ -865,6 +875,8 @@ impl AppState {
                 collapsible: entry.collapsible,
                 turn: None, // separator already handled
                 user_turn_index: entry.user_turn_index,
+                superseded: entry.superseded,
+                replacement_for_user_turn_index: entry.replacement_for_user_turn_index,
                 images: vec![],
             });
         }
@@ -1185,6 +1197,8 @@ impl AppState {
                                 Some("agent_output"),
                                 output_id.clone(),
                                 None,
+                                false,
+                                None,
                             ));
                         }
                     }
@@ -1199,6 +1213,8 @@ impl AppState {
                             Vec::new(),
                             Some("agent_output"),
                             output_id.clone(),
+                            None,
+                            false,
                             None,
                         ));
                     }
@@ -1953,15 +1969,22 @@ impl AppState {
                 let user_turn_index = msg["user_turn_index"]
                     .as_u64()
                     .and_then(|v| u32::try_from(v).ok());
+                let superseded = msg["superseded"].as_bool().unwrap_or(false);
+                let replacement_for_user_turn_index = msg["replacement_for_user_turn_index"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok());
+                let kind = msg["kind"].as_str();
                 cmds.extend(self.add_log_with_metadata(
                     level,
                     content,
                     turn,
                     source,
                     Vec::new(),
-                    None,
+                    kind,
                     None,
                     user_turn_index,
+                    superseded,
+                    replacement_for_user_turn_index,
                 ));
             }
 
@@ -2210,7 +2233,9 @@ impl AppState {
         source: &str,
         images: Vec<String>,
     ) -> Vec<UiCommand> {
-        self.add_log_with_metadata(level, content, turn, source, images, None, None, None)
+        self.add_log_with_metadata(
+            level, content, turn, source, images, None, None, None, false, None,
+        )
     }
 
     fn add_log_with_metadata(
@@ -2223,6 +2248,8 @@ impl AppState {
         kind: Option<&str>,
         output_id: Option<String>,
         user_turn_index: Option<u32>,
+        superseded: bool,
+        replacement_for_user_turn_index: Option<u32>,
     ) -> Vec<UiCommand> {
         // Trim replay timestamps to HH:MM:SS so they render identically to
         // the old replay path (which truncated via `ts[..8.min(ts.len())]`).
@@ -2256,6 +2283,8 @@ impl AppState {
             collapsible: is_collapsible,
             turn,
             user_turn_index,
+            superseded,
+            replacement_for_user_turn_index,
         };
         self.log_buffer.push(entry);
 
@@ -2284,6 +2313,8 @@ impl AppState {
             collapsible: is_collapsible,
             turn: None, // separator already emitted
             user_turn_index,
+            superseded,
+            replacement_for_user_turn_index,
             images,
         });
         cmds
@@ -3786,6 +3817,50 @@ mod tests {
     }
 
     #[test]
+    fn log_entry_preserves_superseded_metadata() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "log_entry",
+            "level": "info",
+            "source": "user",
+            "content": "Old prompt",
+            "session_id": "session-1",
+            "user_turn_index": 3,
+            "superseded": true,
+            "kind": "rollback_marker",
+            "replacement_for_user_turn_index": 3
+        });
+
+        let cmds = s.handle_message(&msg);
+        let entry = cmds
+            .iter()
+            .find_map(|cmd| match cmd {
+                UiCommand::AddLogEntry {
+                    content,
+                    kind,
+                    user_turn_index,
+                    superseded,
+                    replacement_for_user_turn_index,
+                    ..
+                } => Some((
+                    content,
+                    kind,
+                    user_turn_index,
+                    superseded,
+                    replacement_for_user_turn_index,
+                )),
+                _ => None,
+            })
+            .expect("log_entry should emit an AddLogEntry");
+
+        assert_eq!(entry.0, "Old prompt");
+        assert_eq!(entry.1.as_deref(), Some("rollback_marker"));
+        assert_eq!(*entry.2, Some(3));
+        assert!(*entry.3);
+        assert_eq!(*entry.4, Some(3));
+    }
+
+    #[test]
     fn ui_command_serialization() {
         let cmd = UiCommand::AddLogEntry {
             ts: "10:00:00".into(),
@@ -3798,6 +3873,8 @@ mod tests {
             collapsible: false,
             turn: None,
             user_turn_index: None,
+            superseded: false,
+            replacement_for_user_turn_index: None,
             images: vec![],
         };
         let json = serde_json::to_string(&cmd).unwrap();

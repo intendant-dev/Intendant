@@ -1864,8 +1864,11 @@ fn push_external_transcript_entry(
     role: &str,
     text: String,
 ) -> bool {
-    let role = role.trim().to_lowercase();
-    if role != "user" && role != "assistant" && role != "model" {
+    let role = match role.trim().to_lowercase().as_str() {
+        "model" => "assistant".to_string(),
+        other => other.to_string(),
+    };
+    if role != "user" && role != "assistant" {
         return false;
     }
     if text.trim().is_empty() {
@@ -1884,6 +1887,72 @@ fn push_external_transcript_entry(
         "content": text,
     }));
     true
+}
+
+fn external_transcript_entry_role(entry: &serde_json::Value) -> Option<&'static str> {
+    if entry.get("source").and_then(|v| v.as_str()) == Some("user") {
+        Some("user")
+    } else if entry.get("level").and_then(|v| v.as_str()) == Some("model") {
+        Some("assistant")
+    } else {
+        None
+    }
+}
+
+fn forget_external_seen_message(
+    seen_messages: &mut HashSet<(String, String)>,
+    entry: &serde_json::Value,
+) {
+    let Some(role) = external_transcript_entry_role(entry) else {
+        return;
+    };
+    let Some(content) = entry.get("content").and_then(|v| v.as_str()) else {
+        return;
+    };
+    seen_messages.remove(&(role.to_string(), content.to_string()));
+}
+
+fn mark_latest_external_turn_superseded(
+    entries: &mut [serde_json::Value],
+    seen_messages: &mut HashSet<(String, String)>,
+    rollback_ts: &str,
+) -> Option<u32> {
+    for idx in (0..entries.len()).rev() {
+        let entry = &entries[idx];
+        if entry
+            .get("superseded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if entry.get("kind").and_then(|v| v.as_str()) == Some("rollback_marker") {
+            continue;
+        }
+        let Some(role) = external_transcript_entry_role(entry) else {
+            continue;
+        };
+        let user_turn_index = entry
+            .get("user_turn_index")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
+        forget_external_seen_message(seen_messages, entry);
+        if let Some(obj) = entries[idx].as_object_mut() {
+            obj.insert("superseded".to_string(), serde_json::Value::Bool(true));
+            obj.insert(
+                "superseded_at".to_string(),
+                serde_json::Value::String(rollback_ts.to_string()),
+            );
+            obj.insert(
+                "superseded_reason".to_string(),
+                serde_json::Value::String("thread_rollback".to_string()),
+            );
+        }
+        if role == "user" {
+            return user_turn_index;
+        }
+    }
+    None
 }
 
 fn collect_files(root: &Path, suffix: &str, out: &mut Vec<PathBuf>) {
@@ -2903,6 +2972,7 @@ fn external_session_entries_from_home(
                 return None;
             };
             let mut user_turn_index = 0u32;
+            let mut pending_replacement_for_user_turn: Option<u32> = None;
             let mut seen_messages = HashSet::new();
             for line in contents.lines() {
                 let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -2917,32 +2987,36 @@ fn external_session_entries_from_home(
                                 .get("num_turns")
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0);
+                            let ts = value_str(&obj, "timestamp").unwrap_or_default();
+                            let mut superseded_user_turns = Vec::new();
                             for _ in 0..turns {
-                                while let Some(entry) = entries.pop() {
-                                    if let (Some(source), Some(content)) = (
-                                        entry.get("source").and_then(|v| v.as_str()),
-                                        entry.get("content").and_then(|v| v.as_str()),
-                                    ) {
-                                        let role = if source == "user" {
-                                            Some("user")
-                                        } else if entry.get("level").and_then(|v| v.as_str())
-                                            == Some("model")
-                                        {
-                                            Some("assistant")
-                                        } else {
-                                            None
-                                        };
-                                        if let Some(role) = role {
-                                            seen_messages
-                                                .remove(&(role.to_string(), content.to_string()));
-                                        }
-                                    }
-                                    if entry.get("source").and_then(|v| v.as_str()) == Some("user")
-                                    {
-                                        user_turn_index = user_turn_index.saturating_sub(1);
-                                        break;
-                                    }
+                                if let Some(turn) = mark_latest_external_turn_superseded(
+                                    &mut entries,
+                                    &mut seen_messages,
+                                    &ts,
+                                ) {
+                                    superseded_user_turns.push(turn);
+                                    user_turn_index = user_turn_index.saturating_sub(1);
                                 }
+                            }
+                            if let Some(replacement_turn) =
+                                superseded_user_turns.iter().copied().min()
+                            {
+                                pending_replacement_for_user_turn = Some(replacement_turn);
+                            }
+                            if turns > 0 {
+                                entries.push(serde_json::json!({
+                                    "ts": ts,
+                                    "level": "warn",
+                                    "source": "system",
+                                    "content": if turns == 1 {
+                                        "Rewound 1 user turn; overwritten entries are no longer active context.".to_string()
+                                    } else {
+                                        format!("Rewound {turns} user turns; overwritten entries are no longer active context.")
+                                    },
+                                    "kind": "rollback_marker",
+                                    "rollback_turns": turns,
+                                }));
                             }
                             continue;
                         }
@@ -2963,6 +3037,10 @@ fn external_session_entries_from_home(
                             user_turn_index = user_turn_index.saturating_add(1);
                             if let Some(entry) = entries.last_mut() {
                                 entry["user_turn_index"] = serde_json::json!(user_turn_index);
+                                if let Some(turn) = pending_replacement_for_user_turn.take() {
+                                    entry["replacement_for_user_turn_index"] =
+                                        serde_json::json!(turn);
+                                }
                             }
                         }
                     }
@@ -2979,6 +3057,10 @@ fn external_session_entries_from_home(
                             user_turn_index = user_turn_index.saturating_add(1);
                             if let Some(entry) = entries.last_mut() {
                                 entry["user_turn_index"] = serde_json::json!(user_turn_index);
+                                if let Some(turn) = pending_replacement_for_user_turn.take() {
+                                    entry["replacement_for_user_turn_index"] =
+                                        serde_json::json!(turn);
+                                }
                             }
                         }
                     }
@@ -3128,6 +3210,17 @@ fn external_session_activity_replay_from_home_with_attach(
             "source": entry.get("source").and_then(|v| v.as_str()).unwrap_or(source),
             "content": content,
             "user_turn_index": entry.get("user_turn_index").and_then(|v| v.as_u64()),
+            "replacement_for_user_turn_index": entry
+                .get("replacement_for_user_turn_index")
+                .and_then(|v| v.as_u64()),
+            "superseded": entry
+                .get("superseded")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "superseded_reason": entry
+                .get("superseded_reason")
+                .and_then(|v| v.as_str()),
+            "kind": entry.get("kind").and_then(|v| v.as_str()),
         }));
     }
 
@@ -12256,6 +12349,97 @@ mod tests {
                 && entry["source"] == "codex"
                 && entry["content"] == "The task keeps running."
         }));
+    }
+
+    #[test]
+    fn external_activity_replay_marks_rolled_back_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-overwritten-activity";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Old prompt" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Old answer" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "thread_rolled_back", "num_turns": 1 }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "New prompt" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+
+        let old_prompt = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "Old prompt")
+            .expect("old prompt should remain visible");
+        assert_eq!(old_prompt["user_turn_index"], 1);
+        assert_eq!(old_prompt["superseded"], true);
+
+        let old_answer = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "Old answer")
+            .expect("old answer should remain visible");
+        assert_eq!(old_answer["superseded"], true);
+
+        assert!(entries.iter().any(|entry| {
+            entry["event"] == "log_entry"
+                && entry["kind"] == "rollback_marker"
+                && entry["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Rewound 1 user turn"))
+        }));
+
+        let new_prompt = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "New prompt")
+            .expect("replacement prompt should replay");
+        assert_eq!(new_prompt["user_turn_index"], 1);
+        assert_eq!(new_prompt["replacement_for_user_turn_index"], 1);
+        assert_ne!(new_prompt["superseded"], true);
     }
 
     #[test]
