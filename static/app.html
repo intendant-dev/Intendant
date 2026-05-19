@@ -1019,6 +1019,34 @@ html, body {
   background: rgba(137, 180, 250, 0.08);
 }
 .task-target-chip:focus { outline: 1px solid var(--blue); outline-offset: 1px; }
+.edit-message-chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 220px;
+  padding: 3px 6px;
+  border: 1px solid rgba(250, 179, 135, 0.5);
+  border-radius: 4px;
+  background: rgba(250, 179, 135, 0.1);
+  color: var(--peach);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.edit-message-chip.hidden { display: none; }
+.edit-message-chip button {
+  width: 18px;
+  height: 18px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--peach);
+  cursor: pointer;
+  line-height: 1;
+}
+.edit-message-chip button:hover { background: rgba(250, 179, 135, 0.18); }
 .global-task-input {
   flex: 1;
   min-width: 0;
@@ -1112,6 +1140,15 @@ html, body {
   border-color: var(--peach);
 }
 .global-send-btn.steer-mode:hover {
+  background: var(--yellow);
+  border-color: var(--yellow);
+}
+.global-send-btn.edit-mode {
+  background: var(--peach);
+  color: var(--base);
+  border-color: var(--peach);
+}
+.global-send-btn.edit-mode:hover {
   background: var(--yellow);
   border-color: var(--yellow);
 }
@@ -1406,6 +1443,28 @@ html, body {
   min-width: 0;
   white-space: pre-wrap;
   word-break: break-word;
+}
+.log-edit-message {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  margin-left: 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--overlay0);
+  cursor: pointer;
+  line-height: 1;
+  opacity: 0;
+}
+.log-entry:hover .log-edit-message,
+.log-edit-message:focus {
+  opacity: 1;
+}
+.log-edit-message:hover {
+  color: var(--peach);
+  border-color: rgba(250, 179, 135, 0.45);
+  background: rgba(250, 179, 135, 0.1);
 }
 .log-entry .log-content.log-markdown,
 .session-detail-logs .log-content.log-markdown {
@@ -4309,6 +4368,10 @@ html, body {
     </div>
     <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
     <button id="task-target-chip" class="task-target-chip" onclick="focusForegroundSessionWindow()" title="Prompt target">New session</button>
+    <div id="edit-message-chip" class="edit-message-chip hidden" title="Editing a previous user message">
+      <span id="edit-message-label">Editing</span>
+      <button type="button" id="edit-message-cancel" title="Cancel edit">x</button>
+    </div>
     <textarea id="activity-task-input" class="global-task-input" rows="1" placeholder="Enter task..."></textarea>
     <!-- File upload: hidden input triggered by the Attach button. `multiple`
          lets the user pick several at once; we fire one POST per file
@@ -5540,6 +5603,7 @@ let sessionMetadataRefreshTimer = null;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
 let steerCounter = 0;
+let editMessageDraft = null;
 const approvalSessionIds = new Map();
 let spinnerIdx = 0;
 let spinnerInterval = null;
@@ -8610,6 +8674,9 @@ function createLogScaffold(c, extraClass) {
   session.textContent = sid ? sid.substring(0, 8) : '';
   session.title = sid ? `session: ${sid}` : '';
   if (sid) entry.dataset.sessionId = sid;
+  if (c.user_turn_index !== undefined && c.user_turn_index !== null) {
+    entry.dataset.userTurnIndex = String(c.user_turn_index);
+  }
 
   const lvl = document.createElement('span');
   lvl.className = 'log-level';
@@ -8791,6 +8858,27 @@ function renderLogContentElement(cnt, c) {
   cnt.textContent = content;
 }
 
+function isEditableUserMessage(c) {
+  const source = String(c?.source || '').toLowerCase();
+  const sid = String(c?.session_id || '').trim();
+  const turn = Number(c?.user_turn_index || 0);
+  return source === 'user' && !!sid && Number.isInteger(turn) && turn > 0;
+}
+
+function appendEditUserMessageButton(entry, c) {
+  if (!isEditableUserMessage(c)) return;
+  entry.classList.add('editable-user-message');
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'log-edit-message';
+  btn.title = 'Edit this user message and rerun from here';
+  btn.innerHTML = '&#9998;';
+  btn.dataset.sessionId = c.session_id || '';
+  btn.dataset.userTurnIndex = String(c.user_turn_index);
+  btn.dataset.message = c.content || '';
+  entry.appendChild(btn);
+}
+
 function renderLogEntry(c) {
   if (isCommandOutputLog(c)) {
     inferSessionPhaseFromLog(c);
@@ -8838,6 +8926,7 @@ function renderLogEntry(c) {
   }
 
   entry.appendChild(cnt);
+  appendEditUserMessageButton(entry, c);
 
   if (c.collapsible || hasImages) {
     entry.classList.add('collapsible');
@@ -18355,6 +18444,94 @@ function clearTaskTextarea(input) {
   resizeTaskTextarea(input);
 }
 
+function setTaskTextareaValue(input, value) {
+  if (!input) return;
+  input.value = value || '';
+  resizeTaskTextarea(input);
+  input.focus();
+  if (typeof input.setSelectionRange === 'function') {
+    const end = input.value.length;
+    input.setSelectionRange(end, end);
+  }
+}
+
+function renderEditMessageChip() {
+  const chip = document.getElementById('edit-message-chip');
+  const label = document.getElementById('edit-message-label');
+  if (!chip || !label) return;
+  if (!editMessageDraft) {
+    chip.classList.add('hidden');
+    label.textContent = 'Editing';
+    chip.title = 'Editing a previous user message';
+    return;
+  }
+  const sid = shortSessionId(editMessageDraft.sessionId);
+  label.textContent = `Editing ${sid} #${editMessageDraft.userTurnIndex}`;
+  chip.title = `Replacing user turn ${editMessageDraft.userTurnIndex} in session ${editMessageDraft.sessionId}`;
+}
+
+function cancelEditMessageDraft() {
+  editMessageDraft = null;
+  renderEditMessageChip();
+  updateSubmitButtonLabel(currentPhase);
+}
+
+function beginEditUserMessage({ sessionId, userTurnIndex, text }) {
+  if (!sessionId || !userTurnIndex) return;
+  editMessageDraft = {
+    sessionId,
+    userTurnIndex: Number(userTurnIndex),
+    originalText: text || '',
+  };
+  ensureSessionWindow(sessionId);
+  focusSessionWindow(sessionId);
+  renderEditMessageChip();
+  setTaskTextareaValue(document.getElementById('activity-task-input'), text || '');
+  updateSubmitButtonLabel(currentPhase);
+}
+
+function submitEditedUserMessage(input, text) {
+  if (!editMessageDraft || !app) return false;
+  const attachments = pendingAttachments.map(a => a.frameId);
+  const attachmentReceipt = pendingAttachments.slice();
+  const targetSessionId = editMessageDraft.sessionId;
+  const msg = {
+    action: 'edit_user_message',
+    session_id: targetSessionId,
+    user_turn_index: editMessageDraft.userTurnIndex,
+    text,
+  };
+  if (attachments.length > 0) msg.attachments = attachments;
+  app.send_server_action(msg);
+  markSessionWindowPendingActive(targetSessionId);
+  if (attachments.length > 0) {
+    renderAttachmentReceipt(text, attachmentReceipt, 'Edited', targetSessionId);
+    clearPendingAttachments();
+  }
+  clearTaskTextarea(input);
+  editMessageDraft = null;
+  renderEditMessageChip();
+  updateSubmitButtonLabel(currentPhase);
+  return true;
+}
+
+document.addEventListener('click', (e) => {
+  const editBtn = e.target.closest?.('.log-edit-message');
+  if (!editBtn) return;
+  e.preventDefault();
+  e.stopPropagation();
+  beginEditUserMessage({
+    sessionId: editBtn.dataset.sessionId || '',
+    userTurnIndex: editBtn.dataset.userTurnIndex || '',
+    text: editBtn.dataset.message || '',
+  });
+});
+
+document.getElementById('edit-message-cancel')?.addEventListener('click', (e) => {
+  e.preventDefault();
+  cancelEditMessageDraft();
+});
+
 function wireTaskTextarea(id, submit) {
   const input = document.getElementById(id);
   if (!input) return;
@@ -18414,6 +18591,10 @@ window.submitActivityOrSteer = function() {
   if (!input) return;
   const text = input.value.trim();
   if (!text) return;
+  if (editMessageDraft) {
+    submitEditedUserMessage(input, text);
+    return;
+  }
   const codexSlash = parseCodexSlashCommand(text);
   if (codexSlash) {
     if (dispatchCodexSlashCommand(codexSlash)) {
@@ -18459,6 +18640,14 @@ window.submitActivityOrSteer = function() {
 function updateSubmitButtonLabel(phase) {
   const btn = document.getElementById('activity-submit-btn');
   if (!btn) return;
+  if (editMessageDraft) {
+    btn.textContent = 'Save & rerun';
+    btn.classList.add('edit-mode');
+    btn.classList.remove('steer-mode');
+    btn.title = 'Replace the selected user message and rerun the session from that turn.';
+    return;
+  }
+  btn.classList.remove('edit-mode');
   const targetSessionId = resolvePromptTargetSessionId();
   const active = targetSessionId
     ? isSessionWindowEffectivelyActive(targetSessionId, phase)

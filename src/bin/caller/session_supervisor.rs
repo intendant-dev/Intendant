@@ -189,6 +189,15 @@ impl SessionSupervisor {
             } => {
                 self.route_follow_up(session_id, text, direct, vec![]).await;
             }
+            event::ControlMsg::EditUserMessage {
+                session_id,
+                user_turn_index,
+                text,
+                attachments,
+            } => {
+                self.route_edit_user_message(session_id, user_turn_index, text, attachments)
+                    .await;
+            }
             event::ControlMsg::Interrupt {
                 session_id,
                 expected_turn: _,
@@ -824,6 +833,89 @@ impl SessionSupervisor {
         }
     }
 
+    async fn route_edit_user_message(
+        &self,
+        session_id: Option<String>,
+        user_turn_index: u32,
+        text: String,
+        attachments: Vec<String>,
+    ) {
+        let (target_id, entry) = {
+            let state = self.state.lock().await;
+            let target_id = session_id.or_else(|| state.active_session_id.clone());
+            let Some(target_id) = target_id else {
+                drop(state);
+                self.warn("Edit dropped: no active managed session");
+                return;
+            };
+            let entry = state.sessions.get(&target_id).map(|s| {
+                (
+                    s.session_id.clone(),
+                    s.source.clone(),
+                    s.project_root.clone(),
+                    s.session_dir.clone(),
+                    s.follow_up_tx.clone(),
+                )
+            });
+            (target_id, entry)
+        };
+
+        let Some((managed_id, source, project_root, session_dir, tx)) = entry else {
+            self.warn(&format!(
+                "Edit dropped: session {} is not managed by this daemon",
+                short_session(&target_id)
+            ));
+            return;
+        };
+        if source != "codex" {
+            self.warn(&format!(
+                "Edit dropped: {} session {} does not support user-message rewind yet",
+                source,
+                short_session(&managed_id)
+            ));
+            return;
+        }
+        if user_turn_index == 0 {
+            self.warn(&format!(
+                "Edit dropped: invalid user turn index 0 for Codex session {}",
+                short_session(&managed_id)
+            ));
+            return;
+        }
+
+        let resolved_attachments = if attachments.is_empty() {
+            Vec::new()
+        } else {
+            resolve_attachments(
+                &attachments,
+                &self.config.frame_registry,
+                &session_dir,
+                &project_root,
+            )
+            .await
+        };
+        if resolved_attachments.len() < attachments.len() {
+            self.warn(&format!(
+                "Only resolved {} of {} edit attachment(s) for Codex session {}",
+                resolved_attachments.len(),
+                attachments.len(),
+                short_session(&managed_id)
+            ));
+        }
+        let msg = FollowUpMessage::edit_user_message(
+            text,
+            UserAttachments::from_items(resolved_attachments),
+            user_turn_index,
+        );
+        if tx.send(msg).await.is_err() {
+            self.warn(&format!(
+                "Edit dropped: Codex session {} in {} is not accepting input",
+                short_session(&managed_id),
+                project_root.display()
+            ));
+        }
+    }
+
     async fn route_interrupt(&self, session_id: Option<String>) {
         let Some(target_id) = self.resolve_target_session_id(session_id).await else {
             self.warn("Interrupt dropped: no active managed session");
@@ -1304,6 +1396,7 @@ fn control_target_session_id(msg: &event::ControlMsg) -> Option<&str> {
         | event::ControlMsg::Interrupt { session_id, .. }
         | event::ControlMsg::Steer { session_id, .. }
         | event::ControlMsg::StartTask { session_id, .. }
+        | event::ControlMsg::EditUserMessage { session_id, .. }
         | event::ControlMsg::FollowUp { session_id, .. } => session_id.as_deref(),
         event::ControlMsg::ResumeSession { .. } => None,
         _ => None,

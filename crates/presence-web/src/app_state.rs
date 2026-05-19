@@ -28,6 +28,8 @@ pub enum UiCommand {
         collapsible: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_turn_index: Option<u32>,
         /// Base64-encoded images (screenshots) associated with this entry.
         /// Sent separately from content so JS can lazy-load them on expand.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -712,6 +714,7 @@ struct LogEntry {
     output_id: Option<String>,
     collapsible: bool,
     turn: Option<u64>,
+    user_turn_index: Option<u32>,
 }
 
 // ── AppState ───────────────────────────────────────────────────────
@@ -861,6 +864,7 @@ impl AppState {
                 output_id: entry.output_id.clone(),
                 collapsible: entry.collapsible,
                 turn: None, // separator already handled
+                user_turn_index: entry.user_turn_index,
                 images: vec![],
             });
         }
@@ -1180,6 +1184,7 @@ impl AppState {
                                 out.images,
                                 Some("agent_output"),
                                 output_id.clone(),
+                                None,
                             ));
                         }
                     }
@@ -1194,6 +1199,7 @@ impl AppState {
                             Vec::new(),
                             Some("agent_output"),
                             output_id.clone(),
+                            None,
                         ));
                     }
                 }
@@ -1944,7 +1950,19 @@ impl AppState {
                 let source = msg["source"].as_str().unwrap_or("system");
                 let content = msg["content"].as_str().unwrap_or("");
                 let turn = msg["turn"].as_u64();
-                cmds.extend(self.add_log(level, content, turn, source));
+                let user_turn_index = msg["user_turn_index"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok());
+                cmds.extend(self.add_log_with_metadata(
+                    level,
+                    content,
+                    turn,
+                    source,
+                    Vec::new(),
+                    None,
+                    None,
+                    user_turn_index,
+                ));
             }
 
             "file_changed" => {
@@ -2192,7 +2210,7 @@ impl AppState {
         source: &str,
         images: Vec<String>,
     ) -> Vec<UiCommand> {
-        self.add_log_with_metadata(level, content, turn, source, images, None, None)
+        self.add_log_with_metadata(level, content, turn, source, images, None, None, None)
     }
 
     fn add_log_with_metadata(
@@ -2204,6 +2222,7 @@ impl AppState {
         images: Vec<String>,
         kind: Option<&str>,
         output_id: Option<String>,
+        user_turn_index: Option<u32>,
     ) -> Vec<UiCommand> {
         // Trim replay timestamps to HH:MM:SS so they render identically to
         // the old replay path (which truncated via `ts[..8.min(ts.len())]`).
@@ -2236,6 +2255,7 @@ impl AppState {
             output_id: output_id.clone(),
             collapsible: is_collapsible,
             turn,
+            user_turn_index,
         };
         self.log_buffer.push(entry);
 
@@ -2263,6 +2283,7 @@ impl AppState {
             output_id,
             collapsible: is_collapsible,
             turn: None, // separator already emitted
+            user_turn_index,
             images,
         });
         cmds
@@ -3776,6 +3797,7 @@ mod tests {
             output_id: None,
             collapsible: false,
             turn: None,
+            user_turn_index: None,
             images: vec![],
         };
         let json = serde_json::to_string(&cmd).unwrap();

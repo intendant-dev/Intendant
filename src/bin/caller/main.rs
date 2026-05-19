@@ -289,18 +289,170 @@ fn emit_task_dispatched_log(
     });
 }
 
-fn emit_user_message_log(bus: &EventBus, session_log: &SharedSessionLog, text: &str) {
+fn emit_user_message_log(
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+    session_id: Option<&str>,
+    user_turn_index: Option<u32>,
+    text: &str,
+) {
     let text = text.trim();
     if text.is_empty() {
         return;
     }
     slog(session_log, |l| l.info(&format!("[user] {}", text)));
-    bus.send(AppEvent::LogEntry {
-        level: "info".to_string(),
-        source: "User".to_string(),
+    bus.send(AppEvent::UserMessageLog {
+        session_id: session_id.map(str::to_string),
         content: text.to_string(),
-        turn: None,
+        user_turn_index,
     });
+}
+
+fn json_string_field(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key).and_then(|x| x.as_str()).map(str::to_string)
+}
+
+fn collect_jsonl_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_jsonl_files(&path, out);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|name| name.ends_with(".jsonl"))
+            .unwrap_or(false)
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn codex_session_file_id(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
+            return obj
+                .get("payload")
+                .and_then(|payload| json_string_field(payload, "id"));
+        }
+    }
+    None
+}
+
+fn find_codex_session_file_for_main(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let mut files = Vec::new();
+    collect_jsonl_files(&home.join(".codex").join("sessions"), &mut files);
+    collect_jsonl_files(&home.join(".codex").join("archived_sessions"), &mut files);
+    files
+        .into_iter()
+        .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))
+}
+
+fn codex_message_content_text(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| item.get("content").and_then(|v| v.as_str()))
+                        .map(str::to_string)
+                })
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn codex_payload_user_text(payload: &serde_json::Value) -> Option<String> {
+    if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
+        return None;
+    }
+    if payload.get("role").and_then(|v| v.as_str()) != Some("user") {
+        return None;
+    }
+    let text = codex_message_content_text(payload.get("content")?)?;
+    if is_codex_injected_user_text_for_main(&text) {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn is_codex_injected_user_text_for_main(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("# AGENTS.md instructions for ") || trimmed.starts_with("<turn_aborted>")
+}
+
+fn count_codex_user_turns_from_history(session_id: &str) -> Option<u32> {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
+    let path = find_codex_session_file_for_main(&home, session_id)?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut saw_user_message_event = false;
+    let mut event_user_turns = 0u32;
+    let mut fallback_user_turns = 0u32;
+
+    for line in contents.lines() {
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "event_msg" => {
+                let Some(payload) = obj.get("payload") else {
+                    continue;
+                };
+                match payload.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                    "user_message" => {
+                        saw_user_message_event = true;
+                        event_user_turns = event_user_turns.saturating_add(1);
+                    }
+                    "thread_rolled_back" => {
+                        let turns = payload
+                            .get("num_turns")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32;
+                        event_user_turns = event_user_turns.saturating_sub(turns);
+                        fallback_user_turns = fallback_user_turns.saturating_sub(turns);
+                    }
+                    _ => {}
+                }
+            }
+            "response_item" => {
+                if obj
+                    .get("payload")
+                    .and_then(codex_payload_user_text)
+                    .is_some()
+                {
+                    fallback_user_turns = fallback_user_turns.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(if saw_user_message_event {
+        event_user_turns
+    } else {
+        fallback_user_turns
+    })
 }
 
 /// Resolve external agent backend from an explicit override, falling back to
@@ -1667,6 +1819,7 @@ struct FollowUpMessage {
     text: String,
     attachments: UserAttachments,
     steer_id: Option<String>,
+    edit_user_turn_index: Option<u32>,
 }
 
 impl FollowUpMessage {
@@ -1675,6 +1828,7 @@ impl FollowUpMessage {
             text,
             attachments: UserAttachments::default(),
             steer_id: None,
+            edit_user_turn_index: None,
         }
     }
 
@@ -1683,6 +1837,7 @@ impl FollowUpMessage {
             text,
             attachments,
             steer_id: None,
+            edit_user_turn_index: None,
         }
     }
 
@@ -1691,6 +1846,16 @@ impl FollowUpMessage {
             text,
             attachments,
             steer_id: Some(steer_id),
+            edit_user_turn_index: None,
+        }
+    }
+
+    fn edit_user_message(text: String, attachments: UserAttachments, user_turn_index: u32) -> Self {
+        Self {
+            text,
+            attachments,
+            steer_id: None,
+            edit_user_turn_index: Some(user_turn_index),
         }
     }
 }
@@ -7337,17 +7502,27 @@ async fn run_external_agent_mode(
     }
 
     // Construct, initialize, and start a thread for the external agent
+    let resumed_external_session = resume_session.clone();
     let (mut agent, thread, mut event_rx) =
         create_external_agent(&backend, &project, &session_log, web_port, resume_session).await?;
 
     // Event loop
-    let mut round = 0usize;
+    let mut round = match (
+        &backend,
+        resumed_external_session.as_deref(),
+        thread.thread_id.as_str(),
+    ) {
+        (external_agent::AgentBackend::Codex, Some(_), session_id) => {
+            count_codex_user_turns_from_history(session_id).unwrap_or(0) as usize
+        }
+        _ => 0,
+    };
     let mut stats = LoopStats::default();
     let live_session_id = control_session_id.or_else(|| session_log_id(&session_log));
     let mut next_turn = if task.trim().is_empty() {
         None
     } else {
-        Some((task, attachments, None))
+        Some((task, attachments, None, None))
     };
 
     let drain_config = DrainConfig {
@@ -7370,14 +7545,19 @@ async fn run_external_agent_mode(
     let mut turn_bus_rx = bus.subscribe();
 
     'outer: loop {
-        let (turn_text, attachments, steer_id) = match next_turn.take() {
+        let (turn_text, attachments, steer_id, edit_user_turn_index) = match next_turn.take() {
             Some(turn) => turn,
             None => loop {
                 tokio::select! {
                     maybe_followup = follow_up_rx.recv() => {
                         match maybe_followup {
                             Some(followup) => {
-                                break (followup.text, followup.attachments, followup.steer_id);
+                                break (
+                                    followup.text,
+                                    followup.attachments,
+                                    followup.steer_id,
+                                    followup.edit_user_turn_index,
+                                );
                             }
                             None => {
                                 slog(&session_log, |l| {
@@ -7423,10 +7603,62 @@ async fn run_external_agent_mode(
             },
         };
 
+        if let Some(user_turn_index) = edit_user_turn_index {
+            if user_turn_index == 0 || user_turn_index as usize > round {
+                let message = format!(
+                    "Cannot edit user turn {} in {} session {}; current user turn count is {}",
+                    user_turn_index,
+                    backend,
+                    live_session_id
+                        .as_deref()
+                        .map(|sid| sid.chars().take(8).collect::<String>())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    round
+                );
+                slog(&session_log, |l| l.warn(&message));
+                bus.send(AppEvent::LoopError(message));
+                continue;
+            }
+            let turns_to_drop = round as u32 - user_turn_index + 1;
+            match agent.rollback_turns(turns_to_drop).await {
+                Ok(()) => {
+                    round = user_turn_index.saturating_sub(1) as usize;
+                    let message = format!(
+                        "Edited user turn {}; rolled back {} turn{}",
+                        user_turn_index,
+                        turns_to_drop,
+                        if turns_to_drop == 1 { "" } else { "s" }
+                    );
+                    slog(&session_log, |l| l.info(&message));
+                    bus.send(AppEvent::LogEntry {
+                        level: "info".to_string(),
+                        source: "system".to_string(),
+                        content: message,
+                        turn: None,
+                    });
+                }
+                Err(e) => {
+                    let message = format!(
+                        "Cannot edit user turn {} in {} session: {}",
+                        user_turn_index, backend, e
+                    );
+                    slog(&session_log, |l| l.warn(&message));
+                    bus.send(AppEvent::LoopError(message));
+                    continue;
+                }
+            }
+        }
+
         round += 1;
         stats.turns = 0;
         let attachment_count = attachments.len();
-        emit_user_message_log(&bus, &session_log, &turn_text);
+        emit_user_message_log(
+            &bus,
+            &session_log,
+            live_session_id.as_deref(),
+            Some(round as u32),
+            &turn_text,
+        );
         let merged = drain_steer_queue_as_followup(
             &context_injection,
             &turn_text,

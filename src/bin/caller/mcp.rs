@@ -1895,6 +1895,27 @@ async fn handle_control_command_mcp(
             }
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::EditUserMessage {
+            session_id,
+            user_turn_index,
+            text,
+            attachments,
+        } => {
+            bus.send(AppEvent::ControlCommand(ControlMsg::EditUserMessage {
+                session_id,
+                user_turn_index,
+                text,
+                attachments,
+            }));
+            emit_control_result(
+                control_tx,
+                "edit_user_message",
+                true,
+                "edit requested".to_string(),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::QueryDetail { scope, target } => {
             // Log query detail requests; full handling via presence layer
             let msg = format!("query_detail: scope={}, target={:?}", scope, target);
@@ -2218,6 +2239,7 @@ pub fn spawn_event_listener(
                     | AppEvent::ContextSnapshot { .. }
                     | AppEvent::StatusUpdate { .. }
                     | AppEvent::LogEntry { .. }
+                    | AppEvent::UserMessageLog { .. }
                     | AppEvent::ExternalAgentChanged { .. }
                     | AppEvent::AutonomyChanged { .. }
                     | AppEvent::CodexConfigChanged { .. }

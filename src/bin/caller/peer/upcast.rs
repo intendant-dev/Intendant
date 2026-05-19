@@ -1077,6 +1077,9 @@ impl AppEventUpcaster {
                 };
                 vec![log_event(log_level, source, content.clone())]
             }
+            AppEvent::UserMessageLog { content, .. } => {
+                vec![log_event(LogLevel::Info, "User", content.clone())]
+            }
 
             // ---- Terminal ----
             AppEvent::Quit => vec![PeerEvent::Disconnected {
@@ -1998,6 +2001,8 @@ impl WireEventUpcaster {
                 source,
                 content,
                 turn: _,
+                session_id: _,
+                user_turn_index: _,
             } => {
                 vec![log_event(wire_log_level(level), source, content.clone())]
             }
