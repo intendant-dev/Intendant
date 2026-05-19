@@ -999,6 +999,7 @@ html, body {
 .global-task-bar .phase-banner { min-width: 160px; }
 .global-task-input {
   flex: 1;
+  min-width: 0;
   padding: 4px 8px;
   border: 1px solid var(--surface1);
   border-radius: 4px;
@@ -1006,6 +1007,12 @@ html, body {
   color: var(--text);
   font-family: inherit;
   font-size: 12px;
+  line-height: 1.4;
+  min-height: 28px;
+  max-height: 120px;
+  box-sizing: border-box;
+  resize: none;
+  overflow-y: auto;
 }
 .global-task-input:focus { outline: none; border-color: var(--blue); }
 .global-direct-toggle {
@@ -1787,12 +1794,47 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   margin-bottom: 16px;
 }
 .sessions-title {
   font-size: 14px;
   font-weight: 600;
   color: var(--text);
+}
+.sessions-new-task {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  margin-left: auto;
+}
+.sessions-new-task-input {
+  width: 200px;
+  min-height: 28px;
+  max-height: 96px;
+  padding: 4px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  box-sizing: border-box;
+  resize: none;
+  overflow-y: auto;
+}
+.sessions-new-task-input:focus { outline: none; border-color: var(--blue); }
+.sessions-start-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--green);
+  border-radius: 4px;
+  background: var(--green);
+  color: var(--base);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
 }
 .sessions-refresh {
   padding: 4px 12px;
@@ -4089,7 +4131,7 @@ html, body {
       <span class="phase-text" id="phase-text">Idle</span>
     </div>
     <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
-    <input id="activity-task-input" class="global-task-input" placeholder="Enter task..." />
+    <textarea id="activity-task-input" class="global-task-input" rows="1" placeholder="Enter task..."></textarea>
     <!-- File upload: hidden input triggered by the Attach button. `multiple`
          lets the user pick several at once; we fire one POST per file
          (to /api/session/current/uploads) so progress is independent per
@@ -4638,9 +4680,9 @@ html, body {
       <div class="sessions-container">
         <div class="sessions-header">
           <span class="sessions-title">Recent Sessions</span>
-          <div style="display:flex;gap:4px;align-items:center;margin-left:auto">
-            <input id="new-session-input" placeholder="New task..." style="padding:4px 8px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);font-size:12px;width:200px" />
-            <button onclick="startNewSession()" style="padding:4px 12px;border:1px solid var(--green);border-radius:4px;background:var(--green);color:var(--base);font-size:12px;font-weight:600;cursor:pointer">Start</button>
+          <div class="sessions-new-task">
+            <textarea id="new-session-input" class="sessions-new-task-input" rows="1" placeholder="New task..."></textarea>
+            <button class="sessions-start-btn" onclick="startNewSession()">Start</button>
           </div>
           <button class="sessions-refresh" onclick="loadSessions()" style="margin-left:8px">Refresh</button>
           <div class="sessions-filter" id="sessions-filter">
@@ -17399,12 +17441,37 @@ function onSessionEnded(sessionId, reason) {
   switchTab('sessions');
 }
 
+function resizeTaskTextarea(input) {
+  if (!input || input.tagName !== 'TEXTAREA') return;
+  const maxHeight = Number.parseFloat(window.getComputedStyle(input).maxHeight);
+  input.style.height = 'auto';
+  input.style.height = `${Math.min(input.scrollHeight, Number.isFinite(maxHeight) ? maxHeight : 120)}px`;
+}
+
+function clearTaskTextarea(input) {
+  if (!input) return;
+  input.value = '';
+  resizeTaskTextarea(input);
+}
+
+function wireTaskTextarea(id, submit) {
+  const input = document.getElementById(id);
+  if (!input) return;
+  input.addEventListener('input', () => resizeTaskTextarea(input));
+  input.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || e.shiftKey || e.isComposing) return;
+    e.preventDefault();
+    submit();
+  });
+  resizeTaskTextarea(input);
+}
+
 window.submitActivityTask = function() {
   const input = document.getElementById('activity-task-input');
   if (!input || !app) return;
   const text = input.value.trim();
   if (!text) return;
-  input.value = '';
+  clearTaskTextarea(input);
   // Unified submit: always send `start_task` regardless of current phase.
   // The backend dispatcher routes appropriately (presence-mediated vs direct,
   // task_tx vs follow_up_tx) based on mode and the `direct` flag. The old
@@ -17468,7 +17535,7 @@ window.submitActivityOrSteer = function() {
       renderAttachmentReceipt(text, attachmentReceipt, 'Steered');
       clearPendingAttachments();
     }
-    input.value = '';
+    clearTaskTextarea(input);
   } else {
     // Normal task / follow-up path.
     submitActivityTask();
@@ -17553,7 +17620,7 @@ function startNewSession() {
   if (!input) return;
   const task = input.value.trim();
   if (!task) return;
-  input.value = '';
+  clearTaskTextarea(input);
   if (app) {
     const direct = document.getElementById('direct-mode-toggle')?.checked || false;
     const attachments = pendingAttachments.map(a => a.frameId);
@@ -18700,12 +18767,11 @@ document.querySelector('#human-input')?.addEventListener('keydown', (e) => {
     window.sendHumanResponse();
   }
 });
-document.getElementById('activity-task-input')?.addEventListener('keydown', (e) => {
-  // Enter uses the same phase-aware dispatcher as the button so keyboard
-  // users get the same Send vs Steer behavior for free — no stale code
-  // path that bypasses steering when typed instead of clicked.
-  if (e.key === 'Enter') { e.preventDefault(); submitActivityOrSteer(); }
-});
+// Enter uses the same phase-aware dispatcher as the button so keyboard
+// users get the same Send vs Steer behavior. Shift+Enter is left to the
+// textarea so multiline task instructions work naturally.
+wireTaskTextarea('activity-task-input', () => submitActivityOrSteer());
+wireTaskTextarea('new-session-input', () => startNewSession());
 
 // Verbosity toggle
 document.getElementById('verbosity-select').addEventListener('change', (e) => {
