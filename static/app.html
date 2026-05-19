@@ -8082,6 +8082,42 @@ function renderTurnSeparator(turn) {
 
 // Stores base64 image data keyed by DOM element — lazy-loaded on expand
 const _logImageStore = new WeakMap();
+const _wiredCollapsibleLogEntries = new WeakSet();
+
+function appendDeferredLogImages(entry, cnt) {
+  if (!entry || !cnt || !_logImageStore.has(entry)) return;
+  const imgs = _logImageStore.get(entry);
+  _logImageStore.delete(entry);
+  const gallery = document.createElement('div');
+  gallery.className = 'log-image-gallery';
+  for (const b64 of imgs) {
+    const img = document.createElement('img');
+    img.src = 'data:image/png;base64,' + b64;
+    img.className = 'log-screenshot';
+    img.loading = 'lazy';
+    gallery.appendChild(img);
+  }
+  cnt.appendChild(gallery);
+}
+
+function wireCollapsibleLogEntry(entry, cnt, sourceEntry = null) {
+  if (!entry || !cnt || _wiredCollapsibleLogEntries.has(entry)) return;
+  if (sourceEntry && _logImageStore.has(sourceEntry) && !_logImageStore.has(entry)) {
+    _logImageStore.set(entry, _logImageStore.get(sourceEntry));
+  }
+  _wiredCollapsibleLogEntries.add(entry);
+  entry.addEventListener('click', (event) => {
+    if (event.target?.closest?.('.log-edit-message')) return;
+    const expanding = !entry.classList.contains('expanded');
+    entry.classList.toggle('expanded', expanding);
+    if (expanding) appendDeferredLogImages(entry, cnt);
+  });
+}
+
+function wireSessionWindowLogClone(clone, sourceEntry) {
+  if (!clone || !clone.classList.contains('collapsible')) return;
+  wireCollapsibleLogEntry(clone, clone.querySelector('.log-content'), sourceEntry);
+}
 
 // Stable hash-to-hue mapping so each host gets its own visually
 // distinct badge color. Saturation is intentionally low so the pills
@@ -8463,6 +8499,7 @@ function appendLogEntryToSessionWindow(entry) {
   const clone = entry.cloneNode(true);
   clone.removeAttribute('id');
   clone.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
+  wireSessionWindowLogClone(clone, entry);
   win.log.appendChild(clone);
   while (win.log.children.length > SESSION_WINDOW_LOG_LIMIT) {
     win.log.removeChild(win.log.firstElementChild);
@@ -9061,25 +9098,7 @@ function renderLogEntry(c) {
     toggle.className = 'collapse-toggle';
     toggle.innerHTML = '<span class="arrow">\u25B8 more</span><span class="arrow-up">\u25BE less</span>';
     entry.appendChild(toggle);
-    entry.addEventListener('click', () => {
-      const expanding = !entry.classList.contains('expanded');
-      entry.classList.toggle('expanded');
-      if (expanding && _logImageStore.has(entry)) {
-        // Lazy-load: create <img> tags only on first expand
-        const imgs = _logImageStore.get(entry);
-        _logImageStore.delete(entry);
-        const gallery = document.createElement('div');
-        gallery.className = 'log-image-gallery';
-        for (const b64 of imgs) {
-          const img = document.createElement('img');
-          img.src = 'data:image/png;base64,' + b64;
-          img.className = 'log-screenshot';
-          img.loading = 'lazy';
-          gallery.appendChild(img);
-        }
-        cnt.appendChild(gallery);
-      }
-    });
+    wireCollapsibleLogEntry(entry, cnt);
   }
 
   appendLogEntryElement(entry);
