@@ -816,6 +816,7 @@ fn provider_request_item_count(raw: &serde_json::Value) -> Option<usize> {
 async fn drain_external_agent_events(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
+    bus_rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
     config: &DrainConfig<'_>,
     stats: &mut LoopStats,
 ) -> DrainOutcome {
@@ -823,7 +824,6 @@ async fn drain_external_agent_events(
 
     let approval_counter = std::sync::atomic::AtomicU64::new(1);
     let mut turns_in_round = 0usize;
-    let mut bus_rx = config.bus.subscribe();
     let local_session_id = config.session_id.clone();
     // Track whether we've been asked to interrupt this drain cycle. When the
     // agent finally emits TurnCompleted / Terminated we convert that into a
@@ -6089,6 +6089,10 @@ async fn run_with_presence(
     // waiting for the next task.
     let local_session_id = session_log_id(&session_log);
     let mut outer_bus_rx = bus.subscribe();
+    // Turn controls (steer / interrupt) need to be subscribed before the
+    // turn-start RPC. Otherwise an immediate follow-up can land during the
+    // handoff and miss the running-turn drain entirely.
+    let mut turn_bus_rx = bus.subscribe();
 
     // Outer loop: either a task envelope arrives (run the agent), a thread
     // action arrives (invoke it on the persistent agent), or the task
@@ -6151,6 +6155,14 @@ async fn run_with_presence(
                     target_native_message_count,
                     turns_to_drop,
                 },
+                Ok(AppEvent::InterruptRequested { session_id })
+                    if event_targets_session(&session_id, &local_session_id) =>
+                {
+                    // Drop idle interrupts so an old Stop action cannot
+                    // interrupt the next task that happens to start later.
+                    turn_bus_rx = bus.subscribe();
+                    continue;
+                }
                 // Any other bus event: skip, keep selecting. Lagged /
                 // Closed also fall through — task_rx close is the
                 // authoritative "we're done" signal.
@@ -6214,6 +6226,7 @@ async fn run_with_presence(
                         }));
                     }
                 }
+                turn_bus_rx = bus.subscribe();
                 continue;
             }
             OuterSignal::GeminiThreadAction { op, params: _ } => {
@@ -6247,6 +6260,7 @@ async fn run_with_presence(
                     success,
                     message,
                 });
+                turn_bus_rx = bus.subscribe();
                 continue;
             }
             OuterSignal::ConversationRollback {
@@ -6328,6 +6342,7 @@ async fn run_with_presence(
                         method: "truncated".into(),
                     });
                 }
+                turn_bus_rx = bus.subscribe();
                 continue;
             }
         };
@@ -6632,6 +6647,7 @@ async fn run_with_presence(
                     level: Some(types::LogLevel::Error),
                     turn: None,
                 });
+                turn_bus_rx = bus.subscribe();
                 continue;
             }
             if let Some(id) = envelope.steer_id.as_deref() {
@@ -6658,8 +6674,14 @@ async fn run_with_presence(
                 headless: false,
                 context_injection: &context_injection,
             };
-            match drain_external_agent_events(agent, event_rx, &drain_config, &mut cumulative_stats)
-                .await
+            match drain_external_agent_events(
+                agent,
+                event_rx,
+                &mut turn_bus_rx,
+                &drain_config,
+                &mut cumulative_stats,
+            )
+            .await
             {
                 DrainOutcome::TurnCompleted {
                     message,
@@ -6710,6 +6732,7 @@ async fn run_with_presence(
                     persistent_event_rx = None;
                 }
             }
+            turn_bus_rx = bus.subscribe();
         } else {
             // ── Native agent path ──
             if persistent_conv.is_none() {
@@ -7342,6 +7365,9 @@ async fn run_external_agent_mode(
         context_injection: &context_injection,
     };
     let mut idle_bus_rx = bus.subscribe();
+    // Subscribe while idle so a steer sent immediately after the prompt
+    // (before turn/start returns) is still available to the turn drain.
+    let mut turn_bus_rx = bus.subscribe();
 
     'outer: loop {
         let (turn_text, attachments, steer_id) = match next_turn.take() {
@@ -7375,6 +7401,15 @@ async fn run_external_agent_mode(
                                     &drain_config,
                                 )
                                 .await;
+                                turn_bus_rx = bus.subscribe();
+                            }
+                            Ok(AppEvent::InterruptRequested { session_id })
+                                if event_targets_session(&session_id, &live_session_id) =>
+                            {
+                                // Ignore idle interrupts and reset the turn
+                                // receiver so the next task does not inherit
+                                // a stale Stop request.
+                                turn_bus_rx = bus.subscribe();
                             }
                             Ok(_) => continue,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -7447,8 +7482,14 @@ async fn run_external_agent_mode(
             });
         }
 
-        match drain_external_agent_events(&mut agent, &mut event_rx, &drain_config, &mut stats)
-            .await
+        match drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut turn_bus_rx,
+            &drain_config,
+            &mut stats,
+        )
+        .await
         {
             DrainOutcome::TurnCompleted {
                 message,
@@ -7505,6 +7546,7 @@ async fn run_external_agent_mode(
                 break;
             }
         }
+        turn_bus_rx = bus.subscribe();
     }
 
     if let Err(e) = agent.shutdown().await {

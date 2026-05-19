@@ -5534,6 +5534,7 @@ const sessionMetadataById = new Map();
 const sessionUsageById = new Map();
 let latestGlobalUsage = null;
 const SESSION_WINDOW_LOG_LIMIT = 600;
+const SESSION_PENDING_ACTIVE_MS = 30000;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
 let steerCounter = 0;
@@ -7971,6 +7972,48 @@ function sessionPhaseClass(phase) {
   return '';
 }
 
+function hasPendingActiveSessionWindow(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win || !win.pendingActiveUntil) return false;
+  if (win.pendingActiveUntil <= Date.now()) {
+    win.pendingActiveUntil = 0;
+    return false;
+  }
+  return true;
+}
+
+function isSessionWindowEffectivelyActive(sessionId, fallbackPhase = currentPhase) {
+  const sid = String(sessionId || '').trim();
+  if (sid && hasPendingActiveSessionWindow(sid)) return true;
+  const phase = sid ? (sessionWindows.get(sid)?.phase || fallbackPhase) : fallbackPhase;
+  return isAgentActivePhase(phase);
+}
+
+function markSessionWindowPendingActive(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const expiresAt = Date.now() + SESSION_PENDING_ACTIVE_MS;
+  const win = ensureSessionWindow(sid, { phase: 'thinking', ended: false });
+  if (!win) return;
+  win.pendingActiveUntil = expiresAt;
+  updateSessionWindow(sid, { phase: 'thinking', ended: false });
+  if (sid === resolvePromptTargetSessionId()) {
+    setPhase('thinking');
+  } else {
+    updateTaskTargetChip();
+  }
+  setTimeout(() => {
+    const latest = sessionWindows.get(sid);
+    if (!latest || latest.pendingActiveUntil !== expiresAt) return;
+    latest.pendingActiveUntil = 0;
+    if (sid === resolvePromptTargetSessionId()) {
+      updateSubmitButtonLabel(currentPhase);
+      updateStopButtonVisibility(currentPhase);
+    }
+  }, SESSION_PENDING_ACTIVE_MS + 50);
+}
+
 function updateTaskTargetChip() {
   const chip = document.getElementById('task-target-chip');
   if (!chip) return;
@@ -8150,6 +8193,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     task,
     status,
     phase: normalizeSessionPhase(meta.phase || 'idle'),
+    pendingActiveUntil: 0,
     ended: false,
   };
   sessionWindows.set(sid, win);
@@ -8186,9 +8230,15 @@ function updateSessionWindow(sessionId, meta = {}) {
     win.task.textContent = meta.task;
     win.task.title = meta.task;
   }
-  if (meta.ended !== undefined) win.ended = !!meta.ended;
+  if (meta.ended !== undefined) {
+    win.ended = !!meta.ended;
+    if (win.ended) win.pendingActiveUntil = 0;
+  }
   if (meta.phase) {
     win.phase = normalizeSessionPhase(meta.phase);
+    if (win.phase === 'done' || win.phase === 'interrupted') {
+      win.pendingActiveUntil = 0;
+    }
     win.status.textContent = win.phase;
     win.status.className = 'session-window-status';
     const cls = sessionPhaseClass(win.phase);
@@ -18305,6 +18355,7 @@ window.submitActivityTask = function() {
   if (direct) msg.direct = true;
   if (attachments.length > 0) msg.attachments = attachments;
   app.send_server_action(msg);
+  if (targetSessionId) markSessionWindowPendingActive(targetSessionId);
   if (attachments.length > 0) {
     renderAttachmentReceipt(text, attachmentReceipt, 'Sent', targetSessionId);
     clearPendingAttachments();
@@ -18337,10 +18388,7 @@ window.submitActivityOrSteer = function() {
     return;
   }
   const targetSessionId = resolvePromptTargetSessionId();
-  const targetPhase = targetSessionId
-    ? (sessionWindows.get(targetSessionId)?.phase || currentPhase)
-    : currentPhase;
-  if (targetSessionId && isAgentActivePhase(targetPhase)) {
+  if (targetSessionId && isSessionWindowEffectivelyActive(targetSessionId, currentPhase)) {
     // Mid-turn steer path. JS generates the id locally and we render an
     // optimistic pending row immediately — the backend round-trips a
     // steer_requested echo that updates the same row by id (idempotent
@@ -18377,7 +18425,10 @@ window.submitActivityOrSteer = function() {
 function updateSubmitButtonLabel(phase) {
   const btn = document.getElementById('activity-submit-btn');
   if (!btn) return;
-  const active = isAgentActivePhase(phase);
+  const targetSessionId = resolvePromptTargetSessionId();
+  const active = targetSessionId
+    ? isSessionWindowEffectivelyActive(targetSessionId, phase)
+    : isAgentActivePhase(phase);
   if (active) {
     btn.innerHTML = '\u2197 Steer';
     btn.classList.add('steer-mode');
@@ -19382,7 +19433,10 @@ function updateStopButtonVisibility(phase) {
   const btn = document.getElementById('stop-btn');
   if (!btn) return;
   const key = (phase || '').toLowerCase();
-  const show = isAgentActivePhase(key);
+  const targetSessionId = resolvePromptTargetSessionId();
+  const show = targetSessionId
+    ? isSessionWindowEffectivelyActive(targetSessionId, key)
+    : isAgentActivePhase(key);
   btn.style.display = show ? '' : 'none';
   // Only `interrupting` should show the disabled "Interrupting..." label.
   // Every other phase (active or hidden) resets the button to its default.
