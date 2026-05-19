@@ -11,3 +11,5 @@ intendant.toml
 .codex
 .gemini/
 AGENTS.md
+/.worktrees/
+/workspace_files/
