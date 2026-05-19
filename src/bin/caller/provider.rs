@@ -2843,13 +2843,13 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
             Ok(Box::new(AnthropicProvider::new(ant, model, ctx, max_out)))
         }
         (Some(oai), Some(_ant), Some("openai")) | (Some(oai), Some(_ant), None) => {
-            let model = env::var("MODEL_NAME").unwrap_or_else(|_| "gpt-5.4".to_string());
+            let model = env::var("MODEL_NAME").unwrap_or_else(|_| "gpt-5.5".to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
             Ok(Box::new(OpenAIProvider::new(oai, model, ctx, max_out)))
         }
         (Some(oai), None, _) => {
-            let model = env::var("MODEL_NAME").unwrap_or_else(|_| "gpt-5.4".to_string());
+            let model = env::var("MODEL_NAME").unwrap_or_else(|_| "gpt-5.5".to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
             Ok(Box::new(OpenAIProvider::new(oai, model, ctx, max_out)))
