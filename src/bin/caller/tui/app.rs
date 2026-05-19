@@ -1461,6 +1461,24 @@ impl App {
                     );
                 }
             }
+            ControlMsg::EditUserMessage {
+                user_turn_index,
+                ref text,
+                ..
+            } => {
+                self.follow_up_textarea = None;
+                self.mode = AppMode::Normal;
+                self.current_phase = Phase::Thinking;
+                self.round += 1;
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Edit user turn {}: {}",
+                        user_turn_index,
+                        truncate_str(text, 80)
+                    ),
+                );
+            }
             ControlMsg::QueryDetail { scope, target } => {
                 self.log(LogLevel::Info, format!("Query detail request: {}", scope));
                 let result = match scope.as_str() {
@@ -2341,6 +2359,7 @@ impl App {
             | AppEvent::ContextSnapshot { .. }
             | AppEvent::StatusUpdate { .. }
             | AppEvent::LogEntry { .. }
+            | AppEvent::UserMessageLog { .. }
             | AppEvent::LiveUsageUpdate { .. }
             | AppEvent::DisplayMetrics { .. }
             | AppEvent::DisplayResize { .. }

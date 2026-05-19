@@ -582,6 +582,17 @@ pub enum AppEvent {
         turn: Option<usize>,
     },
 
+    /// Editable user-message log entry for managed external sessions.
+    ///
+    /// This keeps the ordinary log surface generic while carrying the session
+    /// and user-turn metadata the dashboard needs to request a Codex-style
+    /// rewind and replacement.
+    UserMessageLog {
+        session_id: Option<String>,
+        content: String,
+        user_turn_index: Option<u32>,
+    },
+
     /// Display transport pipeline metrics snapshot.
     DisplayMetrics {
         snapshot: crate::display::DisplayMetricsSnapshot,
@@ -986,6 +997,21 @@ pub enum ControlMsg {
         /// (or `Some(false)`) means route through presence as before.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         direct: Option<bool>,
+    },
+    /// Replace a previous user message by rewinding the target session to the
+    /// selected user turn and submitting replacement text.
+    ///
+    /// Currently this is implemented for managed Codex-backed sessions, whose
+    /// app-server protocol exposes thread rollback.
+    EditUserMessage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        user_turn_index: u32,
+        text: String,
+        /// Frame/upload IDs attached via the dashboard. These are resolved
+        /// just like StartTask.attachments before the replacement turn is sent.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<String>,
     },
     TakeDisplay {
         display_id: u32,
@@ -1565,6 +1591,20 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             source: source.clone(),
             content: content.clone(),
             turn: *turn,
+            session_id: None,
+            user_turn_index: None,
+        }),
+        AppEvent::UserMessageLog {
+            session_id,
+            content,
+            user_turn_index,
+        } => Some(OutboundEvent::LogEntry {
+            level: "info".to_string(),
+            source: "User".to_string(),
+            content: content.clone(),
+            turn: None,
+            session_id: session_id.clone(),
+            user_turn_index: *user_turn_index,
         }),
         AppEvent::RecordingStarted { stream_name } => Some(OutboundEvent::RecordingStarted {
             stream_name: stream_name.clone(),

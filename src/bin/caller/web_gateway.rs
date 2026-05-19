@@ -2843,7 +2843,7 @@ fn external_session_entries_from_home(
     source: &str,
     session_id: &str,
 ) -> Option<Vec<serde_json::Value>> {
-    let mut entries = Vec::new();
+    let mut entries: Vec<serde_json::Value> = Vec::new();
 
     match source {
         "codex" => {
@@ -2851,19 +2851,50 @@ fn external_session_entries_from_home(
             let Ok(contents) = std::fs::read_to_string(&path) else {
                 return None;
             };
+            let mut user_turn_index = 0u32;
             for line in contents.lines() {
                 let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
                     continue;
                 };
+                if obj.get("type").and_then(|v| v.as_str()) == Some("event_msg") {
+                    if let Some(payload) = obj.get("payload") {
+                        if payload.get("type").and_then(|v| v.as_str())
+                            == Some("thread_rolled_back")
+                        {
+                            let turns = payload
+                                .get("num_turns")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            for _ in 0..turns {
+                                while let Some(entry) = entries.pop() {
+                                    if entry.get("source").and_then(|v| v.as_str()) == Some("User")
+                                    {
+                                        user_turn_index = user_turn_index.saturating_sub(1);
+                                        break;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
                 let ts = value_str(&obj, "timestamp").unwrap_or_default();
                 if let Some(payload) = obj.get("payload") {
                     if let Some((role, text)) = codex_payload_text(payload) {
-                        entries.push(serde_json::json!({
+                        if role == "user" && is_codex_injected_user_text(&text) {
+                            continue;
+                        }
+                        let mut entry = serde_json::json!({
                             "ts": ts,
                             "level": if role == "assistant" { "model" } else { "info" },
-                            "source": "codex",
+                            "source": if role == "user" { "User" } else { "codex" },
                             "content": text,
-                        }));
+                        });
+                        if role == "user" {
+                            user_turn_index = user_turn_index.saturating_add(1);
+                            entry["user_turn_index"] = serde_json::json!(user_turn_index);
+                        }
+                        entries.push(entry);
                     }
                 }
             }
@@ -3009,6 +3040,8 @@ fn external_session_activity_replay_from_home_with_attach(
             "level": entry.get("level").and_then(|v| v.as_str()).unwrap_or("info"),
             "source": entry.get("source").and_then(|v| v.as_str()).unwrap_or(source),
             "content": content,
+            "session_id": session_id,
+            "user_turn_index": entry.get("user_turn_index").and_then(|v| v.as_u64()),
         }));
     }
 
@@ -12023,8 +12056,9 @@ mod tests {
         assert!(entries.iter().any(|entry| {
             entry["event"] == "log_entry"
                 && entry["level"] == "info"
-                && entry["source"] == "codex"
+                && entry["source"] == "User"
                 && entry["content"] == "What happens on refresh?"
+                && entry["user_turn_index"] == 1
         }));
         assert!(entries.iter().any(|entry| {
             entry["event"] == "log_entry"
