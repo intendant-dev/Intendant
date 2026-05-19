@@ -5681,6 +5681,7 @@ let logEntryCount = 0;
 let commandOutputGroupSeq = 0;
 let activeCommandOutputGroup = null;
 const commandOutputGroups = new Map();
+const commandOutputGroupByEntry = new WeakMap();
 let currentPhase = 'idle';
 let currentSessionFullId = '';
 let foregroundSessionFullId = '';
@@ -8128,6 +8129,7 @@ function renderTurnSeparator(turn) {
 // Stores base64 image data keyed by DOM element — lazy-loaded on expand
 const _logImageStore = new WeakMap();
 const _wiredCollapsibleLogEntries = new WeakSet();
+const _wiredCommandOutputLogEntries = new WeakSet();
 
 function appendDeferredLogImages(entry, cnt) {
   if (!entry || !cnt || !_logImageStore.has(entry)) return;
@@ -8160,7 +8162,12 @@ function wireCollapsibleLogEntry(entry, cnt, sourceEntry = null) {
 }
 
 function wireSessionWindowLogClone(clone, sourceEntry) {
-  if (!clone || !clone.classList.contains('collapsible')) return;
+  if (!clone) return;
+  if (clone.classList.contains('command-output-group')) {
+    wireCommandOutputGroupClone(clone, sourceEntry);
+    return;
+  }
+  if (!clone.classList.contains('collapsible')) return;
   wireCollapsibleLogEntry(clone, clone.querySelector('.log-content'), sourceEntry);
 }
 
@@ -8937,14 +8944,63 @@ function appendLogEntryElement(entry) {
   if (autoScroll) stream.scrollTop = stream.scrollHeight;
 }
 
-function updateCommandOutputSummary(group) {
+function commandOutputCloneViews(group) {
+  if (!group || !Array.isArray(group.clones)) return [];
+  group.clones = group.clones.filter(view => view.entry?.isConnected);
+  return group.clones;
+}
+
+function commandOutputSummaryHtml(group) {
   const parts = [];
   if (group.chunks > 0) parts.push(group.chunks + ' chunk' + (group.chunks === 1 ? '' : 's'));
   if (group.lines > 0) parts.push(group.lines + ' line' + (group.lines === 1 ? '' : 's'));
   if (group.bytes > 0) parts.push(formatCompactBytes(group.bytes));
   if (group.warns > 0) parts.push(`<span class="output-warn">${group.warns} warning${group.warns === 1 ? '' : 's'}</span>`);
   const detail = parts.length ? parts.join(' · ') : 'ready';
-  group.summary.innerHTML = `<span class="status-dot"></span><span>output · ${detail}</span>`;
+  return `<span class="status-dot"></span><span>output · ${detail}</span>`;
+}
+
+function updateCommandOutputSummary(group) {
+  const html = commandOutputSummaryHtml(group);
+  group.summary.innerHTML = html;
+  for (const view of commandOutputCloneViews(group)) {
+    if (view.summary) view.summary.innerHTML = html;
+  }
+}
+
+function appendCommandOutputText(body, text) {
+  if (!body || !text) return;
+  const pre = document.createElement('pre');
+  pre.className = 'command-output-pre';
+  const code = document.createElement('code');
+  code.innerHTML = highlightCommandOutput(text);
+  pre.appendChild(code);
+  body.appendChild(pre);
+}
+
+function wireCommandOutputGroupClone(clone, sourceEntry) {
+  if (!clone || _wiredCommandOutputLogEntries.has(clone)) return;
+  const group = sourceEntry ? commandOutputGroupByEntry.get(sourceEntry) : null;
+  if (!group) return;
+  const view = {
+    entry: clone,
+    summary: clone.querySelector('.command-output-summary'),
+    body: clone.querySelector('.command-output-body'),
+    loaded: false,
+    loading: false,
+  };
+  if (!view.summary || !view.body) return;
+
+  _wiredCommandOutputLogEntries.add(clone);
+  if (!Array.isArray(group.clones)) group.clones = [];
+  group.clones.push(view);
+  view.summary.innerHTML = group.summary.innerHTML;
+  clone.classList.toggle('finalized', group.finalized);
+  clone.classList.toggle('expanded', group.entry.classList.contains('expanded'));
+  if (group.finalized) {
+    view.body.innerHTML = '';
+  }
+  clone.addEventListener('click', () => toggleCommandOutputView(group, view));
 }
 
 function appendCommandOutputChunk(group, c) {
@@ -8960,12 +9016,12 @@ function appendCommandOutputChunk(group, c) {
   if ((c.level || '').toLowerCase() === 'warn') group.warns += 1;
   updateCommandOutputSummary(group);
   if (!group.finalized && text) {
-    const pre = document.createElement('pre');
-    pre.className = 'command-output-pre';
-    const code = document.createElement('code');
-    code.innerHTML = highlightCommandOutput(text);
-    pre.appendChild(code);
-    group.body.appendChild(pre);
+    appendCommandOutputText(group.body, text);
+    for (const view of commandOutputCloneViews(group)) {
+      if (view.entry.classList.contains('expanded')) {
+        appendCommandOutputText(view.body, text);
+      }
+    }
   }
 }
 
@@ -9002,7 +9058,9 @@ function renderCommandOutputEntry(c) {
       finalized: false,
       loaded: false,
       loading: false,
+      clones: [],
     };
+    commandOutputGroupByEntry.set(entry, group);
     entry.addEventListener('click', () => toggleCommandOutputGroup(group));
     commandOutputGroups.set(groupId, group);
     activeCommandOutputGroup = group;
@@ -9022,49 +9080,59 @@ function finalizeActiveCommandOutputGroup() {
   group.entry.classList.remove('expanded');
   group.body.innerHTML = '';
   group.loaded = false;
+  group.loading = false;
+  for (const view of commandOutputCloneViews(group)) {
+    view.entry.classList.add('finalized');
+    view.entry.classList.remove('expanded');
+    view.body.innerHTML = '';
+    view.loaded = false;
+    view.loading = false;
+  }
   activeCommandOutputGroup = null;
 }
 
-async function toggleCommandOutputGroup(group) {
-  if (!group.finalized) return;
-  const expanding = !group.entry.classList.contains('expanded');
-  group.entry.classList.toggle('expanded', expanding);
-  if (!expanding) {
-    group.body.innerHTML = '';
-    group.loaded = false;
+async function loadCommandOutputIntoBody(group, body) {
+  if (!group.outputIds.length) {
+    body.textContent = 'Output is not available for lazy loading.';
     return;
   }
-  if (group.loaded || group.loading) return;
-  group.loading = true;
-  group.body.textContent = 'Loading output...';
-  try {
-    if (!group.outputIds.length) {
-      group.body.textContent = 'Output is not available for lazy loading.';
-      return;
-    }
-    const resp = await authedFetch('/api/session/current/agent-output?ids=' + encodeURIComponent(group.outputIds.join(',')));
-    const json = await resp.json();
-    if (!resp.ok) throw new Error(json.error || resp.statusText);
-    group.body.innerHTML = '';
-    for (const out of (json.outputs || [])) {
-      const text = [out.stdout || '', out.stderr || ''].filter(Boolean).join(out.stdout && out.stderr ? '\n' : '');
-      if (!text) continue;
-      const pre = document.createElement('pre');
-      pre.className = 'command-output-pre';
-      const code = document.createElement('code');
-      code.innerHTML = highlightCommandOutput(text);
-      pre.appendChild(code);
-      group.body.appendChild(pre);
-    }
-    if (!group.body.childElementCount) {
-      group.body.textContent = 'No persisted output found.';
-    }
-    group.loaded = true;
-  } catch (e) {
-    group.body.textContent = 'Could not load output: ' + e;
-  } finally {
-    group.loading = false;
+  const resp = await authedFetch('/api/session/current/agent-output?ids=' + encodeURIComponent(group.outputIds.join(',')));
+  const json = await resp.json();
+  if (!resp.ok) throw new Error(json.error || resp.statusText);
+  body.innerHTML = '';
+  for (const out of (json.outputs || [])) {
+    const text = [out.stdout || '', out.stderr || ''].filter(Boolean).join(out.stdout && out.stderr ? '\n' : '');
+    appendCommandOutputText(body, text);
   }
+  if (!body.childElementCount) {
+    body.textContent = 'No persisted output found.';
+  }
+}
+
+async function toggleCommandOutputView(group, view) {
+  if (!group.finalized || !view?.entry || !view?.body) return;
+  const expanding = !view.entry.classList.contains('expanded');
+  view.entry.classList.toggle('expanded', expanding);
+  if (!expanding) {
+    view.body.innerHTML = '';
+    view.loaded = false;
+    return;
+  }
+  if (view.loaded || view.loading) return;
+  view.loading = true;
+  view.body.textContent = 'Loading output...';
+  try {
+    await loadCommandOutputIntoBody(group, view.body);
+    view.loaded = true;
+  } catch (e) {
+    view.body.textContent = 'Could not load output: ' + e;
+  } finally {
+    view.loading = false;
+  }
+}
+
+async function toggleCommandOutputGroup(group) {
+  await toggleCommandOutputView(group, group);
 }
 
 function shouldRenderMarkdownLog(c) {
