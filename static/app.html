@@ -1020,6 +1020,23 @@ html, body {
   background: var(--session-badge-bg, rgba(137, 180, 250, 0.08));
 }
 .task-target-chip:focus { outline: 1px solid var(--blue); outline-offset: 1px; }
+.task-new-session-btn {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.task-new-session-btn:hover {
+  border-color: var(--green);
+  color: var(--green);
+}
+.task-new-session-btn:focus { outline: 1px solid var(--blue); outline-offset: 1px; }
 .edit-message-chip {
   display: flex;
   align-items: center;
@@ -2177,14 +2194,27 @@ html, body {
 }
 .sessions-search input:focus { outline: none; border-color: var(--blue); }
 .sessions-search input::placeholder { color: var(--overlay0); }
+.sessions-subtab-panes {
+  background: transparent;
+}
+.sessions-new-pane {
+  padding: 16px 4px;
+}
+.sessions-new-panel {
+  max-width: 860px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.sessions-new-panel .sessions-title {
+  margin-bottom: 2px;
+}
 .sessions-new-task {
   display: flex;
-  align-items: flex-end;
-  gap: 6px;
-  flex: 1 1 520px;
-  justify-content: flex-end;
-  margin-left: auto;
-  min-width: min(100%, 520px);
+  align-items: stretch;
+  gap: 10px;
+  flex-direction: column;
+  min-width: 0;
 }
 .sessions-new-session-field {
   display: flex;
@@ -2197,12 +2227,10 @@ html, body {
   text-transform: uppercase;
 }
 .sessions-new-session-task {
-  flex: 1 1 220px;
-  max-width: 300px;
+  width: 100%;
 }
 .sessions-new-session-project {
-  flex: 1 1 280px;
-  max-width: 430px;
+  width: 100%;
 }
 .sessions-project-label {
   color: var(--overlay0);
@@ -2214,8 +2242,8 @@ html, body {
 }
 .sessions-new-task-input {
   width: 100%;
-  min-height: 28px;
-  max-height: 96px;
+  min-height: 84px;
+  max-height: 180px;
   padding: 4px 8px;
   border: 1px solid var(--surface1);
   border-radius: 4px;
@@ -2284,6 +2312,7 @@ html, body {
 .sessions-project-status.warn { color: var(--yellow); }
 .sessions-project-status.error { color: var(--red); }
 .sessions-start-btn {
+  align-self: flex-start;
   padding: 4px 12px;
   border: 1px solid var(--green);
   border-radius: 4px;
@@ -4679,7 +4708,7 @@ html, body {
   .usage-cards { flex-direction: column; }
   .sessions-header { align-items: stretch; }
   .sessions-search { flex: 1 1 100%; max-width: none; margin-left: 0; }
-  .sessions-new-task { width: 100%; min-width: 0; margin-left: 0; flex-wrap: wrap; justify-content: stretch; }
+  .sessions-new-task { width: 100%; min-width: 0; }
   .sessions-new-session-field { flex: 1 1 100%; max-width: none; }
   .sessions-project-row { flex-wrap: wrap; }
   .sessions-project-browse, .sessions-project-create-label { flex: 0 0 auto; }
@@ -4783,6 +4812,7 @@ html, body {
     </div>
     <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
     <button id="task-target-chip" class="task-target-chip" onclick="focusForegroundSessionWindow()" title="Prompt target">New session</button>
+    <button id="task-new-session-btn" class="task-new-session-btn" onclick="openNewSessionFromPrompt()" title="Create a new session">New</button>
     <div id="edit-message-chip" class="edit-message-chip hidden" title="Editing a previous user message">
       <span id="edit-message-label">Editing</span>
       <button type="button" id="edit-message-cancel" title="Cancel edit">x</button>
@@ -5335,87 +5365,100 @@ html, body {
     <!-- Sessions Tab -->
     <div id="tab-sessions" class="tab-pane">
       <div class="sessions-container">
-        <div class="sessions-header">
-          <span class="sessions-title">Recent Sessions</span>
-          <label class="sessions-search" for="sessions-search">
-            Search
-            <input type="search" id="sessions-search" placeholder="ID, task, model, path..." autocomplete="off" spellcheck="false">
-          </label>
-          <div class="sessions-new-task">
-            <label class="sessions-new-session-field sessions-new-session-task" for="new-session-input">
-              New session
-              <textarea id="new-session-input" class="sessions-new-task-input" rows="1" placeholder="Initial message..."></textarea>
-            </label>
-            <div class="sessions-new-session-field sessions-new-session-project">
-              <label class="sessions-project-label" for="new-session-project-root">Project</label>
-              <div class="sessions-project-row">
-                <input id="new-session-project-root" class="sessions-project-input" type="text" autocomplete="off" spellcheck="false" list="new-session-project-options" placeholder="/path/to/project">
-                <button type="button" class="sessions-project-browse" onclick="openProjectDirectoryPicker()">Browse</button>
-                <label class="sessions-project-create-label" id="new-session-create-project-dir-wrap" title="Create this directory on the Intendant host before starting">
-                  <input id="new-session-create-project-dir" type="checkbox">
-                  Create
+        <div class="subtabs" id="sessions-subtabs">
+          <button class="subtab-btn active" data-sessions-tab="recent">Recent</button>
+          <button class="subtab-btn" data-sessions-tab="new">New Session</button>
+        </div>
+        <div class="subtab-panes sessions-subtab-panes">
+          <div class="subtab-pane active" id="sessions-pane-recent">
+            <div class="sessions-header">
+              <span class="sessions-title">Recent Sessions</span>
+              <label class="sessions-search" for="sessions-search">
+                Search
+                <input type="search" id="sessions-search" placeholder="ID, task, model, path..." autocomplete="off" spellcheck="false">
+              </label>
+              <button class="sessions-refresh" onclick="loadSessions()" style="margin-left:8px">Refresh</button>
+              <div class="sessions-filter" id="sessions-filter">
+                <label><input type="checkbox" id="filter-abandoned" checked> abandoned</label>
+                <label><input type="checkbox" id="filter-idle" checked> idle</label>
+              </div>
+              <div class="sessions-sort">
+                <label>Sort
+                  <select id="sort-sessions">
+                    <option value="updated-desc" selected>Date changed (newest)</option>
+                    <option value="updated-asc">Date changed (oldest)</option>
+                    <option value="created-desc">Creation date (newest)</option>
+                    <option value="created-asc">Creation date (oldest)</option>
+                    <option value="cost-desc">Cost (highest)</option>
+                    <option value="cost-asc">Cost (lowest)</option>
+                    <option value="size-desc">Size (largest)</option>
+                    <option value="size-asc">Size (smallest)</option>
+                    <option value="turns-desc">Turns (most)</option>
+                    <option value="turns-asc">Turns (fewest)</option>
+                  </select>
                 </label>
               </div>
-              <div id="new-session-project-status" class="sessions-project-status"></div>
-              <datalist id="new-session-project-options"></datalist>
             </div>
-            <button class="sessions-start-btn" onclick="startNewSession()">Start session</button>
-          </div>
-          <button class="sessions-refresh" onclick="loadSessions()" style="margin-left:8px">Refresh</button>
-          <div class="sessions-filter" id="sessions-filter">
-            <label><input type="checkbox" id="filter-abandoned" checked> abandoned</label>
-            <label><input type="checkbox" id="filter-idle" checked> idle</label>
-          </div>
-          <div class="sessions-sort">
-            <label>Sort
-              <select id="sort-sessions">
-                <option value="updated-desc" selected>Date changed (newest)</option>
-                <option value="updated-asc">Date changed (oldest)</option>
-                <option value="created-desc">Creation date (newest)</option>
-                <option value="created-asc">Creation date (oldest)</option>
-                <option value="cost-desc">Cost (highest)</option>
-                <option value="cost-asc">Cost (lowest)</option>
-                <option value="size-desc">Size (largest)</option>
-                <option value="size-asc">Size (smallest)</option>
-                <option value="turns-desc">Turns (most)</option>
-                <option value="turns-asc">Turns (fewest)</option>
-              </select>
-            </label>
-          </div>
-        </div>
-        <div class="sessions-aggregate" id="sessions-aggregate"></div>
-        <div class="sessions-list" id="sessions-list">
-          <div class="empty-state">Loading sessions...</div>
-        </div>
-        <div class="session-detail" id="session-detail" style="display:none">
-          <div class="session-detail-header">
-            <button class="session-back-btn" onclick="closeSessionDetail()">&larr; Back</button>
-            <span class="session-detail-title" id="session-detail-title"></span>
-          </div>
-          <div class="session-detail-body" id="session-detail-body">
-            <div class="sd-section" id="sd-recordings" style="display:none">
-              <div class="sd-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
-                <span class="sd-section-chevron">&#x25BE;</span>
-                <span class="sd-section-title">Recordings</span>
-                <span class="sd-section-badge" id="sd-recordings-badge"></span>
-              </div>
-              <div class="sd-section-content" id="session-detail-recordings"></div>
+            <div class="sessions-aggregate" id="sessions-aggregate"></div>
+            <div class="sessions-list" id="sessions-list">
+              <div class="empty-state">Loading sessions...</div>
             </div>
-            <div class="sd-section" id="sd-frames" style="display:none">
-              <div class="sd-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
-                <span class="sd-section-chevron">&#x25BE;</span>
-                <span class="sd-section-title">Frames</span>
-                <span class="sd-section-badge" id="sd-frames-badge"></span>
+            <div class="session-detail" id="session-detail" style="display:none">
+              <div class="session-detail-header">
+                <button class="session-back-btn" onclick="closeSessionDetail()">&larr; Back</button>
+                <span class="session-detail-title" id="session-detail-title"></span>
               </div>
-              <div class="sd-section-content" id="session-detail-frames"></div>
+              <div class="session-detail-body" id="session-detail-body">
+                <div class="sd-section" id="sd-recordings" style="display:none">
+                  <div class="sd-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
+                    <span class="sd-section-chevron">&#x25BE;</span>
+                    <span class="sd-section-title">Recordings</span>
+                    <span class="sd-section-badge" id="sd-recordings-badge"></span>
+                  </div>
+                  <div class="sd-section-content" id="session-detail-recordings"></div>
+                </div>
+                <div class="sd-section" id="sd-frames" style="display:none">
+                  <div class="sd-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
+                    <span class="sd-section-chevron">&#x25BE;</span>
+                    <span class="sd-section-title">Frames</span>
+                    <span class="sd-section-badge" id="sd-frames-badge"></span>
+                  </div>
+                  <div class="sd-section-content" id="session-detail-frames"></div>
+                </div>
+                <div class="sd-section" id="sd-logs">
+                  <div class="sd-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
+                    <span class="sd-section-chevron">&#x25BE;</span>
+                    <span class="sd-section-title">Logs</span>
+                    <span class="sd-section-badge" id="sd-logs-badge"></span>
+                  </div>
+                  <div class="sd-section-content session-detail-logs" id="session-detail-logs"></div>
+                </div>
+              </div>
             </div>
-            <div class="sd-section" id="sd-logs">
-              <div class="sd-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
-                <span class="sd-section-chevron">&#x25BE;</span>
-                <span class="sd-section-title">Logs</span>
-                <span class="sd-section-badge" id="sd-logs-badge"></span>
+          </div>
+          <div class="subtab-pane sessions-new-pane" id="sessions-pane-new">
+            <div class="sessions-new-panel">
+              <span class="sessions-title">New Session</span>
+              <div class="sessions-new-task">
+                <label class="sessions-new-session-field sessions-new-session-task" for="new-session-input">
+                  Initial message
+                  <textarea id="new-session-input" class="sessions-new-task-input" rows="4" placeholder="Initial message..."></textarea>
+                </label>
+                <div class="sessions-new-session-field sessions-new-session-project">
+                  <label class="sessions-project-label" for="new-session-project-root">Project</label>
+                  <div class="sessions-project-row">
+                    <input id="new-session-project-root" class="sessions-project-input" type="text" autocomplete="off" spellcheck="false" list="new-session-project-options" placeholder="/path/to/project">
+                    <button type="button" class="sessions-project-browse" onclick="openProjectDirectoryPicker()">Browse</button>
+                    <label class="sessions-project-create-label" id="new-session-create-project-dir-wrap" title="Create this directory on the Intendant host before starting">
+                      <input id="new-session-create-project-dir" type="checkbox">
+                      Create
+                    </label>
+                  </div>
+                  <div id="new-session-project-status" class="sessions-project-status"></div>
+                  <datalist id="new-session-project-options"></datalist>
+                </div>
+                <button class="sessions-start-btn" onclick="startNewSession()">Start session</button>
               </div>
-              <div class="sd-section-content session-detail-logs" id="session-detail-logs"></div>
             </div>
           </div>
         </div>
@@ -14389,6 +14432,11 @@ document.querySelectorAll('#tab-settings .subtab-btn[data-settings-tab]').forEac
   btn.addEventListener('click', () => routeTo('settings', btn.dataset.settingsTab));
 });
 
+// Sessions sub-tab switching (Recent | New Session).
+document.querySelectorAll('#sessions-subtabs .subtab-btn[data-sessions-tab]').forEach(btn => {
+  btn.addEventListener('click', () => routeTo('sessions', btn.dataset.sessionsTab));
+});
+
 // Activity sub-tab switching (Log | Changes).
 document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').forEach(btn => {
   btn.addEventListener('click', () => routeTo('activity', btn.dataset.activityTab));
@@ -14418,6 +14466,7 @@ const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'sessions', 'se
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['tui', 'shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
+const VALID_SESSIONS_SUBTABS = ['recent', 'new'];
 
 function parseRoute() {
   const raw = window.location.hash.slice(1); // strip leading '#'
@@ -14431,6 +14480,9 @@ function parseRoute() {
     return { tab, subtab: null };
   }
   if (tab === 'settings' && subtab && !VALID_SETTINGS_SUBTABS.includes(subtab)) {
+    return { tab, subtab: null };
+  }
+  if (tab === 'sessions' && subtab && !VALID_SESSIONS_SUBTABS.includes(subtab)) {
     return { tab, subtab: null };
   }
   return { tab, subtab: subtab || null };
@@ -14456,6 +14508,8 @@ function routeTo(tab, subtab) {
     switchTerminalSubtab(subtab);
   } else if (tab === 'settings' && subtab) {
     switchSettingsSubtab(subtab);
+  } else if (tab === 'sessions') {
+    switchSessionsSubtab(subtab || 'recent');
   }
 }
 
@@ -14480,6 +14534,8 @@ function applyCurrentRoute() {
     switchTerminalSubtab(subtab);
   } else if (tab === 'settings' && subtab) {
     switchSettingsSubtab(subtab);
+  } else if (tab === 'sessions') {
+    switchSessionsSubtab(subtab || 'recent');
   }
 }
 
@@ -14658,6 +14714,48 @@ function switchActivitySubtab(name) {
     refreshControlPane();
   }
 }
+
+let activeSessionsSubtab = 'recent';
+
+function focusNewSessionInput() {
+  const input = document.getElementById('new-session-input');
+  if (!input) return;
+  resizeTaskTextarea(input);
+  input.focus();
+  if (typeof input.setSelectionRange === 'function') {
+    const end = input.value.length;
+    input.setSelectionRange(end, end);
+  }
+}
+
+function switchSessionsSubtab(name) {
+  const next = VALID_SESSIONS_SUBTABS.includes(name) ? name : 'recent';
+  activeSessionsSubtab = next;
+  document.querySelectorAll('#sessions-subtabs .subtab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.sessionsTab === next);
+  });
+  document.querySelectorAll('#tab-sessions .sessions-subtab-panes > .subtab-pane').forEach(pane => {
+    pane.classList.toggle('active', pane.id === `sessions-pane-${next}`);
+  });
+  if (next === 'new') {
+    updateNewSessionProjectPrefills();
+    requestAnimationFrame(focusNewSessionInput);
+  } else if (!sessionsLoaded) {
+    loadSessions();
+  }
+}
+
+function openNewSessionFromPrompt() {
+  const source = document.getElementById('activity-task-input');
+  const dest = document.getElementById('new-session-input');
+  const draft = source?.value || '';
+  if (dest && draft.trim()) {
+    dest.value = draft;
+  }
+  routeTo('sessions', 'new');
+  requestAnimationFrame(focusNewSessionInput);
+}
+window.openNewSessionFromPrompt = openNewSessionFromPrompt;
 
 const SETTINGS_SUBTAB_KEY = 'intendant_settings_subtab';
 let activeSettingsSubtab =
