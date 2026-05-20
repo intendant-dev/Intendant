@@ -2506,6 +2506,21 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.session-detail-action-btn {
+  flex: 0 0 auto;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  padding: 4px 10px;
+  color: var(--subtext0);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.session-detail-action-btn:hover {
+  border-color: var(--blue);
+  color: var(--blue);
+}
 .session-detail-body { flex: 1; overflow-y: auto; display: flex; flex-direction: column; min-height: 0; }
 .sd-section { border-bottom: 1px solid var(--surface0); }
 .sd-section:last-child { border-bottom: none; flex: 1; display: flex; flex-direction: column; min-height: 200px; }
@@ -2583,7 +2598,7 @@ html, body {
   background: var(--surface0);
   border: 1px solid var(--surface1);
   border-radius: 6px;
-  padding: 9px 124px 9px 12px;
+  padding: 9px 270px 9px 12px;
   cursor: default;
   position: relative;
   transition: border-color 0.15s;
@@ -2772,7 +2787,8 @@ html, body {
   right: 12px;
   top: 34px;
 }
-.sc-delete-btn {
+.sc-delete-btn,
+.sc-rename-btn {
   font-size: 11px;
   padding: 2px 7px;
   border: 1px solid var(--surface1);
@@ -2785,6 +2801,10 @@ html, body {
 .sc-delete-btn:hover {
   border-color: var(--red);
   color: var(--red);
+}
+.sc-rename-btn:hover {
+  border-color: var(--blue);
+  color: var(--blue);
 }
 .sc-resume-btn {
   font-size: 11px;
@@ -5514,7 +5534,7 @@ html, body {
               <div class="sessions-toolbar">
                 <label class="sessions-search" for="sessions-search">
                   <span>Search</span>
-                  <input type="search" id="sessions-search" placeholder="ID, task, model, path; logs if detailed..." autocomplete="off" spellcheck="false">
+                  <input type="search" id="sessions-search" placeholder="ID, name, task, model, path; logs with Deep search..." autocomplete="off" spellcheck="false">
                 </label>
                 <label class="sessions-control">Source
                   <select id="filter-session-source">
@@ -5536,7 +5556,7 @@ html, body {
                     <option value="interrupted">Interrupted</option>
                   </select>
                 </label>
-                <label class="sessions-toggle"><input type="checkbox" id="sessions-detailed-search"> Detailed logs</label>
+                <label class="sessions-toggle" title="Search session log content on the server, not just summary fields. Slower and capped for dashboard responsiveness."><input type="checkbox" id="sessions-detailed-search"> Deep search</label>
                 <label class="sessions-sort">Sort
                   <select id="sort-sessions">
                     <option value="updated-desc" selected>Date changed (newest)</option>
@@ -5562,6 +5582,7 @@ html, body {
               <div class="session-detail-header">
                 <button class="session-back-btn" onclick="closeSessionDetail()">&larr; Back</button>
                 <span class="session-detail-title" id="session-detail-title"></span>
+                <button class="session-detail-action-btn" id="session-detail-rename" type="button" title="Rename this session">Rename</button>
               </div>
               <div class="session-detail-body" id="session-detail-body">
                 <div class="sd-section" id="sd-recordings" style="display:none">
@@ -6266,6 +6287,7 @@ const SESSION_WINDOW_LOG_LIMIT = 600;
 const SESSION_PENDING_ACTIVE_MS = 30000;
 const SESSION_METADATA_REFRESH_MS = 2500;
 let sessionMetadataRefreshTimer = null;
+let currentSessionDetail = null;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
 let steerCounter = 0;
@@ -8532,7 +8554,7 @@ function handleSessionRenameResult(evt) {
   const sid = String(evt.session_id || '').trim();
   if (evt.success) {
     const name = compactSessionText(evt.name);
-    if (sid && name) updateSessionWindow(sid, { name, source: evt.source || undefined });
+    if (sid && name) applySessionRenameToUi(sid, evt.source || '', name);
     refreshSessionWindowMetadata(600);
   }
   showControlToast(
@@ -9130,6 +9152,67 @@ function copyTextToClipboard(text) {
   });
 }
 
+function sessionIdentityMatches(session, sessionId, source = '') {
+  if (!session || !sessionId) return false;
+  const sid = String(sessionId || '').trim();
+  if (String(session.session_id || '').trim() !== sid && String(session.resume_id || '').trim() !== sid) {
+    return false;
+  }
+  const normalizedSource = String(source || '').trim();
+  return !normalizedSource || String(session.source || 'intendant').trim() === normalizedSource;
+}
+
+function applySessionRenameToUi(sessionId, source, name) {
+  const sid = String(sessionId || '').trim();
+  const displayName = compactSessionText(name);
+  if (!sid || !displayName) return;
+  const normalizedSource = String(source || '').trim();
+  for (const session of _cachedSessions) {
+    if (sessionIdentityMatches(session, sid, normalizedSource)) {
+      session.name = displayName;
+    }
+  }
+  const previous = sessionMetadataById.get(sid) || {};
+  sessionMetadataById.set(sid, {
+    ...previous,
+    name: displayName,
+    ...(normalizedSource ? { source: normalizedSource } : {}),
+  });
+  updateSessionWindow(sid, { name: displayName, source: normalizedSource || undefined });
+  if (currentSessionDetail && sessionIdentityMatches(currentSessionDetail, sid, normalizedSource)) {
+    currentSessionDetail = { ...currentSessionDetail, name: displayName };
+    renderSessionDetailTitle(currentSessionDetail);
+  }
+  if (sessionsLoaded) _refilterSessions();
+}
+
+function requestSessionRename(sessionOrId, sourceArg = '') {
+  const session = typeof sessionOrId === 'object'
+    ? sessionOrId
+    : { session_id: sessionOrId, source: sourceArg };
+  const sid = String(session?.session_id || session?.resume_id || '').trim();
+  if (!sid) {
+    showControlToast('error', 'Rename session failed: session ID is missing');
+    return false;
+  }
+  const source = String(sourceArg || session.source || 'intendant').trim();
+  const cached = sessionMetadataById.get(sid) || {};
+  const currentName = compactSessionText(session.name || cached.name);
+  const name = window.prompt('Session name:', currentName);
+  if (name === null) return false;
+  if (!name.trim()) {
+    showControlToast('error', 'Rename session failed: session name is required');
+    return false;
+  }
+  dispatchControlMsg({
+    action: 'rename_session',
+    session_id: sid,
+    source,
+    name: name.trim(),
+  });
+  return true;
+}
+
 const SESSION_WINDOW_GENERIC_ACTIONS = [
   { op: 'copy-session-id', label: 'Copy full session ID', title: 'Copy the full session ID' },
   { op: 'rename-session', label: 'Rename session...', title: 'Rename this session' },
@@ -9208,18 +9291,10 @@ function runSessionWindowAction(sessionId, op) {
   if (op === 'rename-session') {
     const win = sessionWindows.get(sid);
     const meta = sessionMetadataById.get(sid) || {};
-    const currentName = compactSessionText(meta.name);
-    const name = window.prompt('Session name:', currentName);
-    if (name === null) return;
-    if (!name.trim()) {
-      showControlToast('error', 'Rename session failed: session name is required');
-      return;
-    }
-    dispatchControlMsg({
-      action: 'rename_session',
+    requestSessionRename({
       session_id: sid,
       source: meta.source || win?.source || '',
-      name: name.trim(),
+      name: meta.name || '',
     });
     return;
   }
@@ -20560,6 +20635,10 @@ document.getElementById('filter-session-status')?.addEventListener('change', _re
 document.getElementById('sessions-detailed-search')?.addEventListener('change', _refreshSessionsFilters);
 document.getElementById('sort-sessions')?.addEventListener('change', _refilterSessions);
 document.getElementById('sessions-search')?.addEventListener('input', _refreshSessionsFilters);
+document.getElementById('session-detail-rename')?.addEventListener('click', (ev) => {
+  ev.preventDefault();
+  if (currentSessionDetail) requestSessionRename(currentSessionDetail);
+});
 document.getElementById('new-session-project-root')?.addEventListener('input', (ev) => {
   ev.currentTarget.title = ev.currentTarget.value.trim();
   scheduleNewSessionProjectStatusRefresh();
@@ -20713,12 +20792,12 @@ function updateSessionsSearchStatus() {
   const query = sessionSearchQuery();
   if (!sessionDetailedSearchEnabled() || !query) return;
   if (_sessionLogSearch.loading) {
-    el.textContent = 'Searching detailed logs...';
+    el.textContent = 'Deep search is scanning session logs...';
     return;
   }
   if (_sessionLogSearch.error) {
     el.classList.add('error');
-    el.textContent = `Detailed log search failed: ${_sessionLogSearch.error}`;
+    el.textContent = `Deep search failed: ${_sessionLogSearch.error}`;
     return;
   }
   if (_sessionLogSearch.loaded) {
@@ -20726,7 +20805,7 @@ function updateSessionsSearchStatus() {
     const suffix = _sessionLogSearch.truncated
       ? ` Search capped at ${_sessionLogSearch.limit.toLocaleString()} sessions.`
       : '';
-    el.textContent = `Detailed log search scanned ${_sessionLogSearch.searched.toLocaleString()} sessions; ${resultCount.toLocaleString()} had log matches.${suffix}`;
+    el.textContent = `Deep search scanned ${_sessionLogSearch.searched.toLocaleString()} sessions; ${resultCount.toLocaleString()} had log matches.${suffix}`;
   }
 }
 
@@ -21117,19 +21196,32 @@ function renderSessionsList(sessions, el) {
     }
 
     // Actions row
-    if (s.can_resume || s.can_delete || ((s.total_bytes > 0 || !isCurrent) && !isExternal)) {
+    if (sessionId || s.can_resume || s.can_delete || ((s.total_bytes > 0 || !isCurrent) && !isExternal)) {
       const actions = document.createElement('div');
       actions.className = 'sc-actions';
 
       if (s.can_resume !== false) {
         const resumeBtn = document.createElement('button');
         resumeBtn.className = 'sc-resume-btn';
-        resumeBtn.textContent = 'Open';
+        resumeBtn.textContent = 'Resume session';
+        resumeBtn.title = 'Resume this session in Activity';
         resumeBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           resumeSession(s);
         });
         actions.appendChild(resumeBtn);
+      }
+
+      if (sessionId) {
+        const renameBtn = document.createElement('button');
+        renameBtn.className = 'sc-rename-btn';
+        renameBtn.textContent = 'Rename';
+        renameBtn.title = 'Rename this session';
+        renameBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          requestSessionRename(s);
+        });
+        actions.appendChild(renameBtn);
       }
 
       if (!isExternal && s.can_delete !== false) {
@@ -21244,37 +21336,33 @@ function deleteSessionData(sessionId, target, label) {
     .catch(e => alert('Delete failed: ' + e.message));
 }
 
-function openSessionDetail(sessionOrId, taskArg) {
-  const session = typeof sessionOrId === 'object'
-    ? sessionOrId
-    : { session_id: sessionOrId, task: taskArg, source: 'intendant' };
-  const sessionId = session.session_id;
+function renderSessionDetailTitle(session) {
+  const titleEl = document.getElementById('session-detail-title');
+  if (!titleEl || !session) return;
+  const sessionId = session.session_id || session.resume_id || '';
   const source = session.source || 'intendant';
   const sessionName = compactSessionText(session.name);
-  const task = compactSessionText(session.task) || '(no task)';
-  const listEl = document.getElementById('sessions-list');
-  const aggEl = document.getElementById('sessions-aggregate');
-  const headerEl = document.querySelector('.sessions-header');
-  const detailEl = document.getElementById('session-detail');
-  const titleEl = document.getElementById('session-detail-title');
-  const logsEl = document.getElementById('session-detail-logs');
-
-  listEl.style.display = 'none';
-  aggEl.style.display = 'none';
-  headerEl.style.display = 'none';
-  detailEl.style.display = 'flex';
+  const task = compactSessionText(session.task);
+  const primaryText = sessionName || task || 'Untitled session';
   const sourceLabel = session.source_label || (source === 'intendant' ? 'Intendant' : prettyAgentName(source) || source);
+  const titleKindLabel = sessionName ? 'name' : task ? 'initial' : 'untitled';
+  const titleKindHelp = sessionName
+    ? 'User-assigned session name'
+    : task
+      ? 'Initial message fallback'
+      : 'No initial message found';
+
   titleEl.innerHTML = '';
   const titleLine = document.createElement('div');
   titleLine.className = 'sd-title-line';
   const titleKind = document.createElement('span');
   titleKind.className = 'sd-title-kind';
-  titleKind.textContent = sessionName ? 'name' : 'initial';
-  titleKind.title = sessionName ? 'User-assigned session name' : 'Initial message fallback';
+  titleKind.textContent = titleKindLabel;
+  titleKind.title = titleKindHelp;
   const titleText = document.createElement('span');
   titleText.className = 'sd-title-text';
-  titleText.textContent = sessionName || task;
-  titleText.title = sessionName || task;
+  titleText.textContent = primaryText;
+  titleText.title = primaryText;
   const titleId = document.createElement('span');
   titleId.className = 'sd-title-id';
   titleId.textContent = `${sourceLabel} ${sessionId}`;
@@ -21289,6 +21377,7 @@ function openSessionDetail(sessionOrId, taskArg) {
     const subKind = document.createElement('span');
     subKind.className = 'sd-title-kind';
     subKind.textContent = 'initial';
+    subKind.title = 'Initial message fallback';
     const subText = document.createElement('span');
     subText.className = 'sd-title-text';
     subText.textContent = task;
@@ -21297,6 +21386,32 @@ function openSessionDetail(sessionOrId, taskArg) {
     subline.appendChild(subText);
     titleEl.appendChild(subline);
   }
+
+  const renameBtn = document.getElementById('session-detail-rename');
+  if (renameBtn) {
+    renameBtn.disabled = !sessionId;
+    renameBtn.title = sessionId ? 'Rename this session' : 'Session ID is missing';
+  }
+}
+
+function openSessionDetail(sessionOrId, taskArg) {
+  const session = typeof sessionOrId === 'object'
+    ? sessionOrId
+    : { session_id: sessionOrId, task: taskArg, source: 'intendant' };
+  const sessionId = session.session_id;
+  const source = session.source || 'intendant';
+  const listEl = document.getElementById('sessions-list');
+  const aggEl = document.getElementById('sessions-aggregate');
+  const headerEl = document.querySelector('.sessions-header');
+  const detailEl = document.getElementById('session-detail');
+  const logsEl = document.getElementById('session-detail-logs');
+
+  listEl.style.display = 'none';
+  aggEl.style.display = 'none';
+  headerEl.style.display = 'none';
+  detailEl.style.display = 'flex';
+  currentSessionDetail = { ...session, source };
+  renderSessionDetailTitle(currentSessionDetail);
   logsEl.innerHTML = '<div class="empty-state">Loading...</div>';
 
   // Reset sections
@@ -21344,6 +21459,7 @@ function closeSessionDetail() {
   document.getElementById('sessions-aggregate').style.display = '';
   document.querySelector('.sessions-header').style.display = '';
   document.getElementById('session-detail').style.display = 'none';
+  currentSessionDetail = null;
 }
 window.closeSessionDetail = closeSessionDetail;
 window.loadSessions = loadSessions;
