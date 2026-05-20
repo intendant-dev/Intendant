@@ -29,6 +29,9 @@ const EXTERNAL_SESSION_SCAN_LIMIT: usize = 2_000;
 const EXTERNAL_SESSION_READ_LIMIT: u64 = 512 * 1024;
 const SESSION_LIST_LIMIT: usize = 5_000;
 const SESSION_SOURCE_FLOOR: usize = 100;
+const SESSION_LOG_SEARCH_LIMIT: usize = 500;
+const SESSION_LOG_SEARCH_SNIPPETS_PER_SESSION: usize = 3;
+const SESSION_LOG_SEARCH_SNIPPET_CHARS: usize = 220;
 const FS_LIST_LIMIT: usize = 500;
 
 /// Tracks which WebSocket connection currently owns the voice model (is "active").
@@ -1760,9 +1763,8 @@ mod host_header_tests {
 /// for each session (newest first, capped at 100).
 /// Return session detail: replayed log entries + metadata for a single session.
 /// Resolve a session directory by exact ID or prefix match.
-fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let logs_dir = PathBuf::from(format!("{}/.intendant/logs", home));
+fn resolve_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let logs_dir = home.join(".intendant").join("logs");
 
     if logs_dir.join(session_id).is_dir() {
         return Some(logs_dir.join(session_id));
@@ -1777,6 +1779,11 @@ fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    resolve_session_dir_from_home(&PathBuf::from(home), session_id)
 }
 
 /// List recording streams from a recordings directory on disk.
@@ -1852,6 +1859,199 @@ fn get_session_detail(session_id: &str) -> String {
         "entries": entries,
         "frames": frames,
     }).to_string()
+}
+
+fn session_log_search_from_request(request_line: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let home_path = PathBuf::from(&home);
+    let query = query_param(request_line, "q").unwrap_or_default();
+    let source_filter = query_param(request_line, "source").unwrap_or_else(|| "all".to_string());
+    session_log_search_from_home(&home_path, &query, &source_filter)
+}
+
+fn session_log_search_from_home(home: &Path, query: &str, source_filter: &str) -> String {
+    let terms = session_log_search_terms(query);
+    if terms.is_empty() {
+        return serde_json::json!({
+            "query": query,
+            "source_filter": normalize_session_source_filter(source_filter),
+            "searched": 0,
+            "truncated": false,
+            "limit": SESSION_LOG_SEARCH_LIMIT,
+            "results": [],
+        })
+        .to_string();
+    }
+
+    let sessions: Vec<serde_json::Value> =
+        serde_json::from_str(&list_sessions_from_home(home)).unwrap_or_else(|_| Vec::new());
+    let source_filter = normalize_session_source_filter(source_filter);
+    let mut results = Vec::new();
+    let mut searched = 0usize;
+    let mut truncated = false;
+
+    for session in sessions {
+        let source = session
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("intendant");
+        if !session_source_matches_filter(source, &source_filter) {
+            continue;
+        }
+
+        let Some(session_id) = session.get("session_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if searched >= SESSION_LOG_SEARCH_LIMIT {
+            truncated = true;
+            break;
+        }
+        searched += 1;
+
+        let entries = if source == "intendant" {
+            intendant_session_search_entries_from_home(home, session_id).unwrap_or_default()
+        } else {
+            external_session_entries_from_home(home, source, session_id).unwrap_or_default()
+        };
+        let (matches, snippets) = search_session_entries(&entries, &terms);
+        if matches == 0 {
+            continue;
+        }
+        results.push(serde_json::json!({
+            "key": format!("{source}:{session_id}"),
+            "source": source,
+            "session_id": session_id,
+            "matches": matches,
+            "snippets": snippets,
+        }));
+    }
+
+    serde_json::json!({
+        "query": query,
+        "source_filter": source_filter,
+        "searched": searched,
+        "truncated": truncated,
+        "limit": SESSION_LOG_SEARCH_LIMIT,
+        "results": results,
+    })
+    .to_string()
+}
+
+fn intendant_session_search_entries_from_home(
+    home: &Path,
+    session_id: &str,
+) -> Option<Vec<serde_json::Value>> {
+    let session_dir = resolve_session_dir_from_home(home, session_id)?;
+    let contents = std::fs::read_to_string(session_dir.join("session.jsonl")).ok()?;
+    Some(replay_jsonl_to_outbound_entries(&contents, &session_dir))
+}
+
+fn normalize_session_source_filter(source_filter: &str) -> String {
+    let value = source_filter.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "all" => "all".to_string(),
+        "external" => "external".to_string(),
+        "intendant" | "codex" | "claude-code" | "gemini" => value,
+        "claude" => "claude-code".to_string(),
+        _ => "all".to_string(),
+    }
+}
+
+fn session_source_matches_filter(source: &str, source_filter: &str) -> bool {
+    match source_filter {
+        "all" => true,
+        "external" => source != "intendant",
+        "claude" | "claude-code" => source == "claude-code",
+        other => source == other,
+    }
+}
+
+fn session_log_search_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|term| term.trim().to_ascii_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect()
+}
+
+fn search_session_entries(
+    entries: &[serde_json::Value],
+    terms: &[String],
+) -> (usize, Vec<serde_json::Value>) {
+    let mut matches = 0usize;
+    let mut snippets = Vec::new();
+
+    for entry in entries {
+        let text = session_log_entry_search_text(entry);
+        if text.trim().is_empty() || !text_matches_session_terms(&text, terms) {
+            continue;
+        }
+        matches += 1;
+        if snippets.len() < SESSION_LOG_SEARCH_SNIPPETS_PER_SESSION {
+            snippets.push(serde_json::json!({
+                "ts": entry.get("ts").and_then(|v| v.as_str()).unwrap_or(""),
+                "source": entry.get("source").and_then(|v| v.as_str()).unwrap_or(""),
+                "level": entry.get("level").and_then(|v| v.as_str()).unwrap_or(""),
+                "event": entry.get("event").and_then(|v| v.as_str()).unwrap_or(""),
+                "content": session_log_match_snippet(&text, terms, SESSION_LOG_SEARCH_SNIPPET_CHARS),
+            }));
+        }
+    }
+
+    (matches, snippets)
+}
+
+fn session_log_entry_search_text(entry: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    for key in [
+        "content",
+        "message",
+        "summary",
+        "reasoning_summary",
+        "commands_preview",
+        "stdout",
+        "stderr",
+    ] {
+        if let Some(value) = entry.get(key).and_then(|v| v.as_str()) {
+            parts.push(value);
+        }
+    }
+    parts.join("\n")
+}
+
+fn text_matches_session_terms(text: &str, terms: &[String]) -> bool {
+    let haystack = text.to_ascii_lowercase();
+    terms.iter().all(|term| haystack.contains(term))
+}
+
+fn session_log_match_snippet(text: &str, terms: &[String], max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let total_chars = compact.chars().count();
+    if total_chars <= max_chars {
+        return compact;
+    }
+
+    let lower = compact.to_ascii_lowercase();
+    let match_byte = terms
+        .iter()
+        .filter_map(|term| lower.find(term))
+        .min()
+        .unwrap_or(0);
+    let match_char = compact[..match_byte].chars().count();
+    let start_char = match_char.saturating_sub(max_chars / 3);
+    let end_char = (start_char + max_chars).min(total_chars);
+    let mut snippet: String = compact
+        .chars()
+        .skip(start_char)
+        .take(end_char - start_char)
+        .collect();
+    if start_char > 0 {
+        snippet.insert_str(0, "...");
+    }
+    if end_char < total_chars {
+        snippet.push_str("...");
+    }
+    snippet
 }
 
 fn value_str(v: &serde_json::Value, key: &str) -> Option<String> {
@@ -10130,6 +10330,22 @@ pub fn spawn_web_gateway(
                             body.len(),
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.contains("/api/sessions/search") {
+                        let body = session_log_search_from_request(&request_line);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(),
+                            body
+                        );
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/api/sessions") {
                         // Session listing endpoint. CORS `*` so the
                         // multi-host Stats tab can fetch sibling
@@ -12306,6 +12522,127 @@ mod tests {
             wrapped.get("cwd").and_then(|v| v.as_str()),
             Some(expected_cwd.as_str())
         );
+    }
+
+    #[test]
+    fn session_log_search_finds_intendant_log_content_not_summary() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "intendant-search-session";
+        let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": session_id,
+                "created_at": "2026-05-17T20:44:00",
+                "task": "ordinary dashboard task",
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            log_dir.join("session.jsonl"),
+            serde_json::json!({
+                "ts": "2026-05-17T20:45:00",
+                "event": "info",
+                "message": "Detailed log contains alpha-search-token"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "alpha-search-token",
+            "all",
+        ))
+        .unwrap();
+        let results = response.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("session_id").and_then(|v| v.as_str()),
+            Some(session_id)
+        );
+        assert_eq!(
+            results[0].get("source").and_then(|v| v.as_str()),
+            Some("intendant")
+        );
+    }
+
+    #[test]
+    fn session_log_search_can_filter_external_agent_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let id = "019e37ae-search-filter";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": "/repo"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:40Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "ordinary request"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:50Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "external-only beta-search-token"
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "beta-search-token",
+            "external",
+        ))
+        .unwrap();
+        let results = response.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("source").and_then(|v| v.as_str()),
+            Some("codex")
+        );
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "beta-search-token",
+            "intendant",
+        ))
+        .unwrap();
+        assert!(response
+            .get("results")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

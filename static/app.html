@@ -2672,6 +2672,32 @@ html, body {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
 }
+.session-card .sc-search-hit {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin: 4px 0 8px;
+  padding: 5px 7px;
+  border-left: 2px solid var(--blue);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--blue) 8%, transparent);
+  font-size: 12px;
+  color: var(--subtext0);
+}
+.session-card .sc-search-hit-count {
+  flex: 0 0 auto;
+  color: var(--blue);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.session-card .sc-search-hit-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .session-card .sc-meta {
   display: flex;
   gap: 16px;
@@ -2776,6 +2802,24 @@ html, body {
 }
 .sessions-filter input[type="checkbox"] {
   accent-color: var(--blue);
+}
+.sessions-filter select {
+  padding: 2px 6px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 11px;
+  font-family: inherit;
+}
+.sessions-search-status {
+  min-height: 16px;
+  margin: -8px 0 12px;
+  color: var(--overlay1);
+  font-size: 11px;
+}
+.sessions-search-status.error {
+  color: var(--red);
 }
 .sessions-sort {
   display: flex;
@@ -5412,10 +5456,21 @@ html, body {
               <span class="sessions-title">Recent Sessions</span>
               <label class="sessions-search" for="sessions-search">
                 Search
-                <input type="search" id="sessions-search" placeholder="ID, task, model, path..." autocomplete="off" spellcheck="false">
+                <input type="search" id="sessions-search" placeholder="ID, task, model, path; logs if detailed..." autocomplete="off" spellcheck="false">
               </label>
               <button class="sessions-refresh" onclick="loadSessions()" style="margin-left:8px">Refresh</button>
               <div class="sessions-filter" id="sessions-filter">
+                <label>Source
+                  <select id="filter-session-source">
+                    <option value="all" selected>all</option>
+                    <option value="intendant">Intendant</option>
+                    <option value="external">external</option>
+                    <option value="codex">Codex</option>
+                    <option value="claude-code">Claude</option>
+                    <option value="gemini">Gemini</option>
+                  </select>
+                </label>
+                <label><input type="checkbox" id="sessions-detailed-search"> detailed logs</label>
                 <label><input type="checkbox" id="filter-abandoned" checked> abandoned</label>
                 <label><input type="checkbox" id="filter-idle" checked> idle</label>
               </div>
@@ -5436,6 +5491,7 @@ html, body {
                 </label>
               </div>
             </div>
+            <div class="sessions-search-status" id="sessions-search-status"></div>
             <div class="sessions-aggregate" id="sessions-aggregate"></div>
             <div class="sessions-list" id="sessions-list">
               <div class="empty-state">Loading sessions...</div>
@@ -6192,6 +6248,8 @@ const VERBOSITY_KEY = 'intendant_verbosity';
 const HOST_FILTER_KEY = 'intendant_host_filter';
 const SESSIONS_FILTER_ABANDONED_KEY = 'intendant_sessions_filter_abandoned';
 const SESSIONS_FILTER_IDLE_KEY = 'intendant_sessions_filter_idle';
+const SESSIONS_FILTER_SOURCE_KEY = 'intendant_sessions_filter_source';
+const SESSIONS_DETAILED_SEARCH_KEY = 'intendant_sessions_detailed_search';
 
 // Current Activity host filter selection. Empty string = show all
 // hosts. Otherwise matches log entries whose `data-host-id` equals
@@ -14936,6 +14994,22 @@ function restoreClientToggles() {
       localStorage.setItem(SESSIONS_FILTER_IDLE_KEY, String(fi.checked));
     });
   }
+  const fs = document.getElementById('filter-session-source');
+  if (fs) {
+    const stored = localStorage.getItem(SESSIONS_FILTER_SOURCE_KEY);
+    if (stored && Array.from(fs.options).some(opt => opt.value === stored)) fs.value = stored;
+    fs.addEventListener('change', () => {
+      localStorage.setItem(SESSIONS_FILTER_SOURCE_KEY, fs.value);
+    });
+  }
+  const ds = document.getElementById('sessions-detailed-search');
+  if (ds) {
+    const stored = localStorage.getItem(SESSIONS_DETAILED_SEARCH_KEY);
+    if (stored !== null) ds.checked = stored === 'true';
+    ds.addEventListener('change', () => {
+      localStorage.setItem(SESSIONS_DETAILED_SEARCH_KEY, String(ds.checked));
+    });
+  }
 
   // Host filter (Activity tab). The dropdown's option list is built
   // later by refreshHostFilterOptions() — that function reads from
@@ -20384,6 +20458,19 @@ function onDebugScreenTornDown() {
 // ── Sessions Tab ──
 let sessionsLoaded = false;
 let _cachedSessions = [];
+let _sessionLogSearchTimer = null;
+let _sessionLogSearchToken = 0;
+let _sessionLogSearch = {
+  query: '',
+  sourceFilter: 'all',
+  loading: false,
+  loaded: false,
+  error: null,
+  searched: 0,
+  truncated: false,
+  limit: 0,
+  results: new Map(),
+};
 
 function loadSessions() {
   const listEl = document.getElementById('sessions-list');
@@ -20397,6 +20484,7 @@ function loadSessions() {
       _cachedSessions = sessions;
       updateNewSessionProjectPrefills(sessions);
       cacheSessionWindowMetadata(sessions);
+      scheduleSessionLogSearch(true);
       renderSessionsAggregate(sessions, aggEl);
       renderSessionsList(sessions, listEl);
     })
@@ -20410,10 +20498,16 @@ function _refilterSessions() {
     renderSessionsList(_cachedSessions, document.getElementById('sessions-list'));
   }
 }
+function _refreshSessionsFilters() {
+  scheduleSessionLogSearch();
+  _refilterSessions();
+}
 document.getElementById('filter-abandoned')?.addEventListener('change', _refilterSessions);
 document.getElementById('filter-idle')?.addEventListener('change', _refilterSessions);
+document.getElementById('filter-session-source')?.addEventListener('change', _refreshSessionsFilters);
+document.getElementById('sessions-detailed-search')?.addEventListener('change', _refreshSessionsFilters);
 document.getElementById('sort-sessions')?.addEventListener('change', _refilterSessions);
-document.getElementById('sessions-search')?.addEventListener('input', _refilterSessions);
+document.getElementById('sessions-search')?.addEventListener('input', _refreshSessionsFilters);
 document.getElementById('new-session-project-root')?.addEventListener('input', (ev) => {
   ev.currentTarget.title = ev.currentTarget.value.trim();
   scheduleNewSessionProjectStatusRefresh();
@@ -20427,7 +20521,7 @@ document.getElementById('fs-picker-path')?.addEventListener('keydown', (ev) => {
 document.getElementById('sessions-search')?.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Escape' || !ev.currentTarget.value) return;
   ev.currentTarget.value = '';
-  _refilterSessions();
+  _refreshSessionsFilters();
   ev.stopPropagation();
 });
 
@@ -20443,6 +20537,135 @@ function sessionDateSortValue(session, field) {
 
 function sessionSearchQuery() {
   return (document.getElementById('sessions-search')?.value || '').trim().toLowerCase();
+}
+
+function sessionSourceFilterValue() {
+  return document.getElementById('filter-session-source')?.value || 'all';
+}
+
+function sessionDetailedSearchEnabled() {
+  return !!document.getElementById('sessions-detailed-search')?.checked;
+}
+
+function sessionMatchesSourceFilter(source, filter) {
+  if (!filter || filter === 'all') return true;
+  if (filter === 'external') return source !== 'intendant';
+  return source === filter;
+}
+
+function sessionLogSearchKey(source, sessionId) {
+  return `${source || 'intendant'}:${sessionId || ''}`;
+}
+
+function scheduleSessionLogSearch(force = false) {
+  const query = sessionSearchQuery();
+  const sourceFilter = sessionSourceFilterValue();
+  const detailed = sessionDetailedSearchEnabled();
+  if (_sessionLogSearchTimer) {
+    clearTimeout(_sessionLogSearchTimer);
+    _sessionLogSearchTimer = null;
+  }
+  if (!detailed || !query) {
+    _sessionLogSearchToken += 1;
+    _sessionLogSearch = {
+      query,
+      sourceFilter,
+      loading: false,
+      loaded: false,
+      error: null,
+      searched: 0,
+      truncated: false,
+      limit: 0,
+      results: new Map(),
+    };
+    return;
+  }
+  if (!force && _sessionLogSearch.query === query && _sessionLogSearch.sourceFilter === sourceFilter && (_sessionLogSearch.loading || _sessionLogSearch.loaded)) {
+    return;
+  }
+  _sessionLogSearch = {
+    query,
+    sourceFilter,
+    loading: true,
+    loaded: false,
+    error: null,
+    searched: 0,
+    truncated: false,
+    limit: 0,
+    results: new Map(),
+  };
+  const token = ++_sessionLogSearchToken;
+  _sessionLogSearchTimer = setTimeout(() => {
+    const url = `/api/sessions/search?q=${encodeURIComponent(query)}&source=${encodeURIComponent(sourceFilter)}`;
+    authedFetch(url)
+      .then(r => r.ok ? r.json() : Promise.reject(new Error(`/api/sessions/search returned ${r.status}`)))
+      .then(data => {
+        if (token !== _sessionLogSearchToken) return;
+        const results = new Map();
+        for (const hit of data.results || []) {
+          const key = hit.key || sessionLogSearchKey(hit.source, hit.session_id);
+          results.set(key, hit);
+        }
+        _sessionLogSearch = {
+          query,
+          sourceFilter,
+          loading: false,
+          loaded: true,
+          error: null,
+          searched: data.searched || 0,
+          truncated: !!data.truncated,
+          limit: data.limit || 0,
+          results,
+        };
+        _refilterSessions();
+      })
+      .catch(err => {
+        if (token !== _sessionLogSearchToken) return;
+        _sessionLogSearch = {
+          query,
+          sourceFilter,
+          loading: false,
+          loaded: true,
+          error: err.message || String(err),
+          searched: 0,
+          truncated: false,
+          limit: 0,
+          results: new Map(),
+        };
+        _refilterSessions();
+      });
+  }, 250);
+}
+
+function sessionLogSearchHit(session, source, query, sourceFilter) {
+  if (!sessionDetailedSearchEnabled() || !query) return null;
+  if (_sessionLogSearch.query !== query || _sessionLogSearch.sourceFilter !== sourceFilter) return null;
+  return _sessionLogSearch.results.get(sessionLogSearchKey(source, session.session_id)) || null;
+}
+
+function updateSessionsSearchStatus() {
+  const el = document.getElementById('sessions-search-status');
+  if (!el) return;
+  el.classList.remove('error');
+  el.textContent = '';
+  const query = sessionSearchQuery();
+  if (!sessionDetailedSearchEnabled() || !query) return;
+  if (_sessionLogSearch.loading) {
+    el.textContent = 'Searching detailed logs...';
+    return;
+  }
+  if (_sessionLogSearch.error) {
+    el.classList.add('error');
+    el.textContent = `Detailed log search failed: ${_sessionLogSearch.error}`;
+    return;
+  }
+  if (_sessionLogSearch.loaded) {
+    const resultCount = _sessionLogSearch.results.size;
+    const suffix = _sessionLogSearch.truncated
+      ? ` Search capped at ${_sessionLogSearch.limit.toLocaleString()} sessions.`
+      : '';
+    el.textContent = `Detailed log search scanned ${_sessionLogSearch.searched.toLocaleString()} sessions; ${resultCount.toLocaleString()} had log matches.${suffix}`;
+  }
 }
 
 function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
@@ -20528,6 +20751,7 @@ function renderSessionsAggregate(sessions, el) {
 
 function renderSessionsList(sessions, el) {
   el.innerHTML = '';
+  updateSessionsSearchStatus();
 
   if (sessions.length === 0) {
     el.innerHTML = '<div class="empty-state">No sessions found</div>';
@@ -20572,6 +20796,8 @@ function renderSessionsList(sessions, el) {
   const showAbandoned = document.getElementById('filter-abandoned')?.checked ?? true;
   const showIdle = document.getElementById('filter-idle')?.checked ?? true;
   const query = sessionSearchQuery();
+  const sourceFilter = sessionSourceFilterValue();
+  const detailedSearch = sessionDetailedSearchEnabled();
   let visibleCount = 0;
 
   for (const s of sorted) {
@@ -20587,9 +20813,16 @@ function renderSessionsList(sessions, el) {
     }
 
     // Apply filters
+    if (!sessionMatchesSourceFilter(source, sourceFilter)) continue;
     if (!showAbandoned && displayStatus === 'abandoned') continue;
     if (!showIdle && displayStatus === 'idle') continue;
-    if (!sessionMatchesSearch(s, query, displayStatus, source, shortId, isCurrent)) continue;
+    const summaryMatch = sessionMatchesSearch(s, query, displayStatus, source, shortId, isCurrent);
+    const logHit = sessionLogSearchHit(s, source, query, sourceFilter);
+    if (query && detailedSearch) {
+      if (!summaryMatch && !logHit) continue;
+    } else if (!summaryMatch) {
+      continue;
+    }
 
     visibleCount += 1;
 
@@ -20665,6 +20898,23 @@ function renderSessionsList(sessions, el) {
       taskEl.textContent = taskText;
       taskEl.title = taskText;
       card.appendChild(taskEl);
+    }
+
+    if (logHit) {
+      const hitEl = document.createElement('div');
+      hitEl.className = 'sc-search-hit';
+      const hitCount = document.createElement('span');
+      hitCount.className = 'sc-search-hit-count';
+      const matches = Number(logHit.matches || 0);
+      hitCount.textContent = `${matches} log ${matches === 1 ? 'match' : 'matches'}`;
+      hitEl.appendChild(hitCount);
+      const firstSnippet = (logHit.snippets || [])[0] || {};
+      const hitText = document.createElement('span');
+      hitText.className = 'sc-search-hit-text';
+      hitText.textContent = firstSnippet.content || '';
+      hitText.title = firstSnippet.content || '';
+      hitEl.appendChild(hitText);
+      card.appendChild(hitEl);
     }
 
     // Meta row
