@@ -17,6 +17,7 @@ use crate::event::{AppEvent, EventBus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
@@ -115,7 +116,43 @@ const SNAPSHOT_DIR_SOFT_CAP_BYTES: u64 = 500 * 1024 * 1024;
 /// Keep this aligned for initial baselines and live change events. If the
 /// initial scan skips a file that the live watcher later accepts, an atomic
 /// rewrite can look like a brand-new file and report the whole file as added.
-const SNAPSHOT_MAX_FILE_BYTES: u64 = 1_000_000;
+pub(crate) const SNAPSHOT_MAX_FILE_BYTES: u64 = 1_000_000;
+
+pub(crate) const BASELINE_MANIFEST_FILE: &str = "baseline_manifest.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct BaselineFileMeta {
+    pub supported_text: bool,
+    pub hash: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+pub(crate) type BaselineManifest = HashMap<String, BaselineFileMeta>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct TextFileSnapshot {
+    pub bytes: Vec<u8>,
+    pub text: String,
+    pub hash: [u8; 32],
+    pub hash_hex: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UnsupportedFileSnapshot {
+    pub reason: String,
+    pub hash: [u8; 32],
+    pub hash_hex: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum InspectedFile {
+    Text(TextFileSnapshot),
+    Unsupported(UnsupportedFileSnapshot),
+}
 
 // ---------------------------------------------------------------------------
 // Ignore filter
@@ -123,6 +160,7 @@ const SNAPSHOT_MAX_FILE_BYTES: u64 = 1_000_000;
 
 const IGNORED_DIRS: &[&str] = &[
     ".git",
+    ".worktrees",
     "target",
     "node_modules",
     ".intendant",
@@ -143,7 +181,7 @@ const IGNORED_EXTENSIONS: &[&str] = &[
     "svg", "webp", "zip", "tar", "gz", "bz2",
 ];
 
-fn should_ignore(rel_path: &Path) -> bool {
+pub(crate) fn should_ignore(rel_path: &Path) -> bool {
     for component in rel_path.components() {
         if let std::path::Component::Normal(name) = component {
             let name_str = name.to_string_lossy();
@@ -171,7 +209,7 @@ fn is_binary(data: &[u8]) -> bool {
     data[..check_len].contains(&0)
 }
 
-fn sha256_hash(data: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256_hash(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
     let result = hasher.finalize();
@@ -181,7 +219,7 @@ fn sha256_hash(data: &[u8]) -> [u8; 32] {
 }
 
 /// Lowercase hex encoding of a 32-byte sha256.
-fn hex_encode(bytes: &[u8; 32]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(64);
     for b in bytes {
@@ -189,6 +227,82 @@ fn hex_encode(bytes: &[u8; 32]) -> String {
         s.push(HEX[(b & 0x0f) as usize] as char);
     }
     s
+}
+
+pub(crate) fn rel_path_key(rel_path: &Path) -> String {
+    rel_path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<[u8; 32]> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    Ok(out)
+}
+
+pub(crate) fn inspect_file(path: &Path) -> std::io::Result<InspectedFile> {
+    let meta = std::fs::metadata(path)?;
+    let size = meta.len();
+
+    if size > SNAPSHOT_MAX_FILE_BYTES {
+        let hash = sha256_file(path)?;
+        return Ok(InspectedFile::Unsupported(UnsupportedFileSnapshot {
+            reason: format!("file is larger than {} bytes", SNAPSHOT_MAX_FILE_BYTES),
+            hash,
+            hash_hex: hex_encode(&hash),
+            size,
+        }));
+    }
+
+    let bytes = std::fs::read(path)?;
+    let hash = sha256_hash(&bytes);
+    let hash_hex = hex_encode(&hash);
+
+    if is_binary(&bytes) {
+        return Ok(InspectedFile::Unsupported(UnsupportedFileSnapshot {
+            reason: "binary file".to_string(),
+            hash,
+            hash_hex,
+            size,
+        }));
+    }
+
+    let text = match String::from_utf8(bytes.clone()) {
+        Ok(text) => text,
+        Err(_) => {
+            return Ok(InspectedFile::Unsupported(UnsupportedFileSnapshot {
+                reason: "file is not valid UTF-8".to_string(),
+                hash,
+                hash_hex,
+                size,
+            }));
+        }
+    };
+
+    Ok(InspectedFile::Text(TextFileSnapshot {
+        bytes,
+        text,
+        hash,
+        hash_hex,
+        size,
+    }))
 }
 
 /// Produce a unified diff between `baseline` and `current` with standard
@@ -279,6 +393,8 @@ pub struct FileWatcher {
     bus: EventBus,
     /// Baseline file content (original at session start), keyed by relative path.
     baselines: HashMap<PathBuf, Vec<u8>>,
+    /// Metadata for every non-ignored file that existed at session start.
+    baseline_manifest: BaselineManifest,
     /// SHA-256 hashes of last-known content, for change deduplication.
     hashes: HashMap<PathBuf, [u8; 32]>,
     /// Persistent session history of per-round snapshots.
@@ -301,6 +417,7 @@ impl FileWatcher {
             .map_err(|e| CallerError::Config(format!("create rounds dir: {}", e)))?;
 
         let mut baselines = HashMap::new();
+        let mut baseline_manifest = BaselineManifest::new();
         let mut hashes = HashMap::new();
 
         let mut stack = vec![project_root.clone()];
@@ -334,43 +451,59 @@ impl FileWatcher {
                 if should_ignore(&rel) {
                     continue;
                 }
-                // Check file size (skip >100KB for initial scan).
-                let meta = match std::fs::metadata(&path) {
-                    Ok(m) => m,
+                let rel_key = rel_path_key(&rel);
+                match inspect_file(&path) {
+                    Ok(InspectedFile::Text(snapshot)) => {
+                        let baseline_path = baseline_dir.join(&rel);
+                        if let Some(parent) = baseline_path.parent() {
+                            std::fs::create_dir_all(parent).map_err(|e| {
+                                CallerError::Config(format!(
+                                    "create baseline parent {}: {}",
+                                    parent.display(),
+                                    e
+                                ))
+                            })?;
+                        }
+                        std::fs::write(&baseline_path, &snapshot.bytes).map_err(|e| {
+                            CallerError::Config(format!(
+                                "write baseline {}: {}",
+                                baseline_path.display(),
+                                e
+                            ))
+                        })?;
+                        baselines.insert(rel.clone(), snapshot.bytes);
+                        hashes.insert(rel, snapshot.hash);
+                        baseline_manifest.insert(
+                            rel_key,
+                            BaselineFileMeta {
+                                supported_text: true,
+                                hash: snapshot.hash_hex,
+                                size: snapshot.size,
+                                reason: None,
+                            },
+                        );
+                    }
+                    Ok(InspectedFile::Unsupported(snapshot)) => {
+                        hashes.insert(rel, snapshot.hash);
+                        baseline_manifest.insert(
+                            rel_key,
+                            BaselineFileMeta {
+                                supported_text: false,
+                                hash: snapshot.hash_hex,
+                                size: snapshot.size,
+                                reason: Some(snapshot.reason),
+                            },
+                        );
+                    }
                     Err(_) => continue,
-                };
-                if meta.len() > SNAPSHOT_MAX_FILE_BYTES {
-                    continue;
                 }
-                let content = match std::fs::read(&path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                if is_binary(&content) {
-                    continue;
-                }
-                let baseline_path = baseline_dir.join(&rel);
-                if let Some(parent) = baseline_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        CallerError::Config(format!(
-                            "create baseline parent {}: {}",
-                            parent.display(),
-                            e
-                        ))
-                    })?;
-                }
-                std::fs::write(&baseline_path, &content).map_err(|e| {
-                    CallerError::Config(format!(
-                        "write baseline {}: {}",
-                        baseline_path.display(),
-                        e
-                    ))
-                })?;
-                let hash = sha256_hash(&content);
-                baselines.insert(rel.clone(), content);
-                hashes.insert(rel, hash);
             }
         }
+
+        let manifest_path = snapshot_dir.join(BASELINE_MANIFEST_FILE);
+        let manifest_bytes = serde_json::to_vec_pretty(&baseline_manifest)
+            .map_err(|e| CallerError::Config(format!("baseline manifest serialize: {}", e)))?;
+        atomic_write(&manifest_path, &manifest_bytes).map_err(CallerError::Io)?;
 
         // Load history.json if it exists (session resume / restart).
         let history_path = snapshot_dir.join("history.json");
@@ -384,6 +517,7 @@ impl FileWatcher {
             snapshot_dir,
             bus,
             baselines,
+            baseline_manifest,
             hashes,
             history,
         })
@@ -467,13 +601,16 @@ impl FileWatcher {
             return;
         }
 
-        let known_file = self.baselines.contains_key(&rel) || self.hashes.contains_key(&rel);
+        let rel_key = rel_path_key(&rel);
+        let existed_at_baseline =
+            self.baselines.contains_key(&rel) || self.baseline_manifest.contains_key(&rel_key);
+        let known_file = existed_at_baseline || self.hashes.contains_key(&rel);
         let change_kind = match kind {
             notify::EventKind::Create(_) => {
                 if !abs_path.is_file() {
                     return;
                 }
-                if known_file {
+                if existed_at_baseline {
                     FileChangeKind::Modified
                 } else {
                     FileChangeKind::Created
@@ -483,7 +620,11 @@ impl FileWatcher {
                 if !abs_path.is_file() {
                     return;
                 }
-                FileChangeKind::Modified
+                if existed_at_baseline {
+                    FileChangeKind::Modified
+                } else {
+                    FileChangeKind::Created
+                }
             }
             notify::EventKind::Remove(_) => FileChangeKind::Deleted,
             _ => return,
@@ -491,61 +632,57 @@ impl FileWatcher {
 
         match change_kind {
             FileChangeKind::Created | FileChangeKind::Modified => {
-                let content = match std::fs::read(abs_path) {
-                    Ok(c) => c,
-                    Err(_) => return, // file gone or permission denied
-                };
+                match inspect_file(abs_path) {
+                    Ok(InspectedFile::Text(snapshot)) => {
+                        if self.hashes.get(&rel) == Some(&snapshot.hash) {
+                            return; // no actual change
+                        }
+                        self.hashes.insert(rel.clone(), snapshot.hash);
 
-                // Skip binary files or oversized files.
-                if content.len() as u64 > SNAPSHOT_MAX_FILE_BYTES || is_binary(&content) {
-                    return;
-                }
+                        let (lines_added, lines_removed) =
+                            if let Some(baseline_bytes) = self.baselines.get(&rel) {
+                                let baseline_str = String::from_utf8_lossy(baseline_bytes);
+                                diff_stats(&baseline_str, &snapshot.text)
+                            } else if existed_at_baseline {
+                                (0, 0)
+                            } else {
+                                diff_stats("", &snapshot.text)
+                            };
 
-                let hash = sha256_hash(&content);
-                if self.hashes.get(&rel) == Some(&hash) {
-                    return; // no actual change
-                }
-                self.hashes.insert(rel.clone(), hash);
-
-                // Save baseline if we don't have one yet.
-                if !self.baselines.contains_key(&rel) {
-                    let baseline_path = self.snapshot_dir.join("baseline").join(&rel);
-                    if let Some(parent) = baseline_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
+                        self.bus.send(AppEvent::FileChanged {
+                            path: rel_key,
+                            kind: change_kind,
+                            lines_added,
+                            lines_removed,
+                        });
                     }
-                    if change_kind == FileChangeKind::Created {
-                        // New file — baseline is empty.
-                        let _ = std::fs::write(&baseline_path, b"");
-                        self.baselines.insert(rel.clone(), Vec::new());
-                    } else {
-                        // Modified file we didn't track at startup — save
-                        // current content as baseline (best-effort).
-                        let _ = std::fs::write(&baseline_path, &content);
-                        self.baselines.insert(rel.clone(), content.clone());
+                    Ok(InspectedFile::Unsupported(snapshot)) => {
+                        if self.hashes.get(&rel) == Some(&snapshot.hash) {
+                            return; // no actual change
+                        }
+                        self.hashes.insert(rel.clone(), snapshot.hash);
+                        self.bus.send(AppEvent::FileChanged {
+                            path: rel_key,
+                            kind: change_kind,
+                            lines_added: 0,
+                            lines_removed: 0,
+                        });
                     }
+                    Err(_) => return,
                 }
-
-                // Compute diff stats.
-                let empty = Vec::new();
-                let baseline_bytes = self.baselines.get(&rel).unwrap_or(&empty);
-                let baseline_str = String::from_utf8_lossy(baseline_bytes);
-                let current_str = String::from_utf8_lossy(&content);
-                let (lines_added, lines_removed) = diff_stats(&baseline_str, &current_str);
-
-                self.bus.send(AppEvent::FileChanged {
-                    path: rel.to_string_lossy().to_string(),
-                    kind: change_kind,
-                    lines_added,
-                    lines_removed,
-                });
             }
             FileChangeKind::Deleted => {
-                if self.baselines.contains_key(&rel) || self.hashes.contains_key(&rel) {
+                if known_file {
+                    let lines_removed = self
+                        .baselines
+                        .get(&rel)
+                        .map(|bytes| String::from_utf8_lossy(bytes).lines().count() as u32)
+                        .unwrap_or(0);
                     self.bus.send(AppEvent::FileChanged {
-                        path: rel.to_string_lossy().to_string(),
+                        path: rel_key,
                         kind: FileChangeKind::Deleted,
                         lines_added: 0,
-                        lines_removed: 0,
+                        lines_removed,
                     });
                 }
                 self.hashes.remove(&rel);
@@ -771,31 +908,20 @@ impl FileWatcher {
                 if should_ignore(&rel) {
                     continue;
                 }
-                let meta = match std::fs::metadata(&path) {
-                    Ok(m) => m,
-                    Err(_) => continue,
+                let snapshot = match inspect_file(&path) {
+                    Ok(InspectedFile::Text(snapshot)) => snapshot,
+                    Ok(InspectedFile::Unsupported(_)) | Err(_) => continue,
                 };
-                if meta.len() > SNAPSHOT_MAX_FILE_BYTES {
-                    continue;
-                }
-                let content = match std::fs::read(&path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                if is_binary(&content) {
-                    continue;
-                }
-                let hash = hex_encode(&sha256_hash(&content));
-                let obj_path = objects_dir.join(&hash);
+                let obj_path = objects_dir.join(&snapshot.hash_hex);
                 if !obj_path.exists() {
                     // Write into a tmp path first so a partial write can't
                     // leave a corrupt blob under its hash.
                     let tmp = obj_path.with_extension("tmp");
-                    if std::fs::write(&tmp, &content).is_ok() {
+                    if std::fs::write(&tmp, &snapshot.bytes).is_ok() {
                         let _ = std::fs::rename(&tmp, &obj_path);
                     }
                 }
-                out.insert(rel.to_string_lossy().to_string(), hash);
+                out.insert(rel_path_key(&rel), snapshot.hash_hex);
             }
         }
         Ok(out)
@@ -829,10 +955,7 @@ impl FileWatcher {
         // First round: compare against baseline in-memory mirror.
         let mut baseline_hex: HashMap<String, String> = HashMap::new();
         for (rel, bytes) in &self.baselines {
-            baseline_hex.insert(
-                rel.to_string_lossy().to_string(),
-                hex_encode(&sha256_hash(bytes)),
-            );
+            baseline_hex.insert(rel_path_key(rel), hex_encode(&sha256_hash(bytes)));
         }
         let mut keys: HashSet<&String> = baseline_hex.keys().collect();
         keys.extend(current.keys());
@@ -883,19 +1006,11 @@ impl FileWatcher {
                 if should_ignore(&rel) {
                     continue;
                 }
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    if meta.len() > SNAPSHOT_MAX_FILE_BYTES {
-                        continue;
-                    }
-                }
-                let content = match std::fs::read(&path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
+                let snapshot = match inspect_file(&path) {
+                    Ok(InspectedFile::Text(snapshot)) => snapshot,
+                    Ok(InspectedFile::Unsupported(_)) | Err(_) => continue,
                 };
-                if is_binary(&content) {
-                    continue;
-                }
-                current.insert(rel.to_string_lossy().to_string(), sha256_hash(&content));
+                current.insert(rel_path_key(&rel), snapshot.hash);
             }
         }
 
@@ -981,15 +1096,12 @@ impl FileWatcher {
                 if should_ignore(&rel) {
                     continue;
                 }
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    if meta.len() > SNAPSHOT_MAX_FILE_BYTES {
-                        continue;
-                    }
-                }
-                if let Ok(content) = std::fs::read(&path) {
-                    if !is_binary(&content) {
-                        new_hashes.insert(rel, sha256_hash(&content));
-                    }
+                if let Ok(snapshot) = inspect_file(&path) {
+                    let hash = match snapshot {
+                        InspectedFile::Text(snapshot) => snapshot.hash,
+                        InspectedFile::Unsupported(snapshot) => snapshot.hash,
+                    };
+                    new_hashes.insert(rel, hash);
                 }
             }
         }
@@ -1125,11 +1237,65 @@ mod tests {
         assert!(should_ignore(Path::new("images/logo.png")));
         assert!(should_ignore(Path::new("archive.tar.gz")));
         assert!(should_ignore(Path::new(".claude/settings.json")));
+        assert!(should_ignore(Path::new(".worktrees/feature/src/main.rs")));
 
         assert!(!should_ignore(Path::new("src/main.rs")));
         assert!(!should_ignore(Path::new("Cargo.toml")));
         assert!(!should_ignore(Path::new("README.md")));
         assert!(!should_ignore(Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn new_records_unsupported_baseline_manifest_without_text_baseline() {
+        let root = TempDir::new().unwrap();
+        let snap = TempDir::new().unwrap();
+        std::fs::write(root.path().join("data.dat"), b"text\0binary").unwrap();
+
+        let _watcher = make_watcher(root.path(), snap.path());
+
+        let manifest_path = snap.path().join(BASELINE_MANIFEST_FILE);
+        let manifest: BaselineManifest =
+            serde_json::from_slice(&std::fs::read(manifest_path).unwrap()).unwrap();
+        let meta = manifest.get("data.dat").expect("unsupported file metadata");
+        assert!(!meta.supported_text);
+        assert_eq!(meta.reason.as_deref(), Some("binary file"));
+        assert!(!snap.path().join("baseline").join("data.dat").exists());
+    }
+
+    #[test]
+    fn created_empty_file_does_not_become_baseline_sentinel() {
+        let root = TempDir::new().unwrap();
+        let snap = TempDir::new().unwrap();
+        let file_path = root.path().join("empty.txt");
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut watcher =
+            FileWatcher::new(root.path().to_path_buf(), snap.path().to_path_buf(), bus)
+                .expect("watcher");
+
+        std::fs::write(&file_path, b"").unwrap();
+        watcher.process_change(
+            &file_path,
+            &notify::EventKind::Create(notify::event::CreateKind::File),
+        );
+
+        match rx.try_recv().expect("file_changed event") {
+            AppEvent::FileChanged {
+                path,
+                kind,
+                lines_added,
+                lines_removed,
+            } => {
+                assert_eq!(path, "empty.txt");
+                assert_eq!(kind, FileChangeKind::Created);
+                assert_eq!(lines_added, 0);
+                assert_eq!(lines_removed, 0);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(!snap.path().join("baseline").join("empty.txt").exists());
+        assert!(!watcher.baselines.contains_key(Path::new("empty.txt")));
     }
 
     #[test]

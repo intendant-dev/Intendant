@@ -3648,6 +3648,23 @@ fn list_sessions() -> String {
 ///
 /// - No path suffix: list all changed files (baseline vs current).
 /// - With path suffix: return unified diff for a single file.
+#[derive(Debug, Clone)]
+enum ChangeFileState {
+    Text { content: String, hash: String },
+    Unsupported { hash: String, reason: String },
+}
+
+#[derive(Debug, Clone)]
+struct ChangeRecord {
+    path: String,
+    kind: &'static str,
+    lines_added: u32,
+    lines_removed: u32,
+    diff_available: bool,
+    reason: Option<String>,
+    diff: Option<String>,
+}
+
 fn handle_changes_request(
     request_line: &str,
     snapshot_dir: Option<&Path>,
@@ -3688,9 +3705,19 @@ fn handle_changes_request(
     }
 }
 
-/// List all files that have changed since the session baseline.
-fn handle_changes_list(baseline_dir: &Path, project_root: &Path) -> String {
-    let mut changes = Vec::new();
+fn load_baseline_manifest(baseline_dir: &Path) -> crate::file_watcher::BaselineManifest {
+    let Some(snapshot_dir) = baseline_dir.parent() else {
+        return HashMap::new();
+    };
+    let path = snapshot_dir.join(crate::file_watcher::BASELINE_MANIFEST_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+fn collect_baseline_text_paths(baseline_dir: &Path) -> HashSet<String> {
+    let mut paths = HashSet::new();
     let mut stack = vec![baseline_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
@@ -3703,56 +3730,288 @@ fn handle_changes_list(baseline_dir: &Path, project_root: &Path) -> String {
                 stack.push(path);
                 continue;
             }
+            if !path.is_file() {
+                continue;
+            }
             let rel = match path.strip_prefix(baseline_dir) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            let rel_str = rel.to_string_lossy().to_string();
-            let current_path = project_root.join(rel);
-
-            let baseline = std::fs::read_to_string(&path).unwrap_or_default();
-            if current_path.exists() {
-                let current = match std::fs::read_to_string(&current_path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                if baseline == current {
-                    continue; // no change
-                }
-                let (lines_added, lines_removed) = {
-                    let diff = similar::TextDiff::from_lines(baseline.as_str(), current.as_str());
-                    let mut added = 0u32;
-                    let mut removed = 0u32;
-                    for change in diff.iter_all_changes() {
-                        match change.tag() {
-                            similar::ChangeTag::Insert => added += 1,
-                            similar::ChangeTag::Delete => removed += 1,
-                            similar::ChangeTag::Equal => {}
-                        }
-                    }
-                    (added, removed)
-                };
-                let kind = if baseline.is_empty() {
-                    "created"
-                } else {
-                    "modified"
-                };
-                changes.push(serde_json::json!({
-                    "path": rel_str,
-                    "kind": kind,
-                    "lines_added": lines_added,
-                    "lines_removed": lines_removed,
-                }));
-            } else {
-                // File was deleted.
-                let lines_removed = baseline.lines().count() as u32;
-                changes.push(serde_json::json!({
-                    "path": rel_str,
-                    "kind": "deleted",
-                    "lines_added": 0,
-                    "lines_removed": lines_removed,
-                }));
+            if crate::file_watcher::should_ignore(rel) {
+                continue;
             }
+            paths.insert(crate::file_watcher::rel_path_key(rel));
+        }
+    }
+    paths
+}
+
+fn collect_current_change_states(project_root: &Path) -> HashMap<String, ChangeFileState> {
+    let mut states = HashMap::new();
+    let mut stack = vec![project_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                if let Ok(rel) = path.strip_prefix(project_root) {
+                    if !crate::file_watcher::should_ignore(rel) {
+                        stack.push(path);
+                    }
+                }
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            let rel = match path.strip_prefix(project_root) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if crate::file_watcher::should_ignore(rel) {
+                continue;
+            }
+            let key = crate::file_watcher::rel_path_key(rel);
+            match crate::file_watcher::inspect_file(&path) {
+                Ok(crate::file_watcher::InspectedFile::Text(snapshot)) => {
+                    states.insert(
+                        key,
+                        ChangeFileState::Text {
+                            content: snapshot.text,
+                            hash: snapshot.hash_hex,
+                        },
+                    );
+                }
+                Ok(crate::file_watcher::InspectedFile::Unsupported(snapshot)) => {
+                    states.insert(
+                        key,
+                        ChangeFileState::Unsupported {
+                            hash: snapshot.hash_hex,
+                            reason: snapshot.reason,
+                        },
+                    );
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+    states
+}
+
+fn inspect_current_change_state(project_root: &Path, rel_key: &str) -> Option<ChangeFileState> {
+    let path = project_root.join(Path::new(rel_key));
+    if !path.exists() {
+        return None;
+    }
+    match crate::file_watcher::inspect_file(&path) {
+        Ok(crate::file_watcher::InspectedFile::Text(snapshot)) => Some(ChangeFileState::Text {
+            content: snapshot.text,
+            hash: snapshot.hash_hex,
+        }),
+        Ok(crate::file_watcher::InspectedFile::Unsupported(snapshot)) => {
+            Some(ChangeFileState::Unsupported {
+                hash: snapshot.hash_hex,
+                reason: snapshot.reason,
+            })
+        }
+        Err(_) => None,
+    }
+}
+
+fn read_baseline_text(baseline_dir: &Path, rel_key: &str) -> Option<String> {
+    std::fs::read_to_string(baseline_dir.join(Path::new(rel_key))).ok()
+}
+
+fn baseline_hash_for(
+    baseline_text: Option<&str>,
+    baseline_meta: Option<&crate::file_watcher::BaselineFileMeta>,
+) -> Option<String> {
+    baseline_meta.map(|m| m.hash.clone()).or_else(|| {
+        baseline_text.map(|s| {
+            crate::file_watcher::hex_encode(&crate::file_watcher::sha256_hash(s.as_bytes()))
+        })
+    })
+}
+
+fn diff_stat_pair(baseline: &str, current: &str) -> (u32, u32) {
+    let diff = similar::TextDiff::from_lines(baseline, current);
+    let mut added = 0u32;
+    let mut removed = 0u32;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Insert => added += 1,
+            similar::ChangeTag::Delete => removed += 1,
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    (added, removed)
+}
+
+fn unsupported_change_record(rel_key: &str, kind: &'static str, reason: String) -> ChangeRecord {
+    ChangeRecord {
+        path: rel_key.to_string(),
+        kind,
+        lines_added: 0,
+        lines_removed: 0,
+        diff_available: false,
+        reason: Some(reason),
+        diff: None,
+    }
+}
+
+fn compute_change_record(
+    rel_key: &str,
+    baseline_dir: &Path,
+    current: Option<&ChangeFileState>,
+    baseline_manifest: &crate::file_watcher::BaselineManifest,
+    include_diff: bool,
+) -> Option<ChangeRecord> {
+    let baseline_text = read_baseline_text(baseline_dir, rel_key);
+    let baseline_meta = baseline_manifest.get(rel_key);
+    let baseline_exists = baseline_text.is_some() || baseline_meta.is_some();
+    let baseline_supported_text =
+        baseline_text.is_some() && baseline_meta.map(|m| m.supported_text).unwrap_or(true);
+
+    match (
+        baseline_exists,
+        baseline_supported_text,
+        baseline_text.as_deref(),
+        current,
+    ) {
+        (false, _, _, None) => None,
+        (false, _, _, Some(ChangeFileState::Text { content, .. })) => {
+            let (lines_added, lines_removed) = diff_stat_pair("", content);
+            let diff = include_diff
+                .then(|| crate::file_watcher::compute_unified_diff("", content, rel_key));
+            Some(ChangeRecord {
+                path: rel_key.to_string(),
+                kind: "created",
+                lines_added,
+                lines_removed,
+                diff_available: true,
+                reason: None,
+                diff,
+            })
+        }
+        (false, _, _, Some(ChangeFileState::Unsupported { reason, .. })) => Some(
+            unsupported_change_record(rel_key, "created", reason.clone()),
+        ),
+        (true, true, Some(base), None) => {
+            let diff =
+                include_diff.then(|| crate::file_watcher::compute_unified_diff(base, "", rel_key));
+            Some(ChangeRecord {
+                path: rel_key.to_string(),
+                kind: "deleted",
+                lines_added: 0,
+                lines_removed: base.lines().count() as u32,
+                diff_available: true,
+                reason: None,
+                diff,
+            })
+        }
+        (true, false, _, None) => {
+            let reason = baseline_meta
+                .and_then(|m| m.reason.clone())
+                .unwrap_or_else(|| "baseline file was not text-diffable".to_string());
+            Some(unsupported_change_record(rel_key, "deleted", reason))
+        }
+        (true, true, Some(base), Some(ChangeFileState::Text { content, hash })) => {
+            let baseline_hash = baseline_hash_for(Some(base), baseline_meta);
+            if baseline_hash.as_ref() == Some(hash) || base == content {
+                return None;
+            }
+            let (lines_added, lines_removed) = diff_stat_pair(base, content);
+            let diff = include_diff
+                .then(|| crate::file_watcher::compute_unified_diff(base, content, rel_key));
+            Some(ChangeRecord {
+                path: rel_key.to_string(),
+                kind: "modified",
+                lines_added,
+                lines_removed,
+                diff_available: true,
+                reason: None,
+                diff,
+            })
+        }
+        (true, true, Some(base), Some(ChangeFileState::Unsupported { hash, reason })) => {
+            let baseline_hash = baseline_hash_for(Some(base), baseline_meta);
+            if baseline_hash.as_ref() == Some(hash) {
+                return None;
+            }
+            Some(unsupported_change_record(
+                rel_key,
+                "modified",
+                reason.clone(),
+            ))
+        }
+        (true, false, _, Some(ChangeFileState::Text { hash, .. }))
+        | (true, false, _, Some(ChangeFileState::Unsupported { hash, .. })) => {
+            if baseline_meta.map(|m| &m.hash) == Some(hash) {
+                return None;
+            }
+            let reason = baseline_meta
+                .and_then(|m| m.reason.clone())
+                .unwrap_or_else(|| "baseline file was not text-diffable".to_string());
+            Some(unsupported_change_record(rel_key, "modified", reason))
+        }
+        _ => None,
+    }
+}
+
+fn change_record_summary_json(record: &ChangeRecord) -> serde_json::Value {
+    serde_json::json!({
+        "path": record.path.clone(),
+        "kind": record.kind,
+        "lines_added": record.lines_added,
+        "lines_removed": record.lines_removed,
+        "diff_available": record.diff_available,
+        "reason": record.reason.clone(),
+    })
+}
+
+fn change_record_detail_json(record: &ChangeRecord) -> serde_json::Value {
+    serde_json::json!({
+        "path": record.path.clone(),
+        "kind": record.kind,
+        "diff": record.diff.clone().unwrap_or_default(),
+        "lines_added": record.lines_added,
+        "lines_removed": record.lines_removed,
+        "diff_available": record.diff_available,
+        "reason": record.reason.clone(),
+    })
+}
+
+/// List all files that have changed since the session baseline.
+fn handle_changes_list(baseline_dir: &Path, project_root: &Path) -> String {
+    let baseline_manifest = load_baseline_manifest(baseline_dir);
+    let baseline_paths = collect_baseline_text_paths(baseline_dir);
+    let current_states = collect_current_change_states(project_root);
+    let mut keys: HashSet<String> = baseline_manifest.keys().cloned().collect();
+    keys.extend(baseline_paths);
+    keys.extend(current_states.keys().cloned());
+
+    let mut changes = Vec::new();
+    let mut sorted_keys: Vec<String> = keys.into_iter().collect();
+    sorted_keys.sort();
+    for key in sorted_keys {
+        if crate::file_watcher::should_ignore(Path::new(&key)) {
+            continue;
+        }
+        if let Some(record) = compute_change_record(
+            &key,
+            baseline_dir,
+            current_states.get(&key),
+            &baseline_manifest,
+            false,
+        ) {
+            changes.push(change_record_summary_json(&record));
         }
     }
     serde_json::to_string(&changes).unwrap_or_else(|_| "[]".to_string())
@@ -3774,6 +4033,12 @@ fn handle_changes_file_diff(
                 serde_json::json!({"error": "invalid path"}).to_string(),
             );
         }
+    }
+    if crate::file_watcher::should_ignore(rel) {
+        return (
+            "404 Not Found",
+            serde_json::json!({"error": "no changes for path"}).to_string(),
+        );
     }
 
     let baseline_path = baseline_dir.join(rel);
@@ -3811,38 +4076,22 @@ fn handle_changes_file_diff(
         }
     }
 
-    let baseline = std::fs::read_to_string(&baseline_path).unwrap_or_default();
-    let current = if current_path.exists() {
-        std::fs::read_to_string(&current_path).unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let baseline_manifest = load_baseline_manifest(baseline_dir);
+    let current = inspect_current_change_state(project_root, &decoded);
 
-    let diff = crate::file_watcher::compute_unified_diff(&baseline, &current, &decoded);
-    let (lines_added, lines_removed) = {
-        let text_diff = similar::TextDiff::from_lines(baseline.as_str(), current.as_str());
-        let mut added = 0u32;
-        let mut removed = 0u32;
-        for change in text_diff.iter_all_changes() {
-            match change.tag() {
-                similar::ChangeTag::Insert => added += 1,
-                similar::ChangeTag::Delete => removed += 1,
-                similar::ChangeTag::Equal => {}
-            }
-        }
-        (added, removed)
-    };
-
-    (
-        "200 OK",
-        serde_json::json!({
-            "path": decoded,
-            "diff": diff,
-            "lines_added": lines_added,
-            "lines_removed": lines_removed,
-        })
-        .to_string(),
-    )
+    match compute_change_record(
+        &decoded,
+        baseline_dir,
+        current.as_ref(),
+        &baseline_manifest,
+        true,
+    ) {
+        Some(record) => ("200 OK", change_record_detail_json(&record).to_string()),
+        None => (
+            "404 Not Found",
+            serde_json::json!({"error": "no changes for path"}).to_string(),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -13211,6 +13460,146 @@ mod tests {
             "list endpoint should return an array"
         );
         assert_eq!(json[0]["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn changes_request_lists_current_only_created_file() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(snapshot.path().join("baseline")).unwrap();
+        let current_path = project.path().join("src/new.rs");
+        std::fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        std::fs::write(&current_path, "new\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["path"], "src/new.rs");
+        assert_eq!(json[0]["kind"], "created");
+        assert_eq!(json[0]["lines_added"], 1);
+        assert_eq!(json[0]["diff_available"], true);
+    }
+
+    #[test]
+    fn changes_request_lists_created_empty_file() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(snapshot.path().join("baseline")).unwrap();
+        std::fs::write(project.path().join("empty.txt"), "").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["path"], "empty.txt");
+        assert_eq!(json[0]["kind"], "created");
+        assert_eq!(json[0]["lines_added"], 0);
+        assert_eq!(json[0]["lines_removed"], 0);
+    }
+
+    #[test]
+    fn changes_request_empty_baseline_file_modified_is_not_created() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let baseline_path = snapshot.path().join("baseline/empty.txt");
+        std::fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        std::fs::write(&baseline_path, "").unwrap();
+        std::fs::write(project.path().join("empty.txt"), "now has text\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json[0]["path"], "empty.txt");
+        assert_eq!(json[0]["kind"], "modified");
+        assert_eq!(json[0]["lines_added"], 1);
+    }
+
+    #[test]
+    fn changes_request_created_then_deleted_net_zero_is_absent() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(snapshot.path().join("baseline")).unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn changes_request_ignores_nested_worktrees() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(snapshot.path().join("baseline")).unwrap();
+        let worktree_file = project.path().join(".worktrees/feature/src/main.rs");
+        std::fs::create_dir_all(worktree_file.parent().unwrap()).unwrap();
+        std::fs::write(worktree_file, "fn main() {}\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn changes_request_reports_unsupported_current_for_text_baseline() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let baseline_path = snapshot.path().join("baseline/src/main.rs");
+        let current_path = project.path().join("src/main.rs");
+        std::fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        std::fs::write(&baseline_path, "fn main() {}\n").unwrap();
+        std::fs::write(&current_path, b"fn\0main").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json[0]["path"], "src/main.rs");
+        assert_eq!(json[0]["kind"], "modified");
+        assert_eq!(json[0]["diff_available"], false);
+        assert_eq!(json[0]["reason"], "binary file");
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes/src/main.rs HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, "200 OK");
+        assert_eq!(json["diff_available"], false);
+        assert_eq!(json["diff"], "");
     }
 
     #[test]
