@@ -29,6 +29,7 @@ const EXTERNAL_SESSION_SCAN_LIMIT: usize = 2_000;
 const EXTERNAL_SESSION_READ_LIMIT: u64 = 512 * 1024;
 const SESSION_LIST_LIMIT: usize = 5_000;
 const SESSION_SOURCE_FLOOR: usize = 100;
+const FS_LIST_LIMIT: usize = 500;
 
 /// Tracks which WebSocket connection currently owns the voice model (is "active").
 /// Only one connection can be active at a time; all others are "passive" (TUI-only).
@@ -1122,6 +1123,36 @@ pub struct WebQueryCtx {
     pub presence_session: Option<Arc<Mutex<crate::presence::PresenceSession>>>,
     /// Shared context injection queue for mid-task interjections.
     pub context_injection: Option<crate::event::ContextInjectionQueue>,
+}
+
+#[derive(Debug, Serialize)]
+struct FsPathStatus {
+    input: String,
+    path: String,
+    exists: bool,
+    is_dir: bool,
+    is_file: bool,
+    readable: bool,
+    parent: Option<String>,
+    parent_exists: bool,
+    parent_is_dir: bool,
+    nearest_existing_parent: Option<String>,
+    can_create: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct FsListEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    is_file: bool,
+    is_symlink: bool,
+    hidden: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct FsMkdirRequest {
+    path: String,
 }
 
 /// Debug state for the voice model, tracked server-side from WebSocket messages.
@@ -4260,6 +4291,33 @@ fn pending_upload_session_dir(project_root: &std::path::Path) -> std::path::Path
     project_root.join(".intendant").join("pending_uploads")
 }
 
+fn json_response(status: &str, body: String) -> String {
+    format!(
+        "HTTP/1.1 {}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        status,
+        body.len(),
+        body
+    )
+}
+
+fn json_ok(value: serde_json::Value) -> String {
+    json_response("200 OK", value.to_string())
+}
+
+fn json_error(status: &str, message: impl AsRef<str>) -> String {
+    json_response(
+        status,
+        serde_json::json!({ "error": message.as_ref() }).to_string(),
+    )
+}
+
 fn effective_upload_destination(
     requested: crate::upload_store::UploadDestination,
     has_active_session: bool,
@@ -4357,6 +4415,154 @@ fn url_path_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+fn expand_dashboard_fs_path(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    let path = if trimmed.is_empty() || trimmed == "~" {
+        dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        dirs::home_dir()
+            .ok_or_else(|| "could not resolve home directory".to_string())?
+            .join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+    if !path.is_absolute() {
+        return Err(format!(
+            "path must be absolute or start with ~/ (got {})",
+            trimmed
+        ));
+    }
+    Ok(path)
+}
+
+fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    loop {
+        if current.exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn inspect_dashboard_fs_path(raw: &str) -> Result<FsPathStatus, String> {
+    let path = expand_dashboard_fs_path(raw)?;
+    let metadata = std::fs::metadata(&path).ok();
+    let exists = metadata.is_some();
+    let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+    let is_file = metadata.as_ref().map(|m| m.is_file()).unwrap_or(false);
+    let readable = if is_dir {
+        std::fs::read_dir(&path).is_ok()
+    } else if is_file {
+        std::fs::File::open(&path).is_ok()
+    } else {
+        false
+    };
+    let display_path = if exists {
+        std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone())
+    } else {
+        path.clone()
+    };
+    let parent = path.parent().map(|p| p.to_string_lossy().to_string());
+    let parent_metadata = path.parent().and_then(|p| std::fs::metadata(p).ok());
+    let nearest = nearest_existing_parent(&path);
+    let nearest_is_dir = nearest
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    Ok(FsPathStatus {
+        input: raw.trim().to_string(),
+        path: display_path.to_string_lossy().to_string(),
+        exists,
+        is_dir,
+        is_file,
+        readable,
+        parent,
+        parent_exists: parent_metadata.is_some(),
+        parent_is_dir: parent_metadata.map(|m| m.is_dir()).unwrap_or(false),
+        nearest_existing_parent: nearest.map(|p| p.to_string_lossy().to_string()),
+        can_create: !exists && nearest_is_dir,
+    })
+}
+
+fn list_dashboard_fs_dir(raw: &str) -> Result<serde_json::Value, String> {
+    let path = expand_dashboard_fs_path(raw)?;
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|e| format!("{} is not accessible: {}", path.display(), e))?;
+    if !canonical.is_dir() {
+        return Err(format!("{} is not a directory", canonical.display()));
+    }
+    let read_dir = std::fs::read_dir(&canonical)
+        .map_err(|e| format!("could not read {}: {}", canonical.display(), e))?;
+    let mut entries = Vec::new();
+    for entry in read_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let file_type = entry.file_type().ok();
+        let metadata = entry.metadata().ok();
+        let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let is_file = metadata.as_ref().map(|m| m.is_file()).unwrap_or(false);
+        entries.push(FsListEntry {
+            hidden: name.starts_with('.'),
+            name,
+            path: entry.path().to_string_lossy().to_string(),
+            is_dir,
+            is_file,
+            is_symlink: file_type.map(|t| t.is_symlink()).unwrap_or(false),
+        });
+    }
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    let truncated = entries.len() > FS_LIST_LIMIT;
+    entries.truncate(FS_LIST_LIMIT);
+    let parent = canonical.parent().map(|p| p.to_string_lossy().to_string());
+    Ok(serde_json::json!({
+        "path": canonical.to_string_lossy().to_string(),
+        "parent": parent,
+        "home": dirs::home_dir().map(|p| p.to_string_lossy().to_string()),
+        "entries": entries,
+        "truncated": truncated,
+    }))
+}
+
+fn mkdir_dashboard_fs_path(raw: &str) -> Result<serde_json::Value, (String, String)> {
+    let path = expand_dashboard_fs_path(raw).map_err(|e| ("400 Bad Request".to_string(), e))?;
+    if path.exists() {
+        if path.is_dir() {
+            let display = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            return Ok(serde_json::json!({
+                "ok": true,
+                "created": false,
+                "already_exists": true,
+                "path": display.to_string_lossy().to_string(),
+                "notice": "Directory already exists"
+            }));
+        }
+        return Err((
+            "409 Conflict".to_string(),
+            format!("{} already exists and is not a directory", path.display()),
+        ));
+    }
+    std::fs::create_dir_all(&path).map_err(|e| {
+        (
+            "500 Internal Server Error".to_string(),
+            format!("failed to create {}: {}", path.display(), e),
+        )
+    })?;
+    let display = std::fs::canonicalize(&path).unwrap_or(path);
+    Ok(serde_json::json!({
+        "ok": true,
+        "created": true,
+        "already_exists": false,
+        "path": display.to_string_lossy().to_string()
+    }))
 }
 
 /// Extract the `Content-Type` request header value, or a generic default.
@@ -8311,6 +8517,42 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/fs/stat")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let path = query_param(&request_line, "path").unwrap_or_default();
+                        let response = match inspect_dashboard_fs_path(&path) {
+                            Ok(status) => json_response(
+                                "200 OK",
+                                serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string()),
+                            ),
+                            Err(e) => json_error("400 Bad Request", e),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/fs/list")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let path = query_param(&request_line, "path").unwrap_or_default();
+                        let response = match list_dashboard_fs_dir(&path) {
+                            Ok(body) => json_ok(body),
+                            Err(e) => json_error("400 Bad Request", e),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST")
+                        && request_line.contains(" /api/fs/mkdir")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let response = match serde_json::from_str::<FsMkdirRequest>(&body_text) {
+                            Ok(req) => match mkdir_dashboard_fs_path(&req.path) {
+                                Ok(body) => json_ok(body),
+                                Err((status, message)) => json_error(&status, message),
+                            },
+                            Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST")
                         && request_line.contains("/api/settings")
                     {
@@ -11831,6 +12073,51 @@ mod tests {
             pending_upload_session_dir(&root),
             root.join(".intendant").join("pending_uploads")
         );
+    }
+
+    #[test]
+    fn dashboard_fs_stat_reports_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = inspect_dashboard_fs_path(dir.path().to_str().unwrap()).unwrap();
+
+        assert!(status.exists);
+        assert!(status.is_dir);
+        assert!(status.readable);
+        assert!(!status.can_create);
+    }
+
+    #[test]
+    fn dashboard_fs_stat_marks_missing_directory_creatable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("new").join("project");
+        let status = inspect_dashboard_fs_path(missing.to_str().unwrap()).unwrap();
+
+        assert!(!status.exists);
+        assert!(status.can_create);
+        assert_eq!(
+            status.nearest_existing_parent.as_deref(),
+            Some(dir.path().to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn dashboard_fs_mkdir_creates_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("new").join("project");
+        let result = mkdir_dashboard_fs_path(missing.to_str().unwrap()).unwrap();
+
+        assert_eq!(result["created"], true);
+        assert_eq!(result["already_exists"], false);
+        assert!(missing.is_dir());
+    }
+
+    #[test]
+    fn dashboard_fs_mkdir_reports_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = mkdir_dashboard_fs_path(dir.path().to_str().unwrap()).unwrap();
+
+        assert_eq!(result["created"], false);
+        assert_eq!(result["already_exists"], true);
     }
 
     #[test]
