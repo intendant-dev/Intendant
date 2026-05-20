@@ -8248,7 +8248,7 @@ function promptCodexThreadActionParams(opts = {}) {
     if (prompt === null) return null;
     if (prompt.trim()) params.prompt = prompt.trim();
   } else if (opts.promptRename) {
-    const name = window.prompt('Thread name:', '');
+    const name = window.prompt(opts.promptRenameLabel || 'Thread name:', '');
     if (name === null) return null;
     if (!name.trim()) {
       showControlToast('error', '/rename failed: thread name is required');
@@ -8817,7 +8817,13 @@ const SESSION_WINDOW_GENERIC_ACTIONS = [
 
 const SESSION_WINDOW_CODEX_ACTIONS = [
   { op: 'fork', label: 'Fork...', title: 'Fork this Codex thread', promptName: true },
-  { op: 'rename', label: 'Rename...', title: 'Rename this Codex thread', promptRename: true },
+  {
+    op: 'rename',
+    label: 'Rename session...',
+    title: 'Rename this session',
+    promptRename: true,
+    promptRenameLabel: 'Session name:',
+  },
   { op: 'goal', label: 'Configure goal...', title: 'Create or update this thread goal', promptGoal: true },
   { op: 'goal-get', label: 'Goal status', title: 'Fetch this thread goal' },
   { op: 'compact', label: 'Compact', title: 'Compact this thread history' },
