@@ -2217,6 +2217,67 @@ html, body {
   min-width: 116px;
   font-size: 11px;
   color: var(--overlay0);
+  position: relative;
+}
+.sessions-multi-filter-btn {
+  height: 28px;
+  min-width: 132px;
+  padding: 2px 24px 2px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+  position: relative;
+}
+.sessions-multi-filter-btn::after {
+  content: "\25BE";
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--overlay0);
+  font-size: 10px;
+}
+.sessions-multi-filter-btn:hover,
+.sessions-multi-filter-btn[aria-expanded="true"] {
+  border-color: var(--blue);
+}
+.sessions-multi-filter-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 80;
+  min-width: 180px;
+  padding: 5px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--mantle);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.32);
+}
+.sessions-multi-filter-menu.hidden { display: none; }
+.sessions-multi-filter-menu label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 7px;
+  border-radius: 4px;
+  color: var(--subtext0);
+  font-size: 12px;
+  text-transform: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sessions-multi-filter-menu label:hover {
+  background: var(--surface0);
+  color: var(--text);
+}
+.sessions-multi-filter-menu input {
+  margin: 0;
+  accent-color: var(--blue);
 }
 .sessions-toggle {
   display: flex;
@@ -2610,6 +2671,13 @@ html, body {
   border-radius: 3px;
   padding: 0 4px;
 }
+.session-detail-title .sd-title-kind.name,
+.session-card .sc-title-kind.name {
+  color: var(--mauve);
+  border-color: color-mix(in srgb, var(--mauve) 55%, var(--surface1));
+  background: color-mix(in srgb, var(--mauve) 14%, transparent);
+  font-weight: 700;
+}
 .session-detail-title .sd-title-text {
   min-width: 0;
   overflow: hidden;
@@ -2640,6 +2708,17 @@ html, body {
 .session-detail-action-btn:hover {
   border-color: var(--blue);
   color: var(--blue);
+}
+.session-rename-btn {
+  border-color: color-mix(in srgb, var(--mauve) 55%, var(--surface1));
+  background: color-mix(in srgb, var(--mauve) 12%, transparent);
+  color: var(--mauve);
+  font-weight: 600;
+}
+.session-rename-btn:hover {
+  border-color: var(--mauve);
+  background: color-mix(in srgb, var(--mauve) 18%, transparent);
+  color: var(--mauve);
 }
 .session-detail-body { flex: 1; overflow-y: auto; display: flex; flex-direction: column; min-height: 0; }
 .sd-section { border-bottom: 1px solid var(--surface0); }
@@ -2922,9 +3001,16 @@ html, body {
   border-color: var(--red);
   color: var(--red);
 }
+.sc-rename-btn {
+  border-color: color-mix(in srgb, var(--mauve) 55%, var(--surface1));
+  background: color-mix(in srgb, var(--mauve) 12%, transparent);
+  color: var(--mauve);
+  font-weight: 600;
+}
 .sc-rename-btn:hover {
-  border-color: var(--blue);
-  color: var(--blue);
+  border-color: var(--mauve);
+  background: color-mix(in srgb, var(--mauve) 18%, transparent);
+  color: var(--mauve);
 }
 .sc-resume-btn {
   font-size: 11px;
@@ -5657,26 +5743,28 @@ html, body {
                   <span>Search</span>
                   <input type="search" id="sessions-search" placeholder="ID, name, task, model, path; logs with Deep search..." autocomplete="off" spellcheck="false">
                 </label>
-                <label class="sessions-control">Source
-                  <select id="filter-session-source">
-                    <option value="all" selected>All sources</option>
-                    <option value="intendant">Intendant</option>
-                    <option value="external">External agents</option>
-                    <option value="codex">Codex</option>
-                    <option value="claude-code">Claude</option>
-                    <option value="gemini">Gemini</option>
-                  </select>
-                </label>
-                <label class="sessions-control">Status
-                  <select id="filter-session-status">
-                    <option value="all" selected>All statuses</option>
-                    <option value="active">Active</option>
-                    <option value="idle">Idle</option>
-                    <option value="completed">Completed</option>
-                    <option value="abandoned">Abandoned</option>
-                    <option value="interrupted">Interrupted</option>
-                  </select>
-                </label>
+                <div class="sessions-control sessions-multi-filter" data-session-filter="source">
+                  <span>Source</span>
+                  <button type="button" class="sessions-multi-filter-btn" id="filter-session-source" aria-haspopup="true" aria-expanded="false">All sources</button>
+                  <div class="sessions-multi-filter-menu hidden" id="filter-session-source-menu" role="menu" aria-label="Source filters">
+                    <label><input type="checkbox" value="intendant"> Intendant</label>
+                    <label><input type="checkbox" value="external"> External agents</label>
+                    <label><input type="checkbox" value="codex"> Codex</label>
+                    <label><input type="checkbox" value="claude-code"> Claude</label>
+                    <label><input type="checkbox" value="gemini"> Gemini</label>
+                  </div>
+                </div>
+                <div class="sessions-control sessions-multi-filter" data-session-filter="status">
+                  <span>Status</span>
+                  <button type="button" class="sessions-multi-filter-btn" id="filter-session-status" aria-haspopup="true" aria-expanded="false">All statuses</button>
+                  <div class="sessions-multi-filter-menu hidden" id="filter-session-status-menu" role="menu" aria-label="Status filters">
+                    <label><input type="checkbox" value="active"> Active</label>
+                    <label><input type="checkbox" value="idle"> Idle</label>
+                    <label><input type="checkbox" value="completed"> Completed</label>
+                    <label><input type="checkbox" value="abandoned"> Abandoned</label>
+                    <label><input type="checkbox" value="interrupted"> Interrupted</label>
+                  </div>
+                </div>
                 <label class="sessions-toggle" title="Search session log content on the server, not just summary fields. Slower and capped for dashboard responsiveness."><input type="checkbox" id="sessions-detailed-search"> Deep search</label>
                 <label class="sessions-sort">Sort
                   <select id="sort-sessions">
@@ -5703,7 +5791,7 @@ html, body {
               <div class="session-detail-header">
                 <button class="session-back-btn" onclick="closeSessionDetail()">&larr; Back</button>
                 <span class="session-detail-title" id="session-detail-title"></span>
-                <button class="session-detail-action-btn" id="session-detail-rename" type="button" title="Rename this session">Rename</button>
+                <button class="session-detail-action-btn session-rename-btn" id="session-detail-rename" type="button" title="Rename this session">Rename</button>
               </div>
               <div class="session-detail-body" id="session-detail-body">
                 <div class="sd-section" id="sd-recordings" style="display:none">
@@ -6489,6 +6577,20 @@ const HOST_FILTER_KEY = 'intendant_host_filter';
 const SESSIONS_FILTER_SOURCE_KEY = 'intendant_sessions_filter_source';
 const SESSIONS_FILTER_STATUS_KEY = 'intendant_sessions_filter_status';
 const SESSIONS_DETAILED_SEARCH_KEY = 'intendant_sessions_detailed_search';
+const SESSION_SOURCE_FILTER_OPTIONS = [
+  { value: 'intendant', label: 'Intendant', plural: 'sources' },
+  { value: 'external', label: 'External agents', plural: 'sources' },
+  { value: 'codex', label: 'Codex', plural: 'sources' },
+  { value: 'claude-code', label: 'Claude', plural: 'sources' },
+  { value: 'gemini', label: 'Gemini', plural: 'sources' },
+];
+const SESSION_STATUS_FILTER_OPTIONS = [
+  { value: 'active', label: 'Active', plural: 'statuses' },
+  { value: 'idle', label: 'Idle', plural: 'statuses' },
+  { value: 'completed', label: 'Completed', plural: 'statuses' },
+  { value: 'abandoned', label: 'Abandoned', plural: 'statuses' },
+  { value: 'interrupted', label: 'Interrupted', plural: 'statuses' },
+];
 
 // Current Activity host filter selection. Empty string = show all
 // hosts. Otherwise matches log entries whose `data-host-id` equals
@@ -15272,22 +15374,8 @@ function restoreClientToggles() {
 
   // Sessions filters are UI preferences; restore them locally so reloads keep
   // the same list shape without writing anything to intendant.toml.
-  const fs = document.getElementById('filter-session-source');
-  if (fs) {
-    const stored = localStorage.getItem(SESSIONS_FILTER_SOURCE_KEY);
-    if (stored && Array.from(fs.options).some(opt => opt.value === stored)) fs.value = stored;
-    fs.addEventListener('change', () => {
-      localStorage.setItem(SESSIONS_FILTER_SOURCE_KEY, fs.value);
-    });
-  }
-  const status = document.getElementById('filter-session-status');
-  if (status) {
-    const stored = localStorage.getItem(SESSIONS_FILTER_STATUS_KEY);
-    if (stored && Array.from(status.options).some(opt => opt.value === stored)) status.value = stored;
-    status.addEventListener('change', () => {
-      localStorage.setItem(SESSIONS_FILTER_STATUS_KEY, status.value);
-    });
-  }
+  restoreSessionMultiFilter('source');
+  restoreSessionMultiFilter('status');
   const ds = document.getElementById('sessions-detailed-search');
   if (ds) {
     const stored = localStorage.getItem(SESSIONS_DETAILED_SEARCH_KEY);
@@ -20790,8 +20878,135 @@ function _refreshSessionsFilters() {
   scheduleSessionLogSearch();
   _refilterSessions();
 }
-document.getElementById('filter-session-source')?.addEventListener('change', _refreshSessionsFilters);
-document.getElementById('filter-session-status')?.addEventListener('change', _refilterSessions);
+function sessionMultiFilterConfig(kind) {
+  if (kind === 'source') {
+    return {
+      key: SESSIONS_FILTER_SOURCE_KEY,
+      buttonId: 'filter-session-source',
+      menuId: 'filter-session-source-menu',
+      allLabel: 'All sources',
+      options: SESSION_SOURCE_FILTER_OPTIONS,
+    };
+  }
+  return {
+    key: SESSIONS_FILTER_STATUS_KEY,
+    buttonId: 'filter-session-status',
+    menuId: 'filter-session-status-menu',
+    allLabel: 'All statuses',
+    options: SESSION_STATUS_FILTER_OPTIONS,
+  };
+}
+
+function parseStoredSessionMultiFilter(kind) {
+  const cfg = sessionMultiFilterConfig(kind);
+  const stored = localStorage.getItem(cfg.key);
+  const allowed = new Set(cfg.options.map(opt => opt.value));
+  if (!stored || stored === 'all') return [];
+  let parsed = null;
+  try { parsed = JSON.parse(stored); } catch (_) {}
+  const rawValues = Array.isArray(parsed)
+    ? parsed
+    : String(stored).split(',').map(v => v.trim());
+  const seen = new Set();
+  const values = [];
+  for (const value of rawValues) {
+    if (!allowed.has(value) || seen.has(value)) continue;
+    seen.add(value);
+    values.push(value);
+  }
+  return values;
+}
+
+function sessionMultiFilterValues(kind) {
+  const cfg = sessionMultiFilterConfig(kind);
+  const menu = document.getElementById(cfg.menuId);
+  if (!menu) return [];
+  return Array.from(menu.querySelectorAll('input[type="checkbox"]:checked'))
+    .map(input => input.value)
+    .filter(Boolean);
+}
+
+function sessionMultiFilterKey(values) {
+  return values && values.length > 0 ? values.join(',') : 'all';
+}
+
+function sessionSourceSearchScope(values) {
+  return values && values.length === 1 ? values[0] : 'all';
+}
+
+function updateSessionMultiFilterSummary(kind) {
+  const cfg = sessionMultiFilterConfig(kind);
+  const button = document.getElementById(cfg.buttonId);
+  if (!button) return;
+  const values = sessionMultiFilterValues(kind);
+  if (values.length === 0) {
+    button.textContent = cfg.allLabel;
+    button.title = cfg.allLabel;
+    return;
+  }
+  const labels = values
+    .map(value => cfg.options.find(opt => opt.value === value)?.label || value);
+  const plural = cfg.options[0]?.plural || 'filters';
+  button.textContent = labels.length === 1 ? labels[0] : `${labels.length} ${plural}`;
+  button.title = labels.join(', ');
+}
+
+function setSessionMultiFilterValues(kind, values) {
+  const cfg = sessionMultiFilterConfig(kind);
+  const selected = new Set(values || []);
+  const menu = document.getElementById(cfg.menuId);
+  if (!menu) return;
+  menu.querySelectorAll('input[type="checkbox"]').forEach(input => {
+    input.checked = selected.has(input.value);
+  });
+  updateSessionMultiFilterSummary(kind);
+}
+
+function restoreSessionMultiFilter(kind) {
+  setSessionMultiFilterValues(kind, parseStoredSessionMultiFilter(kind));
+}
+
+function closeSessionMultiFilterMenus(exceptKind = '') {
+  ['source', 'status'].forEach(kind => {
+    if (kind === exceptKind) return;
+    const cfg = sessionMultiFilterConfig(kind);
+    document.getElementById(cfg.menuId)?.classList.add('hidden');
+    document.getElementById(cfg.buttonId)?.setAttribute('aria-expanded', 'false');
+  });
+}
+
+function setupSessionMultiFilter(kind, onChange) {
+  const cfg = sessionMultiFilterConfig(kind);
+  const button = document.getElementById(cfg.buttonId);
+  const menu = document.getElementById(cfg.menuId);
+  if (!button || !menu) return;
+  button.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const willOpen = menu.classList.contains('hidden');
+    closeSessionMultiFilterMenus(willOpen ? kind : '');
+    menu.classList.toggle('hidden', !willOpen);
+    button.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+  });
+  menu.addEventListener('click', ev => ev.stopPropagation());
+  menu.addEventListener('change', () => {
+    const values = sessionMultiFilterValues(kind);
+    localStorage.setItem(cfg.key, JSON.stringify(values));
+    updateSessionMultiFilterSummary(kind);
+    onChange?.();
+  });
+  button.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') closeSessionMultiFilterMenus();
+  });
+  updateSessionMultiFilterSummary(kind);
+}
+
+setupSessionMultiFilter('source', _refreshSessionsFilters);
+setupSessionMultiFilter('status', _refilterSessions);
+document.addEventListener('click', () => closeSessionMultiFilterMenus());
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape') closeSessionMultiFilterMenus();
+});
 document.getElementById('sessions-detailed-search')?.addEventListener('change', _refreshSessionsFilters);
 document.getElementById('sort-sessions')?.addEventListener('change', _refilterSessions);
 document.getElementById('sessions-search')?.addEventListener('input', _refreshSessionsFilters);
@@ -20839,11 +21054,11 @@ function sessionSearchQuery() {
 }
 
 function sessionSourceFilterValue() {
-  return document.getElementById('filter-session-source')?.value || 'all';
+  return sessionMultiFilterValues('source');
 }
 
 function sessionStatusFilterValue() {
-  return document.getElementById('filter-session-status')?.value || 'all';
+  return sessionMultiFilterValues('status');
 }
 
 function sessionDetailedSearchEnabled() {
@@ -20851,15 +21066,17 @@ function sessionDetailedSearchEnabled() {
 }
 
 function sessionMatchesSourceFilter(source, filter) {
-  if (!filter || filter === 'all') return true;
-  if (filter === 'external') return source !== 'intendant';
-  return source === filter;
+  const filters = Array.isArray(filter) ? filter : (filter && filter !== 'all' ? [filter] : []);
+  if (filters.length === 0) return true;
+  if (filters.includes('external') && source !== 'intendant') return true;
+  return filters.includes(source);
 }
 
 function sessionMatchesStatusFilter(status, filter) {
-  if (!filter || filter === 'all') return true;
-  if (filter === 'active') return status === 'running' || status === 'in_progress';
-  return status === filter;
+  const filters = Array.isArray(filter) ? filter : (filter && filter !== 'all' ? [filter] : []);
+  if (filters.length === 0) return true;
+  if (filters.includes('active') && (status === 'running' || status === 'in_progress')) return true;
+  return filters.includes(status);
 }
 
 function sessionLogSearchKey(source, sessionId) {
@@ -20869,6 +21086,8 @@ function sessionLogSearchKey(source, sessionId) {
 function scheduleSessionLogSearch(force = false) {
   const query = sessionSearchQuery();
   const sourceFilter = sessionSourceFilterValue();
+  const sourceFilterKey = sessionMultiFilterKey(sourceFilter);
+  const sourceSearchScope = sessionSourceSearchScope(sourceFilter);
   const detailed = sessionDetailedSearchEnabled();
   if (_sessionLogSearchTimer) {
     clearTimeout(_sessionLogSearchTimer);
@@ -20878,7 +21097,7 @@ function scheduleSessionLogSearch(force = false) {
     _sessionLogSearchToken += 1;
     _sessionLogSearch = {
       query,
-      sourceFilter,
+      sourceFilter: sourceFilterKey,
       loading: false,
       loaded: false,
       error: null,
@@ -20889,12 +21108,12 @@ function scheduleSessionLogSearch(force = false) {
     };
     return;
   }
-  if (!force && _sessionLogSearch.query === query && _sessionLogSearch.sourceFilter === sourceFilter && (_sessionLogSearch.loading || _sessionLogSearch.loaded)) {
+  if (!force && _sessionLogSearch.query === query && _sessionLogSearch.sourceFilter === sourceFilterKey && (_sessionLogSearch.loading || _sessionLogSearch.loaded)) {
     return;
   }
   _sessionLogSearch = {
     query,
-    sourceFilter,
+    sourceFilter: sourceFilterKey,
     loading: true,
     loaded: false,
     error: null,
@@ -20905,7 +21124,7 @@ function scheduleSessionLogSearch(force = false) {
   };
   const token = ++_sessionLogSearchToken;
   _sessionLogSearchTimer = setTimeout(() => {
-    const url = `/api/sessions/search?q=${encodeURIComponent(query)}&source=${encodeURIComponent(sourceFilter)}`;
+    const url = `/api/sessions/search?q=${encodeURIComponent(query)}&source=${encodeURIComponent(sourceSearchScope)}`;
     authedFetch(url)
       .then(r => r.ok ? r.json() : Promise.reject(new Error(`/api/sessions/search returned ${r.status}`)))
       .then(data => {
@@ -20917,7 +21136,7 @@ function scheduleSessionLogSearch(force = false) {
         }
         _sessionLogSearch = {
           query,
-          sourceFilter,
+          sourceFilter: sourceFilterKey,
           loading: false,
           loaded: true,
           error: null,
@@ -20932,7 +21151,7 @@ function scheduleSessionLogSearch(force = false) {
         if (token !== _sessionLogSearchToken) return;
         _sessionLogSearch = {
           query,
-          sourceFilter,
+          sourceFilter: sourceFilterKey,
           loading: false,
           loaded: true,
           error: err.message || String(err),
@@ -20948,7 +21167,7 @@ function scheduleSessionLogSearch(force = false) {
 
 function sessionLogSearchHit(session, source, query, sourceFilter) {
   if (!sessionDetailedSearchEnabled() || !query) return null;
-  if (_sessionLogSearch.query !== query || _sessionLogSearch.sourceFilter !== sourceFilter) return null;
+  if (_sessionLogSearch.query !== query || _sessionLogSearch.sourceFilter !== sessionMultiFilterKey(sourceFilter)) return null;
   return _sessionLogSearch.results.get(sessionLogSearchKey(source, session.session_id)) || null;
 }
 
@@ -21154,6 +21373,7 @@ function renderSessionsList(sessions, el) {
     titleRow.className = 'sc-title-row';
     const titleKind = document.createElement('span');
     titleKind.className = 'sc-title-kind';
+    titleKind.classList.add(titleKindText);
     titleKind.textContent = titleKindText;
     titleKind.title = sessionName
       ? 'User-assigned session name'
@@ -21837,6 +22057,7 @@ function renderSessionDetailTitle(session) {
   titleLine.className = 'sd-title-line';
   const titleKind = document.createElement('span');
   titleKind.className = 'sd-title-kind';
+  titleKind.classList.add(titleKindLabel);
   titleKind.textContent = titleKindLabel;
   titleKind.title = titleKindHelp;
   const titleText = document.createElement('span');
@@ -21856,6 +22077,7 @@ function renderSessionDetailTitle(session) {
     subline.className = 'sd-title-subline';
     const subKind = document.createElement('span');
     subKind.className = 'sd-title-kind';
+    subKind.classList.add('initial');
     subKind.textContent = 'initial';
     subKind.title = 'Initial message fallback';
     const subText = document.createElement('span');
