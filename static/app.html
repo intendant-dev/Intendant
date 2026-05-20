@@ -1014,9 +1014,9 @@ html, body {
   cursor: pointer;
 }
 .task-target-chip.has-target {
-  color: var(--blue);
-  border-color: rgba(137, 180, 250, 0.45);
-  background: rgba(137, 180, 250, 0.08);
+  color: var(--session-badge-fg, var(--blue));
+  border-color: var(--session-badge-border, rgba(137, 180, 250, 0.45));
+  background: var(--session-badge-bg, rgba(137, 180, 250, 0.08));
 }
 .task-target-chip:focus { outline: 1px solid var(--blue); outline-offset: 1px; }
 .edit-message-chip {
@@ -8283,8 +8283,19 @@ function allocateSessionBadgeStyle(sessionId) {
   return style;
 }
 
+function clearSessionBadgeStyle(el) {
+  if (!el) return;
+  el.style.removeProperty('--session-badge-bg');
+  el.style.removeProperty('--session-badge-border');
+  el.style.removeProperty('--session-badge-fg');
+}
+
 function applySessionBadgeStyle(el, sessionId) {
-  if (!el || !sessionId) return;
+  if (!el) return;
+  if (!sessionId) {
+    clearSessionBadgeStyle(el);
+    return;
+  }
   const style = allocateSessionBadgeStyle(sessionId);
   el.style.setProperty('--session-badge-bg', style.bg);
   el.style.setProperty('--session-badge-border', style.border);
@@ -8359,6 +8370,7 @@ function updateTaskTargetChip() {
   chip.classList.toggle('has-target', !!sid);
   chip.textContent = sid ? `Target ${shortSessionId(sid)}` : 'New session';
   chip.title = sid ? `Prompt target: ${sid}` : 'Prompt target: new session';
+  applySessionBadgeStyle(chip, sid);
 }
 
 function resolvePromptTargetSessionId() {
