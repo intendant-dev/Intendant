@@ -2163,8 +2163,16 @@ html, body {
   max-width: 300px;
 }
 .sessions-new-session-project {
-  flex: 1 1 240px;
-  max-width: 340px;
+  flex: 1 1 280px;
+  max-width: 430px;
+}
+.sessions-project-label {
+  color: var(--overlay0);
+}
+.sessions-project-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
 }
 .sessions-new-task-input {
   width: 100%;
@@ -2198,6 +2206,45 @@ html, body {
 }
 .sessions-project-input:focus { outline: none; border-color: var(--blue); }
 .sessions-project-input::placeholder { color: var(--overlay0); }
+.sessions-project-browse,
+.sessions-project-create-label {
+  height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sessions-project-browse:hover,
+.sessions-project-create-label:hover {
+  border-color: var(--overlay0);
+  color: var(--text);
+}
+.sessions-project-create-label {
+  display: none;
+  align-items: center;
+  gap: 5px;
+  text-transform: none;
+}
+.sessions-project-create-label.visible { display: inline-flex; }
+.sessions-project-create-label input { margin: 0; }
+.sessions-project-status {
+  min-height: 14px;
+  color: var(--overlay0);
+  font-size: 11px;
+  line-height: 1.25;
+  text-transform: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sessions-project-status.ok { color: var(--green); }
+.sessions-project-status.warn { color: var(--yellow); }
+.sessions-project-status.error { color: var(--red); }
 .sessions-start-btn {
   padding: 4px 12px;
   border: 1px solid var(--green);
@@ -2966,6 +3013,105 @@ html, body {
 .modal-cancel { background: var(--surface1); color: var(--text); }
 .modal-confirm { background: var(--red); color: var(--base); }
 .modal-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
+.fs-picker-dialog {
+  width: min(720px, calc(100vw - 32px));
+  max-width: 720px;
+}
+.fs-picker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.fs-picker-header h3 { margin: 0; }
+.fs-picker-close {
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  cursor: pointer;
+}
+.fs-picker-close:hover { color: var(--text); border-color: var(--overlay0); }
+.fs-picker-path-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.fs-picker-path-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+}
+.fs-picker-path-row input:focus { outline: none; border-color: var(--blue); }
+.fs-picker-path-row button,
+.fs-picker-entry {
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.fs-picker-path-row button {
+  padding: 6px 12px;
+}
+.fs-picker-status {
+  min-height: 18px;
+  margin-bottom: 8px;
+  color: var(--overlay0);
+  font-size: 12px;
+}
+.fs-picker-status.error { color: var(--red); }
+.fs-picker-list {
+  height: min(420px, 54vh);
+  overflow: auto;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--mantle);
+  padding: 4px;
+}
+.fs-picker-entry {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  margin-bottom: 3px;
+  text-align: left;
+}
+.fs-picker-entry:hover,
+.fs-picker-entry.selected {
+  background: var(--surface1);
+  border-color: var(--overlay0);
+}
+.fs-picker-entry.file {
+  cursor: default;
+  opacity: 0.55;
+}
+.fs-picker-dialog .modal-confirm {
+  background: var(--green);
+  color: var(--base);
+}
+.fs-picker-entry-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fs-picker-entry-meta {
+  color: var(--overlay0);
+  font-size: 11px;
+}
 
 /* ── Control sub-tab ── */
 .control-pane-body {
@@ -4416,6 +4562,8 @@ html, body {
   .sessions-search { flex: 1 1 100%; max-width: none; margin-left: 0; }
   .sessions-new-task { width: 100%; min-width: 0; margin-left: 0; flex-wrap: wrap; justify-content: stretch; }
   .sessions-new-session-field { flex: 1 1 100%; max-width: none; }
+  .sessions-project-row { flex-wrap: wrap; }
+  .sessions-project-browse, .sessions-project-create-label { flex: 0 0 auto; }
   .sessions-start-btn { width: 100%; }
   .sessions-filter, .sessions-sort { margin-left: 0; }
   .sessions-aggregate { flex-direction: column; }
@@ -5079,11 +5227,19 @@ html, body {
               New session
               <textarea id="new-session-input" class="sessions-new-task-input" rows="1" placeholder="Initial message..."></textarea>
             </label>
-            <label class="sessions-new-session-field sessions-new-session-project" for="new-session-project-root">
-              Project
-              <input id="new-session-project-root" class="sessions-project-input" type="text" autocomplete="off" spellcheck="false" list="new-session-project-options" placeholder="/path/to/project">
+            <div class="sessions-new-session-field sessions-new-session-project">
+              <label class="sessions-project-label" for="new-session-project-root">Project</label>
+              <div class="sessions-project-row">
+                <input id="new-session-project-root" class="sessions-project-input" type="text" autocomplete="off" spellcheck="false" list="new-session-project-options" placeholder="/path/to/project">
+                <button type="button" class="sessions-project-browse" onclick="openProjectDirectoryPicker()">Browse</button>
+                <label class="sessions-project-create-label" id="new-session-create-project-dir-wrap" title="Create this directory on the Intendant host before starting">
+                  <input id="new-session-create-project-dir" type="checkbox">
+                  Create
+                </label>
+              </div>
+              <div id="new-session-project-status" class="sessions-project-status"></div>
               <datalist id="new-session-project-options"></datalist>
-            </label>
+            </div>
             <button class="sessions-start-btn" onclick="startNewSession()">Start session</button>
           </div>
           <button class="sessions-refresh" onclick="loadSessions()" style="margin-left:8px">Refresh</button>
@@ -5537,6 +5693,26 @@ html, body {
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeRollbackModal()">Cancel</button>
       <button class="modal-confirm" id="rollback-confirm-btn" onclick="confirmRollback()">Roll back</button>
+    </div>
+  </div>
+</div>
+
+<div id="fs-picker-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog fs-picker-dialog">
+    <div class="fs-picker-header">
+      <h3>Choose project directory</h3>
+      <button type="button" class="fs-picker-close" onclick="closeProjectDirectoryPicker()" title="Close">X</button>
+    </div>
+    <div class="fs-picker-path-row">
+      <input id="fs-picker-path" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/project">
+      <button type="button" onclick="loadProjectDirectoryPickerPath()">Go</button>
+    </div>
+    <div id="fs-picker-status" class="fs-picker-status"></div>
+    <div id="fs-picker-list" class="fs-picker-list"></div>
+    <div class="modal-actions">
+      <button class="modal-cancel" type="button" onclick="closeProjectDirectoryPicker()">Cancel</button>
+      <button class="modal-cancel" type="button" onclick="createPickerDirectory()">Create directory</button>
+      <button class="modal-confirm" id="fs-picker-use-btn" type="button" onclick="useProjectDirectoryPickerSelection()">Use directory</button>
     </div>
   </div>
 </div>
@@ -8757,7 +8933,9 @@ function toggleSessionWindowMaximized(sessionId) {
 function shouldDeferSessionWindowEscape() {
   if (annotationMode || clipMode || clipAnnotatingRange || displayPickerVisible) return true;
   const rollbackModal = document.getElementById('rollback-modal');
-  return !!rollbackModal && rollbackModal.style.display !== 'none';
+  const fsPickerModal = document.getElementById('fs-picker-modal');
+  return (!!rollbackModal && rollbackModal.style.display !== 'none')
+    || (!!fsPickerModal && fsPickerModal.style.display !== 'none');
 }
 
 function focusSessionWindow(sessionId) {
@@ -19304,6 +19482,122 @@ function setNewSessionProjectRoot(root) {
   if (input && dashboardProjectRoot && !input.value.trim()) input.value = dashboardProjectRoot;
   updateNewSessionProjectPrefills();
   if (input) input.title = input.value.trim() || dashboardProjectRoot;
+  scheduleNewSessionProjectStatusRefresh();
+}
+
+let newSessionProjectStatusTimer = null;
+let fsPickerCurrentPath = '';
+
+function newSessionProjectInputValue() {
+  return document.getElementById('new-session-project-root')?.value.trim() || '';
+}
+
+function setNewSessionProjectStatus(kind, text) {
+  const el = document.getElementById('new-session-project-status');
+  if (!el) return;
+  el.className = 'sessions-project-status' + (kind ? ` ${kind}` : '');
+  el.textContent = text || '';
+  el.title = text || '';
+}
+
+function setNewSessionCreateVisible(visible) {
+  const wrap = document.getElementById('new-session-create-project-dir-wrap');
+  const box = document.getElementById('new-session-create-project-dir');
+  if (wrap) wrap.classList.toggle('visible', !!visible);
+  if (!visible && box) box.checked = false;
+}
+
+async function fetchProjectPathStatus(path) {
+  const resp = await authedFetch('/api/fs/stat?path=' + encodeURIComponent(path || ''));
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || `Path check failed (${resp.status})`);
+  return data;
+}
+
+function renderNewSessionProjectStatus(status) {
+  if (!status) {
+    setNewSessionProjectStatus('', '');
+    setNewSessionCreateVisible(false);
+    return;
+  }
+  if (status.exists && status.is_dir) {
+    setNewSessionProjectStatus('ok', 'Directory exists on this host');
+    setNewSessionCreateVisible(false);
+  } else if (status.exists) {
+    setNewSessionProjectStatus('error', 'Path exists but is not a directory');
+    setNewSessionCreateVisible(false);
+  } else if (status.can_create) {
+    setNewSessionProjectStatus('warn', 'Directory does not exist on this host');
+    setNewSessionCreateVisible(true);
+  } else {
+    setNewSessionProjectStatus('error', 'Directory cannot be created from this path');
+    setNewSessionCreateVisible(false);
+  }
+}
+
+async function refreshNewSessionProjectStatus() {
+  const path = newSessionProjectInputValue();
+  if (!path) {
+    renderNewSessionProjectStatus(null);
+    return null;
+  }
+  try {
+    const status = await fetchProjectPathStatus(path);
+    if (newSessionProjectInputValue() !== path) return null;
+    renderNewSessionProjectStatus(status);
+    return status;
+  } catch (e) {
+    if (newSessionProjectInputValue() === path) {
+      setNewSessionProjectStatus('error', e.message || 'Path check failed');
+      setNewSessionCreateVisible(false);
+    }
+    return null;
+  }
+}
+
+function scheduleNewSessionProjectStatusRefresh() {
+  if (newSessionProjectStatusTimer) clearTimeout(newSessionProjectStatusTimer);
+  newSessionProjectStatusTimer = setTimeout(refreshNewSessionProjectStatus, 180);
+}
+
+async function ensureNewSessionProjectDirectory(projectRoot) {
+  if (!projectRoot) return '';
+  let status;
+  try {
+    status = await fetchProjectPathStatus(projectRoot);
+  } catch (e) {
+    setNewSessionProjectStatus('error', e.message || 'Path check failed');
+    setNewSessionCreateVisible(false);
+    return null;
+  }
+  renderNewSessionProjectStatus(status);
+  if (status.exists && status.is_dir) return status.path || projectRoot;
+  if (status.exists) return null;
+
+  const create = document.getElementById('new-session-create-project-dir')?.checked || false;
+  if (!create) {
+    setNewSessionProjectStatus('warn', 'Directory does not exist; enable Create to start here');
+    setNewSessionCreateVisible(true);
+    return null;
+  }
+
+  setNewSessionProjectStatus('warn', 'Creating directory on this host...');
+  const resp = await authedFetch('/api/fs/mkdir', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: projectRoot }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    setNewSessionProjectStatus('error', data.error || `Create failed (${resp.status})`);
+    return null;
+  }
+  const createdPath = data.path || projectRoot;
+  const input = document.getElementById('new-session-project-root');
+  if (input) input.value = createdPath;
+  setNewSessionProjectStatus('ok', data.already_exists ? 'Directory already exists on this host' : 'Directory created on this host');
+  setNewSessionCreateVisible(false);
+  return createdPath;
 }
 
 function addNewSessionProjectPrefill(options, seen, value, source, sessionId = '') {
@@ -19345,8 +19639,122 @@ function updateNewSessionProjectPrefills(sessions = _cachedSessions) {
   if (input) {
     if (!input.value.trim() && options.length > 0) input.value = options[0].path;
     input.title = input.value.trim() || '';
+    scheduleNewSessionProjectStatusRefresh();
   }
 }
+
+function setFsPickerStatus(kind, text) {
+  const el = document.getElementById('fs-picker-status');
+  if (!el) return;
+  el.className = 'fs-picker-status' + (kind ? ` ${kind}` : '');
+  el.textContent = text || '';
+}
+
+function renderProjectDirectoryPicker(data) {
+  const list = document.getElementById('fs-picker-list');
+  const useBtn = document.getElementById('fs-picker-use-btn');
+  if (!list) return;
+  fsPickerCurrentPath = data.path || '';
+  if (useBtn) useBtn.disabled = !fsPickerCurrentPath;
+
+  const rows = [];
+  if (data.parent) {
+    rows.push(
+      `<button type="button" class="fs-picker-entry dir" data-path="${escapeHtml(data.parent)}">` +
+      `<span class="fs-picker-entry-meta">up</span>` +
+      `<span class="fs-picker-entry-name" title="${escapeHtml(data.parent)}">..</span>` +
+      `<span class="fs-picker-entry-meta">parent</span>` +
+      `</button>`
+    );
+  }
+  for (const entry of data.entries || []) {
+    const cls = entry.is_dir ? 'dir' : 'file';
+    const title = escapeHtml(entry.path || entry.name || '');
+    rows.push(
+      `<button type="button" class="fs-picker-entry ${cls}" data-path="${title}" ${entry.is_dir ? '' : 'disabled'}>` +
+      `<span class="fs-picker-entry-meta">${entry.is_dir ? 'dir' : 'file'}</span>` +
+      `<span class="fs-picker-entry-name" title="${title}">${escapeHtml(entry.name || '')}</span>` +
+      `<span class="fs-picker-entry-meta">${entry.hidden ? 'hidden' : ''}</span>` +
+      `</button>`
+    );
+  }
+  list.innerHTML = rows.length ? rows.join('') : '<div class="empty-state">No entries</div>';
+  list.querySelectorAll('.fs-picker-entry.dir').forEach(btn => {
+    btn.addEventListener('click', () => loadProjectDirectoryPicker(btn.dataset.path || ''));
+  });
+}
+
+async function loadProjectDirectoryPicker(path) {
+  const input = document.getElementById('fs-picker-path');
+  const target = String(path || input?.value || '').trim() || dashboardProjectRoot || '~';
+  if (input) input.value = target;
+  fsPickerCurrentPath = '';
+  const useBtn = document.getElementById('fs-picker-use-btn');
+  if (useBtn) useBtn.disabled = true;
+  setFsPickerStatus('', 'Loading...');
+  try {
+    const resp = await authedFetch('/api/fs/list?path=' + encodeURIComponent(target));
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || `Directory load failed (${resp.status})`);
+    if (input) input.value = data.path || target;
+    setFsPickerStatus('', data.truncated ? 'Showing first 500 entries' : '');
+    renderProjectDirectoryPicker(data);
+  } catch (e) {
+    setFsPickerStatus('error', e.message || 'Directory load failed');
+    const list = document.getElementById('fs-picker-list');
+    if (list) list.innerHTML = '<div class="empty-state">Directory unavailable</div>';
+  }
+}
+
+function loadProjectDirectoryPickerPath() {
+  loadProjectDirectoryPicker(document.getElementById('fs-picker-path')?.value || '');
+}
+
+function openProjectDirectoryPicker() {
+  const modal = document.getElementById('fs-picker-modal');
+  if (modal) modal.style.display = 'flex';
+  loadProjectDirectoryPicker(newSessionProjectInputValue() || dashboardProjectRoot || '~');
+}
+
+function closeProjectDirectoryPicker() {
+  const modal = document.getElementById('fs-picker-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+function useProjectDirectoryPickerSelection() {
+  if (!fsPickerCurrentPath) return;
+  const input = document.getElementById('new-session-project-root');
+  if (input) {
+    input.value = fsPickerCurrentPath;
+    input.title = fsPickerCurrentPath;
+  }
+  closeProjectDirectoryPicker();
+  refreshNewSessionProjectStatus();
+}
+
+async function createPickerDirectory() {
+  const path = document.getElementById('fs-picker-path')?.value.trim() || '';
+  if (!path) return;
+  setFsPickerStatus('', 'Creating directory...');
+  const resp = await authedFetch('/api/fs/mkdir', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    setFsPickerStatus('error', data.error || `Create failed (${resp.status})`);
+    return;
+  }
+  setFsPickerStatus('', data.already_exists ? 'Directory already exists' : 'Directory created');
+  await loadProjectDirectoryPicker(data.path || path);
+}
+
+window.openProjectDirectoryPicker = openProjectDirectoryPicker;
+window.closeProjectDirectoryPicker = closeProjectDirectoryPicker;
+window.loadProjectDirectoryPickerPath = loadProjectDirectoryPickerPath;
+window.useProjectDirectoryPickerSelection = useProjectDirectoryPickerSelection;
+window.createPickerDirectory = createPickerDirectory;
 
 async function loadNewSessionProjectRoot() {
   try {
@@ -19358,21 +19766,23 @@ async function loadNewSessionProjectRoot() {
   }
 }
 
-function startNewSession() {
+async function startNewSession() {
   const input = document.getElementById('new-session-input');
   if (!input) return;
   const task = input.value.trim();
   if (!task) return;
-  clearTaskTextarea(input);
   if (app) {
     const direct = document.getElementById('direct-mode-toggle')?.checked || false;
     const attachments = pendingAttachments.map(a => a.frameId);
     const attachmentReceipt = pendingAttachments.slice();
-    const projectRoot = document.getElementById('new-session-project-root')?.value.trim() || '';
+    const requestedProjectRoot = document.getElementById('new-session-project-root')?.value.trim() || '';
+    const projectRoot = await ensureNewSessionProjectDirectory(requestedProjectRoot);
+    if (requestedProjectRoot && !projectRoot) return;
     const msg = { action: 'create_session', task: task };
     if (projectRoot) msg.project_root = projectRoot;
     if (direct) msg.direct = true;
     if (attachments.length > 0) msg.attachments = attachments;
+    clearTaskTextarea(input);
     app.send_server_action(msg);
     if (attachments.length > 0) {
       renderAttachmentReceipt(task, attachmentReceipt, 'Sent');
@@ -19458,6 +19868,13 @@ document.getElementById('sort-sessions')?.addEventListener('change', _refilterSe
 document.getElementById('sessions-search')?.addEventListener('input', _refilterSessions);
 document.getElementById('new-session-project-root')?.addEventListener('input', (ev) => {
   ev.currentTarget.title = ev.currentTarget.value.trim();
+  scheduleNewSessionProjectStatusRefresh();
+});
+document.getElementById('new-session-create-project-dir')?.addEventListener('change', refreshNewSessionProjectStatus);
+document.getElementById('fs-picker-path')?.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Enter') return;
+  ev.preventDefault();
+  loadProjectDirectoryPickerPath();
 });
 document.getElementById('sessions-search')?.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Escape' || !ev.currentTarget.value) return;
@@ -20582,10 +20999,18 @@ document.addEventListener('keydown', (e) => {
   const modal = document.getElementById('rollback-modal');
   if (modal && modal.style.display !== 'none') {
     closeRollbackModal();
+    return;
+  }
+  const fsPickerModal = document.getElementById('fs-picker-modal');
+  if (fsPickerModal && fsPickerModal.style.display !== 'none') {
+    closeProjectDirectoryPicker();
   }
 });
 document.getElementById('rollback-modal')?.addEventListener('click', (e) => {
   if (e.target && e.target.id === 'rollback-modal') closeRollbackModal();
+});
+document.getElementById('fs-picker-modal')?.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'fs-picker-modal') closeProjectDirectoryPicker();
 });
 
 // Enter to submit
