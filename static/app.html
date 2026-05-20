@@ -6650,6 +6650,9 @@ let shellInitialized = false;
 let shellOpenSent = false;
 const SHELL_HOST_ID = 'local';
 const SHELL_TERMINAL_ID = 'shell-0';
+let shellOutputQueue = [];
+let shellOutputQueuedBytes = 0;
+let shellOutputFlushScheduled = false;
 let activeTermSubtab = 'tui';
 
 // Shell key bar state: sticky modifiers (Ctrl, Alt) that transform the
@@ -7128,7 +7131,9 @@ async function main() {
         if (s) s.handleIceCandidate(d.candidate);
         return;
       }
-      // Standalone shell — intercept before WASM.
+      // Standalone shell fallback for older WASM bundles. Current bundles
+      // dispatch these through set_on_terminal_output/exited below so they
+      // don't take the generic raw-message bridge.
       if (d.t === 'terminal_output') {
         if (d.terminal_id === SHELL_TERMINAL_ID && d.host_id === SHELL_HOST_ID) {
           handleShellOutput(d.data);
@@ -7211,6 +7216,22 @@ async function main() {
     const cmds = app.handle_server_message(msg);
     if (cmds) processCommands(cmds);
   });
+
+  if (app.set_on_terminal_output) {
+    app.set_on_terminal_output((hostId, terminalId, data) => {
+      if (terminalId === SHELL_TERMINAL_ID && hostId === SHELL_HOST_ID) {
+        handleShellOutput(data);
+      }
+    });
+  }
+
+  if (app.set_on_terminal_exited) {
+    app.set_on_terminal_exited((hostId, terminalId, status) => {
+      if (terminalId === SHELL_TERMINAL_ID && hostId === SHELL_HOST_ID) {
+        handleShellExited(status);
+      }
+    });
+  }
 
   // Connection state indicator
   app.set_on_server_state((connected) => {
@@ -11058,10 +11079,16 @@ function renderUsageCard(label, data) {
 }
 
 // ── Terminal Tab (lazy xterm.js) ──
+function base64ToBytes(base64data) {
+  const binary = atob(base64data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
 function handleTermData(base64data) {
   if (term) {
-    const bytes = Uint8Array.from(atob(base64data), c => c.charCodeAt(0));
-    term.write(bytes);
+    term.write(base64ToBytes(base64data));
   } else {
     termBuffer.push(base64data);
   }
@@ -11072,12 +11099,46 @@ function handleTermData(base64data) {
 // for this host/terminal pair.
 function handleShellOutput(base64data) {
   if (!shellTerm) return;
-  const bytes = Uint8Array.from(atob(base64data), c => c.charCodeAt(0));
-  shellTerm.write(bytes);
+  const bytes = base64ToBytes(base64data);
+  shellOutputQueue.push(bytes);
+  shellOutputQueuedBytes += bytes.byteLength;
+  if (!shellOutputFlushScheduled) {
+    shellOutputFlushScheduled = true;
+    requestAnimationFrame(flushShellOutput);
+  }
+}
+
+function flushShellOutput() {
+  shellOutputFlushScheduled = false;
+  if (!shellTerm) {
+    shellOutputQueue = [];
+    shellOutputQueuedBytes = 0;
+    return;
+  }
+  if (shellOutputQueue.length === 0) return;
+
+  const chunks = shellOutputQueue;
+  const total = shellOutputQueuedBytes;
+  shellOutputQueue = [];
+  shellOutputQueuedBytes = 0;
+
+  if (chunks.length === 1) {
+    shellTerm.write(chunks[0]);
+    return;
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  shellTerm.write(merged);
 }
 
 function handleShellExited(status) {
   if (!shellTerm) return;
+  flushShellOutput();
   shellTerm.write(`\r\n\x1b[33m[shell exited with status ${status}]\x1b[0m\r\n`);
   shellOpenSent = false;
 }
@@ -11131,8 +11192,7 @@ function initTerminal() {
         app.send_key(domEvent.key, domEvent.ctrlKey, domEvent.altKey, domEvent.shiftKey);
       });
       for (const b64 of termBuffer) {
-        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-        term.write(bytes);
+        term.write(base64ToBytes(b64));
       }
       termBuffer = [];
       new ResizeObserver(() => {

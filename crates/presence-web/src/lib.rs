@@ -140,6 +140,16 @@ mod wasm_impl {
         }
 
         #[wasm_bindgen]
+        pub fn set_on_terminal_output(&self, f: Function) {
+            *self.callbacks.on_terminal_output.borrow_mut() = Some(f);
+        }
+
+        #[wasm_bindgen]
+        pub fn set_on_terminal_exited(&self, f: Function) {
+            *self.callbacks.on_terminal_exited.borrow_mut() = Some(f);
+        }
+
+        #[wasm_bindgen]
         pub fn set_on_server_state(&self, f: Function) {
             *self.callbacks.on_server_state.borrow_mut() = Some(f);
         }
@@ -255,12 +265,43 @@ mod wasm_impl {
                 let presence = presence;
                 let last_session_id: RefCell<Option<String>> = RefCell::new(None);
                 Box::new(move |msg: serde_json::Value| {
+                    let t = msg.get("t").and_then(|v| v.as_str());
+
+                    match t {
+                        Some("terminal_output") => {
+                            let host_id = msg
+                                .get("host_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("local");
+                            let terminal_id = msg
+                                .get("terminal_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("shell-0");
+                            if let Some(data) = msg.get("data").and_then(|v| v.as_str()) {
+                                cb.invoke_terminal_output(host_id, terminal_id, data);
+                            }
+                            return;
+                        }
+                        Some("terminal_exited") => {
+                            let host_id = msg
+                                .get("host_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("local");
+                            let terminal_id = msg
+                                .get("terminal_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("shell-0");
+                            let status = msg.get("status").and_then(|v| v.as_i64()).unwrap_or(-1);
+                            cb.invoke_terminal_exited(host_id, terminal_id, status as i32);
+                            return;
+                        }
+                        _ => {}
+                    }
+
                     // Fire raw message callback (for dashboard interception)
                     cb.invoke_raw_message(&to_js(&msg));
 
                     // Route by message type
-                    let t = msg.get("t").and_then(|v| v.as_str());
-
                     match t {
                         Some("term") => {
                             if let Some(d) = msg["d"].as_str() {
