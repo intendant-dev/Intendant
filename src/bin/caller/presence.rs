@@ -1018,6 +1018,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::CodexConfigChanged { .. }
         | AppEvent::CodexThreadActionRequested { .. }
         | AppEvent::CodexThreadActionResult { .. }
+        | AppEvent::SessionRenameResult { .. }
         | AppEvent::GeminiConfigChanged { .. }
         | AppEvent::GeminiThreadActionRequested { .. }
         | AppEvent::GeminiThreadActionResult { .. }

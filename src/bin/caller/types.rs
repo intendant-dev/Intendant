@@ -247,6 +247,15 @@ pub enum OutboundEvent {
         success: bool,
         message: String,
     },
+    SessionRenameResult {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        success: bool,
+        message: String,
+    },
     CodexConfigChanged {
         #[serde(skip_serializing_if = "Option::is_none")]
         command: Option<String>,

@@ -274,6 +274,7 @@ impl AppEventUpcaster {
             | AppEvent::ContextSnapshot { .. }
             | AppEvent::CodexThreadActionRequested { .. }
             | AppEvent::GeminiThreadActionRequested { .. }
+            | AppEvent::SessionRenameResult { .. }
             | AppEvent::FileChanged { .. }
             | AppEvent::UploadReady { .. }
             | AppEvent::UploadDeleted { .. }
@@ -1331,6 +1332,7 @@ impl WireEventUpcaster {
             | OutboundEvent::Redone { .. }
             | OutboundEvent::HistoryPruned { .. }
             | OutboundEvent::ConversationRolledBack { .. }
+            | OutboundEvent::SessionRenameResult { .. }
             | OutboundEvent::PeerAdded { .. }
             | OutboundEvent::PeerRemoved { .. }
             | OutboundEvent::PeerStateChanged { .. }

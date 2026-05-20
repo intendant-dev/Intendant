@@ -7113,6 +7113,9 @@ function processCommands(cmds) {
       case 'codex_thread_action_result':
         handleCodexThreadActionResult(c);
         break;
+      case 'session_rename_result':
+        handleSessionRenameResult(c);
+        break;
       case 'gemini_config_changed':
         applyGeminiConfigChanged(c);
         break;
@@ -8218,19 +8221,34 @@ function releaseActionPending(op) {
 
 function handleCodexThreadActionResult(evt) {
   releaseActionPending(evt.action);
+  let successText = `/${evt.action}: ${evt.message}`;
   if (evt.success && evt.action === 'rename') {
     const sid = String(evt.session_id || '').trim();
     const name = String(evt.message || '').replace(/^Codex thread renamed to\s+/i, '').trim();
     if (sid && name && name !== evt.message) {
       updateSessionWindow(sid, { name });
+      successText = `Renamed session to ${name}`;
     }
     refreshSessionWindowMetadata(600);
   }
   showControlToast(
     evt.success ? 'success' : 'error',
     evt.success
-      ? `/${evt.action}: ${evt.message}`
+      ? successText
       : `/${evt.action} failed: ${evt.message}`
+  );
+}
+
+function handleSessionRenameResult(evt) {
+  const sid = String(evt.session_id || '').trim();
+  if (evt.success) {
+    const name = compactSessionText(evt.name);
+    if (sid && name) updateSessionWindow(sid, { name, source: evt.source || undefined });
+    refreshSessionWindowMetadata(600);
+  }
+  showControlToast(
+    evt.success ? 'success' : 'error',
+    evt.success ? evt.message : `Rename session failed: ${evt.message}`
   );
 }
 
@@ -8721,8 +8739,10 @@ function normalizeSessionWindowMeta(meta = {}) {
     out.cwd = cwd;
     out.cwdLabel = compactPathLabel(cwd, true);
   }
-  const source = compactSessionText(meta.source_label || meta.sourceLabel || meta.source);
+  const source = compactSessionText(meta.source || meta.source_id || meta.sourceId);
   if (source) out.source = source;
+  const sourceLabel = compactSessionText(meta.source_label || meta.sourceLabel);
+  if (sourceLabel) out.sourceLabel = sourceLabel;
   if (meta.phase) out.phase = meta.phase;
   if (meta.ended !== undefined) out.ended = !!meta.ended;
   return out;
@@ -8735,6 +8755,7 @@ function sessionWindowMetaFromSession(session) {
     task: session.task,
     cwd: session.cwd || session.workdir || session.workDir,
     project_root: session.project_root,
+    source: session.source,
     source_label: session.source_label || prettyAgentName(session.source || '') || session.source,
   });
 }
@@ -8813,17 +8834,11 @@ function copyTextToClipboard(text) {
 
 const SESSION_WINDOW_GENERIC_ACTIONS = [
   { op: 'copy-session-id', label: 'Copy full session ID', title: 'Copy the full session ID' },
+  { op: 'rename-session', label: 'Rename session...', title: 'Rename this session' },
 ];
 
 const SESSION_WINDOW_CODEX_ACTIONS = [
   { op: 'fork', label: 'Fork...', title: 'Fork this Codex thread', promptName: true },
-  {
-    op: 'rename',
-    label: 'Rename session...',
-    title: 'Rename this session',
-    promptRename: true,
-    promptRenameLabel: 'Session name:',
-  },
   { op: 'goal', label: 'Configure goal...', title: 'Create or update this thread goal', promptGoal: true },
   { op: 'goal-get', label: 'Goal status', title: 'Fetch this thread goal' },
   { op: 'compact', label: 'Compact', title: 'Compact this thread history' },
@@ -8833,7 +8848,7 @@ function sessionWindowIsCodex(sessionId, win = null) {
   const sid = String(sessionId || '').trim();
   const current = win || (sid ? sessionWindows.get(sid) : null);
   const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
-  return normalizeAgentId(current?.source || meta.source || '') === 'codex';
+  return normalizeAgentId(current?.source || meta.source || meta.sourceLabel || '') === 'codex';
 }
 
 function closeSessionWindowMenus(exceptSessionId = '') {
@@ -8890,6 +8905,24 @@ function runSessionWindowAction(sessionId, op) {
     copyTextToClipboard(sid)
       .then(() => showControlToast('success', `Copied session ID ${shortSessionId(sid)}`))
       .catch(err => showControlToast('error', `Copy session ID failed: ${err?.message || err}`));
+    return;
+  }
+  if (op === 'rename-session') {
+    const win = sessionWindows.get(sid);
+    const meta = sessionMetadataById.get(sid) || {};
+    const currentName = compactSessionText(meta.name);
+    const name = window.prompt('Session name:', currentName);
+    if (name === null) return;
+    if (!name.trim()) {
+      showControlToast('error', 'Rename session failed: session name is required');
+      return;
+    }
+    dispatchControlMsg({
+      action: 'rename_session',
+      session_id: sid,
+      source: meta.source || win?.source || '',
+      name: name.trim(),
+    });
     return;
   }
   runSessionWindowCodexAction(sid, op);

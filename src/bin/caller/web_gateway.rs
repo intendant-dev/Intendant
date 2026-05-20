@@ -3395,6 +3395,7 @@ fn list_sessions_from_home(home_path: &Path) -> String {
     external_sessions.extend(list_codex_sessions(home_path));
     external_sessions.extend(list_claude_sessions(home_path));
     external_sessions.extend(list_gemini_sessions(home_path));
+    crate::session_names::apply_session_name_overlays(home_path, &mut external_sessions);
     if !logs_dir.is_dir() {
         sort_sessions_newest_first(&mut external_sessions);
         truncate_sessions_preserving_sources(&mut external_sessions);
@@ -3722,9 +3723,7 @@ fn list_sessions_from_home(home_path: &Path) -> String {
         }));
     }
 
-    sessions.extend(list_codex_sessions(home_path));
-    sessions.extend(list_claude_sessions(home_path));
-    sessions.extend(list_gemini_sessions(home_path));
+    sessions.extend(external_sessions);
 
     sort_sessions_newest_first(&mut sessions);
     truncate_sessions_preserving_sources(&mut sessions);
@@ -12461,6 +12460,73 @@ mod tests {
         assert_eq!(
             session.get("task").and_then(|v| v.as_str()),
             Some("Fix activity replay")
+        );
+    }
+
+    #[test]
+    fn list_sessions_applies_external_session_name_overlay() {
+        let home = tempfile::tempdir().unwrap();
+        let codex_dir = home.path().join(".codex");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37ae-overlay-name";
+        std::fs::write(
+            codex_dir.join("session_index.jsonl"),
+            serde_json::json!({
+                "id": id,
+                "updated_at": "2026-05-17T20:44:33Z"
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": "/Users/vm/projects/intendant"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Fix naming"}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+        crate::session_names::rename_session(home.path(), "codex", id, "Overlay name").unwrap();
+
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(home.path())).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(
+            session.get("name").and_then(|v| v.as_str()),
+            Some("Overlay name")
+        );
+        assert_eq!(
+            session.get("task").and_then(|v| v.as_str()),
+            Some("Fix naming")
         );
     }
 

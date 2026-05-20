@@ -34,6 +34,7 @@ mod recording;
 mod sandbox;
 mod schema_validator;
 mod session_log;
+mod session_names;
 mod session_supervisor;
 mod skills;
 mod sub_agent;

@@ -524,6 +524,15 @@ pub enum AppEvent {
         message: String,
     },
 
+    /// Emitted after a generic session rename is persisted or rejected.
+    SessionRenameResult {
+        session_id: String,
+        source: Option<String>,
+        name: Option<String>,
+        success: bool,
+        message: String,
+    },
+
     /// Emitted when one or more fields of the Codex runtime configuration
     /// change. Fields not included in the event are unchanged from the
     /// previous state. Broadcast by the control plane; consumed by the
@@ -830,6 +839,15 @@ pub enum ControlMsg {
         op: String,
         #[serde(default)]
         params: serde_json::Value,
+    },
+    /// Rename a session through Intendant's generic session-name abstraction.
+    /// Backends with native rename support may map this to their own protocol;
+    /// otherwise Intendant persists a local overlay keyed by source/session id.
+    RenameSession {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        name: String,
     },
     /// Set the Gemini model override. `None`/missing lets Gemini pick.
     /// Applies to the NEXT task because Gemini latches `--model` at
@@ -1559,6 +1577,19 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         } => Some(OutboundEvent::CodexThreadActionResult {
             session_id: session_id.clone(),
             action: action.clone(),
+            success: *success,
+            message: message.clone(),
+        }),
+        AppEvent::SessionRenameResult {
+            session_id,
+            source,
+            name,
+            success,
+            message,
+        } => Some(OutboundEvent::SessionRenameResult {
+            session_id: session_id.clone(),
+            source: source.clone(),
+            name: name.clone(),
             success: *success,
             message: message.clone(),
         }),
@@ -2657,6 +2688,24 @@ mod tests {
                 assert_eq!(attachments, vec!["upload:u1"]);
             }
             _ => panic!("expected CreateSession"),
+        }
+    }
+
+    #[test]
+    fn control_msg_rename_session_deserialize() {
+        let json = r#"{"action":"rename_session","session_id":"abc123","source":"intendant","name":"UI polish"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::RenameSession {
+                session_id,
+                source,
+                name,
+            } => {
+                assert_eq!(session_id, "abc123");
+                assert_eq!(source.as_deref(), Some("intendant"));
+                assert_eq!(name, "UI polish");
+            }
+            _ => panic!("expected RenameSession"),
         }
     }
 

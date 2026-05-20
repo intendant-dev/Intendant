@@ -1248,6 +1248,18 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::RenameSession {
+            session_id, name, ..
+        } => {
+            emit_control_result(
+                control_tx,
+                "rename_session",
+                true,
+                format!("Session rename requested: {} → {}", session_id, name),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::SetGeminiModel { model } => {
             let label = model
                 .as_deref()
@@ -2246,6 +2258,7 @@ pub fn spawn_event_listener(
                     | AppEvent::CodexConfigChanged { .. }
                     | AppEvent::CodexThreadActionRequested { .. }
                     | AppEvent::CodexThreadActionResult { .. }
+                    | AppEvent::SessionRenameResult { .. }
                     | AppEvent::GeminiConfigChanged { .. }
                     | AppEvent::GeminiThreadActionRequested { .. }
                     | AppEvent::GeminiThreadActionResult { .. } => {} // Derived events — handled by outbound broadcaster

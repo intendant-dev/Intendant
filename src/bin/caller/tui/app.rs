@@ -1269,6 +1269,16 @@ impl App {
                 // few hundred ms depending on the RPC).
                 self.log(LogLevel::Info, format!("Codex thread action: {}", op));
             }
+            ControlMsg::RenameSession {
+                ref session_id,
+                ref name,
+                ..
+            } => {
+                self.log(
+                    LogLevel::Info,
+                    format!("Rename session {} → {}", session_id, name),
+                );
+            }
             ControlMsg::SetGeminiModel { ref model } => {
                 let label = model
                     .as_deref()
@@ -2368,6 +2378,7 @@ impl App {
             | AppEvent::CodexConfigChanged { .. }
             | AppEvent::CodexThreadActionRequested { .. }
             | AppEvent::CodexThreadActionResult { .. }
+            | AppEvent::SessionRenameResult { .. }
             | AppEvent::GeminiConfigChanged { .. }
             | AppEvent::GeminiThreadActionRequested { .. }
             | AppEvent::GeminiThreadActionResult { .. }

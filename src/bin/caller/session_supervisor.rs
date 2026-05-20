@@ -236,6 +236,13 @@ impl SessionSupervisor {
                 )
                 .await;
             }
+            event::ControlMsg::RenameSession {
+                session_id,
+                source,
+                name,
+            } => {
+                self.rename_session(session_id, source, name).await;
+            }
             _ => {}
         }
     }
@@ -244,6 +251,7 @@ impl SessionSupervisor {
         match msg {
             event::ControlMsg::CreateSession { .. } => true,
             event::ControlMsg::ResumeSession { .. } => true,
+            event::ControlMsg::RenameSession { .. } => true,
             _ => {
                 if let Some(session_id) = control_target_session_id(msg) {
                     self.session_is_managed(session_id).await
@@ -277,14 +285,14 @@ impl SessionSupervisor {
             .lock()
             .map(|log| log.session_id().to_string())
             .unwrap_or_else(|_| path_file_name(&log_dir));
-        let project_root = match resolve_project_root_override(project_root, &self.config.project_root)
-        {
-            Ok(root) => root,
-            Err(e) => {
-                self.loop_error(format!("Project load failed: {}", e));
-                return;
-            }
-        };
+        let project_root =
+            match resolve_project_root_override(project_root, &self.config.project_root) {
+                Ok(root) => root,
+                Err(e) => {
+                    self.loop_error(format!("Project load failed: {}", e));
+                    return;
+                }
+            };
         let project = match Project::from_root(project_root) {
             Ok(project) => project,
             Err(e) => {
@@ -1071,6 +1079,62 @@ impl SessionSupervisor {
         }
     }
 
+    async fn rename_session(&self, session_id: String, source: Option<String>, name: String) {
+        let managed = {
+            let state = self.state.lock().await;
+            state
+                .sessions
+                .get(&session_id)
+                .map(|session| (session.session_id.clone(), session.source.clone()))
+        };
+
+        if let Some((managed_id, managed_source)) = managed.as_ref() {
+            if managed_source == "codex" {
+                self.config.bus.send(AppEvent::ControlCommand(
+                    event::ControlMsg::CodexThreadAction {
+                        session_id: Some(managed_id.clone()),
+                        op: "rename".to_string(),
+                        params: serde_json::json!({ "name": name }),
+                    },
+                ));
+                return;
+            }
+        }
+
+        let source = managed
+            .map(|(_, source)| source)
+            .or(source)
+            .unwrap_or_else(|| "intendant".to_string());
+        let normalized_source = crate::session_names::normalize_source(&source);
+        let result = match dirs::home_dir() {
+            Some(home) => {
+                crate::session_names::rename_session(&home, &normalized_source, &session_id, &name)
+            }
+            None => Err("could not resolve home directory".to_string()),
+        };
+
+        match result {
+            Ok(name) => {
+                self.config.bus.send(AppEvent::SessionRenameResult {
+                    session_id,
+                    source: Some(normalized_source),
+                    name: Some(name.clone()),
+                    success: true,
+                    message: format!("Renamed session to {}", name),
+                });
+            }
+            Err(message) => {
+                self.config.bus.send(AppEvent::SessionRenameResult {
+                    session_id,
+                    source: Some(normalized_source),
+                    name: None,
+                    success: false,
+                    message,
+                });
+            }
+        }
+    }
+
     async fn resolve_target_session_id(&self, session_id: Option<String>) -> Option<String> {
         let state = self.state.lock().await;
         session_id.or_else(|| state.active_session_id.clone())
@@ -1457,6 +1521,7 @@ fn control_target_session_id(msg: &event::ControlMsg) -> Option<&str> {
         | event::ControlMsg::StartTask { session_id, .. }
         | event::ControlMsg::EditUserMessage { session_id, .. }
         | event::ControlMsg::FollowUp { session_id, .. } => session_id.as_deref(),
+        event::ControlMsg::RenameSession { session_id, .. } => Some(session_id.as_str()),
         event::ControlMsg::ResumeSession { .. } => None,
         _ => None,
     }
