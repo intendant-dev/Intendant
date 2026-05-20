@@ -5058,7 +5058,8 @@ html, body {
             </label>
             <label class="sessions-new-session-field sessions-new-session-project" for="new-session-project-root">
               Project
-              <input id="new-session-project-root" class="sessions-project-input" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/project">
+              <input id="new-session-project-root" class="sessions-project-input" type="text" autocomplete="off" spellcheck="false" list="new-session-project-options" placeholder="/path/to/project">
+              <datalist id="new-session-project-options"></datalist>
             </label>
             <button class="sessions-start-btn" onclick="startNewSession()">Start session</button>
           </div>
@@ -19142,9 +19143,51 @@ function onSteerStatusUpdate(id, text, status, reason) {
 function setNewSessionProjectRoot(root) {
   dashboardProjectRoot = String(root || '').trim();
   const input = document.getElementById('new-session-project-root');
-  if (!input || !dashboardProjectRoot) return;
-  if (!input.value.trim()) input.value = dashboardProjectRoot;
-  input.title = dashboardProjectRoot;
+  if (input && dashboardProjectRoot && !input.value.trim()) input.value = dashboardProjectRoot;
+  updateNewSessionProjectPrefills();
+  if (input) input.title = input.value.trim() || dashboardProjectRoot;
+}
+
+function addNewSessionProjectPrefill(options, seen, value, source, sessionId = '') {
+  const path = String(value || '').trim();
+  if (!path || seen.has(path)) return;
+  seen.add(path);
+  const sid = shortSessionId(sessionId);
+  options.push({
+    path,
+    label: sid ? `${source} · ${sid}` : source,
+  });
+}
+
+function updateNewSessionProjectPrefills(sessions = _cachedSessions) {
+  const datalist = document.getElementById('new-session-project-options');
+  if (!datalist) return;
+  const options = [];
+  const seen = new Set();
+  addNewSessionProjectPrefill(options, seen, dashboardProjectRoot, 'current PROJ');
+
+  const recent = Array.isArray(sessions)
+    ? [...sessions].sort((a, b) => sessionDateSortValue(b, 'updated_at') - sessionDateSortValue(a, 'updated_at'))
+    : [];
+  for (const session of recent) {
+    addNewSessionProjectPrefill(options, seen, session.project_root, 'recent PROJ', session.session_id);
+    addNewSessionProjectPrefill(options, seen, session.cwd, 'recent CWD', session.session_id);
+    if (options.length >= 12) break;
+  }
+
+  datalist.innerHTML = '';
+  for (const option of options.slice(0, 12)) {
+    const el = document.createElement('option');
+    el.value = option.path;
+    el.label = option.label;
+    datalist.appendChild(el);
+  }
+
+  const input = document.getElementById('new-session-project-root');
+  if (input) {
+    if (!input.value.trim() && options.length > 0) input.value = options[0].path;
+    input.title = input.value.trim() || '';
+  }
 }
 
 async function loadNewSessionProjectRoot() {
@@ -19236,6 +19279,7 @@ function loadSessions() {
     .then(sessions => {
       sessionsLoaded = true;
       _cachedSessions = sessions;
+      updateNewSessionProjectPrefills(sessions);
       cacheSessionWindowMetadata(sessions);
       renderSessionsAggregate(sessions, aggEl);
       renderSessionsList(sessions, listEl);
@@ -19254,6 +19298,9 @@ document.getElementById('filter-abandoned')?.addEventListener('change', _refilte
 document.getElementById('filter-idle')?.addEventListener('change', _refilterSessions);
 document.getElementById('sort-sessions')?.addEventListener('change', _refilterSessions);
 document.getElementById('sessions-search')?.addEventListener('input', _refilterSessions);
+document.getElementById('new-session-project-root')?.addEventListener('input', (ev) => {
+  ev.currentTarget.title = ev.currentTarget.value.trim();
+});
 document.getElementById('sessions-search')?.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Escape' || !ev.currentTarget.value) return;
   ev.currentTarget.value = '';
