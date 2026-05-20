@@ -3314,11 +3314,15 @@ fn session_ended_id_from_wire(line: &str) -> Option<String> {
 fn list_sessions() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let home_path = PathBuf::from(&home);
-    let logs_dir = PathBuf::from(format!("{}/.intendant/logs", home));
+    list_sessions_from_home(&home_path)
+}
+
+fn list_sessions_from_home(home_path: &Path) -> String {
+    let logs_dir = home_path.join(".intendant").join("logs");
     let mut external_sessions = Vec::new();
-    external_sessions.extend(list_codex_sessions(&home_path));
-    external_sessions.extend(list_claude_sessions(&home_path));
-    external_sessions.extend(list_gemini_sessions(&home_path));
+    external_sessions.extend(list_codex_sessions(home_path));
+    external_sessions.extend(list_claude_sessions(home_path));
+    external_sessions.extend(list_gemini_sessions(home_path));
     if !logs_dir.is_dir() {
         sort_sessions_newest_first(&mut external_sessions);
         truncate_sessions_preserving_sources(&mut external_sessions);
@@ -3411,14 +3415,18 @@ fn list_sessions() -> String {
                                 .map(|s| s.to_string());
                         }
                     }
-                    "info" => {
-                        if message.starts_with("Provider: ") && provider.is_none() {
-                            provider = Some(message.trim_start_matches("Provider: ").to_string());
-                        } else if message.starts_with("Model: ") && model.is_none() {
-                            model = Some(message.trim_start_matches("Model: ").to_string());
-                        } else if message.starts_with("Task: ") && task.is_none() {
-                            task = Some(message.trim_start_matches("Task: ").to_string());
-                        } else if external_resume_id.is_none() {
+                    "info" | "debug" => {
+                        if event == "info" {
+                            if message.starts_with("Provider: ") && provider.is_none() {
+                                provider =
+                                    Some(message.trim_start_matches("Provider: ").to_string());
+                            } else if message.starts_with("Model: ") && model.is_none() {
+                                model = Some(message.trim_start_matches("Model: ").to_string());
+                            } else if message.starts_with("Task: ") && task.is_none() {
+                                task = Some(message.trim_start_matches("Task: ").to_string());
+                            }
+                        }
+                        if external_resume_id.is_none() {
                             external_resume_id = external_agent_thread_id_from_message(message);
                         }
                     }
@@ -3634,9 +3642,9 @@ fn list_sessions() -> String {
         }));
     }
 
-    sessions.extend(list_codex_sessions(&home_path));
-    sessions.extend(list_claude_sessions(&home_path));
-    sessions.extend(list_gemini_sessions(&home_path));
+    sessions.extend(list_codex_sessions(home_path));
+    sessions.extend(list_claude_sessions(home_path));
+    sessions.extend(list_gemini_sessions(home_path));
 
     sort_sessions_newest_first(&mut sessions);
     truncate_sessions_preserving_sources(&mut sessions);
@@ -11568,6 +11576,108 @@ mod tests {
         assert_eq!(
             context.get("resume-id").and_then(|ctx| ctx.cwd.as_deref()),
             Some("/repo/.worktrees/feature")
+        );
+    }
+
+    #[test]
+    fn list_sessions_joins_external_context_from_debug_thread_log() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        let command_cwd = repo.join(".worktrees").join("feature");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&command_cwd).unwrap();
+
+        let intendant_id = "intendant-wrapper-session";
+        let log_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join(intendant_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": intendant_id,
+                "created_at": "2026-05-17T20:44:00",
+                "project_root": repo.to_string_lossy(),
+                "task": "Dashboard-started Codex task",
+                "status": "running"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let codex_id = "019e37ae-dashboard-started";
+        let intendant_lines = [serde_json::json!({
+            "ts": "2026-05-17T20:44:01",
+            "event": "debug",
+            "message": format!("External agent thread: {codex_id}")
+        })];
+        std::fs::write(
+            log_dir.join("session.jsonl"),
+            intendant_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let codex_lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": codex_id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": repo.to_string_lossy()
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "exec_command_end",
+                    "cwd": command_cwd.to_string_lossy()
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{codex_id}.jsonl")),
+            codex_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(home.path())).unwrap();
+        let wrapped = sessions
+            .iter()
+            .find(|s| {
+                s.get("source").and_then(|v| v.as_str()) == Some("intendant")
+                    && s.get("session_id").and_then(|v| v.as_str()) == Some(intendant_id)
+            })
+            .expect("intendant wrapper session should be listed");
+        let expected_project_root = repo.to_string_lossy().to_string();
+        let expected_cwd = command_cwd.to_string_lossy().to_string();
+        assert_eq!(
+            wrapped.get("project_root").and_then(|v| v.as_str()),
+            Some(expected_project_root.as_str())
+        );
+        assert_eq!(
+            wrapped.get("cwd").and_then(|v| v.as_str()),
+            Some(expected_cwd.as_str())
         );
     }
 
