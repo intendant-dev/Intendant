@@ -1068,6 +1068,7 @@ async fn mint_session_token(provider: &str, model: &str) -> Result<String, Strin
 
 const APP_HTML: &str = include_str!("../../../static/app.html");
 const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.js");
+const ICON_128_PNG: &[u8] = include_bytes!("../../../static/icon-128.png");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
 // 0 means replay the full compact transcript. External activity replay
@@ -1174,6 +1175,7 @@ impl Default for WebGatewayConfig {
 /// - `GET /config` returns a JSON `WebGatewayConfig` (voice/runtime only).
 /// - `GET /.well-known/agent-card.json` returns a JSON `AgentCard` with
 ///   this daemon's identity, capabilities, transports, and auth scheme.
+/// - `GET /icon-128.png` and `GET /favicon.ico` return the dashboard icon.
 /// - `GET /` (and any other path) returns the web TUI page.
 /// - WebSocket connections are bridged to the EventBus (inbound control
 ///   messages) and broadcast channel (outbound events), mirroring the
@@ -1543,13 +1545,14 @@ fn resume_session_activity_replay_from_home(
 }
 
 /// Compute a short content hash for cache-busting embedded static assets.
-/// When the WASM or JS changes (i.e. a new build), the hash changes,
+/// When the WASM, JS, or favicon changes (i.e. a new build), the hash changes,
 /// the URL changes, and browsers fetch the new version.
 fn asset_version_hash() -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     WASM_WEB_BIN.hash(&mut hasher);
     WASM_WEB_JS.hash(&mut hasher);
+    ICON_128_PNG.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -5284,7 +5287,8 @@ pub fn spawn_web_gateway(
             .replace(
                 "/wasm-web/presence_web_bg.wasm",
                 &format!("/wasm-web/presence_web_bg.wasm?v={}", v),
-            ),
+            )
+            .replace("/icon-128.png", &format!("/icon-128.png?v={}", v)),
     );
 
     tokio::spawn(async move {
@@ -7925,6 +7929,22 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(header.as_bytes()).await;
                         let _ = stream.write_all(wasm_data).await;
+                    } else if request_line.contains("/icon-128.png")
+                        || request_line.contains("/favicon.ico")
+                    {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: image/png\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Connection: close\r\n\
+                             \r\n",
+                            ICON_128_PNG.len()
+                        );
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(header.as_bytes()).await;
+                        let _ = stream.write_all(ICON_128_PNG).await;
                     } else if request_line.contains(" /frames/") {
                         // Serve HQ frame images from the frame registry.
                         // URL format: /frames/<frame_id> (not /api/session/*/frames/*)
@@ -13699,9 +13719,8 @@ mod tests {
         (port, handle)
     }
 
-    /// Fire a raw HTTP request and read the response. Small helper
-    /// because the /api/peers tests all make a handful of these.
-    async fn http_request(port: u16, request: &str) -> String {
+    /// Fire a raw HTTP request and read the response bytes.
+    async fn http_request_bytes(port: u16, request: &str) -> Vec<u8> {
         use tokio::io::AsyncWriteExt;
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
             .await
@@ -13713,7 +13732,13 @@ mod tests {
             tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response),
         )
         .await;
-        String::from_utf8_lossy(&response).into_owned()
+        response
+    }
+
+    /// Fire a raw HTTP request and read the response. Small helper
+    /// because the /api/peers tests all make a handful of these.
+    async fn http_request(port: u16, request: &str) -> String {
+        String::from_utf8_lossy(&http_request_bytes(port, request).await).into_owned()
     }
 
     /// Same as `spawn_test_gateway_with_registry` but also wires an
@@ -13899,6 +13924,41 @@ mod tests {
             "config should serve unauthenticated, got: {resp}"
         );
         assert!(!resp.contains("401"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_favicon_routes_serve_png() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
+
+        for path in ["/icon-128.png", "/favicon.ico"] {
+            let request = format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
+            let resp = http_request_bytes(port, &request).await;
+            let response_str = String::from_utf8_lossy(&resp);
+            assert!(
+                response_str.starts_with("HTTP/1.1 200 OK"),
+                "expected 200 for {path}, got: {response_str}"
+            );
+            assert!(
+                response_str.contains("Content-Type: image/png"),
+                "expected PNG content type for {path}, got: {response_str}"
+            );
+            assert!(
+                !response_str.contains("<!DOCTYPE html>"),
+                "{path} should not fall through to app HTML"
+            );
+
+            let body_offset = resp
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|idx| idx + 4)
+                .expect("HTTP response should contain a body separator");
+            assert!(
+                resp[body_offset..].starts_with(b"\x89PNG\r\n\x1a\n"),
+                "{path} should serve PNG bytes"
+            );
+        }
+
         handle.abort();
     }
 
