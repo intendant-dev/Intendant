@@ -2168,9 +2168,14 @@ html, body {
 
 /* ── Sessions Tab ── */
 .sessions-container {
-  padding: 16px;
+  padding: 0 16px 16px;
   overflow-y: auto;
   flex: 1;
+}
+.sessions-container > .subtabs {
+  margin: 0 -16px;
+  padding-left: 16px;
+  padding-right: 16px;
 }
 .sessions-header {
   display: flex;
@@ -2809,6 +2814,17 @@ html, body {
 .session-detail-action-btn:hover {
   border-color: var(--blue);
   color: var(--blue);
+}
+.session-resume-btn {
+  border-color: color-mix(in srgb, var(--green) 70%, var(--surface1));
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+  color: var(--green);
+  font-weight: 600;
+}
+.session-resume-btn:hover {
+  border-color: var(--green);
+  background: color-mix(in srgb, var(--green) 20%, transparent);
+  color: var(--green);
 }
 .session-rename-btn {
   border-color: color-mix(in srgb, var(--mauve) 55%, var(--surface1));
@@ -5893,6 +5909,7 @@ html, body {
               <div class="session-detail-header">
                 <button class="session-back-btn" onclick="closeSessionDetail()">&larr; Back</button>
                 <span class="session-detail-title" id="session-detail-title"></span>
+                <button class="session-detail-action-btn session-resume-btn" id="session-detail-resume" type="button" title="Resume this session in Activity">Resume session</button>
                 <button class="session-detail-action-btn session-rename-btn" id="session-detail-rename" type="button" title="Rename this session">Rename</button>
               </div>
               <div class="session-detail-body" id="session-detail-body">
@@ -21420,6 +21437,10 @@ document.getElementById('session-detail-rename')?.addEventListener('click', (ev)
   ev.preventDefault();
   if (currentSessionDetail) requestSessionRename(currentSessionDetail);
 });
+document.getElementById('session-detail-resume')?.addEventListener('click', (ev) => {
+  ev.preventDefault();
+  if (currentSessionDetail) resumeSession(currentSessionDetail);
+});
 document.getElementById('worktrees-search')?.addEventListener('input', _refilterWorktrees);
 document.getElementById('sort-worktrees')?.addEventListener('change', _refilterWorktrees);
 document.getElementById('filter-worktrees-active')?.addEventListener('change', _refilterWorktrees);
@@ -22692,6 +22713,13 @@ function renderSessionDetailTitle(session) {
   if (renameBtn) {
     renameBtn.disabled = !sessionId;
     renameBtn.title = sessionId ? 'Rename this session' : 'Session ID is missing';
+  }
+  const resumeBtn = document.getElementById('session-detail-resume');
+  if (resumeBtn) {
+    const canResume = !!sessionId && session.can_resume !== false;
+    resumeBtn.disabled = !canResume;
+    resumeBtn.style.display = canResume ? '' : 'none';
+    resumeBtn.title = canResume ? 'Resume this session in Activity' : 'Session cannot be resumed';
   }
 }
 
