@@ -5,6 +5,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -5658,19 +5659,26 @@ fn delete_session_data(session_id: &str, target: &str) -> String {
     let dir_byte_size = |path: &std::path::Path| -> u64 {
         let mut total = 0u64;
         if path.is_dir() {
-            fn walk(dir: &std::path::Path, total: &mut u64) {
+            // On-disk allocation (512-byte blocks) with hardlinked inodes
+            // counted once, matching `du` — so bytes_freed reflects the space
+            // actually reclaimed, not apparent size.
+            fn walk(dir: &std::path::Path, total: &mut u64, seen: &mut HashSet<(u64, u64)>) {
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     for e in entries.flatten() {
                         let p = e.path();
                         if p.is_dir() {
-                            walk(&p, total);
+                            walk(&p, total, seen);
                         } else if let Ok(m) = p.metadata() {
-                            *total += m.len();
+                            if m.nlink() > 1 && !seen.insert((m.dev(), m.ino())) {
+                                continue;
+                            }
+                            *total = total.saturating_add(m.blocks().saturating_mul(512));
                         }
                     }
                 }
             }
-            walk(path, &mut total);
+            let mut seen: HashSet<(u64, u64)> = HashSet::new();
+            walk(path, &mut total, &mut seen);
         }
         total
     };
