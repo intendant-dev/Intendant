@@ -1085,6 +1085,53 @@ struct SourceState {
     gen: u64,
 }
 
+/// Policy for an always-on / baseline encoder that fails to construct at
+/// pool startup ([`EncoderPool::new`]).
+///
+/// **macOS / Linux — fail loud (panic).** The baseline there is VP8
+/// (libvpx), the universally-available fallback the pool guarantees is
+/// producing frames the instant any peer subscribes. libvpx has no host
+/// dependency that can be absent, so a construction failure means the
+/// build is fundamentally broken — better to fail loud at startup than
+/// serve a silent never-decoding stream. Keeping the panic here also means
+/// a real regression in the VP8 path can't be masked by this softening.
+#[cfg(not(target_os = "windows"))]
+fn baseline_encoder_construction_failed(id: &EncoderId, err: &str) -> ! {
+    panic!(
+        "always-on encoder {} construction failed at pool startup: {} — \
+         always-on codecs must always be constructable; a VP8 libvpx \
+         failure at startup is unrecoverable",
+        id, err,
+    )
+}
+
+/// Windows variant — degrade, do not panic.
+///
+/// The baseline on Windows is the Media Foundation H.264 software encoder
+/// (VP8/libvpx is gated off). Unlike libvpx, that MFT can be genuinely
+/// unavailable or reject a configuration on a given host (e.g. the
+/// `Server-Media-Foundation` optional feature missing, no registered H.264
+/// encoder MFT, or an output media type the MFT won't initialize). When
+/// the pool is constructed eagerly at `--web` daemon startup
+/// (`auto_activate_windows_user_display` → `DisplaySession::start`), a
+/// panic here takes down the entire dashboard daemon, not just the display
+/// stream. So on Windows we log and continue with an empty (or partial)
+/// always-on bank: `subscribe` simply yields no baseline subscription, the
+/// Video tab reports no active stream, and every other surface (Activity,
+/// Stats, Terminal, Sessions, Settings) stays up. This is the
+/// degrade-gracefully contract the rest of the pool already honors for
+/// on-demand construction failures.
+#[cfg(target_os = "windows")]
+fn baseline_encoder_construction_failed(id: &EncoderId, err: &str) {
+    eprintln!(
+        "[encoder/pool] WARN: always-on baseline encoder {} failed to \
+         construct at pool startup: {} — display will not stream on this \
+         host (the dashboard stays up); check that the Media Foundation \
+         H.264 encoder is available",
+        id, err,
+    );
+}
+
 impl EncoderPool {
     /// Construct a pool. The `layer_factory` closure is invoked
     /// **immediately** with `(source_width, source_height)` to
@@ -1143,14 +1190,9 @@ impl EncoderPool {
         let mut always_on = Vec::with_capacity(initial_layers.len());
         for layer in initial_layers {
             // Always-on bank is the platform [`BASELINE_CODEC`] (VP8 on
-            // macOS/Linux, H.264 on Windows — see module docs). Use the
-            // failable constructor here and PANIC on failure — always-on is
-            // the universally-available fallback path; if even the baseline
-            // codec won't construct, there is no recovery and the display
-            // pipeline is fundamentally broken. Better to fail loud at pool
-            // construction than produce a silent never-decoding stream.
+            // macOS/Linux, H.264 on Windows — see module docs).
             let id = EncoderId::new(BASELINE_CODEC, layer.rid.clone());
-            let handle = try_spawn_encoder_thread(
+            match try_spawn_encoder_thread(
                 id.clone(),
                 layer,
                 source_width,
@@ -1158,16 +1200,10 @@ impl EncoderPool {
                 &i420_tx,
                 duration_ms,
                 &counters,
-            )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "always-on encoder {} construction failed at pool startup: {} — \
-                             always-on codecs must always be constructable; a VP8 libvpx \
-                             failure at startup is unrecoverable",
-                    id, e,
-                )
-            });
-            always_on.push(handle);
+            ) {
+                Ok(handle) => always_on.push(handle),
+                Err(e) => baseline_encoder_construction_failed(&id, &e),
+            }
         }
 
         Self {
@@ -1290,10 +1326,12 @@ impl EncoderPool {
     ///
     /// # Panics
     ///
-    /// Panics if a new always-on encoder fails to construct: an
-    /// always-on construction failure at any lifecycle point —
-    /// startup or resize — is unrecoverable by contract (see
-    /// [`Self::new`]).
+    /// On macOS / Linux, panics if a new always-on encoder fails to
+    /// construct — a VP8 baseline failure at any lifecycle point (startup
+    /// or resize) is unrecoverable by contract (see [`Self::new`] and
+    /// [`baseline_encoder_construction_failed`]). On Windows the same
+    /// failure is logged and the layer is dropped instead, so a resize the
+    /// Media Foundation H.264 MFT can't honor never crashes the daemon.
     pub fn on_resize(&self, new_width: u32, new_height: u32) {
         // Atomic update of dimensions + epoch under the source-state
         // write lock. Holding the lock across both the dim and gen
@@ -1355,7 +1393,7 @@ impl EncoderPool {
             let new_layers = (self.inner.layer_factory)(new_width, new_height);
             for layer in new_layers {
                 let id = EncoderId::new(BASELINE_CODEC, layer.rid.clone());
-                let new_handle = try_spawn_encoder_thread(
+                match try_spawn_encoder_thread(
                     id.clone(),
                     layer,
                     new_width,
@@ -1363,16 +1401,16 @@ impl EncoderPool {
                     &self.inner.i420_tx,
                     self.inner.duration_ms,
                     &self.inner.counters,
-                )
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "on_resize: always-on respawn failed for {:?}: {} — \
-                         always-on construction failure is unrecoverable by \
-                         contract (see EncoderPool::new)",
-                        id, e,
-                    )
-                });
-                always_on.push(new_handle);
+                ) {
+                    Ok(new_handle) => always_on.push(new_handle),
+                    // Same per-platform policy as `EncoderPool::new`:
+                    // panic on macOS/Linux (VP8 always reconstructs),
+                    // log + degrade on Windows (a resize to a resolution
+                    // the MF H.264 MFT rejects must not crash the daemon —
+                    // the bank is left without this layer until the next
+                    // resize regenerates it).
+                    Err(e) => baseline_encoder_construction_failed(&id, &e),
+                }
             }
         }
 
@@ -1540,11 +1578,14 @@ impl EncoderPool {
         // a resize happened before they're consumed.
         let source_at_start = self.snapshot_source();
 
-        // Always-on: no refcount, subscribe-only. These are guaranteed
-        // to be producing frames — EncoderPool::new panics on
-        // always-on construction failure. Read lock is held only for
-        // the duration of this iteration; on_resize acquires the write
-        // lock to swap handles.
+        // Always-on: no refcount, subscribe-only. On macOS/Linux these
+        // are guaranteed to be producing frames (EncoderPool::new panics
+        // on a VP8 baseline construction failure); on Windows the bank may
+        // be empty if the Media Foundation H.264 baseline failed to
+        // construct (logged + degraded), in which case this loop simply
+        // yields no baseline subscription. Read lock is held only for the
+        // duration of this iteration; on_resize acquires the write lock to
+        // swap handles.
         {
             let always_on = self.inner.always_on.read().unwrap();
             for handle in always_on.iter() {

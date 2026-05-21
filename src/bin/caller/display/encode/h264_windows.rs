@@ -30,10 +30,15 @@
 //! ## Profile / NAL framing
 //!
 //! The output type is configured for **Constrained Baseline** profile
-//! (`eAVEncH264VProfile_ConstrainedBase`) at Level 3.1, target bitrate and
-//! frame rate, so every emitted packet matches
-//! [`PayloadSpec::h264_constrained_baseline`] (profile-level-id `42e01f`,
-//! packetization-mode 1) — identical to the macOS/Linux backends.
+//! (`eAVEncH264VProfile_ConstrainedBase`), target bitrate and frame rate, so
+//! every emitted packet matches [`PayloadSpec::h264_constrained_baseline`]
+//! (profile-level-id `42e01f`, packetization-mode 1) — identical to the
+//! macOS/Linux backends. We deliberately leave `MF_MT_MPEG2_LEVEL` unset and
+//! let the MFT pick the minimal valid level for the frame size (a pinned Level
+//! 3.1 made `SetOutputType` reject any resolution above its 3600-macroblock
+//! ceiling, e.g. 1600x900 — see [`Self::configure_output_type`]); the
+//! advertised `42e01f` stays put, matching the macOS/Linux posture of relying
+//! on browser leniency toward an actual SPS level above the negotiated one.
 //!
 //! The MS H.264 encoder emits **Annex-B** byte-stream output (start-code
 //! prefixed NAL units), which is exactly what the WebRTC H.264 path expects —
@@ -71,7 +76,7 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264, MFVideoFormat_NV12,
     MFVideoInterlace_Progressive, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
     MF_VERSION, CODECAPI_AVEncCommonLowLatency, CODECAPI_AVLowLatencyMode,
     eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_ConstrainedBase,
 };
@@ -83,10 +88,6 @@ use windows::Win32::System::Variant::{
 
 /// Annex-B start code prefix for NAL units.
 const ANNEXB_START_CODE: &[u8] = &[0x00, 0x00, 0x00, 0x01];
-
-/// H.264 Level 3.1 (`level_idc = 0x1F = 31`) — matches
-/// [`PayloadSpec::h264_constrained_baseline`]'s `42e01f`.
-const H264_LEVEL_3_1: u32 = 31;
 
 /// Keyframe (GOP) cadence in frames. 30 frames ≈ 1s at 30fps, matching the
 /// macOS (`max_key_frame_interval = 30`) and Linux (`-g 30`) backends so a
@@ -359,17 +360,39 @@ impl MediaFoundationEncoder {
             set_attribute_size(&out_type, &MF_MT_FRAME_SIZE, width, height)?;
             set_attribute_ratio(&out_type, &MF_MT_FRAME_RATE, GOP_SIZE, 1)?;
             set_attribute_ratio(&out_type, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
-            // Constrained Baseline profile + Level 3.1 → profile-level-id 42e01f.
+            // Constrained Baseline profile → profile-level-id family 42xx.
             out_type
                 .SetUINT32(
                     &MF_MT_MPEG2_PROFILE,
                     eAVEncH264VProfile_ConstrainedBase.0 as u32,
                 )
                 .map_err(|e| format!("out MPEG2_PROFILE ConstrainedBase: {e}"))?;
-            // Level is best-effort: some encoder builds reject an explicit level
-            // and pick one from resolution/bitrate. Don't fail the whole encoder
-            // on it — the profile is the load-bearing field for fmtp matching.
-            let _ = out_type.SetUINT32(&MF_MT_MPEG2_LEVEL, H264_LEVEL_3_1);
+            // Do NOT pin MF_MT_MPEG2_LEVEL.
+            //
+            // The MS H.264 encoder MFT cross-validates (profile, level,
+            // frame size, frame rate, bitrate) inside `SetOutputType` — not in
+            // the per-attribute `SetUINT32`. Pinning Level 3.1 (`level_idc=31`,
+            // MaxFS=3600 macroblocks) made `SetOutputType` reject any frame
+            // larger than that ceiling: a 1600x900 desktop is 100x57 = 5700
+            // macroblocks, well over 3600, so SetOutputType returned
+            // MF_E_INVALIDMEDIATYPE (0xC00D36B6) and the always-on pool encoder
+            // panicked at startup. (The earlier synthetic-frame test used
+            // 320x240 = 300 MBs, which fits Level 3.1, so it never tripped this
+            // — the bug only surfaces at real desktop resolutions > ~720p.)
+            // The `let _ =` "best-effort set" did NOT help: the attribute store
+            // succeeds; the rejection happens later at SetOutputType.
+            //
+            // With the level attribute omitted, the MFT auto-derives the
+            // minimal valid level for the frame size / rate / bitrate (e.g.
+            // Level 4.0 for 1600x900), so SetOutputType always succeeds for any
+            // encodable resolution. The advertised profile-level-id stays
+            // `42e01f` ([`PayloadSpec::h264_constrained_baseline`]) — identical
+            // to the macOS VideoToolbox and Linux ffmpeg backends, which also
+            // advertise Constrained Baseline / Level 3.1 yet emit a higher
+            // actual level_idc for >720p content and rely on WebRTC browsers'
+            // standard leniency toward an SPS level above the negotiated one.
+            // Keeping the same posture across all three backends means the
+            // fmtp-matching logic in `mod.rs` is unchanged.
 
             transform
                 .SetOutputType(STREAM_ID, &out_type, 0)
