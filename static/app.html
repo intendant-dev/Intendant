@@ -1014,7 +1014,13 @@ html, body {
   white-space: nowrap;
   cursor: pointer;
 }
+.task-target-chip .session-identity-prefix {
+  flex-shrink: 0;
+}
 .task-target-chip.has-target {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   color: var(--session-badge-fg, var(--blue));
   border-color: var(--session-badge-border, rgba(137, 180, 250, 0.45));
   background: var(--session-badge-bg, rgba(137, 180, 250, 0.08));
@@ -1322,7 +1328,11 @@ html, body {
 }
 .session-window-id {
   flex-shrink: 1;
-  max-width: 220px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 260px;
   color: var(--session-badge-fg, var(--text));
   background: var(--session-badge-bg, var(--surface0));
   border: 1px solid var(--session-badge-border, transparent);
@@ -1333,6 +1343,19 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.session-identity-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-identity-short,
+.session-identity-separator {
+  flex-shrink: 0;
+}
+.session-identity-separator {
+  opacity: 0.65;
 }
 .session-window-task {
   color: var(--overlay1);
@@ -1527,6 +1550,9 @@ html, body {
 }
 .log-entry .log-session {
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   font-size: 9px;
   font-weight: 600;
   padding: 1px 5px;
@@ -9521,15 +9547,15 @@ function updateTaskTargetChip() {
   if (!sid) {
     chip.style.display = 'none';
     chip.classList.remove('has-target');
-    chip.textContent = '';
+    chip.replaceChildren();
     chip.title = '';
+    chip.removeAttribute('aria-label');
     applySessionBadgeStyle(chip, '');
     return;
   }
   chip.style.display = '';
   chip.classList.add('has-target');
-  chip.textContent = `Target ${shortSessionId(sid)}`;
-  chip.title = `Prompt target: ${sid}`;
+  renderSessionIdentity(chip, sid, { prefix: 'Target', showName: false, titlePrefix: 'Prompt target' });
   applySessionBadgeStyle(chip, sid);
 }
 
@@ -9541,6 +9567,70 @@ function resolvePromptTargetSessionId() {
 
 function compactSessionText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function sessionIdentityParts(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
+  const name = compactSessionText(meta.name || meta.display_name || meta.displayName || meta.thread_name || meta.threadName || meta.title);
+  return { sid, shortId: shortSessionId(sid), name };
+}
+
+function appendSessionIdentityPart(el, className, text) {
+  if (!text) return;
+  const part = document.createElement('span');
+  part.className = className;
+  part.textContent = text;
+  el.appendChild(part);
+}
+
+function renderSessionIdentity(el, sessionId, options = {}) {
+  if (!el) return;
+  const { sid, shortId, name } = sessionIdentityParts(sessionId);
+  el.replaceChildren();
+  if (!sid) {
+    el.title = '';
+    el.removeAttribute('aria-label');
+    return;
+  }
+
+  const showName = options.showName !== false && !!name;
+  const titleText = showName ? `${name} \u00b7 ${sid}` : sid;
+  const prefix = compactSessionText(options.prefix);
+  if (prefix) appendSessionIdentityPart(el, 'session-identity-prefix', prefix);
+
+  if (options.order === 'name-id' && showName) {
+    appendSessionIdentityPart(el, 'session-identity-name', name);
+    appendSessionIdentityPart(el, 'session-identity-separator', '\u00b7');
+    appendSessionIdentityPart(el, 'session-identity-short', shortId);
+  } else {
+    appendSessionIdentityPart(el, 'session-identity-short', shortId);
+    if (showName) {
+      appendSessionIdentityPart(el, 'session-identity-separator', '\u00b7');
+      appendSessionIdentityPart(el, 'session-identity-name', name);
+    }
+  }
+
+  const title = options.titlePrefix ? `${options.titlePrefix}: ${titleText}` : titleText;
+  el.title = title;
+  el.setAttribute('aria-label', title);
+}
+
+function refreshSessionIdentityLabels(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  if (sid === resolvePromptTargetSessionId()) updateTaskTargetChip();
+  const selector = window.CSS?.escape
+    ? `.log-entry[data-session-id="${CSS.escape(sid)}"]`
+    : '.log-entry[data-session-id]';
+  document.querySelectorAll(selector).forEach(entry => {
+    if (entry.dataset.sessionId !== sid) return;
+    for (const child of entry.children) {
+      if (child.classList?.contains('log-session')) {
+        renderSessionIdentity(child, sid, { showName: false });
+      }
+    }
+  });
 }
 
 function compactPathLabel(value, preserveAbsolute = false) {
@@ -9639,12 +9729,16 @@ function cacheSessionWindowMetadata(sessions) {
   for (const session of sessions) {
     if (!session || typeof session !== 'object') continue;
     const meta = sessionWindowMetaFromSession(session);
-    const ids = [session.session_id, session.resume_id]
-      .map(id => String(id || '').trim())
-      .filter(Boolean);
+    const ids = Array.from(new Set([
+      session.session_id,
+      session.resume_id,
+      session.backend_session_id,
+      session.intendant_session_id,
+    ].map(id => String(id || '').trim()).filter(Boolean)));
     for (const id of ids) {
       const { meta: merged, changed } = mergeSessionWindowMetadata(id, meta);
       if (changed && sessionWindows.has(id)) updateSessionWindow(id, merged);
+      if (changed) refreshSessionIdentityLabels(id);
     }
     if (session.backend_session_id && session.session_id) {
       applySessionIdentity({
@@ -9729,7 +9823,10 @@ function copyTextToClipboard(text) {
 function sessionIdentityMatches(session, sessionId, source = '') {
   if (!session || !sessionId) return false;
   const sid = String(sessionId || '').trim();
-  if (String(session.session_id || '').trim() !== sid && String(session.resume_id || '').trim() !== sid) {
+  const ids = [session.session_id, session.resume_id, session.backend_session_id, session.intendant_session_id]
+    .map(id => String(id || '').trim())
+    .filter(Boolean);
+  if (!ids.includes(sid)) {
     return false;
   }
   const normalizedSource = String(source || '').trim();
@@ -9741,18 +9838,26 @@ function applySessionRenameToUi(sessionId, source, name) {
   const displayName = compactSessionText(name);
   if (!sid || !displayName) return;
   const normalizedSource = String(source || '').trim();
+  const aliasIds = new Set([sid]);
   for (const session of _cachedSessions) {
     if (sessionIdentityMatches(session, sid, normalizedSource)) {
       session.name = displayName;
+      [session.session_id, session.resume_id, session.backend_session_id, session.intendant_session_id].forEach(id => {
+        const alias = String(id || '').trim();
+        if (alias) aliasIds.add(alias);
+      });
     }
   }
-  const previous = sessionMetadataById.get(sid) || {};
-  sessionMetadataById.set(sid, {
-    ...previous,
-    name: displayName,
-    ...(normalizedSource ? { source: normalizedSource } : {}),
+  aliasIds.forEach(id => {
+    const previous = sessionMetadataById.get(id) || {};
+    sessionMetadataById.set(id, {
+      ...previous,
+      name: displayName,
+      ...(normalizedSource ? { source: normalizedSource } : {}),
+    });
+    updateSessionWindow(id, { name: displayName, source: normalizedSource || undefined });
+    refreshSessionIdentityLabels(id);
   });
-  updateSessionWindow(sid, { name: displayName, source: normalizedSource || undefined });
   if (currentSessionDetail && sessionIdentityMatches(currentSessionDetail, sid, normalizedSource)) {
     currentSessionDetail = { ...currentSessionDetail, name: displayName };
     renderSessionDetailTitle(currentSessionDetail);
@@ -9929,8 +10034,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   title.className = 'session-window-title';
   const id = document.createElement('div');
   id.className = 'session-window-id';
-  id.textContent = shortSessionId(sid);
-  id.title = sid;
+  renderSessionIdentity(id, sid, { order: 'id-name', showName: false });
   applySessionBadgeStyle(id, sid);
   const project = document.createElement('div');
   project.className = 'session-window-project';
@@ -10094,8 +10198,7 @@ function updateSessionWindow(sessionId, meta = {}) {
   if (win.metadataSignature === signature) return;
   win.metadataSignature = signature;
   const displayName = compactSessionText(meta.name);
-  win.id.textContent = displayName || shortSessionId(sid);
-  win.id.title = displayName ? `${displayName} · ${sid}` : sid;
+  renderSessionIdentity(win.id, sid, { order: 'id-name' });
   if (meta.projectRoot) {
     win.project.textContent = meta.projectLabel || compactPathLabel(meta.projectRoot, true);
     win.project.title = meta.projectRoot;
@@ -10531,8 +10634,7 @@ function createLogScaffold(c, extraClass) {
   const session = document.createElement('span');
   session.className = 'log-session';
   const sid = c.session_id || '';
-  session.textContent = sid ? sid.substring(0, 8) : '';
-  session.title = sid ? `session: ${sid}` : '';
+  renderSessionIdentity(session, sid, { showName: false });
   if (sid) {
     entry.dataset.sessionId = sid;
     applySessionBadgeStyle(session, sid);
