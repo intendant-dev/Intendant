@@ -49,6 +49,7 @@ mod upload_store;
 mod user_mode;
 mod vision;
 mod web_gateway;
+mod web_tls;
 mod worktree;
 mod worktree_inventory;
 
@@ -2029,6 +2030,16 @@ struct CliFlags {
     /// --web [PORT]: Serve TUI via web (xterm.js + optional voice).
     web: bool,
     web_port: u16,
+    /// --tls: Serve the `--web` dashboard over HTTPS/WSS. Off by default
+    /// (plain HTTP). ORs with `[server.tls] enabled` in intendant.toml.
+    /// With no cert/key override, a self-signed cert is minted at startup
+    /// (SAN = bind IP + localhost, optional config hostname).
+    tls: bool,
+    /// --tls-cert <PATH>: PEM cert (chain) overriding the auto self-signed
+    /// cert. Must be paired with `--tls-key`. Implies `--tls`.
+    tls_cert: Option<String>,
+    /// --tls-key <PATH>: PEM private key matching `--tls-cert`.
+    tls_key: Option<String>,
     /// --transcription: Enable user speech transcription.
     transcription: bool,
     /// --record-display <ID>: Record an existing X11 display (repeatable).
@@ -2071,6 +2082,9 @@ fn print_help() {
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle starts daemon/no TUI)");
+    println!("    --tls                 Serve the web dashboard over HTTPS/WSS (auto self-signed cert)");
+    println!("    --tls-cert <PATH>     PEM cert overriding the self-signed cert (with --tls-key; implies --tls)");
+    println!("    --tls-key <PATH>      PEM private key matching --tls-cert");
     println!("    --no-web              Disable web dashboard; use terminal TUI when interactive");
     println!("    --transcription       Enable user speech transcription");
     println!(
@@ -2211,6 +2225,59 @@ async fn bind_dual_stack_or_v4(port: u16) -> std::io::Result<tokio::net::TcpList
     tokio::net::TcpListener::from_std(std_listener)
 }
 
+/// Build the optional TLS acceptor for the `--web` dashboard.
+///
+/// TLS is enabled when either the CLI `--tls` flag is set or
+/// `[server.tls] enabled = true` is in intendant.toml. When enabled, the
+/// cert source is resolved in priority order:
+///   1. Explicit PEM files — CLI `--tls-cert`/`--tls-key` first, else
+///      `[server.tls] cert`/`key`. Both halves of a pair must be present.
+///   2. Otherwise a self-signed cert minted by `rcgen`, with the listener
+///      bind IP plus `localhost` (and optional `[server.tls] hostname`) in
+///      the SAN list.
+///
+/// Returns `Ok(None)` when TLS is off (the default), `Ok(Some(acceptor))`
+/// when on and the cert built, or `Err` when enabled but misconfigured
+/// (mismatched cert/key pair, unreadable/invalid PEM, cert-gen failure) —
+/// surfaced loudly at startup rather than silently serving plain HTTP.
+fn build_web_tls_acceptor(
+    flags: &CliFlags,
+    server_cfg: &project::ServerTlsConfig,
+    bind_addr: Option<std::net::SocketAddr>,
+) -> Result<Option<tokio_rustls::TlsAcceptor>, CallerError> {
+    let enabled = flags.tls || server_cfg.enabled;
+    if !enabled {
+        return Ok(None);
+    }
+
+    // Resolve an explicit cert/key pair: CLI overrides config. A
+    // half-specified pair (only cert or only key) is a configuration
+    // error rather than a silent fallback to self-signed.
+    let cert_path = flags.tls_cert.clone().or_else(|| server_cfg.cert.clone());
+    let key_path = flags.tls_key.clone().or_else(|| server_cfg.key.clone());
+    let source = match (cert_path, key_path) {
+        (Some(c), Some(k)) => web_tls::TlsCertSource::Files {
+            cert_path: c.into(),
+            key_path: k.into(),
+        },
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(CallerError::Config(
+                "TLS cert/key must be supplied together (got only one of --tls-cert/--tls-key \
+                 or [server.tls] cert/key)"
+                    .to_string(),
+            ));
+        }
+        (None, None) => web_tls::TlsCertSource::SelfSigned {
+            bind_ip: bind_addr.map(|a| a.ip()),
+            hostname: server_cfg.hostname.clone(),
+        },
+    };
+
+    let acceptor = web_tls::build_acceptor(&source)
+        .map_err(|e| CallerError::Config(format!("TLS setup failed: {e}")))?;
+    Ok(Some(acceptor))
+}
+
 fn parse_cli_flags() -> Result<CliFlags, CallerError> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut flags = CliFlags {
@@ -2231,6 +2298,9 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         no_presence: false,
         web: false,
         web_port: web_gateway::DEFAULT_PORT,
+        tls: false,
+        tls_cert: None,
+        tls_key: None,
         transcription: false,
         record_displays: Vec::new(),
 
@@ -2349,6 +2419,34 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                     i += 2;
                 } else {
                     i += 1;
+                }
+            }
+            "--tls" => {
+                // Serve the dashboard over HTTPS/WSS. Auto self-signed
+                // cert unless --tls-cert/--tls-key are also given.
+                flags.tls = true;
+                i += 1;
+            }
+            "--tls-cert" => {
+                if i + 1 < args.len() {
+                    flags.tls_cert = Some(args[i + 1].clone());
+                    flags.tls = true; // a cert override implies TLS
+                    i += 2;
+                } else {
+                    return Err(CallerError::Config(
+                        "Missing value for --tls-cert".to_string(),
+                    ));
+                }
+            }
+            "--tls-key" => {
+                if i + 1 < args.len() {
+                    flags.tls_key = Some(args[i + 1].clone());
+                    flags.tls = true; // a key override implies TLS
+                    i += 2;
+                } else {
+                    return Err(CallerError::Config(
+                        "Missing value for --tls-key".to_string(),
+                    ));
                 }
             }
             "--transcription" => {
@@ -3685,6 +3783,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
             transcription: false,
             record_displays: Vec::new(),
             agent_backend: None,
@@ -3730,6 +3831,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
             transcription: false,
             record_displays: Vec::new(),
 
@@ -3775,6 +3879,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: true,
             web_port: web_gateway::DEFAULT_PORT,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
             transcription: false,
             record_displays: Vec::new(),
 
@@ -3808,6 +3915,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: true,
             web_port: 9000,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
             transcription: false,
             record_displays: Vec::new(),
 
@@ -9587,6 +9697,21 @@ async fn main() -> Result<(), CallerError> {
     // Only expose the web port to external agents when the web gateway is actually running.
     let web_port_for_agent: Option<u16> = if use_web { Some(web_port) } else { None };
 
+    // Build the dashboard's TLS acceptor once (cheap to clone into each
+    // gateway spawn site). Off unless `--tls` / `[server.tls] enabled`.
+    // A misconfiguration (bad cert/key, half-specified pair) fails startup
+    // here rather than silently degrading to plain HTTP. The bind address
+    // feeds the self-signed cert's SAN list.
+    let web_tls_acceptor = if use_web {
+        let bind_addr = web_listener.as_ref().and_then(|l| l.local_addr().ok());
+        build_web_tls_acceptor(&flags, &project.config.server.tls, bind_addr)?
+    } else {
+        None
+    };
+    if web_tls_acceptor.is_some() {
+        eprintln!("[web_gateway] TLS enabled — dashboard served over HTTPS/WSS on port {web_port}");
+    }
+
     let provider_result = provider::select_provider();
     let provider = match provider_result {
         Ok(p) => {
@@ -9769,6 +9894,7 @@ async fn main() -> Result<(), CallerError> {
                 &project.config.server.auth,
                 &lan::backend::select_backend().cert_dir(),
             )?,
+            web_tls_acceptor.clone(),
         );
         eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
 
@@ -9987,6 +10113,7 @@ async fn main() -> Result<(), CallerError> {
                     &project.config.server.auth,
                     &lan::backend::select_backend().cert_dir(),
                 )?,
+                web_tls_acceptor.clone(),
             );
             slog(&session_log, |l| {
                 l.info(&format!("Web TUI: http://0.0.0.0:{}", web_port))
@@ -10582,6 +10709,7 @@ async fn main() -> Result<(), CallerError> {
                     &project.config.server.auth,
                     &lan::backend::select_backend().cert_dir(),
                 )?,
+                web_tls_acceptor.clone(),
             );
             app.log(
                 types::LogLevel::Info,
@@ -11081,6 +11209,7 @@ async fn main() -> Result<(), CallerError> {
                     &project.config.server.auth,
                     &lan::backend::select_backend().cert_dir(),
                 )?,
+                web_tls_acceptor.clone(),
             );
             eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
             Some(shared_session)

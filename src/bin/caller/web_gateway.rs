@@ -16,9 +16,28 @@ use std::sync::{Arc, Mutex};
 // uses in this file.  All access goes through `unwrap_or_else(|e| e.into_inner())`
 // to remain poison-tolerant, matching the rest of the file's std-lock idiom.
 use std::sync::RwLock as StdRwLock;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
+
+/// Unified read/write surface for a demuxed dashboard connection.
+///
+/// After the per-connection demux peels off raw ICE-TCP (which stays a
+/// concrete `TcpStream`), the surviving connection is either a plain
+/// `TcpStream` or a TLS-wrapped `tokio_rustls::server::TlsStream<TcpStream>`.
+/// Both implement `AsyncRead + AsyncWrite + Unpin + Send`, so the WebSocket
+/// and HTTP handling that follows operates through this boxed trait object
+/// — identical code path for HTTP and HTTPS, plain WS and WSS. The
+/// `tokio_tungstenite::accept_async` upgrade and every `read_exact` /
+/// `write_all` call are already generic over these trait bounds; only the
+/// three small body-reading helpers had to be made generic to match.
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
+/// Boxed demuxed connection (plain TCP or TLS), used for all post-demux
+/// HTTP/WebSocket handling.
+type DemuxStream = std::pin::Pin<Box<dyn AsyncReadWrite>>;
 
 /// Monotonically increasing counter for assigning unique peer IDs to WebSocket
 /// connections.  Used for WebRTC signaling so that each browser tab gets a
@@ -4935,7 +4954,7 @@ fn handle_changes_file_diff(
 /// Read the full POST body (honoring Content-Length). Returns the peeked
 /// prefix if the headers already carried the entire payload; otherwise reads
 /// the remainder from the stream.
-async fn read_post_body(header_text: &str, stream: &mut tokio::net::TcpStream) -> String {
+async fn read_post_body<S: AsyncRead + Unpin>(header_text: &str, stream: &mut S) -> String {
     use tokio::io::AsyncReadExt;
     let content_length: usize = header_text
         .lines()
@@ -4982,10 +5001,10 @@ const UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024;
 ///
 /// This is the binary counterpart to `read_post_body` — same peek-then-
 /// stream pattern, but sinks to disk instead of a UTF-8 `String`.
-async fn stream_body_to_tempfile(
+async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
     header_text: &str,
     initial_request_bytes: &[u8],
-    stream: &mut tokio::net::TcpStream,
+    stream: &mut S,
     max_bytes: usize,
 ) -> Result<(tempfile::NamedTempFile, usize), String> {
     use std::io::Write;
@@ -6171,6 +6190,15 @@ pub fn spawn_web_gateway(
     // don't exercise the advertise path; production call sites in
     // main.rs build the requirements from the project config.
     local_card_auth: crate::peer::AuthRequirements,
+    // Native TLS for the dashboard. `Some(acceptor)` (built in main.rs
+    // from `[server.tls]` / `--tls`) makes the per-connection demux wrap
+    // any connection whose first bytes are a TLS ClientHello, serving the
+    // dashboard over HTTPS/WSS. `None` (the default) preserves the
+    // current plain-HTTP behavior. Either way the raw ICE-TCP (STUN-
+    // framed) demux branch is unaffected — TLS is distinguished by its
+    // `0x16` handshake-record first byte, which is disjoint from both the
+    // STUN length-prefix and HTTP method bytes.
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -6598,6 +6626,9 @@ pub fn spawn_web_gateway(
             let terminal_registry = terminal_registry.clone();
             let inbound_bearer_token = inbound_bearer_token.clone();
             let worktree_inventory_cache = worktree_inventory_cache.clone();
+            // `TlsAcceptor` wraps an `Arc<ServerConfig>`, so cloning is cheap
+            // (one Arc bump). `None` when TLS is disabled.
+            let tls_acceptor = tls_acceptor.clone();
 
             tokio::spawn(async move {
                 // Snapshot session state at connection time
@@ -6614,20 +6645,32 @@ pub fn spawn_web_gateway(
                 // Peek at the first bytes to detect (in order):
                 //  1. ICE-TCP STUN-framed traffic (RFC 4571 length prefix
                 //     followed by a STUN message whose magic cookie
-                //     0x2112A442 sits at payload offset 4 = peek offset 6)
-                //  2. WebSocket upgrade (HTTP header containing
+                //     0x2112A442 sits at payload offset 4 = peek offset 6).
+                //     First byte (length MSB) is 0x00 for STUN-sized frames.
+                //  2. TLS ClientHello (handshake record: first byte 0x16,
+                //     then version major 0x03) — only when a TLS acceptor
+                //     is configured. Wrapped in the rustls acceptor; the
+                //     decrypted stream then flows through the WS/HTTP paths
+                //     below exactly as a plain connection would.
+                //  3. WebSocket upgrade (HTTP header containing
                 //     "Upgrade: websocket")
-                //  3. Plain HTTP (everything else)
+                //  4. Plain HTTP (everything else)
                 //
-                // `peek()` does not consume the data, so both the
-                // WebSocket handshake and the HTTP parser still get the
-                // full request. Only the ICE-TCP branch actually reads
-                // (and consumes) the first RFC 4571 frame, after which
-                // the rest of the stream is handed to the WebRTC peer's
-                // reader task.
+                // The three first-byte classes are mutually exclusive:
+                // STUN length-prefix MSB 0x00, TLS handshake 0x16, HTTP
+                // method ASCII letters (>= 0x41). So one peeked byte
+                // disambiguates raw ICE-TCP from TLS from cleartext HTTP.
+                //
+                // `peek()` does not consume the data, so the ICE-TCP, TLS,
+                // WebSocket, and HTTP branches all still get the full
+                // first segment. The ICE-TCP branch reads (and consumes)
+                // the first RFC 4571 frame and hands the rest to the
+                // WebRTC peer reader; the TLS branch lets the handshake
+                // consume the peeked ClientHello and re-reads the
+                // decrypted request head before dispatching.
                 let mut buf = [0u8; 2048];
-                let mut stream = stream;
-                let n = match stream.peek(&mut buf).await {
+                let mut raw_stream = stream;
+                let peeked = match raw_stream.peek(&mut buf).await {
                     Ok(n) if n > 0 => n,
                     _ => return,
                 };
@@ -6640,21 +6683,21 @@ pub fn spawn_web_gateway(
                 // length prefix. A valid HTTP request never starts with
                 // these bytes (method chars are ASCII >= 0x41).
                 let looks_like_stun_tcp =
-                    n >= 22 && buf[2] < 2 && buf[6..10] == [0x21, 0x12, 0xA4, 0x42];
+                    peeked >= 22 && buf[2] < 2 && buf[6..10] == [0x21, 0x12, 0xA4, 0x42];
                 if looks_like_stun_tcp {
                     // Consume the first RFC 4571 frame from the stream
                     // (peek leaves it in the kernel buffer; we have to
                     // read it through to hand a clean stream to the peer
                     // reader task).
                     let first_frame =
-                        match crate::display::webrtc::read_rfc4571_frame_pub(&mut stream).await {
+                        match crate::display::webrtc::read_rfc4571_frame_pub(&mut raw_stream).await {
                             Ok(f) => f,
                             Err(e) => {
                                 eprintln!("[web_gateway] ICE-TCP first-frame read failed: {e}");
                                 return;
                             }
                         };
-                    let remote_addr = match stream.peer_addr() {
+                    let remote_addr = match raw_stream.peer_addr() {
                         Ok(a) => a,
                         Err(_) => return,
                     };
@@ -6673,7 +6716,7 @@ pub fn spawn_web_gateway(
                     match crate::display::webrtc::parse_first_frame_ufrag(&first_frame) {
                         Some(ufrag) if tcp_peer_registry.contains_ufrag(&ufrag) => {
                             if let Err(e) = tcp_peer_registry
-                                .route_accepted(stream, first_frame, remote_addr)
+                                .route_accepted(raw_stream, first_frame, remote_addr)
                                 .await
                             {
                                 eprintln!(
@@ -6683,7 +6726,7 @@ pub fn spawn_web_gateway(
                         }
                         Some(ufrag) if tcp_relay_registry.contains_ufrag(&ufrag) => {
                             if let Err(e) =
-                                tcp_relay_registry.route_accepted(stream, first_frame).await
+                                tcp_relay_registry.route_accepted(raw_stream, first_frame).await
                             {
                                 eprintln!(
                                     "[web_gateway] ICE-TCP relay routing for ufrag={ufrag} from {remote_addr} failed: {e}"
@@ -6705,6 +6748,65 @@ pub fn spawn_web_gateway(
                     }
                     return;
                 }
+
+                // Connection is not raw ICE-TCP. It is one of: TLS
+                // (HTTPS/WSS), plain WebSocket, or plain HTTP. Convert the
+                // raw `TcpStream` into a unified, boxed `DemuxStream` that
+                // the WS/HTTP handling below operates through. The plain
+                // path boxes the TcpStream verbatim (the peeked bytes stay
+                // in the kernel buffer, unconsumed). The TLS path runs the
+                // rustls handshake — which consumes the peeked ClientHello
+                // — then re-reads the decrypted request head so the rest of
+                // the handler sees cleartext HTTP.
+                let is_tls = tls_acceptor.is_some()
+                    && crate::web_tls::looks_like_tls_client_hello(&buf[..peeked]);
+                let buf_owned: Vec<u8>;
+                let n: usize;
+                let mut stream: DemuxStream;
+                if is_tls {
+                    let acceptor = tls_acceptor
+                        .as_ref()
+                        .expect("is_tls implies acceptor present")
+                        .clone();
+                    let mut tls_stream = match acceptor.accept(raw_stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[web_gateway] TLS handshake failed: {e}");
+                            return;
+                        }
+                    };
+                    // Read the first segment of the *decrypted* request so
+                    // we can route on the real HTTP request line/headers.
+                    // This is the TLS analogue of the plain-path peek.
+                    use tokio::io::AsyncReadExt;
+                    let mut decrypted = vec![0u8; 8192];
+                    let read_n = match tls_stream.read(&mut decrypted).await {
+                        Ok(0) => return, // client closed right after handshake
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[web_gateway] TLS first decrypted read failed: {e}");
+                            return;
+                        }
+                    };
+                    decrypted.truncate(read_n);
+                    n = read_n;
+                    buf_owned = decrypted.clone();
+                    // Replay the decrypted request head in front of the TLS
+                    // stream so the WS upgrade / HTTP body reads downstream
+                    // see the request from byte zero.
+                    stream = Box::pin(crate::web_tls::PrefixedStream::new(decrypted, tls_stream));
+                } else {
+                    // Plain HTTP/WS: the peeked bytes are still in the
+                    // kernel buffer. Box the raw stream with an empty
+                    // replay prefix — a zero-overhead pass-through that
+                    // reads the request straight from the socket.
+                    n = peeked;
+                    buf_owned = buf[..peeked].to_vec();
+                    stream = Box::pin(crate::web_tls::PrefixedStream::new(Vec::new(), raw_stream));
+                }
+                // Downstream code reads `buf[..n]`; point `buf` at the
+                // (decrypted, for TLS) request head we just captured.
+                let buf = buf_owned.as_slice();
 
                 let header_text = String::from_utf8_lossy(&buf[..n]);
                 let is_websocket = header_text
@@ -11335,7 +11437,7 @@ async fn peers_remove(registry: &crate::peer::PeerRegistry, body_text: &str) -> 
 /// Factored out of the original inline body-reading block in the
 /// `/api/peers` handler so the per-peer outbound op handlers below
 /// can share it without duplicating the peek-then-stream pattern.
-async fn read_request_body(stream: &mut tokio::net::TcpStream, header_text: &str) -> String {
+async fn read_request_body<S: AsyncRead + Unpin>(stream: &mut S, header_text: &str) -> String {
     use tokio::io::AsyncReadExt;
     let content_length: usize = header_text
         .lines()
@@ -15922,6 +16024,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
 
         // Give it a moment to start
@@ -15956,6 +16059,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -16011,6 +16115,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -16077,6 +16182,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
@@ -16129,6 +16235,7 @@ mod tests {
             Vec::new(),
             bearer_token,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
@@ -17238,6 +17345,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -17297,6 +17405,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -17351,6 +17460,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -17429,6 +17539,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -17547,6 +17658,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -17617,6 +17729,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -17693,6 +17806,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                None,
             )
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -17764,6 +17878,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                None,
             )
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -17848,6 +17963,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                None,
             )
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -17935,6 +18051,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -17995,6 +18112,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -18056,6 +18174,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -18114,6 +18233,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -18178,6 +18298,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -18244,6 +18365,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -18334,6 +18456,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -18459,6 +18582,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -18559,6 +18683,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
