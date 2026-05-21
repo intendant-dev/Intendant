@@ -1690,6 +1690,9 @@ html, body {
   text-transform: uppercase;
   letter-spacing: 0.3px;
 }
+.log-command-failed .log-command-label {
+  background: var(--red);
+}
 .log-command-code {
   margin-top: 2px;
   white-space: pre-wrap;
@@ -10236,6 +10239,13 @@ function detectCommandLog(content) {
   return null;
 }
 
+function detectCommandFailureLog(content) {
+  const text = String(content || '').trim();
+  const m = text.match(/^(Command failed(?:\s*\([^)]+\))?:\s*[^\n]+)\nCommand:\s*([\s\S]+)$/i);
+  if (!m) return null;
+  return { label: m[1], command: m[2] };
+}
+
 function highlightShellCommand(command) {
   const src = String(command || '');
   let html = '';
@@ -10629,6 +10639,14 @@ function shouldRenderMarkdownLog(c) {
 
 function renderLogContentElement(cnt, c) {
   const content = c.content || '';
+  const failedCommand = detectCommandFailureLog(content);
+  if (failedCommand) {
+    cnt.classList.add('log-command', 'log-command-failed');
+    cnt.innerHTML =
+      `<span class="log-command-label">${escapeHtml(failedCommand.label)}</span>` +
+      `<code class="log-command-code">${highlightShellCommand(failedCommand.command)}</code>`;
+    return;
+  }
   const command = detectCommandLog(content);
   if (command) {
     cnt.classList.add('log-command');

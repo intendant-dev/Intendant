@@ -1279,6 +1279,7 @@ impl SessionSupervisor {
 
     fn warn(&self, message: &str) {
         self.config.bus.send(AppEvent::LogEntry {
+            session_id: None,
             level: "warn".to_string(),
             source: "session-supervisor".to_string(),
             content: message.to_string(),

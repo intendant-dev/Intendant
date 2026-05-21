@@ -1972,7 +1972,7 @@ fn extract_failure_message(item: &serde_json::Value) -> String {
 
     match (exit_code, output_tail) {
         (Some(code), Some(tail)) => format!("command exited {}: {}", code, tail),
-        (Some(code), None) => format!("command exited {}", code),
+        (Some(code), None) => format!("command exited {} (no output)", code),
         (None, Some(tail)) => tail,
         (None, None) => "unknown error".to_string(),
     }
@@ -3234,6 +3234,30 @@ mod tests {
                 );
             }
             other => panic!("expected Failed with output tail, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_item_completed_failed_exit_only_mentions_empty_output() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "id": "item-2",
+                "type": "commandExecution",
+                "status": "failed",
+                "exitCode": 1
+            }
+        });
+        translate_notification("item/completed", &params, &tx);
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolCompleted {
+                status: ToolCompletionStatus::Failed { message },
+                ..
+            } => {
+                assert_eq!(message, "command exited 1 (no output)");
+            }
+            other => panic!("expected Failed with exit-only detail, got {:?}", other),
         }
     }
 

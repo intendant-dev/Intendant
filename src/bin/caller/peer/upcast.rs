@@ -1119,6 +1119,7 @@ impl AppEventUpcaster {
                 source,
                 content,
                 turn: _,
+                ..
             } => {
                 let log_level = match level.as_str() {
                     "trace" => LogLevel::Trace,
@@ -2888,6 +2889,7 @@ mod tests {
     fn log_entry_passthrough() {
         let mut u = AppEventUpcaster::new();
         let out = u.upcast(&AppEvent::LogEntry {
+            session_id: None,
             level: "warn".into(),
             source: "presence".into(),
             content: "something funny".into(),
@@ -3250,6 +3252,7 @@ mod tests {
     #[test]
     fn parity_log_entry() {
         assert_parity(AppEvent::LogEntry {
+            session_id: None,
             level: "warn".into(),
             source: "presence".into(),
             content: "something funny".into(),

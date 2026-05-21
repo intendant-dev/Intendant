@@ -284,6 +284,7 @@ fn emit_task_dispatched_log(
     );
     slog(session_log, |l| l.info(&message));
     bus.send(AppEvent::LogEntry {
+        session_id: None,
         level: "info".to_string(),
         source: "system".to_string(),
         content: message,
@@ -827,12 +828,24 @@ fn external_tool_failure_content(
     message: &str,
     tool_preview: Option<&str>,
 ) -> String {
-    let mut content = if item_id.trim().is_empty() {
-        format!("Tool failed: {message}")
+    let preview = tool_preview.map(str::trim).filter(|s| !s.is_empty());
+    let command = preview.and_then(|preview| preview.strip_prefix("command: ").map(str::trim));
+    let label = if command.is_some() {
+        "Command failed"
     } else {
-        format!("Tool failed ({item_id}): {message}")
+        "Tool failed"
     };
-    if let Some(preview) = tool_preview.map(str::trim).filter(|s| !s.is_empty()) {
+
+    let mut content = if item_id.trim().is_empty() {
+        format!("{label}: {message}")
+    } else {
+        format!("{label} ({item_id}): {message}")
+    };
+
+    if let Some(command) = command {
+        content.push_str("\nCommand: ");
+        content.push_str(command);
+    } else if let Some(preview) = preview {
         content.push_str("\nTool: ");
         content.push_str(preview);
     }
@@ -1315,6 +1328,7 @@ async fn drain_external_agent_events(
                     _ => l.info(&message),
                 });
                 config.bus.send(AppEvent::LogEntry {
+                    session_id: config.session_id.clone(),
                     level,
                     source: config
                         .agent_source
@@ -1402,6 +1416,7 @@ async fn drain_external_agent_events(
                         );
                         slog(config.session_log, |l| l.warn(&content));
                         config.bus.send(AppEvent::LogEntry {
+                            session_id: config.session_id.clone(),
                             level: "warn".to_string(),
                             source: external_agent_log_source(config.agent_source.as_deref()),
                             content,
@@ -4202,7 +4217,7 @@ Also: {"source": "bare"}"#;
 
         assert_eq!(
             content,
-            "Tool failed (call-1): command exited 1\nTool: command: rg missing static/app.html"
+            "Command failed (call-1): command exited 1\nCommand: rg missing static/app.html"
         );
     }
 

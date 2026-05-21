@@ -593,6 +593,7 @@ pub enum AppEvent {
     /// `emit_task_dispatched_log`) so dispatch-style messages reach external
     /// consumers in headless mode where no TUI is running.
     LogEntry {
+        session_id: Option<String>,
         level: String,
         source: String,
         content: String,
@@ -1649,6 +1650,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         }),
         AppEvent::GeminiThreadActionRequested { .. } => None,
         AppEvent::LogEntry {
+            session_id,
             level,
             source,
             content,
@@ -1658,7 +1660,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             source: source.clone(),
             content: content.clone(),
             turn: *turn,
-            session_id: None,
+            session_id: session_id.clone(),
             user_turn_index: None,
             replacement_for_user_turn_index: None,
         }),
@@ -3097,6 +3099,21 @@ mod tests {
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"agent_output\""));
         assert!(json.contains("\"hello\""));
+    }
+
+    #[test]
+    fn outbound_log_entry_preserves_session_id() {
+        let event = AppEvent::LogEntry {
+            session_id: Some("sess-log".to_string()),
+            level: "info".to_string(),
+            source: "Codex".to_string(),
+            content: "Codex compacted context".to_string(),
+            turn: None,
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"log_entry\""));
+        assert!(json.contains("\"session_id\":\"sess-log\""));
     }
 
     #[test]

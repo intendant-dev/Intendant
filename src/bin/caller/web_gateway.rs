@@ -1276,6 +1276,7 @@ fn replay_jsonl_to_outbound_entries(
     log_dir: &std::path::Path,
 ) -> Vec<serde_json::Value> {
     let (provider, model, autonomy) = scan_replay_status(contents);
+    let replay_session_id = replay_session_id_from_dir(log_dir);
 
     let mut entries: Vec<serde_json::Value> = Vec::new();
     entries.push(serde_json::json!({
@@ -1313,11 +1314,33 @@ fn replay_jsonl_to_outbound_entries(
                 .unwrap_or("")
                 .to_string();
             obj.insert("ts".to_string(), serde_json::Value::String(ts));
+            if !obj.contains_key("session_id") {
+                if let Some(session_id) = replay_session_id.as_deref() {
+                    obj.insert(
+                        "session_id".to_string(),
+                        serde_json::Value::String(session_id.to_string()),
+                    );
+                }
+            }
         }
         entries.push(value);
     }
 
     entries
+}
+
+fn replay_session_id_from_dir(log_dir: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(log_dir.join("session_meta.json"))
+        .ok()
+        .and_then(|meta| serde_json::from_str::<crate::session_log::SessionMeta>(&meta).ok())
+        .map(|meta| meta.session_id)
+        .filter(|session_id| !session_id.trim().is_empty())
+        .or_else(|| {
+            log_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .filter(|session_id| !session_id.trim().is_empty())
+        })
 }
 
 fn session_log_replay_from_dir(log_dir: &std::path::Path) -> Option<String> {
@@ -11324,6 +11347,7 @@ async fn peers_webrtc_signal(
         Ok(r) => r,
         Err(e) => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!("rejecting webrtc signal from browser — invalid body: {e}"),
@@ -11343,6 +11367,7 @@ async fn peers_webrtc_signal(
         crate::peer::WebRtcSignal::Unknown => "unknown",
     };
     bus.send(AppEvent::LogEntry {
+        session_id: None,
         level: "debug".to_string(),
         source: LOG_SOURCE.to_string(),
         content: format!(
@@ -11356,6 +11381,7 @@ async fn peers_webrtc_signal(
         Some(h) => h,
         None => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!("peer {id} not in registry — dropping {signal_kind}"),
@@ -11380,6 +11406,7 @@ async fn peers_webrtc_signal(
         Ok(()) => (200, serde_json::json!({"ok": true}).to_string()),
         Err(crate::peer::PeerError::NotConnected) => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -11394,6 +11421,7 @@ async fn peers_webrtc_signal(
         }
         Err(crate::peer::PeerError::UnsupportedCapability(_)) => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -11411,6 +11439,7 @@ async fn peers_webrtc_signal(
         }
         Err(e) => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "error".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!("webrtc_signal to peer {id} failed: {e}"),
@@ -11467,6 +11496,7 @@ async fn maybe_rewrite_federated_answer(
         Some(u) => u,
         None => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -11496,6 +11526,7 @@ async fn maybe_rewrite_federated_answer(
         Some(u) => u,
         None => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -11511,6 +11542,7 @@ async fn maybe_rewrite_federated_answer(
         Some(addr) => addr,
         None => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -11535,6 +11567,7 @@ async fn maybe_rewrite_federated_answer(
             Some(addr) => addr,
             None => {
                 bus.send(AppEvent::LogEntry {
+                    session_id: None,
                     level: "warn".to_string(),
                     source: LOG_SOURCE.to_string(),
                     content: format!(
@@ -11548,6 +11581,7 @@ async fn maybe_rewrite_federated_answer(
         },
         None => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -11563,6 +11597,7 @@ async fn maybe_rewrite_federated_answer(
     let rewritten_sdp =
         crate::display::webrtc::inject_relay_tcp_candidate(&sdp, primary_relay_addr);
     bus.send(AppEvent::LogEntry {
+        session_id: None,
         level: "info".to_string(),
         source: LOG_SOURCE.to_string(),
         content: format!(
@@ -11692,6 +11727,7 @@ async fn handle_federated_webrtc_signal(
         crate::peer::WebRtcSignal::Unknown => "unknown",
     };
     bus.send(AppEvent::LogEntry {
+        session_id: None,
         level: "debug".to_string(),
         source: LOG_SOURCE.to_string(),
         content: format!(
@@ -11704,6 +11740,7 @@ async fn handle_federated_webrtc_signal(
         Some(r) => r,
         None => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -11718,6 +11755,7 @@ async fn handle_federated_webrtc_signal(
         Some(s) => s,
         None => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -11752,6 +11790,7 @@ async fn handle_federated_webrtc_signal(
                 _ => None,
             };
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "debug".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -11775,6 +11814,7 @@ async fn handle_federated_webrtc_signal(
             if let Some(addr) = tcp_advertised_addr {
                 if addr.ip().is_loopback() {
                     bus.send(AppEvent::LogEntry {
+                        session_id: None,
                         level: "warn".to_string(),
                         source: LOG_SOURCE.to_string(),
                         content: format!(
@@ -11838,6 +11878,7 @@ async fn handle_federated_webrtc_signal(
             match answer_result {
                 Ok(answer_sdp) => {
                     bus.send(AppEvent::LogEntry {
+                        session_id: None,
                         level: "info".to_string(),
                         source: LOG_SOURCE.to_string(),
                         content: format!(
@@ -11882,6 +11923,7 @@ async fn handle_federated_webrtc_signal(
                         Ok(s) => {
                             if direct_tx.send(s).is_err() {
                                 bus.send(AppEvent::LogEntry {
+                                    session_id: None,
                                     level: "warn".to_string(),
                                     source: LOG_SOURCE.to_string(),
                                     content: format!(
@@ -11893,6 +11935,7 @@ async fn handle_federated_webrtc_signal(
                         }
                         Err(e) => {
                             bus.send(AppEvent::LogEntry {
+                                session_id: None,
                                 level: "error".to_string(),
                                 source: LOG_SOURCE.to_string(),
                                 content: format!(
@@ -11922,6 +11965,7 @@ async fn handle_federated_webrtc_signal(
                             if let Ok(s) = serde_json::to_string(&evt) {
                                 if direct_tx_ice.send(s).is_err() {
                                     bus_ice.send(AppEvent::LogEntry {
+                                        session_id: None,
                                         level: "debug".to_string(),
                                         source: LOG_SOURCE.to_string(),
                                         content: format!(
@@ -11934,6 +11978,7 @@ async fn handle_federated_webrtc_signal(
                             }
                         }
                         bus_ice.send(AppEvent::LogEntry {
+                            session_id: None,
                             level: "debug".to_string(),
                             source: LOG_SOURCE.to_string(),
                             content: format!(
@@ -11945,6 +11990,7 @@ async fn handle_federated_webrtc_signal(
                 }
                 Err(e) => {
                     bus.send(AppEvent::LogEntry {
+                        session_id: None,
                         level: "warn".to_string(),
                         source: LOG_SOURCE.to_string(),
                         content: format!(
@@ -11959,6 +12005,7 @@ async fn handle_federated_webrtc_signal(
             match session.add_ice_candidate(peer_id, &candidate_json).await {
                 Ok(()) => {
                     bus.send(AppEvent::LogEntry {
+                        session_id: None,
                         level: "debug".to_string(),
                         source: LOG_SOURCE.to_string(),
                         content: format!(
@@ -11969,6 +12016,7 @@ async fn handle_federated_webrtc_signal(
                 }
                 Err(e) => {
                     bus.send(AppEvent::LogEntry {
+                        session_id: None,
                         level: "warn".to_string(),
                         source: LOG_SOURCE.to_string(),
                         content: format!(
@@ -11986,6 +12034,7 @@ async fn handle_federated_webrtc_signal(
             // An incoming Answer here means a confused sender — log
             // and drop rather than silently mishandling.
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -12022,6 +12071,7 @@ async fn handle_federated_webrtc_signal(
                 &federated_authority_subscribers,
             );
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "debug".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -12036,6 +12086,7 @@ async fn handle_federated_webrtc_signal(
             // debug so the operator can see unknown signal arrivals
             // when they're hunting wire-format issues.
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "debug".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -15489,6 +15540,10 @@ mod tests {
             turn_started.get("ts").is_some(),
             "ts should be injected into each outbound entry"
         );
+        assert_eq!(
+            turn_started.get("session_id").and_then(|v| v.as_str()),
+            Some("session")
+        );
 
         // auto_approved preview preserved.
         let auto_approved = entries
@@ -15498,6 +15553,10 @@ mod tests {
         assert_eq!(
             auto_approved.get("preview").and_then(|v| v.as_str()),
             Some("exec: ls")
+        );
+        assert_eq!(
+            auto_approved.get("session_id").and_then(|v| v.as_str()),
+            Some("session")
         );
 
         // round_complete fields propagated.

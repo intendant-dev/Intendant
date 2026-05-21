@@ -2612,6 +2612,7 @@ pub fn session_log_entry_to_app_event(
                 }),
                 "dedup-auto-approved" => Some(AppEvent::AutoApproved { preview }),
                 "denied-policy" | "denied-no-approver" => Some(AppEvent::LogEntry {
+                    session_id: None,
                     level: "warn".to_string(),
                     source: "system".to_string(),
                     content: format!("Denied ({}): {}", decision, preview),
@@ -2834,6 +2835,7 @@ pub fn session_log_entry_to_app_event(
                 event_type
             };
             Some(AppEvent::LogEntry {
+                session_id: None,
                 level: level.to_string(),
                 source: source.to_string(),
                 content,
@@ -2890,6 +2892,7 @@ pub fn session_log_entry_to_app_event(
                 _ => unreachable!(),
             };
             Some(AppEvent::LogEntry {
+                session_id: None,
                 level: level.to_string(),
                 source: "worker".to_string(),
                 content,
@@ -2897,6 +2900,7 @@ pub fn session_log_entry_to_app_event(
             })
         }
         "session_end" => Some(AppEvent::LogEntry {
+            session_id: None,
             level: "info".to_string(),
             source: "system".to_string(),
             content: message.to_string(),
@@ -4037,6 +4041,7 @@ mod tests {
                 source,
                 content,
                 turn,
+                ..
             } => {
                 assert_eq!(level, "warn");
                 assert_eq!(source, "system");
