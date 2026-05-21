@@ -8,6 +8,7 @@
 //! - **macOS**: `pbpaste` / `pbcopy`, `osascript` for image clipboard
 //! - **Linux (Wayland)**: `wl-paste --no-newline` / `wl-copy` (from `wl-clipboard`)
 //! - **Linux (X11)**: `xclip -o -selection clipboard` / `xclip -i -selection clipboard`
+//! - **Windows**: the `arboard` crate (Win32 clipboard API under the hood)
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -456,34 +457,113 @@ async fn write_clipboard_image(_mime: &str, data: &[u8]) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Platform: Windows (Tier-0 stub)
+// Platform: Windows
 // ---------------------------------------------------------------------------
 //
-// Windows clipboard sync isn't wired yet (Tier-1 will use the Win32
-// clipboard API — OpenClipboard / GetClipboardData / SetClipboardData).
-// The monitor calls these four functions unconditionally, so each gets a
-// stub matching the platform signature: reads report "nothing on the
-// clipboard" (`None`), writes report success (`Ok(())`) so a paste request
-// is silently a no-op rather than an error the caller has to special-case.
+// Backed by the `arboard` crate, which wraps the Win32 clipboard API
+// (OpenClipboard / GetClipboardData / SetClipboardData). `arboard::Clipboard`
+// is a synchronous handle that opens the native clipboard only for the
+// duration of a single transfer, so we create a fresh one per call (cheap,
+// and avoids holding the clipboard open across `.await` points). All native
+// work runs on `spawn_blocking` so the 500ms monitor poll never blocks a
+// tokio worker thread.
+//
+// Image contract mirrors macOS/Linux exactly: `read_clipboard_image` returns
+// `("image/png", <PNG bytes>)` and `write_clipboard_image` receives PNG bytes
+// (the `ClipboardMonitor` normalises to PNG before calling). arboard speaks
+// raw RGBA8 `ImageData`, so we encode RGBA -> PNG on read and decode PNG ->
+// RGBA on write (the same `image` crate helpers used elsewhere in display/).
+//
+// Reads swallow errors into `None` (matching the macOS/Linux arms): an empty
+// or text-only clipboard yields `ContentNotAvailable`, which during a 500ms
+// poll loop is the normal "nothing applicable" case, not a failure worth
+// logging.
 
 #[cfg(target_os = "windows")]
 async fn read_clipboard_text() -> Option<String> {
-    None
+    tokio::task::spawn_blocking(|| {
+        let mut clipboard = arboard::Clipboard::new().ok()?;
+        clipboard.get_text().ok()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[cfg(target_os = "windows")]
 async fn read_clipboard_image() -> Option<(String, Vec<u8>)> {
-    None
+    tokio::task::spawn_blocking(|| {
+        let mut clipboard = arboard::Clipboard::new().ok()?;
+        let image = clipboard.get_image().ok()?;
+        rgba_image_to_png(image.width, image.height, &image.bytes)
+            .map(|png| ("image/png".to_string(), png))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[cfg(target_os = "windows")]
-async fn write_clipboard_text(_text: &str) -> Result<(), String> {
-    Ok(())
+async fn write_clipboard_text(text: &str) -> Result<(), String> {
+    let text = text.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("open clipboard: {e}"))?;
+        clipboard
+            .set_text(text)
+            .map_err(|e| format!("set clipboard text: {e}"))
+    })
+    .await
+    .map_err(|e| format!("clipboard task join: {e}"))?
 }
 
 #[cfg(target_os = "windows")]
-async fn write_clipboard_image(_mime: &str, _data: &[u8]) -> Result<(), String> {
-    Ok(())
+async fn write_clipboard_image(_mime: &str, data: &[u8]) -> Result<(), String> {
+    // The monitor always hands us PNG bytes; arboard wants raw RGBA8.
+    let (width, height, rgba) = png_to_rgba_image(data)?;
+    tokio::task::spawn_blocking(move || {
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("open clipboard: {e}"))?;
+        let image = arboard::ImageData {
+            width,
+            height,
+            bytes: std::borrow::Cow::Owned(rgba),
+        };
+        clipboard
+            .set_image(image)
+            .map_err(|e| format!("set clipboard image: {e}"))
+    })
+    .await
+    .map_err(|e| format!("clipboard task join: {e}"))?
+}
+
+/// Encode a raw RGBA8 buffer (as produced by `arboard::Clipboard::get_image`)
+/// into PNG bytes, matching the `("image/png", <PNG bytes>)` contract the
+/// macOS/Linux `read_clipboard_image` arms return.
+///
+/// Returns `None` if the dimensions don't match the buffer length or PNG
+/// encoding fails, so the caller can treat it as "nothing usable on the
+/// clipboard" rather than an error.
+#[cfg(target_os = "windows")]
+fn rgba_image_to_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
+    let img = image::RgbaImage::from_raw(width as u32, height as u32, rgba.to_vec())?;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+    Some(buf.into_inner())
+}
+
+/// Decode PNG bytes into a raw RGBA8 buffer for `arboard::Clipboard::set_image`.
+///
+/// The `ClipboardMonitor` normalises every incoming image to PNG before
+/// calling `write_clipboard_image`, so we only need to handle PNG here.
+/// Returns `(width, height, rgba_bytes)`.
+#[cfg(target_os = "windows")]
+fn png_to_rgba_image(png: &[u8]) -> Result<(usize, usize, Vec<u8>), String> {
+    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .map_err(|e| format!("PNG decode failed: {e}"))?
+        .to_rgba8();
+    let (width, height) = (img.width() as usize, img.height() as usize);
+    Ok((width, height, img.into_raw()))
 }
 
 #[cfg(test)]
@@ -532,5 +612,55 @@ mod tests {
             data: vec![1, 2, 3],
         };
         assert_eq!(a, b);
+    }
+
+    // Windows clipboard image helpers: pure RGBA<->PNG conversions, no live
+    // clipboard required. These pin the contract the `ClipboardMonitor`
+    // depends on (read returns PNG, write accepts PNG).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rgba_to_png_is_decodable_png() {
+        // 2x2 RGBA: red, green, blue, white.
+        #[rustfmt::skip]
+        let rgba: Vec<u8> = vec![
+            255, 0, 0, 255,    0, 255, 0, 255,
+            0, 0, 255, 255,    255, 255, 255, 255,
+        ];
+        let png = super::rgba_image_to_png(2, 2, &rgba).expect("encode PNG");
+        // Real PNG signature.
+        assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        // image crate can read it back as a PNG of the right dimensions.
+        let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .expect("decode PNG")
+            .to_rgba8();
+        assert_eq!((decoded.width(), decoded.height()), (2, 2));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rgba_to_png_rejects_mismatched_dimensions() {
+        // 3 bytes can't form any non-empty RGBA image of the claimed 2x2 size.
+        assert!(super::rgba_image_to_png(2, 2, &[1, 2, 3]).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn png_to_rgba_roundtrips_dimensions_and_pixels() {
+        #[rustfmt::skip]
+        let rgba: Vec<u8> = vec![
+            255, 0, 0, 255,    0, 255, 0, 255,
+            0, 0, 255, 255,    255, 255, 255, 255,
+        ];
+        let png = super::rgba_image_to_png(2, 2, &rgba).expect("encode PNG");
+        let (w, h, out) = super::png_to_rgba_image(&png).expect("decode PNG");
+        assert_eq!((w, h), (2, 2));
+        // PNG is lossless, so the RGBA bytes survive the round trip exactly.
+        assert_eq!(out, rgba);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn png_to_rgba_rejects_non_png() {
+        assert!(super::png_to_rgba_image(b"not a png").is_err());
     }
 }
