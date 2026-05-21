@@ -2,6 +2,7 @@
 
 - [Introduction](./introduction.md)
 - [Getting Started](./getting-started.md)
+- [Windows Support](./windows-support.md)
 - [Architecture](./architecture.md)
 - [Configuration](./configuration.md)
 - [Runtime Protocol](./runtime-protocol.md)
