@@ -99,16 +99,26 @@ openssl = "0.10"
 openssl-sys = "0.9"
 
 # Windows-only system bindings, used by `platform.rs` for the process
-# liveness check (OpenProcess / GetExitCodeProcess) and to keep room for
-# the Tier-1 backends (DXGI capture, SendInput, WASAPI, clipboard) without
+# liveness check (OpenProcess / GetExitCodeProcess) and command-line readout
+# (NtQueryInformationProcess via the Wdk surface, with a
+# QueryFullProcessImageNameW exe-path fallback), and to keep room for the
+# Tier-1 backends (DXGI capture, SendInput, WASAPI, clipboard) without
 # re-touching Cargo.toml. Feature set is the minimum platform.rs needs
 # today plus the threading/process-status surfaces those backends will use.
+# `Wdk_System_Threading` pulls in NtQueryInformationProcess +
+# ProcessCommandLineInformation (the documented-but-NT command-line class).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
+    "Wdk_System_Threading",
 ] }
+# Cross-platform network-interface enumeration. On Windows it wraps
+# GetAdaptersAddresses; this backs `lan::routable_local_addrs`, which feeds
+# the web-gateway advertise URLs and WebRTC ICE host-candidate gathering.
+# The unix path keeps its existing direct `getifaddrs(3)` walk via libc.
+if-addrs = "0.15"
 
 [profile.dev]
 split-debuginfo = "unpacked"

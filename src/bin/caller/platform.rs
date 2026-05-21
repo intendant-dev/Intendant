@@ -169,14 +169,154 @@ pub fn process_cmdline(pid: u32) -> Option<String> {
 
 /// Read the command line of a process by PID.
 ///
-/// Windows has no `/proc` and no `KERN_PROCARGS2`; the equivalent is a
-/// Toolhelp32 / `NtQueryInformationProcess` walk. Tier-0 returns `None`
-/// (cmdline simply unavailable) so callers degrade to PID-only.
-// TODO Tier-1: read the cmdline via CreateToolhelp32Snapshot + Process32
-// (or QueryFullProcessImageNameW for the exe path).
+/// Windows has no `/proc` and no `KERN_PROCARGS2`. We take a two-tier,
+/// best-effort approach:
+///
+/// 1. **Full command line** via `NtQueryInformationProcess` with the
+///    `ProcessCommandLineInformation` class (Windows 8.1+). This returns
+///    the *exact* command line the process was launched with — the closest
+///    analogue to Linux `/proc/<pid>/cmdline`. The result is a
+///    `UNICODE_STRING` header immediately followed by the UTF-16 buffer it
+///    points at, so we copy the whole blob and read the buffer at its
+///    offset. We use the standard two-call size-probe: the first call
+///    returns `STATUS_INFO_LENGTH_MISMATCH` with the needed length.
+/// 2. **Executable path** via `QueryFullProcessImageNameW` as a fallback
+///    when the NT call is unavailable (pre-8.1) or denied. This loses the
+///    arguments but the full image path is still strictly more useful than
+///    `None` for the liveness / process-identification heuristics this
+///    powers.
+///
+/// Both tiers open the process with only `PROCESS_QUERY_LIMITED_INFORMATION`
+/// (the same minimal right [`process_alive`] uses), so this works against
+/// other users' processes that we'd be allowed to query at all without
+/// needing `PROCESS_VM_READ`. Returns `None` only if the PID can't be opened
+/// or both queries fail.
+///
+/// Limitation: `ProcessCommandLineInformation` is a documented-but-NT
+/// information class — it's stable across all supported Windows releases
+/// (8.1 and up, which covers every target this port runs on) but is not a
+/// kernel32 export, hence the ntdll path. The exe-path fallback keeps the
+/// function useful even where the NT class is refused.
 #[cfg(windows)]
-pub fn process_cmdline(_pid: u32) -> Option<String> {
-    None
+pub fn process_cmdline(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // Safety: every raw pointer below is into a buffer we own and size
+    // ourselves; the handle is always closed before returning.
+    unsafe {
+        let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+
+        let result = query_cmdline_nt(handle).or_else(|| query_image_path(handle));
+
+        CloseHandle(handle);
+        result
+    }
+}
+
+/// Tier 1: full command line via `NtQueryInformationProcess`.
+///
+/// # Safety
+/// `handle` must be a live process handle opened with at least
+/// `PROCESS_QUERY_LIMITED_INFORMATION`.
+#[cfg(windows)]
+unsafe fn query_cmdline_nt(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<String> {
+    use windows_sys::Wdk::System::Threading::{
+        NtQueryInformationProcess, ProcessCommandLineInformation,
+    };
+    use windows_sys::Win32::Foundation::{STATUS_INFO_LENGTH_MISMATCH, UNICODE_STRING};
+
+    // First call: probe the required buffer length. Passing a zero-length
+    // buffer makes ntdll report the size via `ret_len` and return
+    // STATUS_INFO_LENGTH_MISMATCH.
+    let mut needed: u32 = 0;
+    let status = NtQueryInformationProcess(
+        handle,
+        ProcessCommandLineInformation,
+        std::ptr::null_mut(),
+        0,
+        &mut needed,
+    );
+    // Any status other than the length-mismatch sentinel (e.g. invalid info
+    // class on a pre-8.1 kernel, or access denied) means we can't use this
+    // path — let the caller fall back to the image path.
+    if status != STATUS_INFO_LENGTH_MISMATCH || (needed as usize) < std::mem::size_of::<UNICODE_STRING>() {
+        return None;
+    }
+
+    // Allocate a u16-aligned buffer so the trailing UTF-16 command-line text
+    // (which the UNICODE_STRING.Buffer points into) is correctly aligned.
+    let cap_u16 = (needed as usize).div_ceil(std::mem::size_of::<u16>());
+    let mut buf: Vec<u16> = vec![0u16; cap_u16];
+    let byte_cap = (cap_u16 * std::mem::size_of::<u16>()) as u32;
+
+    let mut written: u32 = 0;
+    let status = NtQueryInformationProcess(
+        handle,
+        ProcessCommandLineInformation,
+        buf.as_mut_ptr() as *mut core::ffi::c_void,
+        byte_cap,
+        &mut written,
+    );
+    // NTSTATUS success codes are >= 0 (the sign bit flags errors).
+    if status < 0 {
+        return None;
+    }
+
+    // The blob begins with a UNICODE_STRING whose Buffer points somewhere
+    // inside the same allocation (right after the header). Read the header
+    // by copy to avoid an unaligned struct reference into the u16 buffer.
+    let header = std::ptr::read_unaligned(buf.as_ptr() as *const UNICODE_STRING);
+    let len_bytes = header.Length as usize;
+    if len_bytes == 0 || header.Buffer.is_null() {
+        // Empty command line is possible but useless; treat as "no cmdline"
+        // so the caller falls through to the image path.
+        return None;
+    }
+
+    // `Length` is in bytes; the text is `Length / 2` UTF-16 code units at
+    // `Buffer`. Buffer lies within our own allocation, so reading
+    // `len_bytes` from it is in-bounds.
+    let units = len_bytes / std::mem::size_of::<u16>();
+    let slice = std::slice::from_raw_parts(header.Buffer as *const u16, units);
+    let s = String::from_utf16_lossy(slice);
+    let s = s.trim_end_matches('\0').to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Tier 2 fallback: full executable image path via
+/// `QueryFullProcessImageNameW`. Arguments are lost, but the path alone is
+/// more useful than nothing.
+///
+/// # Safety
+/// `handle` must be a live process handle opened with at least
+/// `PROCESS_QUERY_LIMITED_INFORMATION`.
+#[cfg(windows)]
+unsafe fn query_image_path(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<String> {
+    use windows_sys::Win32::System::Threading::{QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
+
+    // MAX_PATH is a soft limit on Windows; long paths can exceed it, so size
+    // generously and let the call report the actual length back.
+    let mut buf: Vec<u16> = vec![0u16; 4096];
+    let mut size: u32 = buf.len() as u32;
+    let ok = QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut size);
+    if ok == 0 || size == 0 {
+        return None;
+    }
+    // On success `size` is the length in code units, excluding the NUL.
+    let s = String::from_utf16_lossy(&buf[..size as usize]);
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Get the UID of the current process. POSIX `getuid()`.
@@ -228,5 +368,21 @@ mod tests {
     #[test]
     fn cmdline_of_dead_pid() {
         assert!(process_cmdline(u32::MAX).is_none());
+    }
+
+    // Windows-specific: the real implementation must yield a non-empty
+    // string for our own PID, and (whether it came from the NT command-line
+    // class or the QueryFullProcessImageNameW exe-path fallback) it should
+    // reference the running test binary — i.e. contain an `.exe` token.
+    #[cfg(windows)]
+    #[test]
+    fn cmdline_of_current_process_is_nonempty_and_exe_like() {
+        let cmdline = process_cmdline(std::process::id())
+            .expect("own cmdline should be readable on Windows");
+        assert!(!cmdline.trim().is_empty(), "cmdline should not be blank");
+        assert!(
+            cmdline.to_ascii_lowercase().contains(".exe"),
+            "cmdline should reference the test executable, got: {cmdline:?}"
+        );
     }
 }
