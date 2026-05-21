@@ -455,6 +455,37 @@ async fn write_clipboard_image(_mime: &str, data: &[u8]) -> Result<(), String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Platform: Windows (Tier-0 stub)
+// ---------------------------------------------------------------------------
+//
+// Windows clipboard sync isn't wired yet (Tier-1 will use the Win32
+// clipboard API — OpenClipboard / GetClipboardData / SetClipboardData).
+// The monitor calls these four functions unconditionally, so each gets a
+// stub matching the platform signature: reads report "nothing on the
+// clipboard" (`None`), writes report success (`Ok(())`) so a paste request
+// is silently a no-op rather than an error the caller has to special-case.
+
+#[cfg(target_os = "windows")]
+async fn read_clipboard_text() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+async fn read_clipboard_image() -> Option<(String, Vec<u8>)> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+async fn write_clipboard_text(_text: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn write_clipboard_image(_mime: &str, _data: &[u8]) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -13,11 +13,21 @@
 use std::fmt;
 
 pub mod backend;
+// The cert-generation + nginx + distribution machinery depends on OpenSSL
+// (`certs`) and the apt/brew/systemd setup flow, all deferred on Windows
+// (Tier-0). Gated off `cfg(windows)`; `backend` and `state` stay available
+// everywhere because `resolve_host_label` / `routable_local_addrs` (called
+// by the web dashboard, not just `lan setup`) need them.
+#[cfg(not(target_os = "windows"))]
 pub mod cert_server;
+#[cfg(not(target_os = "windows"))]
 pub mod certs;
+#[cfg(not(target_os = "windows"))]
 pub mod instructions;
+#[cfg(not(target_os = "windows"))]
 pub mod nginx_config;
 pub mod state;
+#[cfg(not(target_os = "windows"))]
 pub mod wizard;
 
 /// Resolve the multi-host `HostId` for this machine.
@@ -156,6 +166,9 @@ impl From<std::io::Error> for LanError {
     }
 }
 
+// OpenSSL is gated off Windows (Tier-0), so this conversion only exists on
+// platforms where the `certs` module (its sole user) is compiled.
+#[cfg(not(target_os = "windows"))]
 impl From<openssl::error::ErrorStack> for LanError {
     fn from(e: openssl::error::ErrorStack) -> Self {
         LanError(format!("openssl: {e}"))
@@ -165,6 +178,11 @@ impl From<openssl::error::ErrorStack> for LanError {
 pub type LanResult<T> = Result<T, LanError>;
 
 /// Parsed `intendant lan <action> [flags]` invocation.
+// The `intendant lan` subcommand (arg parsing + setup/recert/remove/list/
+// serve-certs actions) drives the OpenSSL cert machinery, so the whole
+// command surface is gated off Windows. Only the lookup helpers above
+// (`resolve_host_label`, `routable_local_addrs`) remain on Windows.
+#[cfg(not(target_os = "windows"))]
 #[derive(Debug)]
 pub struct LanArgs {
     pub action: LanAction,
@@ -181,6 +199,7 @@ pub struct LanArgs {
     pub no_serve_certs: bool,
 }
 
+#[cfg(not(target_os = "windows"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanAction {
     Setup,
@@ -191,6 +210,7 @@ pub enum LanAction {
     Help,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl Default for LanArgs {
     fn default() -> Self {
         Self {
@@ -207,6 +227,7 @@ impl Default for LanArgs {
 }
 
 /// Top-level entry invoked from `main()` when argv[1] == "lan".
+#[cfg(not(target_os = "windows"))]
 pub async fn run(argv: Vec<String>) -> LanResult<()> {
     let args = parse_args(&argv)?;
     match args.action {
@@ -222,6 +243,7 @@ pub async fn run(argv: Vec<String>) -> LanResult<()> {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn parse_args(argv: &[String]) -> LanResult<LanArgs> {
     let mut args = LanArgs::default();
 
@@ -299,6 +321,7 @@ fn parse_args(argv: &[String]) -> LanResult<LanArgs> {
     Ok(args)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn print_help() {
     println!("Intendant LAN access setup");
     println!();
@@ -327,6 +350,7 @@ fn print_help() {
     println!("    NAT traversal  — Tailscale");
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn cmd_setup(args: LanArgs) -> LanResult<()> {
     let be = backend::select_backend();
     be.require_privileges()?;
@@ -384,6 +408,7 @@ async fn cmd_setup(args: LanArgs) -> LanResult<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn cmd_recert(args: LanArgs) -> LanResult<()> {
     let be = backend::select_backend();
     be.require_privileges()?;
@@ -414,6 +439,7 @@ async fn cmd_recert(args: LanArgs) -> LanResult<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn cmd_remove(_args: LanArgs) -> LanResult<()> {
     let be = backend::select_backend();
     be.require_privileges()?;
@@ -427,6 +453,7 @@ async fn cmd_remove(_args: LanArgs) -> LanResult<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 fn cmd_list(_args: LanArgs) -> LanResult<()> {
     let be = backend::select_backend();
     let cert_dir = be.cert_dir();
@@ -443,6 +470,7 @@ fn cmd_list(_args: LanArgs) -> LanResult<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn cmd_serve_certs(args: LanArgs) -> LanResult<()> {
     let be = backend::select_backend();
     let cert_dir = be.cert_dir();

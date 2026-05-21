@@ -147,16 +147,33 @@ fn build_local_advertised_auth(
         "none" => peer::TransportAuth::None,
         "mutual-tls" => peer::TransportAuth::MutualTls,
         "pin-self-cert" => {
-            let fp = lan::certs::read_server_cert_fingerprint(cert_dir).ok_or_else(|| {
-                CallerError::Config(format!(
-                    "[server.auth] advertised_transport = \"pin-self-cert\" requires \
-                     a local server cert at {}/server.crt — run `intendant lan setup` \
-                     first, or change advertised_transport to \"none\" / \"mutual-tls\"",
-                    cert_dir.display()
-                ))
-            })?;
-            peer::TransportAuth::PinnedMutualTls {
-                server_cert_fingerprints: vec![fp],
+            // `pin-self-cert` reads the local server cert produced by
+            // `intendant lan setup`, whose `certs` module (OpenSSL) is
+            // deferred on Windows (Tier-0). Surface a clean config error
+            // there rather than referencing the gated module.
+            #[cfg(target_os = "windows")]
+            {
+                let _ = cert_dir;
+                return Err(CallerError::Config(
+                    "[server.auth] advertised_transport = \"pin-self-cert\" is not \
+                     supported on Windows yet (the `intendant lan` cert subsystem is \
+                     deferred); use \"none\" or \"mutual-tls\""
+                        .to_string(),
+                ));
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let fp = lan::certs::read_server_cert_fingerprint(cert_dir).ok_or_else(|| {
+                    CallerError::Config(format!(
+                        "[server.auth] advertised_transport = \"pin-self-cert\" requires \
+                         a local server cert at {}/server.crt — run `intendant lan setup` \
+                         first, or change advertised_transport to \"none\" / \"mutual-tls\"",
+                        cert_dir.display()
+                    ))
+                })?;
+                peer::TransportAuth::PinnedMutualTls {
+                    server_cert_fingerprints: vec![fp],
+                }
             }
         }
         other => {
@@ -2908,7 +2925,7 @@ pub(crate) fn query_display_resolution(_display_id: u32) -> (u32, u32) {
 
 /// Query the resolution of an existing X11 display via xdpyinfo.
 /// Returns (width, height) or a default of (1280, 720) if detection fails.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 pub(crate) fn query_display_resolution(display_id: u32) -> (u32, u32) {
     let output = std::process::Command::new("xdpyinfo")
         .arg("-display")
@@ -2931,6 +2948,14 @@ pub(crate) fn query_display_resolution(display_id: u32) -> (u32, u32) {
             }
         }
     }
+    (1280, 720)
+}
+
+/// No X11 / `xdpyinfo` on Windows. Return the same conservative default
+/// the X11 path falls back to; Tier-1's DXGI backend will report the real
+/// resolution via the display enumeration path instead.
+#[cfg(target_os = "windows")]
+pub(crate) fn query_display_resolution(_display_id: u32) -> (u32, u32) {
     (1280, 720)
 }
 
@@ -3071,6 +3096,9 @@ mod tests {
     /// `advertised_transport = "pin-self-cert"` reads the LAN cert
     /// dir, computes the fingerprint, embeds it in PinnedMutualTls.
     /// Uses `lan::certs::ensure_certs` to populate a tempdir.
+    // `lan::certs` (OpenSSL) is gated off Windows, and the pin-self-cert
+    // path errors there, so this test only applies to non-Windows.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn build_local_advertised_auth_pin_self_cert_reads_cert_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3155,6 +3183,9 @@ mod tests {
     /// full defense-in-depth advertise (PinnedMutualTls transport +
     /// Bearer application). The expected configuration for WAN-
     /// exposed daemons that want both wire-layer and app-layer auth.
+    // `lan::certs` (OpenSSL) is gated off Windows, and the pin-self-cert
+    // path errors there, so this test only applies to non-Windows.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn build_local_advertised_auth_full_defense_in_depth() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5012,6 +5043,11 @@ async fn run_agent_loop(
                             }
                         };
 
+                        // Vortex shared-memory probe is POSIX-only
+                        // (`shm_open`). On Windows the Vortex bridge isn't
+                        // available, so the probe is compiled out and the
+                        // code falls through to the regular audio bridge.
+                        #[cfg(unix)]
                         let vortex_shm_available = unsafe {
                             let fd = libc::shm_open(
                                 b"/vortex-audio\0".as_ptr() as *const libc::c_char,
@@ -5025,6 +5061,8 @@ async fn run_agent_loop(
                                 false
                             }
                         };
+                        #[cfg(not(unix))]
+                        let vortex_shm_available = false;
                         let mut bridge = if vortex_shm_available {
                             audio_routing::create_vortex_bridge("shm")
                         } else {
@@ -9303,16 +9341,26 @@ async fn main() -> Result<(), CallerError> {
 
     // Intercept `intendant lan <action>` before the main runtime setup —
     // the lan subcommand is a pure system-setup path with no project,
-    // no .env, no provider selection.
+    // no .env, no provider selection. The subcommand's cert machinery
+    // (OpenSSL + nginx) is deferred on Windows (Tier-0), so there it
+    // reports unsupported and exits rather than calling the gated path.
     if env::args().nth(1).as_deref() == Some("lan") {
-        let argv: Vec<String> = env::args().skip(2).collect();
-        return match lan::run(argv).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        };
+        #[cfg(not(target_os = "windows"))]
+        {
+            let argv: Vec<String> = env::args().skip(2).collect();
+            return match lan::run(argv).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+        }
+        #[cfg(target_os = "windows")]
+        {
+            eprintln!("error: `intendant lan` is not supported on Windows yet");
+            std::process::exit(1);
+        }
     }
 
     // Load .env: cwd (+ parents) first, then project root, then ~/.config/intendant/

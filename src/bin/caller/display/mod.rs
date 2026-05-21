@@ -159,6 +159,15 @@ async fn enumerate_displays_platform() -> Vec<DisplayInfo> {
     Vec::new()
 }
 
+/// No display capture backend exists on Windows yet (Tier-1 will add a
+/// DXGI Desktop Duplication backend). Report no displays so callers
+/// (`list_displays`, the dashboard) gracefully show an empty set rather
+/// than failing.
+#[cfg(target_os = "windows")]
+async fn enumerate_displays_platform() -> Vec<DisplayInfo> {
+    Vec::new()
+}
+
 // ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------

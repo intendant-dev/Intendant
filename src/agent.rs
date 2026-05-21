@@ -1,5 +1,10 @@
 use crate::error::AgentError;
 use crate::models::{AgentInput, Command as AgentCommand, ProcessInfo, ProcessStatus};
+// `MetadataExt` exposes the POSIX `mode`/`uid`/`gid` accessors used by
+// `inspectPath`. They don't exist on Windows metadata, so the import (and
+// the fields it powers) are gated to Unix; the Windows arm of the
+// `inspectPath` result omits those fields.
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
 use std::{
@@ -550,7 +555,8 @@ impl Agent {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        Ok(serde_json::json!({
+        #[cfg(unix)]
+        let result = serde_json::json!({
             "exists": true,
             "path": path_str,
             "type": file_type,
@@ -559,8 +565,18 @@ impl Agent {
             "modified": modified,
             "uid": meta.uid(),
             "gid": meta.gid()
-        })
-        .to_string())
+        });
+        // Windows file metadata has no POSIX mode/uid/gid; omit those fields
+        // (Tier-1 could surface ACL/owner info via the Win32 security APIs).
+        #[cfg(not(unix))]
+        let result = serde_json::json!({
+            "exists": true,
+            "path": path_str,
+            "type": file_type,
+            "size": meta.len(),
+            "modified": modified,
+        });
+        Ok(result.to_string())
     }
 
     async fn exec_pty(&self, cmd: &AgentCommand) -> Result<String, AgentError> {

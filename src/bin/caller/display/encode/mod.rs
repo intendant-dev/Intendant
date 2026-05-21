@@ -522,6 +522,19 @@ fn create_h264_encoder(
     Ok((Box::new(enc), CodecChoice::H264))
 }
 
+/// No H264 encoder backend exists on Windows yet (Tier-1 will add a
+/// Media Foundation / NVENC backend). Returning `Err` lets the codec
+/// selection path fall through exactly as it does when a hardware H264
+/// encoder is unavailable on Linux/macOS.
+#[cfg(target_os = "windows")]
+fn create_h264_encoder(
+    _width: u32,
+    _height: u32,
+    _bitrate_kbps: u32,
+) -> Result<(Box<dyn Encoder>, CodecChoice), String> {
+    Err("H264 encoding is not yet implemented on Windows".to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Color space conversion
 // ---------------------------------------------------------------------------

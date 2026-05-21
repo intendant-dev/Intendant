@@ -743,14 +743,27 @@ pub async fn start_audio_bridge(
     capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
 ) -> Result<AudioStreamBridge, CallerError> {
     if bridge.vortex_socket_path().is_some() {
-        return start_vortex_shm_bridge(
-            session_write,
-            provider,
-            sample_rate,
-            audio_out_rx,
-            capture_tee_tx,
-        )
-        .await;
+        // The Vortex shared-memory bridge is POSIX-only (shm_open/mmap).
+        // On Windows `create_vortex_bridge` is never selected, so this
+        // branch is unreachable in practice; gate it so the Unix-only
+        // helper isn't referenced on Windows.
+        #[cfg(unix)]
+        {
+            return start_vortex_shm_bridge(
+                session_write,
+                provider,
+                sample_rate,
+                audio_out_rx,
+                capture_tee_tx,
+            )
+            .await;
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(CallerError::Agent(
+                "Vortex audio bridge is not supported on this platform".into(),
+            ));
+        }
     }
 
     if let Some(host) = bridge.network_host() {
@@ -803,6 +816,11 @@ const OFF_IN_BUFFER: usize = OFF_OUT_BUFFER + VORTEX_RING_SAMPLES * 4;
 
 /// Direct shared memory bridge: reads/writes the Vortex HAL plugin's ring
 /// buffers without the daemon. No sockets, no IPC, no deadlocks.
+///
+/// POSIX-only: uses `shm_open` + `mmap`. The Vortex HAL plugin is a
+/// macOS/Linux guest-tools component, so this bridge is gated off Windows;
+/// the dispatcher in [`start_audio_bridge`] never routes here on Windows.
+#[cfg(unix)]
 async fn start_vortex_shm_bridge(
     session_write: Arc<Mutex<WsSink>>,
     provider: LiveAudioProvider,
@@ -984,6 +1002,9 @@ async fn start_vortex_shm_bridge(
 /// Vortex audio bridge: listens on a Unix socket for the Vortex guest daemon,
 /// speaks the Vortex wire protocol, and converts between Float32 stereo 48kHz
 /// (daemon) and PCM16 mono 24kHz (model).
+///
+/// Unix-only: binds a `UnixListener`. Gated off Windows for Tier-0.
+#[cfg(unix)]
 async fn start_vortex_audio_bridge(
     session_write: Arc<Mutex<WsSink>>,
     provider: LiveAudioProvider,

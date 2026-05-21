@@ -4054,25 +4054,44 @@ impl IntendantServer {
             use std::io::Write;
             let _ = std::io::stdout().flush();
 
-            // exec() replaces the process image. stdin/stdout fds survive.
-            use std::os::unix::process::CommandExt;
-            let exe = match std::env::current_exe() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("reload failed: cannot determine current exe: {}", e);
-                    return;
-                }
-            };
-            let err = std::process::Command::new(exe)
-                .args(&args[1..])
-                .env("INTENDANT_MCP_RELOAD", "1")
-                .exec();
-            // exec only returns on error
-            eprintln!("reload exec failed: {}", err);
-            std::process::exit(1);
+            // exec() replaces the process image in place (stdin/stdout fds
+            // survive), which is what keeps the MCP stdio connection alive
+            // across the reload. `CommandExt::exec` is Unix-only; on
+            // Windows there is no in-place image replacement, so the
+            // hot-reload is unavailable in Tier-0.
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let exe = match std::env::current_exe() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("reload failed: cannot determine current exe: {}", e);
+                        return;
+                    }
+                };
+                let err = std::process::Command::new(exe)
+                    .args(&args[1..])
+                    .env("INTENDANT_MCP_RELOAD", "1")
+                    .exec();
+                // exec only returns on error
+                eprintln!("reload exec failed: {}", err);
+                std::process::exit(1);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = &args;
+                eprintln!("reload not supported on this platform (exec() is Unix-only)");
+            }
         });
 
-        "ok - reloading in-place (MCP connection preserved)".to_string()
+        #[cfg(unix)]
+        {
+            "ok - reloading in-place (MCP connection preserved)".to_string()
+        }
+        #[cfg(not(unix))]
+        {
+            "error - in-place reload is not supported on this platform".to_string()
+        }
     }
 
     #[tool(description = "Enumerate available displays with their IDs, names, and resolutions.")]
@@ -4357,6 +4376,10 @@ impl IntendantServer {
         };
 
         // Create audio bridge
+        // Vortex shared-memory probe is POSIX-only (`shm_open`). On
+        // Windows the Vortex bridge isn't available, so the probe is
+        // compiled out and we fall through to the regular audio bridge.
+        #[cfg(unix)]
         let vortex_shm_available = unsafe {
             let fd = libc::shm_open(
                 b"/vortex-audio\0".as_ptr() as *const libc::c_char,
@@ -4370,6 +4393,8 @@ impl IntendantServer {
                 false
             }
         };
+        #[cfg(not(unix))]
+        let vortex_shm_available = false;
         let mut bridge = if vortex_shm_available {
             audio_routing::create_vortex_bridge("shm")
         } else {

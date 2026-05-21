@@ -30,6 +30,7 @@ pub fn ensure_tool_paths() {
 ///
 /// Uses POSIX `kill(pid, 0)` which checks process existence without
 /// sending a signal.
+#[cfg(unix)]
 pub fn process_alive(pid: u32) -> bool {
     // pid_t is i32; values > i32::MAX overflow to negative which have
     // special semantics in kill() (e.g. -1 = all processes). Reject them.
@@ -44,6 +45,42 @@ pub fn process_alive(pid: u32) -> bool {
     }
     // EPERM means the process exists but we can't signal it — still alive
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Check whether a process with the given PID is currently running.
+///
+/// Windows has no `kill(pid, 0)` equivalent, so we `OpenProcess` for the
+/// minimal `PROCESS_QUERY_LIMITED_INFORMATION` right and ask for the
+/// exit code: a live process reports `STILL_ACTIVE` (259), an exited one
+/// reports its real code. A failed `OpenProcess` (handle null) means the
+/// PID isn't a process we can see — treated as not alive.
+///
+/// Caveat shared with the POSIX path: a recently-exited PID can be
+/// reused, and the rare process that legitimately exits with code 259 is
+/// indistinguishable from a running one. Both are acceptable for the
+/// liveness heuristics this powers (stale-session / orphan detection).
+#[cfg(windows)]
+pub fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // Safety: OpenProcess with a query-only access right is a read-only
+    // probe; we always close the handle if one was returned.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        // STILL_ACTIVE (259) == process has not exited. If the query
+        // itself failed, fall back to "exists" — the handle opened, so
+        // there is a process there.
+        !ok || code == STILL_ACTIVE as u32
+    }
 }
 
 /// Read the command line of a process by PID.
@@ -130,9 +167,33 @@ pub fn process_cmdline(pid: u32) -> Option<String> {
     }
 }
 
+/// Read the command line of a process by PID.
+///
+/// Windows has no `/proc` and no `KERN_PROCARGS2`; the equivalent is a
+/// Toolhelp32 / `NtQueryInformationProcess` walk. Tier-0 returns `None`
+/// (cmdline simply unavailable) so callers degrade to PID-only.
+// TODO Tier-1: read the cmdline via CreateToolhelp32Snapshot + Process32
+// (or QueryFullProcessImageNameW for the exe path).
+#[cfg(windows)]
+pub fn process_cmdline(_pid: u32) -> Option<String> {
+    None
+}
+
 /// Get the UID of the current process. POSIX `getuid()`.
+#[cfg(unix)]
 pub fn current_uid() -> u32 {
     unsafe { libc::getuid() }
+}
+
+/// Get the UID of the current process.
+///
+/// Windows has no numeric UID model (it uses SIDs). Tier-0 returns 0 —
+/// the only caller is the control-socket peer-credential check, which is
+/// itself `#[cfg(unix)]`-gated, so this value is never compared against a
+/// real peer UID on Windows.
+#[cfg(windows)]
+pub fn current_uid() -> u32 {
+    0
 }
 
 #[cfg(test)]

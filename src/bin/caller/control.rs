@@ -3,7 +3,9 @@ use crate::types::OutboundEvent;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::broadcast;
 
@@ -14,6 +16,13 @@ pub fn socket_path() -> PathBuf {
 
 /// Spawn the Unix control socket server.
 /// Returns a broadcast sender for pushing events to connected clients.
+///
+/// The control socket is a Unix-domain socket (`--control-socket`). On
+/// non-Unix targets (Windows) there is no `UnixListener`, so this is a
+/// no-op: it returns the same `(JoinHandle, Sender)` shape with a task
+/// that exits immediately. A Tier-1 Windows port could back this with a
+/// named pipe or a localhost TCP socket.
+#[cfg(unix)]
 pub fn spawn_control_server(
     bus: EventBus,
 ) -> (tokio::task::JoinHandle<()>, broadcast::Sender<String>) {
@@ -128,6 +137,19 @@ pub fn spawn_control_server(
         }
     });
 
+    (handle, outbound_tx)
+}
+
+/// Non-Unix stub: no Unix-domain control socket. Returns an
+/// immediately-completing task and a live (but unused) broadcast sender
+/// so callers behind `--control-socket` keep the same shape.
+#[cfg(not(unix))]
+pub fn spawn_control_server(
+    _bus: EventBus,
+) -> (tokio::task::JoinHandle<()>, broadcast::Sender<String>) {
+    let (outbound_tx, _) = broadcast::channel::<String>(256);
+    eprintln!("Control socket is not available on this platform (Unix-only)");
+    let handle = tokio::spawn(async {});
     (handle, outbound_tx)
 }
 
