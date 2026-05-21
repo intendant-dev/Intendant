@@ -1550,6 +1550,104 @@ fn external_session_context_by_id(
     out
 }
 
+fn session_value_matches_external_id(session: &serde_json::Value, external_id: &str) -> bool {
+    ["session_id", "resume_id", "backend_session_id"]
+        .into_iter()
+        .any(|key| session.get(key).and_then(|v| v.as_str()) == Some(external_id))
+}
+
+fn external_session_row_matches(
+    session: &serde_json::Value,
+    source: &str,
+    external_id: &str,
+) -> bool {
+    let source = crate::session_names::normalize_source(source);
+    if !session_value_matches_external_id(session, external_id) {
+        return false;
+    }
+    let row_source = session
+        .get("source")
+        .and_then(|v| v.as_str())
+        .map(crate::session_names::normalize_source);
+    let row_backend_source = session
+        .get("backend_source")
+        .and_then(|v| v.as_str())
+        .map(crate::session_names::normalize_source);
+    row_source.as_deref() == Some(source.as_str())
+        || row_backend_source.as_deref() == Some(source.as_str())
+}
+
+fn merge_intendant_wrapper_into_external_session(
+    external: &mut serde_json::Value,
+    wrapper: &serde_json::Value,
+) {
+    let Some(obj) = external.as_object_mut() else {
+        return;
+    };
+    let Some(wrapper_obj) = wrapper.as_object() else {
+        return;
+    };
+
+    for (target_key, wrapper_key) in [
+        ("intendant_session_id", "session_id"),
+        ("intendant_session_path", "path"),
+        ("backend_source", "backend_source"),
+        ("backend_source_label", "backend_source_label"),
+        ("backend_session_id", "backend_session_id"),
+    ] {
+        if let Some(value) = wrapper_obj.get(wrapper_key) {
+            obj.insert(target_key.to_string(), value.clone());
+        }
+    }
+
+    for key in ["name", "task", "project_root", "cwd", "provider", "model"] {
+        let current_is_empty = obj
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::is_empty)
+            .unwrap_or(true);
+        if current_is_empty {
+            if let Some(value) = wrapper_obj.get(key).filter(|v| !v.is_null()) {
+                obj.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+
+    for key in [
+        "recordings",
+        "recording_bytes",
+        "annotations",
+        "clips",
+        "frames_bytes",
+        "turns_bytes",
+        "logs_bytes",
+        "total_bytes",
+    ] {
+        if let Some(value) = wrapper_obj.get(key) {
+            obj.insert(format!("intendant_{key}"), value.clone());
+        }
+    }
+    if let Some(value) = wrapper_obj.get("status") {
+        obj.insert("intendant_status".to_string(), value.clone());
+    }
+    obj.insert(
+        "can_delete_intendant_log".to_string(),
+        serde_json::json!(true),
+    );
+
+    if let (Some(current), Some(wrapper_updated)) = (
+        obj.get("updated_at").and_then(|v| v.as_str()),
+        wrapper_obj.get("updated_at").and_then(|v| v.as_str()),
+    ) {
+        if timestamp_sort_secs(wrapper_updated) > timestamp_sort_secs(current) {
+            obj.insert(
+                "updated_at".to_string(),
+                serde_json::Value::String(wrapper_updated.to_string()),
+            );
+        }
+    }
+}
+
 fn external_agent_thread_id_from_message(message: &str) -> Option<String> {
     if let Some(thread_id) = message.strip_prefix("External agent thread: ") {
         return clean_external_thread_id(thread_id);
@@ -4312,14 +4410,14 @@ fn list_sessions_from_home(home_path: &Path) -> String {
         let updated_at =
             mtime_secs_to_string(updated_at_secs).unwrap_or_else(|| created_at.clone());
 
-        sessions.push(serde_json::json!({
+        let wrapper_session = serde_json::json!({
             "source": "intendant",
             "source_label": "Intendant",
-            "session_id": session_id,
-            "resume_id": session_id,
-            "backend_source": external_source,
+            "session_id": session_id.clone(),
+            "resume_id": session_id.clone(),
+            "backend_source": external_source.clone(),
             "backend_source_label": backend_source_label,
-            "backend_session_id": external_resume_id,
+            "backend_session_id": external_resume_id.clone(),
             "created_at": created_at,
             "updated_at": updated_at,
             "name": name,
@@ -4344,12 +4442,32 @@ fn list_sessions_from_home(home_path: &Path) -> String {
             "turns_bytes": turns_bytes,
             "logs_bytes": logs_bytes,
             "total_bytes": total_bytes,
-            "cwd": cwd.or_else(|| project_root.clone()),
-            "project_root": project_root,
+            "cwd": cwd.clone().or_else(|| project_root.clone()),
+            "project_root": project_root.clone(),
             "path": dir.to_string_lossy().to_string(),
             "can_delete": true,
             "can_resume": true,
-        }));
+        });
+
+        let merged_into_external = external_source
+            .as_deref()
+            .zip(external_resume_id.as_deref())
+            .filter(|(source, external_id)| {
+                crate::external_agent::source_session_id_is_canonical(source, external_id)
+            })
+            .and_then(|(source, external_id)| {
+                external_sessions
+                    .iter_mut()
+                    .find(|session| external_session_row_matches(session, source, external_id))
+            })
+            .map(|external| {
+                merge_intendant_wrapper_into_external_session(external, &wrapper_session);
+            })
+            .is_some();
+
+        if !merged_into_external {
+            sessions.push(wrapper_session);
+        }
     }
 
     sessions.extend(external_sessions);
@@ -13090,13 +13208,20 @@ mod tests {
 
         let sessions: Vec<serde_json::Value> =
             serde_json::from_str(&list_sessions_from_home(home.path())).unwrap();
+        assert!(
+            sessions.iter().all(|s| {
+                !(s.get("source").and_then(|v| v.as_str()) == Some("intendant")
+                    && s.get("session_id").and_then(|v| v.as_str()) == Some(intendant_id))
+            }),
+            "intendant wrapper should be merged into the native external session row"
+        );
         let wrapped = sessions
             .iter()
             .find(|s| {
-                s.get("source").and_then(|v| v.as_str()) == Some("intendant")
-                    && s.get("session_id").and_then(|v| v.as_str()) == Some(intendant_id)
+                s.get("source").and_then(|v| v.as_str()) == Some("codex")
+                    && s.get("session_id").and_then(|v| v.as_str()) == Some(codex_id)
             })
-            .expect("intendant wrapper session should be listed");
+            .expect("native Codex session should be listed");
         let expected_project_root = repo.to_string_lossy().to_string();
         let expected_cwd = command_cwd.to_string_lossy().to_string();
         assert_eq!(
@@ -13118,6 +13243,10 @@ mod tests {
         assert_eq!(
             wrapped.get("backend_session_id").and_then(|v| v.as_str()),
             Some(codex_id)
+        );
+        assert_eq!(
+            wrapped.get("intendant_session_id").and_then(|v| v.as_str()),
+            Some(intendant_id)
         );
     }
 

@@ -37,6 +37,7 @@ pub struct SessionSupervisor {
 #[derive(Default)]
 struct SupervisorState {
     sessions: HashMap<String, ManagedSession>,
+    session_aliases: HashMap<String, String>,
     active_session_id: Option<String>,
 }
 
@@ -47,6 +48,46 @@ struct ManagedSession {
     session_dir: PathBuf,
     follow_up_tx: mpsc::Sender<FollowUpMessage>,
     approval_registry: event::ApprovalRegistry,
+}
+
+impl SupervisorState {
+    fn resolve_session_id(&self, session_id: &str) -> Option<String> {
+        if self.sessions.contains_key(session_id) {
+            return Some(session_id.to_string());
+        }
+
+        let mut current = session_id;
+        for _ in 0..8 {
+            let Some(next) = self.session_aliases.get(current) else {
+                return None;
+            };
+            if self.sessions.contains_key(next) {
+                return Some(next.clone());
+            }
+            if next == current {
+                return None;
+            }
+            current = next;
+        }
+        None
+    }
+
+    fn session_is_managed(&self, session_id: &str) -> bool {
+        self.resolve_session_id(session_id).is_some()
+    }
+
+    fn remove_session(&mut self, session_id: &str) -> Option<(String, ManagedSession)> {
+        let canonical = self.resolve_session_id(session_id)?;
+        let removed = self.sessions.remove(&canonical)?;
+        self.session_aliases
+            .retain(|alias, target| alias != &canonical && target != &canonical);
+        if self.active_session_id.as_deref() == Some(&canonical)
+            || self.active_session_id.as_deref() == Some(session_id)
+        {
+            self.active_session_id = self.sessions.keys().next().cloned();
+        }
+        Some((canonical, removed))
+    }
 }
 
 impl SessionSupervisor {
@@ -65,6 +106,14 @@ impl SessionSupervisor {
                     Ok(AppEvent::ControlCommand(msg)) => {
                         self.handle_control_msg(msg).await;
                     }
+                    Ok(AppEvent::SessionIdentity {
+                        session_id,
+                        source,
+                        backend_session_id,
+                    }) => {
+                        self.apply_session_identity(session_id, source, backend_session_id)
+                            .await;
+                    }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -82,6 +131,14 @@ impl SessionSupervisor {
                         if self.should_handle_session_control(&msg).await {
                             self.handle_control_msg(msg).await;
                         }
+                    }
+                    Ok(AppEvent::SessionIdentity {
+                        session_id,
+                        source,
+                        backend_session_id,
+                    }) => {
+                        self.apply_session_identity(session_id, source, backend_session_id)
+                            .await;
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -305,10 +362,6 @@ impl SessionSupervisor {
 
         write_session_meta(&session_log, &project.root, Some(&task));
         self.activate_shared_session(session_log.clone()).await;
-        self.config.bus.send(AppEvent::SessionStarted {
-            session_id: session_id.clone(),
-            task: Some(task.clone()),
-        });
 
         if !reference_frame_ids.is_empty() {
             if self
@@ -323,6 +376,10 @@ impl SessionSupervisor {
                 )
                 .await
             {
+                self.config.bus.send(AppEvent::SessionStarted {
+                    session_id: session_id.clone(),
+                    task: Some(task.clone()),
+                });
                 return;
             }
         }
@@ -367,6 +424,14 @@ impl SessionSupervisor {
             .map(|b| b.as_short_str().to_string())
             .unwrap_or_else(|| "intendant".to_string());
 
+        let emit_session_started_after_identity = backend.is_some();
+        if !emit_session_started_after_identity {
+            self.config.bus.send(AppEvent::SessionStarted {
+                session_id: session_id.clone(),
+                task: Some(task.clone()),
+            });
+        }
+
         emit_task_dispatched_log(&self.config.bus, &session_log, &task, attachments.len());
         self.spawn_agent_session(
             session_id,
@@ -379,6 +444,7 @@ impl SessionSupervisor {
             use_direct,
             attachments_for_agent,
             None,
+            emit_session_started_after_identity,
         )
         .await;
     }
@@ -477,6 +543,7 @@ impl SessionSupervisor {
                     direct.unwrap_or(true),
                     UserAttachments::default(),
                     Some(resume_token.clone()),
+                    false,
                 )
                 .await;
                 self.emit_attached_status(&resume_token, &source_norm).await;
@@ -551,6 +618,7 @@ impl SessionSupervisor {
             direct.unwrap_or(true),
             UserAttachments::default(),
             Some(resume_token),
+            false,
         )
         .await;
     }
@@ -570,6 +638,11 @@ impl SessionSupervisor {
                     && (session.session_id == session_id || session.session_id == resume_token)
             })
             .map(|session| session.session_id.clone())
+            .or_else(|| {
+                state
+                    .resolve_session_id(session_id)
+                    .or_else(|| state.resolve_session_id(resume_token))
+            })
     }
 
     async fn spawn_agent_session(
@@ -584,6 +657,7 @@ impl SessionSupervisor {
         use_direct: bool,
         attachments: UserAttachments,
         resume_token: Option<String>,
+        emit_session_started_after_identity: bool,
     ) {
         let (follow_up_tx, follow_up_rx) = mpsc::channel::<FollowUpMessage>(16);
         let approval_registry = event::ApprovalRegistry::default();
@@ -621,6 +695,7 @@ impl SessionSupervisor {
                     attachments,
                     resume_token,
                     Some(session_id.clone()),
+                    emit_session_started_after_identity,
                 )
                 .await
             } else {
@@ -763,12 +838,15 @@ impl SessionSupervisor {
     ) {
         let (target_id, entry) = {
             let state = self.state.lock().await;
-            let target_id = session_id.or_else(|| state.active_session_id.clone());
-            let Some(target_id) = target_id else {
+            let requested_id = session_id.or_else(|| state.active_session_id.clone());
+            let Some(requested_id) = requested_id else {
                 drop(state);
                 self.warn("FollowUp dropped: no active managed session");
                 return;
             };
+            let target_id = state
+                .resolve_session_id(&requested_id)
+                .unwrap_or_else(|| requested_id.clone());
             let entry = state.sessions.get(&target_id).map(|s| {
                 (
                     s.session_id.clone(),
@@ -867,12 +945,15 @@ impl SessionSupervisor {
     ) {
         let (target_id, entry) = {
             let state = self.state.lock().await;
-            let target_id = session_id.or_else(|| state.active_session_id.clone());
-            let Some(target_id) = target_id else {
+            let requested_id = session_id.or_else(|| state.active_session_id.clone());
+            let Some(requested_id) = requested_id else {
                 drop(state);
                 self.warn("Edit dropped: no active managed session");
                 return;
             };
+            let target_id = state
+                .resolve_session_id(&requested_id)
+                .unwrap_or_else(|| requested_id.clone());
             let entry = state.sessions.get(&target_id).map(|s| {
                 (
                     s.session_id.clone(),
@@ -971,6 +1052,9 @@ impl SessionSupervisor {
         };
         let entry = {
             let state = self.state.lock().await;
+            let target_id = state
+                .resolve_session_id(&target_id)
+                .unwrap_or_else(|| target_id.clone());
             state.sessions.get(&target_id).map(|s| {
                 (
                     s.session_id.clone(),
@@ -1049,6 +1133,9 @@ impl SessionSupervisor {
         };
         let registry = {
             let state = self.state.lock().await;
+            let target_id = state
+                .resolve_session_id(&target_id)
+                .unwrap_or_else(|| target_id.clone());
             state
                 .sessions
                 .get(&target_id)
@@ -1090,9 +1177,12 @@ impl SessionSupervisor {
     ) {
         let managed = {
             let state = self.state.lock().await;
+            let resolved_id = state
+                .resolve_session_id(&session_id)
+                .unwrap_or_else(|| session_id.clone());
             state
                 .sessions
-                .get(&session_id)
+                .get(&resolved_id)
                 .map(|session| (session.session_id.clone(), session.source.clone()))
         };
 
@@ -1151,14 +1241,71 @@ impl SessionSupervisor {
         }
     }
 
+    async fn apply_session_identity(
+        &self,
+        session_id: String,
+        source: String,
+        backend_session_id: String,
+    ) {
+        let source = crate::session_names::normalize_source(&source);
+        if !external_agent::source_session_id_is_canonical(&source, &backend_session_id) {
+            return;
+        }
+        if session_id == backend_session_id {
+            return;
+        }
+
+        let mut state = self.state.lock().await;
+        let Some(current_key) = state.resolve_session_id(&session_id) else {
+            return;
+        };
+        if current_key == backend_session_id {
+            state
+                .session_aliases
+                .insert(session_id, backend_session_id.clone());
+            return;
+        }
+        if state.sessions.contains_key(&backend_session_id) {
+            state
+                .session_aliases
+                .insert(session_id.clone(), backend_session_id.clone());
+            state
+                .session_aliases
+                .insert(current_key, backend_session_id.clone());
+            if state.active_session_id.as_deref() == Some(&session_id) {
+                state.active_session_id = Some(backend_session_id);
+            }
+            return;
+        }
+
+        let Some(mut session) = state.sessions.remove(&current_key) else {
+            return;
+        };
+        session.session_id = backend_session_id.clone();
+        session.source = source;
+        state.sessions.insert(backend_session_id.clone(), session);
+        state
+            .session_aliases
+            .insert(session_id.clone(), backend_session_id.clone());
+        state
+            .session_aliases
+            .insert(current_key.clone(), backend_session_id.clone());
+        if state.active_session_id.as_deref() == Some(&session_id)
+            || state.active_session_id.as_deref() == Some(&current_key)
+        {
+            state.active_session_id = Some(backend_session_id);
+        }
+    }
+
     async fn resolve_target_session_id(&self, session_id: Option<String>) -> Option<String> {
         let state = self.state.lock().await;
-        session_id.or_else(|| state.active_session_id.clone())
+        let requested = session_id.or_else(|| state.active_session_id.clone())?;
+        Some(state.resolve_session_id(&requested).unwrap_or(requested))
     }
 
     async fn session_is_managed(&self, session_id: &str) -> bool {
         let state = self.state.lock().await;
-        state.sessions.contains_key(session_id)
+        state.session_is_managed(session_id)
     }
 
     async fn register_session(
@@ -1172,6 +1319,7 @@ impl SessionSupervisor {
     ) {
         let mut state = self.state.lock().await;
         state.active_session_id = Some(session_id.clone());
+        state.session_aliases.remove(&session_id);
         state.sessions.insert(
             session_id.clone(),
             ManagedSession {
@@ -1212,18 +1360,18 @@ impl SessionSupervisor {
             }
         };
 
+        let ended_session_id = {
+            let mut state = self.state.lock().await;
+            state
+                .remove_session(&session_id)
+                .map(|(canonical, _)| canonical)
+                .unwrap_or_else(|| session_id.clone())
+        };
+
         self.config.bus.send(AppEvent::SessionEnded {
-            session_id: session_id.clone(),
+            session_id: ended_session_id.clone(),
             reason,
         });
-
-        {
-            let mut state = self.state.lock().await;
-            state.sessions.remove(&session_id);
-            if state.active_session_id.as_deref() == Some(&session_id) {
-                state.active_session_id = state.sessions.keys().next().cloned();
-            }
-        }
 
         if let Some(ref shared_session) = self.config.shared_session {
             let mut state = shared_session.write().await;
@@ -1231,13 +1379,10 @@ impl SessionSupervisor {
                 .session_log
                 .as_ref()
                 .map(|log| {
+                    let log_session_id = log.lock().ok().map(|log| log.session_id().to_string());
                     Arc::ptr_eq(log, &session_log)
-                        || log
-                            .lock()
-                            .ok()
-                            .map(|log| log.session_id().to_string())
-                            .as_deref()
-                            == Some(&session_id)
+                        || log_session_id.as_deref() == Some(&session_id)
+                        || log_session_id.as_deref() == Some(&ended_session_id)
                 })
                 .unwrap_or(false);
             if matches_current {
@@ -1556,10 +1701,45 @@ fn short_text(text: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn managed_session(id: &str, source: &str) -> ManagedSession {
+        let (tx, _rx) = mpsc::channel(1);
+        ManagedSession {
+            session_id: id.to_string(),
+            source: source.to_string(),
+            project_root: PathBuf::from("/tmp/project"),
+            session_dir: PathBuf::from("/tmp/session"),
+            follow_up_tx: tx,
+            approval_registry: event::ApprovalRegistry::default(),
+        }
+    }
+
     fn slash(text: &str) -> CodexSlashCommand {
         parse_codex_slash_command(text)
             .expect("recognized slash command")
             .expect("valid slash command")
+    }
+
+    #[test]
+    fn supervisor_state_resolves_and_removes_session_aliases() {
+        let mut state = SupervisorState::default();
+        state
+            .sessions
+            .insert("backend".to_string(), managed_session("backend", "codex"));
+        state
+            .session_aliases
+            .insert("wrapper".to_string(), "backend".to_string());
+        state.active_session_id = Some("backend".to_string());
+
+        assert_eq!(
+            state.resolve_session_id("wrapper").as_deref(),
+            Some("backend")
+        );
+        assert!(state.session_is_managed("wrapper"));
+
+        let removed = state.remove_session("wrapper");
+        assert!(removed.is_some());
+        assert!(!state.session_is_managed("wrapper"));
+        assert!(!state.session_is_managed("backend"));
     }
 
     #[test]

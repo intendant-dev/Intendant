@@ -101,6 +101,20 @@ fn event_targets_session(target: &Option<String>, session_id: &Option<String>) -
     }
 }
 
+fn event_targets_session_or_alias(
+    target: &Option<String>,
+    session_id: &Option<String>,
+    alias_session_id: &Option<String>,
+) -> bool {
+    match target {
+        Some(target) => {
+            session_id.as_deref() == Some(target.as_str())
+                || alias_session_id.as_deref() == Some(target.as_str())
+        }
+        None => true,
+    }
+}
+
 /// Build the [`peer::AuthRequirements`] this daemon advertises in
 /// its own Agent Card from the project's `[server.auth]` config and
 /// the LAN cert dir.
@@ -702,6 +716,7 @@ async fn create_external_agent(
 struct DrainConfig<'a> {
     bus: &'a EventBus,
     session_id: Option<String>,
+    alias_session_id: Option<String>,
     autonomy: SharedAutonomy,
     session_log: &'a SharedSessionLog,
     project_root: &'a Path,
@@ -1051,6 +1066,7 @@ async fn drain_external_agent_events(
     let approval_counter = std::sync::atomic::AtomicU64::new(1);
     let mut turns_in_round = 0usize;
     let local_session_id = config.session_id.clone();
+    let alias_session_id = config.alias_session_id.clone();
     // Track whether we've been asked to interrupt this drain cycle. When the
     // agent finally emits TurnCompleted / Terminated we convert that into a
     // DrainOutcome::Interrupted + Interrupted event so the caller can choose
@@ -1086,11 +1102,16 @@ async fn drain_external_agent_events(
         let mut watcher_rx = config.bus.subscribe();
         let registry = config.approval_registry.clone();
         let watcher_session_id = local_session_id.clone();
+        let watcher_alias_session_id = alias_session_id.clone();
         tokio::spawn(async move {
             loop {
                 match watcher_rx.recv().await {
                     Ok(AppEvent::InterruptRequested { session_id })
-                        if event_targets_session(&session_id, &watcher_session_id) =>
+                        if event_targets_session_or_alias(
+                            &session_id,
+                            &watcher_session_id,
+                            &watcher_alias_session_id,
+                        ) =>
                     {
                         let pending: Vec<_> = {
                             let mut reg = registry.lock().unwrap();
@@ -1131,7 +1152,11 @@ async fn drain_external_agent_events(
             bus_event = bus_rx.recv() => {
                 match bus_event {
                     Ok(AppEvent::InterruptRequested { session_id })
-                        if event_targets_session(&session_id, &local_session_id) =>
+                        if event_targets_session_or_alias(
+                            &session_id,
+                            &local_session_id,
+                            &alias_session_id,
+                        ) =>
                     {
                         interrupt_pending = true;
                         // Approval registry is drained by the background
@@ -1172,7 +1197,11 @@ async fn drain_external_agent_events(
                         session_id,
                         text,
                         id,
-                    }) if event_targets_session(&session_id, &local_session_id) => {
+                    }) if event_targets_session_or_alias(
+                        &session_id,
+                        &local_session_id,
+                        &alias_session_id,
+                    ) => {
                         // Try native mid-turn steering first. On success the
                         // backend injects the text into the active turn and
                         // we're done. On failure (unsupported or no active
@@ -1220,7 +1249,11 @@ async fn drain_external_agent_events(
                         session_id,
                         action,
                         params,
-                    }) if event_targets_session(&session_id, &local_session_id) => {
+                    }) if event_targets_session_or_alias(
+                        &session_id,
+                        &local_session_id,
+                        &alias_session_id,
+                    ) => {
                         handle_external_thread_action(agent, action, params, config).await;
                         continue;
                     }
@@ -6972,6 +7005,7 @@ async fn run_with_presence(
             let drain_config = DrainConfig {
                 bus: &bus,
                 session_id: session_log_id(&session_log),
+                alias_session_id: None,
                 autonomy: autonomy.clone(),
                 session_log: &session_log,
                 project_root: &project.root,
@@ -7631,6 +7665,7 @@ async fn run_external_agent_mode(
     attachments: UserAttachments,
     resume_session: Option<String>,
     control_session_id: Option<String>,
+    emit_session_started_after_identity: bool,
 ) -> Result<LoopStats, CallerError> {
     slog(&session_log, |l| {
         l.info(&format!("Mode: external agent ({})", backend));
@@ -7647,22 +7682,59 @@ async fn run_external_agent_mode(
 
     // Construct, initialize, and start a thread for the external agent
     let resumed_external_session = resume_session.clone();
-    let live_session_id = control_session_id.or_else(|| session_log_id(&session_log));
+    let intendant_session_id = control_session_id.or_else(|| session_log_id(&session_log));
     let (mut agent, thread, mut event_rx) =
-        create_external_agent(&backend, &project, &session_log, web_port, resume_session).await?;
-    if let Some(session_id) = live_session_id.clone() {
+        match create_external_agent(&backend, &project, &session_log, web_port, resume_session)
+            .await
+        {
+            Ok(started) => started,
+            Err(e) => {
+                if emit_session_started_after_identity {
+                    if let Some(session_id) = intendant_session_id.clone() {
+                        bus.send(AppEvent::SessionStarted {
+                            session_id,
+                            task: if task.trim().is_empty() {
+                                None
+                            } else {
+                                Some(task.clone())
+                            },
+                        });
+                    }
+                }
+                return Err(e);
+            }
+        };
+    let backend_session_id = thread.thread_id.clone();
+    let live_session_id = if backend.thread_id_is_canonical(&backend_session_id) {
+        Some(backend_session_id.clone())
+    } else {
+        intendant_session_id.clone()
+    };
+    if let Some(session_id) = intendant_session_id.clone() {
         bus.send(AppEvent::SessionIdentity {
             session_id,
             source: backend.as_short_str().to_string(),
-            backend_session_id: thread.thread_id.clone(),
+            backend_session_id: backend_session_id.clone(),
         });
+    }
+    if emit_session_started_after_identity {
+        if let Some(session_id) = live_session_id.clone() {
+            bus.send(AppEvent::SessionStarted {
+                session_id,
+                task: if task.trim().is_empty() {
+                    None
+                } else {
+                    Some(task.clone())
+                },
+            });
+        }
     }
 
     // Event loop
     let mut round = match (
         &backend,
         resumed_external_session.as_deref(),
-        thread.thread_id.as_str(),
+        backend_session_id.as_str(),
     ) {
         (external_agent::AgentBackend::Codex, Some(_), session_id) => {
             count_codex_user_turns_from_history(session_id).unwrap_or(0) as usize
@@ -7679,6 +7751,11 @@ async fn run_external_agent_mode(
     let drain_config = DrainConfig {
         bus: &bus,
         session_id: live_session_id.clone(),
+        alias_session_id: if intendant_session_id != live_session_id {
+            intendant_session_id.clone()
+        } else {
+            None
+        },
         autonomy: autonomy.clone(),
         session_log: &session_log,
         project_root: &project.root,
@@ -7724,7 +7801,11 @@ async fn run_external_agent_mode(
                                 session_id,
                                 action,
                                 params,
-                            }) if event_targets_session(&session_id, &live_session_id) => {
+                            }) if event_targets_session_or_alias(
+                                &session_id,
+                                &live_session_id,
+                                &drain_config.alias_session_id,
+                            ) => {
                                 handle_external_thread_action(
                                     &mut agent,
                                     action,
@@ -7735,7 +7816,11 @@ async fn run_external_agent_mode(
                                 turn_bus_rx = bus.subscribe();
                             }
                             Ok(AppEvent::InterruptRequested { session_id })
-                                if event_targets_session(&session_id, &live_session_id) =>
+                                if event_targets_session_or_alias(
+                                    &session_id,
+                                    &live_session_id,
+                                    &drain_config.alias_session_id,
+                                ) =>
                             {
                                 // Ignore idle interrupts and reset the turn
                                 // receiver so the next task does not inherit
@@ -9963,6 +10048,7 @@ async fn main() -> Result<(), CallerError> {
                             UserAttachments::default(),
                             None,
                             None,
+                            false,
                         )
                         .await
                     } else if use_orchestration {
@@ -10647,6 +10733,7 @@ async fn main() -> Result<(), CallerError> {
                         UserAttachments::default(),
                         None,
                         None,
+                        false,
                     )
                     .await
                 } else {
@@ -11097,6 +11184,7 @@ async fn main() -> Result<(), CallerError> {
                 UserAttachments::default(),
                 None,
                 None,
+                false,
             )
             .await
         } else {
