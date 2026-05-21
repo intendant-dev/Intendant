@@ -5,23 +5,33 @@
 //! LAN clients (phones, tablets, other boxes) can reach the dashboard
 //! over HTTPS authenticated by a client certificate.
 //!
-//! Shared across platforms: cert generation (openssl), nginx config
-//! rendering, client cert distribution, import instructions. Platform
-//! differences (apt vs brew, systemd vs launchd, cert dir location) are
-//! isolated behind the `LanBackend` trait.
+//! Shared across platforms: cert generation (pure-Rust rcgen +
+//! p12-keystore), nginx config rendering, client cert distribution, import
+//! instructions. Platform differences (apt vs brew, systemd vs launchd, cert
+//! dir location) are isolated behind the `LanBackend` trait.
 
 use std::fmt;
 
 pub mod backend;
-// The cert-generation + nginx + distribution machinery depends on OpenSSL
-// (`certs`) and the apt/brew/systemd setup flow, all deferred on Windows
-// (Tier-0). Gated off `cfg(windows)`; `backend` and `state` stay available
-// everywhere because `resolve_host_label` / `routable_local_addrs` (called
-// by the web dashboard, not just `lan setup`) need them.
+// `certs` is pure-Rust (rcgen + p12-keystore) and compiles on every
+// platform, so it stays ungated — `read_server_cert_fingerprint` backs the
+// `pin-self-cert` transport, which doesn't need the nginx flow.
+//
+// The nginx + distribution machinery (`cert_server`, `instructions`,
+// `nginx_config`, `wizard`) and the apt/brew/systemd setup flow are still
+// deferred on Windows (Tier-0): they depend on nginx + apt/brew +
+// systemd/launchd, none of which apply. `backend` and `state` stay available
+// everywhere because `resolve_host_label` / `routable_local_addrs` (called by
+// the web dashboard, not just `lan setup`) need them.
+//
+// On Windows only `certs::read_server_cert_fingerprint` is reachable; the
+// cert/p12 *generation* functions are exercised solely by the still-deferred
+// `lan setup` nginx flow, so they compile-but-are-unused there. Silence those
+// dead-code warnings on Windows; every item is live on macOS/Linux.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+pub mod certs;
 #[cfg(not(target_os = "windows"))]
 pub mod cert_server;
-#[cfg(not(target_os = "windows"))]
-pub mod certs;
 #[cfg(not(target_os = "windows"))]
 pub mod instructions;
 #[cfg(not(target_os = "windows"))]
@@ -197,12 +207,11 @@ impl From<std::io::Error> for LanError {
     }
 }
 
-// OpenSSL is gated off Windows (Tier-0), so this conversion only exists on
-// platforms where the `certs` module (its sole user) is compiled.
-#[cfg(not(target_os = "windows"))]
-impl From<openssl::error::ErrorStack> for LanError {
-    fn from(e: openssl::error::ErrorStack) -> Self {
-        LanError(format!("openssl: {e}"))
+// `certs` (rcgen-based, pure-Rust) uses `?` on `rcgen::Error`; surface it as
+// a LanError. Available on all platforms, like the `certs` module itself.
+impl From<rcgen::Error> for LanError {
+    fn from(e: rcgen::Error) -> Self {
+        LanError(format!("rcgen: {e}"))
     }
 }
 
