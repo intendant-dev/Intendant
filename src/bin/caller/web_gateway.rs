@@ -2511,6 +2511,15 @@ fn compact_text(s: &str, max: usize) -> String {
     }
 }
 
+fn preview_text(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let mut out: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
 fn message_content_text(content: &serde_json::Value) -> Option<String> {
     match content {
         serde_json::Value::String(s) => Some(s.clone()),
@@ -8073,11 +8082,7 @@ pub fn spawn_web_gateway(
                                             let args_preview = {
                                                 let s = serde_json::to_string(&args)
                                                     .unwrap_or_default();
-                                                if s.len() > 200 {
-                                                    format!("{}...", &s[..200])
-                                                } else {
-                                                    s
-                                                }
+                                                preview_text(&s, 200)
                                             };
                                             bus_inbound.send(AppEvent::PresenceLog {
                                                 message: format!(
@@ -8181,11 +8186,8 @@ pub fn spawn_web_gateway(
                                                 };
 
                                             // Log the tool response at Debug level
-                                            let result_preview = if query_result.text.len() > 200 {
-                                                format!("{}...", &query_result.text[..200])
-                                            } else {
-                                                query_result.text.clone()
-                                            };
+                                            let result_preview =
+                                                preview_text(&query_result.text, 200);
                                             bus_inbound.send(AppEvent::PresenceLog {
                                                 message: format!(
                                                     "[tool_response] {} → {}",
@@ -8264,11 +8266,8 @@ pub fn spawn_web_gateway(
                                                 )
                                             };
 
-                                            let result_preview = if query_result.text.len() > 200 {
-                                                format!("{}...", &query_result.text[..200])
-                                            } else {
-                                                query_result.text.clone()
-                                            };
+                                            let result_preview =
+                                                preview_text(&query_result.text, 200);
                                             bus_inbound.send(AppEvent::PresenceLog {
                                                 message: format!(
                                                     "[async_query_result] {} → {}",
@@ -8893,7 +8892,7 @@ pub fn spawn_web_gateway(
                                                                     ..
                                                                 } => format!(
                                                                     "StartTask({})",
-                                                                    &task[..task.len().min(60)]
+                                                                    preview_text(task, 60)
                                                                 ),
                                                                 other => format!("{:?}", other),
                                                             }
@@ -12955,6 +12954,21 @@ mod tests {
     fn initial_body_bytes_rejects_incomplete_headers() {
         let request = b"POST /api/session/current/uploads HTTP/1.1\r\nContent-Length: 4\r\n";
         assert!(initial_body_bytes(request).is_err());
+    }
+
+    #[test]
+    fn preview_text_truncates_on_char_boundary() {
+        let text = "Wait, the `CONCURRENT AGENTS (n)` indicator is at the top — where";
+
+        assert_eq!(
+            preview_text(text, 60),
+            "Wait, the `CONCURRENT AGENTS (n)` indicator is at the top — ..."
+        );
+    }
+
+    #[test]
+    fn preview_text_leaves_short_unicode_unchanged() {
+        assert_eq!(preview_text("top — where", 60), "top — where");
     }
 
     #[test]
