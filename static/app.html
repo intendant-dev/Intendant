@@ -11010,7 +11010,9 @@ function updateStatusBar(d) {
   }
   if (d.session_id) {
     const sid = String(d.session_id || '').trim();
-    if (!daemonSessionFullId) setDaemonSessionId(sid);
+    // Status events are session-scoped and may refer to dashboard-spawned
+    // wrapper sessions. The status bar's session id represents the daemon
+    // process session and is initialized only from the bootstrap snapshot.
     if (sid && sid !== daemonSessionFullId) {
       ensureSessionWindow(sid, { ended: false });
       updateTaskTargetChip();
