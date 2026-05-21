@@ -167,6 +167,26 @@ impl AgentBackend {
             AgentBackend::GeminiCli => "gemini",
         }
     }
+
+    pub fn thread_id_is_canonical(&self, thread_id: &str) -> bool {
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            return false;
+        }
+        match self {
+            AgentBackend::Codex | AgentBackend::GeminiCli => true,
+            // Claude Code does not expose a real session id during start_thread
+            // today. Keep the Intendant log id as canonical until that backend
+            // reports a usable native id.
+            AgentBackend::ClaudeCode => thread_id != "claude-code-session",
+        }
+    }
+}
+
+pub fn source_session_id_is_canonical(source: &str, session_id: &str) -> bool {
+    AgentBackend::from_str_loose(source)
+        .map(|backend| backend.thread_id_is_canonical(session_id))
+        .unwrap_or(false)
 }
 
 impl std::fmt::Display for AgentBackend {
@@ -561,6 +581,16 @@ mod tests {
         ] {
             assert_eq!(AgentBackend::from_str_loose(v.as_short_str()), Some(v));
         }
+    }
+
+    #[test]
+    fn canonical_thread_ids_match_backend_capabilities() {
+        assert!(AgentBackend::Codex.thread_id_is_canonical("019e37cf-34ad-7b08-8a1e-7ad5086eb39f"));
+        assert!(AgentBackend::GeminiCli.thread_id_is_canonical("session-2026-05-21T12-00"));
+        assert!(!AgentBackend::ClaudeCode.thread_id_is_canonical("claude-code-session"));
+        assert!(AgentBackend::ClaudeCode.thread_id_is_canonical("real-claude-session"));
+        assert!(!source_session_id_is_canonical("unknown", "abc"));
+        assert!(source_session_id_is_canonical("codex", "019abc"));
     }
 
     #[test]
