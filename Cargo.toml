@@ -73,6 +73,25 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 similar = "2"
 sha2 = "0.10"
+# `intendant lan` mTLS certificate generation — pure-Rust, replacing the
+# former OpenSSL dependency. `rcgen` builds the CA + server (SAN=IP, ≤825d) +
+# client certs on the `ring` backend (ECDSA P-256 keys, no aws-lc-sys C
+# toolchain); `x509-parser` (enabled in rcgen and used directly) reads the
+# server cert CN back for IP-drift detection and reconstructs the CA issuer
+# on `recert`. `p12-keystore` writes the client bundle as a MODERN PKCS#12
+# (PBES2 / PBKDF2-HMAC-SHA256 / AES-256-CBC + SHA-256 MAC) that Apple's
+# `SecPKCS12Import` (Keychain Access on macOS 15+, iOS 18 profile install)
+# accepts. All four are pure-Rust and cross-platform, so they live here
+# rather than under a platform gate. `pem` decodes stored PEM certs to DER
+# for the SHA-256 fingerprint (`pin-self-cert`) path.
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
+x509-parser = "0.18"
+p12-keystore = "0.2.1"
+pem = "3"
+rand = "0.8"
+# `rcgen`'s `not_before` / `not_after` cert-validity fields are `time`'s
+# `OffsetDateTime`; we set them via `OffsetDateTime::now_utc()` + `Duration`.
+time = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
@@ -86,17 +105,16 @@ core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
 shiguredo_video_toolbox = "2026.1"
 
-# Native deps that have no Windows backend yet (Tier-0 Windows port defers
-# the VP8/libvpx encoder and the `intendant lan` mTLS cert subsystem).
-# Gated to non-Windows so the MSVC target doesn't try to build the libvpx
-# (`env-libvpx-sys` needs a C toolchain + the vpx headers) or OpenSSL
-# (`openssl-sys` needs the OpenSSL libs/headers) FFI crates. The VP8 and
-# `lan` code paths are themselves cfg'd off Windows so nothing references
-# these symbols there.
+# Native dep that has no Windows backend yet (Tier-0 Windows port defers the
+# VP8/libvpx encoder). Gated to non-Windows so the MSVC target doesn't try to
+# build the libvpx FFI crate (`env-libvpx-sys` needs a C toolchain + the vpx
+# headers). The VP8 code path is itself cfg'd off Windows so nothing
+# references these symbols there.
+#
+# (The `intendant lan` cert subsystem used to live here too, via OpenSSL; it
+# is now pure-Rust — rcgen + p12-keystore — and moved to `[dependencies]`.)
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 env-libvpx-sys = { version = "5.1", features = ["generate"] }
-openssl = "0.10"
-openssl-sys = "0.9"
 
 # Windows-only system bindings, used by `platform.rs` for the process
 # liveness check (OpenProcess / GetExitCodeProcess) and command-line readout
