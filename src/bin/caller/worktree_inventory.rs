@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
@@ -915,6 +916,8 @@ fn measure_tree(root: &Path) -> TreeMeasure {
     let mut measure = TreeMeasure::default();
     let mut stack = vec![root.to_path_buf()];
     let mut visited = 0usize;
+    // Track inodes of multiply-linked files so each is counted once.
+    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
     while let Some(path) = stack.pop() {
         visited += 1;
         if visited >= MAX_SIZE_ENTRIES_PER_WORKTREE {
@@ -945,7 +948,18 @@ fn measure_tree(root: &Path) -> TreeMeasure {
             }
         } else {
             measure.files += 1;
-            measure.bytes = measure.bytes.saturating_add(meta.len());
+            // Count actual on-disk allocation (512-byte blocks) and de-duplicate
+            // hardlinked files by (dev, ino) so a single inode with N links is
+            // counted once — matching `du` and reflecting the space actually
+            // reclaimed by deleting the worktree. `meta.len()` (apparent size)
+            // over-counts both sparse files and hardlink-dense trees like Cargo
+            // `target/` dirs (e.g. a 5.6 GiB worktree reported as 9+ GiB).
+            if meta.nlink() > 1 && !seen_inodes.insert((meta.dev(), meta.ino())) {
+                continue;
+            }
+            measure.bytes = measure
+                .bytes
+                .saturating_add(meta.blocks().saturating_mul(512));
         }
     }
     measure
@@ -1301,5 +1315,35 @@ mod tests {
 
         assert!(err.contains("HEAD changed"));
         assert!(wt.exists());
+    }
+
+    #[test]
+    fn measure_tree_counts_hardlinks_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("tree");
+        std::fs::create_dir(&dir).unwrap();
+
+        // A file big enough to occupy real blocks, plus a hardlink to it.
+        let original = dir.join("original.bin");
+        std::fs::write(&original, vec![b'x'; 64 * 1024]).unwrap();
+        std::fs::hard_link(&original, dir.join("hardlink.bin")).unwrap();
+
+        // du-style allocation of the single shared inode.
+        let single = std::fs::symlink_metadata(&original).unwrap().blocks() * 512;
+        assert!(single > 0, "test file should occupy at least one block");
+
+        let measure = measure_tree(&dir);
+        // Both directory entries are seen as files...
+        assert_eq!(measure.files, 2);
+        // ...but the shared inode's blocks are counted only once (not doubled).
+        assert_eq!(measure.bytes, single);
+
+        // An independent file accumulates on top — guards against over-dedup.
+        let other = dir.join("other.bin");
+        std::fs::write(&other, vec![b'y'; 64 * 1024]).unwrap();
+        let other_alloc = std::fs::symlink_metadata(&other).unwrap().blocks() * 512;
+        let measure = measure_tree(&dir);
+        assert_eq!(measure.files, 3);
+        assert_eq!(measure.bytes, single + other_alloc);
     }
 }
