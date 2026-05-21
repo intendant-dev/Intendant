@@ -129,6 +129,37 @@ pub fn routable_local_addrs(include_loopback: bool) -> Vec<std::net::IpAddr> {
             }
         }
     }
+
+    // Windows has no `getifaddrs(3)`; the OS API is `GetAdaptersAddresses`.
+    // Rather than hand-roll that FFI walk we use the `if-addrs` crate, which
+    // wraps it and yields the same per-interface address list. The filtering
+    // mirrors the unix arm: drop loopback (unless requested), link-local
+    // (IPv6 fe80::/10 and IPv4 169.254/16 — neither is a useful advertised
+    // endpoint), and unspecified addresses. Enumeration order is preserved so
+    // the caller's later stable sort keeps a multi-NIC host's primary NIC
+    // first, matching the unix behaviour.
+    #[cfg(windows)]
+    {
+        if let Ok(ifaces) = if_addrs::get_if_addrs() {
+            for iface in ifaces {
+                if iface.is_link_local() {
+                    continue;
+                }
+                let ip = iface.ip();
+                if ip.is_unspecified() {
+                    continue;
+                }
+                if ip.is_loopback() {
+                    // Loopback is added once up-front (as 127.0.0.1) when
+                    // requested; skip the per-interface loopback entries so
+                    // we don't emit duplicates or ::1 alongside it.
+                    continue;
+                }
+                out.push(ip);
+            }
+        }
+    }
+
     out
 }
 
@@ -491,4 +522,59 @@ async fn cmd_serve_certs(args: LanArgs) -> LanResult<()> {
     };
     cert_server::serve(&state, args.cert_port, &lan_ip, args.https_port).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn include_loopback_prepends_localhost() {
+        let addrs = routable_local_addrs(true);
+        assert_eq!(
+            addrs.first(),
+            Some(&IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "include_loopback should put 127.0.0.1 first"
+        );
+    }
+
+    #[test]
+    fn no_loopback_excludes_loopback_addrs() {
+        // With loopback disabled, no returned address may be a loopback
+        // address on any platform.
+        let addrs = routable_local_addrs(false);
+        assert!(
+            addrs.iter().all(|ip| !ip.is_loopback()),
+            "no-loopback result must not contain loopback addresses: {addrs:?}"
+        );
+    }
+
+    #[test]
+    fn returned_addrs_are_never_unspecified() {
+        for include_loopback in [false, true] {
+            let addrs = routable_local_addrs(include_loopback);
+            assert!(
+                addrs.iter().all(|ip| !ip.is_unspecified()),
+                "0.0.0.0 / :: are not real bind targets: {addrs:?}"
+            );
+        }
+    }
+
+    // Windows-specific: the GetAdaptersAddresses-backed enumeration must
+    // surface the machine's real routable interface(s), not just loopback.
+    // Runs on the CI/build VM, which has a routable NIC.
+    #[cfg(windows)]
+    #[test]
+    fn windows_enumerates_at_least_one_routable_addr() {
+        let addrs = routable_local_addrs(false);
+        assert!(
+            !addrs.is_empty(),
+            "expected at least one non-loopback routable interface address"
+        );
+        assert!(
+            addrs.iter().all(|ip| !ip.is_loopback() && !ip.is_unspecified()),
+            "every address must be routable (non-loopback, non-unspecified): {addrs:?}"
+        );
+    }
 }
