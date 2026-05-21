@@ -249,6 +249,7 @@ impl Dispatcher {
     fn warn_drop(&self, bus: &EventBus, kind: &str, preview: &str) {
         let trunc: String = preview.chars().take(80).collect();
         bus.send(AppEvent::LogEntry {
+            session_id: None,
             level: "warn".to_string(),
             source: "system".to_string(),
             content: format!("{} dropped (no dispatch target available): {}", kind, trunc),

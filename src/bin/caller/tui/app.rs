@@ -757,6 +757,7 @@ impl App {
         }
         .to_string();
         self.pending_derived.push(AppEvent::LogEntry {
+            session_id: None,
             level: level_str,
             source: source_str,
             content: content.clone(),
