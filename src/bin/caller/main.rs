@@ -8887,6 +8887,45 @@ async fn activate_user_display(
     }
 }
 
+/// Auto-register the Windows desktop as an active display at web-daemon
+/// startup, so the dashboard's Video tab streams it on connect — no grant
+/// click and no running agent required.
+///
+/// On macOS and Linux the screen is shared behind a consent gate (TCC, the
+/// Wayland portal dialog) or a virtual display is launched on demand, so
+/// those platforms keep activating the user display only on an explicit
+/// grant. Windows has no such per-session consent step: in the headless /
+/// RDP server scenario the existing desktop *is* the always-on stream, and
+/// the OS-level capture permission is implicit. We therefore mirror the
+/// macOS *end state* (a live `DisplaySession` already in the registry, so a
+/// fresh browser connect replays `display_ready` and auto-streams) by
+/// activating display 0 up front, reusing the same [`activate_user_display`]
+/// machinery — which on Windows captures the existing desktop via
+/// `WindowsBackend` (DXGI Desktop Duplication), NOT a virtual Xvfb display.
+///
+/// The autonomy grant flag and `INTENDANT_USER_DISPLAY_GRANTED` env are set
+/// to match a real grant, so the dashboard's "your display" toggle, CU
+/// display targeting, and agent subprocesses all observe a consistent
+/// "granted" state. Activation degrades gracefully — if the capture backend
+/// can't start (no interactive desktop, etc.) `activate_user_display` logs
+/// and returns without registering, leaving the dashboard at "No displays
+/// active" rather than failing startup.
+#[cfg(target_os = "windows")]
+async fn auto_activate_windows_user_display(
+    bus: &EventBus,
+    session_registry: &display::SharedSessionRegistry,
+    frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<frames::FrameRegistry>>>,
+    autonomy: &SharedAutonomy,
+) {
+    eprintln!("[user_display] Windows: auto-registering desktop as active display (display 0)");
+    {
+        let mut guard = autonomy.write().await;
+        guard.user_display_granted = true;
+    }
+    std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+    activate_user_display(bus, session_registry, frame_registry, 0).await;
+}
+
 /// Detect a Wayland compositor socket even when WAYLAND_DISPLAY is not set.
 /// Checks /run/user/<uid>/ for wayland-* sockets.
 #[cfg(target_os = "linux")]
@@ -9789,6 +9828,18 @@ async fn main() -> Result<(), CallerError> {
             session_registry.clone(),
             Some(frame_registry.clone()),
         );
+        // Windows: auto-register the existing desktop as an active display so
+        // the dashboard streams it on connect (mirrors the macOS end state of
+        // a live session sitting in the registry). macOS/Linux compile this
+        // out and keep activating only on an explicit grant.
+        #[cfg(target_os = "windows")]
+        auto_activate_windows_user_display(
+            &bus,
+            &session_registry,
+            Some(frame_registry.clone()),
+            &autonomy,
+        )
+        .await;
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = Some(debug::spawn_debug_screen_handler(
             bus.subscribe(),
