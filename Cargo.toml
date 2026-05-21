@@ -63,7 +63,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "tls1
 # `lan`/nginx/OpenSSL path. Both ride the same `ring` provider and `rustls`
 # 0.23 the rest of the tree is pinned to — no `aws-lc` is pulled in.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+# (rcgen is declared once below — it's shared by the gateway self-signed cert
+# and the `lan` mTLS cert generation, with the superset feature set.)
 # Parses operator-supplied PEM cert/key files for the optional
 # `--tls-cert`/`--tls-key` override. Pure-Rust, only transitive dep is
 # `rustls-pki-types` (already in-tree). Auto self-signed (rcgen) is the
