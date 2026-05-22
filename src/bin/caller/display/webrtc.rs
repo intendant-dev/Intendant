@@ -1271,6 +1271,172 @@ fn host_candidate_init(addr: SocketAddr, protocol: RTCIceProtocol) -> RTCIceCand
     }
 }
 
+/// Build a server-reflexive (srflx) UDP ICE candidate.
+///
+/// `mapped` is the public `IP:port` the STUN server observed for this
+/// socket; `base` is the local host address the socket is bound to (the
+/// candidate's `raddr`/`rport`, required by RFC 5245 § 4.3 for srflx
+/// candidates). The foundation differs from host candidates so the two
+/// don't collapse into one pair, and the type-preference byte of the
+/// priority is `100 << 24` (srflx) rather than host's `126 << 24`, so
+/// host pairs are still tried first while srflx provides the reachable
+/// public path for NAT'd peers.
+fn srflx_candidate_init(mapped: SocketAddr, base: SocketAddr) -> RTCIceCandidateInit {
+    // Priority = (type-pref << 24) | (local-pref << 8) | (256 - component).
+    // srflx type preference 100, local preference 65535, component 1.
+    let priority = (100u32 << 24) | (65_535u32 << 8) | (256 - 1);
+    RTCIceCandidateInit {
+        candidate: format!(
+            "candidate:2 1 udp {priority} {} {} typ srflx raddr {} rport {} generation 0",
+            mapped.ip(),
+            mapped.port(),
+            base.ip(),
+            base.port()
+        ),
+        sdp_mid: Some(String::new()),
+        sdp_mline_index: Some(0),
+        username_fragment: None,
+        url: None,
+    }
+}
+
+/// Maximum time we'll wait for a STUN Binding Success Response before
+/// giving up on srflx gathering for a socket. Short on purpose: srflx is
+/// an optimisation, and we must never block peer setup on a slow/blocked
+/// STUN server. On timeout we proceed with host + ICE-TCP candidates.
+const STUN_BINDING_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Send a STUN Binding Request from `socket` to `stun_addr` and parse the
+/// `XOR-MAPPED-ADDRESS` from the Binding Success Response, returning the
+/// public `IP:port` the STUN server saw for this socket's base.
+///
+/// The request is built with `rtc::stun` (already a transitive dependency
+/// via the `rtc` meta-crate — no new dep): `Message::build` writes the
+/// 20-byte header with the magic cookie and a random transaction ID, sets
+/// the message type to `BINDING_REQUEST`, and `marshal_binary` yields the
+/// wire bytes. The response is validated by `unmarshal_binary` (which
+/// checks the magic cookie and message length) before
+/// `XorMappedAddress::get_from` decodes the attribute.
+///
+/// The same `socket` that ICE will use for the host candidate is reused
+/// here so the mapping the STUN server reports corresponds to that
+/// candidate's base — exactly the pairing a remote peer needs to reach us
+/// over UDP through a 1:1 NAT.
+///
+/// Errors (DNS failure, send/recv failure, timeout, malformed response,
+/// non-success class) are returned to the caller, which logs and degrades
+/// gracefully. This function never panics.
+async fn stun_binding_mapped_addr(
+    socket: &UdpSocket,
+    stun_addr: SocketAddr,
+) -> Result<SocketAddr, String> {
+    use rtc::stun::message::{Getter, Message, BINDING_REQUEST};
+    use rtc::stun::xoraddr::XorMappedAddress;
+
+    let mut request = Message::new();
+    request
+        .build(&[
+            Box::new(rtc::stun::message::TransactionId::new()),
+            Box::new(BINDING_REQUEST),
+        ])
+        .map_err(|e| format!("build STUN binding request: {e}"))?;
+    let request_tid = request.transaction_id;
+    let wire = request
+        .marshal_binary()
+        .map_err(|e| format!("marshal STUN binding request: {e}"))?;
+
+    let exchange = async {
+        socket
+            .send_to(&wire, stun_addr)
+            .await
+            .map_err(|e| format!("send STUN binding request to {stun_addr}: {e}"))?;
+
+        // Loop in case an unrelated datagram (e.g. an early ICE
+        // connectivity check from the browser) arrives on the socket
+        // before the STUN response: skip anything that isn't a STUN
+        // Binding Success Response matching our transaction ID.
+        let mut buf = [0u8; 1500];
+        loop {
+            let (n, from) = socket
+                .recv_from(&mut buf)
+                .await
+                .map_err(|e| format!("recv STUN response: {e}"))?;
+            if from != stun_addr {
+                continue;
+            }
+            let mut response = Message::new();
+            if response.unmarshal_binary(&buf[..n]).is_err() {
+                continue;
+            }
+            if response.transaction_id != request_tid {
+                continue;
+            }
+            if response.typ != rtc::stun::message::BINDING_SUCCESS {
+                return Err(format!(
+                    "STUN server returned non-success class {:?}",
+                    response.typ
+                ));
+            }
+            let mut mapped = XorMappedAddress::default();
+            mapped
+                .get_from(&response)
+                .map_err(|e| format!("parse XOR-MAPPED-ADDRESS: {e}"))?;
+            return Ok(SocketAddr::new(mapped.ip, mapped.port));
+        }
+    };
+
+    match tokio::time::timeout(STUN_BINDING_TIMEOUT, exchange).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "STUN binding to {stun_addr} timed out after {STUN_BINDING_TIMEOUT:?}"
+        )),
+    }
+}
+
+/// Extract STUN server `host:port` socket addresses from an [`IceConfig`].
+///
+/// Each ICE server may carry several URLs; we keep only `stun:`/`stuns:`
+/// entries (TURN is out of scope for srflx gathering) and resolve each via
+/// DNS. The configured default is `stun:stun.l.google.com:19302`; a STUN
+/// URL without an explicit port falls back to the IANA default 3478.
+///
+/// Returns deduplicated resolved addresses. An empty result (no STUN
+/// servers configured, or all failed to resolve) means srflx gathering is
+/// skipped entirely — host/ICE-TCP candidates still work.
+async fn resolve_stun_servers(ice_config: &IceConfig) -> Vec<SocketAddr> {
+    use rtc::stun::uri::Uri;
+
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for server in &ice_config.ice_servers {
+        for url in &server.urls {
+            let uri = match Uri::parse_uri(url) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            // `scheme` is the URL scheme ("stun"/"stuns"); skip turn/turns.
+            if uri.scheme != "stun" && uri.scheme != "stuns" {
+                continue;
+            }
+            let port = uri.port.unwrap_or(rtc::stun::DEFAULT_PORT);
+            let host_port = format!("{}:{}", uri.host, port);
+            let resolved = tokio::net::lookup_host(host_port.clone()).await;
+            match resolved {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        if !out.contains(&addr) {
+                            out.push(addr);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[display/webrtc] STUN server {host_port} resolve failed: {e}");
+                }
+            }
+        }
+    }
+    out
+}
+
 fn first_video_mid_from_offer(sdp: &str) -> Option<String> {
     let mut in_video = false;
     for raw in sdp.lines() {
@@ -1594,7 +1760,7 @@ impl WebRtcPeer {
         offer_sdp: &str,
         active_codec: CodecKind,
         active_rids: &[SimulcastRid],
-        _ice_config: &IceConfig,
+        ice_config: &IceConfig,
         tcp_peer_registry: Option<Arc<TcpPeerRegistry>>,
         tcp_advertised_addr: Option<SocketAddr>,
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
@@ -1776,6 +1942,11 @@ impl WebRtcPeer {
         // interface and emit a host candidate that exactly matches each
         // socket's local address.
         let mut sockets: Vec<Arc<UdpSocket>> = Vec::new();
+        // `(socket, host_base)` for the sockets we successfully added a host
+        // candidate for. Reused below for STUN srflx gathering so the
+        // server-reflexive mapping corresponds to a candidate base ICE
+        // already knows about.
+        let mut srflx_bases: Vec<(Arc<UdpSocket>, SocketAddr)> = Vec::new();
         // WebRTC needs loopback so a browser on the same machine can
         // pair against the daemon's host candidates.
         let local_addrs = crate::lan::routable_local_addrs(true);
@@ -1799,7 +1970,11 @@ impl WebRtcPeer {
             };
             let candidate = host_candidate_init(local, RTCIceProtocol::Udp);
             match rtc.add_local_candidate(candidate) {
-                Ok(()) => sockets.push(Arc::new(socket)),
+                Ok(()) => {
+                    let socket = Arc::new(socket);
+                    sockets.push(Arc::clone(&socket));
+                    srflx_bases.push((socket, local));
+                }
                 Err(e) => eprintln!("[display/webrtc] skipping UDP host candidate {local}: {e}"),
             }
         }
@@ -1807,6 +1982,73 @@ impl WebRtcPeer {
             return Err(CallerError::WebRtc(
                 "no usable local UDP sockets bound".to_string(),
             ));
+        }
+
+        // --- Server-reflexive (srflx) UDP candidates via STUN -------------
+        //
+        // ICE host candidates carry the socket's *local* address. On a
+        // NAT'd host (e.g. a GCP VM with internal `10.x` / loopback only)
+        // those are unreachable from a remote browser, so without a public
+        // candidate the only thing that can pair is the ICE-TCP candidate —
+        // which has Windows transport problems. To advertise a reachable
+        // UDP path we ask the configured STUN server what public `IP:port`
+        // it observes for each of our ICE sockets and add that as a srflx
+        // candidate. Because the binding request goes out the *same* socket
+        // ICE will use, the mapping matches the candidate's base, so a 1:1
+        // NAT (GCP) returns the public IP the browser can reach directly.
+        //
+        // This is a best-effort optimisation layered on top of the host /
+        // ICE-TCP candidates already added above: if there's no STUN server
+        // configured, DNS fails, or the binding times out, we log and carry
+        // on with exactly the candidate set we had before. The query is
+        // time-boxed (`STUN_BINDING_TIMEOUT`) and runs concurrently across
+        // sockets so it never meaningfully delays the answer.
+        let stun_servers = resolve_stun_servers(ice_config).await;
+        if let Some(&stun_addr) = stun_servers.first() {
+            // One Binding Request per socket, run concurrently on a
+            // `JoinSet` (tokio, already a direct dep) so a slow/blocked
+            // socket can't stack its timeout on top of the others. We only
+            // need a single public mapping per base, so we use the first
+            // resolved STUN server address.
+            let mut gathers = tokio::task::JoinSet::new();
+            for (socket, base) in &srflx_bases {
+                let socket = Arc::clone(socket);
+                let base = *base;
+                gathers.spawn(async move {
+                    (base, stun_binding_mapped_addr(&socket, stun_addr).await)
+                });
+            }
+            while let Some(joined) = gathers.join_next().await {
+                let (base, result) = match joined {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        eprintln!("[display/webrtc] peer {peer_id}: srflx gather task failed: {e}");
+                        continue;
+                    }
+                };
+                match result {
+                    Ok(mapped) => {
+                        // Skip a degenerate mapping that equals the base
+                        // (no NAT in front, or STUN reflected loopback) —
+                        // it would duplicate the host candidate.
+                        if mapped == base {
+                            continue;
+                        }
+                        let candidate = srflx_candidate_init(mapped, base);
+                        match rtc.add_local_candidate(candidate) {
+                            Ok(()) => eprintln!(
+                                "[display/webrtc] peer {peer_id}: added srflx candidate {mapped} (base {base})"
+                            ),
+                            Err(e) => eprintln!(
+                                "[display/webrtc] peer {peer_id}: failed to add srflx candidate {mapped}: {e}"
+                            ),
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[display/webrtc] peer {peer_id}: srflx gathering for base {base} failed: {e}"
+                    ),
+                }
+            }
         }
 
         // --- ICE-TCP candidate (Host-header derived, pair-friendly) ------
@@ -4640,6 +4882,137 @@ mod tests {
     #[test]
     fn stun_too_short() {
         assert_eq!(parse_stun_username(&[0u8; 5]), None);
+    }
+
+    // --- srflx (STUN server-reflexive) gathering tests ---
+
+    #[test]
+    fn srflx_candidate_init_formats_typ_srflx_with_raddr_rport() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let mapped = SocketAddr::new(Ipv4Addr::new(34, 173, 63, 221).into(), 50000);
+        let base = SocketAddr::new(Ipv4Addr::new(10, 128, 0, 2).into(), 40000);
+        let init = srflx_candidate_init(mapped, base);
+        // Public mapped address is the candidate's transport address.
+        assert!(
+            init.candidate.contains("udp"),
+            "udp transport: {}",
+            init.candidate
+        );
+        assert!(
+            init.candidate.contains("34.173.63.221 50000 typ srflx"),
+            "mapped addr + typ srflx: {}",
+            init.candidate
+        );
+        // RFC 5245 §4.3: srflx candidate carries the host base as raddr/rport.
+        assert!(
+            init.candidate.contains("raddr 10.128.0.2 rport 40000"),
+            "raddr/rport = base: {}",
+            init.candidate
+        );
+        // srflx must outrank ICE-TCP (1_677_721_855) but rank below UDP host
+        // (2_130_706_431) so host pairs are still tried first.
+        let priority: u32 = init
+            .candidate
+            .split_whitespace()
+            .nth(3)
+            .and_then(|p| p.parse().ok())
+            .expect("priority field");
+        assert!(
+            priority < 2_130_706_431 && priority > 1_677_721_855,
+            "srflx priority {priority} between ICE-TCP and UDP host"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_stun_servers_parses_stun_url_and_skips_turn() {
+        use std::net::Ipv4Addr;
+        // Mix of a resolvable literal-IP stun URL and a turn URL that must
+        // be ignored (srflx only needs STUN). Using a literal IP avoids a
+        // DNS dependency in the unit test.
+        let ice_config = IceConfig {
+            ice_servers: vec![crate::display::IceServer {
+                urls: vec![
+                    "stun:127.0.0.1:19302".to_string(),
+                    "turn:127.0.0.1:3478".to_string(),
+                ],
+                username: None,
+                credential: None,
+            }],
+        };
+        let resolved = resolve_stun_servers(&ice_config).await;
+        assert_eq!(
+            resolved,
+            vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 19302)],
+            "only the stun: URL resolved, turn: skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_stun_servers_empty_when_no_servers() {
+        let resolved = resolve_stun_servers(&IceConfig::default()).await;
+        assert!(resolved.is_empty(), "no ice servers -> no STUN addrs");
+    }
+
+    #[tokio::test]
+    async fn stun_binding_round_trips_against_local_responder() {
+        // Stand up a tiny local "STUN server" that answers any Binding
+        // Request with a Binding Success carrying the peer's address as
+        // XOR-MAPPED-ADDRESS — exercising our request build + response
+        // parse path without touching the network.
+        use rtc::stun::message::{Message, Setter, BINDING_SUCCESS};
+        use rtc::stun::xoraddr::XorMappedAddress;
+
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            let (n, from) = server.recv_from(&mut buf).await.unwrap();
+            let mut req = Message::new();
+            req.unmarshal_binary(&buf[..n]).unwrap();
+            // Echo the requester's address back as XOR-MAPPED-ADDRESS,
+            // preserving the request's transaction ID (required for the
+            // client to accept the response).
+            let mut resp = Message::new();
+            resp.build(&[
+                Box::new(req.transaction_id) as Box<dyn Setter>,
+                Box::new(BINDING_SUCCESS),
+                Box::new(XorMappedAddress {
+                    ip: from.ip(),
+                    port: from.port(),
+                }),
+            ])
+            .unwrap();
+            let wire = resp.marshal_binary().unwrap();
+            server.send_to(&wire, from).await.unwrap();
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let mapped = stun_binding_mapped_addr(&client, server_addr)
+            .await
+            .expect("binding success");
+        assert_eq!(
+            mapped, client_addr,
+            "parsed XOR-MAPPED-ADDRESS == client's own address"
+        );
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stun_binding_times_out_against_silent_server() {
+        // A bound-but-silent UDP socket never answers; the client must
+        // give up after STUN_BINDING_TIMEOUT rather than hang forever.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let started = std::time::Instant::now();
+        let result = stun_binding_mapped_addr(&client, silent_addr).await;
+        assert!(result.is_err(), "no response -> Err, got {result:?}");
+        assert!(
+            started.elapsed() < STUN_BINDING_TIMEOUT + Duration::from_secs(1),
+            "returned promptly after timeout, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
