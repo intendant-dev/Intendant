@@ -2271,9 +2271,14 @@ fn try_h264_fallback_for_layer(
     if codec != CodecKind::H264 {
         return None;
     }
-    // Idempotent — see VAAPI_BANNED in h264_linux.rs (one-way
-    // AtomicBool that's never cleared). Calling when already
-    // banned is a no-op store.
+    // Ban BOTH GPU encoders before reconstructing. The watchdog fires on a
+    // silent-failure (encoder accepts input, emits nothing) but can't tell
+    // which backend the dead encoder used — VA-API or NVENC — so banning
+    // both forces the rebuilt encoder past the GPU arms straight to
+    // software libx264, which is the watchdog's whole intent. Idempotent —
+    // see VAAPI_BANNED / NVENC_BANNED in h264_linux.rs (one-way AtomicBools
+    // that are never cleared). Calling when already banned is a no-op store.
+    super::h264_linux::ban_nvenc();
     super::h264_linux::ban_vaapi();
     match super::select_codec_for_mime(
         codec.mime(),

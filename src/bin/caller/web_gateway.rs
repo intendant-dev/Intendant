@@ -1340,6 +1340,16 @@ pub struct WebGatewayConfig {
     /// Empty by default (local-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ice_servers: Vec<crate::display::IceServer>,
+    /// Whether the *federated* (peer-to-peer) display path may negotiate
+    /// H.264. Default false ⇒ the browser pins VP8 for federation (the
+    /// safe default for lossy TURN-relayed paths). When true the browser
+    /// skips the VP8 pin and lets codec order default, allowing the peer's
+    /// H.264 encoder (intra-refresh libx264 / NVENC) to be selected. Does
+    /// NOT affect the *local* DisplaySlot path, which already defaults
+    /// codec order. Sourced from `[webrtc].federation_allow_h264` in
+    /// intendant.toml.
+    #[serde(default)]
+    pub federation_allow_h264: bool,
 }
 
 impl Default for WebGatewayConfig {
@@ -1351,6 +1361,7 @@ impl Default for WebGatewayConfig {
             output_sample_rate: 24000,
             transcription_enabled: false,
             ice_servers: Vec::new(),
+            federation_allow_h264: false,
         }
     }
 }
@@ -12248,12 +12259,14 @@ pub fn build_config(
     live_model: Option<&str>,
     transcription_enabled: bool,
     ice_config: crate::display::IceConfig,
+    federation_allow_h264: bool,
 ) -> WebGatewayConfig {
     build_config_inner(
         live_provider,
         live_model,
         transcription_enabled,
         ice_config.ice_servers,
+        federation_allow_h264,
     )
 }
 
@@ -13943,6 +13956,7 @@ fn build_config_inner(
     live_model: Option<&str>,
     transcription_enabled: bool,
     ice_servers: Vec<crate::display::IceServer>,
+    federation_allow_h264: bool,
 ) -> WebGatewayConfig {
     // If an explicit provider is given, use it directly.
     if let Some(provider) = live_provider {
@@ -13962,6 +13976,7 @@ fn build_config_inner(
             output_sample_rate: output_rate,
             transcription_enabled,
             ice_servers,
+            federation_allow_h264,
             ..Default::default()
         };
     }
@@ -13980,6 +13995,7 @@ fn build_config_inner(
                 output_sample_rate: 24000,
                 transcription_enabled,
                 ice_servers,
+                federation_allow_h264,
                 ..Default::default()
             };
         }
@@ -13990,6 +14006,7 @@ fn build_config_inner(
             output_sample_rate: 24000,
             transcription_enabled,
             ice_servers,
+            federation_allow_h264,
             ..Default::default()
         };
     }
@@ -14003,12 +14020,14 @@ fn build_config_inner(
             output_sample_rate: 24000,
             transcription_enabled,
             ice_servers,
+            federation_allow_h264,
             ..Default::default()
         }
     } else {
         let mut cfg = WebGatewayConfig::default();
         cfg.transcription_enabled = transcription_enabled;
         cfg.ice_servers = ice_servers;
+        cfg.federation_allow_h264 = federation_allow_h264;
         cfg
     }
 }
@@ -17487,6 +17506,7 @@ mod tests {
             Some("gemini-2.5-flash-native-audio-preview-12-2025"),
             false,
             crate::display::IceConfig::default(),
+            false,
         );
         assert_eq!(config.provider, "gemini");
         assert_eq!(config.input_sample_rate, 16000);
@@ -17499,6 +17519,7 @@ mod tests {
             Some("gpt-4o-realtime-preview"),
             false,
             crate::display::IceConfig::default(),
+            false,
         );
         assert_eq!(config.provider, "openai");
         assert_eq!(config.input_sample_rate, 24000);
@@ -17511,6 +17532,7 @@ mod tests {
             None,
             false,
             crate::display::IceConfig::default(),
+            false,
         );
         assert_eq!(config.provider, "openai");
         assert_eq!(config.model, "gpt-4o-realtime-preview");
@@ -17520,7 +17542,7 @@ mod tests {
     fn test_build_config_no_model() {
         // With no model and no env vars set in a predictable way,
         // this should default to gemini
-        let config = build_config(None, None, false, crate::display::IceConfig::default());
+        let config = build_config(None, None, false, crate::display::IceConfig::default(), false);
         // Either gemini or openai depending on env, but it shouldn't panic
         assert!(!config.provider.is_empty());
     }

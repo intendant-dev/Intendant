@@ -12017,6 +12017,7 @@ async fn main() -> Result<(), CallerError> {
             project.config.presence.live_model.as_deref(),
             project.config.transcription.enabled,
             project.config.webrtc.to_ice_config(),
+            project.config.webrtc.federation_allow_h264,
         );
         let shared_session = Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
             daemon_session_id: session_log_id(&session_log),
@@ -12235,6 +12236,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
                 project.config.webrtc.to_ice_config(),
+                project.config.webrtc.federation_allow_h264,
             );
             let snapshot_dir = log_dir.join("file_snapshots");
             let shared_session =
@@ -12827,6 +12829,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
                 project.config.webrtc.to_ice_config(),
+                project.config.webrtc.federation_allow_h264,
             );
             let snapshot_dir = log_dir.join("file_snapshots");
             let shared_session =
@@ -13333,6 +13336,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
                 project.config.webrtc.to_ice_config(),
+                project.config.webrtc.federation_allow_h264,
             );
             let snapshot_dir = log_dir.join("file_snapshots");
             let shared_session =

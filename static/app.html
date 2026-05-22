@@ -20694,11 +20694,26 @@ class PeerDisplayConnection {
     // packet and survive better; this A/B confirms whether the block is
     // H.264-specific or lower in RTP/media.
     //
+    // **Flag gate (`[webrtc].federation_allow_h264`)**: the IDR-reassembly
+    // math above assumed periodic fat IDRs. The peer's H.264 encoder now
+    // uses *intra refresh* (no post-seed IDRs — recovery spread across the
+    // GOP via small slices + recovery-point SEI), which removes the
+    // un-reassemblable access unit that motivated the pin. When the
+    // operator opts in via `federation_allow_h264=true`, SKIP the VP8 pin
+    // entirely and let codec order default — exactly like the local
+    // DisplaySlot path — so the peer's intra-refresh H.264 (libx264/NVENC)
+    // can be negotiated. Default false keeps VP8 the federation default.
+    //
     // `RTCRtpReceiver.getCapabilities('video')` returns null on browsers
     // that don't implement it (rare in 2026 — Safari/WebKit, Chrome,
     // Firefox all support it); guard so a no-op fallback leaves the
     // transceiver at its browser default.
-    if (videoTransceiver && typeof videoTransceiver.setCodecPreferences === 'function') {
+    const allowFederationH264 = !!(gatewayConfig && gatewayConfig.federation_allow_h264);
+    if (allowFederationH264) {
+      this._log('info',
+        'federation_allow_h264=true — skipping VP8 codec pin, letting codec ' +
+        'order default so peer intra-refresh H.264 can be negotiated');
+    } else if (videoTransceiver && typeof videoTransceiver.setCodecPreferences === 'function') {
       const caps = (typeof RTCRtpReceiver !== 'undefined' && RTCRtpReceiver.getCapabilities)
         ? RTCRtpReceiver.getCapabilities('video')
         : null;

@@ -53,6 +53,14 @@ pub struct WebRtcConfig {
     /// Empty by default (local-only, no STUN/TURN).
     #[serde(default)]
     pub ice_servers: Vec<WebRtcIceServerConfig>,
+    /// Whether the federated (peer-to-peer) display path may negotiate
+    /// H.264. Default false ⇒ federation pins VP8 in the browser (the safe
+    /// default for lossy TURN-relayed paths). Set true to let federation
+    /// negotiate the peer's intra-refresh H.264 (libx264 / NVENC). Threaded
+    /// into the `/config` payload alongside `ice_servers`; the local
+    /// (same-machine) display path is unaffected.
+    #[serde(default)]
+    pub federation_allow_h264: bool,
 }
 
 /// A single ICE server entry in intendant.toml `[webrtc]` configuration.
