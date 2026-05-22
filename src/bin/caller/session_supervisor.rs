@@ -1630,6 +1630,17 @@ fn parse_codex_slash_command(text: &str) -> Option<Result<CodexSlashCommand, Str
                 params: serde_json::Value::Object(params),
             }))
         }
+        "side" | "btw" => {
+            let mut params = serde_json::Map::new();
+            let prompt = unquote_slash_value(args);
+            if !prompt.is_empty() {
+                params.insert("prompt".to_string(), serde_json::Value::String(prompt));
+            }
+            Some(Ok(CodexSlashCommand {
+                op: "side".to_string(),
+                params: serde_json::Value::Object(params),
+            }))
+        }
         "goal" => Some(parse_goal_slash_command(args)),
         _ => None,
     }
@@ -1841,6 +1852,20 @@ mod tests {
         let command = slash("/fork dashboard branch");
         assert_eq!(command.op, "fork");
         assert_eq!(command.params["name"], "dashboard branch");
+    }
+
+    #[test]
+    fn parses_side_slash_command_with_prompt() {
+        let command = slash("/side why is this failing?");
+        assert_eq!(command.op, "side");
+        assert_eq!(command.params["prompt"], "why is this failing?");
+    }
+
+    #[test]
+    fn parses_btw_alias_as_side_slash_command() {
+        let command = slash("/btw \"quick context check\"");
+        assert_eq!(command.op, "side");
+        assert_eq!(command.params["prompt"], "quick context check");
     }
 
     #[test]

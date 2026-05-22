@@ -243,7 +243,7 @@ pub enum OutboundEvent {
         autonomy: String,
     },
     /// Delivered to browsers when a Codex thread-level action finishes
-    /// (compact, fork, rollback, review, rename, goal, init, memory-reset).
+    /// (compact, fork, side, rollback, review, rename, goal, init, memory-reset).
     /// `success` + `message` are surfaced as a dashboard toast and logged.
     CodexThreadActionResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
