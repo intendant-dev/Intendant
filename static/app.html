@@ -1400,6 +1400,7 @@ html, body {
 .session-window-grid.maximized .session-window.maximized {
   display: flex;
   flex: 1 1 auto;
+  align-self: stretch;
   width: 100%;
   min-height: 0;
   max-height: none;
@@ -1467,6 +1468,7 @@ html, body {
 .session-window {
   position: relative;
   z-index: 2;
+  align-self: start;
   min-height: 180px;
   max-height: 320px;
   display: flex;
@@ -1516,7 +1518,7 @@ html, body {
   min-height: 130px;
 }
 .session-window:not(.header-collapsed):not(.minimized) {
-  max-height: none;
+  max-height: 320px;
 }
 .session-window.header-collapsed .session-window-task {
   display: none;
@@ -1743,9 +1745,6 @@ html, body {
   min-height: 0;
   overflow-y: auto;
   padding: 3px 0;
-}
-.session-window:not(.header-collapsed):not(.minimized) .session-window-log {
-  max-height: 220px;
 }
 .session-window-log .log-entry {
   padding: 2px 8px;
