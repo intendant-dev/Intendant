@@ -1418,6 +1418,7 @@ html, body {
   display: none;
 }
 .session-window {
+  position: relative;
   min-height: 180px;
   max-height: 320px;
   display: flex;
@@ -1427,6 +1428,10 @@ html, body {
   background: var(--mantle);
   overflow: hidden;
   cursor: pointer;
+}
+.session-window.menu-open {
+  overflow: visible;
+  z-index: 45;
 }
 .session-window.foreground {
   border-color: var(--blue);
@@ -11074,6 +11079,7 @@ function closeSessionWindowMenus(exceptSessionId = '') {
     if (sid === except || !win.actionMenu) continue;
     if (!win.actionMenu.classList.contains('hidden')) closed = true;
     win.actionMenu.classList.add('hidden');
+    win.el?.classList.remove('menu-open');
     win.actionMenuButton?.setAttribute('aria-expanded', 'false');
   }
   return closed;
@@ -11086,6 +11092,7 @@ function setSessionWindowMenuOpen(sessionId, open) {
   const nextOpen = !!open;
   closeSessionWindowMenus(nextOpen ? sid : '');
   win.actionMenu.classList.toggle('hidden', !nextOpen);
+  win.el.classList.toggle('menu-open', nextOpen);
   win.actionMenuButton.setAttribute('aria-expanded', nextOpen ? 'true' : 'false');
   return nextOpen;
 }
