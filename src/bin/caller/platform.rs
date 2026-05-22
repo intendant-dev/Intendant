@@ -441,8 +441,9 @@ echo $!
 /// doc comment for the cross-platform contract.
 #[cfg(windows)]
 pub async fn spawn_detached_restart(cmd: &str) -> Result<u32, String> {
-    use std::os::windows::process::CommandExt;
     use std::process::Stdio;
+    // `creation_flags` is an inherent method on tokio's Command (it mirrors
+    // the std `CommandExt` Windows extension), so no trait import is needed.
     use tokio::process::Command;
 
     // Win32 process-creation flags (values from winbase.h, stable ABI):

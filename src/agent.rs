@@ -30,7 +30,19 @@ static NONCE_RE: LazyLock<regex::Regex> =
 
 struct PtySession {
     writer: Box<dyn std::io::Write + Send>,
-    reader: Box<dyn std::io::Read + Send>,
+    // All bytes the shell has emitted so far, accumulated by a dedicated
+    // background reader thread (see `exec_pty`). A background thread — rather
+    // than an inline blocking `read()` in the command loop — is what makes the
+    // per-command read timeout robust: `portable_pty`'s reader is blocking and
+    // has no portable non-blocking / deadline mode, so an inline read against
+    // a shell that has gone quiet (e.g. PowerShell sitting at its prompt on
+    // Windows ConPTY) blocks indefinitely and the loop's elapsed-time check
+    // never runs. Draining on a thread lets `exec_pty` poll this buffer under
+    // an async deadline that always fires.
+    output: Arc<std::sync::Mutex<Vec<u8>>>,
+    // How many bytes of `output` previous `exec_pty` calls have already
+    // consumed, so each call only scans newly-produced bytes for its markers.
+    read_offset: usize,
     // Keep master alive to prevent EOF
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
@@ -635,7 +647,7 @@ impl Agent {
             };
             spawn_result?;
 
-            let reader = pair
+            let mut reader = pair
                 .master
                 .try_clone_reader()
                 .map_err(|e| AgentError::Process(format!("Failed to clone reader: {}", e)))?;
@@ -644,11 +656,36 @@ impl Agent {
                 .take_writer()
                 .map_err(|e| AgentError::Process(format!("Failed to take writer: {}", e)))?;
 
+            // Dedicated blocking reader thread: drains the PTY into the shared
+            // buffer for the session's lifetime. `exec_pty` polls the buffer
+            // under an async deadline rather than blocking on `read()` itself,
+            // so a quiet shell can never wedge the command loop. The thread
+            // exits on EOF/error (when the shell dies and the master closes).
+            let output = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let output_for_thread = Arc::clone(&output);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if let Ok(mut o) = output_for_thread.lock() {
+                                o.extend_from_slice(&buf[..n]);
+                            } else {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
             sessions.insert(
                 shell_id.clone(),
                 PtySession {
                     writer,
-                    reader,
+                    output,
+                    read_offset: 0,
                     _master: pair.master,
                 },
             );
@@ -673,28 +710,41 @@ impl Agent {
             .flush()
             .map_err(|e| AgentError::Process(format!("Failed to flush PTY: {}", e)))?;
 
-        // Read from PTY until end marker appears, with timeout
-        let mut output = String::new();
+        // Poll the background-filled buffer until the end marker appears or the
+        // deadline elapses. Only bytes produced since this session's last
+        // command (`read_offset`) are this call's output. Because the blocking
+        // `read()` runs on the reader thread, this deadline is always honored —
+        // a shell that goes quiet (no output, no EOF) can't wedge us.
         let timeout_duration = Duration::from_secs(30);
         let start = std::time::Instant::now();
-        let mut buf = [0u8; 4096];
+        let mut output = String::new();
+        // Where this call's output ends within the shared buffer; advanced past
+        // the consumed bytes once we're done so the next call starts fresh.
+        let mut consumed_to = session.read_offset;
 
         loop {
+            // Snapshot the bytes produced for this call so far.
+            {
+                let guard = session
+                    .output
+                    .lock()
+                    .map_err(|_| AgentError::Process("PTY reader buffer poisoned".to_string()))?;
+                if guard.len() > session.read_offset {
+                    output = String::from_utf8_lossy(&guard[session.read_offset..]).into_owned();
+                    consumed_to = guard.len();
+                }
+            }
+
+            if output.contains(&marker) {
+                break;
+            }
             if start.elapsed() >= timeout_duration {
                 break;
             }
-
-            match session.reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    output.push_str(&String::from_utf8_lossy(&buf[..n]));
-                    if output.contains(&marker) {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        // Mark this call's bytes consumed regardless of outcome.
+        session.read_offset = consumed_to;
 
         // Clean output: strip ANSI escapes and carriage returns
         let cleaned = ANSI_RE.replace_all(&output, "").to_string();
