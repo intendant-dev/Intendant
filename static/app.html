@@ -1881,6 +1881,19 @@ html, body {
 .syntax-op { color: var(--red); font-weight: 700; }
 .syntax-path { color: var(--sapphire); }
 .syntax-comment { color: var(--overlay1); font-style: italic; }
+.syntax-keyword { color: var(--mauve); font-weight: 600; }
+.syntax-type { color: var(--yellow); }
+.syntax-fn { color: var(--blue); }
+.syntax-number { color: var(--peach); }
+.syntax-punct { color: var(--overlay1); }
+.syntax-md-heading { color: var(--mauve); font-weight: 700; }
+.syntax-md-marker { color: var(--blue); font-weight: 700; }
+.syntax-md-code {
+  color: var(--green);
+  background: rgba(166, 227, 161, 0.08);
+  border-radius: 3px;
+  padding: 0 2px;
+}
 .log-entry.command-output-group {
   background: rgba(24, 24, 37, 0.42);
 }
@@ -2019,6 +2032,20 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text);
+}
+.diff-log-file-path-wrap {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.diff-log-file-abs-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--overlay1);
+  font-size: 10px;
 }
 .diff-log-file-stats {
   flex-shrink: 0;
@@ -8580,7 +8607,7 @@ async function selectChangesFile(path, options = {}) {
       content.innerHTML = `<span class="changes-empty">${escapeHtml(reason)}</span>`;
       return;
     }
-    content.innerHTML = renderDiffLines(data.diff || '');
+    content.innerHTML = renderDiffLines(data.diff || '', path);
   } catch (e) {
     if (path !== activeChangesFile) return;
     renderChangesDiffHeader(path, changedFiles.get(path), 'Error');
@@ -9613,10 +9640,218 @@ if (document.readyState === 'loading') {
   wireControlPaneListeners();
 }
 
-function renderDiffLines(diffText) {
+const DIFF_LANGUAGE_EXTENSIONS = {
+  js: 'javascript',
+  jsx: 'javascript',
+  mjs: 'javascript',
+  cjs: 'javascript',
+  ts: 'typescript',
+  tsx: 'typescript',
+  rs: 'rust',
+  py: 'python',
+  rb: 'ruby',
+  go: 'go',
+  java: 'java',
+  c: 'c',
+  h: 'c',
+  cc: 'cpp',
+  cpp: 'cpp',
+  cxx: 'cpp',
+  hpp: 'cpp',
+  cs: 'csharp',
+  swift: 'swift',
+  kt: 'kotlin',
+  kts: 'kotlin',
+  php: 'php',
+  sh: 'shell',
+  bash: 'shell',
+  zsh: 'shell',
+  fish: 'shell',
+  ps1: 'shell',
+  json: 'json',
+  jsonl: 'json',
+  toml: 'toml',
+  yaml: 'yaml',
+  yml: 'yaml',
+  md: 'markdown',
+  markdown: 'markdown',
+  css: 'css',
+  scss: 'css',
+  sass: 'css',
+  html: 'html',
+  htm: 'html',
+  xml: 'xml',
+  sql: 'sql',
+};
+
+const DIFF_LANGUAGE_LABELS = {
+  javascript: 'JS',
+  typescript: 'TS',
+  rust: 'Rust',
+  python: 'Python',
+  ruby: 'Ruby',
+  go: 'Go',
+  java: 'Java',
+  c: 'C',
+  cpp: 'C++',
+  csharp: 'C#',
+  swift: 'Swift',
+  kotlin: 'Kotlin',
+  php: 'PHP',
+  shell: 'Shell',
+  json: 'JSON',
+  toml: 'TOML',
+  yaml: 'YAML',
+  markdown: 'Markdown',
+  css: 'CSS',
+  html: 'HTML',
+  xml: 'XML',
+  sql: 'SQL',
+};
+
+const DIFF_COMMON_KEYWORDS = new Set([
+  'as', 'async', 'await', 'break', 'case', 'catch', 'class', 'const',
+  'continue', 'default', 'defer', 'delete', 'do', 'else', 'enum', 'export',
+  'extends', 'false', 'finally', 'for', 'from', 'func', 'function', 'if',
+  'import', 'in', 'interface', 'let', 'match', 'mod', 'mut', 'new', 'nil',
+  'null', 'pub', 'return', 'self', 'static', 'struct', 'switch', 'this',
+  'throw', 'trait', 'true', 'try', 'type', 'undefined', 'use', 'var', 'where',
+  'while',
+]);
+
+function detectDiffLanguage(path) {
+  const clean = String(path || '').split('?')[0].split('#')[0].toLowerCase();
+  const base = clean.split(/[\\/]/).pop() || '';
+  if (base === 'makefile' || base === 'dockerfile') return 'shell';
+  if (base === 'cargo.toml') return 'toml';
+  if (base === 'package.json' || base === 'tsconfig.json') return 'json';
+  const m = base.match(/\.([a-z0-9]+)$/);
+  return m ? (DIFF_LANGUAGE_EXTENSIONS[m[1]] || '') : '';
+}
+
+function diffLanguageLabel(language) {
+  return DIFF_LANGUAGE_LABELS[language] || '';
+}
+
+function spanSyntax(cls, value) {
+  return `<span class="${cls}">${escapeHtml(value)}</span>`;
+}
+
+function highlightMarkdownFragment(src) {
+  let html = escapeHtml(src);
+  html = html.replace(/^(\s{0,3}#{1,6})(\s.*)?$/, '<span class="syntax-md-heading">$1</span>$2');
+  html = html.replace(/^(\s*(?:[-*+]|\d+\.|&gt;))(\s+)/, '<span class="syntax-md-marker">$1</span>$2');
+  html = html.replace(/(`[^`]+`)/g, '<span class="syntax-md-code">$1</span>');
+  html = html.replace(/(\*\*[^*]+\*\*)/g, '<span class="syntax-keyword">$1</span>');
+  return html;
+}
+
+function highlightJsonLikeFragment(src) {
+  let html = escapeHtml(src);
+  html = html.replace(/(&quot;(?:\\.|[^&])*?&quot;)(\s*:)/g, '<span class="output-json-key">$1</span>$2');
+  html = html.replace(/(:\s*)(&quot;(?:\\.|[^&])*?&quot;)/g, '$1<span class="syntax-string">$2</span>');
+  html = html.replace(/\b(true|false|null)\b/g, '<span class="syntax-keyword">$1</span>');
+  html = html.replace(/\b(-?\d+(?:\.\d+)?)\b/g, '<span class="syntax-number">$1</span>');
+  return html;
+}
+
+function highlightProgrammingFragment(src, language) {
+  let html = '';
+  let i = 0;
+  const hashComment = ['python', 'ruby', 'shell', 'toml', 'yaml'].includes(language);
+  const sqlComment = language === 'sql';
+
+  while (i < src.length) {
+    const ch = src[i];
+    const next = src[i + 1] || '';
+
+    if (hashComment && ch === '#') {
+      html += spanSyntax('syntax-comment', src.slice(i));
+      break;
+    }
+    if (sqlComment && ch === '-' && next === '-') {
+      html += spanSyntax('syntax-comment', src.slice(i));
+      break;
+    }
+    if (ch === '/' && next === '/') {
+      html += spanSyntax('syntax-comment', src.slice(i));
+      break;
+    }
+    if (ch === '/' && next === '*') {
+      const end = src.indexOf('*/', i + 2);
+      const stop = end === -1 ? src.length : end + 2;
+      html += spanSyntax('syntax-comment', src.slice(i, stop));
+      i = stop;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const quote = ch;
+      let j = i + 1;
+      while (j < src.length) {
+        if (src[j] === '\\') { j += 2; continue; }
+        if (src[j] === quote) { j++; break; }
+        j++;
+      }
+      html += spanSyntax('syntax-string', src.slice(i, j));
+      i = j;
+      continue;
+    }
+    if (/[0-9]/.test(ch) && (i === 0 || !/[A-Za-z0-9_]/.test(src[i - 1] || ''))) {
+      let j = i + 1;
+      while (j < src.length && /[A-Za-z0-9_.]/.test(src[j])) j++;
+      html += spanSyntax('syntax-number', src.slice(i, j));
+      i = j;
+      continue;
+    }
+    if (/[A-Za-z_$]/.test(ch)) {
+      let j = i + 1;
+      while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j++;
+      const token = src.slice(i, j);
+      const rest = src.slice(j).trimStart();
+      if (DIFF_COMMON_KEYWORDS.has(token)) {
+        html += spanSyntax('syntax-keyword', token);
+      } else if (/^[A-Z][A-Za-z0-9_$]*$/.test(token)) {
+        html += spanSyntax('syntax-type', token);
+      } else if (rest.startsWith('(')) {
+        html += spanSyntax('syntax-fn', token);
+      } else {
+        html += escapeHtml(token);
+      }
+      i = j;
+      continue;
+    }
+    if ('{}[]().,;:'.includes(ch)) {
+      html += spanSyntax('syntax-punct', ch);
+    } else {
+      html += escapeHtml(ch);
+    }
+    i++;
+  }
+  return html;
+}
+
+function highlightDiffCodeFragment(src, language) {
+  if (!language) return escapeHtml(src);
+  if (language === 'markdown') return highlightMarkdownFragment(src);
+  if (language === 'json') return highlightJsonLikeFragment(src);
+  return highlightProgrammingFragment(src, language);
+}
+
+function renderDiffLineCode(line, cls, language) {
+  if (!language || cls.includes('diff-line-file') || cls.includes('diff-line-hunk')) {
+    return escapeHtml(line);
+  }
+  if (line.startsWith('+') || line.startsWith('-') || line.startsWith(' ')) {
+    return escapeHtml(line[0]) + highlightDiffCodeFragment(line.slice(1), language);
+  }
+  return highlightDiffCodeFragment(line, language);
+}
+
+function renderDiffLines(diffText, path = '') {
   if (!diffText) return '<span class="changes-empty">No changes</span>';
   let oldLine = null;
   let newLine = null;
+  const language = detectDiffLanguage(path);
   const lines = diffText.endsWith('\n') ? diffText.slice(0, -1).split('\n') : diffText.split('\n');
   return lines.map(line => {
     let cls = 'diff-line diff-line-ctx';
@@ -9643,7 +9878,7 @@ function renderDiffLines(diffText) {
       if (newLine !== null) newNo = String(newLine++);
     }
 
-    return `<span class="${cls}"><span class="diff-old">${oldNo}</span><span class="diff-new">${newNo}</span><span class="diff-code">${escapeHtml(line)}</span></span>`;
+    return `<span class="${cls}"><span class="diff-old">${oldNo}</span><span class="diff-new">${newNo}</span><span class="diff-code">${renderDiffLineCode(line, cls, language)}</span></span>`;
   }).join('');
 }
 
@@ -9653,6 +9888,13 @@ function normalizeDiffPath(raw) {
   return path
     .replace(/^"|"$/g, '')
     .replace(/^(a|b)\//, '');
+}
+
+function parseDiffMetadataLine(line) {
+  const m = String(line || '').match(/^# intendant-(project-root|cwd):\s*(.*)$/);
+  if (!m) return null;
+  const key = m[1] === 'project-root' ? 'projectRoot' : 'cwd';
+  return { key, value: m[2].trim() };
 }
 
 function parseDiffGitLine(line) {
@@ -9680,6 +9922,7 @@ function createParsedDiffFile(oldPath = '', newPath = '') {
 function parseUnifiedDiff(diffText) {
   const text = String(diffText || '');
   const files = [];
+  const metadata = {};
   let current = null;
   const lines = text.endsWith('\n') ? text.slice(0, -1).split('\n') : text.split('\n');
   const pushFile = (oldPath = '', newPath = '') => {
@@ -9690,6 +9933,11 @@ function parseUnifiedDiff(diffText) {
   const ensureFile = () => current || pushFile();
 
   for (const line of lines) {
+    const meta = parseDiffMetadataLine(line);
+    if (meta) {
+      metadata[meta.key] = meta.value;
+      continue;
+    }
     if (line.startsWith('diff --git ')) {
       const parsed = parseDiffGitLine(line);
       pushFile(parsed.oldPath, parsed.newPath).lines.push(line);
@@ -9722,7 +9970,13 @@ function parseUnifiedDiff(diffText) {
   const visibleFiles = files.filter(file => file.lines.length > 0);
   const totalAdded = visibleFiles.reduce((sum, file) => sum + file.added, 0);
   const totalRemoved = visibleFiles.reduce((sum, file) => sum + file.removed, 0);
-  return { files: visibleFiles, added: totalAdded, removed: totalRemoved };
+  return {
+    files: visibleFiles,
+    added: totalAdded,
+    removed: totalRemoved,
+    projectRoot: metadata.projectRoot || '',
+    cwd: metadata.cwd || '',
+  };
 }
 
 function diffLogContent(c) {
@@ -9759,7 +10013,40 @@ function diffLogSummaryHtml(parsed) {
     + (pathText ? `<span class="diff-log-summary-paths" title="${escapeHtml(paths.join(', '))}">${escapeHtml(pathText)}</span>` : '');
 }
 
-function renderDiffLogBody(body, parsed) {
+function isAbsolutePath(path) {
+  const value = String(path || '');
+  return value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+function joinPathForDisplay(root, path) {
+  const base = String(root || '').replace(/[\\/]+$/, '');
+  const rel = String(path || '').replace(/^[\\/]+/, '');
+  if (!base || !rel) return '';
+  const sep = /^[A-Za-z]:[\\/]/.test(base) ? '\\' : '/';
+  return `${base}${sep}${rel}`;
+}
+
+function projectRootForDiff(parsed, options = {}) {
+  if (parsed?.projectRoot) return parsed.projectRoot;
+  if (options.projectRoot) return options.projectRoot;
+  const sid = String(options.sessionId || '').trim();
+  if (sid) {
+    const meta = sessionMetadataById.get(sid) || {};
+    if (meta.projectRoot) return meta.projectRoot;
+    if (meta.cwd) return meta.cwd;
+  }
+  return '';
+}
+
+function absolutePathForDiffFile(file, parsed, options = {}) {
+  const path = file.path || file.newPath || file.oldPath || '';
+  if (!path) return '';
+  if (isAbsolutePath(path)) return path;
+  const root = projectRootForDiff(parsed, options);
+  return root ? joinPathForDisplay(root, path) : '';
+}
+
+function renderDiffLogBody(body, parsed, options = {}) {
   body.innerHTML = '';
   const files = parsed.files && parsed.files.length ? parsed.files : [createParsedDiffFile('', '')];
   for (const file of files) {
@@ -9768,20 +10055,33 @@ function renderDiffLogBody(body, parsed) {
 
     const header = document.createElement('div');
     header.className = 'diff-log-file-header';
+    const pathWrap = document.createElement('span');
+    pathWrap.className = 'diff-log-file-path-wrap';
     const path = document.createElement('span');
     path.className = 'diff-log-file-path';
     path.textContent = file.path || 'diff';
-    path.title = [file.oldPath, file.newPath].filter(Boolean).join(' -> ') || file.path || 'diff';
+    const absolutePath = absolutePathForDiffFile(file, parsed, options);
+    path.title = [file.oldPath, file.newPath].filter(Boolean).join(' -> ') || absolutePath || file.path || 'diff';
+    pathWrap.appendChild(path);
+    if (absolutePath) {
+      const absolute = document.createElement('span');
+      absolute.className = 'diff-log-file-abs-path';
+      absolute.textContent = absolutePath;
+      absolute.title = absolutePath;
+      pathWrap.appendChild(absolute);
+    }
     const stats = document.createElement('span');
     stats.className = 'diff-log-file-stats';
-    stats.textContent = `+${file.added || 0} / -${file.removed || 0}`;
-    header.appendChild(path);
+    const language = detectDiffLanguage(file.path || file.newPath || file.oldPath || '');
+    const languageLabel = diffLanguageLabel(language);
+    stats.textContent = `${languageLabel ? `${languageLabel} · ` : ''}+${file.added || 0} / -${file.removed || 0}`;
+    header.appendChild(pathWrap);
     header.appendChild(stats);
     fileEl.appendChild(header);
 
     const lines = document.createElement('pre');
     lines.className = 'diff-log-lines';
-    lines.innerHTML = renderDiffLines((file.lines || []).join('\n'));
+    lines.innerHTML = renderDiffLines((file.lines || []).join('\n'), file.path || file.newPath || file.oldPath || '');
     fileEl.appendChild(lines);
     body.appendChild(fileEl);
   }
@@ -11725,7 +12025,7 @@ function renderDiffLogEntry(c) {
   summary.innerHTML = diffLogSummaryHtml(parsed);
   const body = document.createElement('span');
   body.className = 'diff-log-body';
-  renderDiffLogBody(body, parsed);
+  renderDiffLogBody(body, parsed, { sessionId: c.session_id || '' });
   wrap.appendChild(summary);
   wrap.appendChild(body);
 
@@ -24268,7 +24568,7 @@ function renderSessionDetailEntries(entries, el) {
       summary.innerHTML = diffLogSummaryHtml(parsed);
       const body = document.createElement('span');
       body.className = 'diff-log-body';
-      renderDiffLogBody(body, parsed);
+      renderDiffLogBody(body, parsed, { sessionId: e.session_id || '' });
       wrap.appendChild(summary);
       wrap.appendChild(body);
       const toggle = document.createElement('span');

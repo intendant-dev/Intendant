@@ -1964,15 +1964,20 @@ async fn drain_external_agent_events(
                             files.join(", ")
                         )
                     };
+                    let diff_content = format!(
+                        "# intendant-project-root: {}\n{}",
+                        config.project_root.display(),
+                        delta.unified_diff
+                    );
                     slog(config.session_log, |l| {
-                        l.info(&format!("{}\n{}", header, delta.unified_diff));
+                        l.info(&format!("{}\n{}", header, diff_content));
                     });
                     if !delta.unified_diff.trim().is_empty() {
                         config.bus.send(AppEvent::LogEntry {
                             session_id: config.session_id.clone(),
                             level: "info".to_string(),
                             source: "Diff".to_string(),
-                            content: delta.unified_diff,
+                            content: diff_content,
                             turn: None,
                         });
                     }
