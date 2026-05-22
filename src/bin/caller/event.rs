@@ -837,13 +837,13 @@ pub enum ControlMsg {
     },
     /// Invoke one of Codex's thread-level actions against the persistent
     /// agent. Mirrors the raw-codex slash-command surface: `/new`, `/compact`,
-    /// `/fork`, `/undo`, `/review`, `/rename`, `/goal`, `/init`,
+    /// `/fork`, `/side`, `/undo`, `/review`, `/rename`, `/goal`, `/init`,
     /// `/memory-reset`. Applies immediately (not "next task") because Codex's
     /// app-server accepts these as mid-session RPCs.
     ///
     /// `params` is a free-form JSON object whose shape depends on `op`:
-    /// `/fork` accepts `{"name": "..."}`, `/undo` accepts `{"turns": N}`,
-    /// `/review` accepts `{"prompt": "..."}`, `/rename` accepts
+    /// `/fork` accepts `{"name": "..."}`, `/side` accepts `{"prompt": "..."}`,
+    /// `/undo` accepts `{"turns": N}`, `/review` accepts `{"prompt": "..."}`, `/rename` accepts
     /// `{"name": "..."}`, `/goal` accepts `{"objective": "...",
     /// "tokenBudget": N, "status": "active|paused|budgetLimited|complete"}`,
     /// and the rest ignore params. Callers that don't need params may omit the

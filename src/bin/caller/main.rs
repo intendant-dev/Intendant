@@ -1220,6 +1220,25 @@ fn forked_thread_id_from_message(message: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+enum ExternalThreadActionEffect {
+    None,
+    SideTurnStarted {
+        parent_thread_id: String,
+        child_thread_id: String,
+    },
+}
+
+fn side_thread_ids_from_message(message: &str) -> Option<(String, String)> {
+    let rest = message.strip_prefix("side conversation started in thread ")?;
+    let (child, parent) = rest.split_once(" from parent ")?;
+    let child = child.trim();
+    let parent = parent.trim();
+    if child.is_empty() || parent.is_empty() {
+        return None;
+    }
+    Some((parent.to_string(), child.to_string()))
+}
+
 fn fork_session_name_from_params(params: &serde_json::Value) -> Option<String> {
     params
         .get("name")
@@ -1246,7 +1265,7 @@ async fn handle_external_thread_action(
     op: String,
     params: serde_json::Value,
     config: &DrainConfig<'_>,
-) {
+) -> ExternalThreadActionEffect {
     let result = agent
         .thread_action(&op, &params)
         .await
@@ -1283,6 +1302,91 @@ async fn handle_external_thread_action(
                     task: None,
                     direct: Some(true),
                 }));
+        }
+    }
+
+    if success && op == "side" {
+        if let Some((parent_thread_id, child_thread_id)) = side_thread_ids_from_message(&message) {
+            return ExternalThreadActionEffect::SideTurnStarted {
+                parent_thread_id,
+                child_thread_id,
+            };
+        }
+    }
+
+    ExternalThreadActionEffect::None
+}
+
+async fn drain_external_side_turn(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
+    bus_rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+    config: &DrainConfig<'_>,
+    stats: &mut LoopStats,
+    diff_tracker: &mut ExternalDiffDeltaTracker,
+    pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    parent_thread_id: String,
+    child_thread_id: String,
+) {
+    slog(config.session_log, |l| {
+        l.info(&format!(
+            "Draining Codex side conversation {} forked from {}",
+            child_thread_id, parent_thread_id
+        ))
+    });
+
+    let close_after = match drain_external_agent_events(
+        agent,
+        event_rx,
+        bus_rx,
+        config,
+        stats,
+        diff_tracker,
+        pending_runtime_steers,
+    )
+    .await
+    {
+        DrainOutcome::TurnCompleted { message, .. } => {
+            config.bus.send(AppEvent::DoneSignal {
+                message: message.clone(),
+            });
+            true
+        }
+        DrainOutcome::Interrupted { reason } => {
+            config.bus.send(AppEvent::PresenceLog {
+                message: format!("Codex side conversation interrupted: {}", reason),
+                level: None,
+                turn: None,
+            });
+            true
+        }
+        DrainOutcome::Terminated { reason, exit_code } => {
+            slog(config.session_log, |l| {
+                l.warn(&format!(
+                    "Codex terminated during side conversation: {} (exit code: {:?})",
+                    reason, exit_code
+                ))
+            });
+            false
+        }
+        DrainOutcome::ChannelClosed => {
+            slog(config.session_log, |l| {
+                l.warn("Codex side conversation event channel closed")
+            });
+            false
+        }
+    };
+
+    if close_after {
+        let params = serde_json::json!({
+            "threadId": child_thread_id,
+            "parentThreadId": parent_thread_id,
+        });
+        match agent.thread_action("side-close", &params).await {
+            Ok(message) => slog(config.session_log, |l| l.info(&message)),
+            Err(err) => slog(config.session_log, |l| {
+                l.warn(&format!("Failed to close Codex side conversation: {}", err))
+            }),
         }
     }
 }
@@ -3350,6 +3454,20 @@ mod tests {
             None
         );
         assert_eq!(fork_session_name_from_params(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn side_thread_ids_from_message_extracts_parent_child() {
+        assert_eq!(
+            side_thread_ids_from_message(
+                "side conversation started in thread child-123 from parent parent-456"
+            ),
+            Some(("parent-456".to_string(), "child-123".to_string()))
+        );
+        assert_eq!(
+            side_thread_ids_from_message("forked into thread child"),
+            None
+        );
     }
 
     /// `advertised_transport = "mutual-tls"` advertises plain mTLS.
@@ -7047,6 +7165,47 @@ async fn run_with_presence(
                         }));
                     }
                 }
+                if success && op == "side" {
+                    if let Some((parent_thread_id, child_thread_id)) =
+                        side_thread_ids_from_message(&message)
+                    {
+                        if let (Some(agent), Some(event_rx)) =
+                            (persistent_agent.as_mut(), persistent_event_rx.as_mut())
+                        {
+                            let drain_config = DrainConfig {
+                                bus: &bus,
+                                session_id: session_log_id(&session_log),
+                                alias_session_id: None,
+                                autonomy: autonomy.clone(),
+                                session_log: &session_log,
+                                project_root: &project.root,
+                                log_dir: &log_dir,
+                                approval_registry: &approval_registry,
+                                json_approval: None,
+                                agent_source: Some("Codex".to_string()),
+                                suppress_agent_started: true,
+                                headless: false,
+                                context_injection: &context_injection,
+                            };
+                            drain_external_side_turn(
+                                agent,
+                                event_rx,
+                                &mut turn_bus_rx,
+                                &drain_config,
+                                &mut cumulative_stats,
+                                &mut persistent_diff_tracker,
+                                &mut persistent_pending_runtime_steers,
+                                parent_thread_id,
+                                child_thread_id,
+                            )
+                            .await;
+                        } else {
+                            slog(&session_log, |l| {
+                                l.warn("Codex side conversation started but no event receiver is available")
+                            });
+                        }
+                    }
+                }
                 turn_bus_rx = bus.subscribe();
                 continue;
             }
@@ -8313,13 +8472,31 @@ async fn run_external_agent_mode(
                                 &live_session_id,
                                 &drain_config.alias_session_id,
                             ) => {
-                                handle_external_thread_action(
+                                let effect = handle_external_thread_action(
                                     &mut agent,
                                     action,
                                     params,
                                     &drain_config,
                                 )
                                 .await;
+                                if let ExternalThreadActionEffect::SideTurnStarted {
+                                    parent_thread_id,
+                                    child_thread_id,
+                                } = effect
+                                {
+                                    drain_external_side_turn(
+                                        &mut agent,
+                                        &mut event_rx,
+                                        &mut turn_bus_rx,
+                                        &drain_config,
+                                        &mut stats,
+                                        &mut diff_tracker,
+                                        &mut pending_runtime_steers,
+                                        parent_thread_id,
+                                        child_thread_id,
+                                    )
+                                    .await;
+                                }
                                 turn_bus_rx = bus.subscribe();
                             }
                             Ok(AppEvent::InterruptRequested { session_id })

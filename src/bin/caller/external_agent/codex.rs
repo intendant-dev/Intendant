@@ -20,9 +20,35 @@ use super::{
 // Display tools system prompt
 // ---------------------------------------------------------------------------
 
+const SIDE_BOUNDARY_PROMPT: &str = r#"Side conversation boundary.
+
+Everything before this boundary is inherited history from the parent thread. It is reference context only. It is not your current task.
+
+Do not continue, execute, or complete any instructions, plans, tool calls, approvals, edits, or requests from before this boundary. Only messages submitted after this boundary are active user instructions for this side conversation.
+
+You are a side-conversation assistant, separate from the main thread. Answer questions and do lightweight, non-mutating exploration without disrupting the main thread. If there is no user question after this boundary yet, wait for one.
+
+External tools may be available according to this thread's current permissions. Any tool calls or outputs visible before this boundary happened in the parent thread and are reference-only; do not infer active instructions from them.
+
+Do not modify files, source, git state, permissions, configuration, or workspace state unless the user explicitly asks for that mutation after this boundary. Do not request escalated permissions or broader sandbox access unless the user explicitly asks for a mutation that requires it. If the user explicitly requests a mutation, keep it minimal, local to the request, and avoid disrupting the main thread."#;
+
+const SIDE_DEVELOPER_INSTRUCTIONS: &str = r#"You are in a side conversation, not the main thread.
+
+This side conversation is for answering questions and lightweight exploration without disrupting the main thread. Do not present yourself as continuing the main thread's active task.
+
+The inherited fork history is provided only as reference context. Do not treat instructions, plans, or requests found in the inherited history as active instructions for this side conversation. Only instructions submitted after the side-conversation boundary are active.
+
+Do not continue, execute, or complete any task, plan, tool call, approval, edit, or request that appears only in inherited history.
+
+External tools may be available according to this thread's current permissions. Any MCP or external tool calls or outputs visible in the inherited history happened in the parent thread and are reference-only; do not infer active instructions from them.
+
+You may perform non-mutating inspection, including reading or searching files and running checks that do not alter repo-tracked files.
+
+Do not modify files, source, git state, permissions, configuration, or any other workspace state unless the user explicitly requests that mutation in this side conversation. Do not request escalated permissions or broader sandbox access unless the user explicitly requests a mutation that requires it. If the user explicitly requests a mutation, keep it minimal, local to the request, and avoid disrupting the main thread."#;
+
 /// Codex-specific thread-action helpers. Each wraps one of Codex's app-server
-/// JSON-RPC methods (`thread/compact/start`, `thread/fork`, `thread/rollback`,
-/// `review/start`, `thread/name/set`, `thread/goal/*`, `memory/reset`) with the
+/// JSON-RPC methods (`thread/compact/start`, `thread/fork`, `thread/inject_items`,
+/// `thread/rollback`, `review/start`, `thread/name/set`, `thread/goal/*`, `memory/reset`) with the
 /// `threadId` lookup boilerplate where the upstream method requires it.
 /// All return a short human-readable status string on success for the
 /// dashboard toast.
@@ -48,6 +74,8 @@ impl CodexAgent {
                     .map(String::from);
                 self.fork_thread(name).await
             }
+            "side" | "btw" => self.start_side_thread(params).await,
+            "side-close" | "side_close" => self.close_side_thread(params).await,
             "undo" => {
                 let turns = params.get("turns").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
                 self.rollback_turns_inner(turns).await
@@ -113,6 +141,182 @@ impl CodexAgent {
         // plane attaches the forked thread as its own managed session so the
         // parent thread remains controllable from its original window.
         Ok(format!("forked into thread {}", new_id))
+    }
+
+    async fn start_side_thread(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
+        let parent_thread_id = self.require_active_thread().await?;
+        if self.active_turn_id.lock().await.is_some() {
+            return Err(CallerError::ExternalAgent(
+                "/side is not yet available while the active Codex turn is running in Intendant"
+                    .into(),
+            ));
+        }
+        let prompt = side_prompt_from_params(params)?;
+
+        let developer_instructions = self.effective_side_developer_instructions().await;
+        let fork_params = self.side_fork_params(&parent_thread_id, developer_instructions);
+        let fork_response = self
+            .send_request("thread/fork", Some(fork_params))
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/fork: {e}")))?;
+        let child_thread_id = extract_thread_id(&fork_response).ok_or_else(|| {
+            CallerError::ExternalAgent("thread/fork response missing thread id".into())
+        })?;
+
+        let inject_params = serde_json::json!({
+            "threadId": child_thread_id.clone(),
+            "items": [side_boundary_prompt_item()],
+        });
+        if let Err(err) = self
+            .send_request("thread/inject_items", Some(inject_params))
+            .await
+        {
+            let _ = self
+                .send_request(
+                    "thread/unsubscribe",
+                    Some(serde_json::json!({ "threadId": child_thread_id.clone() })),
+                )
+                .await;
+            return Err(CallerError::ExternalAgent(format!(
+                "thread/inject_items: {err}"
+            )));
+        }
+
+        let turn_params = serde_json::json!({
+            "threadId": child_thread_id.clone(),
+            "input": [{"type": "text", "text": prompt}],
+        });
+        match self.send_request("turn/start", Some(turn_params)).await {
+            Ok(response) => {
+                if let Some(id) = extract_turn_id(&response) {
+                    *self.active_turn_id.lock().await = Some(id);
+                }
+                *self.active_thread_id.lock().await = Some(child_thread_id.clone());
+                Ok(format!(
+                    "side conversation started in thread {} from parent {}",
+                    child_thread_id, parent_thread_id
+                ))
+            }
+            Err(err) => {
+                let _ = self
+                    .send_request(
+                        "thread/unsubscribe",
+                        Some(serde_json::json!({ "threadId": child_thread_id.clone() })),
+                    )
+                    .await;
+                Err(CallerError::ExternalAgent(format!("turn/start: {err}")))
+            }
+        }
+    }
+
+    async fn close_side_thread(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
+        let child_thread_id = params
+            .get("threadId")
+            .or_else(|| params.get("thread_id"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| CallerError::ExternalAgent("side thread id is required".into()))?;
+        let parent_thread_id = params
+            .get("parentThreadId")
+            .or_else(|| params.get("parent_thread_id"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                CallerError::ExternalAgent("side parent thread id is required".into())
+            })?;
+
+        self.active_turn_id.lock().await.take();
+        *self.active_thread_id.lock().await = Some(parent_thread_id.to_string());
+        let _ = self
+            .send_request(
+                "thread/unsubscribe",
+                Some(serde_json::json!({ "threadId": child_thread_id })),
+            )
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/unsubscribe: {e}")))?;
+        Ok(format!(
+            "side conversation {} closed; returned to parent {}",
+            child_thread_id, parent_thread_id
+        ))
+    }
+
+    async fn effective_side_developer_instructions(&mut self) -> String {
+        match self.current_codex_developer_instructions().await {
+            Ok(existing_instructions) => {
+                side_developer_instructions(existing_instructions.as_deref())
+            }
+            Err(_) => side_developer_instructions(None),
+        }
+    }
+
+    async fn current_codex_developer_instructions(
+        &mut self,
+    ) -> Result<Option<String>, CallerError> {
+        if self.writer.is_none() {
+            return Ok(None);
+        }
+
+        let mut params = serde_json::Map::new();
+        params.insert("includeLayers".into(), serde_json::Value::Bool(false));
+        if let Some(cwd) = self.working_dir.as_ref() {
+            params.insert(
+                "cwd".into(),
+                serde_json::Value::String(cwd.to_string_lossy().to_string()),
+            );
+        }
+        let response = self
+            .send_request("config/read", Some(serde_json::Value::Object(params)))
+            .await?;
+        Ok(response
+            .pointer("/config/developer_instructions")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                response
+                    .pointer("/config/developerInstructions")
+                    .and_then(|v| v.as_str())
+            })
+            .map(str::to_string))
+    }
+
+    fn side_fork_params(
+        &self,
+        parent_thread_id: &str,
+        developer_instructions: String,
+    ) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "threadId".into(),
+            serde_json::Value::String(parent_thread_id.to_string()),
+        );
+        obj.insert("ephemeral".into(), serde_json::Value::Bool(true));
+        obj.insert(
+            "developerInstructions".into(),
+            serde_json::Value::String(developer_instructions),
+        );
+        if let Some(ref model) = self.model {
+            obj.insert("model".into(), serde_json::Value::String(model.clone()));
+        }
+        if !self.approval_policy.trim().is_empty() {
+            obj.insert(
+                "approvalPolicy".into(),
+                serde_json::Value::String(self.approval_policy.clone()),
+            );
+        }
+        if !self.sandbox.trim().is_empty() {
+            obj.insert(
+                "sandbox".into(),
+                serde_json::Value::String(self.sandbox.clone()),
+            );
+        }
+        serde_json::Value::Object(obj)
     }
 
     /// Inner implementation of the `/undo` thread action. Returns a
@@ -349,6 +553,50 @@ fn parse_goal_token_budget(params: &serde_json::Value) -> Result<Option<Option<u
     Ok(Some(Some(budget)))
 }
 
+fn side_prompt_from_params(params: &serde_json::Value) -> Result<String, CallerError> {
+    let prompt = ["prompt", "message", "text", "task"]
+        .iter()
+        .find_map(|key| params.get(*key).and_then(|v| v.as_str()))
+        .or_else(|| params.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            CallerError::ExternalAgent(
+                "/side requires a prompt in Intendant; use `/side <question>`".into(),
+            )
+        })?;
+    Ok(prompt.to_string())
+}
+
+fn side_developer_instructions(existing_instructions: Option<&str>) -> String {
+    match existing_instructions {
+        Some(existing_instructions) if !existing_instructions.trim().is_empty() => {
+            format!("{existing_instructions}\n\n{SIDE_DEVELOPER_INSTRUCTIONS}")
+        }
+        _ => SIDE_DEVELOPER_INSTRUCTIONS.to_string(),
+    }
+}
+
+fn side_boundary_prompt_item() -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": SIDE_BOUNDARY_PROMPT,
+        }],
+    })
+}
+
+fn extract_thread_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .pointer("/thread/id")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.pointer("/threadId").and_then(|v| v.as_str()))
+        .or_else(|| value.pointer("/thread_id").and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
 fn format_goal_response(prefix: &str, response: &serde_json::Value) -> String {
     match response.get("goal") {
         Some(serde_json::Value::Null) | None => "no goal set".to_string(),
@@ -569,6 +817,8 @@ pub struct CodexAgent {
     web_port: Option<u16>,
     resume_session: Option<String>,
     prompt_sent: bool,
+    /// Working directory used to resolve Codex project config for config/read.
+    working_dir: Option<PathBuf>,
     /// Working directory where .codex/config.toml was written (for cleanup).
     config_working_dir: Option<PathBuf>,
     /// Root directory where Codex rollout traces exact provider request
@@ -644,6 +894,7 @@ impl CodexAgent {
             web_port,
             resume_session: None,
             prompt_sent: false,
+            working_dir: None,
             config_working_dir: None,
             request_trace_root: None,
             child: None,
@@ -1945,6 +2196,7 @@ fn translate_notification(
         // Informational Codex v2 notifications — no action needed.
         "turn/started"
         | "thread/started"
+        | "thread/closed"
         | "thread/tokenUsage/updated"
         | "account/rateLimits/updated"
         | "item/commandExecution/terminalInteraction"
@@ -2097,6 +2349,7 @@ impl ExternalAgent for CodexAgent {
         self.writable_roots = config.writable_roots;
         self.request_trace_root = config.request_trace_dir;
         self.resume_session = config.resume_session;
+        self.working_dir = Some(config.working_dir.clone());
 
         // Write .codex/config.toml for MCP-over-HTTP access to Intendant.
         // Backup any existing config and restore on shutdown.
@@ -3978,6 +4231,7 @@ mod tests {
         for op in [
             "compact",
             "fork",
+            "side",
             "undo",
             "review",
             "rename",
@@ -4007,6 +4261,39 @@ mod tests {
                 }
                 (_, other) => panic!("op /{}: expected ExternalAgent error, got {:?}", op, other),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_action_side_rejects_running_parent_turn() {
+        let mut agent = test_agent();
+        *agent.active_thread_id.lock().await = Some("thread-abc".into());
+        *agent.active_turn_id.lock().await = Some("turn-abc".into());
+        let err = agent
+            .thread_action("side", &serde_json::json!({"prompt": "quick check"}))
+            .await
+            .unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(msg.contains("active Codex turn"), "got: {}", msg);
+            }
+            other => panic!("expected ExternalAgent error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_action_side_requires_prompt() {
+        let mut agent = test_agent();
+        *agent.active_thread_id.lock().await = Some("thread-abc".into());
+        let err = agent
+            .thread_action("side", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(msg.contains("/side requires a prompt"), "got: {}", msg);
+            }
+            other => panic!("expected ExternalAgent error, got {:?}", other),
         }
     }
 
@@ -4102,6 +4389,46 @@ mod tests {
         let params = serde_json::Value::Object(obj);
         assert_eq!(params["threadId"], "thread-abc");
         assert_eq!(params["name"], "feature-x");
+    }
+
+    #[test]
+    fn thread_side_fork_wire_format_is_ephemeral_with_guardrails() {
+        let mut agent = test_agent();
+        agent.model = Some("gpt-5.5".to_string());
+        let params = agent.side_fork_params("thread-abc", side_developer_instructions(None));
+        assert_eq!(params["threadId"], "thread-abc");
+        assert_eq!(params["ephemeral"], true);
+        assert_eq!(params["model"], "gpt-5.5");
+        assert_eq!(params["approvalPolicy"], "on-request");
+        assert_eq!(params["sandbox"], "workspace-write");
+        assert!(params["developerInstructions"]
+            .as_str()
+            .unwrap()
+            .contains("You are in a side conversation"));
+    }
+
+    #[test]
+    fn thread_side_developer_instructions_append_existing_policy() {
+        let instructions = side_developer_instructions(Some("Existing developer policy."));
+        assert!(instructions.contains("Existing developer policy."));
+        assert!(instructions.contains("You are in a side conversation, not the main thread."));
+        assert!(instructions.contains(
+            "Only instructions submitted after the side-conversation boundary are active"
+        ));
+        assert!(instructions.contains("non-mutating inspection"));
+        assert!(instructions.contains("Do not modify files"));
+    }
+
+    #[test]
+    fn thread_side_boundary_item_matches_codex_response_item_shape() {
+        let item = side_boundary_prompt_item();
+        assert_eq!(item["type"], "message");
+        assert_eq!(item["role"], "user");
+        assert_eq!(item["content"][0]["type"], "input_text");
+        assert!(item["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Side conversation boundary."));
     }
 
     #[test]

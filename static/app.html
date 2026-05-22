@@ -5875,6 +5875,7 @@ html, body {
                   <button class="control-action-btn" data-codex-action="compact" title="Compact conversation history to free context (/compact)">Compact</button>
                   <button class="control-action-btn" data-codex-action="undo" data-turns="1" title="Roll back the last turn (/undo)">Undo</button>
                   <button class="control-action-btn" data-codex-action="fork" data-prompt-name="1" title="Fork the current thread into a new branch (/fork)">Fork…</button>
+                  <button class="control-action-btn" data-codex-action="side" data-prompt-side="1" title="Ask a side question in an ephemeral Codex fork (/side)">Side…</button>
                   <button class="control-action-btn" data-codex-action="review" data-prompt-review="1" title="Review pending changes (/review)">Review…</button>
                   <button class="control-action-btn" data-codex-action="rename" data-prompt-rename="1" title="Rename the current Codex thread (/rename)">Rename…</button>
                   <button class="control-action-btn" data-codex-action="goal" data-prompt-goal="1" title="Create or update the persisted Codex thread goal (/goal)">Goal…</button>
@@ -9441,6 +9442,12 @@ function parseCodexSlashCommand(text) {
     if (forkName) params.name = forkName;
     return { op: 'fork', params };
   }
+  if (name === 'side' || name === 'btw') {
+    const params = {};
+    const prompt = unquoteSlashValue(rest);
+    if (prompt) params.prompt = prompt;
+    return { op: 'side', params };
+  }
   if (name === 'goal') return parseGoalSlash(rest);
   return null;
 }
@@ -9530,6 +9537,14 @@ function promptCodexThreadActionParams(opts = {}) {
     const name = window.prompt('Fork name (leave empty for auto):', '');
     if (name === null) return null;
     if (name.trim()) params.name = name.trim();
+  } else if (opts.promptSide) {
+    const prompt = window.prompt('Side prompt:', '');
+    if (prompt === null) return null;
+    if (!prompt.trim()) {
+      showControlToast('error', '/side failed: prompt is required');
+      return null;
+    }
+    params.prompt = prompt.trim();
   } else if (opts.promptReview) {
     const prompt = window.prompt(
       'Review prompt (leave empty to review current changes with Codex defaults):',
@@ -9582,6 +9597,7 @@ function onControlActionBtnClick(ev) {
   if (!op) return;
   const params = promptCodexThreadActionParams({
     promptName: btn.dataset.promptName,
+    promptSide: btn.dataset.promptSide,
     promptReview: btn.dataset.promptReview,
     promptRename: btn.dataset.promptRename,
     promptGoal: btn.dataset.promptGoal,
@@ -11062,6 +11078,7 @@ const SESSION_WINDOW_GENERIC_ACTIONS = [
 
 const SESSION_WINDOW_CODEX_ACTIONS = [
   { op: 'fork', label: 'Fork...', title: 'Fork this Codex thread', promptName: true },
+  { op: 'side', label: 'Side...', title: 'Ask a side question in an ephemeral Codex fork', promptSide: true },
   { op: 'goal', label: 'Configure goal...', title: 'Create or update this thread goal', promptGoal: true },
   { op: 'goal-get', label: 'Goal status', title: 'Fetch this thread goal' },
   { op: 'compact', label: 'Compact', title: 'Compact this thread history' },
