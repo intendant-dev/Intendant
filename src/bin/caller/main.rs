@@ -57,6 +57,7 @@ use conversation::Conversation;
 use error::CallerError;
 use event::{AppEvent, EventBus};
 use project::Project;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -528,6 +529,24 @@ fn gemini_runtime_config_equal(
         && a.debug == b.debug
 }
 
+fn normalize_diff_file_path(path: &str) -> Option<String> {
+    let path = path.split('\t').next().unwrap_or(path).trim();
+    if path == "/dev/null" {
+        return None;
+    }
+    // Strip exactly one git-style `a/` or `b/` prefix. Codex sometimes
+    // produces `b//home/...` (double slash) for absolute paths; that
+    // becomes `/home/...` after the single-prefix strip.
+    let path = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.to_string())
+}
+
 /// Extract file paths from a unified-diff header. Reads `+++ b/<path>` lines
 /// (git-style), with `--- a/<path>` used as a fallback for pure-delete diffs
 /// where the `+++` side is `/dev/null`. Deduplicates while preserving order.
@@ -545,28 +564,256 @@ fn parse_diff_file_paths(unified_diff: &str) -> Vec<String> {
         } else {
             continue;
         };
-        // Drop optional tab-separated timestamp/metadata, trim whitespace.
-        let path = path.split('\t').next().unwrap_or(path).trim();
-        if path == "/dev/null" {
-            continue;
-        }
-        // Strip exactly one git-style `a/` or `b/` prefix. Codex sometimes
-        // produces `b//home/...` (double slash) for absolute paths; that
-        // becomes `/home/...` after the single-prefix strip, which is
-        // exactly what we want.
-        let path = path
-            .strip_prefix("a/")
-            .or_else(|| path.strip_prefix("b/"))
-            .unwrap_or(path);
-        if path.is_empty() {
-            continue;
-        }
-        let owned = path.to_string();
-        if !out.iter().any(|p| p == &owned) {
-            out.push(owned);
+        if let Some(path) = normalize_diff_file_path(path) {
+            if !out.iter().any(|p| p == &path) {
+                out.push(path);
+            }
         }
     }
     out
+}
+
+fn diff_line_text(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
+}
+
+fn is_unified_file_boundary(lines: &[&str], idx: usize) -> bool {
+    let line = diff_line_text(lines[idx]);
+    line.starts_with("diff --git ")
+        || (line.starts_with("--- ")
+            && lines
+                .get(idx + 1)
+                .is_some_and(|next| diff_line_text(next).starts_with("+++ ")))
+}
+
+fn split_unified_diff_by_file(unified_diff: &str) -> Vec<(String, String)> {
+    if unified_diff.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines: Vec<&str> = unified_diff.split_inclusive('\n').collect();
+    if lines.is_empty() {
+        lines.push(unified_diff);
+    }
+
+    let mut starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            diff_line_text(line)
+                .starts_with("diff --git ")
+                .then_some(idx)
+        })
+        .collect();
+    if starts.is_empty() {
+        for idx in 0..lines.len() {
+            if is_unified_file_boundary(&lines, idx) {
+                starts.push(idx);
+            }
+        }
+    }
+    if starts.is_empty() {
+        let files = parse_diff_file_paths(unified_diff);
+        return files
+            .into_iter()
+            .next()
+            .map(|path| vec![(path, unified_diff.to_string())])
+            .unwrap_or_default();
+    }
+
+    let mut out = Vec::new();
+    for (i, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(lines.len());
+        let block = lines[start..end].concat();
+        if let Some(path) = parse_diff_file_paths(&block).into_iter().next() {
+            out.push((path, block));
+        }
+    }
+    out
+}
+
+fn external_diff_log_body(message: &str) -> Option<&str> {
+    if !message.starts_with("External agent diff") {
+        return None;
+    }
+    let first_line_end = message.find('\n')?;
+    let body = &message[first_line_end + 1..];
+    if body.contains("diff --git ") || body.contains("--- ") || body.contains("@@ ") {
+        Some(body)
+    } else {
+        None
+    }
+}
+
+fn parse_session_diff_file_paths(log_dir: &Path) -> Vec<String> {
+    let Ok(contents) = std::fs::read_to_string(log_dir.join("session.jsonl")) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(message) = value.get("message").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(diff_body) = external_diff_log_body(message) else {
+            continue;
+        };
+        for path in parse_diff_file_paths(diff_body) {
+            if !out.iter().any(|p| p == &path) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn resolve_diff_file_path(project_root: &Path, display_path: &str) -> Option<PathBuf> {
+    let path = Path::new(display_path);
+    if path.is_absolute() {
+        return (path.starts_with(project_root)
+            || path.starts_with("/tmp")
+            || path.starts_with("/private/tmp"))
+        .then(|| path.to_path_buf());
+    }
+
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+
+    Some(project_root.join(path))
+}
+
+fn read_diff_file_text(project_root: &Path, display_path: &str) -> Option<Option<String>> {
+    let path = resolve_diff_file_path(project_root, display_path)?;
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
+}
+
+struct ExternalDiffDelta {
+    files_changed: Vec<String>,
+    unified_diff: String,
+}
+
+#[derive(Default)]
+struct ExternalDiffDeltaTracker {
+    snapshots: HashMap<String, Option<String>>,
+}
+
+impl ExternalDiffDeltaTracker {
+    fn seed_current_paths<'a>(
+        &mut self,
+        project_root: &Path,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) {
+        for path in paths {
+            let Some(path) = normalize_diff_file_path(path) else {
+                continue;
+            };
+            let Some(current) = read_diff_file_text(project_root, &path) else {
+                continue;
+            };
+            self.snapshots.insert(path, current);
+        }
+    }
+
+    fn seed_from_session_log(&mut self, project_root: &Path, log_dir: &Path) {
+        let paths = parse_session_diff_file_paths(log_dir);
+        self.seed_current_paths(project_root, paths.iter().map(String::as_str));
+    }
+
+    fn delta(
+        &mut self,
+        project_root: &Path,
+        files_changed: &[String],
+        unified_diff: &str,
+    ) -> Option<ExternalDiffDelta> {
+        let mut ordered_paths = Vec::new();
+        let mut seen = HashSet::new();
+        let mut block_by_path = HashMap::new();
+
+        for (path, block) in split_unified_diff_by_file(unified_diff) {
+            if seen.insert(path.clone()) {
+                ordered_paths.push(path.clone());
+            }
+            block_by_path.entry(path).or_insert(block);
+        }
+
+        for path in files_changed {
+            if let Some(path) = normalize_diff_file_path(path) {
+                if seen.insert(path.clone()) {
+                    ordered_paths.push(path);
+                }
+            }
+        }
+
+        let mut previously_tracked: Vec<String> = self.snapshots.keys().cloned().collect();
+        previously_tracked.sort();
+        for path in previously_tracked {
+            if seen.insert(path.clone()) {
+                ordered_paths.push(path);
+            }
+        }
+
+        let mut delta_diff = String::new();
+        let mut delta_files = Vec::new();
+
+        for path in ordered_paths {
+            let current = read_diff_file_text(project_root, &path).flatten();
+            let maybe_delta = if let Some(previous) = self.snapshots.get(&path) {
+                if previous == &current {
+                    None
+                } else {
+                    Some(file_watcher::compute_unified_diff(
+                        previous.as_deref().unwrap_or(""),
+                        current.as_deref().unwrap_or(""),
+                        &path,
+                    ))
+                }
+            } else if let Some(block) = block_by_path.get(&path) {
+                Some(block.clone())
+            } else {
+                current
+                    .as_ref()
+                    .map(|text| file_watcher::compute_unified_diff("", text, &path))
+            };
+
+            self.snapshots.insert(path.clone(), current);
+
+            let Some(file_delta) = maybe_delta else {
+                continue;
+            };
+            if file_delta.trim().is_empty() {
+                continue;
+            }
+            delta_files.push(path);
+            delta_diff.push_str(&file_delta);
+            if !delta_diff.ends_with('\n') {
+                delta_diff.push('\n');
+            }
+        }
+
+        if delta_diff.trim().is_empty() {
+            None
+        } else {
+            Some(ExternalDiffDelta {
+                files_changed: delta_files,
+                unified_diff: delta_diff,
+            })
+        }
+    }
 }
 
 /// Resolve external agent backend from shared state (written by the web UI),
@@ -1060,6 +1307,7 @@ async fn drain_external_agent_events(
     bus_rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
     config: &DrainConfig<'_>,
     stats: &mut LoopStats,
+    diff_tracker: &mut ExternalDiffDeltaTracker,
 ) -> DrainOutcome {
     use std::sync::atomic::Ordering;
 
@@ -1690,13 +1938,18 @@ async fn drain_external_agent_events(
                     // Identical to the previous emission — skip.
                 } else {
                     last_diff_hash = Some(hash);
+                    let Some(delta) =
+                        diff_tracker.delta(config.project_root, &files_changed, &unified_diff)
+                    else {
+                        continue;
+                    };
                     // Prefer the file paths from the unified diff header
                     // (`+++ b/<path>`) because `files_changed` from Codex is
                     // frequently empty in practice. Fall back to the agent's
                     // own list if parsing the diff yields nothing.
-                    let parsed_files = parse_diff_file_paths(&unified_diff);
+                    let parsed_files = parse_diff_file_paths(&delta.unified_diff);
                     let files = if parsed_files.is_empty() {
-                        files_changed
+                        delta.files_changed
                     } else {
                         parsed_files
                     };
@@ -1712,14 +1965,14 @@ async fn drain_external_agent_events(
                         )
                     };
                     slog(config.session_log, |l| {
-                        l.info(&format!("{}\n{}", header, unified_diff));
+                        l.info(&format!("{}\n{}", header, delta.unified_diff));
                     });
-                    if !unified_diff.trim().is_empty() {
+                    if !delta.unified_diff.trim().is_empty() {
                         config.bus.send(AppEvent::LogEntry {
                             session_id: config.session_id.clone(),
                             level: "info".to_string(),
                             source: "Diff".to_string(),
-                            content: unified_diff,
+                            content: delta.unified_diff,
                             turn: None,
                         });
                     }
@@ -3318,6 +3571,179 @@ deleted file mode 100644
 ";
         let files = parse_diff_file_paths(diff);
         assert_eq!(files, vec!["one.rs".to_string(), "two.rs".to_string()]);
+    }
+
+    #[test]
+    fn split_unified_diff_by_file_keeps_file_blocks() {
+        let diff = "\
+diff --git a/one.rs b/one.rs
+--- a/one.rs
++++ b/one.rs
+@@ -1 +1 @@
+-a
++b
+diff --git a/two.rs b/two.rs
+--- a/two.rs
++++ b/two.rs
+@@ -1 +1 @@
+-x
++y
+";
+        let blocks = split_unified_diff_by_file(diff);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "one.rs");
+        assert!(blocks[0].1.contains("diff --git a/one.rs b/one.rs"));
+        assert!(!blocks[0].1.contains("diff --git a/two.rs b/two.rs"));
+        assert_eq!(blocks[1].0, "two.rs");
+        assert!(blocks[1].1.contains("diff --git a/two.rs b/two.rs"));
+    }
+
+    #[test]
+    fn resolve_diff_file_path_allows_project_and_tmp_absolute_paths() {
+        let project_root = Path::new("/work/project");
+        assert_eq!(
+            resolve_diff_file_path(project_root, "/work/project/src/main.rs").unwrap(),
+            PathBuf::from("/work/project/src/main.rs")
+        );
+        assert_eq!(
+            resolve_diff_file_path(project_root, "/tmp/intendant-edit.txt").unwrap(),
+            PathBuf::from("/tmp/intendant-edit.txt")
+        );
+        assert!(resolve_diff_file_path(project_root, "/etc/passwd").is_none());
+        assert!(resolve_diff_file_path(project_root, "../outside.txt").is_none());
+    }
+
+    #[test]
+    fn parse_session_diff_file_paths_reads_persisted_diff_logs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let jsonl = r#"{"event":"info","message":"External agent diff: one.rs\n--- a/one.rs\n+++ b/one.rs\n@@ -1 +1 @@\n-a\n+b\n"}"#;
+        std::fs::write(tmp.path().join("session.jsonl"), format!("{jsonl}\n")).unwrap();
+
+        let files = parse_session_diff_file_paths(tmp.path());
+        assert_eq!(files, vec!["one.rs".to_string()]);
+    }
+
+    #[test]
+    fn external_diff_delta_tracker_can_seed_resumed_session_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        let log_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(project_root.join("tracked.txt"), "old logged state\n").unwrap();
+        let jsonl = r#"{"event":"info","message":"External agent diff: tracked.txt\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -0,0 +1 @@\n+old logged state\n"}"#;
+        std::fs::write(log_dir.join("session.jsonl"), format!("{jsonl}\n")).unwrap();
+
+        let mut tracker = ExternalDiffDeltaTracker::default();
+        tracker.seed_from_session_log(&project_root, &log_dir);
+
+        std::fs::write(
+            project_root.join("tracked.txt"),
+            "old logged state\nnew resumed edit\n",
+        )
+        .unwrap();
+        let cumulative_after_resume = "\
+diff --git a/tracked.txt b/tracked.txt
+--- /dev/null
++++ b/tracked.txt
+@@ -0,0 +1,2 @@
++old logged state
++new resumed edit
+";
+        let delta = tracker
+            .delta(&project_root, &[], cumulative_after_resume)
+            .unwrap();
+        assert_eq!(delta.files_changed, vec!["tracked.txt".to_string()]);
+        assert!(delta.unified_diff.contains("+new resumed edit"));
+        assert!(!delta.unified_diff.contains("+old logged state"));
+    }
+
+    #[test]
+    fn external_diff_delta_tracker_emits_per_event_changes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path();
+        let mut tracker = ExternalDiffDeltaTracker::default();
+
+        let smoke_delete = "\
+diff --git a/activity-diff-smoke.txt b/activity-diff-smoke.txt
+deleted file mode 100644
+--- a/activity-diff-smoke.txt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-old one
+-old two
+";
+        let first = tracker.delta(project_root, &[], smoke_delete).unwrap();
+        assert_eq!(
+            first.files_changed,
+            vec!["activity-diff-smoke.txt".to_string()]
+        );
+        assert!(first.unified_diff.contains("activity-diff-smoke.txt"));
+        assert!(first.unified_diff.contains("-old one"));
+
+        std::fs::write(
+            project_root.join("activity-diff-live-check.md"),
+            "# Activity Diff Live Check\n\n- first event\n",
+        )
+        .unwrap();
+        let cumulative_after_create = format!(
+            "{}{}",
+            smoke_delete,
+            "\
+diff --git a/activity-diff-live-check.md b/activity-diff-live-check.md
+new file mode 100644
+--- /dev/null
++++ b/activity-diff-live-check.md
+@@ -0,0 +1,3 @@
++# Activity Diff Live Check
++
++- first event
+"
+        );
+        let second = tracker
+            .delta(project_root, &[], &cumulative_after_create)
+            .unwrap();
+        assert_eq!(
+            second.files_changed,
+            vec!["activity-diff-live-check.md".to_string()]
+        );
+        assert!(!second.unified_diff.contains("activity-diff-smoke.txt"));
+        assert!(second.unified_diff.contains("activity-diff-live-check.md"));
+        assert!(second.unified_diff.contains("+- first event"));
+
+        std::fs::write(
+            project_root.join("activity-diff-live-check.md"),
+            "# Activity Diff Live Check\n\n- first event\n- second event\n",
+        )
+        .unwrap();
+        let cumulative_after_modify = format!(
+            "{}{}",
+            smoke_delete,
+            "\
+diff --git a/activity-diff-live-check.md b/activity-diff-live-check.md
+new file mode 100644
+--- /dev/null
++++ b/activity-diff-live-check.md
+@@ -0,0 +1,4 @@
++# Activity Diff Live Check
++
++- first event
++- second event
+"
+        );
+        let third = tracker
+            .delta(project_root, &[], &cumulative_after_modify)
+            .unwrap();
+        assert_eq!(
+            third.files_changed,
+            vec!["activity-diff-live-check.md".to_string()]
+        );
+        assert!(!third.unified_diff.contains("activity-diff-smoke.txt"));
+        assert!(third
+            .unified_diff
+            .contains("--- a/activity-diff-live-check.md"));
+        assert!(third.unified_diff.contains("+- second event"));
+        assert!(!third.unified_diff.contains("+@"));
     }
 
     #[test]
@@ -6418,6 +6844,7 @@ async fn run_with_presence(
     let mut persistent_event_rx: Option<
         tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
     > = None;
+    let mut persistent_diff_tracker = ExternalDiffDeltaTracker::default();
     // Track which backend the persistent agent was created for, so we can reset
     // when the web UI changes the selection between tasks.
     let mut persistent_agent_backend: Option<external_agent::AgentBackend> = None;
@@ -6536,6 +6963,7 @@ async fn run_with_presence(
                     persistent_thread = None;
                     persistent_event_rx = None;
                     persistent_codex_config = None;
+                    persistent_diff_tracker = ExternalDiffDeltaTracker::default();
                     Ok("agent torn down; next task will start a fresh thread".to_string())
                 } else if let Some(ref mut agent) = persistent_agent {
                     agent
@@ -6869,6 +7297,7 @@ async fn run_with_presence(
             persistent_event_rx = None;
             persistent_codex_config = None;
             persistent_gemini_config = None;
+            persistent_diff_tracker = ExternalDiffDeltaTracker::default();
         }
 
         if let Some(ref backend) = agent_backend {
@@ -6936,6 +7365,7 @@ async fn run_with_presence(
                 persistent_agent = Some(agent);
                 persistent_thread = Some(thread);
                 persistent_event_rx = Some(event_rx);
+                persistent_diff_tracker = ExternalDiffDeltaTracker::default();
                 persistent_agent_backend = agent_backend.clone();
                 // Remember the Codex config this agent was spawned with so
                 // we can detect drift at the next task and rebuild.
@@ -6969,6 +7399,7 @@ async fn run_with_presence(
                 session_log_id(&session_log).as_deref(),
             )
             .unwrap_or_else(|| task_text.clone());
+            persistent_diff_tracker.seed_from_session_log(&project.root, &log_dir);
             let send_result = if envelope.attachment_frame_ids.is_empty() {
                 agent.send_message(thread, &merged_text).await
             } else {
@@ -7032,6 +7463,7 @@ async fn run_with_presence(
                 &mut turn_bus_rx,
                 &drain_config,
                 &mut cumulative_stats,
+                &mut persistent_diff_tracker,
             )
             .await
             {
@@ -7076,12 +7508,14 @@ async fn run_with_presence(
                     persistent_agent = None;
                     persistent_thread = None;
                     persistent_event_rx = None;
+                    persistent_diff_tracker = ExternalDiffDeltaTracker::default();
                 }
                 DrainOutcome::ChannelClosed => {
                     // Channel closed unexpectedly
                     persistent_agent = None;
                     persistent_thread = None;
                     persistent_event_rx = None;
+                    persistent_diff_tracker = ExternalDiffDeltaTracker::default();
                 }
             }
             turn_bus_rx = bus.subscribe();
@@ -7751,6 +8185,7 @@ async fn run_external_agent_mode(
         _ => 0,
     };
     let mut stats = LoopStats::default();
+    let mut diff_tracker = ExternalDiffDeltaTracker::default();
     let mut next_turn = if task.trim().is_empty() {
         None
     } else {
@@ -7952,6 +8387,7 @@ async fn run_external_agent_mode(
                 ));
             }
         });
+        diff_tracker.seed_from_session_log(&project.root, &_log_dir);
         let send_result = if attachments.is_empty() {
             agent.send_message(&thread, &merged).await
         } else {
@@ -7983,6 +8419,7 @@ async fn run_external_agent_mode(
             &mut turn_bus_rx,
             &drain_config,
             &mut stats,
+            &mut diff_tracker,
         )
         .await
         {
