@@ -1908,6 +1908,7 @@ html, body {
   color: var(--base);
   background: var(--yellow);
 }
+.log-copy-entry,
 .log-edit-message {
   flex: 0 0 auto;
   width: 22px;
@@ -1918,12 +1919,26 @@ html, body {
   background: transparent;
   color: var(--overlay0);
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
   line-height: 1;
   opacity: 0;
+  pointer-events: none;
 }
 .log-entry:hover .log-edit-message,
-.log-edit-message:focus {
+.log-edit-message:focus,
+.log-entry:hover .log-copy-entry,
+.log-copy-entry:focus {
   opacity: 1;
+  pointer-events: auto;
+}
+.log-copy-entry:hover,
+.log-copy-entry.copied {
+  color: var(--green);
+  border-color: rgba(166, 227, 161, 0.45);
+  background: rgba(166, 227, 161, 0.1);
 }
 .log-edit-message:hover {
   color: var(--peach);
@@ -7288,6 +7303,8 @@ let commandOutputGroupSeq = 0;
 let activeCommandOutputGroup = null;
 const commandOutputGroups = new Map();
 const commandOutputGroupByEntry = new WeakMap();
+const logEntryCopyTextByEntry = new WeakMap();
+const wiredLogCopyButtons = new WeakSet();
 let currentPhase = 'idle';
 let daemonSessionFullId = '';
 let currentSessionFullId = '';
@@ -10462,7 +10479,7 @@ function wireCollapsibleLogEntry(entry, cnt, sourceEntry = null) {
   }
   _wiredCollapsibleLogEntries.add(entry);
   entry.addEventListener('click', (event) => {
-    if (event.target?.closest?.('.log-edit-message')) return;
+    if (event.target?.closest?.('.log-edit-message, .log-copy-entry')) return;
     const expanding = !entry.classList.contains('expanded');
     entry.classList.toggle('expanded', expanding);
     if (expanding) appendDeferredLogImages(entry, cnt);
@@ -10471,6 +10488,8 @@ function wireCollapsibleLogEntry(entry, cnt, sourceEntry = null) {
 
 function wireSessionWindowLogClone(clone, sourceEntry) {
   if (!clone) return;
+  copyLogEntryCopyText(sourceEntry, clone);
+  wireLogCopyButton(clone);
   if (clone.classList.contains('command-output-group')) {
     wireCommandOutputGroupClone(clone, sourceEntry);
     return;
@@ -11116,6 +11135,71 @@ function copyTextToClipboard(text) {
       ta.remove();
     }
   });
+}
+
+function setLogEntryCopyText(entry, textOrRef) {
+  if (!entry) return null;
+  const ref = textOrRef && typeof textOrRef === 'object' && Object.prototype.hasOwnProperty.call(textOrRef, 'text')
+    ? textOrRef
+    : { text: String(textOrRef ?? '') };
+  logEntryCopyTextByEntry.set(entry, ref);
+  return ref;
+}
+
+function copyLogEntryCopyText(sourceEntry, targetEntry) {
+  const ref = sourceEntry ? logEntryCopyTextByEntry.get(sourceEntry) : null;
+  if (ref && targetEntry) logEntryCopyTextByEntry.set(targetEntry, ref);
+}
+
+function getLogEntryCopyText(entry) {
+  const ref = entry ? logEntryCopyTextByEntry.get(entry) : null;
+  if (ref) return String(ref.text ?? '');
+  return entry?.querySelector?.('.log-content')?.innerText || '';
+}
+
+function resetLogCopyButton(btn) {
+  if (!btn) return;
+  btn.classList.remove('copied');
+  btn.innerHTML = '&#x29C9;';
+  btn.title = 'Copy raw log entry';
+  btn.setAttribute('aria-label', btn.title);
+}
+
+async function onLogCopyButtonClick(ev) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  const btn = ev.currentTarget;
+  const entry = btn.closest('.log-entry');
+  try {
+    await copyTextToClipboard(getLogEntryCopyText(entry));
+    btn.classList.add('copied');
+    btn.innerHTML = '&#x2713;';
+    btn.title = 'Copied';
+    btn.setAttribute('aria-label', btn.title);
+    clearTimeout(btn._copyResetTimer);
+    btn._copyResetTimer = setTimeout(() => resetLogCopyButton(btn), 1200);
+  } catch (e) {
+    showControlToast('error', 'Copy failed: ' + (e?.message || e));
+  }
+}
+
+function wireLogCopyButton(entry) {
+  const btn = entry?.querySelector?.(':scope > .log-copy-entry');
+  if (!btn || wiredLogCopyButtons.has(btn)) return;
+  wiredLogCopyButtons.add(btn);
+  btn.addEventListener('click', onLogCopyButtonClick);
+}
+
+function appendCopyLogEntryButton(entry, textOrRef) {
+  if (!entry) return null;
+  if (textOrRef !== undefined) setLogEntryCopyText(entry, textOrRef);
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'log-copy-entry';
+  resetLogCopyButton(btn);
+  entry.appendChild(btn);
+  wireLogCopyButton(entry);
+  return btn;
 }
 
 function sessionAliasIds(session) {
@@ -12560,7 +12644,8 @@ function wireDiffLogEntry(entry) {
 }
 
 function appendCommandOutputChunk(group, c) {
-  const text = c.content || '';
+  const text = c.content ?? '';
+  if (group.copyRef && text) group.copyRef.text += text;
   if (c.output_id && !group.outputIdSet.has(c.output_id)) {
     group.outputIdSet.add(c.output_id);
     group.outputIds.push(c.output_id);
@@ -12599,6 +12684,8 @@ function renderCommandOutputEntry(c) {
     toggle.innerHTML = '<span class="arrow">\u25B8 output</span><span class="arrow-up">\u25BE hide</span>';
     entry.appendChild(wrap);
     entry.appendChild(toggle);
+    const copyRef = setLogEntryCopyText(entry, '');
+    appendCopyLogEntryButton(entry);
 
     const group = {
       id: groupId,
@@ -12615,6 +12702,7 @@ function renderCommandOutputEntry(c) {
       loaded: false,
       loading: false,
       clones: [],
+      copyRef,
     };
     commandOutputGroupByEntry.set(entry, group);
     entry.addEventListener('click', () => toggleCommandOutputGroup(group));
@@ -12718,6 +12806,7 @@ function renderDiffLogEntry(c) {
   toggle.innerHTML = '<span class="arrow">\u25B8 diff</span><span class="arrow-up">\u25BE hide</span>';
   entry.appendChild(wrap);
   entry.appendChild(toggle);
+  appendCopyLogEntryButton(entry, diffText);
   wireDiffLogEntry(entry);
   appendLogEntryElement(entry);
 }
@@ -12919,6 +13008,7 @@ function renderLogEntry(c) {
   }
 
   entry.appendChild(cnt);
+  appendCopyLogEntryButton(entry, c.content ?? '');
   appendEditUserMessageButton(entry, c);
 
   if (c.collapsible || hasImages) {
