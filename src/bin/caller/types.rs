@@ -161,6 +161,12 @@ pub enum OutboundEvent {
         source: String,
         backend_session_id: String,
     },
+    SessionRelationship {
+        parent_session_id: String,
+        child_session_id: String,
+        relationship: String,
+        ephemeral: bool,
+    },
     SessionAttached {
         session_id: String,
         source: String,

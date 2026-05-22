@@ -2379,6 +2379,7 @@ impl App {
             | AppEvent::CodexConfigChanged { .. }
             | AppEvent::CodexThreadActionRequested { .. }
             | AppEvent::CodexThreadActionResult { .. }
+            | AppEvent::SessionRelationship { .. }
             | AppEvent::SessionRenameResult { .. }
             | AppEvent::GeminiConfigChanged { .. }
             | AppEvent::GeminiThreadActionRequested { .. }

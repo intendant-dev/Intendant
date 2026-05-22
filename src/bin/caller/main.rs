@@ -1225,6 +1225,7 @@ enum ExternalThreadActionEffect {
     SideTurnStarted {
         parent_thread_id: String,
         child_thread_id: String,
+        prompt: Option<String>,
     },
 }
 
@@ -1246,6 +1247,38 @@ fn fork_session_name_from_params(params: &serde_json::Value) -> Option<String> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
+}
+
+fn side_session_prompt_from_params(params: &serde_json::Value) -> Option<String> {
+    ["prompt", "message", "text", "task"]
+        .iter()
+        .find_map(|key| params.get(*key).and_then(|v| v.as_str()))
+        .or_else(|| params.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn emit_session_relationship(
+    bus: &EventBus,
+    parent_session_id: Option<&str>,
+    child_session_id: &str,
+    relationship: &str,
+    ephemeral: bool,
+) {
+    let Some(parent_session_id) = parent_session_id.map(str::trim).filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    if parent_session_id == child_session_id {
+        return;
+    }
+    bus.send(AppEvent::SessionRelationship {
+        parent_session_id: parent_session_id.to_string(),
+        child_session_id: child_session_id.to_string(),
+        relationship: relationship.to_string(),
+        ephemeral,
+    });
 }
 
 fn emit_codex_fork_session_name(bus: &EventBus, child_id: &str, params: &serde_json::Value) {
@@ -1292,6 +1325,13 @@ async fn handle_external_thread_action(
     if success && op == "fork" {
         if let Some(child_id) = forked_thread_id_from_message(&message) {
             emit_codex_fork_session_name(config.bus, &child_id, &params);
+            emit_session_relationship(
+                config.bus,
+                config.session_id.as_deref(),
+                &child_id,
+                "fork",
+                false,
+            );
             config
                 .bus
                 .send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
@@ -1307,9 +1347,17 @@ async fn handle_external_thread_action(
 
     if success && op == "side" {
         if let Some((parent_thread_id, child_thread_id)) = side_thread_ids_from_message(&message) {
+            emit_session_relationship(
+                config.bus,
+                config.session_id.as_deref().or(Some(&parent_thread_id)),
+                &child_thread_id,
+                "side",
+                true,
+            );
             return ExternalThreadActionEffect::SideTurnStarted {
                 parent_thread_id,
                 child_thread_id,
+                prompt: side_session_prompt_from_params(&params),
             };
         }
     }
@@ -1327,6 +1375,7 @@ async fn drain_external_side_turn(
     pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
     parent_thread_id: String,
     child_thread_id: String,
+    prompt: Option<String>,
 ) {
     slog(config.session_log, |l| {
         l.info(&format!(
@@ -1334,12 +1383,52 @@ async fn drain_external_side_turn(
             child_thread_id, parent_thread_id
         ))
     });
+    config.bus.send(AppEvent::SessionStarted {
+        session_id: child_thread_id.clone(),
+        task: Some(
+            prompt
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or("Side conversation")
+                .to_string(),
+        ),
+    });
+    config.bus.send(AppEvent::SessionIdentity {
+        session_id: child_thread_id.clone(),
+        source: "codex".to_string(),
+        backend_session_id: child_thread_id.clone(),
+    });
+    let parent_session_id = config.session_id.as_deref().unwrap_or(&parent_thread_id);
+    emit_session_relationship(
+        config.bus,
+        Some(parent_session_id),
+        &child_thread_id,
+        "side",
+        true,
+    );
+
+    let child_session_id = Some(child_thread_id.clone());
+    let child_config = DrainConfig {
+        bus: config.bus,
+        session_id: child_session_id.clone(),
+        alias_session_id: None,
+        autonomy: config.autonomy.clone(),
+        session_log: config.session_log,
+        project_root: config.project_root,
+        log_dir: config.log_dir,
+        approval_registry: config.approval_registry,
+        json_approval: config.json_approval.clone(),
+        agent_source: config.agent_source.clone(),
+        suppress_agent_started: config.suppress_agent_started,
+        headless: config.headless,
+        context_injection: config.context_injection,
+    };
 
     let close_after = match drain_external_agent_events(
         agent,
         event_rx,
         bus_rx,
-        config,
+        &child_config,
         stats,
         diff_tracker,
         pending_runtime_steers,
@@ -1347,15 +1436,23 @@ async fn drain_external_side_turn(
     .await
     {
         DrainOutcome::TurnCompleted { message, .. } => {
-            config.bus.send(AppEvent::DoneSignal {
-                message: message.clone(),
+            child_config.bus.send(AppEvent::LogEntry {
+                session_id: child_config.session_id.clone(),
+                level: "info".to_string(),
+                source: "Codex".to_string(),
+                content: message
+                    .clone()
+                    .unwrap_or_else(|| "Side conversation complete".to_string()),
+                turn: None,
             });
             true
         }
         DrainOutcome::Interrupted { reason } => {
-            config.bus.send(AppEvent::PresenceLog {
-                message: format!("Codex side conversation interrupted: {}", reason),
-                level: None,
+            child_config.bus.send(AppEvent::LogEntry {
+                session_id: child_config.session_id.clone(),
+                level: "warn".to_string(),
+                source: "Codex".to_string(),
+                content: format!("Side conversation interrupted: {}", reason),
                 turn: None,
             });
             true
@@ -1379,7 +1476,7 @@ async fn drain_external_side_turn(
 
     if close_after {
         let params = serde_json::json!({
-            "threadId": child_thread_id,
+            "threadId": child_thread_id.clone(),
             "parentThreadId": parent_thread_id,
         });
         match agent.thread_action("side-close", &params).await {
@@ -1388,6 +1485,10 @@ async fn drain_external_side_turn(
                 l.warn(&format!("Failed to close Codex side conversation: {}", err))
             }),
         }
+        config.bus.send(AppEvent::SessionEnded {
+            session_id: child_thread_id,
+            reason: "side conversation complete".to_string(),
+        });
     }
 }
 
@@ -3454,6 +3555,26 @@ mod tests {
             None
         );
         assert_eq!(fork_session_name_from_params(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn side_session_prompt_from_params_accepts_prompt_aliases() {
+        assert_eq!(
+            side_session_prompt_from_params(&serde_json::json!({ "prompt": "  quick question  " })),
+            Some("quick question".to_string())
+        );
+        assert_eq!(
+            side_session_prompt_from_params(&serde_json::json!({ "task": "check this" })),
+            Some("check this".to_string())
+        );
+        assert_eq!(
+            side_session_prompt_from_params(&serde_json::json!("inline prompt")),
+            Some("inline prompt".to_string())
+        );
+        assert_eq!(
+            side_session_prompt_from_params(&serde_json::json!({ "prompt": "   " })),
+            None
+        );
     }
 
     #[test]
@@ -7155,6 +7276,13 @@ async fn run_with_presence(
                 if success && op == "fork" {
                     if let Some(child_id) = forked_thread_id_from_message(&message) {
                         emit_codex_fork_session_name(&bus, &child_id, &params);
+                        emit_session_relationship(
+                            &bus,
+                            result_session_id.as_deref(),
+                            &child_id,
+                            "fork",
+                            false,
+                        );
                         bus.send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
                             source: "codex".to_string(),
                             session_id: child_id.clone(),
@@ -7169,6 +7297,7 @@ async fn run_with_presence(
                     if let Some((parent_thread_id, child_thread_id)) =
                         side_thread_ids_from_message(&message)
                     {
+                        let side_prompt = side_session_prompt_from_params(&params);
                         if let (Some(agent), Some(event_rx)) =
                             (persistent_agent.as_mut(), persistent_event_rx.as_mut())
                         {
@@ -7203,6 +7332,7 @@ async fn run_with_presence(
                                 &mut persistent_pending_runtime_steers,
                                 parent_thread_id,
                                 child_thread_id,
+                                side_prompt,
                             )
                             .await;
                         } else {
@@ -8488,6 +8618,7 @@ async fn run_external_agent_mode(
                                 if let ExternalThreadActionEffect::SideTurnStarted {
                                     parent_thread_id,
                                     child_thread_id,
+                                    prompt,
                                 } = effect
                                 {
                                     // `turn_bus_rx` can still have the
@@ -8506,6 +8637,7 @@ async fn run_external_agent_mode(
                                         &mut pending_runtime_steers,
                                         parent_thread_id,
                                         child_thread_id,
+                                        prompt,
                                     )
                                     .await;
                                 }

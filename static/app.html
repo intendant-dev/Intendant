@@ -1335,6 +1335,52 @@ html, body {
   border-bottom: 1px solid var(--surface0);
   background: var(--base);
   flex-shrink: 0;
+  position: relative;
+}
+.session-relationship-wires {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  overflow: visible;
+}
+.session-relationship-wire {
+  fill: none;
+  stroke: color-mix(in srgb, var(--overlay0) 58%, transparent);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+.session-relationship-wire.side {
+  stroke-dasharray: 4 4;
+}
+.session-relationship-wire.fork {
+  stroke: color-mix(in srgb, var(--blue) 58%, transparent);
+}
+.session-relationship-wire.subagent {
+  stroke: color-mix(in srgb, var(--green) 58%, transparent);
+}
+.session-relationship-wire.active {
+  stroke-width: 2.4;
+  stroke: var(--blue);
+  filter: drop-shadow(0 0 4px rgba(137, 180, 250, 0.45));
+}
+.session-relationship-endpoint {
+  fill: var(--base);
+  stroke: color-mix(in srgb, var(--overlay0) 70%, transparent);
+  stroke-width: 1.4;
+}
+.session-relationship-endpoint.side {
+  stroke-dasharray: 3 2;
+}
+.session-relationship-endpoint.fork {
+  stroke: color-mix(in srgb, var(--blue) 80%, transparent);
+}
+.session-relationship-endpoint.subagent {
+  stroke: color-mix(in srgb, var(--green) 80%, transparent);
+}
+.session-relationship-endpoint.active {
+  stroke: var(--blue);
+  stroke-width: 2;
 }
 .session-window-grid.resized {
   height: var(--session-window-grid-height);
@@ -1420,6 +1466,7 @@ html, body {
 }
 .session-window {
   position: relative;
+  z-index: 2;
   min-height: 180px;
   max-height: 320px;
   display: flex;
@@ -1437,6 +1484,16 @@ html, body {
 .session-window.foreground {
   border-color: var(--blue);
   box-shadow: inset 0 0 0 1px rgba(137, 180, 250, 0.35);
+}
+.session-window.relationship-parent-highlight {
+  border-color: color-mix(in srgb, var(--blue) 72%, var(--surface1));
+  box-shadow:
+    inset 0 0 0 1px rgba(137, 180, 250, 0.25),
+    0 0 0 1px rgba(137, 180, 250, 0.12);
+}
+.session-window.relationship-child-highlight {
+  border-color: color-mix(in srgb, var(--teal) 62%, var(--surface1));
+  box-shadow: inset 0 0 0 1px rgba(148, 226, 213, 0.18);
 }
 .session-window.minimized {
   min-height: 36px;
@@ -1498,6 +1555,38 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.session-window-relation-strip {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+}
+.session-window-relation-chip {
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  padding: 1px 5px;
+  background: var(--surface0);
+  color: var(--overlay1);
+  font-size: 9px;
+  font-weight: 800;
+  line-height: 1.4;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.session-window-relation-chip.side {
+  border-style: dashed;
+  color: var(--mauve);
+}
+.session-window-relation-chip.fork {
+  color: var(--blue);
+}
+.session-window-relation-chip.subagent {
+  color: var(--green);
+}
+.session-window-relation-chip.children {
+  color: var(--teal);
 }
 .session-identity-name {
   min-width: 0;
@@ -7154,12 +7243,14 @@ let currentSessionFullId = '';
 let foregroundSessionFullId = '';
 let maximizedSessionWindowId = '';
 const sessionWindows = new Map();
+const sessionRelationships = new Map();
 let processingLogReplay = false;
 let logReplayAppendBatch = null;
 const sessionMetadataById = new Map();
 const sessionUsageById = new Map();
 let latestGlobalUsage = null;
 let dashboardProjectRoot = '';
+let sessionRelationshipRenderHandle = 0;
 const SESSION_WINDOW_LOG_LIMIT = 600;
 const SESSION_PENDING_ACTIVE_MS = 30000;
 const SESSION_METADATA_REFRESH_MS = 15000;
@@ -7167,6 +7258,7 @@ const SESSION_WINDOW_GRID_HEIGHT_KEY = 'intendant_session_window_grid_height_v3'
 const SESSION_WINDOW_GRID_MIN_HEIGHT = 180;
 const SESSION_WINDOW_GRID_DEFAULT_RATIO = 0.5;
 const SESSION_WINDOW_GRID_MAX_RATIO = 0.8;
+const SESSION_RELATIONSHIP_KINDS = new Set(['side', 'fork', 'subagent']);
 const CONCURRENT_LOG_MODE_NORMAL = 'normal';
 const CONCURRENT_LOG_MODE_MINIMIZED = 'minimized';
 const CONCURRENT_LOG_MODE_MAXIMIZED = 'maximized';
@@ -7735,6 +7827,9 @@ async function main() {
       }
       if (d.event === 'session_identity') {
         applySessionIdentity(d);
+      }
+      if (d.event === 'session_relationship') {
+        applySessionRelationship(d);
       }
       if (d.event === 'approval_required' && d.id !== undefined && d.session_id) {
         approvalSessionIds.set(String(d.id), d.session_id);
@@ -8331,6 +8426,7 @@ function processCommands(cmds) {
       case 'remove_recording': removeRecordingStream(c.stream_name); break;
       case 'recording_error': /* logged via add_log_entry */ break;
       case 'session_started': onSessionStarted(c.session_id, c.task); break;
+      case 'session_relationship': applySessionRelationship(c); break;
       case 'session_attached': onSessionAttached(c.session_id, c.source); break;
       case 'session_ended': onSessionEnded(c.session_id, c.reason); break;
       case 'external_agent_changed': updateStatusBar({ external_agent: c.agent }); break;
@@ -10892,6 +10988,7 @@ function applySessionWindowGridHeight() {
     grid.classList.remove('resized');
   }
   syncSessionWindowGridControls();
+  scheduleSessionRelationshipRender();
 }
 
 function setSessionWindowGridHeight(heightPx, persist = true) {
@@ -11140,6 +11237,262 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
   });
 }
 
+function normalizeSessionRelationshipKind(value) {
+  const kind = String(value || '').trim().toLowerCase();
+  return SESSION_RELATIONSHIP_KINDS.has(kind) ? kind : 'fork';
+}
+
+function sessionRelationshipKey(parentId, childId, kind) {
+  return `${kind}\u001f${parentId}\u001f${childId}`;
+}
+
+function applySessionRelationship(evt = {}) {
+  const parentId = String(evt.parent_session_id || evt.parentSessionId || '').trim();
+  const childId = String(evt.child_session_id || evt.childSessionId || '').trim();
+  if (!parentId || !childId || parentId === childId) return;
+  const kind = normalizeSessionRelationshipKind(evt.relationship || evt.kind);
+  const relationship = {
+    parentId,
+    childId,
+    kind,
+    ephemeral: !!evt.ephemeral,
+  };
+  sessionRelationships.set(sessionRelationshipKey(parentId, childId, kind), relationship);
+  applySessionRelationshipMetadata(relationship);
+  scheduleSessionRelationshipRender();
+}
+
+function applySessionRelationshipMetadata(rel) {
+  if (!rel) return;
+  const parentMeta = sessionMetadataById.get(rel.parentId) || {};
+  const parentChildren = Array.isArray(parentMeta.children) ? parentMeta.children.slice() : [];
+  if (!parentChildren.some(child => child.id === rel.childId && child.kind === rel.kind)) {
+    parentChildren.push({ id: rel.childId, kind: rel.kind, ephemeral: rel.ephemeral });
+  }
+  sessionMetadataById.set(rel.parentId, { ...parentMeta, children: parentChildren });
+
+  const childMeta = sessionMetadataById.get(rel.childId) || {};
+  sessionMetadataById.set(rel.childId, {
+    ...childMeta,
+    parentId: rel.parentId,
+    relationshipKind: rel.kind,
+    relationshipEphemeral: rel.ephemeral,
+  });
+
+  updateSessionRelationshipBadges(rel.parentId);
+  updateSessionRelationshipBadges(rel.childId);
+}
+
+function activeSessionRelationshipIds() {
+  const focused = foregroundSessionFullId || currentSessionFullId || '';
+  if (!focused) return { parents: new Set(), children: new Set(), activeKeys: new Set() };
+  const parents = new Set();
+  const children = new Set();
+  const activeKeys = new Set();
+  for (const [key, rel] of sessionRelationships) {
+    if (rel.childId === focused) {
+      parents.add(rel.parentId);
+      children.add(rel.childId);
+      activeKeys.add(key);
+    } else if (rel.parentId === focused) {
+      parents.add(rel.parentId);
+      children.add(rel.childId);
+      activeKeys.add(key);
+    }
+  }
+  return { parents, children, activeKeys };
+}
+
+function updateSessionRelationshipBadges(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win || !win.relationStrip) return;
+  const meta = sessionMetadataById.get(sid) || {};
+  const chips = [];
+  if (meta.relationshipKind && meta.parentId) {
+    chips.push({
+      kind: meta.relationshipKind,
+      text: meta.relationshipKind === 'subagent' ? 'sub' : meta.relationshipKind,
+      title: `${meta.relationshipKind} of ${shortSessionId(meta.parentId)}. Click to focus parent.`,
+      target: meta.parentId,
+    });
+  }
+  const children = Array.isArray(meta.children) ? meta.children : [];
+  if (children.length > 0) {
+    const sides = children.filter(child => child.kind === 'side').length;
+    const forks = children.filter(child => child.kind === 'fork').length;
+    const subs = children.filter(child => child.kind === 'subagent').length;
+    const label = [
+      sides ? `${sides} side` : '',
+      forks ? `${forks} fork` : '',
+      subs ? `${subs} sub` : '',
+    ].filter(Boolean).join(' ');
+    chips.push({
+      kind: 'children',
+      text: label || `${children.length} child`,
+      title: `${children.length} related session${children.length === 1 ? '' : 's'}. Click to highlight children.`,
+      target: '',
+    });
+  }
+
+  win.relationStrip.replaceChildren();
+  win.relationStrip.classList.toggle('hidden', chips.length === 0);
+  for (const chip of chips) {
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.className = `session-window-relation-chip ${chip.kind}`;
+    el.textContent = chip.text;
+    el.title = chip.title;
+    el.setAttribute('aria-label', chip.title);
+    el.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (chip.target && sessionWindows.has(chip.target)) {
+        focusSessionWindow(chip.target);
+      } else {
+        focusSessionWindow(sid);
+      }
+    });
+    win.relationStrip.appendChild(el);
+  }
+}
+
+function scheduleSessionRelationshipRender() {
+  if (sessionRelationshipRenderHandle) return;
+  sessionRelationshipRenderHandle = requestAnimationFrame(() => {
+    sessionRelationshipRenderHandle = 0;
+    renderSessionRelationships();
+  });
+}
+
+function ensureSessionRelationshipOverlay(grid) {
+  let svg = grid.querySelector(':scope > svg.session-relationship-wires');
+  if (!svg) {
+    svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.classList.add('session-relationship-wires');
+    svg.setAttribute('aria-hidden', 'true');
+    grid.prepend(svg);
+  }
+  return svg;
+}
+
+function sessionWindowAnchor(rect, side) {
+  switch (side) {
+    case 'left': return { x: rect.left, y: rect.top + rect.height / 2 };
+    case 'right': return { x: rect.right, y: rect.top + rect.height / 2 };
+    case 'bottom': return { x: rect.left + rect.width / 2, y: rect.bottom };
+    case 'top': return { x: rect.left + rect.width / 2, y: rect.top };
+    default: return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  }
+}
+
+function sessionWindowRectInGrid(grid, win) {
+  const gridRect = grid.getBoundingClientRect();
+  const rect = win.el.getBoundingClientRect();
+  return {
+    left: rect.left - gridRect.left + grid.scrollLeft,
+    top: rect.top - gridRect.top + grid.scrollTop,
+    right: rect.right - gridRect.left + grid.scrollLeft,
+    bottom: rect.bottom - gridRect.top + grid.scrollTop,
+    width: rect.width,
+    height: rect.height,
+  };
+}
+
+function relationshipPath(parentRect, childRect, kind, direction, trunkValue) {
+  if (kind === 'subagent') {
+    const parent = sessionWindowAnchor(parentRect, 'bottom');
+    const child = sessionWindowAnchor(childRect, 'top');
+    const trunkY = trunkValue ?? ((parent.y + child.y) / 2);
+    return `M ${parent.x} ${parent.y} V ${trunkY} H ${child.x} V ${child.y}`;
+  }
+  const childIsRight = direction === 'right';
+  const parent = sessionWindowAnchor(parentRect, childIsRight ? 'right' : 'left');
+  const child = sessionWindowAnchor(childRect, childIsRight ? 'left' : 'right');
+  const trunkX = trunkValue ?? ((parent.x + child.x) / 2);
+  return `M ${parent.x} ${parent.y} H ${trunkX} V ${child.y} H ${child.x}`;
+}
+
+function relationshipEndpointForChild(childRect, kind, direction) {
+  if (kind === 'subagent') return sessionWindowAnchor(childRect, 'top');
+  return sessionWindowAnchor(childRect, direction === 'right' ? 'left' : 'right');
+}
+
+function renderSessionRelationships() {
+  const grid = document.getElementById('session-window-grid');
+  if (!grid) return;
+  const svg = ensureSessionRelationshipOverlay(grid);
+  svg.replaceChildren();
+  svg.setAttribute('width', Math.max(grid.scrollWidth, grid.clientWidth));
+  svg.setAttribute('height', Math.max(grid.scrollHeight, grid.clientHeight));
+  svg.setAttribute('viewBox', `0 0 ${Math.max(grid.scrollWidth, grid.clientWidth)} ${Math.max(grid.scrollHeight, grid.clientHeight)}`);
+
+  for (const [sid, win] of sessionWindows) {
+    win.el.classList.remove('relationship-parent-highlight', 'relationship-child-highlight');
+    updateSessionRelationshipBadges(sid);
+  }
+
+  const active = activeSessionRelationshipIds();
+  for (const sid of active.parents) sessionWindows.get(sid)?.el.classList.add('relationship-parent-highlight');
+  for (const sid of active.children) sessionWindows.get(sid)?.el.classList.add('relationship-child-highlight');
+
+  const rects = new Map();
+  for (const [sid, win] of sessionWindows) {
+    if (win.minimized && win.el.offsetParent === null) continue;
+    rects.set(sid, sessionWindowRectInGrid(grid, win));
+  }
+
+  const visible = Array.from(sessionRelationships.entries())
+    .filter(([, rel]) => rects.has(rel.parentId) && rects.has(rel.childId));
+  const trunkByGroup = new Map();
+  for (const [, rel] of visible) {
+    const parentRect = rects.get(rel.parentId);
+    const childRect = rects.get(rel.childId);
+    const kind = rel.kind;
+    const direction = kind === 'subagent'
+      ? 'down'
+      : ((childRect.left + childRect.width / 2) >= (parentRect.left + parentRect.width / 2) ? 'right' : 'left');
+    const groupKey = `${rel.parentId}\u001f${kind}\u001f${direction}`;
+    if (kind === 'subagent') {
+      const candidate = Math.min(childRect.top - 14, parentRect.bottom + 22);
+      trunkByGroup.set(groupKey, Math.max(parentRect.bottom + 12, candidate));
+    } else if (direction === 'right') {
+      const candidate = Math.min(childRect.left - 14, parentRect.right + 28);
+      const current = trunkByGroup.get(groupKey);
+      trunkByGroup.set(groupKey, current === undefined ? Math.max(parentRect.right + 12, candidate) : Math.min(current, Math.max(parentRect.right + 12, candidate)));
+    } else {
+      const candidate = Math.max(childRect.right + 14, parentRect.left - 28);
+      const current = trunkByGroup.get(groupKey);
+      trunkByGroup.set(groupKey, current === undefined ? Math.min(parentRect.left - 12, candidate) : Math.max(current, Math.min(parentRect.left - 12, candidate)));
+    }
+  }
+
+  for (const [key, rel] of visible) {
+    const parentRect = rects.get(rel.parentId);
+    const childRect = rects.get(rel.childId);
+    const kind = rel.kind;
+    const direction = kind === 'subagent'
+      ? 'down'
+      : ((childRect.left + childRect.width / 2) >= (parentRect.left + parentRect.width / 2) ? 'right' : 'left');
+    const groupKey = `${rel.parentId}\u001f${kind}\u001f${direction}`;
+    const activeClass = active.activeKeys.has(key) ? ' active' : '';
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.classList.add('session-relationship-wire', kind);
+    if (activeClass) path.classList.add('active');
+    path.setAttribute('d', relationshipPath(parentRect, childRect, kind, direction, trunkByGroup.get(groupKey)));
+    svg.appendChild(path);
+
+    const endpoint = relationshipEndpointForChild(childRect, kind, direction);
+    const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    dot.classList.add('session-relationship-endpoint', kind);
+    if (activeClass) dot.classList.add('active');
+    dot.setAttribute('cx', endpoint.x);
+    dot.setAttribute('cy', endpoint.y);
+    dot.setAttribute('r', kind === 'side' ? '3.5' : '4');
+    svg.appendChild(dot);
+  }
+}
+
 function runSessionWindowAction(sessionId, op) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -11205,6 +11558,8 @@ function ensureSessionWindow(sessionId, meta = {}) {
   id.className = 'session-window-id';
   renderSessionIdentity(id, sid, { order: 'id-name', showName: false });
   applySessionBadgeStyle(id, sid);
+  const relationStrip = document.createElement('div');
+  relationStrip.className = 'session-window-relation-strip hidden';
   const project = document.createElement('div');
   project.className = 'session-window-project';
   project.textContent = meta.projectLabel || meta.projectRoot || 'unknown';
@@ -11216,6 +11571,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const metaRow = document.createElement('div');
   metaRow.className = 'session-window-meta';
   metaRow.appendChild(id);
+  metaRow.appendChild(relationStrip);
   metaRow.appendChild(project);
   const task = document.createElement('div');
   task.className = 'session-window-task';
@@ -11340,10 +11696,11 @@ function ensureSessionWindow(sessionId, meta = {}) {
         updateTaskTargetChip();
       }
     }
-    if (grid.childElementCount === 0) grid.classList.add('hidden');
+    if (!grid.querySelector('.session-window')) grid.classList.add('hidden');
     updateSessionWindowMaximizeState();
     syncSessionWindowGridControls();
     syncSessionWindowMetadataRefresh();
+    scheduleSessionRelationshipRender();
   });
 
   grid.appendChild(el);
@@ -11351,6 +11708,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     el,
     log,
     id,
+    relationStrip,
     project,
     cwd,
     task,
@@ -11369,6 +11727,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   syncSessionWindowMetadataRefresh();
   updateSessionWindow(sid, meta);
   updateSessionWindowMaximizeState();
+  scheduleSessionRelationshipRender();
   return win;
 }
 
@@ -11421,6 +11780,8 @@ function updateSessionWindow(sessionId, meta = {}) {
     if (cls) win.status.classList.add(cls);
   }
   updateSessionWindowActionMenuVisibility(sid);
+  updateSessionRelationshipBadges(sid);
+  scheduleSessionRelationshipRender();
 }
 
 function updateSessionWindowMinimizeState(sessionId) {
@@ -11447,6 +11808,7 @@ function setSessionWindowMinimized(sessionId, minimized) {
     updateSessionWindowMaximizeState();
   }
   updateSessionWindowMinimizeState(sid);
+  scheduleSessionRelationshipRender();
 }
 
 function toggleSessionWindowMinimized(sessionId) {
@@ -11488,6 +11850,7 @@ function setSessionWindowMaximized(sessionId, maximized) {
     maximizedSessionWindowId = '';
   }
   updateSessionWindowMaximizeState();
+  scheduleSessionRelationshipRender();
 }
 
 function toggleSessionWindowMaximized(sessionId) {
@@ -11518,6 +11881,7 @@ function focusSessionWindow(sessionId) {
   for (const [id, other] of sessionWindows) {
     other.el.classList.toggle('foreground', id === sid);
   }
+  scheduleSessionRelationshipRender();
   updateTaskTargetChip();
   renderForegroundSessionUsage();
   renderContextPane();
@@ -11561,7 +11925,10 @@ document.getElementById('concurrent-log-maximize')?.addEventListener('click', (e
       : CONCURRENT_LOG_MODE_MAXIMIZED
   );
 });
-window.addEventListener('resize', () => applySessionWindowGridHeight());
+window.addEventListener('resize', () => {
+  applySessionWindowGridHeight();
+  scheduleSessionRelationshipRender();
+});
 
 function createLogReplayAppendBatch() {
   return {
@@ -22028,6 +22395,7 @@ function onSessionEnded(sessionId, reason) {
       updateTaskTargetChip();
     }
   }
+  scheduleSessionRelationshipRender();
   // Refresh sessions list if already loaded
   if (sessionsLoaded) loadSessions();
 }
