@@ -20699,20 +20699,46 @@ class PeerDisplayConnection {
     // uses *intra refresh* (no post-seed IDRs — recovery spread across the
     // GOP via small slices + recovery-point SEI), which removes the
     // un-reassemblable access unit that motivated the pin. When the
-    // operator opts in via `federation_allow_h264=true`, SKIP the VP8 pin
-    // entirely and let codec order default — exactly like the local
-    // DisplaySlot path — so the peer's intra-refresh H.264 (libx264/NVENC)
-    // can be negotiated. Default false keeps VP8 the federation default.
+    // operator opts in via `federation_allow_h264=true`, PREFER H.264 by
+    // reordering the receiver's codec list so every `video/H264` variant
+    // comes FIRST (then VP8 and the rest, preserved in their original
+    // relative order as a fallback) and applying it via
+    // `setCodecPreferences`. Simply skipping the pin is not enough: the
+    // browser default order is not uniform across platforms — a Linux
+    // Chrome happened to put VP8 first, so federation kept landing on VP8
+    // and never exercised the peer's intra-refresh H.264 (libx264/NVENC)
+    // path. Putting H.264 first in the offer makes the peer answer with
+    // H.264 whenever it can encode it. Default false keeps VP8 the
+    // federation default (explicit VP8 pin, unchanged below).
     //
     // `RTCRtpReceiver.getCapabilities('video')` returns null on browsers
     // that don't implement it (rare in 2026 — Safari/WebKit, Chrome,
     // Firefox all support it); guard so a no-op fallback leaves the
     // transceiver at its browser default.
     const allowFederationH264 = !!(gatewayConfig && gatewayConfig.federation_allow_h264);
-    if (allowFederationH264) {
-      this._log('info',
-        'federation_allow_h264=true — skipping VP8 codec pin, letting codec ' +
-        'order default so peer intra-refresh H.264 can be negotiated');
+    if (allowFederationH264 && videoTransceiver && typeof videoTransceiver.setCodecPreferences === 'function') {
+      const caps = (typeof RTCRtpReceiver !== 'undefined' && RTCRtpReceiver.getCapabilities)
+        ? RTCRtpReceiver.getCapabilities('video')
+        : null;
+      const allCodecs = caps && caps.codecs ? caps.codecs : [];
+      const isH264 = (c) => c && c.mimeType && c.mimeType.toLowerCase() === 'video/h264';
+      const h264 = allCodecs.filter(isH264);
+      const rest = allCodecs.filter(c => !isH264(c));
+      if (h264.length > 0) {
+        const reordered = h264.concat(rest);
+        try {
+          videoTransceiver.setCodecPreferences(reordered);
+          this._log('info',
+            `federation_allow_h264=true — codec preference reordered to prefer ` +
+            `H.264 first (${h264.length} H.264 variant(s), ${rest.length} other(s))`);
+        } catch (e) {
+          this._log('warn', `setCodecPreferences(H264-first) failed: ${e.message} — falling back to browser default`);
+        }
+      } else {
+        this._log('warn',
+          'federation_allow_h264=true but no H.264 in RTCRtpReceiver capabilities — ' +
+          'leaving codec order at browser default');
+      }
     } else if (videoTransceiver && typeof videoTransceiver.setCodecPreferences === 'function') {
       const caps = (typeof RTCRtpReceiver !== 'undefined' && RTCRtpReceiver.getCapabilities)
         ? RTCRtpReceiver.getCapabilities('video')
