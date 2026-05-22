@@ -9400,9 +9400,14 @@ const controlPendingActions = new Map(); // op -> { timeoutHandle, btnEl }
 
 function dispatchCodexThreadAction(op, params, sessionId = '') {
   const sid = String(sessionId || '').trim() || resolvePromptTargetSessionId();
+  if (sid && sessionWindowIsSide(sid) && !codexThreadActionAllowedForSide(op)) {
+    showControlToast('error', `/${op} is not available in a /side window; use the parent thread`);
+    return false;
+  }
   const payload = { action: 'codex_thread_action', op, params: params || {} };
   if (sid) payload.session_id = sid;
   dispatchControlMsg(payload);
+  return true;
 }
 
 function showControlToast(kind, text) {
@@ -9581,9 +9586,11 @@ function dispatchCodexSlashCommand(parsed) {
     showControlToast('error', `/${parsed.op}: select a Codex session first`);
     return false;
   }
-  markActionPending(parsed.op);
-  dispatchCodexThreadAction(parsed.op, parsed.params || {});
-  return true;
+  if (dispatchCodexThreadAction(parsed.op, parsed.params || {}, sid)) {
+    markActionPending(parsed.op);
+    return true;
+  }
+  return false;
 }
 
 function markActionPending(op) {
@@ -9736,8 +9743,9 @@ function onControlActionBtnClick(ev) {
     }
     return;
   }
-  markActionPending(op);
-  dispatchCodexThreadAction(op, params);
+  if (dispatchCodexThreadAction(op, params)) {
+    markActionPending(op);
+  }
 }
 
 function wireControlPaneListeners() {
@@ -11211,6 +11219,18 @@ function sessionWindowIsCodex(sessionId, win = null) {
   return normalizeAgentId(meta.backendSource || current?.source || meta.source || meta.sourceLabel || '') === 'codex';
 }
 
+function sessionWindowIsSide(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return false;
+  const meta = sessionMetadataById.get(sid) || {};
+  return meta.relationshipKind === 'side';
+}
+
+function codexThreadActionAllowedForSide(op) {
+  const normalized = String(op || '').trim().toLowerCase().replace(/_/g, '-');
+  return normalized === 'side-close';
+}
+
 function closeSessionWindowMenus(exceptSessionId = '') {
   const except = String(exceptSessionId || '').trim();
   let closed = false;
@@ -11248,15 +11268,16 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
   const win = sid ? sessionWindows.get(sid) : null;
   if (!win || !win.actionMenuButton) return;
   const isCodex = sessionWindowIsCodex(sid, win);
+  const isSide = sessionWindowIsSide(sid);
   win.actionMenuButton.classList.remove('hidden');
   win.actionMenuButton.disabled = false;
   win.actionMenuButton.title = 'Session actions';
   win.actionMenuButton.setAttribute('aria-label', win.actionMenuButton.title);
   win.actionMenu?.querySelectorAll('[data-session-window-codex-action]').forEach(item => {
-    item.classList.toggle('hidden', !isCodex);
+    item.classList.toggle('hidden', !isCodex || isSide);
   });
   win.actionMenu?.querySelectorAll('[data-session-window-codex-separator]').forEach(item => {
-    item.classList.toggle('hidden', !isCodex);
+    item.classList.toggle('hidden', !isCodex || isSide);
   });
 }
 
@@ -11312,6 +11333,7 @@ function applySessionRelationshipMetadata(rel) {
   if (sessionWindows.has(rel.childId) && Object.keys(inheritedMeta).length > 0) {
     updateSessionWindow(rel.childId, inheritedMeta);
   }
+  updateSessionWindowActionMenuVisibility(rel.childId);
   updateSessionWindowRelationshipStyle(rel.childId);
 }
 
@@ -11592,8 +11614,9 @@ function runSessionWindowCodexAction(sessionId, op) {
   }
   const params = promptCodexThreadActionParams(spec);
   if (params === null) return;
-  markActionPending(op);
-  dispatchCodexThreadAction(op, params, sid);
+  if (dispatchCodexThreadAction(op, params, sid)) {
+    markActionPending(op);
+  }
 }
 
 function ensureSessionWindow(sessionId, meta = {}) {

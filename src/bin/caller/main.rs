@@ -1293,6 +1293,79 @@ fn side_child_thread_id_from_params(params: &serde_json::Value) -> Option<String
         .map(str::to_string)
 }
 
+fn thread_id_from_action_params(params: &serde_json::Value) -> Option<String> {
+    params
+        .pointer("/thread/id")
+        .and_then(|value| value.as_str())
+        .or_else(|| params.pointer("/threadId").and_then(|value| value.as_str()))
+        .or_else(|| {
+            params
+                .pointer("/thread_id")
+                .and_then(|value| value.as_str())
+        })
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn thread_action_params_with_thread_id(
+    op: &str,
+    params: serde_json::Value,
+    thread_id: Option<&str>,
+) -> serde_json::Value {
+    if thread_id_from_action_params(&params).is_some() {
+        return params;
+    }
+
+    let Some(thread_id) = thread_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return params;
+    };
+
+    match params {
+        serde_json::Value::Object(mut obj) => {
+            obj.insert(
+                "threadId".to_string(),
+                serde_json::Value::String(thread_id.to_string()),
+            );
+            serde_json::Value::Object(obj)
+        }
+        serde_json::Value::Null => serde_json::json!({ "threadId": thread_id }),
+        serde_json::Value::String(prompt) if matches!(op, "side" | "btw") => {
+            serde_json::json!({
+                "threadId": thread_id,
+                "prompt": prompt,
+            })
+        }
+        other => other,
+    }
+}
+
+fn thread_action_params_for_target(
+    op: &str,
+    params: serde_json::Value,
+    target_session_id: &Option<String>,
+    config: &DrainConfig<'_>,
+) -> serde_json::Value {
+    if thread_id_from_action_params(&params).is_some() {
+        return params;
+    }
+
+    let target = target_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .or(config.session_id.as_deref());
+    let thread_id = target.map(|target| {
+        if config.alias_session_id.as_deref() == Some(target) {
+            config.session_id.as_deref().unwrap_or(target)
+        } else {
+            target
+        }
+    });
+
+    thread_action_params_with_thread_id(op, params, thread_id)
+}
+
 fn emit_session_relationship(
     bus: &EventBus,
     parent_session_id: Option<&str>,
@@ -1331,8 +1404,12 @@ async fn handle_external_thread_action(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     op: String,
     params: serde_json::Value,
+    target_session_id: Option<String>,
     config: &DrainConfig<'_>,
 ) -> ExternalThreadActionEffect {
+    let params = thread_action_params_for_target(&op, params, &target_session_id, config);
+    let action_thread_id = thread_id_from_action_params(&params);
+    let result_session_id = target_session_id.or_else(|| config.session_id.clone());
     let result = agent
         .thread_action(&op, &params)
         .await
@@ -1350,7 +1427,7 @@ async fn handle_external_thread_action(
         ))
     });
     config.bus.send(AppEvent::CodexThreadActionResult {
-        session_id: config.session_id.clone(),
+        session_id: result_session_id.clone(),
         action: op.clone(),
         success,
         message: message.clone(),
@@ -1361,7 +1438,10 @@ async fn handle_external_thread_action(
             emit_codex_fork_session_name(config.bus, &child_id, &params);
             emit_session_relationship(
                 config.bus,
-                config.session_id.as_deref(),
+                action_thread_id
+                    .as_deref()
+                    .or(result_session_id.as_deref())
+                    .or(config.session_id.as_deref()),
                 &child_id,
                 "fork",
                 false,
@@ -1754,7 +1834,8 @@ async fn drain_external_agent_events(
                         &local_session_id,
                         &alias_session_id,
                     ) => {
-                        handle_external_thread_action(agent, action, params, config).await;
+                        handle_external_thread_action(agent, action, params, session_id, config)
+                            .await;
                         continue;
                     }
                     Ok(_) => continue,
@@ -3738,6 +3819,32 @@ mod tests {
             side_thread_ids_from_message("forked into thread child"),
             None
         );
+    }
+
+    #[test]
+    fn thread_action_params_with_thread_id_targets_clicked_window() {
+        let params = thread_action_params_with_thread_id(
+            "fork",
+            serde_json::json!({ "name": "Parent fork" }),
+            Some("parent-thread"),
+        );
+        assert_eq!(params["threadId"], "parent-thread");
+        assert_eq!(params["name"], "Parent fork");
+
+        let explicit = thread_action_params_with_thread_id(
+            "fork",
+            serde_json::json!({ "threadId": "explicit-thread" }),
+            Some("parent-thread"),
+        );
+        assert_eq!(explicit["threadId"], "explicit-thread");
+
+        let side_prompt = thread_action_params_with_thread_id(
+            "side",
+            serde_json::json!("quick check"),
+            Some("parent-thread"),
+        );
+        assert_eq!(side_prompt["threadId"], "parent-thread");
+        assert_eq!(side_prompt["prompt"], "quick check");
     }
 
     /// `advertised_transport = "mutual-tls"` advertises plain mTLS.
@@ -7416,6 +7523,7 @@ async fn run_with_presence(
                 op,
                 params,
             } => {
+                let mut action_params = params;
                 // `/new` is a daemon-side operation (not a Codex RPC): clear
                 // the persistent agent so the next task creates a fresh
                 // thread. Handled here — not inside dispatch_thread_action
@@ -7428,8 +7536,18 @@ async fn run_with_presence(
                     persistent_diff_tracker = ExternalDiffDeltaTracker::default();
                     Ok("agent torn down; next task will start a fresh thread".to_string())
                 } else if let Some(ref mut agent) = persistent_agent {
+                    let target_thread_id = session_id
+                        .as_deref()
+                        .filter(|id| Some(*id) != local_session_id.as_deref())
+                        .or_else(|| {
+                            persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.as_str())
+                        });
+                    action_params =
+                        thread_action_params_with_thread_id(&op, action_params, target_thread_id);
                     agent
-                        .thread_action(&op, &params)
+                        .thread_action(&op, &action_params)
                         .await
                         .map_err(|e| e.to_string())
                 } else {
@@ -7456,7 +7574,7 @@ async fn run_with_presence(
                 });
                 if success && op == "fork" {
                     if let Some(child_id) = forked_thread_id_from_message(&message) {
-                        emit_codex_fork_session_name(&bus, &child_id, &params);
+                        emit_codex_fork_session_name(&bus, &child_id, &action_params);
                         emit_session_relationship(
                             &bus,
                             result_session_id.as_deref(),
@@ -7478,7 +7596,7 @@ async fn run_with_presence(
                     if let Some((parent_thread_id, child_thread_id)) =
                         side_thread_ids_from_message(&message)
                     {
-                        let side_prompt = side_session_prompt_from_params(&params);
+                        let side_prompt = side_session_prompt_from_params(&action_params);
                         if let (Some(agent), Some(event_rx)) =
                             (persistent_agent.as_mut(), persistent_event_rx.as_mut())
                         {
@@ -8794,6 +8912,7 @@ async fn run_external_agent_mode(
                                     &mut agent,
                                     action,
                                     params,
+                                    session_id,
                                     &drain_config,
                                 )
                                 .await;

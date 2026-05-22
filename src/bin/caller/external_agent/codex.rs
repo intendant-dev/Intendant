@@ -60,32 +60,70 @@ impl CodexAgent {
             .ok_or_else(|| CallerError::ExternalAgent("no active Codex thread".into()))
     }
 
+    async fn thread_id_for_action(
+        &self,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
+        if let Some(thread_id) = extract_thread_id(params) {
+            Ok(thread_id)
+        } else {
+            self.require_active_thread().await
+        }
+    }
+
+    async fn ensure_thread_action_allowed(
+        &self,
+        op: &str,
+        params: &serde_json::Value,
+    ) -> Result<(), CallerError> {
+        if matches!(op, "side-close" | "side_close") {
+            return Ok(());
+        }
+        let thread_id = match extract_thread_id(params) {
+            Some(thread_id) => Some(thread_id),
+            None if matches!(op, "memory-reset" | "memory_reset") => None,
+            None => self.active_thread_id.lock().await.clone(),
+        };
+        let Some(thread_id) = thread_id else {
+            return Ok(());
+        };
+        let side_threads = self.side_threads.lock().await;
+        if let Some(parent_thread_id) = side_threads.get(&thread_id) {
+            return Err(CallerError::ExternalAgent(format!(
+                "cannot /{} a /side conversation {}; use the parent thread {} instead",
+                op, thread_id, parent_thread_id
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) async fn dispatch_thread_action(
         &mut self,
         op: &str,
         params: &serde_json::Value,
     ) -> Result<String, CallerError> {
+        self.ensure_thread_action_allowed(op, params).await?;
         match op {
-            "compact" => self.compact_thread().await,
+            "compact" => self.compact_thread(params).await,
             "fork" => {
                 let name = params
                     .get("name")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                self.fork_thread(name).await
+                self.fork_thread(params, name).await
             }
             "side" | "btw" => self.start_side_thread(params).await,
             "side-close" | "side_close" => self.close_side_thread(params).await,
             "undo" => {
                 let turns = params.get("turns").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
-                self.rollback_turns_inner(turns).await
+                self.rollback_turns_inner(params, turns).await
             }
             "review" => {
                 let prompt = params
                     .get("prompt")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                self.start_review(prompt).await
+                self.start_review(params, prompt).await
             }
             "rename" | "name-set" | "name_set" | "thread-name-set" | "thread_name_set" => {
                 self.set_thread_name(params).await
@@ -93,12 +131,12 @@ impl CodexAgent {
             "goal" | "goal-set" | "goal_get" | "goal-get" | "goal-status" => {
                 self.dispatch_goal_action(op, params).await
             }
-            "goal-clear" | "goal_clear" => self.clear_goal().await,
-            "goal-pause" | "goal_pause" => self.update_goal_status("paused").await,
-            "goal-resume" | "goal_resume" => self.update_goal_status("active").await,
-            "goal-complete" | "goal_complete" => self.update_goal_status("complete").await,
+            "goal-clear" | "goal_clear" => self.clear_goal(params).await,
+            "goal-pause" | "goal_pause" => self.update_goal_status(params, "paused").await,
+            "goal-resume" | "goal_resume" => self.update_goal_status(params, "active").await,
+            "goal-complete" | "goal_complete" => self.update_goal_status(params, "complete").await,
             "goal-budget-limited" | "goal_budget_limited" => {
-                self.update_goal_status("budgetLimited").await
+                self.update_goal_status(params, "budgetLimited").await
             }
             "memory-reset" | "memory_reset" => self.reset_memory().await,
             other => Err(CallerError::ExternalAgent(format!(
@@ -108,8 +146,8 @@ impl CodexAgent {
         }
     }
 
-    async fn compact_thread(&mut self) -> Result<String, CallerError> {
-        let thread_id = self.require_active_thread().await?;
+    async fn compact_thread(&mut self, params: &serde_json::Value) -> Result<String, CallerError> {
+        let thread_id = self.thread_id_for_action(params).await?;
         let params = serde_json::json!({ "threadId": thread_id });
         let _ = self
             .send_request("thread/compact/start", Some(params))
@@ -118,8 +156,12 @@ impl CodexAgent {
         Ok("conversation compaction started".to_string())
     }
 
-    async fn fork_thread(&mut self, name: Option<String>) -> Result<String, CallerError> {
-        let thread_id = self.require_active_thread().await?;
+    async fn fork_thread(
+        &mut self,
+        params: &serde_json::Value,
+        name: Option<String>,
+    ) -> Result<String, CallerError> {
+        let thread_id = self.thread_id_for_action(params).await?;
         let mut obj = serde_json::Map::new();
         obj.insert("threadId".into(), serde_json::Value::String(thread_id));
         if let Some(n) = name.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -147,7 +189,7 @@ impl CodexAgent {
         &mut self,
         params: &serde_json::Value,
     ) -> Result<String, CallerError> {
-        let parent_thread_id = self.require_active_thread().await?;
+        let parent_thread_id = self.thread_id_for_action(params).await?;
         if self.active_turn_id.lock().await.is_some() {
             return Err(CallerError::ExternalAgent(
                 "/side is not yet available while the active Codex turn is running in Intendant"
@@ -195,6 +237,10 @@ impl CodexAgent {
                     *self.active_turn_id.lock().await = Some(id);
                 }
                 *self.active_thread_id.lock().await = Some(child_thread_id.clone());
+                self.side_threads
+                    .lock()
+                    .await
+                    .insert(child_thread_id.clone(), parent_thread_id.clone());
                 Ok(format!(
                     "side conversation started in thread {} from parent {}",
                     child_thread_id, parent_thread_id
@@ -222,6 +268,7 @@ impl CodexAgent {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .map(str::to_string)
             .ok_or_else(|| CallerError::ExternalAgent("side thread id is required".into()))?;
         let parent_thread_id = params
             .get("parentThreadId")
@@ -229,19 +276,21 @@ impl CodexAgent {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .map(str::to_string)
             .ok_or_else(|| {
                 CallerError::ExternalAgent("side parent thread id is required".into())
             })?;
 
         self.active_turn_id.lock().await.take();
-        *self.active_thread_id.lock().await = Some(parent_thread_id.to_string());
+        *self.active_thread_id.lock().await = Some(parent_thread_id.clone());
         let _ = self
             .send_request(
                 "thread/unsubscribe",
-                Some(serde_json::json!({ "threadId": child_thread_id })),
+                Some(serde_json::json!({ "threadId": child_thread_id.clone() })),
             )
             .await
             .map_err(|e| CallerError::ExternalAgent(format!("thread/unsubscribe: {e}")))?;
+        self.side_threads.lock().await.remove(&child_thread_id);
         Ok(format!(
             "side conversation {} closed; returned to parent {}",
             child_thread_id, parent_thread_id
@@ -324,13 +373,17 @@ impl CodexAgent {
     /// `ExternalAgent::rollback_turns` trait method (impl below) wraps
     /// this same RPC without the status string — callers just need
     /// to know success/failure.
-    async fn rollback_turns_inner(&mut self, turns: u32) -> Result<String, CallerError> {
+    async fn rollback_turns_inner(
+        &mut self,
+        params: &serde_json::Value,
+        turns: u32,
+    ) -> Result<String, CallerError> {
         if turns == 0 {
             return Err(CallerError::ExternalAgent(
                 "rollback count must be at least 1".into(),
             ));
         }
-        let thread_id = self.require_active_thread().await?;
+        let thread_id = self.thread_id_for_action(params).await?;
         // Codex's `ThreadRollbackParams` accepts `numTurns`; the event it
         // emits after rollback currently uses `num_turns`.
         let params = serde_json::json!({
@@ -344,8 +397,12 @@ impl CodexAgent {
         Ok(format!("rolled back {} turn(s)", turns))
     }
 
-    async fn start_review(&mut self, prompt: Option<String>) -> Result<String, CallerError> {
-        let thread_id = self.require_active_thread().await?;
+    async fn start_review(
+        &mut self,
+        params: &serde_json::Value,
+        prompt: Option<String>,
+    ) -> Result<String, CallerError> {
+        let thread_id = self.thread_id_for_action(params).await?;
         let mut obj = serde_json::Map::new();
         obj.insert("threadId".into(), serde_json::Value::String(thread_id));
         if let Some(p) = prompt.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -373,7 +430,7 @@ impl CodexAgent {
     }
 
     async fn set_thread_name(&mut self, params: &serde_json::Value) -> Result<String, CallerError> {
-        let thread_id = self.require_active_thread().await?;
+        let thread_id = self.thread_id_for_action(params).await?;
         let name = params
             .get("name")
             .or_else(|| params.get("threadName"))
@@ -400,7 +457,7 @@ impl CodexAgent {
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
         {
-            return self.clear_goal().await;
+            return self.clear_goal(params).await;
         }
 
         let status = params
@@ -424,20 +481,21 @@ impl CodexAgent {
             || matches!(op, "goal-set")
         {
             return self
-                .set_goal(objective, status.as_deref(), token_budget)
+                .set_goal(params, objective, status.as_deref(), token_budget)
                 .await;
         }
 
-        self.get_goal().await
+        self.get_goal(params).await
     }
 
     async fn set_goal(
         &mut self,
+        params: &serde_json::Value,
         objective: Option<&str>,
         status: Option<&str>,
         token_budget: Option<Option<u64>>,
     ) -> Result<String, CallerError> {
-        let thread_id = self.require_active_thread().await?;
+        let thread_id = self.thread_id_for_action(params).await?;
         let mut obj = serde_json::Map::new();
         obj.insert("threadId".into(), serde_json::Value::String(thread_id));
         if let Some(objective) = objective {
@@ -468,8 +526,8 @@ impl CodexAgent {
         Ok(format_goal_response("goal updated", &response))
     }
 
-    async fn get_goal(&mut self) -> Result<String, CallerError> {
-        let thread_id = self.require_active_thread().await?;
+    async fn get_goal(&mut self, params: &serde_json::Value) -> Result<String, CallerError> {
+        let thread_id = self.thread_id_for_action(params).await?;
         let params = serde_json::json!({ "threadId": thread_id });
         let response = self
             .send_request("thread/goal/get", Some(params))
@@ -478,8 +536,8 @@ impl CodexAgent {
         Ok(format_goal_response("current goal", &response))
     }
 
-    async fn clear_goal(&mut self) -> Result<String, CallerError> {
-        let thread_id = self.require_active_thread().await?;
+    async fn clear_goal(&mut self, params: &serde_json::Value) -> Result<String, CallerError> {
+        let thread_id = self.thread_id_for_action(params).await?;
         let params = serde_json::json!({ "threadId": thread_id });
         let response = self
             .send_request("thread/goal/clear", Some(params))
@@ -496,8 +554,12 @@ impl CodexAgent {
         })
     }
 
-    async fn update_goal_status(&mut self, status: &str) -> Result<String, CallerError> {
-        self.set_goal(None, Some(status), None).await
+    async fn update_goal_status(
+        &mut self,
+        params: &serde_json::Value,
+        status: &str,
+    ) -> Result<String, CallerError> {
+        self.set_goal(params, None, Some(status), None).await
     }
 }
 
@@ -839,6 +901,10 @@ pub struct CodexAgent {
     /// as a fallback) and cleared on `turn/completed` / `turn/interrupted` /
     /// `Terminated`.
     active_turn_id: Arc<Mutex<Option<String>>>,
+    /// Ephemeral side-conversation child threads keyed by child thread id,
+    /// with the parent thread id as value. Used to keep slash/thread actions
+    /// scoped to durable Codex threads while still allowing side follow-ups.
+    side_threads: Arc<Mutex<HashMap<String, String>>>,
     /// Latest token-usage notification from Codex app-server. Joined with
     /// request payload snapshots so the dashboard can show current context usage.
     latest_token_usage: Arc<Mutex<Option<serde_json::Value>>>,
@@ -906,6 +972,7 @@ impl CodexAgent {
             reader_handle: None,
             active_thread_id: Arc::new(Mutex::new(None)),
             active_turn_id: Arc::new(Mutex::new(None)),
+            side_threads: Arc::new(Mutex::new(HashMap::new())),
             latest_token_usage: Arc::new(Mutex::new(None)),
         }
     }
@@ -2749,7 +2816,9 @@ impl ExternalAgent for CodexAgent {
         if turns_to_drop == 0 {
             return Ok(());
         }
-        let _status = self.rollback_turns_inner(turns_to_drop).await?;
+        let _status = self
+            .rollback_turns_inner(&serde_json::Value::Null, turns_to_drop)
+            .await?;
         Ok(())
     }
 
@@ -4312,6 +4381,53 @@ mod tests {
                     "got: {}",
                     msg
                 );
+            }
+            other => panic!("expected ExternalAgent error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_id_for_action_prefers_explicit_target_over_active_thread() {
+        let agent = test_agent();
+        *agent.active_thread_id.lock().await = Some("side-child".into());
+
+        let explicit = agent
+            .thread_id_for_action(&serde_json::json!({ "threadId": "parent-thread" }))
+            .await
+            .unwrap();
+        assert_eq!(explicit, "parent-thread");
+
+        let nested = agent
+            .thread_id_for_action(&serde_json::json!({ "thread": { "id": "fork-target" } }))
+            .await
+            .unwrap();
+        assert_eq!(nested, "fork-target");
+
+        let fallback = agent
+            .thread_id_for_action(&serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(fallback, "side-child");
+    }
+
+    #[tokio::test]
+    async fn thread_actions_reject_side_child_targets() {
+        let mut agent = test_agent();
+        agent
+            .side_threads
+            .lock()
+            .await
+            .insert("side-child".into(), "parent-thread".into());
+        *agent.active_thread_id.lock().await = Some("side-child".into());
+
+        let err = agent
+            .thread_action("fork", &serde_json::json!({ "threadId": "side-child" }))
+            .await
+            .unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(msg.contains("cannot /fork a /side conversation"), "got: {msg}");
+                assert!(msg.contains("parent-thread"), "got: {msg}");
             }
             other => panic!("expected ExternalAgent error, got {:?}", other),
         }
