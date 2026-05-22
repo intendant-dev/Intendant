@@ -1460,6 +1460,572 @@ async fn resolve_stun_servers(ice_config: &IceConfig) -> Vec<SocketAddr> {
     out
 }
 
+// --- TURN relay candidate gathering ----------------------------------------
+//
+// The server-side `rtc` peer only advertises host (per-interface UDP),
+// srflx (STUN-derived public UDP), and ICE-TCP candidates. On a host with no
+// inbound reachability at all — a Docker container behind a cloud NAT
+// with no inbound UDP and a srflx mapping the browser still can't
+// dial — none of those pair, and a relay-only browser
+// (`iceTransportPolicy: 'relay'`, which the federated path forces) has
+// nothing to connect to. To give such peers a reachable path the server peer
+// allocates its OWN relay on the configured coturn (the same `turn:` server
+// the browser uses) and advertises a `typ relay` candidate carrying the
+// relayed transport address. Media to/from a NAT'd peer then bounces through
+// coturn from both ends.
+//
+// This reuses `rtc`'s sans-I/O TURN client (`rtc::turn::client`, re-exported
+// by the `rtc` 0.9 meta-crate — no new dependency, the analogue of how srflx
+// reuses `rtc::stun`). The client owns no sockets: it is driven through the
+// same `sansio::Protocol` trait (`RtcProtocol`, already imported) as the
+// `RTCPeerConnection` — `handle_read` for inbound bytes, `poll_write` for
+// outbound, `poll_event` for Allocate/CreatePermission/Data events,
+// `poll_timeout`/`handle_timeout` for retransmit + automatic allocation and
+// permission refresh. The app owns the relay UDP socket and pumps it.
+
+/// A resolved TURN server: the long-term credentials and resolved transport
+/// address parsed out of a `turn:`/`turns:` entry in `[webrtc].ice_servers`.
+#[derive(Clone, Debug)]
+struct TurnServerCfg {
+    /// Resolved `IP:port` of the TURN server's signaling transport.
+    addr: SocketAddr,
+    /// Long-term-credential username (the `username` field of the ICE server).
+    username: String,
+    /// Long-term-credential password (the `credential` field).
+    password: String,
+}
+
+/// Maximum time the relay task waits for a TURN Allocate success response
+/// before giving up. Like the STUN srflx timeout, this is OFF the
+/// peer-setup critical path — the SDP answer is created and returned with
+/// host + ICE-TCP candidates before any TURN traffic is sent, and the relay
+/// candidate is *trickled* once the allocation succeeds. A blocked or
+/// unreachable TURN server therefore costs zero added setup latency: the
+/// allocation simply times out and no relay candidate is trickled, leaving
+/// the host/srflx/ICE-TCP candidate set intact.
+const RELAY_ALLOCATE_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// Hard cap on a TURN allocation's lifetime in the relay task. The sans-I/O
+/// turn client auto-refreshes the allocation at half its server-granted
+/// lifetime (and permissions on their own timer) via `handle_timeout`; this
+/// cap only bounds the `poll_timeout`-driven sleep so an idle relay still
+/// wakes periodically to service refreshes even if the server grants a very
+/// long lifetime.
+const RELAY_REFRESH_POLL_CAP: Duration = Duration::from_secs(30);
+
+/// Build a relay (`typ relay`) UDP ICE candidate.
+///
+/// `relayed` is the relayed transport address the TURN server allocated for
+/// us (the candidate's transport address — what the remote peer dials, which
+/// the TURN server then forwards to our relay socket). `mapped` is the
+/// server-reflexive address the TURN server observed for our relay socket
+/// (the `XOR-MAPPED-ADDRESS` in the Allocate response), used as the
+/// candidate's `raddr`/`rport` per RFC 5245 § 4.3 (relayed candidates carry
+/// their reflexive base there). The foundation ("3") differs from host ("1")
+/// and srflx ("2") so the candidates don't collapse, and the type-preference
+/// byte of the priority is `0 << 24` (relay) — the lowest, so direct host /
+/// srflx pairs are always tried first and the relay is the last resort.
+fn relay_candidate_init(relayed: SocketAddr, mapped: SocketAddr) -> RTCIceCandidateInit {
+    // Priority = (type-pref << 24) | (local-pref << 8) | (256 - component).
+    // relay type preference 0 (so the `0 << 24` term vanishes — the lowest
+    // type preference, ensuring host/srflx pairs are tried before the relay),
+    // local preference 65535, component 1.
+    let priority = (65_535u32 << 8) | (256 - 1);
+    RTCIceCandidateInit {
+        candidate: format!(
+            "candidate:3 1 udp {priority} {} {} typ relay raddr {} rport {} generation 0",
+            relayed.ip(),
+            relayed.port(),
+            mapped.ip(),
+            mapped.port()
+        ),
+        sdp_mid: Some(String::new()),
+        sdp_mline_index: Some(0),
+        username_fragment: None,
+        url: None,
+    }
+}
+
+/// Extract plain-UDP TURN servers (`turn:`) with their credentials from an
+/// [`IceConfig`], resolving each host to a transport address.
+///
+/// `rtc::stun::uri::Uri::parse_uri` deliberately rejects the `turn:`/`turns:`
+/// schemes (it is a STUN-only RFC 7064 parser), so this parses the RFC 7065
+/// TURN URI form by hand: `turn:host[:port][?transport=...]`. The
+/// `?transport=` query (UDP/TCP hint) is ignored — we always allocate over
+/// plain UDP from our relay socket. `turns:` (TURN-over-TLS, typically port
+/// 5349) entries are skipped: the sans-I/O client speaks plain UDP STUN/TURN
+/// and cannot drive a TLS endpoint; coturn exposes the same allocation
+/// surface on the plain `turn:` URL we use. Credentials come from the ICE
+/// server's `username`/`credential` fields (the WebRTC config model carries
+/// TURN long-term credentials there, not in the URI). Entries without both a
+/// username and a credential are skipped: an unauthenticated Allocate just
+/// draws a 401 and wastes the timeout. The port defaults to the IANA TURN
+/// port 3478 when absent.
+///
+/// Returns deduplicated resolved servers. An empty result (no plain `turn:`
+/// server configured, or all failed to resolve / lacked credentials) means
+/// relay gathering is skipped entirely — host/srflx/ICE-TCP candidates still
+/// work.
+async fn resolve_turn_servers(ice_config: &IceConfig) -> Vec<TurnServerCfg> {
+    let mut out: Vec<TurnServerCfg> = Vec::new();
+    for server in &ice_config.ice_servers {
+        // TURN long-term credentials are mandatory; without them the
+        // Allocate is unauthenticated and the server answers 401.
+        let (Some(username), Some(password)) = (&server.username, &server.credential) else {
+            continue;
+        };
+        for url in &server.urls {
+            // Split off any RFC 7065 `?transport=` query — we always allocate
+            // over plain UDP from our relay socket.
+            let base = url.split('?').next().unwrap_or(url);
+            // Only plain `turn:` (UDP/TCP, we use UDP). `turns:` is
+            // TURN-over-(D)TLS on a TLS port (typically 5349): our sans-I/O
+            // client speaks plain UDP STUN/TURN, so a TLS endpoint is
+            // unreachable for it. Coturn deployments expose the same
+            // allocation surface on the plain `turn:` URL, which we use; the
+            // `turns:` entry (often listed first for browsers) is skipped.
+            let Some(rest) = base.strip_prefix("turn:") else {
+                continue; // turns:/stun:/stuns:/other — not usable over UDP here.
+            };
+            // `rest` is `host[:port]`, with IPv6 hosts bracketed as
+            // `[::1]:3478`. Parse host + optional port.
+            let (host, port) = parse_turn_host_port(rest);
+            let host_port = format!("{host}:{port}");
+            match tokio::net::lookup_host(host_port.clone()).await {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        if !out.iter().any(|c| c.addr == addr) {
+                            out.push(TurnServerCfg {
+                                addr,
+                                username: username.clone(),
+                                password: password.clone(),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[display/webrtc] TURN server {host_port} resolve failed: {e}");
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Split a TURN URI authority (`host[:port]`, IPv6 hosts bracketed) into a
+/// host string suitable for DNS lookup and a port, defaulting to the IANA
+/// TURN port 3478. Bracketed IPv6 literals keep their brackets stripped for
+/// the host but the trailing `:port` (outside the brackets) is honored.
+fn parse_turn_host_port(authority: &str) -> (String, u16) {
+    const DEFAULT_TURN_PORT: u16 = 3478;
+    if let Some(close) = authority.strip_prefix('[').and_then(|_| authority.find(']')) {
+        // IPv6 literal: `[<addr>]` optionally followed by `:port`.
+        let host = authority[1..close].to_string();
+        let after = &authority[close + 1..];
+        let port = after
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(DEFAULT_TURN_PORT);
+        (host, port)
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        // `host:port` (IPv4 or hostname). If the part after the last colon
+        // isn't a valid port, treat the whole thing as a bare host.
+        match port.parse() {
+            Ok(p) => (host.to_string(), p),
+            Err(_) => (authority.to_string(), DEFAULT_TURN_PORT),
+        }
+    } else {
+        (authority.to_string(), DEFAULT_TURN_PORT)
+    }
+}
+
+/// Outcome of a successful relay allocation, handed back to the driver so it
+/// can advertise the relay candidate and route media through the relay task.
+struct RelayAllocation {
+    /// The relayed transport address coturn allocated (the candidate's
+    /// transport address — what the remote peer dials).
+    relayed_addr: SocketAddr,
+    /// The reflexive base the TURN server observed for our relay socket
+    /// (Allocate response `XOR-MAPPED-ADDRESS`), used as the candidate's
+    /// `raddr`/`rport`.
+    mapped_addr: SocketAddr,
+    /// Driver → relay: RTC outbound bytes that ICE wants to send *from* the
+    /// relayed address. Each item is `(peer_addr, bytes)`; the relay task
+    /// ensures a permission exists for `peer_addr` then sends via the TURN
+    /// client (Send indication → ChannelData once a channel is bound).
+    relay_out_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+}
+
+/// Drive a sans-I/O TURN client to allocate a relay on `server`, then run the
+/// relay's I/O loop until shutdown.
+///
+/// Owns a freshly-bound relay UDP socket (the single owner of its
+/// `recv_from`, so there is no read race — mirrors the per-socket forwarder
+/// pattern). On allocation success it sends a [`RelayAllocation`] back over
+/// `alloc_tx` (carrying the relayed address for the candidate and the
+/// driver→relay media channel) and then loops:
+///
+///   - drains the turn client's `poll_write` to the relay socket (TURN
+///     control + wrapped media to the TURN server),
+///   - reads the relay socket and feeds bytes to `handle_read` (the client
+///     demultiplexes STUN responses, Data indications and ChannelData),
+///   - drains `poll_event`: relayed inbound media
+///     (`DataIndicationOrChannelData`) is unwrapped and pushed to the driver
+///     via `inbound_tx` tagged as arriving *at* the relayed address from the
+///     remote peer (so rtc pairs it with the relay candidate); the first
+///     time a new peer is seen a `create_permission` is issued,
+///   - services `poll_timeout`/`handle_timeout` so the turn client
+///     retransmits unacked requests and auto-refreshes the allocation and
+///     permissions,
+///   - forwards driver→relay media (`relay_out_rx`) through the client's
+///     `Relay::send_to`.
+///
+/// On allocation failure or timeout it logs and returns without sending a
+/// `RelayAllocation`; the driver proceeds with host/srflx/ICE-TCP only.
+async fn run_turn_relay(
+    peer_id: PeerId,
+    server: TurnServerCfg,
+    is_ipv4: bool,
+    inbound_tx: mpsc::Sender<InboundPacket>,
+    alloc_tx: mpsc::Sender<RelayAllocation>,
+    shutdown: CancellationToken,
+) {
+    use rtc::turn::client::{Client, ClientConfig, Event as TurnEvent};
+
+    // Bind the relay socket on the same family as the TURN server so the
+    // kernel can route our datagrams to it. Wildcard bind (port 0) — this
+    // socket only ever talks to the TURN server and (post-allocate) carries
+    // wrapped media, never a directly-advertised candidate of its own.
+    let bind_addr: SocketAddr = if is_ipv4 {
+        SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
+    } else {
+        SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), 0)
+    };
+    let socket = match UdpSocket::bind(bind_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[display/webrtc] peer {peer_id}: TURN relay socket bind failed: {e}");
+            return;
+        }
+    };
+    let local_addr = match socket.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[display/webrtc] peer {peer_id}: TURN relay socket local_addr failed: {e}");
+            return;
+        }
+    };
+
+    let mut client = match Client::new(ClientConfig {
+        stun_serv_addr: String::new(),
+        turn_serv_addr: server.addr.to_string(),
+        local_addr,
+        transport_protocol: TransportProtocol::UDP,
+        username: server.username.clone(),
+        password: server.password.clone(),
+        realm: String::new(),
+        software: String::new(),
+        rto_in_ms: 0,
+    }) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[display/webrtc] peer {peer_id}: TURN client init failed: {e}");
+            return;
+        }
+    };
+
+    // Kick off the allocation. The client pushes the Allocate request onto
+    // its transmit queue; we pump it below.
+    if let Err(e) = client.allocate() {
+        eprintln!("[display/webrtc] peer {peer_id}: TURN allocate() failed: {e}");
+        return;
+    }
+
+    // Phase 1: drive the allocation handshake (anonymous → 401 → authed
+    // Allocate) until we get a relayed address or time out. Permissions are
+    // created lazily once we learn a peer's address from inbound relayed data.
+    let mut relayed_addr: Option<SocketAddr> = None;
+    let mut recv_buf = vec![0u8; UDP_BUF_LEN];
+    let allocate_deadline = tokio::time::Instant::now() + RELAY_ALLOCATE_TIMEOUT;
+
+    'allocate: loop {
+        // Flush any pending TURN control writes to the server.
+        if pump_turn_writes(&mut client, &socket).await.is_err() {
+            return;
+        }
+        // Drain events produced so far.
+        while let Some(event) = client.poll_event() {
+            match event {
+                TurnEvent::AllocateResponse(_, addr) => {
+                    relayed_addr = Some(addr);
+                    // The reflexive base is the XOR-MAPPED-ADDRESS the client
+                    // recorded; if the client didn't surface one we fall back
+                    // to the local socket address (still a valid raddr base).
+                    break;
+                }
+                TurnEvent::AllocateError(_, e) => {
+                    eprintln!(
+                        "[display/webrtc] peer {peer_id}: TURN allocate rejected: {e}"
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if relayed_addr.is_some() {
+            break 'allocate;
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= allocate_deadline {
+            eprintln!(
+                "[display/webrtc] peer {peer_id}: TURN allocate timed out after {RELAY_ALLOCATE_TIMEOUT:?} (no relay candidate)"
+            );
+            return;
+        }
+        // Next turn-client timer (retransmit), bounded by the overall
+        // allocate deadline.
+        let client_timeout = client
+            .poll_timeout()
+            .map(tokio_instant_from_std)
+            .unwrap_or(allocate_deadline)
+            .min(allocate_deadline);
+        let sleep_until = tokio::time::sleep_until(client_timeout);
+        tokio::pin!(sleep_until);
+
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = &mut sleep_until => {
+                let _ = client.handle_timeout(Instant::now());
+            }
+            recv = socket.recv_from(&mut recv_buf) => match recv {
+                Ok((n, from)) => {
+                    feed_turn_inbound(&mut client, &recv_buf[..n], from, local_addr);
+                }
+                Err(e) => {
+                    eprintln!("[display/webrtc] peer {peer_id}: TURN relay recv failed: {e}");
+                    return;
+                }
+            },
+        }
+    }
+
+    let relayed_addr = match relayed_addr {
+        Some(a) => a,
+        None => return,
+    };
+    // raddr/rport for the relay candidate: the reflexive base. The turn
+    // client doesn't expose the Allocate response's XOR-MAPPED-ADDRESS, so we
+    // use the relay socket's local address. The raddr is informational for
+    // pairing (RFC 5245 §4.3); the relayed address is what the peer dials.
+    let mapped = local_addr;
+
+    // Hand the allocation back to the driver: it adds the relay candidate and
+    // begins routing relay-destined RTC output to us.
+    let (relay_out_tx, mut relay_out_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(256);
+    if alloc_tx
+        .send(RelayAllocation {
+            relayed_addr,
+            mapped_addr: mapped,
+            relay_out_tx,
+        })
+        .await
+        .is_err()
+    {
+        // Driver gone before we finished allocating; tear the allocation down.
+        let _ = client.close();
+        let _ = pump_turn_writes(&mut client, &socket).await;
+        return;
+    }
+    eprintln!(
+        "[display/webrtc] peer {peer_id}: TURN relay allocated {relayed_addr} via {} (relay socket {local_addr})",
+        server.addr
+    );
+
+    // Phase 2: steady-state relay I/O loop. Permissions for peers are created
+    // on first sight of inbound relayed data; the turn client auto-refreshes
+    // the allocation + permissions through `handle_timeout`.
+    let mut permitted: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
+    loop {
+        if pump_turn_writes(&mut client, &socket).await.is_err() {
+            return;
+        }
+        // Drain relay events: relayed inbound media + permission results.
+        while let Some(event) = client.poll_event() {
+            match event {
+                TurnEvent::DataIndicationOrChannelData(_, peer_addr, data) => {
+                    // A peer (the browser, via coturn) sent us a packet. Make
+                    // sure we have a permission so our replies can flow back,
+                    // then inject the unwrapped payload into the RTC core as
+                    // if it arrived at our relayed address (so ICE pairs it
+                    // with the relay candidate).
+                    if permitted.insert(peer_addr) {
+                        if let Ok(mut relay) = client.relay(relayed_addr) {
+                            if let Err(e) = relay.create_permission(peer_addr) {
+                                eprintln!(
+                                    "[display/webrtc] peer {peer_id}: TURN create_permission({peer_addr}) failed: {e}"
+                                );
+                            }
+                        }
+                    }
+                    let pkt = InboundPacket {
+                        proto: TransportProtocol::UDP,
+                        source: peer_addr,
+                        destination: relayed_addr,
+                        bytes: data.to_vec(),
+                        received_at: Instant::now(),
+                    };
+                    if inbound_tx.send(pkt).await.is_err() {
+                        return; // driver gone
+                    }
+                }
+                TurnEvent::CreatePermissionError(_, e) => {
+                    eprintln!(
+                        "[display/webrtc] peer {peer_id}: TURN create_permission rejected: {e}"
+                    );
+                }
+                _ => {}
+            }
+        }
+        // Flush any control traffic the permission/event handling produced.
+        if pump_turn_writes(&mut client, &socket).await.is_err() {
+            return;
+        }
+
+        let client_timeout = client
+            .poll_timeout()
+            .map(tokio_instant_from_std)
+            .unwrap_or_else(|| tokio::time::Instant::now() + RELAY_REFRESH_POLL_CAP)
+            .min(tokio::time::Instant::now() + RELAY_REFRESH_POLL_CAP);
+        let sleep_until = tokio::time::sleep_until(client_timeout);
+        tokio::pin!(sleep_until);
+
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                // Release the allocation politely so coturn frees the port.
+                let _ = client.close();
+                let _ = pump_turn_writes(&mut client, &socket).await;
+                return;
+            }
+            _ = &mut sleep_until => {
+                if client.handle_timeout(Instant::now()).is_err() {
+                    return;
+                }
+            }
+            recv = socket.recv_from(&mut recv_buf) => match recv {
+                Ok((n, from)) => {
+                    feed_turn_inbound(&mut client, &recv_buf[..n], from, local_addr);
+                }
+                Err(e) => {
+                    eprintln!("[display/webrtc] peer {peer_id}: TURN relay recv failed: {e}");
+                    return;
+                }
+            },
+            out = relay_out_rx.recv() => match out {
+                Some((peer_addr, bytes)) => {
+                    // RTC wants to send to `peer_addr` via the relay. Ensure a
+                    // permission exists, then hand the payload to the turn
+                    // client, which wraps it (Send indication, upgrading to a
+                    // bound channel) toward coturn.
+                    if permitted.insert(peer_addr) {
+                        if let Ok(mut relay) = client.relay(relayed_addr) {
+                            let _ = relay.create_permission(peer_addr);
+                        }
+                    }
+                    if let Ok(mut relay) = client.relay(relayed_addr) {
+                        if let Err(e) = relay.send_to(&bytes, peer_addr) {
+                            // ErrNoPermission here is expected for the very
+                            // first packet to a peer (permission still in
+                            // flight); the RTC core retransmits, so a single
+                            // dropped check is harmless. Log other errors.
+                            if !is_turn_no_permission(&e) {
+                                eprintln!(
+                                    "[display/webrtc] peer {peer_id}: TURN send_to({peer_addr}) failed: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+                None => {
+                    // Driver dropped the relay sender — peer is going away.
+                    let _ = client.close();
+                    let _ = pump_turn_writes(&mut client, &socket).await;
+                    return;
+                }
+            },
+        }
+    }
+}
+
+/// Drain the turn client's outbound transmit queue to the relay socket.
+/// Each `poll_write` item is a `TaggedBytesMut` whose `transport.peer_addr`
+/// is the destination (the TURN server). Returns `Err(())` if a send fails
+/// fatally (socket dead) so the caller can tear the relay task down.
+async fn pump_turn_writes(
+    client: &mut rtc::turn::client::Client,
+    socket: &UdpSocket,
+) -> Result<(), ()> {
+    while let Some(transmit) = client.poll_write() {
+        if let Err(e) = socket
+            .send_to(&transmit.message, transmit.transport.peer_addr)
+            .await
+        {
+            eprintln!(
+                "[display/webrtc] TURN relay send to {} failed: {e}",
+                transmit.transport.peer_addr
+            );
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+/// Feed a datagram received on the relay socket into the turn client. Wraps
+/// the raw bytes in a `TaggedBytesMut` with `peer_addr = from` (the source),
+/// which the client uses to demultiplex (STUN response from the TURN server
+/// vs. relayed application data). Parse/handling errors are logged at trace
+/// level only — the client discards malformed packets and keeps running.
+fn feed_turn_inbound(
+    client: &mut rtc::turn::client::Client,
+    bytes: &[u8],
+    from: SocketAddr,
+    local_addr: SocketAddr,
+) {
+    let tagged = TaggedBytesMut {
+        now: Instant::now(),
+        transport: TransportContext {
+            local_addr,
+            peer_addr: from,
+            transport_protocol: TransportProtocol::UDP,
+            ecn: None,
+        },
+        message: BytesMut::from(bytes),
+    };
+    // The turn client returns Err for non-STUN traffic from the STUN server
+    // and for malformed packets; both are safe to ignore here (we have no
+    // STUN server configured on this client, only TURN).
+    let _ = client.handle_read(tagged);
+}
+
+/// True if `e` is the turn client's "no permission yet" error, which is the
+/// expected transient for the first packet sent to a freshly-seen peer.
+fn is_turn_no_permission(e: &rtc::shared::error::Error) -> bool {
+    matches!(e, rtc::shared::error::Error::ErrNoPermission)
+}
+
+/// Convert a `std::time::Instant` deadline (what the sans-I/O turn client's
+/// `poll_timeout` returns) into a `tokio::time::Instant` for `sleep_until`.
+fn tokio_instant_from_std(when: Instant) -> tokio::time::Instant {
+    let now_std = Instant::now();
+    let now_tokio = tokio::time::Instant::now();
+    if when <= now_std {
+        now_tokio
+    } else {
+        now_tokio + (when - now_std)
+    }
+}
+
 fn first_video_mid_from_offer(sdp: &str) -> Option<String> {
     let mut in_video = false;
     for raw in sdp.lines() {
@@ -3026,6 +3592,54 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
     // up, or shut down), letting its select-loop branch go dormant.
     drop(srflx_tx);
 
+    // --- TURN relay candidate gathering, in a dedicated relay task --------
+    //
+    // Off the peer-setup critical path, exactly like srflx above: the answer
+    // is already out (host + ICE-TCP), so allocating a relay here adds zero
+    // setup latency and an unreachable/misconfigured TURN server never delays
+    // anything. When the allocation succeeds the task hands back a
+    // `RelayAllocation`; the select loop below adds the `typ relay` candidate
+    // and trickles it to the browser via `ice_tx` (same channel as srflx).
+    //
+    // The relay task owns its own UDP socket (single reader, no race) and
+    // drives the sans-I/O `rtc::turn` client. Relayed inbound media arrives on
+    // `inbound_tx` tagged at the relayed address so ICE pairs it with the
+    // relay candidate; relay-destined RTC *output* is routed to the task via
+    // the `relay_out_tx` carried in the `RelayAllocation` (see
+    // `drain_outputs`, which checks the transmit's local_addr against the
+    // relayed address). Graceful fallback: with no `turn:` server configured
+    // (or all unresolvable / credential-less) we never spawn the task and the
+    // host/srflx/ICE-TCP candidate set is unchanged.
+    let (alloc_tx, mut alloc_rx) = mpsc::channel::<RelayAllocation>(1);
+    let turn_servers = resolve_turn_servers(&ice_config).await;
+    if let Some(server) = turn_servers.into_iter().next() {
+        // Relay over the same address family as our ICE sockets so the relay
+        // path is reachable for the transport the browser is using.
+        let is_ipv4 = sockets
+            .first()
+            .and_then(|s| s.local_addr().ok())
+            .map(|a| a.is_ipv4())
+            .unwrap_or(true);
+        let relay_inbound_tx = inbound_tx.clone();
+        let relay_alloc_tx = alloc_tx.clone();
+        let relay_shutdown = shutdown.clone();
+        tokio::spawn(run_turn_relay(
+            peer_id,
+            server,
+            is_ipv4,
+            relay_inbound_tx,
+            relay_alloc_tx,
+            relay_shutdown,
+        ));
+    }
+    // Drop the template `alloc_tx` so `alloc_rx` closes if no relay task was
+    // spawned (or once the one task exits), letting its select branch idle.
+    drop(alloc_tx);
+    // Once the allocation lands, this is the relayed address ICE advertises
+    // and the channel that routes relay-destined RTC output to the relay task.
+    let mut relay_addr: Option<SocketAddr> = None;
+    let mut relay_out_tx: Option<mpsc::Sender<(SocketAddr, Vec<u8>)>> = None;
+
     // Phase 4d.1: poll-driven observed-send-bitrate computation.
     // Each tick samples `bytes_sent` per outbound stream and computes
     // the rate over the elapsed interval. `prev_outbound_bytes` carries
@@ -3049,6 +3663,8 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
             &mut rtc,
             &sockets_by_addr,
             &mut tcp_senders,
+            relay_addr,
+            relay_out_tx.as_ref(),
             &mut state,
             &input_handler,
             &clipboard_handler,
@@ -3335,6 +3951,57 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
                     }
                 }
             }
+            // The TURN relay task allocated a relay on coturn. Add the
+            // `typ relay` candidate locally so ICE can form the relay pair,
+            // remember the relayed address + the relay-output channel so
+            // `drain_outputs` routes relay-destined RTC output through the
+            // task, and trickle the candidate to the browser via `ice_tx`
+            // (same path srflx uses). Best-effort: a failed add logs but never
+            // tears the peer down — host/srflx/ICE-TCP paths remain. This
+            // fires at most once per peer (the task allocates a single relay).
+            Some(alloc) = alloc_rx.recv() => {
+                let RelayAllocation {
+                    relayed_addr,
+                    mapped_addr,
+                    relay_out_tx: out_tx,
+                } = alloc;
+                // Record routing state so `drain_outputs` can dispatch RTC
+                // output sourced from the relayed address to the relay task.
+                relay_addr = Some(relayed_addr);
+                relay_out_tx = Some(out_tx);
+                let init = relay_candidate_init(relayed_addr, mapped_addr);
+                let candidate_json = serde_json::json!({
+                    "candidate": init.candidate,
+                    "sdpMid": serde_json::Value::Null,
+                    "sdpMLineIndex": 0,
+                })
+                .to_string();
+                match rtc.add_local_candidate(init) {
+                    Ok(()) => {
+                        eprintln!(
+                            "[display/webrtc] peer {peer_id}: added relay candidate {relayed_addr} (raddr {mapped_addr}), trickling to browser"
+                        );
+                        if ice_tx.send((peer_id, candidate_json)).await.is_err() {
+                            eprintln!(
+                                "[display/webrtc] peer {peer_id}: relay trickle channel closed; candidate added locally only"
+                            );
+                        }
+                        if let Err(e) = rtc.handle_timeout(Instant::now()) {
+                            eprintln!(
+                                "[display/webrtc] peer {peer_id}: handle_timeout after relay candidate failed: {e:?}"
+                            );
+                            shutdown.cancel();
+                            for h in forwarder_handles {
+                                let _ = h.await;
+                            }
+                            return;
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[display/webrtc] peer {peer_id}: failed to add relay candidate {relayed_addr}: {e}"
+                    ),
+                }
+            }
             // Phase 4d.1: observed-send-bitrate poll. Calls
             // `rtc.get_stats(now, StatsSelector::None)` (read-only walk
             // of the rtc-side accumulator state, cheap), projects
@@ -3418,6 +4085,13 @@ async fn drain_outputs<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
     sockets_by_addr: &HashMap<SocketAddr, Arc<UdpSocket>>,
     tcp_senders: &mut HashMap<SocketAddr, TcpFrameSender>,
+    // Relay routing: when the allocation has landed, `relay_addr` is our
+    // relayed transport address (the relay candidate's base) and
+    // `relay_out_tx` feeds RTC output destined *from* that address to the
+    // TURN relay task, which wraps it toward coturn. `None` until/unless a
+    // relay allocation succeeds.
+    relay_addr: Option<SocketAddr>,
+    relay_out_tx: Option<&mpsc::Sender<(SocketAddr, Vec<u8>)>>,
     state: &mut DriverState,
     input_handler: &Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: &Arc<dyn Fn(ClipboardContent) + Send + Sync>,
@@ -3426,6 +4100,24 @@ async fn drain_outputs<I: rtc::interceptor::Interceptor>(
     keyframe_request_tx: &mpsc::Sender<SimulcastRid>,
 ) -> Result<Instant, DriverExit> {
     while let Some(t) = rtc.poll_write() {
+        // Relay-destined output: ICE picked the relay candidate, so rtc emits
+        // a transmit whose source is our relayed address. That address is not
+        // a kernel socket we bound — it lives on coturn — so we route the
+        // payload to the TURN relay task instead of `sendto`, and we do this
+        // BEFORE the routability filter (both addresses are public coturn-side
+        // addresses, not a local source bind). The relay task ensures a
+        // permission/channel exists and wraps the bytes toward coturn.
+        if t.transport.transport_protocol == TransportProtocol::UDP
+            && Some(t.transport.local_addr) == relay_addr
+        {
+            if let Some(tx) = relay_out_tx {
+                // try_send keeps the rtc poll loop non-blocking; a full relay
+                // queue drops this packet as backpressure (RTP recovery /
+                // ICE retransmit covers the loss).
+                let _ = tx.try_send((t.transport.peer_addr, t.message.to_vec()));
+            }
+            continue;
+        }
         // Routability filtering only applies to UDP: for UDP we need the
         // kernel's `sendto` to succeed from our bound socket, and a
         // loopback-source-to-routable-destination pair would be rejected with
@@ -5085,6 +5777,161 @@ mod tests {
     async fn resolve_stun_servers_empty_when_no_servers() {
         let resolved = resolve_stun_servers(&IceConfig::default()).await;
         assert!(resolved.is_empty(), "no ice servers -> no STUN addrs");
+    }
+
+    // --- TURN relay gathering tests ---
+
+    #[test]
+    fn relay_candidate_init_formats_typ_relay_with_raddr_rport() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        // Relayed = the address coturn allocated (what the peer dials);
+        // mapped = our relay socket's reflexive base (the raddr/rport).
+        let relayed = SocketAddr::new(Ipv4Addr::new(203, 0, 113, 9).into(), 51000);
+        let mapped = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 5).into(), 44000);
+        let init = relay_candidate_init(relayed, mapped);
+        assert!(
+            init.candidate.contains("udp"),
+            "udp transport: {}",
+            init.candidate
+        );
+        // The relayed address is the candidate's transport address + typ relay.
+        assert!(
+            init.candidate.contains("203.0.113.9 51000 typ relay"),
+            "relayed addr + typ relay: {}",
+            init.candidate
+        );
+        // RFC 5245 §4.3: relay candidate carries its reflexive base as
+        // raddr/rport.
+        assert!(
+            init.candidate.contains("raddr 10.0.0.5 rport 44000"),
+            "raddr/rport = mapped base: {}",
+            init.candidate
+        );
+        // Relay uses the lowest type preference (0) so host/srflx/ICE-TCP
+        // pairs are all tried before the relay last-resort path.
+        let priority: u32 = init
+            .candidate
+            .split_whitespace()
+            .nth(3)
+            .and_then(|p| p.parse().ok())
+            .expect("priority field");
+        assert!(
+            priority < 1_677_721_855,
+            "relay priority {priority} ranks below ICE-TCP (and host/srflx)"
+        );
+        // Distinct foundation so it doesn't collapse with host("1")/srflx("2").
+        assert!(
+            init.candidate.starts_with("candidate:3 "),
+            "relay foundation 3: {}",
+            init.candidate
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_turn_servers_parses_turn_url_skips_stun_and_turns() {
+        use std::net::Ipv4Addr;
+        // Mirrors the real coturn config shape: a `turns:` (TLS) URL listed
+        // first (skipped — UDP client can't drive TLS), a `stun:` URL
+        // (skipped — STUN handled elsewhere), and the plain `turn:` URL
+        // (kept). Different ports prove we pick the plain-UDP 3478 entry, not
+        // the TLS 5349 one. Literal IP avoids a DNS dependency.
+        let ice_config = IceConfig {
+            ice_servers: vec![crate::display::IceServer {
+                urls: vec![
+                    "turns:127.0.0.1:5349?transport=tcp".to_string(),
+                    "stun:127.0.0.1:19302".to_string(),
+                    "turn:127.0.0.1:3478?transport=udp".to_string(),
+                ],
+                username: Some("intendant".to_string()),
+                credential: Some("secret".to_string()),
+            }],
+        };
+        let resolved = resolve_turn_servers(&ice_config).await;
+        assert_eq!(
+            resolved.len(),
+            1,
+            "only the plain turn: URL resolved (turns:/stun: skipped), got {resolved:?}"
+        );
+        assert_eq!(
+            resolved[0].addr,
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 3478),
+            "picked the plain-UDP 3478 endpoint, not the TLS 5349 one"
+        );
+        assert_eq!(resolved[0].username, "intendant");
+        assert_eq!(resolved[0].password, "secret");
+    }
+
+    #[tokio::test]
+    async fn resolve_turn_servers_skips_credential_less_servers() {
+        // A turn server with no username/credential is unusable (the Allocate
+        // would draw a 401), so it's skipped rather than wasting the timeout.
+        let ice_config = IceConfig {
+            ice_servers: vec![crate::display::IceServer {
+                urls: vec!["turn:127.0.0.1:3478".to_string()],
+                username: None,
+                credential: None,
+            }],
+        };
+        let resolved = resolve_turn_servers(&ice_config).await;
+        assert!(
+            resolved.is_empty(),
+            "credential-less turn server skipped, got {resolved:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_turn_servers_empty_when_no_servers() {
+        let resolved = resolve_turn_servers(&IceConfig::default()).await;
+        assert!(resolved.is_empty(), "no ice servers -> no TURN servers");
+    }
+
+    #[tokio::test]
+    async fn resolve_turn_servers_ignores_transport_query() {
+        use std::net::Ipv4Addr;
+        // RFC 7065 `?transport=tcp` query must be stripped before host:port
+        // parsing — we always allocate over UDP regardless of the hint.
+        let ice_config = IceConfig {
+            ice_servers: vec![crate::display::IceServer {
+                urls: vec!["turn:127.0.0.1:3478?transport=tcp".to_string()],
+                username: Some("u".to_string()),
+                credential: Some("p".to_string()),
+            }],
+        };
+        let resolved = resolve_turn_servers(&ice_config).await;
+        assert_eq!(resolved.len(), 1, "transport query stripped, server kept");
+        assert_eq!(
+            resolved[0].addr,
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 3478)
+        );
+    }
+
+    #[test]
+    fn parse_turn_host_port_variants() {
+        // Explicit port.
+        assert_eq!(
+            parse_turn_host_port("turn.example.com:3478"),
+            ("turn.example.com".to_string(), 3478)
+        );
+        // Bare host -> IANA default 3478.
+        assert_eq!(
+            parse_turn_host_port("turn.example.com"),
+            ("turn.example.com".to_string(), 3478)
+        );
+        // IPv4 literal with port.
+        assert_eq!(
+            parse_turn_host_port("203.0.113.9:5349"),
+            ("203.0.113.9".to_string(), 5349)
+        );
+        // Bracketed IPv6 literal with port (brackets stripped from host).
+        assert_eq!(
+            parse_turn_host_port("[2001:db8::1]:3478"),
+            ("2001:db8::1".to_string(), 3478)
+        );
+        // Bracketed IPv6 literal without port -> default.
+        assert_eq!(
+            parse_turn_host_port("[2001:db8::1]"),
+            ("2001:db8::1".to_string(), 3478)
+        );
     }
 
     #[tokio::test]
