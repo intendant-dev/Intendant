@@ -2822,6 +2822,19 @@ impl ExternalAgent for CodexAgent {
         Ok(())
     }
 
+    async fn rollback_thread_turns(
+        &mut self,
+        thread_id: &str,
+        turns_to_drop: u32,
+    ) -> Result<(), CallerError> {
+        if turns_to_drop == 0 {
+            return Ok(());
+        }
+        let params = serde_json::json!({ "threadId": thread_id });
+        let _status = self.rollback_turns_inner(&params, turns_to_drop).await?;
+        Ok(())
+    }
+
     async fn shutdown(&mut self) -> Result<(), CallerError> {
         // Abort reader task
         if let Some(handle) = self.reader_handle.take() {

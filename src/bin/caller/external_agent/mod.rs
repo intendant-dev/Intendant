@@ -499,6 +499,21 @@ pub trait ExternalAgent: Send + Sync {
         ))
     }
 
+    /// Ask the backend to drop the last `turns_to_drop` conversational
+    /// turns from a specific thread. This is used for Codex side
+    /// conversations, where the side child must be rewound without
+    /// touching the parent thread.
+    async fn rollback_thread_turns(
+        &mut self,
+        thread_id: &str,
+        turns_to_drop: u32,
+    ) -> Result<(), CallerError> {
+        let _ = (thread_id, turns_to_drop);
+        Err(CallerError::ExternalAgent(
+            "targeted conversation rollback not supported by this backend".into(),
+        ))
+    }
+
     /// Shut down the agent process.
     async fn shutdown(&mut self) -> Result<(), CallerError>;
 }

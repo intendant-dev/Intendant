@@ -9449,6 +9449,15 @@ function dispatchCodexThreadAction(op, params, sessionId = '') {
     showControlToast('error', `/${op} is not available in a /side window; use the parent thread`);
     return false;
   }
+  if (
+    sid &&
+    sessionWindowIsSide(sid) &&
+    String(op || '').trim().toLowerCase().replace(/_/g, '-') === 'undo' &&
+    isSessionWindowEffectivelyActive(sid, currentPhase)
+  ) {
+    showControlToast('error', '/undo is available after the /side turn finishes or is stopped');
+    return false;
+  }
   const payload = { action: 'codex_thread_action', op, params: params || {} };
   if (sid) payload.session_id = sid;
   dispatchControlMsg(payload);
@@ -11343,7 +11352,7 @@ function sessionWindowIsSide(sessionId) {
 
 function codexThreadActionAllowedForSide(op) {
   const normalized = String(op || '').trim().toLowerCase().replace(/_/g, '-');
-  return normalized === 'side-close';
+  return normalized === 'side-close' || normalized === 'undo';
 }
 
 function closeSessionWindowMenus(exceptSessionId = '') {
