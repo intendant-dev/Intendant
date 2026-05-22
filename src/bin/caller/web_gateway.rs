@@ -136,10 +136,17 @@ struct CodexSessionListSummary {
     parent_id: Option<String>,
     provider: Option<String>,
     usage: SessionUsage,
+    usage_events: Vec<CodexUsageEvent>,
     task: Option<String>,
     turns: u64,
     file_updated_at: Option<String>,
     bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CodexUsageEvent {
+    timestamp: Option<String>,
+    usage: SessionUsage,
 }
 
 #[derive(Clone, Debug)]
@@ -3184,6 +3191,20 @@ impl SessionUsage {
         self.cache_creation_tokens += other.cache_creation_tokens;
         self.cached_tokens += other.cached_tokens;
     }
+
+    fn saturating_sub(self, baseline: SessionUsage) -> SessionUsage {
+        SessionUsage {
+            total_tokens: self.total_tokens.saturating_sub(baseline.total_tokens),
+            prompt_tokens: self.prompt_tokens.saturating_sub(baseline.prompt_tokens),
+            completion_tokens: self
+                .completion_tokens
+                .saturating_sub(baseline.completion_tokens),
+            cache_creation_tokens: self
+                .cache_creation_tokens
+                .saturating_sub(baseline.cache_creation_tokens),
+            cached_tokens: self.cached_tokens.saturating_sub(baseline.cached_tokens),
+        }
+    }
 }
 
 fn value_u64_at(value: &serde_json::Value, paths: &[&str]) -> Option<u64> {
@@ -3565,6 +3586,46 @@ fn resolve_codex_inherited_model(
     None
 }
 
+fn codex_usage_at_or_before(
+    events: &[CodexUsageEvent],
+    timestamp: Option<&str>,
+) -> Option<SessionUsage> {
+    let cutoff = timestamp.map(timestamp_sort_secs).unwrap_or(0);
+    if cutoff <= 0 {
+        return None;
+    }
+
+    let mut selected = None;
+    for event in events {
+        let event_ts = event
+            .timestamp
+            .as_deref()
+            .map(timestamp_sort_secs)
+            .unwrap_or(0);
+        if event_ts > 0 && event_ts <= cutoff {
+            selected = Some(event.usage);
+        }
+    }
+    selected
+}
+
+fn codex_incremental_session_usage(
+    summary: &CodexSessionListSummary,
+    usage_events_by_id: &HashMap<String, Vec<CodexUsageEvent>>,
+) -> SessionUsage {
+    let Some(parent_id) = summary.parent_id.as_deref() else {
+        return summary.usage;
+    };
+    let Some(parent_events) = usage_events_by_id.get(parent_id) else {
+        return summary.usage;
+    };
+    let Some(baseline) = codex_usage_at_or_before(parent_events, summary.created_at.as_deref())
+    else {
+        return summary.usage;
+    };
+    summary.usage.saturating_sub(baseline)
+}
+
 fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListSummary> {
     let key = session_list_cache_key("codex", path, "")?;
     if let Some(entry) = cached_codex_session_list_entry(&key) {
@@ -3585,6 +3646,7 @@ fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListS
     let mut forked_from_id = None;
     let mut provider = Some("Codex".to_string());
     let mut usage = SessionUsage::default();
+    let mut usage_events = Vec::new();
     let mut task_started_turns = 0u64;
     let mut saw_user_message_event = false;
     let mut event_user_turns: Vec<Option<String>> = Vec::new();
@@ -3639,6 +3701,10 @@ fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListS
                         "token_count" => {
                             if let Some(parsed) = codex_session_usage_from_payload(payload) {
                                 usage = parsed;
+                                usage_events.push(CodexUsageEvent {
+                                    timestamp: value_str(&obj, "timestamp"),
+                                    usage: parsed,
+                                });
                             }
                         }
                         "user_message" => {
@@ -3702,6 +3768,7 @@ fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListS
         parent_id: forked_from_id,
         provider,
         usage,
+        usage_events,
         task,
         turns,
         file_updated_at: file_mtime_string(path),
@@ -3715,6 +3782,7 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
     let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
     let mut model_by_id: HashMap<String, String> = HashMap::new();
     let mut parent_by_id: HashMap<String, String> = HashMap::new();
+    let mut usage_events_by_id: HashMap<String, Vec<CodexUsageEvent>> = HashMap::new();
     let index_path = home.join(".codex").join("session_index.jsonl");
     if let Ok(contents) = std::fs::read_to_string(&index_path) {
         for line in contents.lines() {
@@ -3761,6 +3829,7 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
     ));
     files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
     files.truncate(EXTERNAL_SESSION_SCAN_LIMIT);
+    let mut summaries = Vec::new();
     for path in files {
         let Some(summary) = codex_session_list_summary_from_file(&path) else {
             continue;
@@ -3772,6 +3841,12 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
         if let Some(parent_id) = summary.parent_id.clone() {
             parent_by_id.insert(id.clone(), parent_id);
         }
+        usage_events_by_id.insert(id, summary.usage_events.clone());
+        summaries.push((path, summary));
+    }
+
+    for (path, summary) in summaries {
+        let id = summary.id.clone();
         let existing = rows.get(&id);
         let existing_task = existing
             .and_then(|v| value_str(v, "task"))
@@ -3810,7 +3885,8 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
             Some(path.to_string_lossy().to_string()),
             summary.bytes,
         );
-        apply_session_usage(&mut session, summary.usage, summary.model.as_deref());
+        let usage = codex_incremental_session_usage(&summary, &usage_events_by_id);
+        apply_session_usage(&mut session, usage, summary.model.as_deref());
         rows.insert(id, session);
     }
 
@@ -15161,6 +15237,260 @@ mod tests {
     }
 
     #[test]
+    fn list_codex_sessions_subtracts_parent_usage_from_forks() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let parent_id = "019e37c5-parent-cost-thread";
+        let child_id = "019e37c5-child-cost-thread";
+        let parent_lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:09:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": parent_id,
+                    "timestamp": "2026-05-17T21:09:00Z",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:09:30Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 400,
+                            "output_tokens": 250,
+                            "total_tokens": 1250
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:11:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 2000,
+                            "cached_input_tokens": 600,
+                            "output_tokens": 400,
+                            "total_tokens": 2400
+                        }
+                    }
+                }
+            }),
+        ];
+        let child_lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": child_id,
+                    "forked_from_id": parent_id,
+                    "timestamp": "2026-05-17T21:10:00Z",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 400,
+                            "output_tokens": 250,
+                            "total_tokens": 1250
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:30Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1300,
+                            "cached_input_tokens": 550,
+                            "output_tokens": 300,
+                            "total_tokens": 1600
+                        }
+                    }
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-09-00-{parent_id}.jsonl")),
+            parent_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-10-00-{child_id}.jsonl")),
+            child_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let parent = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(parent_id))
+            .expect("parent codex session should be listed");
+        let child = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(child_id))
+            .expect("child codex session should be listed");
+
+        assert_eq!(parent["total_tokens"].as_u64(), Some(2400));
+        assert_eq!(child["prompt_tokens"].as_u64(), Some(300));
+        assert_eq!(child["completion_tokens"].as_u64(), Some(50));
+        assert_eq!(child["cached_tokens"].as_u64(), Some(150));
+        assert_eq!(child["total_tokens"].as_u64(), Some(350));
+        let cost = child["estimated_cost"].as_f64().unwrap();
+        assert!(
+            (cost - 0.0011625).abs() < 1e-12,
+            "unexpected child cost {cost}"
+        );
+    }
+
+    #[test]
+    fn list_codex_sessions_keeps_cumulative_usage_after_thread_rollback() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37c5-rollback-cost-thread";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T21:10:00Z",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 400,
+                            "output_tokens": 250,
+                            "total_tokens": 1250
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 400,
+                            "output_tokens": 250,
+                            "total_tokens": 1250
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:02Z",
+                "type": "event_msg",
+                "payload": {"type": "thread_rolled_back", "num_turns": 1}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 400,
+                            "output_tokens": 250,
+                            "total_tokens": 1250
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 0,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 120
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:04Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1300,
+                            "cached_input_tokens": 550,
+                            "output_tokens": 300,
+                            "total_tokens": 1600
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 300,
+                            "cached_input_tokens": 150,
+                            "output_tokens": 50,
+                            "total_tokens": 350
+                        }
+                    }
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-10-00-{id}.jsonl")),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(session["prompt_tokens"].as_u64(), Some(1300));
+        assert_eq!(session["completion_tokens"].as_u64(), Some(300));
+        assert_eq!(session["cached_tokens"].as_u64(), Some(550));
+        assert_eq!(session["total_tokens"].as_u64(), Some(1600));
+    }
+
+    #[test]
     fn list_codex_sessions_inherits_model_from_parent_thread() {
         let home = tempfile::tempdir().unwrap();
         let sessions_dir = home
@@ -19213,6 +19543,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                None,
             )
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -19276,6 +19607,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                None,
             )
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
