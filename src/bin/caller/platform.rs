@@ -336,6 +336,140 @@ pub fn current_uid() -> u32 {
     0
 }
 
+/// Select the interactive shell program and argument vector for the web
+/// terminal's PTY-backed session.
+///
+/// The web terminal spawns a *login-style interactive* shell (the user types
+/// into it via xterm.js), so it wants the user's full environment (PATH,
+/// aliases, prompt) set up — the opposite of the runtime's marker-scraping PTY
+/// which suppresses startup files.
+///
+/// - **Unix**: `$SHELL -l` (falling back to `/bin/bash -l`) — unchanged from
+///   the original hard-coded behavior. `-l` loads the login-time environment.
+/// - **Windows**: `powershell.exe -NoLogo` (profile *enabled* so the user's
+///   PATH/prompt are configured, the Windows analogue of `-l`). There is no
+///   `$SHELL` convention on Windows. `cmd.exe` is the fallback when PowerShell
+///   can't be launched — see [`interactive_pty_shell_fallback`].
+///
+/// Returns `(program, args)`. The caller wires cwd, the `TERM` env, and stdio.
+#[allow(dead_code)]
+pub fn interactive_pty_shell() -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        ("powershell.exe".to_string(), vec!["-NoLogo".to_string()])
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        (shell, vec!["-l".to_string()])
+    }
+}
+
+/// Windows-only fallback for [`interactive_pty_shell`]: `cmd.exe`, which is
+/// always present. `None` on non-Windows (the Unix `$SHELL`/`bash` primary has
+/// no routine fallback).
+#[allow(dead_code)]
+pub fn interactive_pty_shell_fallback() -> Option<(String, Vec<String>)> {
+    #[cfg(windows)]
+    {
+        Some(("cmd.exe".to_string(), Vec::new()))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Launch a detached controller-restart command and return its PID.
+///
+/// The restarted controller must outlive the process that spawns it (the
+/// current controller is about to exit / `exec()`), so it is started in its
+/// own process group/session with stdio detached.
+///
+/// - **Unix**: unchanged — `nohup setsid bash -lc "$cmd"` (or `nohup bash -lc`
+///   when `setsid` is absent), with the command passed via the
+///   `INTENDANT_RESTART_COMMAND` env var so no shell-quoting of the
+///   user-supplied command is needed. Returns the backgrounded PID via
+///   `echo $!`.
+/// - **Windows**: spawn a detached, window-less child via the Win32
+///   `CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`
+///   creation flags (the documented analogue of `nohup`/`setsid`: no console
+///   window, detached from the parent's console, own process group so a
+///   Ctrl-Break to the parent group won't reach it). The command runs under
+///   `cmd.exe /C` and the child's PID is returned directly from the spawn — no
+///   `echo $!` round-trip.
+#[cfg(not(windows))]
+pub async fn spawn_detached_restart(cmd: &str) -> Result<u32, String> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    // Use setsid when available to separate process group/session so parent
+    // shutdown doesn't tear down the restarted controller process.
+    let wrapper = r#"
+if command -v setsid >/dev/null 2>&1; then
+  nohup setsid bash -lc "$INTENDANT_RESTART_COMMAND" </dev/null >/dev/null 2>&1 &
+else
+  nohup bash -lc "$INTENDANT_RESTART_COMMAND" </dev/null >/dev/null 2>&1 &
+fi
+echo $!
+"#;
+
+    let output = Command::new("bash")
+        .args(["-lc", wrapper])
+        .env("INTENDANT_RESTART_COMMAND", cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to launch detached restart command: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to launch detached restart command (exit={})",
+            output.status
+        ));
+    }
+
+    let pid_text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    pid_text
+        .parse::<u32>()
+        .map_err(|e| format!("Failed to parse detached restart pid '{}': {}", pid_text, e))
+}
+
+/// Windows implementation of [`spawn_detached_restart`]. See the non-Windows
+/// doc comment for the cross-platform contract.
+#[cfg(windows)]
+pub async fn spawn_detached_restart(cmd: &str) -> Result<u32, String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    // Win32 process-creation flags (values from winbase.h, stable ABI):
+    //   CREATE_NO_WINDOW          0x08000000 — no console window for the child
+    //   DETACHED_PROCESS          0x00000008 — don't inherit the parent console
+    //   CREATE_NEW_PROCESS_GROUP  0x00000200 — own group; isolates Ctrl-Break
+    // Together these are the Windows analogue of `nohup` + `setsid`.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    // `cmd.exe /C` interprets the restart command line; the command is passed
+    // as a single argument so cmd does the splitting (mirrors `bash -lc`).
+    let child = Command::new("cmd.exe")
+        .args(["/C", cmd])
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to launch detached restart command: {}", e))?;
+
+    child
+        .id()
+        .ok_or_else(|| "Detached restart child has no PID".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +502,53 @@ mod tests {
     #[test]
     fn cmdline_of_dead_pid() {
         assert!(process_cmdline(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn interactive_pty_shell_picks_platform_shell() {
+        let (program, args) = interactive_pty_shell();
+        #[cfg(windows)]
+        {
+            assert_eq!(program, "powershell.exe");
+            assert!(args.iter().any(|a| a == "-NoLogo"));
+            assert!(interactive_pty_shell_fallback().is_some());
+        }
+        #[cfg(not(windows))]
+        {
+            // Defaults to $SHELL or /bin/bash, always a login shell.
+            assert!(!program.is_empty());
+            assert_eq!(args, vec!["-l".to_string()]);
+            assert!(interactive_pty_shell_fallback().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_detached_restart_yields_live_pid() {
+        // Long-lived per platform so the PID is still alive when we probe.
+        #[cfg(windows)]
+        let long_running = "timeout /T 30 /NOBREAK";
+        #[cfg(not(windows))]
+        let long_running = "sleep 30";
+
+        let pid = spawn_detached_restart(long_running)
+            .await
+            .expect("detached spawn should succeed");
+        assert!(pid > 1);
+        assert!(process_alive(pid), "detached child should be alive");
+
+        // Best-effort cleanup.
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F", "/T"])
+                .status();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
     }
 
     // Windows-specific: the real implementation must yield a non-empty

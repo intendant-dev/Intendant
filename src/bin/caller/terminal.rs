@@ -109,20 +109,33 @@ impl PtySession {
             })
             .map_err(|e| format!("openpty: {e}"))?;
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let mut cmd = PtyCommandBuilder::new(&shell);
-        // `-l` so the login-time env (PATH, aliases, prompt) is set up.
-        cmd.arg("-l");
-        if let Some(ref dir) = cwd {
-            cmd.cwd(dir);
-        }
-        // Seed TERM so xterm.js gets colors and cursor sequences.
-        cmd.env("TERM", "xterm-256color");
-
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| format!("spawn {shell}: {e}"))?;
+        // Platform shell: `$SHELL -l` (login env) on Unix — unchanged;
+        // `powershell.exe -NoLogo` on Windows with a `cmd.exe` fallback. The
+        // builder is consumed by `spawn_command`, so build a fresh one per
+        // spawn attempt.
+        let (shell, shell_args) = crate::platform::interactive_pty_shell();
+        let build_cmd = |program: &str, args: &[String]| {
+            let mut cmd = PtyCommandBuilder::new(program);
+            cmd.args(args);
+            if let Some(ref dir) = cwd {
+                cmd.cwd(dir);
+            }
+            // Seed TERM so xterm.js gets colors and cursor sequences.
+            cmd.env("TERM", "xterm-256color");
+            cmd
+        };
+        let child = match pair.slave.spawn_command(build_cmd(&shell, &shell_args)) {
+            Ok(child) => child,
+            Err(primary_err) => match crate::platform::interactive_pty_shell_fallback() {
+                Some((fb_shell, fb_args)) => pair
+                    .slave
+                    .spawn_command(build_cmd(&fb_shell, &fb_args))
+                    .map_err(|fb_err| {
+                        format!("spawn {shell} ({primary_err}) and fallback {fb_shell} ({fb_err})")
+                    })?,
+                None => return Err(format!("spawn {shell}: {primary_err}")),
+            },
+        };
 
         let reader = pair
             .master

@@ -335,10 +335,15 @@ impl Agent {
                     .to_string(),
             ));
         }
-        let mut cmd_builder = Command::new("bash");
+        // Platform shell: `bash -c <command>` on Unix (unchanged), `cmd.exe
+        // /C <command>` on Windows where bash is not on PATH. The whole
+        // command string is passed as one argument so the shell does the
+        // word-splitting; exec semantics (cwd, env, stdio, exit code) are
+        // identical across both arms.
+        let (shell, shell_args) = crate::utils::agent_shell_command(&command);
+        let mut cmd_builder = Command::new(shell);
         cmd_builder
-            .arg("-c")
-            .arg(&command)
+            .args(&shell_args)
             .env("DISPLAY", format!(":{}", display_id))
             .env_remove("OPENAI_API_KEY")
             .env_remove("ANTHROPIC_API_KEY")
@@ -600,11 +605,35 @@ impl Agent {
                 })
                 .map_err(|e| AgentError::Process(format!("Failed to open PTY: {}", e)))?;
 
-            let mut pty_cmd = PtyCommandBuilder::new("bash");
-            pty_cmd.args(["--norc", "--noprofile"]);
-            pair.slave
-                .spawn_command(pty_cmd)
-                .map_err(|e| AgentError::Process(format!("Failed to spawn shell: {}", e)))?;
+            // Platform PTY shell: `bash --norc --noprofile` on Unix
+            // (unchanged), `powershell.exe -NoLogo -NoProfile` on Windows with
+            // a `cmd.exe` fallback if PowerShell can't be spawned.
+            let build_pty_cmd = |program: &str, args: &[String]| {
+                let mut c = PtyCommandBuilder::new(program);
+                c.args(args);
+                c
+            };
+            let (shell, shell_args) = crate::utils::pty_shell_command();
+            let spawn_result = pair.slave.spawn_command(build_pty_cmd(shell, &shell_args));
+            let spawn_result = match spawn_result {
+                Ok(child) => Ok(child),
+                Err(primary_err) => match crate::utils::pty_shell_fallback() {
+                    Some((fb_shell, fb_args)) => pair
+                        .slave
+                        .spawn_command(build_pty_cmd(fb_shell, &fb_args))
+                        .map_err(|fb_err| {
+                            AgentError::Process(format!(
+                                "Failed to spawn PTY shell '{}' ({}) and fallback '{}' ({})",
+                                shell, primary_err, fb_shell, fb_err
+                            ))
+                        }),
+                    None => Err(AgentError::Process(format!(
+                        "Failed to spawn shell: {}",
+                        primary_err
+                    ))),
+                },
+            };
+            spawn_result?;
 
             let reader = pair
                 .master
