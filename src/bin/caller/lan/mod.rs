@@ -5,19 +5,39 @@
 //! LAN clients (phones, tablets, other boxes) can reach the dashboard
 //! over HTTPS authenticated by a client certificate.
 //!
-//! Shared across platforms: cert generation (openssl), nginx config
-//! rendering, client cert distribution, import instructions. Platform
-//! differences (apt vs brew, systemd vs launchd, cert dir location) are
-//! isolated behind the `LanBackend` trait.
+//! Shared across platforms: cert generation (pure-Rust rcgen +
+//! p12-keystore), nginx config rendering, client cert distribution, import
+//! instructions. Platform differences (apt vs brew, systemd vs launchd, cert
+//! dir location) are isolated behind the `LanBackend` trait.
 
 use std::fmt;
 
 pub mod backend;
-pub mod cert_server;
+// `certs` is pure-Rust (rcgen + p12-keystore) and compiles on every
+// platform, so it stays ungated — `read_server_cert_fingerprint` backs the
+// `pin-self-cert` transport, which doesn't need the nginx flow.
+//
+// The nginx + distribution machinery (`cert_server`, `instructions`,
+// `nginx_config`, `wizard`) and the apt/brew/systemd setup flow are still
+// deferred on Windows (Tier-0): they depend on nginx + apt/brew +
+// systemd/launchd, none of which apply. `backend` and `state` stay available
+// everywhere because `resolve_host_label` / `routable_local_addrs` (called by
+// the web dashboard, not just `lan setup`) need them.
+//
+// On Windows only `certs::read_server_cert_fingerprint` is reachable; the
+// cert/p12 *generation* functions are exercised solely by the still-deferred
+// `lan setup` nginx flow, so they compile-but-are-unused there. Silence those
+// dead-code warnings on Windows; every item is live on macOS/Linux.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub mod certs;
+#[cfg(not(target_os = "windows"))]
+pub mod cert_server;
+#[cfg(not(target_os = "windows"))]
 pub mod instructions;
+#[cfg(not(target_os = "windows"))]
 pub mod nginx_config;
 pub mod state;
+#[cfg(not(target_os = "windows"))]
 pub mod wizard;
 
 /// Resolve the multi-host `HostId` for this machine.
@@ -119,6 +139,37 @@ pub fn routable_local_addrs(include_loopback: bool) -> Vec<std::net::IpAddr> {
             }
         }
     }
+
+    // Windows has no `getifaddrs(3)`; the OS API is `GetAdaptersAddresses`.
+    // Rather than hand-roll that FFI walk we use the `if-addrs` crate, which
+    // wraps it and yields the same per-interface address list. The filtering
+    // mirrors the unix arm: drop loopback (unless requested), link-local
+    // (IPv6 fe80::/10 and IPv4 169.254/16 — neither is a useful advertised
+    // endpoint), and unspecified addresses. Enumeration order is preserved so
+    // the caller's later stable sort keeps a multi-NIC host's primary NIC
+    // first, matching the unix behaviour.
+    #[cfg(windows)]
+    {
+        if let Ok(ifaces) = if_addrs::get_if_addrs() {
+            for iface in ifaces {
+                if iface.is_link_local() {
+                    continue;
+                }
+                let ip = iface.ip();
+                if ip.is_unspecified() {
+                    continue;
+                }
+                if ip.is_loopback() {
+                    // Loopback is added once up-front (as 127.0.0.1) when
+                    // requested; skip the per-interface loopback entries so
+                    // we don't emit duplicates or ::1 alongside it.
+                    continue;
+                }
+                out.push(ip);
+            }
+        }
+    }
+
     out
 }
 
@@ -156,15 +207,22 @@ impl From<std::io::Error> for LanError {
     }
 }
 
-impl From<openssl::error::ErrorStack> for LanError {
-    fn from(e: openssl::error::ErrorStack) -> Self {
-        LanError(format!("openssl: {e}"))
+// `certs` (rcgen-based, pure-Rust) uses `?` on `rcgen::Error`; surface it as
+// a LanError. Available on all platforms, like the `certs` module itself.
+impl From<rcgen::Error> for LanError {
+    fn from(e: rcgen::Error) -> Self {
+        LanError(format!("rcgen: {e}"))
     }
 }
 
 pub type LanResult<T> = Result<T, LanError>;
 
 /// Parsed `intendant lan <action> [flags]` invocation.
+// The `intendant lan` subcommand (arg parsing + setup/recert/remove/list/
+// serve-certs actions) drives the OpenSSL cert machinery, so the whole
+// command surface is gated off Windows. Only the lookup helpers above
+// (`resolve_host_label`, `routable_local_addrs`) remain on Windows.
+#[cfg(not(target_os = "windows"))]
 #[derive(Debug)]
 pub struct LanArgs {
     pub action: LanAction,
@@ -181,6 +239,7 @@ pub struct LanArgs {
     pub no_serve_certs: bool,
 }
 
+#[cfg(not(target_os = "windows"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanAction {
     Setup,
@@ -191,6 +250,7 @@ pub enum LanAction {
     Help,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl Default for LanArgs {
     fn default() -> Self {
         Self {
@@ -207,6 +267,7 @@ impl Default for LanArgs {
 }
 
 /// Top-level entry invoked from `main()` when argv[1] == "lan".
+#[cfg(not(target_os = "windows"))]
 pub async fn run(argv: Vec<String>) -> LanResult<()> {
     let args = parse_args(&argv)?;
     match args.action {
@@ -222,6 +283,7 @@ pub async fn run(argv: Vec<String>) -> LanResult<()> {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn parse_args(argv: &[String]) -> LanResult<LanArgs> {
     let mut args = LanArgs::default();
 
@@ -299,6 +361,7 @@ fn parse_args(argv: &[String]) -> LanResult<LanArgs> {
     Ok(args)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn print_help() {
     println!("Intendant LAN access setup");
     println!();
@@ -327,6 +390,7 @@ fn print_help() {
     println!("    NAT traversal  — Tailscale");
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn cmd_setup(args: LanArgs) -> LanResult<()> {
     let be = backend::select_backend();
     be.require_privileges()?;
@@ -384,6 +448,7 @@ async fn cmd_setup(args: LanArgs) -> LanResult<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn cmd_recert(args: LanArgs) -> LanResult<()> {
     let be = backend::select_backend();
     be.require_privileges()?;
@@ -414,6 +479,7 @@ async fn cmd_recert(args: LanArgs) -> LanResult<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn cmd_remove(_args: LanArgs) -> LanResult<()> {
     let be = backend::select_backend();
     be.require_privileges()?;
@@ -427,6 +493,7 @@ async fn cmd_remove(_args: LanArgs) -> LanResult<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 fn cmd_list(_args: LanArgs) -> LanResult<()> {
     let be = backend::select_backend();
     let cert_dir = be.cert_dir();
@@ -443,6 +510,7 @@ fn cmd_list(_args: LanArgs) -> LanResult<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn cmd_serve_certs(args: LanArgs) -> LanResult<()> {
     let be = backend::select_backend();
     let cert_dir = be.cert_dir();
@@ -463,4 +531,59 @@ async fn cmd_serve_certs(args: LanArgs) -> LanResult<()> {
     };
     cert_server::serve(&state, args.cert_port, &lan_ip, args.https_port).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn include_loopback_prepends_localhost() {
+        let addrs = routable_local_addrs(true);
+        assert_eq!(
+            addrs.first(),
+            Some(&IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "include_loopback should put 127.0.0.1 first"
+        );
+    }
+
+    #[test]
+    fn no_loopback_excludes_loopback_addrs() {
+        // With loopback disabled, no returned address may be a loopback
+        // address on any platform.
+        let addrs = routable_local_addrs(false);
+        assert!(
+            addrs.iter().all(|ip| !ip.is_loopback()),
+            "no-loopback result must not contain loopback addresses: {addrs:?}"
+        );
+    }
+
+    #[test]
+    fn returned_addrs_are_never_unspecified() {
+        for include_loopback in [false, true] {
+            let addrs = routable_local_addrs(include_loopback);
+            assert!(
+                addrs.iter().all(|ip| !ip.is_unspecified()),
+                "0.0.0.0 / :: are not real bind targets: {addrs:?}"
+            );
+        }
+    }
+
+    // Windows-specific: the GetAdaptersAddresses-backed enumeration must
+    // surface the machine's real routable interface(s), not just loopback.
+    // Runs on the CI/build VM, which has a routable NIC.
+    #[cfg(windows)]
+    #[test]
+    fn windows_enumerates_at_least_one_routable_addr() {
+        let addrs = routable_local_addrs(false);
+        assert!(
+            !addrs.is_empty(),
+            "expected at least one non-loopback routable interface address"
+        );
+        assert!(
+            addrs.iter().all(|ip| !ip.is_loopback() && !ip.is_unspecified()),
+            "every address must be routable (non-loopback, non-unspecified): {addrs:?}"
+        );
+    }
 }

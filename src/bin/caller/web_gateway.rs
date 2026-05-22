@@ -18,9 +18,52 @@ use std::sync::{Arc, Mutex, OnceLock};
 // uses in this file.  All access goes through `unwrap_or_else(|e| e.into_inner())`
 // to remain poison-tolerant, matching the rest of the file's std-lock idiom.
 use std::sync::RwLock as StdRwLock;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
+
+/// Unified read/write surface for a demuxed dashboard connection.
+///
+/// After the per-connection demux peels off raw ICE-TCP (which stays a
+/// concrete `TcpStream`), the surviving connection is either a plain
+/// `TcpStream` or a TLS-wrapped `tokio_rustls::server::TlsStream<TcpStream>`.
+/// Both implement `AsyncRead + AsyncWrite + Unpin + Send`, so the WebSocket
+/// and HTTP handling that follows operates through this boxed trait object
+/// — identical code path for HTTP and HTTPS, plain WS and WSS. The
+/// `tokio_tungstenite::accept_async` upgrade and every `read_exact` /
+/// `write_all` call are already generic over these trait bounds; only the
+/// three small body-reading helpers had to be made generic to match.
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
+/// Boxed demuxed connection (plain TCP or TLS), used for all post-demux
+/// HTTP/WebSocket handling.
+type DemuxStream = std::pin::Pin<Box<dyn AsyncReadWrite>>;
+
+/// Finalize a one-shot HTTP response on a demuxed stream before it drops.
+///
+/// Every dashboard HTTP reply is a single buffered response sent with
+/// `Connection: close`, after which the connection task returns and the
+/// boxed [`DemuxStream`] is dropped. For a plain `TcpStream` that's fine —
+/// the kernel keeps queued bytes and flushes them on close. But the TLS
+/// path's stream is a `tokio_rustls::server::TlsStream`, which buffers
+/// *ciphertext* inside the rustls session: `write_all` only guarantees the
+/// plaintext was accepted into that buffer, not that the encrypted records
+/// reached the socket. Dropping the `TlsStream` without flushing discards
+/// the unwritten tail records, truncating large bodies (e.g. the ~871 KB
+/// `app.html` arrived ~19.5 KB short over HTTPS).
+///
+/// Calling `flush` drives rustls to emit all buffered ciphertext to the
+/// TCP socket; `shutdown` then writes the TLS `close_notify` and the TCP
+/// FIN, closing the session cleanly. On the plain path both delegate
+/// straight through to the `TcpStream` (flush is a no-op, shutdown sends
+/// the FIN we'd send on drop anyway), so behavior there is unchanged.
+async fn finalize_http_stream(stream: &mut DemuxStream) {
+    use tokio::io::AsyncWriteExt;
+    let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
+}
 
 /// Monotonically increasing counter for assigning unique peer IDs to WebSocket
 /// connections.  Used for WebRTC signaling so that each browser tab gets a
@@ -5598,7 +5641,7 @@ fn handle_changes_file_diff(
 /// Read the full POST body (honoring Content-Length). Returns the peeked
 /// prefix if the headers already carried the entire payload; otherwise reads
 /// the remainder from the stream.
-async fn read_post_body(header_text: &str, stream: &mut tokio::net::TcpStream) -> String {
+async fn read_post_body<S: AsyncRead + Unpin>(header_text: &str, stream: &mut S) -> String {
     use tokio::io::AsyncReadExt;
     let content_length: usize = header_text
         .lines()
@@ -5645,10 +5688,10 @@ const UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024;
 ///
 /// This is the binary counterpart to `read_post_body` — same peek-then-
 /// stream pattern, but sinks to disk instead of a UTF-8 `String`.
-async fn stream_body_to_tempfile(
+async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
     header_text: &str,
     initial_request_bytes: &[u8],
-    stream: &mut tokio::net::TcpStream,
+    stream: &mut S,
     max_bytes: usize,
 ) -> Result<(tempfile::NamedTempFile, usize), String> {
     use std::io::Write;
@@ -6862,6 +6905,15 @@ pub fn spawn_web_gateway(
     // don't exercise the advertise path; production call sites in
     // main.rs build the requirements from the project config.
     local_card_auth: crate::peer::AuthRequirements,
+    // Native TLS for the dashboard. `Some(acceptor)` (built in main.rs
+    // from `[server.tls]` / `--tls`) makes the per-connection demux wrap
+    // any connection whose first bytes are a TLS ClientHello, serving the
+    // dashboard over HTTPS/WSS. `None` (the default) preserves the
+    // current plain-HTTP behavior. Either way the raw ICE-TCP (STUN-
+    // framed) demux branch is unaffected — TLS is distinguished by its
+    // `0x16` handshake-record first byte, which is disjoint from both the
+    // STUN length-prefix and HTTP method bytes.
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -6873,7 +6925,16 @@ pub fn spawn_web_gateway(
     // address. Multiple URLs let one daemon advertise itself reachable
     // via several paths (LAN IP, Tailscale, host port-forward, etc.)
     // — the connecting peer probes them in order.
-    let advertise_urls = resolve_advertise_urls(listener.local_addr().ok(), &advertise_urls);
+    //
+    // TLS state drives the advertised scheme: when a TLS acceptor is
+    // present the dashboard is HTTPS/WSS-only (strict demux below), so
+    // auto-detected URLs must be `wss://`, not `ws://`, or peers handed a
+    // `ws://` URL would be refused.
+    let advertise_urls = resolve_advertise_urls(
+        listener.local_addr().ok(),
+        &advertise_urls,
+        tls_acceptor.is_some(),
+    );
     let agent_card = build_local_agent_card(advertise_urls, local_card_auth);
     let agent_card_json = serde_json::to_string(&agent_card).unwrap_or_else(|_| "{}".to_string());
 
@@ -7289,6 +7350,9 @@ pub fn spawn_web_gateway(
             let terminal_registry = terminal_registry.clone();
             let inbound_bearer_token = inbound_bearer_token.clone();
             let worktree_inventory_cache = worktree_inventory_cache.clone();
+            // `TlsAcceptor` wraps an `Arc<ServerConfig>`, so cloning is cheap
+            // (one Arc bump). `None` when TLS is disabled.
+            let tls_acceptor = tls_acceptor.clone();
 
             tokio::spawn(async move {
                 // Snapshot session state at connection time
@@ -7306,20 +7370,39 @@ pub fn spawn_web_gateway(
                 // Peek at the first bytes to detect (in order):
                 //  1. ICE-TCP STUN-framed traffic (RFC 4571 length prefix
                 //     followed by a STUN message whose magic cookie
-                //     0x2112A442 sits at payload offset 4 = peek offset 6)
-                //  2. WebSocket upgrade (HTTP header containing
+                //     0x2112A442 sits at payload offset 4 = peek offset 6).
+                //     First byte (length MSB) is 0x00 for STUN-sized frames.
+                //  2. TLS ClientHello (handshake record: first byte 0x16,
+                //     then version major 0x03) — only when a TLS acceptor
+                //     is configured. Wrapped in the rustls acceptor; the
+                //     decrypted stream then flows through the WS/HTTP paths
+                //     below exactly as a plain connection would.
+                //  3. WebSocket upgrade (HTTP header containing
                 //     "Upgrade: websocket")
-                //  3. Plain HTTP (everything else)
+                //  4. Plain HTTP (everything else)
                 //
-                // `peek()` does not consume the data, so both the
-                // WebSocket handshake and the HTTP parser still get the
-                // full request. Only the ICE-TCP branch actually reads
-                // (and consumes) the first RFC 4571 frame, after which
-                // the rest of the stream is handed to the WebRTC peer's
-                // reader task.
+                // Cases 3 and 4 are cleartext. When a TLS acceptor is
+                // configured the dashboard is HTTPS/WSS-only, so such
+                // cleartext connections are refused (see the strict-TLS
+                // rejection below) — only the TLS-wrapped path serves them.
+                // Case 1 (raw ICE-TCP for the WebRTC media tunnel) stays
+                // cleartext regardless: it returns above before that check.
+                //
+                // The three first-byte classes are mutually exclusive:
+                // STUN length-prefix MSB 0x00, TLS handshake 0x16, HTTP
+                // method ASCII letters (>= 0x41). So one peeked byte
+                // disambiguates raw ICE-TCP from TLS from cleartext HTTP.
+                //
+                // `peek()` does not consume the data, so the ICE-TCP, TLS,
+                // WebSocket, and HTTP branches all still get the full
+                // first segment. The ICE-TCP branch reads (and consumes)
+                // the first RFC 4571 frame and hands the rest to the
+                // WebRTC peer reader; the TLS branch lets the handshake
+                // consume the peeked ClientHello and re-reads the
+                // decrypted request head before dispatching.
                 let mut buf = [0u8; 2048];
-                let mut stream = stream;
-                let n = match stream.peek(&mut buf).await {
+                let mut raw_stream = stream;
+                let peeked = match raw_stream.peek(&mut buf).await {
                     Ok(n) if n > 0 => n,
                     _ => return,
                 };
@@ -7332,21 +7415,21 @@ pub fn spawn_web_gateway(
                 // length prefix. A valid HTTP request never starts with
                 // these bytes (method chars are ASCII >= 0x41).
                 let looks_like_stun_tcp =
-                    n >= 22 && buf[2] < 2 && buf[6..10] == [0x21, 0x12, 0xA4, 0x42];
+                    peeked >= 22 && buf[2] < 2 && buf[6..10] == [0x21, 0x12, 0xA4, 0x42];
                 if looks_like_stun_tcp {
                     // Consume the first RFC 4571 frame from the stream
                     // (peek leaves it in the kernel buffer; we have to
                     // read it through to hand a clean stream to the peer
                     // reader task).
                     let first_frame =
-                        match crate::display::webrtc::read_rfc4571_frame_pub(&mut stream).await {
+                        match crate::display::webrtc::read_rfc4571_frame_pub(&mut raw_stream).await {
                             Ok(f) => f,
                             Err(e) => {
                                 eprintln!("[web_gateway] ICE-TCP first-frame read failed: {e}");
                                 return;
                             }
                         };
-                    let remote_addr = match stream.peer_addr() {
+                    let remote_addr = match raw_stream.peer_addr() {
                         Ok(a) => a,
                         Err(_) => return,
                     };
@@ -7365,7 +7448,7 @@ pub fn spawn_web_gateway(
                     match crate::display::webrtc::parse_first_frame_ufrag(&first_frame) {
                         Some(ufrag) if tcp_peer_registry.contains_ufrag(&ufrag) => {
                             if let Err(e) = tcp_peer_registry
-                                .route_accepted(stream, first_frame, remote_addr)
+                                .route_accepted(raw_stream, first_frame, remote_addr)
                                 .await
                             {
                                 eprintln!(
@@ -7375,7 +7458,7 @@ pub fn spawn_web_gateway(
                         }
                         Some(ufrag) if tcp_relay_registry.contains_ufrag(&ufrag) => {
                             if let Err(e) =
-                                tcp_relay_registry.route_accepted(stream, first_frame).await
+                                tcp_relay_registry.route_accepted(raw_stream, first_frame).await
                             {
                                 eprintln!(
                                     "[web_gateway] ICE-TCP relay routing for ufrag={ufrag} from {remote_addr} failed: {e}"
@@ -7397,6 +7480,106 @@ pub fn spawn_web_gateway(
                     }
                     return;
                 }
+
+                // Connection is not raw ICE-TCP. It is one of: TLS
+                // (HTTPS/WSS), plain WebSocket, or plain HTTP. Convert the
+                // raw `TcpStream` into a unified, boxed `DemuxStream` that
+                // the WS/HTTP handling below operates through. The plain
+                // path boxes the TcpStream verbatim (the peeked bytes stay
+                // in the kernel buffer, unconsumed). The TLS path runs the
+                // rustls handshake — which consumes the peeked ClientHello
+                // — then re-reads the decrypted request head so the rest of
+                // the handler sees cleartext HTTP.
+                let is_tls = tls_acceptor.is_some()
+                    && crate::web_tls::looks_like_tls_client_hello(&buf[..peeked]);
+
+                // Strict TLS: when a TLS acceptor is configured the dashboard
+                // is HTTPS/WSS-only. A connection that reaches this point is
+                // neither raw ICE-TCP (handled and returned above — that path
+                // stays cleartext for the WebRTC media tunnel and must keep
+                // working) nor a TLS ClientHello, so it's a cleartext HTTP or
+                // WebSocket client dialing the secure port in the clear.
+                // Opportunistic TLS — quietly serving such a client over plain
+                // HTTP — would undercut the project's "no unencrypted traffic"
+                // guarantee, so we refuse it: emit a one-line HTTP 426 "Upgrade
+                // Required" hint (best effort; a raw WebSocket client may not
+                // parse it, but a browser hitting `http://` shows the operator
+                // why) and close. When TLS is off this branch is skipped and
+                // cleartext is served exactly as before.
+                if tls_acceptor.is_some() && !is_tls {
+                    use tokio::io::AsyncWriteExt;
+                    let peer = raw_stream
+                        .peer_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|_| "<unknown>".to_string());
+                    eprintln!(
+                        "[web_gateway] strict TLS: rejecting cleartext HTTP/WS connection from \
+                         {peer} (dashboard is HTTPS/WSS-only when --tls is enabled)"
+                    );
+                    let body = "This endpoint requires TLS. Use https:// (or wss://) instead of \
+                                http:// / ws://.\n";
+                    let response = format!(
+                        "HTTP/1.1 426 Upgrade Required\r\n\
+                         Content-Type: text/plain\r\n\
+                         Content-Length: {}\r\n\
+                         Upgrade: TLS/1.2\r\n\
+                         Connection: close\r\n\
+                         \r\n\
+                         {body}",
+                        body.len(),
+                    );
+                    let _ = raw_stream.write_all(response.as_bytes()).await;
+                    let _ = raw_stream.shutdown().await;
+                    return;
+                }
+
+                let buf_owned: Vec<u8>;
+                let n: usize;
+                let mut stream: DemuxStream;
+                if is_tls {
+                    let acceptor = tls_acceptor
+                        .as_ref()
+                        .expect("is_tls implies acceptor present")
+                        .clone();
+                    let mut tls_stream = match acceptor.accept(raw_stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[web_gateway] TLS handshake failed: {e}");
+                            return;
+                        }
+                    };
+                    // Read the first segment of the *decrypted* request so
+                    // we can route on the real HTTP request line/headers.
+                    // This is the TLS analogue of the plain-path peek.
+                    use tokio::io::AsyncReadExt;
+                    let mut decrypted = vec![0u8; 8192];
+                    let read_n = match tls_stream.read(&mut decrypted).await {
+                        Ok(0) => return, // client closed right after handshake
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[web_gateway] TLS first decrypted read failed: {e}");
+                            return;
+                        }
+                    };
+                    decrypted.truncate(read_n);
+                    n = read_n;
+                    buf_owned = decrypted.clone();
+                    // Replay the decrypted request head in front of the TLS
+                    // stream so the WS upgrade / HTTP body reads downstream
+                    // see the request from byte zero.
+                    stream = Box::pin(crate::web_tls::PrefixedStream::new(decrypted, tls_stream));
+                } else {
+                    // Plain HTTP/WS: the peeked bytes are still in the
+                    // kernel buffer. Box the raw stream with an empty
+                    // replay prefix — a zero-overhead pass-through that
+                    // reads the request straight from the socket.
+                    n = peeked;
+                    buf_owned = buf[..peeked].to_vec();
+                    stream = Box::pin(crate::web_tls::PrefixedStream::new(Vec::new(), raw_stream));
+                }
+                // Downstream code reads `buf[..n]`; point `buf` at the
+                // (decrypted, for TLS) request head we just captured.
+                let buf = buf_owned.as_slice();
 
                 let header_text = String::from_utf8_lossy(&buf[..n]);
                 let is_websocket = header_text
@@ -7428,8 +7611,12 @@ pub fn spawn_web_gateway(
                         verify_bearer_for_ws(&header_text, inbound_bearer_token.as_deref())
                     {
                         use tokio::io::AsyncWriteExt;
+                        let reason = match status {
+                            401 => "Unauthorized",
+                            _ => "Error",
+                        };
                         let response = format!(
-                            "HTTP/1.1 {status} Unauthorized\r\n\
+                            "HTTP/1.1 {status} {reason}\r\n\
                              Content-Type: application/json\r\n\
                              Content-Length: {}\r\n\
                              WWW-Authenticate: Bearer\r\n\
@@ -7439,6 +7626,13 @@ pub fn spawn_web_gateway(
                             body.len(),
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
+                        // Flush + cleanly shut down before the task returns and
+                        // drops the stream. On the TLS path rustls buffers the
+                        // ciphertext for this 401 inside the session; dropping
+                        // without flushing discards it and the rejected client
+                        // sees an *empty* response instead of the 401 (audit
+                        // F2). A no-op pass-through on plain TCP.
+                        finalize_http_stream(&mut stream).await;
                         return;
                     }
                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
@@ -9847,6 +10041,7 @@ pub fn spawn_web_gateway(
                             Connection: close\r\n\
                             \r\n";
                         let _ = stream.write_all(response.as_bytes()).await;
+                        finalize_http_stream(&mut stream).await;
                         return;
                     }
 
@@ -9879,6 +10074,7 @@ pub fn spawn_web_gateway(
                                 body.len(),
                             );
                             let _ = stream.write_all(response.as_bytes()).await;
+                            finalize_http_stream(&mut stream).await;
                             return;
                         }
                     }
@@ -11860,6 +12056,16 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
                     }
+
+                    // Flush + cleanly shut down the stream before this task
+                    // returns and drops it. Mandatory for the TLS path so the
+                    // final ciphertext records reach the socket (rustls buffers
+                    // them; dropping mid-buffer truncates large bodies); a
+                    // harmless pass-through on plain TCP. Covers every
+                    // fall-through dispatch arm above in one place; the early
+                    // `return`s (OPTIONS / failed federation auth) finalize
+                    // inline before returning.
+                    finalize_http_stream(&mut stream).await;
                 }
             });
         }
@@ -12025,7 +12231,7 @@ async fn peers_remove(registry: &crate::peer::PeerRegistry, body_text: &str) -> 
 /// Factored out of the original inline body-reading block in the
 /// `/api/peers` handler so the per-peer outbound op handlers below
 /// can share it without duplicating the peek-then-stream pattern.
-async fn read_request_body(stream: &mut tokio::net::TcpStream, header_text: &str) -> String {
+async fn read_request_body<S: AsyncRead + Unpin>(stream: &mut S, header_text: &str) -> String {
     use tokio::io::AsyncReadExt;
     let content_length: usize = header_text
         .lines()
@@ -13400,14 +13606,25 @@ pub(crate) fn verify_bearer_token(
 ///
 /// Dedup: exact-string match. If the operator's override happens to
 /// match an auto-detected URL, only the operator's copy is kept.
+///
+/// ## Scheme
+///
+/// `tls_enabled` selects the auto-detected URL scheme: `wss://` when the
+/// dashboard is served over TLS (`--tls` / `[server.tls]`), `ws://`
+/// otherwise. This keeps advertised peer URLs honest — a TLS daemon is
+/// HTTPS/WSS-only (see the strict-TLS demux in `spawn_web_gateway`), so a
+/// peer handed a `ws://` URL would be refused. Operator overrides are
+/// taken verbatim (the operator owns their scheme) and the final
+/// no-listener fallback tracks the flag too.
 pub(crate) fn resolve_advertise_urls(
     local_addr: Option<std::net::SocketAddr>,
     overrides: &[String],
+    tls_enabled: bool,
 ) -> Vec<String> {
     let port = local_addr.map(|a| a.port()).unwrap_or(0);
 
     // Auto-detect. Operator overrides come first; auto entries append.
-    let auto = auto_detect_advertise_urls(local_addr, port);
+    let auto = auto_detect_advertise_urls(local_addr, port, tls_enabled);
 
     let mut out: Vec<String> = Vec::with_capacity(overrides.len() + auto.len());
     for url in overrides {
@@ -13423,15 +13640,21 @@ pub(crate) fn resolve_advertise_urls(
 
     if out.is_empty() {
         // No bind, no overrides, no interfaces. Card stays valid;
-        // URL just won't work until the next daemon restart.
-        out.push("ws://localhost:0/ws".to_string());
+        // URL just won't work until the next daemon restart. Match the
+        // TLS scheme so even this degenerate fallback is scheme-honest.
+        out.push(format_ws_url("localhost", 0, tls_enabled));
     }
     out
 }
 
 /// Build the auto-detected URL list from the listener bind address.
 /// See [`resolve_advertise_urls`] for the full resolution rules.
-fn auto_detect_advertise_urls(local_addr: Option<std::net::SocketAddr>, port: u16) -> Vec<String> {
+/// `tls_enabled` selects `wss://` vs `ws://` (see that fn's docstring).
+fn auto_detect_advertise_urls(
+    local_addr: Option<std::net::SocketAddr>,
+    port: u16,
+    tls_enabled: bool,
+) -> Vec<String> {
     use std::net::IpAddr;
     let Some(addr) = local_addr else {
         return Vec::new();
@@ -13440,10 +13663,10 @@ fn auto_detect_advertise_urls(local_addr: Option<std::net::SocketAddr>, port: u1
     // Specific bind: that one IP wins, no enumeration.
     match addr.ip() {
         IpAddr::V4(v4) if !v4.is_unspecified() => {
-            return vec![format_ws_url(&v4.to_string(), port)];
+            return vec![format_ws_url(&v4.to_string(), port, tls_enabled)];
         }
         IpAddr::V6(v6) if !v6.is_unspecified() => {
-            return vec![format_ws_url(&format!("[{v6}]"), port)];
+            return vec![format_ws_url(&format!("[{v6}]"), port, tls_enabled)];
         }
         _ => {}
     }
@@ -13466,8 +13689,8 @@ fn auto_detect_advertise_urls(local_addr: Option<std::net::SocketAddr>, port: u1
     let mut urls: Vec<String> = ips
         .into_iter()
         .map(|ip| match ip {
-            IpAddr::V6(v6) => format_ws_url(&format!("[{v6}]"), port),
-            ip => format_ws_url(&ip.to_string(), port),
+            IpAddr::V6(v6) => format_ws_url(&format!("[{v6}]"), port, tls_enabled),
+            ip => format_ws_url(&ip.to_string(), port, tls_enabled),
         })
         .collect();
 
@@ -13475,13 +13698,21 @@ fn auto_detect_advertise_urls(local_addr: Option<std::net::SocketAddr>, port: u1
     // back to the resolved host label so the card carries *something*
     // dialable on a trusted LAN with mDNS.
     if urls.is_empty() {
-        urls.push(format_ws_url(&crate::lan::resolve_host_label(), port));
+        urls.push(format_ws_url(
+            &crate::lan::resolve_host_label(),
+            port,
+            tls_enabled,
+        ));
     }
     urls
 }
 
-fn format_ws_url(host: &str, port: u16) -> String {
-    format!("ws://{host}:{port}/ws")
+/// Format one advertised WebSocket URL. `tls_enabled` picks the secure
+/// scheme (`wss://`) so a TLS daemon never advertises a `ws://` URL a peer
+/// would be refused on.
+fn format_ws_url(host: &str, port: u16, tls_enabled: bool) -> String {
+    let scheme = if tls_enabled { "wss" } else { "ws" };
+    format!("{scheme}://{host}:{port}/ws")
 }
 
 /// Assemble the [`crate::peer::AgentCard`] for this daemon from live
@@ -16031,14 +16262,40 @@ mod tests {
         use std::net::{Ipv4Addr, SocketAddr};
         let specific = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8765);
         assert_eq!(
-            resolve_advertise_urls(Some(specific), &[]),
+            resolve_advertise_urls(Some(specific), &[], false),
             vec!["ws://127.0.0.1:8765/ws".to_string()]
         );
         let lan_ip = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
         assert_eq!(
-            resolve_advertise_urls(Some(lan_ip), &[]),
+            resolve_advertise_urls(Some(lan_ip), &[], false),
             vec!["ws://192.168.1.42:8765/ws".to_string()]
         );
+    }
+
+    /// With TLS enabled the auto-detected scheme is `wss://`, not `ws://`
+    /// — a TLS daemon is HTTPS/WSS-only, so advertising `ws://` would hand
+    /// peers a URL they'd be refused on. Operator overrides are still
+    /// taken verbatim (they own their scheme).
+    #[test]
+    fn advertise_url_uses_wss_when_tls_enabled() {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+        let specific = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
+        assert_eq!(
+            resolve_advertise_urls(Some(specific), &[], true),
+            vec!["wss://192.168.1.42:8765/ws".to_string()]
+        );
+        let v6 = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 8765);
+        let urls = resolve_advertise_urls(Some(v6), &[], true);
+        assert_eq!(urls, vec!["wss://[::1]:8765/ws".to_string()]);
+        // Wildcard bind with TLS: every auto-detected URL is wss://.
+        let wildcard = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 8765);
+        for url in resolve_advertise_urls(Some(wildcard), &[], true) {
+            assert!(url.starts_with("wss://"), "tls scheme on every URL: {url}");
+        }
+        // Operator override is verbatim — its scheme is not rewritten.
+        let overrides = vec!["ws://operator.example:9000/ws".to_string()];
+        let urls = resolve_advertise_urls(Some(specific), &overrides, true);
+        assert_eq!(urls[0], "ws://operator.example:9000/ws");
     }
 
     /// Wildcard bind (0.0.0.0) gets replaced with one URL per routable
@@ -16056,7 +16313,7 @@ mod tests {
     fn advertise_url_replaces_ipv4_wildcard_with_interface_urls() {
         use std::net::{Ipv4Addr, SocketAddr};
         let wildcard = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 8765);
-        let urls = resolve_advertise_urls(Some(wildcard), &[]);
+        let urls = resolve_advertise_urls(Some(wildcard), &[], false);
         assert!(
             !urls.is_empty(),
             "auto-detect should produce at least one URL"
@@ -16087,7 +16344,7 @@ mod tests {
     fn advertise_url_replaces_ipv6_wildcard_with_interface_urls() {
         use std::net::{Ipv6Addr, SocketAddr};
         let wildcard = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 8765);
-        let urls = resolve_advertise_urls(Some(wildcard), &[]);
+        let urls = resolve_advertise_urls(Some(wildcard), &[], false);
         assert!(
             !urls.is_empty(),
             "wildcard v6 bind should still produce some auto-detected URLs"
@@ -16108,7 +16365,7 @@ mod tests {
     fn advertise_url_brackets_specific_ipv6_address() {
         use std::net::{Ipv6Addr, SocketAddr};
         let specific = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 8765);
-        let urls = resolve_advertise_urls(Some(specific), &[]);
+        let urls = resolve_advertise_urls(Some(specific), &[], false);
         assert_eq!(urls.len(), 1);
         assert!(
             urls[0].contains("[::1]"),
@@ -16215,7 +16472,7 @@ mod tests {
             "ws://192.168.1.42:8765/ws".to_string(),
             "wss://laptop.tail-abcd.ts.net:8443/ws".to_string(),
         ];
-        let urls = resolve_advertise_urls(Some(bind), &overrides);
+        let urls = resolve_advertise_urls(Some(bind), &overrides, false);
         // Overrides come first, auto-detected entry appended.
         assert_eq!(urls.len(), 3, "got: {urls:?}");
         assert_eq!(urls[0], "ws://192.168.1.42:8765/ws");
@@ -16229,7 +16486,7 @@ mod tests {
     fn empty_overrides_use_only_auto_detected_url() {
         use std::net::{Ipv4Addr, SocketAddr};
         let lan = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
-        let urls = resolve_advertise_urls(Some(lan), &[]);
+        let urls = resolve_advertise_urls(Some(lan), &[], false);
         assert_eq!(urls, vec!["ws://192.168.1.42:8765/ws".to_string()]);
     }
 
@@ -16243,7 +16500,7 @@ mod tests {
         use std::net::{Ipv4Addr, SocketAddr};
         let lan = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
         let overrides = vec!["ws://192.168.1.42:8765/ws".to_string()];
-        let urls = resolve_advertise_urls(Some(lan), &overrides);
+        let urls = resolve_advertise_urls(Some(lan), &overrides, false);
         assert_eq!(urls.len(), 1, "duplicate suppressed: {urls:?}");
         assert_eq!(urls[0], "ws://192.168.1.42:8765/ws");
     }
@@ -16257,7 +16514,7 @@ mod tests {
     fn advertise_wildcard_bind_enumerates_interfaces_excluding_loopback() {
         use std::net::{Ipv4Addr, SocketAddr};
         let wildcard = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 8765);
-        let urls = resolve_advertise_urls(Some(wildcard), &[]);
+        let urls = resolve_advertise_urls(Some(wildcard), &[], false);
         assert!(
             !urls.is_empty(),
             "expected at least one auto-detected URL, got: {urls:?}"
@@ -16285,7 +16542,7 @@ mod tests {
     fn specific_bind_narrows_auto_detection_to_one_interface() {
         use std::net::{Ipv4Addr, SocketAddr};
         let lan_only = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
-        let urls = resolve_advertise_urls(Some(lan_only), &[]);
+        let urls = resolve_advertise_urls(Some(lan_only), &[], false);
         assert_eq!(urls.len(), 1, "specific bind = exactly one auto entry");
         assert_eq!(urls[0], "ws://192.168.1.42:8765/ws");
     }
@@ -16863,6 +17120,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
 
         // Give it a moment to start
@@ -16897,6 +17155,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -16952,6 +17211,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -17018,6 +17278,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
@@ -17070,9 +17331,134 @@ mod tests {
             Vec::new(),
             bearer_token,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
+    }
+
+    /// Spawn a gateway with a self-signed TLS acceptor wired in (strict
+    /// HTTPS/WSS mode) plus an optional inbound bearer token. Used by the
+    /// strict-TLS demux tests and the TLS variant of the /ws bearer test
+    /// (audit F2), which only manifests over TLS — rustls buffers the
+    /// response ciphertext, so a missing flush truncates it to empty.
+    async fn spawn_test_gateway_tls(
+        bearer_token: Option<String>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Self-signed cert with localhost / 127.0.0.1 in the SAN list, the
+        // same construction the production `--tls` self-signed path uses.
+        let acceptor = crate::web_tls::build_acceptor(&crate::web_tls::TlsCertSource::SelfSigned {
+            bind_ip: Some("127.0.0.1".parse().unwrap()),
+            hostname: None,
+        })
+        .expect("self-signed acceptor builds");
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            WebGatewayConfig::default(),
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            bearer_token,
+            crate::peer::AuthRequirements::none(),
+            Some(acceptor),
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        (port, handle)
+    }
+
+    /// Test-only `ServerCertVerifier` that accepts any certificate. The
+    /// gateway serves a self-signed cert with no chain to a trust anchor,
+    /// so a real verifier would reject it; tests only care that the bytes
+    /// flow over an encrypted channel, not that the cert is trusted.
+    /// Signature verification still delegates to the ring provider so the
+    /// handshake's signed-transcript check is genuine.
+    #[derive(Debug)]
+    struct AcceptAnyCert(Arc<rustls::crypto::CryptoProvider>);
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    /// Fire a raw request over a TLS client connection to a `--tls` gateway
+    /// and read the full decrypted response. The TLS analogue of
+    /// `http_request`: connects with `AcceptAnyCert` (the gateway's cert is
+    /// self-signed), writes the request as cleartext into the TLS session,
+    /// and reads to EOF. Returns the decrypted bytes as a lossy string.
+    async fn https_request(port: u16, request: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let tcp = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let mut tls = connector.connect(server_name, tcp).await.unwrap();
+        tls.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            tls.read_to_end(&mut response),
+        )
+        .await;
+        String::from_utf8_lossy(&response).into_owned()
     }
 
     // -----------------------------------------------------------------
@@ -17369,6 +17755,138 @@ mod tests {
         assert!(
             !resp.contains("101 Switching Protocols"),
             "must reject before WS handshake completes"
+        );
+        handle.abort();
+    }
+
+    /// The same /ws-without-token rejection, but over a real TLS connection
+    /// (audit F2). The /ws bearer-reject arm writes the 401 then returns,
+    /// dropping the stream; over TLS the 401's ciphertext can sit in the
+    /// rustls session buffer and be discarded on an abortive close, so the
+    /// client reads an *empty* response instead of the 401. The
+    /// `finalize_http_stream` flush+shutdown on that arm closes the session
+    /// cleanly (close_notify + FIN) so the response always lands. This test
+    /// exercises the TLS path end to end; it's the cross-platform companion
+    /// to the plain-TCP `test_ws_upgrade_rejects_missing_bearer` and is the
+    /// regression net for the empty-response symptom on platforms whose
+    /// socket close discards queued TX (e.g. Windows).
+    #[tokio::test]
+    async fn test_ws_upgrade_rejects_missing_bearer_over_tls() {
+        let (port, handle) = spawn_test_gateway_tls(Some("ws-token".into())).await;
+        let resp = https_request(
+            port,
+            "GET /ws HTTP/1.1\r\n\
+             Host: x\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGVzdA==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+        assert!(
+            !resp.is_empty(),
+            "TLS 401 must not be truncated to empty (audit F2)"
+        );
+        assert!(resp.contains("401"), "expected 401 over TLS, got: {resp}");
+        assert!(
+            resp.contains("WWW-Authenticate: Bearer"),
+            "WWW-Authenticate signals scheme"
+        );
+        assert!(
+            !resp.contains("101 Switching Protocols"),
+            "must reject before WS handshake completes"
+        );
+        handle.abort();
+    }
+
+    /// Strict TLS: with a TLS acceptor configured, a *cleartext* HTTP
+    /// connection to the secure port is refused with a 426 Upgrade Required
+    /// hint and closed — never served over plain HTTP (audit F3 "no
+    /// unencrypted traffic"). Uses a plain `http_request` (no TLS) against
+    /// the TLS gateway.
+    #[tokio::test]
+    async fn test_strict_tls_rejects_cleartext_http() {
+        let (port, handle) = spawn_test_gateway_tls(None).await;
+        let resp = http_request(port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(
+            resp.contains("426"),
+            "cleartext HTTP to a --tls gateway must get 426, got: {resp}"
+        );
+        assert!(
+            !resp.contains("200 OK"),
+            "must not serve the dashboard over cleartext, got: {resp}"
+        );
+        handle.abort();
+    }
+
+    /// Strict TLS: a cleartext WebSocket upgrade to the secure port is
+    /// likewise refused (426) and never upgraded — the WS-over-cleartext
+    /// path is closed off the same way as plain HTTP.
+    #[tokio::test]
+    async fn test_strict_tls_rejects_cleartext_ws() {
+        let (port, handle) = spawn_test_gateway_tls(None).await;
+        let resp = http_request(
+            port,
+            "GET /ws HTTP/1.1\r\n\
+             Host: x\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGVzdA==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.contains("426"),
+            "cleartext WS to a --tls gateway must get 426, got: {resp}"
+        );
+        assert!(
+            !resp.contains("101 Switching Protocols"),
+            "must not upgrade a cleartext WS on the secure port, got: {resp}"
+        );
+        handle.abort();
+    }
+
+    /// Strict TLS sanity + truncation guard: a *real* TLS request to the
+    /// secure port serves the full dashboard (the rejection above is
+    /// specific to cleartext, not a blanket closure). The body-length
+    /// assertion guards the audit-F2 truncation class: the ~871 KB
+    /// `app.html` far exceeds one synchronous rustls record, so a missing
+    /// `finalize_http_stream` flush+shutdown can drop the buffered tail and
+    /// truncate the body. Whether that manifests is platform-dependent
+    /// (Windows' abortive socket close discards queued TX; macOS loopback
+    /// happens to drain it), so this is a cross-platform regression net —
+    /// strongest on the Windows build. We assert the decrypted body length
+    /// matches `Content-Length` and that the closing `</html>` survived.
+    #[tokio::test]
+    async fn test_strict_tls_serves_https() {
+        let (port, handle) = spawn_test_gateway_tls(None).await;
+        let resp = https_request(port, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(
+            resp.contains("200 OK"),
+            "HTTPS request to a --tls gateway should serve the dashboard, got first 200 bytes: {}",
+            &resp.chars().take(200).collect::<String>()
+        );
+        // Body must arrive intact, not truncated mid-buffer (audit F2).
+        let content_length: usize = resp
+            .split("\r\n")
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .expect("response carries a Content-Length");
+        let body = resp
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .expect("response has a header/body separator");
+        assert_eq!(
+            body.len(),
+            content_length,
+            "TLS body truncated: got {} bytes, Content-Length promised {content_length}",
+            body.len()
+        );
+        assert!(
+            body.contains("</html>"),
+            "TLS body must include the closing </html> (not cut off mid-record)"
         );
         handle.abort();
     }
@@ -18179,6 +18697,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -18238,6 +18757,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -18292,6 +18812,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -18370,6 +18891,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -18488,6 +19010,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -18558,6 +19081,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -18634,6 +19158,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                None,
             )
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -18823,6 +19348,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                None,
             )
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -18907,6 +19433,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                None,
             )
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -18994,6 +19521,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -19054,6 +19582,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -19115,6 +19644,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -19173,6 +19703,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -19237,6 +19768,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -19303,6 +19835,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -19393,6 +19926,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -19518,6 +20052,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -19618,6 +20153,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 

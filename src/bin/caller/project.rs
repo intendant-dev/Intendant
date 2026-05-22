@@ -437,6 +437,63 @@ pub struct ServerConfig {
     /// this daemon. See [`ServerAuthConfig`].
     #[serde(default)]
     pub auth: ServerAuthConfig,
+
+    /// Native TLS for the `--web` dashboard. See [`ServerTlsConfig`].
+    /// Off by default — the gateway serves plain HTTP unless `tls = true`
+    /// here or `--tls` is passed on the CLI.
+    #[serde(default)]
+    pub tls: ServerTlsConfig,
+}
+
+/// Native HTTPS/WSS for the `--web` dashboard, lives under `[server.tls]`
+/// in intendant.toml.
+///
+/// When enabled, the gateway's per-connection demux gains a TLS branch:
+/// an accepted connection whose first bytes are a TLS ClientHello
+/// (record type `0x16`) is wrapped in a `tokio_rustls::TlsAcceptor`, and
+/// the decrypted stream then flows through the existing HTTP/WebSocket
+/// handling. Raw ICE-TCP (STUN-framed, RFC 4571 length-prefixed) and UDP
+/// media are untouched — the first-byte check distinguishes `0x16` (TLS)
+/// from the STUN length-prefix/magic-cookie pattern.
+///
+/// This is the pure-Rust (`rustls` + `rcgen`) path to encrypted serving,
+/// available on every platform including Windows — no `intendant lan
+/// setup` / nginx / OpenSSL dependency. It is independent of
+/// [`ServerAuthConfig::advertised_transport`]'s mTLS pinning, which
+/// concerns federation peer auth at a proxy layer.
+///
+/// Example:
+/// ```toml
+/// [server.tls]
+/// enabled = true
+/// # optional explicit cert/key (PEM); omit for an auto self-signed cert
+/// # cert = "/etc/intendant/server.crt"
+/// # key  = "/etc/intendant/server.key"
+/// # extra SAN hostname beyond the bind IP + localhost
+/// # hostname = "intendant.local"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerTlsConfig {
+    /// Master switch. `false` (default) keeps the current plain-HTTP
+    /// behavior. The CLI `--tls` flag ORs into this at runtime.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Optional path to a PEM-encoded certificate (chain) overriding the
+    /// auto-generated self-signed cert. Must be paired with `key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert: Option<String>,
+
+    /// Optional path to the PEM-encoded private key matching `cert`.
+    /// PKCS#8, PKCS#1 (RSA), or SEC1 (EC) are all accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+
+    /// Optional extra hostname to add to the self-signed cert's SAN list
+    /// (in addition to the bind IP and `localhost`). Ignored when an
+    /// explicit `cert`/`key` pair is supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 /// Auth requirements this daemon enforces on inbound peer connections.

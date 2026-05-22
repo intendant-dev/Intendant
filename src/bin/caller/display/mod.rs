@@ -48,6 +48,10 @@ pub mod visual_marker;
 #[cfg(target_os = "linux")]
 pub mod wayland;
 pub mod webrtc;
+#[cfg(windows)]
+pub mod windows;
+#[cfg(windows)]
+pub mod windows_keymap;
 #[cfg(target_os = "linux")]
 pub mod x11;
 
@@ -157,6 +161,14 @@ async fn enumerate_displays_platform() -> Vec<DisplayInfo> {
         return wayland::enumerate_displays().await;
     }
     Vec::new()
+}
+
+/// Enumerate Windows displays via DXGI output enumeration (the same DXGI
+/// objects the Desktop Duplication capture backend uses). Returns an empty
+/// `Vec` on failure; [`enumerate_displays`] then supplies a fallback entry.
+#[cfg(target_os = "windows")]
+async fn enumerate_displays_platform() -> Vec<DisplayInfo> {
+    windows::enumerate_displays().await
 }
 
 // ---------------------------------------------------------------------------
@@ -647,7 +659,36 @@ pub struct DisplaySession {
 /// timestamp and downscaled layers get a marker in their final output
 /// resolution.
 fn convert_for_pool_feed(bgra: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8> {
-    encode::bgra_to_i420(bgra, width, height, stride)
+    let i420 = encode::bgra_to_i420(bgra, width, height, stride);
+
+    // Windows black-frame diagnostic (hop A of the capture → encoder chain):
+    // log the average byte of the BGRA going INTO bgra_to_i420 and the I420
+    // coming OUT, for the first few converted frames. The capture thread logs
+    // the same BGRA buffer as `avg_byte` (~189 on a live desktop); if the
+    // value here differs, the buffer changed between capture and the bridge.
+    // If BGRA-in is bright but I420-out is ~0, the conversion (or its
+    // dimensions/stride) is the offending hop.
+    #[cfg(target_os = "windows")]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static BRIDGE_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = BRIDGE_FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 5 {
+            eprintln!(
+                "[display/pool-feed] frame #{} convert {}x{} stride={} \
+                 bgra avg={} -> i420 avg={} (i420 len={})",
+                n + 1,
+                width,
+                height,
+                stride,
+                encode::sampled_avg_byte(bgra),
+                encode::sampled_avg_byte(&i420),
+                i420.len(),
+            );
+        }
+    }
+
+    i420
 }
 
 const TILE_STREAM_TILE_SIZE_PX: u16 = 64;
@@ -1048,11 +1089,20 @@ impl DisplaySession {
         // failure is the leak class to avoid (X11's capture thread, in
         // particular, ignores send-on-dropped-rx and only exits on
         // explicit `stop_capture`).
-        if encode::pool::LayerSpec::vp8_simulcast(width, height, fps).is_empty() {
+        // On Windows the always-on baseline is a single H.264 layer (VP8 is
+        // gated off — see `encode::pool::BASELINE_CODEC`), so the guard checks
+        // that the single full-resolution layer clears MIN_LAYER_DIM rather
+        // than the VP8 simulcast set.
+        #[cfg(not(target_os = "windows"))]
+        let baseline_empty = encode::pool::LayerSpec::vp8_simulcast(width, height, fps).is_empty();
+        #[cfg(target_os = "windows")]
+        let baseline_empty =
+            width < encode::pool::MIN_LAYER_DIM || height < encode::pool::MIN_LAYER_DIM;
+        if baseline_empty {
             self.backend.stop_capture().await;
             return Err(CallerError::Display(format!(
-                "source too small for VP8 simulcast: {raw_width}x{raw_height} \
-                 (normalized to {width}x{height}, each candidate layer falls \
+                "source too small for the always-on encoder baseline: \
+                 {raw_width}x{raw_height} (normalized to {width}x{height}, \
                  below MIN_LAYER_DIM={})",
                 encode::pool::MIN_LAYER_DIM,
             )));
@@ -1127,31 +1177,45 @@ impl DisplaySession {
         //
         // `get_or_init` swallows concurrent initializations cheaply;
         // in practice `start()` is called at most once per session.
+        // Always-on layer factory. The factory receives the (possibly
+        // resized) source dims and re-derives the layout from them — so a
+        // runtime resize regenerates the layer set at the new dims rather
+        // than rescaling (and accumulating rounding drift on) the previous
+        // epoch's handles. This is the contract from 4a-fix-#3: every
+        // construction site (initial spawn AND on_resize) goes through the
+        // factory's `normalize_layer_dims` filter.
+        //
+        // macOS/Linux: VP8 simulcast (up to full / half / quarter). The
+        // multi-RID end-to-end machinery (answer SDP carrying
+        // `a=simulcast:send f;h;q` + per-rid lines, multi-forwarder intake,
+        // TWCC-driven per-layer pick) lights up only when a peer offers the
+        // matching `a=simulcast:recv f;h;q` hint; the default DisplaySlot and
+        // federated paths leave it dormant.
+        //
+        // Windows: a single full-resolution H.264 layer (`BASELINE_CODEC` is
+        // H.264 there because VP8/libvpx is gated off). H.264 isn't
+        // simulcast in this pool — matching the existing `LayerSpec::single`
+        // rationale — so the always-on bank is one layer the Media
+        // Foundation encoder serves.
+        #[cfg(not(target_os = "windows"))]
+        let layer_factory =
+            move |w: u32, h: u32| encode::pool::LayerSpec::vp8_simulcast(w, h, fps);
+        #[cfg(target_os = "windows")]
+        let layer_factory = move |w: u32, h: u32| {
+            vec![encode::pool::LayerSpec::single(
+                encode::pool::CodecKind::H264,
+                w,
+                h,
+                fps,
+            )]
+        };
+
         let pool_arc = Arc::clone(self.pool.get_or_init(|| {
             Arc::new(encode::pool::EncoderPool::new(
                 width,
                 height,
                 fps,
-                // VP8 layer factory (up to full / half / quarter). The
-                // factory receives the (possibly resized) source dims
-                // and re-derives the layout from them — so a runtime
-                // resize regenerates the layer set at the new dims
-                // rather than rescaling (and accumulating rounding
-                // drift on) the previous epoch's handles. This is the
-                // contract from 4a-fix-#3: every construction site
-                // (initial spawn AND on_resize) goes through
-                // `vp8_simulcast`'s `normalize_layer_dims` filter, so
-                // resize-down dropping the quarter layer and resize-up
-                // restoring it both work cleanly.
-                //
-                // The multi-RID end-to-end machinery (answer SDP
-                // carrying `a=simulcast:send f;h;q` + per-rid lines,
-                // multi-forwarder intake feeding each rid's frames to
-                // a per-rid SSRC packetizer, TWCC-driven per-layer
-                // pick) lights up only when a peer offers the matching
-                // `a=simulcast:recv f;h;q` hint. The default DisplaySlot
-                // and federated paths leave it dormant.
-                move |w, h| encode::pool::LayerSpec::vp8_simulcast(w, h, fps),
+                layer_factory,
                 // Pool encoders feed the same metrics counters as the
                 // capture bridge so DisplayMetricsSnapshot continues to
                 // reflect total throughput. Pool is the sole producer
@@ -3308,6 +3372,10 @@ mod tests {
     ///
     /// Insert the peer BEFORE `session.start()` so the layer-policy's
     /// first tick (immediate after spawn) sees the peer.
+    ///
+    /// Only used by the VP8-simulcast bridge tests, which are gated off
+    /// Windows; gate the helper too so it isn't dead code there.
+    #[cfg(not(target_os = "windows"))]
     async fn register_test_peer_demanding_all_layers(session: &DisplaySession) {
         use crate::display::encode::pool::SimulcastRid;
         use crate::display::webrtc::WebRtcPeer;
@@ -3357,6 +3425,12 @@ mod tests {
     /// this test confirms construction lifetime only — not frame flow.
     /// (See `pool_always_on_layers_all_subscribe_to_i420_after_start`
     /// for the end-to-end frame-flow test.)
+    ///
+    /// VP8-specific (gated off Windows): the layer set, codec identity,
+    /// and three-layer ordering are the VP8-simulcast baseline. On
+    /// Windows the baseline is a single H.264 layer — see
+    /// `display_session_start_initializes_pool_with_single_h264_layer`.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn display_session_start_initializes_pool_with_vp8_simulcast() {
         let backend = Arc::new(StubBackend {
@@ -3412,6 +3486,53 @@ mod tests {
         assert_eq!(
             (always_on[2].layer.width, always_on[2].layer.height),
             (160, 120)
+        );
+    }
+
+    /// Windows counterpart to
+    /// `display_session_start_initializes_pool_with_vp8_simulcast`. On
+    /// Windows the always-on baseline is a **single full-resolution
+    /// H.264 layer** (VP8/libvpx is gated off — see
+    /// `encode::pool::BASELINE_CODEC`), not VP8 simulcast. A 640×480
+    /// source (well above MIN_LAYER_DIM, comfortably within the MS H.264
+    /// software MFT's accepted range) yields exactly one always-on
+    /// encoder at the full RID and full source dims.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn display_session_start_initializes_pool_with_single_h264_layer() {
+        let backend = Arc::new(StubBackend {
+            width: 640,
+            height: 480,
+        });
+        let session = DisplaySession::new(0, backend);
+        session
+            .start(30, None, None)
+            .await
+            .expect("start() must succeed");
+        let pool = session
+            .pool
+            .get()
+            .expect("pool must be initialized after start()");
+        let always_on = pool.always_on();
+        assert_eq!(
+            always_on.len(),
+            1,
+            "Windows baseline spawns a single H.264 always-on layer for a 640×480 source"
+        );
+        assert_eq!(
+            always_on[0].id.codec,
+            encode::pool::CodecKind::H264,
+            "the Windows always-on baseline codec is H.264"
+        );
+        assert_eq!(
+            always_on[0].id.rid,
+            encode::pool::SimulcastRid::full(),
+            "the single H.264 layer uses the full-resolution RID"
+        );
+        assert_eq!(
+            (always_on[0].layer.width, always_on[0].layer.height),
+            (640, 480),
+            "the single layer covers the full source resolution"
         );
     }
 
@@ -3502,6 +3623,16 @@ mod tests {
     /// (16×480 after normalization) and exactly one surviving
     /// always-on simulcast layer (the full layer at 16×480, since
     /// half/quarter at 8/4 width drop below MIN_LAYER_DIM).
+    ///
+    /// VP8-specific (gated off Windows): the "only the full layer
+    /// survives" outcome is a property of `vp8_simulcast`'s per-layer
+    /// MIN_LAYER_DIM filter, which the Windows single-H.264-layer
+    /// factory doesn't have. The 16-px-wide H.264 case would also stress
+    /// the MS MFT's minimum frame size, which is orthogonal to the
+    /// odd-dim-normalization behavior under test. The source-dim
+    /// even-normalization itself is platform-agnostic and already
+    /// exercised by the pool-level dimension tests.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn display_session_start_normalizes_odd_source_dims_in_pool() {
         // 17×480 — width is odd, so `& !1` rounds to 16. Half would
@@ -3549,6 +3680,13 @@ mod tests {
     /// and any one of them being unsubscribed is a silent-black-screen
     /// regression for the peers that pick that RID. Tightening the
     /// assertion to require exactly the always-on count.
+    ///
+    /// VP8-specific (gated off Windows): only the hardcoded
+    /// three-layer precondition is VP8-simulcast. The underlying
+    /// invariant — `push_i420_frame` reaches *every* always-on encoder
+    /// — is platform-agnostic and asserted on Windows by
+    /// `pool_single_h264_layer_subscribes_to_i420_after_start`.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_always_on_layers_all_subscribe_to_i420_after_start() {
         let backend = Arc::new(StubBackend {
@@ -3585,6 +3723,42 @@ mod tests {
         );
     }
 
+    /// Windows counterpart to
+    /// `pool_always_on_layers_all_subscribe_to_i420_after_start`. The
+    /// single H.264 always-on layer must be subscribed to the pool's
+    /// I420 broadcast the moment `start()` returns, so the bridge's
+    /// first `push_i420_frame` reaches it. Same "every always-on encoder
+    /// is wired" invariant, single-layer shape: exactly one subscriber.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn pool_single_h264_layer_subscribes_to_i420_after_start() {
+        let backend = Arc::new(StubBackend {
+            width: 640,
+            height: 480,
+        });
+        let session = DisplaySession::new(0, backend);
+        session
+            .start(30, None, None)
+            .await
+            .expect("start() must succeed");
+        let pool = session.pool.get().expect("pool initialized after start()");
+        let expected_count = pool.always_on().len();
+        assert_eq!(
+            expected_count, 1,
+            "precondition: 640×480 source spawns one H.264 always-on layer on Windows"
+        );
+
+        let i420 = Arc::new(vec![0u8; 640 * 480 * 3 / 2]);
+        let subscriber_count = pool.push_i420_frame(i420, Instant::now());
+        assert_eq!(
+            subscriber_count, expected_count,
+            "pool.push_i420_frame must deliver to the single always-on \
+             H.264 encoder ({expected_count} subscriber expected); got \
+             {subscriber_count}. If 0, the always-on layer is not wired \
+             to the i420 broadcast — silent-black-screen regression."
+        );
+    }
+
     /// **Phase 4b**: real-dim resize through 1366×768 must regenerate
     /// the simulcast layer set via the pool's stored factory, NOT by
     /// rescaling the previous epoch's handles. The pool-level
@@ -3601,6 +3775,14 @@ mod tests {
     /// stored-then-rescaled the previous layout would land here as
     /// "half/quarter dims drift by one pixel after a series of
     /// odd-dim resizes."
+    ///
+    /// VP8-specific (gated off Windows): the half/quarter drift this
+    /// pins only exists for VP8 simulcast. The Windows factory produces
+    /// a single full-res H.264 layer with no derived dims to drift, and
+    /// the factory-regenerates-on-resize contract itself is already
+    /// covered platform-agnostically by the `pool::tests` `on_resize`
+    /// suite.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_resize_through_1366x768_yields_canonical_layout_at_every_step() {
         let backend = Arc::new(StubBackend {
@@ -3806,6 +3988,14 @@ mod tests {
     /// frames arrive at a pool subscriber. Without heartbeat we'd
     /// see ≤1 (the initial encode); with heartbeat we see ≥2 (initial
     /// + at least one heartbeat re-push).
+    ///
+    /// VP8-specific (gated off Windows): subscribes to the pool with a
+    /// VP8 preference and counts VP8-encoded frames at 64×64. Windows
+    /// has no VP8 backend (the subscribe would fail), and the MS H.264
+    /// MFT's minimum frame size makes a 64×64 H.264 rewrite unreliable.
+    /// The heartbeat re-push mechanism itself is codec-agnostic bridge
+    /// logic, fully exercised here on macOS/Linux.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_feed_bridge_heartbeats_on_idle_capture() {
         let backend = Arc::new(StubBackend {
@@ -3881,6 +4071,12 @@ mod tests {
     /// fires, sometimes doesn't.) Then never push anything via
     /// `frame_tx` and assert encoded frames flow to a pool
     /// subscriber, proving the seed branch alone fed the encoder.
+    ///
+    /// VP8-specific (gated off Windows): subscribes with a VP8
+    /// preference and asserts VP8-encoded frame flow at 64×64. Windows
+    /// has no VP8 backend; the seed-snapshot bridge logic it exercises
+    /// is codec-agnostic and covered here on macOS/Linux.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_feed_bridge_seeds_latest_i420_from_capture_snapshot() {
         let backend = Arc::new(StubBackend {
@@ -4052,6 +4248,12 @@ mod tests {
     /// received by a pool subscriber over the burst window; without
     /// burst the count would be ≤2 (initial encode + at most one
     /// heartbeat), with burst it should be at tick rate (~30fps).
+    ///
+    /// VP8-specific (gated off Windows): subscribes with a VP8
+    /// preference and counts VP8-encoded frames over the burst window at
+    /// 64×64. Windows has no VP8 backend; the burst-clocking bridge
+    /// logic is codec-agnostic and exercised here on macOS/Linux.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_feed_bridge_burst_clocks_encoder_at_tick_rate() {
         let backend = Arc::new(StubBackend {

@@ -49,6 +49,7 @@ mod upload_store;
 mod user_mode;
 mod vision;
 mod web_gateway;
+mod web_tls;
 mod worktree;
 mod worktree_inventory;
 
@@ -148,6 +149,11 @@ fn build_local_advertised_auth(
         "none" => peer::TransportAuth::None,
         "mutual-tls" => peer::TransportAuth::MutualTls,
         "pin-self-cert" => {
+            // `pin-self-cert` reads the local server cert produced by
+            // `intendant lan setup`. The `certs` module is now pure-Rust
+            // (rcgen + p12-keystore) and compiles everywhere, so this works
+            // on all platforms; only the nginx-based `lan setup` flow that
+            // writes the cert is still deferred on Windows.
             let fp = lan::certs::read_server_cert_fingerprint(cert_dir).ok_or_else(|| {
                 CallerError::Config(format!(
                     "[server.auth] advertised_transport = \"pin-self-cert\" requires \
@@ -2515,6 +2521,16 @@ struct CliFlags {
     /// --web [PORT]: Serve TUI via web (xterm.js + optional voice).
     web: bool,
     web_port: u16,
+    /// --tls: Serve the `--web` dashboard over HTTPS/WSS. Off by default
+    /// (plain HTTP). ORs with `[server.tls] enabled` in intendant.toml.
+    /// With no cert/key override, a self-signed cert is minted at startup
+    /// (SAN = bind IP + localhost, optional config hostname).
+    tls: bool,
+    /// --tls-cert <PATH>: PEM cert (chain) overriding the auto self-signed
+    /// cert. Must be paired with `--tls-key`. Implies `--tls`.
+    tls_cert: Option<String>,
+    /// --tls-key <PATH>: PEM private key matching `--tls-cert`.
+    tls_key: Option<String>,
     /// --transcription: Enable user speech transcription.
     transcription: bool,
     /// --record-display <ID>: Record an existing X11 display (repeatable).
@@ -2557,6 +2573,9 @@ fn print_help() {
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle starts daemon/no TUI)");
+    println!("    --tls                 Serve the web dashboard over HTTPS/WSS (auto self-signed cert)");
+    println!("    --tls-cert <PATH>     PEM cert overriding the self-signed cert (with --tls-key; implies --tls)");
+    println!("    --tls-key <PATH>      PEM private key matching --tls-cert");
     println!("    --no-web              Disable web dashboard; use terminal TUI when interactive");
     println!("    --transcription       Enable user speech transcription");
     println!(
@@ -2697,6 +2716,59 @@ async fn bind_dual_stack_or_v4(port: u16) -> std::io::Result<tokio::net::TcpList
     tokio::net::TcpListener::from_std(std_listener)
 }
 
+/// Build the optional TLS acceptor for the `--web` dashboard.
+///
+/// TLS is enabled when either the CLI `--tls` flag is set or
+/// `[server.tls] enabled = true` is in intendant.toml. When enabled, the
+/// cert source is resolved in priority order:
+///   1. Explicit PEM files — CLI `--tls-cert`/`--tls-key` first, else
+///      `[server.tls] cert`/`key`. Both halves of a pair must be present.
+///   2. Otherwise a self-signed cert minted by `rcgen`, with the listener
+///      bind IP plus `localhost` (and optional `[server.tls] hostname`) in
+///      the SAN list.
+///
+/// Returns `Ok(None)` when TLS is off (the default), `Ok(Some(acceptor))`
+/// when on and the cert built, or `Err` when enabled but misconfigured
+/// (mismatched cert/key pair, unreadable/invalid PEM, cert-gen failure) —
+/// surfaced loudly at startup rather than silently serving plain HTTP.
+fn build_web_tls_acceptor(
+    flags: &CliFlags,
+    server_cfg: &project::ServerTlsConfig,
+    bind_addr: Option<std::net::SocketAddr>,
+) -> Result<Option<tokio_rustls::TlsAcceptor>, CallerError> {
+    let enabled = flags.tls || server_cfg.enabled;
+    if !enabled {
+        return Ok(None);
+    }
+
+    // Resolve an explicit cert/key pair: CLI overrides config. A
+    // half-specified pair (only cert or only key) is a configuration
+    // error rather than a silent fallback to self-signed.
+    let cert_path = flags.tls_cert.clone().or_else(|| server_cfg.cert.clone());
+    let key_path = flags.tls_key.clone().or_else(|| server_cfg.key.clone());
+    let source = match (cert_path, key_path) {
+        (Some(c), Some(k)) => web_tls::TlsCertSource::Files {
+            cert_path: c.into(),
+            key_path: k.into(),
+        },
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(CallerError::Config(
+                "TLS cert/key must be supplied together (got only one of --tls-cert/--tls-key \
+                 or [server.tls] cert/key)"
+                    .to_string(),
+            ));
+        }
+        (None, None) => web_tls::TlsCertSource::SelfSigned {
+            bind_ip: bind_addr.map(|a| a.ip()),
+            hostname: server_cfg.hostname.clone(),
+        },
+    };
+
+    let acceptor = web_tls::build_acceptor(&source)
+        .map_err(|e| CallerError::Config(format!("TLS setup failed: {e}")))?;
+    Ok(Some(acceptor))
+}
+
 fn parse_cli_flags() -> Result<CliFlags, CallerError> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut flags = CliFlags {
@@ -2717,6 +2789,9 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         no_presence: false,
         web: false,
         web_port: web_gateway::DEFAULT_PORT,
+        tls: false,
+        tls_cert: None,
+        tls_key: None,
         transcription: false,
         record_displays: Vec::new(),
 
@@ -2835,6 +2910,34 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                     i += 2;
                 } else {
                     i += 1;
+                }
+            }
+            "--tls" => {
+                // Serve the dashboard over HTTPS/WSS. Auto self-signed
+                // cert unless --tls-cert/--tls-key are also given.
+                flags.tls = true;
+                i += 1;
+            }
+            "--tls-cert" => {
+                if i + 1 < args.len() {
+                    flags.tls_cert = Some(args[i + 1].clone());
+                    flags.tls = true; // a cert override implies TLS
+                    i += 2;
+                } else {
+                    return Err(CallerError::Config(
+                        "Missing value for --tls-cert".to_string(),
+                    ));
+                }
+            }
+            "--tls-key" => {
+                if i + 1 < args.len() {
+                    flags.tls_key = Some(args[i + 1].clone());
+                    flags.tls = true; // a key override implies TLS
+                    i += 2;
+                } else {
+                    return Err(CallerError::Config(
+                        "Missing value for --tls-key".to_string(),
+                    ));
                 }
             }
             "--transcription" => {
@@ -3411,7 +3514,7 @@ pub(crate) fn query_display_resolution(_display_id: u32) -> (u32, u32) {
 
 /// Query the resolution of an existing X11 display via xdpyinfo.
 /// Returns (width, height) or a default of (1280, 720) if detection fails.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 pub(crate) fn query_display_resolution(display_id: u32) -> (u32, u32) {
     let output = std::process::Command::new("xdpyinfo")
         .arg("-display")
@@ -3434,6 +3537,14 @@ pub(crate) fn query_display_resolution(display_id: u32) -> (u32, u32) {
             }
         }
     }
+    (1280, 720)
+}
+
+/// No X11 / `xdpyinfo` on Windows. Return the same conservative default
+/// the X11 path falls back to; Tier-1's DXGI backend will report the real
+/// resolution via the display enumeration path instead.
+#[cfg(target_os = "windows")]
+pub(crate) fn query_display_resolution(_display_id: u32) -> (u32, u32) {
     (1280, 720)
 }
 
@@ -3608,6 +3719,8 @@ mod tests {
     /// `advertised_transport = "pin-self-cert"` reads the LAN cert
     /// dir, computes the fingerprint, embeds it in PinnedMutualTls.
     /// Uses `lan::certs::ensure_certs` to populate a tempdir.
+    /// `lan::certs` is now pure-Rust and compiles everywhere, so this
+    /// applies on all platforms.
     #[test]
     fn build_local_advertised_auth_pin_self_cert_reads_cert_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3692,6 +3805,8 @@ mod tests {
     /// full defense-in-depth advertise (PinnedMutualTls transport +
     /// Bearer application). The expected configuration for WAN-
     /// exposed daemons that want both wire-layer and app-layer auth.
+    /// `lan::certs` is now pure-Rust and compiles everywhere, so this
+    /// applies on all platforms.
     #[test]
     fn build_local_advertised_auth_full_defense_in_depth() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4268,16 +4383,25 @@ Also: {"source": "bare"}"#;
 
     #[test]
     fn inject_project_context_adds_memory_file() {
+        let root = std::path::PathBuf::from("/tmp/proj");
         let project = Project {
-            root: std::path::PathBuf::from("/tmp/proj"),
+            root: root.clone(),
             config: project::ProjectConfig::default(),
         };
         let input = r#"{"commands":[{"function":"storeMemory","nonce":1,"memory_key":"test","memory_summary":"hello"}]}"#;
         let result = inject_project_context(input, &project);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        // Build the expected path the same platform-aware way production does
+        // (via `PathBuf::join`) instead of hardcoding '/'-joined POSIX text,
+        // so the assertion holds on Windows (separator '\\') too.
+        let expected = root
+            .join(".intendant")
+            .join("memory.json")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             parsed["commands"][0]["memory_file"].as_str().unwrap(),
-            "/tmp/proj/.intendant/memory.json"
+            expected
         );
     }
 
@@ -4364,6 +4488,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
             transcription: false,
             record_displays: Vec::new(),
             agent_backend: None,
@@ -4409,6 +4536,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
             transcription: false,
             record_displays: Vec::new(),
 
@@ -4454,6 +4584,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: true,
             web_port: web_gateway::DEFAULT_PORT,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
             transcription: false,
             record_displays: Vec::new(),
 
@@ -4487,6 +4620,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: true,
             web_port: 9000,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
             transcription: false,
             record_displays: Vec::new(),
 
@@ -5726,6 +5862,11 @@ async fn run_agent_loop(
                             }
                         };
 
+                        // Vortex shared-memory probe is POSIX-only
+                        // (`shm_open`). On Windows the Vortex bridge isn't
+                        // available, so the probe is compiled out and the
+                        // code falls through to the regular audio bridge.
+                        #[cfg(unix)]
                         let vortex_shm_available = unsafe {
                             let fd = libc::shm_open(
                                 b"/vortex-audio\0".as_ptr() as *const libc::c_char,
@@ -5739,6 +5880,8 @@ async fn run_agent_loop(
                                 false
                             }
                         };
+                        #[cfg(not(unix))]
+                        let vortex_shm_available = false;
                         let mut bridge = if vortex_shm_available {
                             audio_routing::create_vortex_bridge("shm")
                         } else {
@@ -9542,10 +9685,85 @@ async fn activate_user_display(
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        // If a specific display was requested, resolve its platform_id (DXGI
+        // output ordinal) from the enumerated list; otherwise capture the
+        // primary output. Mirrors the macOS arm.
+        let backend = if target_display_id != 0 {
+            let displays = display::enumerate_displays().await;
+            if let Some(info) = displays.iter().find(|d| d.id == target_display_id) {
+                display::windows::WindowsBackend::with_output_index(info.platform_id as u32)
+            } else {
+                eprintln!(
+                    "[user_display] display_id {} not found, falling back to primary",
+                    target_display_id
+                );
+                display::windows::WindowsBackend::new()
+            }
+        } else {
+            display::windows::WindowsBackend::new()
+        };
+        let session = display::DisplaySession::new(display_id, Arc::new(backend));
+        if let Err(e) = session.start(30, frame_registry, Some(bus.clone())).await {
+            eprintln!("[user_display] Windows display session failed: {}", e);
+        } else {
+            let (width, height) = session.resolution();
+            let session = Arc::new(session);
+            session.spawn_metrics_logger(Some(bus.clone()));
+            session_registry.write().await.insert(display_id, session);
+            bus.send(AppEvent::DisplayReady {
+                display_id,
+                width,
+                height,
+            });
+            return;
+        }
+    }
+
     #[allow(unreachable_code)]
     {
         eprintln!("[user_display] No supported display backend detected");
     }
+}
+
+/// Auto-register the Windows desktop as an active display at web-daemon
+/// startup, so the dashboard's Video tab streams it on connect — no grant
+/// click and no running agent required.
+///
+/// On macOS and Linux the screen is shared behind a consent gate (TCC, the
+/// Wayland portal dialog) or a virtual display is launched on demand, so
+/// those platforms keep activating the user display only on an explicit
+/// grant. Windows has no such per-session consent step: in the headless /
+/// RDP server scenario the existing desktop *is* the always-on stream, and
+/// the OS-level capture permission is implicit. We therefore mirror the
+/// macOS *end state* (a live `DisplaySession` already in the registry, so a
+/// fresh browser connect replays `display_ready` and auto-streams) by
+/// activating display 0 up front, reusing the same [`activate_user_display`]
+/// machinery — which on Windows captures the existing desktop via
+/// `WindowsBackend` (DXGI Desktop Duplication), NOT a virtual Xvfb display.
+///
+/// The autonomy grant flag and `INTENDANT_USER_DISPLAY_GRANTED` env are set
+/// to match a real grant, so the dashboard's "your display" toggle, CU
+/// display targeting, and agent subprocesses all observe a consistent
+/// "granted" state. Activation degrades gracefully — if the capture backend
+/// can't start (no interactive desktop, etc.) `activate_user_display` logs
+/// and returns without registering, leaving the dashboard at "No displays
+/// active" rather than failing startup.
+#[cfg(target_os = "windows")]
+async fn auto_activate_windows_user_display(
+    bus: &EventBus,
+    session_registry: &display::SharedSessionRegistry,
+    frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<frames::FrameRegistry>>>,
+    autonomy: &SharedAutonomy,
+) {
+    eprintln!("[user_display] Windows: auto-registering desktop as active display (display 0)");
+    {
+        let mut guard = autonomy.write().await;
+        guard.user_display_granted = true;
+    }
+    std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+    activate_user_display(bus, session_registry, frame_registry, 0).await;
 }
 
 /// Detect a Wayland compositor socket even when WAYLAND_DISPLAY is not set.
@@ -10134,16 +10352,26 @@ async fn main() -> Result<(), CallerError> {
 
     // Intercept `intendant lan <action>` before the main runtime setup —
     // the lan subcommand is a pure system-setup path with no project,
-    // no .env, no provider selection.
+    // no .env, no provider selection. The subcommand's cert machinery
+    // (OpenSSL + nginx) is deferred on Windows (Tier-0), so there it
+    // reports unsupported and exits rather than calling the gated path.
     if env::args().nth(1).as_deref() == Some("lan") {
-        let argv: Vec<String> = env::args().skip(2).collect();
-        return match lan::run(argv).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        };
+        #[cfg(not(target_os = "windows"))]
+        {
+            let argv: Vec<String> = env::args().skip(2).collect();
+            return match lan::run(argv).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+        }
+        #[cfg(target_os = "windows")]
+        {
+            eprintln!("error: `intendant lan` is not supported on Windows yet");
+            std::process::exit(1);
+        }
     }
 
     // Load .env: cwd (+ parents) first, then project root, then ~/.config/intendant/
@@ -10334,6 +10562,24 @@ async fn main() -> Result<(), CallerError> {
     // Only expose the web port to external agents when the web gateway is actually running.
     let web_port_for_agent: Option<u16> = if use_web { Some(web_port) } else { None };
 
+    // Build the dashboard's TLS acceptor once (cheap to clone into each
+    // gateway spawn site). Off unless `--tls` / `[server.tls] enabled`.
+    // A misconfiguration (bad cert/key, half-specified pair) fails startup
+    // here rather than silently degrading to plain HTTP. The bind address
+    // feeds the self-signed cert's SAN list.
+    let web_tls_acceptor = if use_web {
+        let bind_addr = web_listener.as_ref().and_then(|l| l.local_addr().ok());
+        build_web_tls_acceptor(&flags, &project.config.server.tls, bind_addr)?
+    } else {
+        None
+    };
+    if web_tls_acceptor.is_some() {
+        eprintln!(
+            "[web_gateway] TLS enabled — dashboard is HTTPS/WSS-only on port {web_port} \
+             (cleartext HTTP/WS connections are refused)"
+        );
+    }
+
     let provider_result = provider::select_provider();
     let provider = match provider_result {
         Ok(p) => {
@@ -10425,6 +10671,18 @@ async fn main() -> Result<(), CallerError> {
             session_registry.clone(),
             Some(frame_registry.clone()),
         );
+        // Windows: auto-register the existing desktop as an active display so
+        // the dashboard streams it on connect (mirrors the macOS end state of
+        // a live session sitting in the registry). macOS/Linux compile this
+        // out and keep activating only on an explicit grant.
+        #[cfg(target_os = "windows")]
+        auto_activate_windows_user_display(
+            &bus,
+            &session_registry,
+            Some(frame_registry.clone()),
+            &autonomy,
+        )
+        .await;
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = Some(debug::spawn_debug_screen_handler(
             bus.subscribe(),
@@ -10517,6 +10775,7 @@ async fn main() -> Result<(), CallerError> {
                 &project.config.server.auth,
                 &lan::backend::select_backend().cert_dir(),
             )?,
+            web_tls_acceptor.clone(),
         );
         eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
 
@@ -10736,6 +10995,7 @@ async fn main() -> Result<(), CallerError> {
                     &project.config.server.auth,
                     &lan::backend::select_backend().cert_dir(),
                 )?,
+                web_tls_acceptor.clone(),
             );
             slog(&session_log, |l| {
                 l.info(&format!("Web TUI: http://0.0.0.0:{}", web_port))
@@ -11332,6 +11592,7 @@ async fn main() -> Result<(), CallerError> {
                     &project.config.server.auth,
                     &lan::backend::select_backend().cert_dir(),
                 )?,
+                web_tls_acceptor.clone(),
             );
             app.log(
                 types::LogLevel::Info,
@@ -11832,6 +12093,7 @@ async fn main() -> Result<(), CallerError> {
                     &project.config.server.auth,
                     &lan::backend::select_backend().cert_dir(),
                 )?,
+                web_tls_acceptor.clone(),
             );
             eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
             Some(shared_session)

@@ -622,6 +622,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
         (port, handle, bus_rx)

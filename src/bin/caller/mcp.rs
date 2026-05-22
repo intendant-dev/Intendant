@@ -774,41 +774,9 @@ fn request_loop_intervention_marker(
 }
 
 async fn spawn_detached_restart_command(cmd: &str) -> Result<u32, String> {
-    use std::process::Stdio;
-    use tokio::process::Command;
-
-    // Use setsid when available to separate process group/session so parent
-    // shutdown doesn't tear down the restarted controller process.
-    let wrapper = r#"
-if command -v setsid >/dev/null 2>&1; then
-  nohup setsid bash -lc "$INTENDANT_RESTART_COMMAND" </dev/null >/dev/null 2>&1 &
-else
-  nohup bash -lc "$INTENDANT_RESTART_COMMAND" </dev/null >/dev/null 2>&1 &
-fi
-echo $!
-"#;
-
-    let output = Command::new("bash")
-        .args(["-lc", wrapper])
-        .env("INTENDANT_RESTART_COMMAND", cmd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .map_err(|e| format!("Failed to launch detached restart command: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "Failed to launch detached restart command (exit={})",
-            output.status
-        ));
-    }
-
-    let pid_text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    pid_text
-        .parse::<u32>()
-        .map_err(|e| format!("Failed to parse detached restart pid '{}': {}", pid_text, e))
+    // Delegate to the platform helper: `nohup setsid bash -lc` on Unix
+    // (unchanged), a detached window-less `cmd.exe /C` child on Windows.
+    super::platform::spawn_detached_restart(cmd).await
 }
 
 async fn run_scheduled_controller_restart_with_state(
@@ -4073,25 +4041,44 @@ impl IntendantServer {
             use std::io::Write;
             let _ = std::io::stdout().flush();
 
-            // exec() replaces the process image. stdin/stdout fds survive.
-            use std::os::unix::process::CommandExt;
-            let exe = match std::env::current_exe() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("reload failed: cannot determine current exe: {}", e);
-                    return;
-                }
-            };
-            let err = std::process::Command::new(exe)
-                .args(&args[1..])
-                .env("INTENDANT_MCP_RELOAD", "1")
-                .exec();
-            // exec only returns on error
-            eprintln!("reload exec failed: {}", err);
-            std::process::exit(1);
+            // exec() replaces the process image in place (stdin/stdout fds
+            // survive), which is what keeps the MCP stdio connection alive
+            // across the reload. `CommandExt::exec` is Unix-only; on
+            // Windows there is no in-place image replacement, so the
+            // hot-reload is unavailable in Tier-0.
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let exe = match std::env::current_exe() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("reload failed: cannot determine current exe: {}", e);
+                        return;
+                    }
+                };
+                let err = std::process::Command::new(exe)
+                    .args(&args[1..])
+                    .env("INTENDANT_MCP_RELOAD", "1")
+                    .exec();
+                // exec only returns on error
+                eprintln!("reload exec failed: {}", err);
+                std::process::exit(1);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = &args;
+                eprintln!("reload not supported on this platform (exec() is Unix-only)");
+            }
         });
 
-        "ok - reloading in-place (MCP connection preserved)".to_string()
+        #[cfg(unix)]
+        {
+            "ok - reloading in-place (MCP connection preserved)".to_string()
+        }
+        #[cfg(not(unix))]
+        {
+            "error - in-place reload is not supported on this platform".to_string()
+        }
     }
 
     #[tool(description = "Enumerate available displays with their IDs, names, and resolutions.")]
@@ -4376,6 +4363,10 @@ impl IntendantServer {
         };
 
         // Create audio bridge
+        // Vortex shared-memory probe is POSIX-only (`shm_open`). On
+        // Windows the Vortex bridge isn't available, so the probe is
+        // compiled out and we fall through to the regular audio bridge.
+        #[cfg(unix)]
         let vortex_shm_available = unsafe {
             let fd = libc::shm_open(
                 b"/vortex-audio\0".as_ptr() as *const libc::c_char,
@@ -4389,6 +4380,8 @@ impl IntendantServer {
                 false
             }
         };
+        #[cfg(not(unix))]
+        let vortex_shm_available = false;
         let mut bridge = if vortex_shm_available {
             audio_routing::create_vortex_bridge("shm")
         } else {
@@ -6299,20 +6292,40 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_detached_restart_command_returns_live_pid() {
-        let pid = spawn_detached_restart_command("sleep 30")
+        // A long-lived command per platform: `sleep` on Unix, a long `timeout`
+        // on Windows (the cmd.exe-resolvable form, /T seconds, /NOBREAK so it
+        // doesn't consume our detached stdin).
+        #[cfg(windows)]
+        let long_running = "timeout /T 30 /NOBREAK";
+        #[cfg(not(windows))]
+        let long_running = "sleep 30";
+
+        let pid = spawn_detached_restart_command(long_running)
             .await
             .expect("detached spawn should succeed");
         assert!(pid > 1);
 
-        let probe = std::process::Command::new("bash")
-            .args(["-lc", &format!("kill -0 {}", pid)])
-            .status()
-            .expect("kill -0 should run");
-        assert!(probe.success(), "spawned pid should be alive");
+        // Liveness via the platform helper (kill(pid,0) on Unix,
+        // OpenProcess/GetExitCodeProcess on Windows) rather than shelling to
+        // bash, which doesn't exist on a stock Windows host.
+        assert!(
+            crate::platform::process_alive(pid),
+            "spawned pid should be alive"
+        );
 
-        let _ = std::process::Command::new("bash")
-            .args(["-lc", &format!("kill -TERM {}", pid)])
-            .status();
+        // Best-effort cleanup of the detached child.
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F", "/T"])
+                .status();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
     }
 
     #[tokio::test]

@@ -47,7 +47,29 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 # the `PinnedMutualTls` transport-auth variant. Same `ClientConfig` is
 # also passed to reqwest via `use_preconfigured_tls` so the agent-card
 # fetch path enforces pinning consistently with the WebSocket path.
-rustls = "0.23"
+#
+# Pinned to the `ring` crypto provider (default-features off) rather than
+# the default `aws-lc-rs`, which drags in `aws-lc-sys` (a C/asm crate
+# needing nasm+cmake to build). reqwest/tokio-tungstenite/rtc all build
+# their rustls `ClientConfig` from the process-default provider, so as
+# long as nothing else in the tree re-enables `rustls/aws_lc_rs` this
+# keeps the whole TLS stack on `ring`. `tls12` + `logging` preserve the
+# feature set the default would have given us.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"] }
+# Server-side TLS for the `--web` dashboard. `tokio-rustls` wraps an accepted
+# `TcpStream` into a `TlsStream` once the demux detects a TLS ClientHello;
+# `rcgen` mints a self-signed cert+key at startup (SAN = bind IP + localhost,
+# optional hostname) so HTTPS/WSS works on Windows (and everywhere) without the
+# `lan`/nginx/OpenSSL path. Both ride the same `ring` provider and `rustls`
+# 0.23 the rest of the tree is pinned to — no `aws-lc` is pulled in.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+# (rcgen is declared once below — it's shared by the gateway self-signed cert
+# and the `lan` mTLS cert generation, with the superset feature set.)
+# Parses operator-supplied PEM cert/key files for the optional
+# `--tls-cert`/`--tls-key` override. Pure-Rust, only transitive dep is
+# `rustls-pki-types` (already in-tree). Auto self-signed (rcgen) is the
+# default and doesn't touch this crate.
+rustls-pemfile = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 presence-core = { path = "crates/presence-core" }
@@ -60,14 +82,30 @@ libc = "0.2"
 socket2 = "0.6"
 rtc = { version = "=0.9.0" }
 bytes = "1"
-env-libvpx-sys = { version = "5.1", features = ["generate"] }
 agent-client-protocol-schema = "0.11.5"
-openssl = "0.10"
-openssl-sys = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 similar = "2"
 sha2 = "0.10"
+# `intendant lan` mTLS certificate generation — pure-Rust, replacing the
+# former OpenSSL dependency. `rcgen` builds the CA + server (SAN=IP, ≤825d) +
+# client certs on the `ring` backend (ECDSA P-256 keys, no aws-lc-sys C
+# toolchain); `x509-parser` (enabled in rcgen and used directly) reads the
+# server cert CN back for IP-drift detection and reconstructs the CA issuer
+# on `recert`. `p12-keystore` writes the client bundle as a MODERN PKCS#12
+# (PBES2 / PBKDF2-HMAC-SHA256 / AES-256-CBC + SHA-256 MAC) that Apple's
+# `SecPKCS12Import` (Keychain Access on macOS 15+, iOS 18 profile install)
+# accepts. All four are pure-Rust and cross-platform, so they live here
+# rather than under a platform gate. `pem` decodes stored PEM certs to DER
+# for the SHA-256 fingerprint (`pin-self-cert`) path.
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
+x509-parser = "0.18"
+p12-keystore = "0.2.1"
+pem = "3"
+rand = "0.8"
+# `rcgen`'s `not_before` / `not_after` cert-validity fields are `time`'s
+# `OffsetDateTime`; we set them via `OffsetDateTime::now_utc()` + `Duration`.
+time = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
@@ -81,6 +119,76 @@ core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
 shiguredo_video_toolbox = "2026.1"
 
+# Native dep that has no Windows backend yet (Tier-0 Windows port defers the
+# VP8/libvpx encoder). Gated to non-Windows so the MSVC target doesn't try to
+# build the libvpx FFI crate (`env-libvpx-sys` needs a C toolchain + the vpx
+# headers). The VP8 code path is itself cfg'd off Windows so nothing
+# references these symbols there.
+#
+# (The `intendant lan` cert subsystem used to live here too, via OpenSSL; it
+# is now pure-Rust — rcgen + p12-keystore — and moved to `[dependencies]`.)
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+env-libvpx-sys = { version = "5.1", features = ["generate"] }
+
+# Windows-only system bindings, used by `platform.rs` for the process
+# liveness check (OpenProcess / GetExitCodeProcess) and command-line readout
+# (NtQueryInformationProcess via the Wdk surface, with a
+# QueryFullProcessImageNameW exe-path fallback), and to keep room for the
+# Tier-1 backends (DXGI capture, SendInput, WASAPI, clipboard) without
+# re-touching Cargo.toml. Feature set is the minimum platform.rs needs
+# today plus the threading/process-status surfaces those backends will use.
+# `Wdk_System_Threading` pulls in NtQueryInformationProcess +
+# ProcessCommandLineInformation (the documented-but-NT command-line class).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Wdk_System_Threading",
+] }
+# Windows clipboard backend (display/clipboard.rs). Wraps the Win32 clipboard
+# API (clipboard-win) and provides RGBA image get/set via its default
+# `image-data` feature. That feature pulls in `image` (0.25, png+bmp) and the
+# Win32_Graphics_Gdi surface of windows-sys, both of which unify with our
+# existing copies — no duplicate crate. The objc2/core-graphics deps named by
+# `image-data` are macOS-target-gated in arboard, so they don't reach the MSVC
+# build. Windows-only: the macOS/Linux arms shell out to pbcopy/wl-copy/xclip.
+arboard = "3"
+# The richer `windows` crate (COM wrappers, RAII interface handles) powers the
+# Tier-1 display backend (`display/windows.rs`): DXGI Desktop Duplication for
+# capture, Direct3D 11 for the staging-texture copy, GDI/WindowsAndMessaging
+# for virtual-screen metrics, and SendInput for keyboard/mouse injection.
+windows = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    # OpenInputDesktop / OpenDesktopW / SetThreadDesktop: the capture thread must
+    # bind to the *interactive* desktop (Winsta0\Default) before any GDI DC work,
+    # otherwise GetDC(None)+BitBlt reads the worker thread's default (blank/black)
+    # desktop even though a real desktop is being displayed. See
+    # `bind_thread_to_input_desktop` in display/windows.rs.
+    "Win32_System_StationsAndDesktops",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    # Media Foundation H.264 encoder (display/encode/h264_windows.rs): the
+    # H.264 Encoder MFT (IMFTransform / MFTEnumEx), media types, samples,
+    # ICodecAPI for force-keyframe, and all the MF_MT_* / MFVideoFormat_* /
+    # eAVEncH264VProfile_* GUIDs. `ICodecAPI::SetValue` takes a `VARIANT`
+    # (Win32_System_Variant, itself gated on Com + Ole), so those come too.
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Variant",
+    "Win32_System_Ole",
+] }
+# Cross-platform network-interface enumeration. On Windows it wraps
+# GetAdaptersAddresses; this backs `lan::routable_local_addrs`, which feeds
+# the web-gateway advertise URLs and WebRTC ICE host-candidate gathering.
+# The unix path keeps its existing direct `getifaddrs(3)` walk via libc.
+if-addrs = "0.15"
+
 [profile.dev]
 split-debuginfo = "unpacked"
 
@@ -90,3 +198,11 @@ split-debuginfo = "unpacked"
 # [dependencies] and [dev-dependencies] for test/example builds — release builds still
 # get just the `full` feature set from line 18.
 tokio = { version = "1.0", features = ["test-util"] }
+
+# macOS-only test dependency: drives Apple's real `SecPKCS12Import` (Security.framework)
+# so a `#[cfg(target_os = "macos")]` test in `lan::certs` can prove the generated
+# `client.p12` is accepted by the actual OS importer — not just round-tripped through
+# the `p12-keystore` crate. Already in the dependency tree transitively (via
+# rustls-native-certs), so pinning it here adds no new crate to the lock.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+security-framework = "3"
