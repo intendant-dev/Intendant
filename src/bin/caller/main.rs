@@ -1482,6 +1482,112 @@ async fn handle_external_thread_action(
     ExternalThreadActionEffect::None
 }
 
+fn undo_turns_from_params(params: &serde_json::Value) -> u32 {
+    params.get("turns").and_then(|v| v.as_u64()).unwrap_or(1) as u32
+}
+
+fn side_rewind_first_turn_for_undo(
+    current_turn_count: usize,
+    turns: u32,
+    side_thread_id: &str,
+) -> Result<u32, String> {
+    if turns == 0 {
+        return Err("rollback count must be at least 1".to_string());
+    }
+    if turns as usize > current_turn_count {
+        return Err(format!(
+            "Cannot /undo {} turn(s) in side conversation {}; only {} side turn(s) exist after the /side boundary",
+            turns, side_thread_id, current_turn_count
+        ));
+    }
+    Ok(current_turn_count as u32 - turns + 1)
+}
+
+async fn rollback_side_thread_from_turn(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    side_rounds: &mut HashMap<String, usize>,
+    side_thread_id: &str,
+    first_user_turn_index: u32,
+    config: &DrainConfig<'_>,
+) -> Result<u32, String> {
+    if first_user_turn_index == 0 {
+        return Err(format!(
+            "Cannot rewind side conversation {}; user turn index must be at least 1",
+            side_thread_id
+        ));
+    }
+
+    let current_turn_count = *side_rounds
+        .entry(side_thread_id.to_string())
+        .or_insert(1);
+    if first_user_turn_index as usize > current_turn_count {
+        return Err(format!(
+            "Cannot rewind side conversation {} to user turn {}; current side user turn count is {}",
+            side_thread_id, first_user_turn_index, current_turn_count
+        ));
+    }
+
+    let turns_to_drop = current_turn_count as u32 - first_user_turn_index + 1;
+    agent
+        .rollback_thread_turns(side_thread_id, turns_to_drop)
+        .await
+        .map_err(|e| format!("thread rollback failed: {}", e))?;
+
+    side_rounds.insert(
+        side_thread_id.to_string(),
+        first_user_turn_index.saturating_sub(1) as usize,
+    );
+    config.bus.send(AppEvent::UserMessageRewind {
+        session_id: Some(side_thread_id.to_string()),
+        user_turn_index: first_user_turn_index,
+        turns_removed: turns_to_drop,
+    });
+    Ok(turns_to_drop)
+}
+
+async fn handle_side_undo_thread_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    side_rounds: &mut HashMap<String, usize>,
+    side_thread_id: &str,
+    params: serde_json::Value,
+    config: &DrainConfig<'_>,
+) {
+    let turns = undo_turns_from_params(&params);
+    let current_turn_count = *side_rounds
+        .entry(side_thread_id.to_string())
+        .or_insert(1);
+    let result = match side_rewind_first_turn_for_undo(current_turn_count, turns, side_thread_id) {
+        Ok(first_user_turn_index) => rollback_side_thread_from_turn(
+            agent,
+            side_rounds,
+            side_thread_id,
+            first_user_turn_index,
+            config,
+        )
+        .await
+        .map(|turns_removed| format!("rolled back {} turn(s)", turns_removed)),
+        Err(message) => Err(message),
+    };
+
+    let (success, message) = match result {
+        Ok(message) => (true, message),
+        Err(message) => (false, message),
+    };
+    slog(config.session_log, |l| {
+        l.info(&format!(
+            "Codex side thread action /undo: {} — {}",
+            if success { "ok" } else { "FAILED" },
+            message
+        ))
+    });
+    config.bus.send(AppEvent::CodexThreadActionResult {
+        session_id: Some(side_thread_id.to_string()),
+        action: "undo".to_string(),
+        success,
+        message,
+    });
+}
+
 fn emit_side_session_started(
     config: &DrainConfig<'_>,
     parent_thread_id: &str,
@@ -3818,6 +3924,27 @@ mod tests {
         assert_eq!(
             side_thread_ids_from_message("forked into thread child"),
             None
+        );
+    }
+
+    #[test]
+    fn side_rewind_first_turn_for_undo_stays_inside_side_boundary() {
+        assert_eq!(
+            side_rewind_first_turn_for_undo(3, 1, "side-child").unwrap(),
+            3
+        );
+        assert_eq!(
+            side_rewind_first_turn_for_undo(3, 3, "side-child").unwrap(),
+            1
+        );
+
+        let zero = side_rewind_first_turn_for_undo(3, 0, "side-child").unwrap_err();
+        assert!(zero.contains("at least 1"), "got: {zero}");
+
+        let beyond = side_rewind_first_turn_for_undo(3, 4, "side-child").unwrap_err();
+        assert!(
+            beyond.contains("after the /side boundary"),
+            "got: {beyond}"
         );
     }
 
@@ -8908,6 +9035,24 @@ async fn run_external_agent_mode(
                                 &drain_config.alias_session_id,
                                 &open_side_threads,
                             ) => {
+                                if let Some(side_thread_id) = session_id
+                                    .as_deref()
+                                    .filter(|id| open_side_threads.contains_key(*id))
+                                    .map(str::to_string)
+                                {
+                                    if action == "undo" {
+                                        handle_side_undo_thread_action(
+                                            &mut agent,
+                                            &mut side_rounds,
+                                            &side_thread_id,
+                                            params,
+                                            &drain_config,
+                                        )
+                                        .await;
+                                        turn_bus_rx = bus.subscribe();
+                                        continue;
+                                    }
+                                }
                                 let effect = handle_external_thread_action(
                                     &mut agent,
                                     action,
@@ -8994,24 +9139,43 @@ async fn run_external_agent_mode(
             .filter(|id| open_side_threads.contains_key(*id))
             .map(str::to_string)
         {
-            if edit_user_turn_index.is_some() {
-                let message = format!(
-                    "Cannot edit side conversation {}; edit/rerun is only available on the parent Codex thread",
-                    side_thread_id
-                );
-                slog(&session_log, |l| l.warn(&message));
-                bus.send(AppEvent::LoopError(message));
-                continue;
+            let mut replacement_for_user_turn_index = None;
+            if let Some(user_turn_index) = edit_user_turn_index {
+                match rollback_side_thread_from_turn(
+                    &mut agent,
+                    &mut side_rounds,
+                    &side_thread_id,
+                    user_turn_index,
+                    &drain_config,
+                )
+                .await
+                {
+                    Ok(turns_to_drop) => {
+                        replacement_for_user_turn_index = Some(user_turn_index);
+                        let message = format!(
+                            "Edited side user turn {}; rolled back {} turn{}",
+                            user_turn_index,
+                            turns_to_drop,
+                            if turns_to_drop == 1 { "" } else { "s" }
+                        );
+                        slog(&session_log, |l| l.info(&message));
+                    }
+                    Err(message) => {
+                        slog(&session_log, |l| l.warn(&message));
+                        bus.send(AppEvent::LoopError(message));
+                        continue;
+                    }
+                }
             }
 
-            let side_round = side_rounds.entry(side_thread_id.clone()).or_insert(1);
+            let side_round = side_rounds.entry(side_thread_id.clone()).or_insert(0);
             *side_round += 1;
             emit_user_message_log(
                 &bus,
                 &session_log,
                 Some(&side_thread_id),
                 Some(*side_round as u32),
-                None,
+                replacement_for_user_turn_index,
                 &turn_text,
             );
             let merged = drain_steer_queue_as_followup(
