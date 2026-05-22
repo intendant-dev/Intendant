@@ -2259,6 +2259,7 @@ pub fn spawn_event_listener(
                     | AppEvent::CodexThreadActionRequested { .. }
                     | AppEvent::CodexThreadActionResult { .. }
                     | AppEvent::SessionIdentity { .. }
+                    | AppEvent::SessionRelationship { .. }
                     | AppEvent::SessionRenameResult { .. }
                     | AppEvent::GeminiConfigChanged { .. }
                     | AppEvent::GeminiThreadActionRequested { .. }

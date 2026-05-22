@@ -242,6 +242,16 @@ pub enum AppEvent {
         source: String,
         backend_session_id: String,
     },
+    /// Links two visible sessions so frontends can draw parent/child
+    /// relationship affordances. `relationship` is intentionally stringly
+    /// typed for cross-backend reuse: known values include "side", "fork",
+    /// and "subagent".
+    SessionRelationship {
+        parent_session_id: String,
+        child_session_id: String,
+        relationship: String,
+        ephemeral: bool,
+    },
     SessionAttached {
         session_id: String,
         source: String,
@@ -1405,6 +1415,17 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             source: source.clone(),
             backend_session_id: backend_session_id.clone(),
+        }),
+        AppEvent::SessionRelationship {
+            parent_session_id,
+            child_session_id,
+            relationship,
+            ephemeral,
+        } => Some(OutboundEvent::SessionRelationship {
+            parent_session_id: parent_session_id.clone(),
+            child_session_id: child_session_id.clone(),
+            relationship: relationship.clone(),
+            ephemeral: *ephemeral,
         }),
         AppEvent::SessionAttached { session_id, source } => Some(OutboundEvent::SessionAttached {
             session_id: session_id.clone(),
@@ -3177,6 +3198,23 @@ mod tests {
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"log_entry\""));
         assert!(json.contains("\"session_id\":\"sess-log\""));
+    }
+
+    #[test]
+    fn outbound_session_relationship_preserves_link_metadata() {
+        let event = AppEvent::SessionRelationship {
+            parent_session_id: "parent-1".to_string(),
+            child_session_id: "child-1".to_string(),
+            relationship: "side".to_string(),
+            ephemeral: true,
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"session_relationship\""));
+        assert!(json.contains("\"parent_session_id\":\"parent-1\""));
+        assert!(json.contains("\"child_session_id\":\"child-1\""));
+        assert!(json.contains("\"relationship\":\"side\""));
+        assert!(json.contains("\"ephemeral\":true"));
     }
 
     #[test]
