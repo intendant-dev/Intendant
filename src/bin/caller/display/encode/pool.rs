@@ -2342,6 +2342,11 @@ fn spawn_encoder_thread_with(
     std::thread::spawn(move || {
         let mut encoder = encoder;
         let mut watchdog = WatchdogState::new();
+        // Windows black-frame diagnostic: count encode calls so the
+        // hop-by-hop avg-byte logging below self-limits to the first few
+        // frames (then stays off the hot path).
+        #[cfg(target_os = "windows")]
+        let mut diag_frame_count: u64 = 0;
 
         loop {
             if shutdown_for_thread.is_cancelled() {
@@ -2476,6 +2481,29 @@ fn spawn_encoder_thread_with(
             } else {
                 &frame.data
             };
+
+            // Windows black-frame diagnostic (hop B): log the average byte of
+            // the exact I420 slice handed to the encoder for the first few
+            // frames. This is the buffer the codec actually sees — if the
+            // bridge logged a bright I420 (hop A) but this reads ~0, the frame
+            // was lost/zeroed in the pool broadcast or the
+            // downscale/visual-marker selection above; if both are bright, the
+            // black is inside the encoder (hop C, in h264_windows.rs).
+            #[cfg(target_os = "windows")]
+            {
+                if diag_frame_count < 5 {
+                    eprintln!(
+                        "[encoder/pool] {} encode-input frame #{} i420 avg={} \
+                         (len={}, downscale={})",
+                        id_for_log,
+                        diag_frame_count + 1,
+                        super::sampled_avg_byte(i420_for_encode),
+                        i420_for_encode.len(),
+                        needs_downscale,
+                    );
+                }
+                diag_frame_count += 1;
+            }
 
             let produced = match encoder.encode(i420_for_encode, duration_ms, force_kf) {
                 Ok(packets) => {

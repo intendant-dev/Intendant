@@ -659,7 +659,36 @@ pub struct DisplaySession {
 /// timestamp and downscaled layers get a marker in their final output
 /// resolution.
 fn convert_for_pool_feed(bgra: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8> {
-    encode::bgra_to_i420(bgra, width, height, stride)
+    let i420 = encode::bgra_to_i420(bgra, width, height, stride);
+
+    // Windows black-frame diagnostic (hop A of the capture → encoder chain):
+    // log the average byte of the BGRA going INTO bgra_to_i420 and the I420
+    // coming OUT, for the first few converted frames. The capture thread logs
+    // the same BGRA buffer as `avg_byte` (~189 on a live desktop); if the
+    // value here differs, the buffer changed between capture and the bridge.
+    // If BGRA-in is bright but I420-out is ~0, the conversion (or its
+    // dimensions/stride) is the offending hop.
+    #[cfg(target_os = "windows")]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static BRIDGE_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = BRIDGE_FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 5 {
+            eprintln!(
+                "[display/pool-feed] frame #{} convert {}x{} stride={} \
+                 bgra avg={} -> i420 avg={} (i420 len={})",
+                n + 1,
+                width,
+                height,
+                stride,
+                encode::sampled_avg_byte(bgra),
+                encode::sampled_avg_byte(&i420),
+                i420.len(),
+            );
+        }
+    }
+
+    i420
 }
 
 const TILE_STREAM_TILE_SIZE_PX: u16 = 64;

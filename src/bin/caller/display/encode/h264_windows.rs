@@ -739,8 +739,36 @@ impl Encoder for MediaFoundationEncoder {
             ));
         }
 
+        // Windows black-frame diagnostic (hop C): the encoder's actual input.
+        // `frame_count` is bumped after ProcessInput below, so capture it here
+        // to gate the logging to the first few frames.
+        let diag = self.frame_count < 5;
+        if diag {
+            eprintln!(
+                "[h264_windows] encode input frame #{} {}x{} i420 avg={} (len={})",
+                self.frame_count + 1,
+                w,
+                h,
+                super::sampled_avg_byte(i420),
+                i420.len(),
+            );
+        }
+
         // BGRA→I420 happened in the pool; convert I420→NV12 into the scratch.
         i420_to_nv12(i420, w, h, &mut self.nv12);
+
+        // Hop C cont'd: NV12 after conversion. If the i420 above is bright but
+        // this is ~0, the I420→NV12 conversion zeroed real input; if both are
+        // bright but `encoded bytes` below is tiny, the MFT itself emitted a
+        // black/empty frame despite live input.
+        if diag {
+            eprintln!(
+                "[h264_windows] encode frame #{} nv12 avg={} (len={})",
+                self.frame_count + 1,
+                super::sampled_avg_byte(&self.nv12),
+                self.nv12.len(),
+            );
+        }
 
         if force_keyframe || self.frame_count == 0 {
             self.force_keyframe();
@@ -761,6 +789,21 @@ impl Encoder for MediaFoundationEncoder {
 
         let mut out = Vec::new();
         self.drain_output(duration_ms, &mut out)?;
+
+        // Hop C terminal: total encoded bytes this frame produced. A black
+        // 800x600 constrained-baseline frame compresses to a tiny packet; real
+        // desktop content is substantially larger. Read alongside the i420/nv12
+        // avgs above: bright input + tiny output => the MFT encoded black.
+        if diag {
+            let bytes: usize = out.iter().map(|p| p.data.len()).sum();
+            eprintln!(
+                "[h264_windows] encode frame #{} produced {} packet(s), encoded bytes={}",
+                self.frame_count,
+                out.len(),
+                bytes,
+            );
+        }
+
         Ok(out)
     }
 

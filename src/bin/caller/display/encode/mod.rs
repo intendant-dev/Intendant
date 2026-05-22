@@ -542,6 +542,44 @@ fn create_h264_encoder(
 }
 
 // ---------------------------------------------------------------------------
+// Black-frame diagnostic
+// ---------------------------------------------------------------------------
+
+/// Average byte value of a pixel buffer over a bounded sample (≤4096 bytes),
+/// stepped across the whole buffer so the sample spans top-to-bottom rather
+/// than just the first rows. Cheap enough for the encode hot path when gated to
+/// the first few frames.
+///
+/// Used by the Windows display port's black-frame diagnostic to pin the exact
+/// pipeline hop where bright captured pixels (`avg ~= 189`) turn into an
+/// all-black buffer (`avg ~= 0`): the bridge logs BGRA-in / I420-out, the pool
+/// encoder thread logs the I420 it hands the codec, and the Media Foundation
+/// H.264 encoder logs the I420 it received, the NV12 it converted to, and the
+/// encoded sample size. An all-black BGRA/I420/NV12 buffer averages ~0; real
+/// desktop content averages well above 0, so the first `avg = 0` in that chain
+/// is the offending hop. Mirrors `display::windows::sampled_avg_byte`, hoisted
+/// here so the bridge (`mod.rs`) and both encode modules share one
+/// implementation. `#[allow(dead_code)]` because only the Windows-gated
+/// diagnostic call sites use it.
+#[allow(dead_code)]
+pub fn sampled_avg_byte(data: &[u8]) -> u32 {
+    if data.is_empty() {
+        return 0;
+    }
+    const MAX_SAMPLES: usize = 4096;
+    let step = (data.len() / MAX_SAMPLES).max(1);
+    let mut sum: u64 = 0;
+    let mut n: u64 = 0;
+    let mut i = 0;
+    while i < data.len() {
+        sum += data[i] as u64;
+        n += 1;
+        i += step;
+    }
+    (sum / n.max(1)) as u32
+}
+
+// ---------------------------------------------------------------------------
 // Color space conversion
 // ---------------------------------------------------------------------------
 
@@ -896,6 +934,23 @@ mod tests {
         let i420 = bgra_to_i420(&bgra, 2, 2, 8);
         // Y: 2*2 = 4, U: 1*1 = 1, V: 1*1 = 1 => total 6
         assert_eq!(i420.len(), 6);
+    }
+
+    #[test]
+    fn sampled_avg_byte_black_is_zero_real_is_nonzero() {
+        // The black-frame diagnostic contract: an all-zero buffer averages 0,
+        // a uniform buffer reports its value, and any real content reads > 0.
+        // This is the signal the Windows hop-by-hop instrumentation relies on.
+        assert_eq!(sampled_avg_byte(&[]), 0);
+        assert_eq!(sampled_avg_byte(&vec![0u8; 800 * 600 * 4]), 0);
+        assert_eq!(sampled_avg_byte(&vec![128u8; 800 * 600 * 4]), 128);
+        let mut content = vec![0u8; 800 * 600 * 4];
+        for (i, b) in content.iter_mut().enumerate() {
+            if i % 2 == 0 {
+                *b = 64;
+            }
+        }
+        assert!(sampled_avg_byte(&content) > 0);
     }
 
     #[test]
