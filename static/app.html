@@ -2016,35 +2016,78 @@ html, body {
   position: sticky;
   top: 0;
   z-index: 1;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 6px 9px;
+  padding: 7px 9px;
   background: var(--mantle);
   border-bottom: 1px solid var(--surface0);
   font-family: var(--font-mono);
   font-size: 11px;
 }
+.diff-log-file-main-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.diff-log-file-detail-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
 .diff-log-file-path {
   min-width: 0;
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text);
+  font-weight: 600;
 }
 .diff-log-file-path-wrap {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
+}
+.diff-log-file-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+.diff-log-file-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 16px;
+  padding: 0 5px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: rgba(49, 50, 68, 0.6);
+  color: var(--subtext0);
+  font-size: 10px;
+  line-height: 1;
+}
+.diff-log-file-badge.lang { color: var(--blue); }
+.diff-log-file-badge.status { color: var(--yellow); }
+.diff-log-file-badge.status.new { color: var(--green); border-color: rgba(166, 227, 161, 0.28); }
+.diff-log-file-badge.status.deleted { color: var(--red); border-color: rgba(243, 139, 168, 0.28); }
+.diff-log-file-badge.status.renamed { color: var(--peach); border-color: rgba(250, 179, 135, 0.28); }
+.diff-log-file-badge.add { color: var(--green); border-color: rgba(166, 227, 161, 0.28); }
+.diff-log-file-badge.del { color: var(--red); border-color: rgba(243, 139, 168, 0.28); }
+.diff-log-file-detail-label {
+  flex-shrink: 0;
+  color: var(--overlay0);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
 }
 .diff-log-file-abs-path {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--overlay1);
+  color: var(--subtext0);
   font-size: 10px;
 }
 .diff-log-file-stats {
@@ -10050,6 +10093,70 @@ function absolutePathForDiffFile(file, parsed, options = {}) {
   return root ? joinPathForDisplay(root, path) : '';
 }
 
+function diffFileHeaderInfo(file) {
+  const lines = file.lines || [];
+  const renameFrom = lines.find(line => line.startsWith('rename from '))?.slice('rename from '.length).trim() || '';
+  const renameTo = lines.find(line => line.startsWith('rename to '))?.slice('rename to '.length).trim() || '';
+  const hasNewFileMode = lines.some(line => line.startsWith('new file mode '));
+  const hasDeletedFileMode = lines.some(line => line.startsWith('deleted file mode '));
+  let status = 'modified';
+  if (renameFrom || renameTo) {
+    status = 'renamed';
+  } else if (hasNewFileMode || (!file.oldPath && !!file.newPath)) {
+    status = 'new';
+  } else if (hasDeletedFileMode || (!!file.oldPath && !file.newPath)) {
+    status = 'deleted';
+  }
+  return { status, renameFrom, renameTo };
+}
+
+function diffStatusLabel(status) {
+  return {
+    new: 'new file',
+    deleted: 'deleted',
+    renamed: 'renamed',
+    modified: 'modified',
+  }[status] || 'modified';
+}
+
+function isUnifiedDiffFileHeaderLine(line) {
+  return line.startsWith('diff --git ')
+    || line.startsWith('index ')
+    || line.startsWith('new file mode ')
+    || line.startsWith('deleted file mode ')
+    || line.startsWith('old mode ')
+    || line.startsWith('new mode ')
+    || line.startsWith('similarity index ')
+    || line.startsWith('dissimilarity index ')
+    || line.startsWith('rename from ')
+    || line.startsWith('rename to ')
+    || line.startsWith('copy from ')
+    || line.startsWith('copy to ')
+    || line.startsWith('--- ')
+    || line.startsWith('+++ ');
+}
+
+function renderDiffLogLines(file) {
+  const visibleLines = (file.lines || []).filter(line => !isUnifiedDiffFileHeaderLine(line));
+  return renderDiffLines(visibleLines.join('\n'), file.path || file.newPath || file.oldPath || '');
+}
+
+function appendDiffBadge(container, text, className = '') {
+  if (!text) return;
+  const badge = document.createElement('span');
+  badge.className = `diff-log-file-badge${className ? ` ${className}` : ''}`;
+  badge.textContent = text;
+  container.appendChild(badge);
+}
+
+function absolutePathForDiffPath(path, parsed, options = {}) {
+  const value = String(path || '').trim();
+  if (!value) return '';
+  if (isAbsolutePath(value)) return value;
+  const root = projectRootForDiff(parsed, options);
+  return root ? joinPathForDisplay(root, value) : value;
+}
+
 function renderDiffLogBody(body, parsed, options = {}) {
   body.innerHTML = '';
   const files = parsed.files && parsed.files.length ? parsed.files : [createParsedDiffFile('', '')];
@@ -10061,31 +10168,49 @@ function renderDiffLogBody(body, parsed, options = {}) {
     header.className = 'diff-log-file-header';
     const pathWrap = document.createElement('span');
     pathWrap.className = 'diff-log-file-path-wrap';
+    const mainRow = document.createElement('span');
+    mainRow.className = 'diff-log-file-main-row';
     const path = document.createElement('span');
     path.className = 'diff-log-file-path';
-    path.textContent = file.path || 'diff';
     const absolutePath = absolutePathForDiffFile(file, parsed, options);
-    path.title = [file.oldPath, file.newPath].filter(Boolean).join(' -> ') || absolutePath || file.path || 'diff';
-    pathWrap.appendChild(path);
-    if (absolutePath) {
-      const absolute = document.createElement('span');
-      absolute.className = 'diff-log-file-abs-path';
-      absolute.textContent = absolutePath;
-      absolute.title = absolutePath;
-      pathWrap.appendChild(absolute);
-    }
-    const stats = document.createElement('span');
-    stats.className = 'diff-log-file-stats';
+    path.textContent = absolutePath || file.path || 'diff';
+    path.title = absolutePath || [file.oldPath, file.newPath].filter(Boolean).join(' -> ') || file.path || 'diff';
+    mainRow.appendChild(path);
+
+    const badges = document.createElement('span');
+    badges.className = 'diff-log-file-badges';
     const language = detectDiffLanguage(file.path || file.newPath || file.oldPath || '');
     const languageLabel = diffLanguageLabel(language);
-    stats.textContent = `${languageLabel ? `${languageLabel} · ` : ''}+${file.added || 0} / -${file.removed || 0}`;
+    const headerInfo = diffFileHeaderInfo(file);
+    appendDiffBadge(badges, languageLabel, 'lang');
+    appendDiffBadge(badges, diffStatusLabel(headerInfo.status), `status ${headerInfo.status}`);
+    appendDiffBadge(badges, `+${file.added || 0}`, 'add');
+    appendDiffBadge(badges, `-${file.removed || 0}`, 'del');
+    mainRow.appendChild(badges);
+    pathWrap.appendChild(mainRow);
+
+    if (headerInfo.status === 'renamed' && headerInfo.renameFrom) {
+      const detailRow = document.createElement('span');
+      detailRow.className = 'diff-log-file-detail-row';
+      const label = document.createElement('span');
+      label.className = 'diff-log-file-detail-label';
+      label.textContent = 'Renamed from';
+      const oldPath = document.createElement('span');
+      oldPath.className = 'diff-log-file-abs-path';
+      const oldAbsolutePath = absolutePathForDiffPath(headerInfo.renameFrom, parsed, options);
+      oldPath.textContent = oldAbsolutePath;
+      oldPath.title = oldAbsolutePath;
+      detailRow.appendChild(label);
+      detailRow.appendChild(oldPath);
+      pathWrap.appendChild(detailRow);
+    }
+
     header.appendChild(pathWrap);
-    header.appendChild(stats);
     fileEl.appendChild(header);
 
     const lines = document.createElement('pre');
     lines.className = 'diff-log-lines';
-    lines.innerHTML = renderDiffLines((file.lines || []).join('\n'), file.path || file.newPath || file.oldPath || '');
+    lines.innerHTML = renderDiffLogLines(file);
     fileEl.appendChild(lines);
     body.appendChild(fileEl);
   }
