@@ -86,7 +86,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, watch, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Bound on the per-peer encoded-frame channel. Frames in excess are dropped
@@ -2534,12 +2534,30 @@ struct InboundPacket {
     received_at: Instant,
 }
 
-/// The outbound write-half of a TCP connection. The driver stores one per
-/// connection (keyed by the remote's source address) so it can route
-/// outbound TCP writes to the right socket.
-/// Writes are serialized through an inner `tokio::Mutex` so concurrent
-/// `write_rfc4571_frame` calls can't interleave frame bytes.
-type TcpWriter = Arc<AsyncMutex<tokio::net::tcp::OwnedWriteHalf>>;
+/// Outbound side of an ICE-TCP connection: the sending end of an ordered
+/// channel feeding that connection's dedicated writer task. The driver
+/// stores one per connection (keyed by the remote's source address) so it
+/// can route outbound TCP writes to the right socket.
+///
+/// **Why a channel + single writer task, not `Arc<Mutex<OwnedWriteHalf>>`
+/// with a spawned write per transmit:** spawning a fresh task for every
+/// `rtc.poll_write()` transmit (the old design) hands the *scheduler*, not
+/// `rtc`, control over the order writes hit the wire — the `Mutex` only
+/// stops byte-level interleaving, not whole-frame reordering — and applies
+/// no backpressure, so under sustained RTP video the kernel send buffer
+/// overflows with unbounded queued tasks. On Linux a non-blocking `send`
+/// that can't fit just yields `EWOULDBLOCK` and tokio waits; on Windows the
+/// TCP stack instead aborts the connection once the unACKed send backlog
+/// trips its retransmit limit, and `send` then returns `WSAECONNABORTED`
+/// (os error 10053) on *every* subsequent write — the 10053 flood that left
+/// the dashboard black. Funnelling every transmit through one ordered
+/// bounded channel drained by a single owner of the write half preserves
+/// `rtc`'s emit order, gives real backpressure (a full queue drops the
+/// frame instead of overflowing the socket), and gives the connection a
+/// single error owner that tears the peer down on the first write failure
+/// rather than re-flooding a dead socket.
+const TCP_OUT_QUEUE: usize = 256;
+type TcpFrameSender = mpsc::Sender<Vec<u8>>;
 
 #[allow(clippy::too_many_arguments)]
 async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
@@ -2633,9 +2651,10 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
         }
     }
 
-    // Outbound write halves for each active ICE-TCP connection, keyed by the
-    // remote's `SocketAddr`.
-    let mut tcp_writers: HashMap<SocketAddr, TcpWriter> = HashMap::new();
+    // Outbound frame senders for each active ICE-TCP connection, keyed by
+    // the remote's `SocketAddr`. Each feeds a dedicated writer task that
+    // owns the connection's write half (see `TcpFrameSender`).
+    let mut tcp_senders: HashMap<SocketAddr, TcpFrameSender> = HashMap::new();
 
     // Spawn one forwarder task per UDP socket. Each forwarder reads packets
     // from its socket and pushes them into the shared inbound channel,
@@ -2707,7 +2726,7 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
         let timeout_at = match drain_outputs(
             &mut rtc,
             &sockets_by_addr,
-            &mut tcp_writers,
+            &mut tcp_senders,
             &mut state,
             &input_handler,
             &clipboard_handler,
@@ -2804,8 +2823,48 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
                     "[display/webrtc] peer {peer_id}: ICE-TCP connection from {remote_addr} → {real_local} (rtc sees {fake_local})"
                 );
                 let (read_half, write_half) = stream.into_split();
-                let writer: TcpWriter = Arc::new(AsyncMutex::new(write_half));
-                tcp_writers.insert(remote_addr, Arc::clone(&writer));
+
+                // Dedicated writer task: owns the write half and drains an
+                // ordered bounded channel, writing one RFC 4571 frame per
+                // queued payload. This is the single owner of the write
+                // half — `drain_outputs` only enqueues onto the channel, so
+                // `rtc`'s emit order is preserved on the wire and there is
+                // exactly one place that observes write failures. On the
+                // first write error (e.g. Windows `WSAECONNABORTED` once the
+                // TCP stack aborts the connection) it logs once and cancels
+                // the peer's shutdown token, tearing the connection down
+                // instead of letting every later transmit re-flood the log
+                // on a dead socket.
+                let (tcp_out_tx, mut tcp_out_rx) = mpsc::channel::<Vec<u8>>(TCP_OUT_QUEUE);
+                tcp_senders.insert(remote_addr, tcp_out_tx);
+                let writer_shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let mut write_half = write_half;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = writer_shutdown.cancelled() => break,
+                            frame = tcp_out_rx.recv() => match frame {
+                                Some(contents) => {
+                                    if let Err(e) =
+                                        write_rfc4571_frame(&mut write_half, &contents).await
+                                    {
+                                        eprintln!(
+                                            "[display/webrtc] ICE-TCP writer for {remote_addr} \
+                                             failed, tearing down connection: {e}"
+                                        );
+                                        writer_shutdown.cancel();
+                                        break;
+                                    }
+                                }
+                                // Sender dropped (driver gone) — nothing more
+                                // to write; flush a FIN and exit.
+                                None => break,
+                            }
+                        }
+                    }
+                    let _ = write_half.shutdown().await;
+                });
 
                 // Spawn reader task for subsequent frames on this connection.
                 let reader_tx = inbound_tx.clone();
@@ -2982,7 +3041,7 @@ enum DriverExit {
 async fn drain_outputs<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
     sockets_by_addr: &HashMap<SocketAddr, Arc<UdpSocket>>,
-    tcp_writers: &mut HashMap<SocketAddr, TcpWriter>,
+    tcp_senders: &mut HashMap<SocketAddr, TcpFrameSender>,
     state: &mut DriverState,
     input_handler: &Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: &Arc<dyn Fn(ClipboardContent) + Send + Sync>,
@@ -3022,16 +3081,29 @@ async fn drain_outputs<I: rtc::interceptor::Interceptor>(
                 }
             }
             TransportProtocol::TCP => {
-                let Some(writer) = tcp_writers.get(&t.transport.peer_addr).cloned() else {
+                let Some(sender) = tcp_senders.get(&t.transport.peer_addr) else {
                     continue;
                 };
                 let contents: Vec<u8> = t.message.to_vec();
-                tokio::spawn(async move {
-                    let mut guard = writer.lock().await;
-                    if let Err(e) = write_rfc4571_frame(&mut *guard, &contents).await {
-                        eprintln!("[display/webrtc] tcp write failed: {e}");
+                // Enqueue onto the connection's ordered writer channel.
+                // `try_send` (never `send().await`) keeps the rtc poll loop
+                // non-blocking: a full queue means the writer task can't
+                // keep up with the encoder, so we drop *this* frame as
+                // backpressure rather than stalling the driver or
+                // overflowing the kernel send buffer. The writer task,
+                // not the scheduler, controls wire order.
+                match sender.try_send(contents) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // Slow/saturated TCP path — drop and let RTP
+                        // recovery (PLI/FIR + keyframes) catch the peer up.
                     }
-                });
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // Writer task exited (connection torn down). Forget
+                        // the dead sender so we stop trying to route to it.
+                        tcp_senders.remove(&t.transport.peer_addr);
+                    }
+                }
             }
         }
     }
