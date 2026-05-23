@@ -2196,7 +2196,14 @@ fn session_log_search_from_request(request_line: &str) -> String {
     let query = query_param(request_line, "q").unwrap_or_default();
     let source_filter = query_param(request_line, "source").unwrap_or_else(|| "all".to_string());
     let mode = query_param(request_line, "mode").unwrap_or_default();
-    session_log_search_from_home(&home_path, &query, &source_filter, &mode)
+    let project_filter = session_project_filter_from_request(request_line);
+    session_log_search_from_home_with_projects(
+        &home_path,
+        &query,
+        &source_filter,
+        &mode,
+        &project_filter,
+    )
 }
 
 fn session_log_search_from_home(
@@ -2204,6 +2211,16 @@ fn session_log_search_from_home(
     query: &str,
     source_filter: &str,
     mode: &str,
+) -> String {
+    session_log_search_from_home_with_projects(home, query, source_filter, mode, &[])
+}
+
+fn session_log_search_from_home_with_projects(
+    home: &Path,
+    query: &str,
+    source_filter: &str,
+    mode: &str,
+    project_filter: &[String],
 ) -> String {
     let mode = SessionLogSearchMode::from_query(mode);
     let terms = session_log_search_terms(query);
@@ -2224,6 +2241,7 @@ fn session_log_search_from_home(
     let sessions: Vec<serde_json::Value> =
         serde_json::from_str(&list_sessions_from_home(home)).unwrap_or_else(|_| Vec::new());
     let source_filter = normalize_session_source_filter(source_filter);
+    let project_filter = normalize_session_project_filter(project_filter);
     let mut results = Vec::new();
     let mut searched = 0usize;
     let mut truncated = false;
@@ -2235,6 +2253,9 @@ fn session_log_search_from_home(
             .and_then(|v| v.as_str())
             .unwrap_or("intendant");
         if !session_source_matches_filter(source, &source_filter) {
+            continue;
+        }
+        if !session_project_matches_filter(&session, &project_filter) {
             continue;
         }
 
@@ -2287,6 +2308,60 @@ fn session_log_search_from_home(
         "results": results,
     })
     .to_string()
+}
+
+fn session_project_filter_from_request(request_line: &str) -> Vec<String> {
+    let Some(raw) = query_param(request_line, "projects") else {
+        return Vec::new();
+    };
+    match serde_json::from_str::<Vec<String>>(&raw) {
+        Ok(values) => values,
+        Err(_) => vec![raw],
+    }
+}
+
+fn normalize_session_project_filter(project_filter: &[String]) -> HashSet<String> {
+    project_filter
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn session_project_directory_value(session: &serde_json::Value) -> Option<String> {
+    for key in [
+        "project_root",
+        "projectRoot",
+        "project_dir",
+        "projectDir",
+        "project",
+        "cwd",
+        "workdir",
+        "workDir",
+    ] {
+        let Some(value) = value_str(session, key) else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn session_project_matches_filter(
+    session: &serde_json::Value,
+    project_filter: &HashSet<String>,
+) -> bool {
+    if project_filter.is_empty() {
+        return true;
+    }
+    match session_project_directory_value(session) {
+        Some(path) => project_filter.contains(&path),
+        None => false,
+    }
 }
 
 fn session_log_search_file_path(
@@ -14446,6 +14521,76 @@ mod tests {
             "",
         ))
         .unwrap();
+        assert!(response
+            .get("results")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn session_log_search_prefilters_by_project_directory() {
+        let home = tempfile::tempdir().unwrap();
+        for (session_id, project_root) in [
+            ("project-search-target", "/repo/target"),
+            ("project-search-other", "/repo/other"),
+        ] {
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            std::fs::create_dir_all(&log_dir).unwrap();
+            std::fs::write(
+                log_dir.join("session_meta.json"),
+                serde_json::json!({
+                    "session_id": session_id,
+                    "created_at": "2026-05-17T20:44:00",
+                    "task": "project scoped task",
+                    "status": "completed",
+                    "project_root": project_root,
+                    "cwd": project_root
+                })
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                log_dir.join("session.jsonl"),
+                serde_json::json!({
+                    "ts": "2026-05-17T20:45:00",
+                    "event": "info",
+                    "message": "shared-project-filter-token"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let project_filter = vec!["/repo/target".to_string()];
+        let response: serde_json::Value =
+            serde_json::from_str(&session_log_search_from_home_with_projects(
+                home.path(),
+                "shared-project-filter-token",
+                "all",
+                "",
+                &project_filter,
+            ))
+            .unwrap();
+        assert_eq!(response.get("searched").and_then(|v| v.as_u64()), Some(1));
+        let results = response.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("session_id").and_then(|v| v.as_str()),
+            Some("project-search-target")
+        );
+
+        let missing_filter = vec!["/repo/missing".to_string()];
+        let response: serde_json::Value =
+            serde_json::from_str(&session_log_search_from_home_with_projects(
+                home.path(),
+                "shared-project-filter-token",
+                "all",
+                "",
+                &missing_filter,
+            ))
+            .unwrap();
+        assert_eq!(response.get("searched").and_then(|v| v.as_u64()), Some(0));
         assert!(response
             .get("results")
             .and_then(|v| v.as_array())
