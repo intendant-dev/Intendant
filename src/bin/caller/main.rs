@@ -1837,6 +1837,163 @@ fn emit_side_session_started(
     );
 }
 
+fn emit_codex_subagent_started(
+    config: &DrainConfig<'_>,
+    parent_thread_id: &str,
+    child_thread_id: &str,
+    prompt: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+) {
+    let child_thread_id = child_thread_id.trim();
+    if child_thread_id.is_empty() {
+        return;
+    }
+    let parent_thread_id = parent_thread_id.trim();
+    let parent_session_id = if parent_thread_id.is_empty() {
+        config.session_id.as_deref().unwrap_or("")
+    } else {
+        parent_thread_id
+    };
+    if parent_session_id.is_empty() || parent_session_id == child_thread_id {
+        return;
+    }
+
+    config.bus.send(AppEvent::SessionIdentity {
+        session_id: child_thread_id.to_string(),
+        source: "codex".to_string(),
+        backend_session_id: child_thread_id.to_string(),
+    });
+    emit_session_relationship(
+        config.bus,
+        Some(parent_session_id),
+        child_thread_id,
+        "subagent",
+        true,
+    );
+    config.bus.send(AppEvent::SessionStarted {
+        session_id: child_thread_id.to_string(),
+        task: Some(
+            prompt
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Codex subagent")
+                .to_string(),
+        ),
+    });
+
+    let mut details = Vec::new();
+    if let Some(model) = model.map(str::trim).filter(|s| !s.is_empty()) {
+        details.push(format!("model {model}"));
+    }
+    if let Some(effort) = reasoning_effort.map(str::trim).filter(|s| !s.is_empty()) {
+        details.push(format!("reasoning {effort}"));
+    }
+    let suffix = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", details.join(", "))
+    };
+    let content = prompt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|prompt| format!("Codex subagent started{suffix}: {prompt}"))
+        .unwrap_or_else(|| format!("Codex subagent started{suffix}"));
+    config.bus.send(AppEvent::LogEntry {
+        session_id: Some(child_thread_id.to_string()),
+        level: "agent".to_string(),
+        source: "Codex".to_string(),
+        content,
+        turn: None,
+    });
+}
+
+fn emit_codex_subagent_state(config: &DrainConfig<'_>, state: &external_agent::SubAgentState) {
+    let thread_id = state.thread_id.trim();
+    if thread_id.is_empty() {
+        return;
+    }
+    let status = state.status.trim();
+    let message = state
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let (level, content) = match status {
+        "completed" => (
+            "info",
+            message
+                .map(|message| format!("Task complete: Codex subagent completed: {message}"))
+                .unwrap_or_else(|| "Task complete: Codex subagent completed".to_string()),
+        ),
+        "interrupted" => (
+            "warn",
+            message
+                .map(|message| format!("Agent interrupted: Codex subagent interrupted: {message}"))
+                .unwrap_or_else(|| "Agent interrupted: Codex subagent interrupted".to_string()),
+        ),
+        "errored" => (
+            "warn",
+            message
+                .map(|message| format!("Session ended: Codex subagent errored: {message}"))
+                .unwrap_or_else(|| "Session ended: Codex subagent errored".to_string()),
+        ),
+        "shutdown" => (
+            "info",
+            message
+                .map(|message| format!("Session ended: Codex subagent shut down: {message}"))
+                .unwrap_or_else(|| "Session ended: Codex subagent shut down".to_string()),
+        ),
+        "notFound" => (
+            "warn",
+            message
+                .map(|message| format!("Session ended: Codex subagent not found: {message}"))
+                .unwrap_or_else(|| "Session ended: Codex subagent not found".to_string()),
+        ),
+        "pendingInit" | "running" => return,
+        other => (
+            "info",
+            message
+                .map(|message| format!("Codex subagent {other}: {message}"))
+                .unwrap_or_else(|| format!("Codex subagent {other}")),
+        ),
+    };
+    config.bus.send(AppEvent::LogEntry {
+        session_id: Some(thread_id.to_string()),
+        level: level.to_string(),
+        source: "Codex".to_string(),
+        content,
+        turn: None,
+    });
+}
+
+fn short_external_session_id(session_id: &str) -> String {
+    session_id.chars().take(8).collect()
+}
+
+fn collab_agent_tool_preview(
+    tool: &str,
+    receiver_thread_ids: &[String],
+    prompt: Option<&str>,
+) -> String {
+    let mut parts = Vec::new();
+    let receivers: Vec<String> = receiver_thread_ids
+        .iter()
+        .map(|id| short_external_session_id(id))
+        .collect();
+    if !receivers.is_empty() {
+        parts.push(format!("target {}", receivers.join(", ")));
+    }
+    if let Some(prompt) = prompt.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(prompt.chars().take(120).collect());
+    }
+    if parts.is_empty() {
+        tool.to_string()
+    } else {
+        format!("{}: {}", tool, parts.join(" - "))
+    }
+}
+
 async fn drain_external_side_turn(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
@@ -2302,6 +2459,86 @@ async fn drain_external_agent_events(
                     content: message,
                     turn: None,
                 });
+            }
+            external_agent::AgentEvent::SubAgentToolCall {
+                item_id,
+                tool,
+                status,
+                sender_thread_id,
+                receiver_thread_ids,
+                prompt,
+                model,
+                reasoning_effort,
+                agents,
+            } => {
+                let prompt_ref = prompt.as_deref();
+                if status == "inProgress" {
+                    turns_in_round += 1;
+                    if !config.suppress_agent_started {
+                        stats.turns += 1;
+                        config.bus.send(AppEvent::AgentStarted {
+                            session_id: config.session_id.clone(),
+                            turn: stats.turns,
+                            commands_preview: collab_agent_tool_preview(
+                                &tool,
+                                &receiver_thread_ids,
+                                prompt_ref,
+                            ),
+                            source: config.agent_source.clone(),
+                        });
+                    }
+                    if tool == "spawnAgent" {
+                        for child_thread_id in &receiver_thread_ids {
+                            emit_codex_subagent_started(
+                                config,
+                                &sender_thread_id,
+                                child_thread_id,
+                                prompt_ref,
+                                model.as_deref(),
+                                reasoning_effort.as_deref(),
+                            );
+                        }
+                    }
+                }
+
+                if status == "failed" {
+                    let item_id = item_id.trim();
+                    let item_suffix = if item_id.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({item_id})")
+                    };
+                    let content = format!(
+                        "Codex subagent tool {}{} failed{}",
+                        tool,
+                        item_suffix,
+                        prompt_ref
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(|p| format!(": {p}"))
+                            .unwrap_or_default()
+                    );
+                    slog(config.session_log, |l| l.warn(&content));
+                    config.bus.send(AppEvent::LogEntry {
+                        session_id: config.session_id.clone(),
+                        level: "warn".to_string(),
+                        source: external_agent_log_source(config.agent_source.as_deref()),
+                        content,
+                        turn: None,
+                    });
+                }
+
+                for state in &agents {
+                    emit_codex_subagent_state(config, state);
+                }
+
+                emit_external_context_snapshot_if_changed(
+                    agent,
+                    config,
+                    external_context_snapshot_turn(stats),
+                    &mut context_snapshot_state,
+                )
+                .await;
             }
             external_agent::AgentEvent::ToolStarted {
                 item_id,

@@ -13,7 +13,8 @@ use crate::error::CallerError;
 
 use super::{
     AgentConfig, AgentContextSnapshot, AgentEvent, AgentImageAttachment, AgentThread,
-    AgentUsageSnapshot, ApprovalCategory, ApprovalDecision, ExternalAgent, ToolCompletionStatus,
+    AgentUsageSnapshot, ApprovalCategory, ApprovalDecision, ExternalAgent, SubAgentState,
+    ToolCompletionStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -1919,6 +1920,92 @@ fn codex_web_search_preview(params: &serde_json::Value) -> String {
     "web search".to_string()
 }
 
+fn string_array_at(value: &serde_json::Value, paths: &[&str]) -> Vec<String> {
+    paths
+        .iter()
+        .find_map(|path| {
+            value.pointer(path).and_then(|v| v.as_array()).map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        item.as_str()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(ToString::to_string)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn codex_collab_agent_states(item: &serde_json::Value) -> Vec<SubAgentState> {
+    let Some(states) = item
+        .get("agentsStates")
+        .or_else(|| item.get("agents_states"))
+        .and_then(|v| v.as_object())
+    else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<SubAgentState> = states
+        .iter()
+        .filter_map(|(thread_id, state)| {
+            let status = state
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+            let message = state
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+            Some(SubAgentState {
+                thread_id: thread_id.clone(),
+                status: status.to_string(),
+                message,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+    out
+}
+
+fn codex_collab_agent_tool_call(params: &serde_json::Value) -> Option<AgentEvent> {
+    let item = params.get("item").unwrap_or(params);
+    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if item_type != "collabAgentToolCall" {
+        return None;
+    }
+
+    let item_id = non_empty_string_at(item, &["/id"]).unwrap_or_default();
+    let tool = non_empty_string_at(item, &["/tool"]).unwrap_or_else(|| "collabAgent".to_string());
+    let status =
+        non_empty_string_at(item, &["/status"]).unwrap_or_else(|| "inProgress".to_string());
+    let sender_thread_id =
+        non_empty_string_at(item, &["/senderThreadId", "/sender_thread_id"]).unwrap_or_default();
+    let receiver_thread_ids =
+        string_array_at(item, &["/receiverThreadIds", "/receiver_thread_ids"]);
+    let prompt = non_empty_string_at(item, &["/prompt"]);
+    let model = non_empty_string_at(item, &["/model"]);
+    let reasoning_effort = non_empty_string_at(item, &["/reasoningEffort", "/reasoning_effort"]);
+    let agents = codex_collab_agent_states(item);
+
+    Some(AgentEvent::SubAgentToolCall {
+        item_id,
+        tool,
+        status,
+        sender_thread_id,
+        receiver_thread_ids,
+        prompt,
+        model,
+        reasoning_effort,
+        agents,
+    })
+}
+
 fn normalize_plan_status(value: &str) -> String {
     value
         .chars()
@@ -2060,6 +2147,11 @@ fn translate_notification(
                         preview: codex_web_search_preview(params),
                     });
                 }
+                "collabAgentToolCall" => {
+                    if let Some(event) = codex_collab_agent_tool_call(params) {
+                        let _ = event_tx.send(event);
+                    }
+                }
                 other => {
                     eprintln!("[codex] unknown item type in item/started: {:?}", other);
                 }
@@ -2124,6 +2216,13 @@ fn translate_notification(
                             text: text.to_string(),
                         });
                     }
+                }
+                return;
+            }
+
+            if item_type == "collabAgentToolCall" {
+                if let Some(event) = codex_collab_agent_tool_call(item) {
+                    let _ = event_tx.send(event);
                 }
                 return;
             }
@@ -3278,6 +3377,108 @@ mod tests {
             }
             other => panic!("expected ToolStarted, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn translate_item_started_collab_spawn_agent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "threadId": "parent-thread",
+            "item": {
+                "type": "collabAgentToolCall",
+                "id": "collab-1",
+                "tool": "spawnAgent",
+                "status": "inProgress",
+                "senderThreadId": "parent-thread",
+                "receiverThreadIds": ["child-thread"],
+                "prompt": "review the patch",
+                "model": "gpt-5.5",
+                "reasoningEffort": "high",
+                "agentsStates": {
+                    "child-thread": {"status": "running", "message": null}
+                }
+            }
+        });
+
+        translate_notification("item/started", &params, &tx);
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::SubAgentToolCall {
+                item_id,
+                tool,
+                status,
+                sender_thread_id,
+                receiver_thread_ids,
+                prompt,
+                model,
+                reasoning_effort,
+                agents,
+            } => {
+                assert_eq!(item_id, "collab-1");
+                assert_eq!(tool, "spawnAgent");
+                assert_eq!(status, "inProgress");
+                assert_eq!(sender_thread_id, "parent-thread");
+                assert_eq!(receiver_thread_ids, vec!["child-thread".to_string()]);
+                assert_eq!(prompt.as_deref(), Some("review the patch"));
+                assert_eq!(model.as_deref(), Some("gpt-5.5"));
+                assert_eq!(reasoning_effort.as_deref(), Some("high"));
+                assert_eq!(agents.len(), 1);
+                assert_eq!(agents[0].thread_id, "child-thread");
+                assert_eq!(agents[0].status, "running");
+            }
+            other => panic!("expected SubAgentToolCall, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_item_completed_collab_agent_state() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "type": "collabAgentToolCall",
+                "id": "collab-2",
+                "tool": "wait",
+                "status": "completed",
+                "senderThreadId": "parent-thread",
+                "receiverThreadIds": ["child-thread"],
+                "prompt": null,
+                "model": null,
+                "reasoningEffort": null,
+                "agentsStates": {
+                    "child-thread": {
+                        "status": "completed",
+                        "message": "looks good"
+                    }
+                }
+            }
+        });
+
+        translate_notification("item/completed", &params, &tx);
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::SubAgentToolCall {
+                item_id,
+                tool,
+                status,
+                agents,
+                ..
+            } => {
+                assert_eq!(item_id, "collab-2");
+                assert_eq!(tool, "wait");
+                assert_eq!(status, "completed");
+                assert_eq!(agents.len(), 1);
+                assert_eq!(agents[0].thread_id, "child-thread");
+                assert_eq!(agents[0].status, "completed");
+                assert_eq!(agents[0].message.as_deref(), Some("looks good"));
+            }
+            other => panic!("expected SubAgentToolCall, got {:?}", other),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "collabAgentToolCall should not also emit generic ToolCompleted"
+        );
     }
 
     #[test]
