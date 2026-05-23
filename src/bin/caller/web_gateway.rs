@@ -4605,7 +4605,7 @@ fn external_session_entries_from_file(
     Some(entries)
 }
 
-fn external_session_entries_from_home(
+pub(crate) fn external_session_entries_from_home(
     home: &Path,
     source: &str,
     session_id: &str,
