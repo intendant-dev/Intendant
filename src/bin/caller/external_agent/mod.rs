@@ -231,6 +231,18 @@ pub enum AgentEvent {
     Usage { usage: AgentUsageSnapshot },
     /// Informational backend event that should be written to the activity log.
     Log { level: String, message: String },
+    /// An external runtime spawned or interacted with native sub-agents.
+    SubAgentToolCall {
+        item_id: String,
+        tool: String,
+        status: String,
+        sender_thread_id: String,
+        receiver_thread_ids: Vec<String>,
+        prompt: Option<String>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        agents: Vec<SubAgentState>,
+    },
     /// A tool/command execution has started.
     ToolStarted {
         item_id: String,
@@ -268,6 +280,13 @@ pub enum AgentEvent {
         reason: String,
         exit_code: Option<i32>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubAgentState {
+    pub thread_id: String,
+    pub status: String,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
