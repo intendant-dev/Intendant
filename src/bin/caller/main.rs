@@ -1967,6 +1967,174 @@ fn emit_codex_subagent_state(config: &DrainConfig<'_>, state: &external_agent::S
     });
 }
 
+fn codex_subagent_terminal_reason(state: &external_agent::SubAgentState) -> Option<String> {
+    let status = state.status.trim();
+    let message = state
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match status {
+        "completed" => Some(
+            message
+                .map(|message| format!("Codex subagent completed: {message}"))
+                .unwrap_or_else(|| "Codex subagent completed".to_string()),
+        ),
+        "interrupted" => Some(
+            message
+                .map(|message| format!("Codex subagent interrupted: {message}"))
+                .unwrap_or_else(|| "Codex subagent interrupted".to_string()),
+        ),
+        "errored" => Some(
+            message
+                .map(|message| format!("Codex subagent errored: {message}"))
+                .unwrap_or_else(|| "Codex subagent errored".to_string()),
+        ),
+        "shutdown" => Some(
+            message
+                .map(|message| format!("Codex subagent shut down: {message}"))
+                .unwrap_or_else(|| "Codex subagent shut down".to_string()),
+        ),
+        "notFound" => Some(
+            message
+                .map(|message| format!("Codex subagent not found: {message}"))
+                .unwrap_or_else(|| "Codex subagent not found".to_string()),
+        ),
+        _ => None,
+    }
+}
+
+fn emit_codex_subagent_terminal(
+    config: &DrainConfig<'_>,
+    stats: &mut LoopStats,
+    state: &external_agent::SubAgentState,
+) {
+    let thread_id = state.thread_id.trim();
+    if thread_id.is_empty() {
+        return;
+    }
+    let Some(reason) = codex_subagent_terminal_reason(state) else {
+        return;
+    };
+    if !stats
+        .codex_subagent_terminal_sessions
+        .insert(thread_id.to_string())
+    {
+        return;
+    }
+
+    if state.status.trim() == "interrupted" {
+        config.bus.send(AppEvent::Interrupted {
+            session_id: Some(thread_id.to_string()),
+            reason,
+        });
+    } else {
+        config.bus.send(AppEvent::SessionEnded {
+            session_id: thread_id.to_string(),
+            reason,
+        });
+    }
+}
+
+fn json_u32_field(value: &serde_json::Value, key: &str) -> Option<u32> {
+    value
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+}
+
+fn emit_codex_subagent_transcript_entry(
+    config: &DrainConfig<'_>,
+    child_thread_id: &str,
+    entry: &serde_json::Value,
+) {
+    let content = entry
+        .get("content")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(content) = content else {
+        return;
+    };
+    let source = entry
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("codex");
+    if source.eq_ignore_ascii_case("user") {
+        config.bus.send(AppEvent::UserMessageLog {
+            session_id: Some(child_thread_id.to_string()),
+            content: content.to_string(),
+            user_turn_index: json_u32_field(entry, "user_turn_index"),
+            user_turn_revision: json_u32_field(entry, "user_turn_revision"),
+            replacement_for_user_turn_index: json_u32_field(
+                entry,
+                "replacement_for_user_turn_index",
+            ),
+        });
+        return;
+    }
+
+    config.bus.send(AppEvent::LogEntry {
+        session_id: Some(child_thread_id.to_string()),
+        level: entry
+            .get("level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("info")
+            .to_string(),
+        source: source.to_string(),
+        content: content.to_string(),
+        turn: None,
+    });
+}
+
+fn emit_codex_subagent_transcript_updates(
+    config: &DrainConfig<'_>,
+    stats: &mut LoopStats,
+    child_thread_id: &str,
+) {
+    let child_thread_id = child_thread_id.trim();
+    if child_thread_id.is_empty() {
+        return;
+    }
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
+    let Some(entries) =
+        crate::web_gateway::external_session_entries_from_home(&home, "codex", child_thread_id)
+    else {
+        return;
+    };
+
+    let offset = stats
+        .codex_subagent_transcript_offsets
+        .entry(child_thread_id.to_string())
+        .or_insert(0);
+    if *offset > entries.len() {
+        *offset = 0;
+    }
+    for entry in entries.iter().skip(*offset) {
+        emit_codex_subagent_transcript_entry(config, child_thread_id, entry);
+    }
+    *offset = entries.len();
+}
+
+fn codex_subagent_thread_ids(
+    receiver_thread_ids: &[String],
+    agents: &[external_agent::SubAgentState],
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    for id in receiver_thread_ids
+        .iter()
+        .map(String::as_str)
+        .chain(agents.iter().map(|state| state.thread_id.as_str()))
+    {
+        let id = id.trim();
+        if !id.is_empty() && seen.insert(id.to_string()) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
 fn short_external_session_id(session_id: &str) -> String {
     session_id.chars().take(8).collect()
 }
@@ -2136,6 +2304,10 @@ async fn drain_external_agent_events(
         EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL,
     );
     context_snapshot_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let post_turn_sleep = tokio::time::sleep(EXTERNAL_POST_TURN_DRAIN_GRACE);
+    tokio::pin!(post_turn_sleep);
+    let mut post_turn_sleep_active = false;
+    let mut pending_turn_completion: Option<(Option<String>, usize)> = None;
 
     // Background watcher: if an interrupt arrives while an approval handler
     // below is blocked on `rx.await`, we need to drain the approval registry
@@ -2349,8 +2521,26 @@ async fn drain_external_agent_events(
             maybe_event = event_rx.recv() => {
                 match maybe_event {
                     Some(e) => e,
+                    None if pending_turn_completion.is_some() => {
+                        let (message, turns_in_round) = pending_turn_completion
+                            .take()
+                            .expect("checked pending turn completion");
+                        return DrainOutcome::TurnCompleted {
+                            message,
+                            turns_in_round,
+                        };
+                    }
                     None => return DrainOutcome::ChannelClosed,
                 }
+            }
+            _ = &mut post_turn_sleep, if post_turn_sleep_active => {
+                let (message, turns_in_round) = pending_turn_completion
+                    .take()
+                    .expect("post-turn sleep active only while completion is pending");
+                return DrainOutcome::TurnCompleted {
+                    message,
+                    turns_in_round,
+                };
             }
         };
 
@@ -2472,6 +2662,7 @@ async fn drain_external_agent_events(
                 agents,
             } => {
                 let prompt_ref = prompt.as_deref();
+                let subagent_thread_ids = codex_subagent_thread_ids(&receiver_thread_ids, &agents);
                 if status == "inProgress" {
                     turns_in_round += 1;
                     if !config.suppress_agent_started {
@@ -2487,18 +2678,27 @@ async fn drain_external_agent_events(
                             source: config.agent_source.clone(),
                         });
                     }
-                    if tool == "spawnAgent" {
-                        for child_thread_id in &receiver_thread_ids {
-                            emit_codex_subagent_started(
-                                config,
-                                &sender_thread_id,
-                                child_thread_id,
-                                prompt_ref,
-                                model.as_deref(),
-                                reasoning_effort.as_deref(),
-                            );
-                        }
+                }
+
+                for child_thread_id in &subagent_thread_ids {
+                    let child_thread_id = child_thread_id.trim();
+                    if child_thread_id.is_empty() || child_thread_id == sender_thread_id.trim() {
+                        continue;
                     }
+                    if stats
+                        .codex_subagent_sessions
+                        .insert(child_thread_id.to_string())
+                    {
+                        emit_codex_subagent_started(
+                            config,
+                            &sender_thread_id,
+                            child_thread_id,
+                            prompt_ref,
+                            model.as_deref(),
+                            reasoning_effort.as_deref(),
+                        );
+                    }
+                    emit_codex_subagent_transcript_updates(config, stats, child_thread_id);
                 }
 
                 if status == "failed" {
@@ -2530,6 +2730,7 @@ async fn drain_external_agent_events(
 
                 for state in &agents {
                     emit_codex_subagent_state(config, state);
+                    emit_codex_subagent_terminal(config, stats, state);
                 }
 
                 emit_external_context_snapshot_if_changed(
@@ -2938,10 +3139,12 @@ async fn drain_external_agent_events(
                         ))
                     });
                 }
-                return DrainOutcome::TurnCompleted {
-                    message,
-                    turns_in_round,
-                };
+                pending_turn_completion = Some((message, turns_in_round));
+                post_turn_sleep_active = true;
+                post_turn_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + EXTERNAL_POST_TURN_DRAIN_GRACE);
+                continue;
             }
             external_agent::AgentEvent::Terminated { reason, exit_code } => {
                 if interrupt_pending {
@@ -3059,6 +3262,7 @@ async fn run_daemon_loop(config: DaemonConfig) {
 const SAFETY_CAP: usize = 500;
 const MIN_BUDGET_TOKENS: u64 = 4096;
 const BUDGET_WARNING_THRESHOLD: f64 = 0.85;
+const EXTERNAL_POST_TURN_DRAIN_GRACE: Duration = Duration::from_millis(750);
 
 /// Why the agent loop exited after a round.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3084,6 +3288,9 @@ struct LoopStats {
     turns: usize,
     rounds: usize,
     usage: provider::TokenUsage,
+    codex_subagent_sessions: std::collections::HashSet<String>,
+    codex_subagent_terminal_sessions: std::collections::HashSet<String>,
+    codex_subagent_transcript_offsets: std::collections::HashMap<String, usize>,
     /// Last model response content (for sub-agent result summaries).
     last_response: Option<String>,
 }
@@ -4400,6 +4607,56 @@ mod tests {
             side_session_prompt_from_params(&serde_json::json!({ "prompt": "   " })),
             None
         );
+    }
+
+    #[test]
+    fn codex_subagent_thread_ids_uses_late_agent_state_ids() {
+        let agents = vec![
+            external_agent::SubAgentState {
+                thread_id: " child-from-state ".to_string(),
+                status: "completed".to_string(),
+                message: None,
+            },
+            external_agent::SubAgentState {
+                thread_id: "child-from-receiver".to_string(),
+                status: "running".to_string(),
+                message: None,
+            },
+        ];
+        assert_eq!(
+            codex_subagent_thread_ids(
+                &[
+                    " child-from-receiver ".to_string(),
+                    String::new(),
+                    "child-from-receiver".to_string(),
+                ],
+                &agents,
+            ),
+            vec![
+                "child-from-receiver".to_string(),
+                "child-from-state".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_subagent_terminal_reason_includes_final_message() {
+        let state = external_agent::SubAgentState {
+            thread_id: "child".to_string(),
+            status: "completed".to_string(),
+            message: Some("done".to_string()),
+        };
+        assert_eq!(
+            codex_subagent_terminal_reason(&state).as_deref(),
+            Some("Codex subagent completed: done")
+        );
+
+        let running = external_agent::SubAgentState {
+            thread_id: "child".to_string(),
+            status: "running".to_string(),
+            message: None,
+        };
+        assert!(codex_subagent_terminal_reason(&running).is_none());
     }
 
     #[test]
