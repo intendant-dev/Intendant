@@ -2707,7 +2707,7 @@ html, body {
 }
 .sessions-toolbar {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) auto auto minmax(210px, auto);
+  grid-template-columns: minmax(220px, 1fr) auto auto auto minmax(210px, auto);
   align-items: end;
   gap: 8px;
 }
@@ -2743,6 +2743,9 @@ html, body {
   font-size: 11px;
   color: var(--overlay0);
   position: relative;
+}
+.sessions-project-filter {
+  min-width: 180px;
 }
 .sessions-multi-filter-btn {
   height: 28px;
@@ -6435,6 +6438,12 @@ html, body {
                   <span>Quick search</span>
                   <input type="search" id="sessions-search" placeholder="ID, name, task, model, path..." autocomplete="off" spellcheck="false">
                 </label>
+                <label class="sessions-control sessions-project-filter" for="filter-session-project">
+                  <span>Project</span>
+                  <select id="filter-session-project">
+                    <option value="">All projects</option>
+                  </select>
+                </label>
                 <div class="sessions-control sessions-multi-filter" data-session-filter="source">
                   <span>Source</span>
                   <button type="button" class="sessions-multi-filter-btn" id="filter-session-source" aria-haspopup="true" aria-expanded="false">All sources</button>
@@ -6548,6 +6557,12 @@ html, body {
                 <label class="sessions-search" for="sessions-deep-result-search">
                   <span>Result filter</span>
                   <input type="search" id="sessions-deep-result-search" placeholder="ID, name, task, model, path..." autocomplete="off" spellcheck="false">
+                </label>
+                <label class="sessions-control sessions-project-filter" for="filter-session-deep-project">
+                  <span>Project</span>
+                  <select id="filter-session-deep-project">
+                    <option value="">All projects</option>
+                  </select>
                 </label>
                 <div class="sessions-control sessions-multi-filter" data-session-filter="deep-source">
                   <span>Source</span>
@@ -7385,8 +7400,10 @@ let selfVersion = '';
 const DIRECT_MODE_KEY = 'intendant_direct_mode';
 const VERBOSITY_KEY = 'intendant_verbosity';
 const HOST_FILTER_KEY = 'intendant_host_filter';
+const SESSIONS_FILTER_PROJECT_KEY = 'intendant_sessions_filter_project';
 const SESSIONS_FILTER_SOURCE_KEY = 'intendant_sessions_filter_source';
 const SESSIONS_FILTER_STATUS_KEY = 'intendant_sessions_filter_status';
+const SESSIONS_DEEP_FILTER_PROJECT_KEY = 'intendant_sessions_deep_filter_project';
 const SESSIONS_DEEP_FILTER_SOURCE_KEY = 'intendant_sessions_deep_filter_source';
 const SESSIONS_DEEP_FILTER_STATUS_KEY = 'intendant_sessions_deep_filter_status';
 const SESSION_SOURCE_FILTER_OPTIONS = [
@@ -17860,6 +17877,8 @@ function restoreClientToggles() {
   restoreSessionMultiFilter('status');
   restoreSessionMultiFilter('deep-source');
   restoreSessionMultiFilter('deep-status');
+  restoreSessionProjectFilter('recent');
+  restoreSessionProjectFilter('deep');
 
   // Host filter (Activity tab). The dropdown's option list is built
   // later by refreshHostFilterOptions() — that function reads from
@@ -23555,6 +23574,7 @@ let _sessionDeepSearch = {
 function applyLoadedSessions(sessions, aggEl) {
   sessionsLoaded = true;
   _cachedSessions = sessions;
+  updateSessionProjectFilterOptions(sessions);
   updateNewSessionProjectPrefills(sessions);
   cacheSessionWindowMetadata(sessions);
   renderSessionsAggregate(sessions, aggEl);
@@ -23589,6 +23609,7 @@ function renderSessionsViews() {
     renderSessionsList(_cachedSessions, document.getElementById('sessions-list'), {
       mode: 'recent',
       query: sessionSearchQuery(),
+      projectFilter: sessionProjectFilterValue(),
       sourceFilter: sessionSourceFilterValue(),
       statusFilter: sessionStatusFilterValue(),
       sortValue: document.getElementById('sort-sessions')?.value || 'updated-desc',
@@ -23598,6 +23619,7 @@ function renderSessionsViews() {
     renderSessionsList(_cachedSessions, document.getElementById('sessions-deep-list'), {
       mode: 'deep',
       query: sessionDeepResultSearchQuery(),
+      projectFilter: sessionDeepProjectFilterValue(),
       sourceFilter: sessionDeepSourceFilterValue(),
       statusFilter: sessionDeepStatusFilterValue(),
       sortValue: document.getElementById('sort-sessions-deep')?.value || 'updated-desc',
@@ -23614,6 +23636,104 @@ function _refilterSessions() {
 function _refreshSessionsFilters() {
   _refilterSessions();
 }
+
+function sessionProjectFilterConfig(scope) {
+  if (scope === 'deep') {
+    return {
+      key: SESSIONS_DEEP_FILTER_PROJECT_KEY,
+      selectId: 'filter-session-deep-project',
+      allLabel: 'All projects',
+    };
+  }
+  return {
+    key: SESSIONS_FILTER_PROJECT_KEY,
+    selectId: 'filter-session-project',
+    allLabel: 'All projects',
+  };
+}
+
+function sessionProjectDirectory(session) {
+  return compactSessionText(
+    session?.project_root ||
+    session?.projectRoot ||
+    session?.project_dir ||
+    session?.projectDir ||
+    session?.project ||
+    session?.cwd ||
+    session?.workdir ||
+    session?.workDir
+  );
+}
+
+function sessionProjectFilterOptions(sessions) {
+  const buckets = new Map();
+  for (const session of Array.isArray(sessions) ? sessions : []) {
+    const path = sessionProjectDirectory(session);
+    if (!path) continue;
+    const existing = buckets.get(path) || {
+      path,
+      label: compactPathLabel(path, true) || path,
+      count: 0,
+    };
+    existing.count += 1;
+    buckets.set(path, existing);
+  }
+  return Array.from(buckets.values()).sort((a, b) => {
+    const byLabel = a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
+    return byLabel || a.path.localeCompare(b.path);
+  });
+}
+
+function updateSessionProjectFilterOptions(sessions = _cachedSessions) {
+  const options = sessionProjectFilterOptions(sessions);
+  for (const scope of ['recent', 'deep']) {
+    const cfg = sessionProjectFilterConfig(scope);
+    const select = document.getElementById(cfg.selectId);
+    if (!select) continue;
+    const stored = localStorage.getItem(cfg.key) || '';
+    const current = select.value || stored;
+    select.innerHTML = '';
+
+    const all = document.createElement('option');
+    all.value = '';
+    all.textContent = cfg.allLabel;
+    select.appendChild(all);
+
+    for (const item of options) {
+      const opt = document.createElement('option');
+      opt.value = item.path;
+      opt.textContent = `${item.label} (${item.count.toLocaleString()})`;
+      opt.title = item.path;
+      select.appendChild(opt);
+    }
+
+    const hasCurrent = current && options.some(item => item.path === current);
+    select.value = hasCurrent ? current : '';
+    select.title = select.value || cfg.allLabel;
+    if (current && !hasCurrent) localStorage.removeItem(cfg.key);
+  }
+}
+
+function restoreSessionProjectFilter(scope) {
+  const cfg = sessionProjectFilterConfig(scope);
+  const select = document.getElementById(cfg.selectId);
+  if (!select) return;
+  select.value = localStorage.getItem(cfg.key) || '';
+  select.title = select.value || cfg.allLabel;
+}
+
+function setupSessionProjectFilter(scope) {
+  const cfg = sessionProjectFilterConfig(scope);
+  const select = document.getElementById(cfg.selectId);
+  if (!select) return;
+  select.addEventListener('change', () => {
+    if (select.value) localStorage.setItem(cfg.key, select.value);
+    else localStorage.removeItem(cfg.key);
+    select.title = select.value || cfg.allLabel;
+    _refilterSessions();
+  });
+}
+
 function sessionMultiFilterConfig(kind) {
   if (kind === 'source') {
     return {
@@ -23755,6 +23875,8 @@ setupSessionMultiFilter('source', _refreshSessionsFilters);
 setupSessionMultiFilter('status', _refilterSessions);
 setupSessionMultiFilter('deep-source', _refilterSessions);
 setupSessionMultiFilter('deep-status', _refilterSessions);
+setupSessionProjectFilter('recent');
+setupSessionProjectFilter('deep');
 document.addEventListener('click', () => closeSessionMultiFilterMenus());
 document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') closeSessionMultiFilterMenus();
@@ -23835,6 +23957,10 @@ function sessionDeepResultSearchQuery() {
   return (document.getElementById('sessions-deep-result-search')?.value || '').trim().toLowerCase();
 }
 
+function sessionProjectFilterValue() {
+  return document.getElementById('filter-session-project')?.value || '';
+}
+
 function sessionSourceFilterValue() {
   return sessionMultiFilterValues('source');
 }
@@ -23849,6 +23975,15 @@ function sessionDeepSourceFilterValue() {
 
 function sessionDeepStatusFilterValue() {
   return sessionMultiFilterValues('deep-status');
+}
+
+function sessionDeepProjectFilterValue() {
+  return document.getElementById('filter-session-deep-project')?.value || '';
+}
+
+function sessionMatchesProjectFilter(session, filter) {
+  if (!filter) return true;
+  return sessionProjectDirectory(session) === filter;
 }
 
 function sessionMatchesSourceFilter(source, filter) {
@@ -24199,6 +24334,7 @@ function renderSessionsList(sessions, el, options = {}) {
   const currentSessionId = daemonSessionFullId || '';
 
   const query = options.query || '';
+  const projectFilter = options.projectFilter || '';
   const sourceFilter = options.sourceFilter || [];
   const statusFilter = options.statusFilter || [];
   const deepSearchActive = deepSearchOnly && _sessionDeepSearch.active;
@@ -24218,6 +24354,7 @@ function renderSessionsList(sessions, el, options = {}) {
     }
 
     // Apply filters
+    if (!sessionMatchesProjectFilter(s, projectFilter)) continue;
     if (!sessionMatchesSourceFilter(source, sourceFilter)) continue;
     if (!sessionMatchesStatusFilter(displayStatus, statusFilter)) continue;
     const summaryMatch = sessionMatchesSearch(s, query, displayStatus, source, shortId, isCurrent);
@@ -24548,6 +24685,8 @@ function renderSessionsList(sessions, el, options = {}) {
       ? 'No sessions match the deep search results'
       : query
       ? 'No sessions match your search'
+      : projectFilter
+      ? 'No sessions match the selected project'
       : 'No sessions match the active filters';
     el.appendChild(empty);
   } else {
@@ -25008,6 +25147,7 @@ function deleteSessionData(sessionId, target, label) {
           s.total_bytes = Math.max(0, (s.total_bytes || 0) - freed);
         }
       }
+      updateSessionProjectFilterOptions(_cachedSessions);
       renderSessionsAggregate(_cachedSessions, document.getElementById('sessions-aggregate'));
       _refilterSessions();
     })
