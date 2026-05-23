@@ -12569,6 +12569,9 @@ function createLogScaffold(c, extraClass) {
   if (c.user_turn_index !== undefined && c.user_turn_index !== null) {
     entry.dataset.userTurnIndex = String(c.user_turn_index);
   }
+  if (c.user_turn_revision !== undefined && c.user_turn_revision !== null) {
+    entry.dataset.userTurnRevision = String(c.user_turn_revision);
+  }
 
   const lvl = document.createElement('span');
   lvl.className = 'log-level';
@@ -12966,7 +12969,8 @@ function markActivityContextRewind(sessionId, userTurnIndex, turnsRemoved) {
 function isEditableUserMessage(c) {
   if (c?.superseded) return false;
   const sid = String(c?.session_id || '').trim();
-  return !!sid && logUserTurnIndex(c) !== null;
+  const revision = Number(c?.user_turn_revision || 0);
+  return !!sid && logUserTurnIndex(c) !== null && Number.isInteger(revision) && revision > 0;
 }
 
 function appendEditUserMessageButton(entry, c) {
@@ -12979,6 +12983,7 @@ function appendEditUserMessageButton(entry, c) {
   btn.innerHTML = '&#9998;';
   btn.dataset.sessionId = c.session_id || '';
   btn.dataset.userTurnIndex = String(c.user_turn_index);
+  btn.dataset.userTurnRevision = String(c.user_turn_revision || '');
   btn.dataset.message = c.content || '';
   entry.appendChild(btn);
 }
@@ -22720,11 +22725,12 @@ function cancelEditMessageDraft() {
   updateSubmitButtonLabel(currentPhase);
 }
 
-function beginEditUserMessage({ sessionId, userTurnIndex, text }) {
-  if (!sessionId || !userTurnIndex) return;
+function beginEditUserMessage({ sessionId, userTurnIndex, userTurnRevision, text }) {
+  if (!sessionId || !userTurnIndex || !userTurnRevision) return;
   editMessageDraft = {
     sessionId,
     userTurnIndex: Number(userTurnIndex),
+    userTurnRevision: Number(userTurnRevision),
     originalText: text || '',
   };
   ensureSessionWindow(sessionId);
@@ -22743,6 +22749,7 @@ function submitEditedUserMessage(input, text) {
     action: 'edit_user_message',
     session_id: targetSessionId,
     user_turn_index: editMessageDraft.userTurnIndex,
+    user_turn_revision: editMessageDraft.userTurnRevision,
     text,
   };
   if (attachments.length > 0) msg.attachments = attachments;
@@ -22767,6 +22774,7 @@ document.addEventListener('click', (e) => {
   beginEditUserMessage({
     sessionId: editBtn.dataset.sessionId || '',
     userTurnIndex: editBtn.dataset.userTurnIndex || '',
+    userTurnRevision: editBtn.dataset.userTurnRevision || '',
     text: editBtn.dataset.message || '',
   });
 });

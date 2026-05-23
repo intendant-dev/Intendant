@@ -2806,7 +2806,6 @@ fn codex_thread_display_name(value: Option<String>) -> Option<String> {
 
 fn push_external_transcript_entry(
     entries: &mut Vec<serde_json::Value>,
-    seen_messages: &mut HashSet<(String, String)>,
     provider_source: &str,
     ts: &str,
     role: &str,
@@ -2825,7 +2824,11 @@ fn push_external_transcript_entry(
     if role == "user" && is_codex_injected_user_text(&text) {
         return false;
     }
-    if !seen_messages.insert((role.clone(), text.clone())) {
+    if entries.last().is_some_and(|entry| {
+        external_transcript_entry_role(entry) == Some(role.as_str())
+            && entry.get("ts").and_then(|v| v.as_str()) == Some(ts)
+            && entry.get("content").and_then(|v| v.as_str()) == Some(text.as_str())
+    }) {
         return false;
     }
     entries.push(serde_json::json!({
@@ -2847,22 +2850,8 @@ fn external_transcript_entry_role(entry: &serde_json::Value) -> Option<&'static 
     }
 }
 
-fn forget_external_seen_message(
-    seen_messages: &mut HashSet<(String, String)>,
-    entry: &serde_json::Value,
-) {
-    let Some(role) = external_transcript_entry_role(entry) else {
-        return;
-    };
-    let Some(content) = entry.get("content").and_then(|v| v.as_str()) else {
-        return;
-    };
-    seen_messages.remove(&(role.to_string(), content.to_string()));
-}
-
 fn mark_latest_external_turn_superseded(
     entries: &mut [serde_json::Value],
-    seen_messages: &mut HashSet<(String, String)>,
     rollback_ts: &str,
 ) -> Option<u32> {
     for idx in (0..entries.len()).rev() {
@@ -2884,7 +2873,6 @@ fn mark_latest_external_turn_superseded(
             .get("user_turn_index")
             .and_then(|v| v.as_u64())
             .and_then(|v| u32::try_from(v).ok());
-        forget_external_seen_message(seen_messages, entry);
         if let Some(obj) = entries[idx].as_object_mut() {
             obj.insert("superseded".to_string(), serde_json::Value::Bool(true));
             obj.insert(
@@ -4274,21 +4262,47 @@ fn store_external_transcript_entries(
     );
 }
 
+#[derive(Debug, Default)]
+struct ReplayUserTurnRevisionState {
+    active_count: u32,
+    latest_revision_by_turn: HashMap<u32, u32>,
+}
+
+impl ReplayUserTurnRevisionState {
+    fn record_next_turn(&mut self) -> (u32, u32) {
+        let turn = self.active_count.saturating_add(1);
+        let revision = self
+            .latest_revision_by_turn
+            .get(&turn)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.latest_revision_by_turn.insert(turn, revision);
+        self.active_count = turn;
+        (turn, revision)
+    }
+
+    fn rewind_from_turn(&mut self, first_user_turn_index: u32) {
+        if first_user_turn_index == 0 || first_user_turn_index > self.active_count {
+            return;
+        }
+        self.active_count = first_user_turn_index.saturating_sub(1);
+    }
+}
+
 fn push_codex_transcript_message(
     entries: &mut Vec<serde_json::Value>,
-    seen_messages: &mut HashSet<(String, String)>,
-    user_turn_index: &mut u32,
+    user_turn_revisions: &mut ReplayUserTurnRevisionState,
     pending_replacement_for_user_turn: &mut Option<u32>,
     ts: &str,
     role: &str,
     text: String,
 ) {
-    if push_external_transcript_entry(entries, seen_messages, "codex", ts, role, text)
-        && role == "user"
-    {
-        *user_turn_index = user_turn_index.saturating_add(1);
+    if push_external_transcript_entry(entries, "codex", ts, role, text) && role == "user" {
+        let (user_turn_index, user_turn_revision) = user_turn_revisions.record_next_turn();
         if let Some(entry) = entries.last_mut() {
-            entry["user_turn_index"] = serde_json::json!(*user_turn_index);
+            entry["user_turn_index"] = serde_json::json!(user_turn_index);
+            entry["user_turn_revision"] = serde_json::json!(user_turn_revision);
             if let Some(turn) = pending_replacement_for_user_turn.take() {
                 entry["replacement_for_user_turn_index"] = serde_json::json!(turn);
             }
@@ -4300,9 +4314,8 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
     let file = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut entries: Vec<serde_json::Value> = Vec::new();
-    let mut user_turn_index = 0u32;
+    let mut user_turn_revisions = ReplayUserTurnRevisionState::default();
     let mut pending_replacement_for_user_turn: Option<u32> = None;
-    let mut seen_messages = HashSet::new();
 
     for line in reader.lines() {
         let Ok(line) = line else {
@@ -4325,13 +4338,10 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                     let ts = value_str(&obj, "timestamp").unwrap_or_default();
                     let mut superseded_user_turns = Vec::new();
                     for _ in 0..turns {
-                        if let Some(turn) = mark_latest_external_turn_superseded(
-                            &mut entries,
-                            &mut seen_messages,
-                            &ts,
-                        ) {
+                        if let Some(turn) = mark_latest_external_turn_superseded(&mut entries, &ts)
+                        {
                             superseded_user_turns.push(turn);
-                            user_turn_index = user_turn_index.saturating_sub(1);
+                            user_turn_revisions.rewind_from_turn(turn);
                         }
                     }
                     if let Some(replacement_turn) = superseded_user_turns.iter().copied().min() {
@@ -4360,8 +4370,7 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
             if let Some((role, text)) = codex_event_message_text(payload) {
                 push_codex_transcript_message(
                     &mut entries,
-                    &mut seen_messages,
-                    &mut user_turn_index,
+                    &mut user_turn_revisions,
                     &mut pending_replacement_for_user_turn,
                     &ts,
                     &role,
@@ -4371,8 +4380,7 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
             if let Some((role, text)) = codex_payload_text(payload) {
                 push_codex_transcript_message(
                     &mut entries,
-                    &mut seen_messages,
-                    &mut user_turn_index,
+                    &mut user_turn_revisions,
                     &mut pending_replacement_for_user_turn,
                     &ts,
                     &role,
@@ -4599,6 +4607,9 @@ fn external_session_activity_replay_from_home_with_attach(
             "content": content,
             "replay_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
             "user_turn_index": entry.get("user_turn_index").and_then(|v| v.as_u64()),
+            "user_turn_revision": entry
+                .get("user_turn_revision")
+                .and_then(|v| v.as_u64()),
             "replacement_for_user_turn_index": entry
                 .get("replacement_for_user_turn_index")
                 .and_then(|v| v.as_u64()),
@@ -7498,7 +7509,8 @@ pub fn spawn_web_gateway(
                     // read it through to hand a clean stream to the peer
                     // reader task).
                     let first_frame =
-                        match crate::display::webrtc::read_rfc4571_frame_pub(&mut raw_stream).await {
+                        match crate::display::webrtc::read_rfc4571_frame_pub(&mut raw_stream).await
+                        {
                             Ok(f) => f,
                             Err(e) => {
                                 eprintln!("[web_gateway] ICE-TCP first-frame read failed: {e}");
@@ -7533,8 +7545,9 @@ pub fn spawn_web_gateway(
                             }
                         }
                         Some(ufrag) if tcp_relay_registry.contains_ufrag(&ufrag) => {
-                            if let Err(e) =
-                                tcp_relay_registry.route_accepted(raw_stream, first_frame).await
+                            if let Err(e) = tcp_relay_registry
+                                .route_accepted(raw_stream, first_frame)
+                                .await
                             {
                                 eprintln!(
                                     "[web_gateway] ICE-TCP relay routing for ufrag={ufrag} from {remote_addr} failed: {e}"
@@ -16231,6 +16244,7 @@ mod tests {
             .find(|entry| entry["event"] == "log_entry" && entry["content"] == "Old prompt")
             .expect("old prompt should remain visible");
         assert_eq!(old_prompt["user_turn_index"], 1);
+        assert_eq!(old_prompt["user_turn_revision"], 1);
         assert_eq!(old_prompt["superseded"], true);
 
         let old_answer = entries
@@ -16252,8 +16266,195 @@ mod tests {
             .find(|entry| entry["event"] == "log_entry" && entry["content"] == "New prompt")
             .expect("replacement prompt should replay");
         assert_eq!(new_prompt["user_turn_index"], 1);
+        assert_eq!(new_prompt["user_turn_revision"], 2);
         assert_eq!(new_prompt["replacement_for_user_turn_index"], 1);
         assert_ne!(new_prompt["superseded"], true);
+    }
+
+    #[test]
+    fn external_activity_replay_tracks_double_rewind_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-double-rewind-activity";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Original prompt" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Original answer" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "thread_rolled_back", "num_turns": 1 }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Replacement one" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:04Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Replacement answer" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:05Z",
+                    "type": "event_msg",
+                    "payload": { "type": "thread_rolled_back", "num_turns": 1 }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:06Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Replacement two" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+
+        let original = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "Original prompt")
+            .expect("original prompt should replay");
+        assert_eq!(original["user_turn_index"], 1);
+        assert_eq!(original["user_turn_revision"], 1);
+        assert_eq!(original["superseded"], true);
+
+        let first_replacement = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "Replacement one")
+            .expect("first replacement should replay");
+        assert_eq!(first_replacement["user_turn_index"], 1);
+        assert_eq!(first_replacement["user_turn_revision"], 2);
+        assert_eq!(first_replacement["replacement_for_user_turn_index"], 1);
+        assert_eq!(first_replacement["superseded"], true);
+
+        let second_replacement = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "Replacement two")
+            .expect("second replacement should replay");
+        assert_eq!(second_replacement["user_turn_index"], 1);
+        assert_eq!(second_replacement["user_turn_revision"], 3);
+        assert_eq!(second_replacement["replacement_for_user_turn_index"], 1);
+        assert_ne!(second_replacement["superseded"], true);
+    }
+
+    #[test]
+    fn codex_transcript_keeps_distinct_identical_user_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-identical-user-turns";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "continue" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "continue" }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "first answer" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "continue" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "continue" }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let entries = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("codex session should parse");
+        let user_entries: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                entry.get("source").and_then(|v| v.as_str()) == Some("user")
+                    && entry.get("content").and_then(|v| v.as_str()) == Some("continue")
+            })
+            .collect();
+
+        assert_eq!(user_entries.len(), 2);
+        assert_eq!(user_entries[0]["user_turn_index"], 1);
+        assert_eq!(user_entries[1]["user_turn_index"], 2);
     }
 
     #[test]

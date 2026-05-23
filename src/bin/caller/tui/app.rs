@@ -1475,6 +1475,7 @@ impl App {
             ControlMsg::EditUserMessage {
                 user_turn_index,
                 ref text,
+                user_turn_revision: _,
                 ..
             } => {
                 self.follow_up_textarea = None;

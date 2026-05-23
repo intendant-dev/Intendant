@@ -333,6 +333,7 @@ fn emit_user_message_log(
     session_log: &SharedSessionLog,
     session_id: Option<&str>,
     user_turn_index: Option<u32>,
+    user_turn_revision: Option<u32>,
     replacement_for_user_turn_index: Option<u32>,
     text: &str,
 ) {
@@ -345,6 +346,7 @@ fn emit_user_message_log(
         session_id: session_id.map(str::to_string),
         content: text.to_string(),
         user_turn_index,
+        user_turn_revision,
         replacement_for_user_turn_index,
     });
 }
@@ -438,18 +440,108 @@ fn codex_payload_user_text(payload: &serde_json::Value) -> Option<String> {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct UserTurnRevisionState {
+    active_count: u32,
+    latest_revision_by_turn: HashMap<u32, u32>,
+    active_revision_by_turn: HashMap<u32, u32>,
+}
+
+impl UserTurnRevisionState {
+    fn active_count(&self) -> u32 {
+        self.active_count
+    }
+
+    fn active_revision(&self, user_turn_index: u32) -> Option<u32> {
+        self.active_revision_by_turn.get(&user_turn_index).copied()
+    }
+
+    fn seed_active_turns_to(&mut self, active_count: u32) {
+        while self.active_count < active_count {
+            self.record_next_turn();
+        }
+    }
+
+    fn record_next_turn(&mut self) -> (u32, u32) {
+        let user_turn_index = self.active_count.saturating_add(1);
+        let revision = self.record_active_turn(user_turn_index);
+        self.active_count = user_turn_index;
+        (user_turn_index, revision)
+    }
+
+    fn record_active_turn(&mut self, user_turn_index: u32) -> u32 {
+        let next_revision = self
+            .latest_revision_by_turn
+            .get(&user_turn_index)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.latest_revision_by_turn
+            .insert(user_turn_index, next_revision);
+        self.active_revision_by_turn
+            .insert(user_turn_index, next_revision);
+        self.active_count = self.active_count.max(user_turn_index);
+        next_revision
+    }
+
+    fn rewind_last_turns(&mut self, turns_to_drop: u32) {
+        if turns_to_drop == 0 || self.active_count == 0 {
+            return;
+        }
+        let first_user_turn_index = self
+            .active_count
+            .saturating_sub(turns_to_drop)
+            .saturating_add(1);
+        self.rewind_from_turn(first_user_turn_index);
+    }
+
+    fn rewind_from_turn(&mut self, first_user_turn_index: u32) {
+        if first_user_turn_index == 0 || first_user_turn_index > self.active_count {
+            return;
+        }
+        for turn in first_user_turn_index..=self.active_count {
+            self.active_revision_by_turn.remove(&turn);
+        }
+        self.active_count = first_user_turn_index.saturating_sub(1);
+    }
+
+    fn validate_expected_revision(
+        &self,
+        user_turn_index: u32,
+        expected_revision: Option<u32>,
+    ) -> Result<(), String> {
+        let Some(expected_revision) = expected_revision else {
+            return Err(format!(
+                "Cannot edit user turn {}; missing active-message revision",
+                user_turn_index
+            ));
+        };
+        match self.active_revision(user_turn_index) {
+            Some(active_revision) if active_revision == expected_revision => Ok(()),
+            Some(active_revision) => Err(format!(
+                "Cannot edit user turn {}; the displayed message revision {} is stale (active revision is {})",
+                user_turn_index, expected_revision, active_revision
+            )),
+            None => Err(format!(
+                "Cannot edit user turn {}; that message is no longer active context",
+                user_turn_index
+            )),
+        }
+    }
+}
+
 fn is_codex_injected_user_text_for_main(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("# AGENTS.md instructions for ") || trimmed.starts_with("<turn_aborted>")
 }
 
-fn count_codex_user_turns_from_history(session_id: &str) -> Option<u32> {
+fn codex_user_turn_state_from_history(session_id: &str) -> Option<UserTurnRevisionState> {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
     let path = find_codex_session_file_for_main(&home, session_id)?;
     let contents = std::fs::read_to_string(path).ok()?;
     let mut saw_user_message_event = false;
-    let mut event_user_turns = 0u32;
-    let mut fallback_user_turns = 0u32;
+    let mut event_state = UserTurnRevisionState::default();
+    let mut fallback_state = UserTurnRevisionState::default();
 
     for line in contents.lines() {
         let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -463,15 +555,15 @@ fn count_codex_user_turns_from_history(session_id: &str) -> Option<u32> {
                 match payload.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                     "user_message" => {
                         saw_user_message_event = true;
-                        event_user_turns = event_user_turns.saturating_add(1);
+                        event_state.record_next_turn();
                     }
                     "thread_rolled_back" => {
                         let turns = payload
                             .get("num_turns")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0) as u32;
-                        event_user_turns = event_user_turns.saturating_sub(turns);
-                        fallback_user_turns = fallback_user_turns.saturating_sub(turns);
+                        event_state.rewind_last_turns(turns);
+                        fallback_state.rewind_last_turns(turns);
                     }
                     _ => {}
                 }
@@ -482,7 +574,7 @@ fn count_codex_user_turns_from_history(session_id: &str) -> Option<u32> {
                     .and_then(codex_payload_user_text)
                     .is_some()
                 {
-                    fallback_user_turns = fallback_user_turns.saturating_add(1);
+                    fallback_state.record_next_turn();
                 }
             }
             _ => {}
@@ -490,9 +582,9 @@ fn count_codex_user_turns_from_history(session_id: &str) -> Option<u32> {
     }
 
     Some(if saw_user_message_event {
-        event_user_turns
+        event_state
     } else {
-        fallback_user_turns
+        fallback_state
     })
 }
 
@@ -1534,9 +1626,96 @@ fn side_rewind_first_turn_for_undo(
     Ok(current_turn_count as u32 - turns + 1)
 }
 
+fn parent_rewind_first_turn_for_undo(current_turn_count: usize, turns: u32) -> Result<u32, String> {
+    if turns == 0 {
+        return Err("rollback count must be at least 1".to_string());
+    }
+    if turns as usize > current_turn_count {
+        return Err(format!(
+            "Cannot /undo {} turn(s); only {} user turn(s) are active",
+            turns, current_turn_count
+        ));
+    }
+    Ok(current_turn_count as u32 - turns + 1)
+}
+
+async fn rollback_parent_thread_from_turn(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    round: &mut usize,
+    user_turn_revisions: &mut UserTurnRevisionState,
+    first_user_turn_index: u32,
+    config: &DrainConfig<'_>,
+) -> Result<u32, String> {
+    if first_user_turn_index == 0 {
+        return Err("Cannot rewind user turn 0".to_string());
+    }
+    if first_user_turn_index as usize > *round {
+        return Err(format!(
+            "Cannot rewind to user turn {}; current user turn count is {}",
+            first_user_turn_index, *round
+        ));
+    }
+
+    let turns_to_drop = *round as u32 - first_user_turn_index + 1;
+    agent
+        .rollback_turns(turns_to_drop)
+        .await
+        .map_err(|e| format!("thread rollback failed: {}", e))?;
+
+    user_turn_revisions.rewind_from_turn(first_user_turn_index);
+    *round = first_user_turn_index.saturating_sub(1) as usize;
+    config.bus.send(AppEvent::UserMessageRewind {
+        session_id: config.session_id.clone(),
+        user_turn_index: first_user_turn_index,
+        turns_removed: turns_to_drop,
+    });
+    Ok(turns_to_drop)
+}
+
+async fn handle_parent_undo_thread_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    round: &mut usize,
+    user_turn_revisions: &mut UserTurnRevisionState,
+    params: serde_json::Value,
+    config: &DrainConfig<'_>,
+) {
+    let turns = undo_turns_from_params(&params);
+    let result = match parent_rewind_first_turn_for_undo(*round, turns) {
+        Ok(first_user_turn_index) => rollback_parent_thread_from_turn(
+            agent,
+            round,
+            user_turn_revisions,
+            first_user_turn_index,
+            config,
+        )
+        .await
+        .map(|turns_removed| format!("rolled back {} turn(s)", turns_removed)),
+        Err(message) => Err(message),
+    };
+
+    let (success, message) = match result {
+        Ok(message) => (true, message),
+        Err(message) => (false, message),
+    };
+    slog(config.session_log, |l| {
+        l.info(&format!(
+            "Codex thread action /undo: {} — {}",
+            if success { "ok" } else { "FAILED" },
+            message
+        ))
+    });
+    config.bus.send(AppEvent::CodexThreadActionResult {
+        session_id: config.session_id.clone(),
+        action: "undo".to_string(),
+        success,
+        message,
+    });
+}
+
 async fn rollback_side_thread_from_turn(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     side_rounds: &mut HashMap<String, usize>,
+    side_turn_revisions: &mut HashMap<String, UserTurnRevisionState>,
     side_thread_id: &str,
     first_user_turn_index: u32,
     config: &DrainConfig<'_>,
@@ -1548,9 +1727,7 @@ async fn rollback_side_thread_from_turn(
         ));
     }
 
-    let current_turn_count = *side_rounds
-        .entry(side_thread_id.to_string())
-        .or_insert(1);
+    let current_turn_count = *side_rounds.entry(side_thread_id.to_string()).or_insert(1);
     if first_user_turn_index as usize > current_turn_count {
         return Err(format!(
             "Cannot rewind side conversation {} to user turn {}; current side user turn count is {}",
@@ -1564,6 +1741,11 @@ async fn rollback_side_thread_from_turn(
         .await
         .map_err(|e| format!("thread rollback failed: {}", e))?;
 
+    let revisions = side_turn_revisions
+        .entry(side_thread_id.to_string())
+        .or_default();
+    revisions.seed_active_turns_to(current_turn_count as u32);
+    revisions.rewind_from_turn(first_user_turn_index);
     side_rounds.insert(
         side_thread_id.to_string(),
         first_user_turn_index.saturating_sub(1) as usize,
@@ -1579,18 +1761,18 @@ async fn rollback_side_thread_from_turn(
 async fn handle_side_undo_thread_action(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     side_rounds: &mut HashMap<String, usize>,
+    side_turn_revisions: &mut HashMap<String, UserTurnRevisionState>,
     side_thread_id: &str,
     params: serde_json::Value,
     config: &DrainConfig<'_>,
 ) {
     let turns = undo_turns_from_params(&params);
-    let current_turn_count = *side_rounds
-        .entry(side_thread_id.to_string())
-        .or_insert(1);
+    let current_turn_count = *side_rounds.entry(side_thread_id.to_string()).or_insert(1);
     let result = match side_rewind_first_turn_for_undo(current_turn_count, turns, side_thread_id) {
         Ok(first_user_turn_index) => rollback_side_thread_from_turn(
             agent,
             side_rounds,
+            side_turn_revisions,
             side_thread_id,
             first_user_turn_index,
             config,
@@ -1972,6 +2154,18 @@ async fn drain_external_agent_events(
                         &local_session_id,
                         &alias_session_id,
                     ) => {
+                        if action == "undo" {
+                            let message =
+                                "/undo is only available between turns for this session"
+                                    .to_string();
+                            config.bus.send(AppEvent::CodexThreadActionResult {
+                                session_id: local_session_id.clone(),
+                                action,
+                                success: false,
+                                message,
+                            });
+                            continue;
+                        }
                         handle_external_thread_action(agent, action, params, session_id, config)
                             .await;
                         continue;
@@ -2022,13 +2216,10 @@ async fn drain_external_agent_events(
                 });
             }
             external_agent::AgentEvent::UserMessage { text } => {
-                if let Some(pos) = pending_runtime_steers
-                    .iter()
-                    .position(|pending| {
-                        pending_runtime_steer_targets_session(pending, &local_session_id)
-                            && (pending.text == text || pending.text.trim() == text.trim())
-                    })
-                {
+                if let Some(pos) = pending_runtime_steers.iter().position(|pending| {
+                    pending_runtime_steer_targets_session(pending, &local_session_id)
+                        && (pending.text == text || pending.text.trim() == text.trim())
+                }) {
                     let Some(pending) = pending_runtime_steers.remove(pos) else {
                         continue;
                     };
@@ -2715,6 +2906,7 @@ struct FollowUpMessage {
     attachments: UserAttachments,
     steer_id: Option<String>,
     edit_user_turn_index: Option<u32>,
+    edit_user_turn_revision: Option<u32>,
     target_session_id: Option<String>,
 }
 
@@ -2725,6 +2917,7 @@ impl FollowUpMessage {
             attachments: UserAttachments::default(),
             steer_id: None,
             edit_user_turn_index: None,
+            edit_user_turn_revision: None,
             target_session_id: None,
         }
     }
@@ -2735,6 +2928,7 @@ impl FollowUpMessage {
             attachments,
             steer_id: None,
             edit_user_turn_index: None,
+            edit_user_turn_revision: None,
             target_session_id: None,
         }
     }
@@ -2745,16 +2939,23 @@ impl FollowUpMessage {
             attachments,
             steer_id: Some(steer_id),
             edit_user_turn_index: None,
+            edit_user_turn_revision: None,
             target_session_id: None,
         }
     }
 
-    fn edit_user_message(text: String, attachments: UserAttachments, user_turn_index: u32) -> Self {
+    fn edit_user_message(
+        text: String,
+        attachments: UserAttachments,
+        user_turn_index: u32,
+        user_turn_revision: u32,
+    ) -> Self {
         Self {
             text,
             attachments,
             steer_id: None,
             edit_user_turn_index: Some(user_turn_index),
+            edit_user_turn_revision: Some(user_turn_revision),
             target_session_id: None,
         }
     }
@@ -2847,7 +3048,9 @@ fn print_help() {
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle starts daemon/no TUI)");
-    println!("    --tls                 Serve the web dashboard over HTTPS/WSS (auto self-signed cert)");
+    println!(
+        "    --tls                 Serve the web dashboard over HTTPS/WSS (auto self-signed cert)"
+    );
     println!("    --tls-cert <PATH>     PEM cert overriding the self-signed cert (with --tls-key; implies --tls)");
     println!("    --tls-key <PATH>      PEM private key matching --tls-cert");
     println!("    --no-web              Disable web dashboard; use terminal TUI when interactive");
@@ -3991,10 +4194,35 @@ mod tests {
         assert!(zero.contains("at least 1"), "got: {zero}");
 
         let beyond = side_rewind_first_turn_for_undo(3, 4, "side-child").unwrap_err();
-        assert!(
-            beyond.contains("after the /side boundary"),
-            "got: {beyond}"
-        );
+        assert!(beyond.contains("after the /side boundary"), "got: {beyond}");
+    }
+
+    #[test]
+    fn parent_rewind_first_turn_for_undo_tracks_active_turn_count() {
+        assert_eq!(parent_rewind_first_turn_for_undo(3, 1).unwrap(), 3);
+        assert_eq!(parent_rewind_first_turn_for_undo(3, 2).unwrap(), 2);
+
+        let zero = parent_rewind_first_turn_for_undo(3, 0).unwrap_err();
+        assert!(zero.contains("at least 1"), "got: {zero}");
+
+        let beyond = parent_rewind_first_turn_for_undo(3, 4).unwrap_err();
+        assert!(beyond.contains("only 3 user turn"), "got: {beyond}");
+    }
+
+    #[test]
+    fn user_turn_revision_state_rejects_stale_replacement() {
+        let mut state = UserTurnRevisionState::default();
+        let (turn, revision) = state.record_next_turn();
+        assert_eq!((turn, revision), (1, 1));
+        assert!(state.validate_expected_revision(1, Some(1)).is_ok());
+
+        state.rewind_from_turn(1);
+        let (replacement_turn, replacement_revision) = state.record_next_turn();
+        assert_eq!((replacement_turn, replacement_revision), (1, 2));
+
+        let stale = state.validate_expected_revision(1, Some(1)).unwrap_err();
+        assert!(stale.contains("stale"), "got: {stale}");
+        assert!(state.validate_expected_revision(1, Some(2)).is_ok());
     }
 
     #[test]
@@ -9032,22 +9260,24 @@ async fn run_external_agent_mode(
     }
 
     // Event loop
-    let mut round = match (
+    let mut user_turn_revisions = match (
         &backend,
         resumed_external_session.as_deref(),
         backend_session_id.as_str(),
     ) {
         (external_agent::AgentBackend::Codex, Some(_), session_id) => {
-            count_codex_user_turns_from_history(session_id).unwrap_or(0) as usize
+            codex_user_turn_state_from_history(session_id).unwrap_or_default()
         }
-        _ => 0,
+        _ => UserTurnRevisionState::default(),
     };
+    let mut round = user_turn_revisions.active_count() as usize;
     let mut stats = LoopStats::default();
     let mut diff_tracker = ExternalDiffDeltaTracker::default();
     let mut pending_runtime_steers: std::collections::VecDeque<PendingRuntimeSteer> =
         std::collections::VecDeque::new();
     let mut open_side_threads: HashMap<String, String> = HashMap::new();
     let mut side_rounds: HashMap<String, usize> = HashMap::new();
+    let mut side_turn_revisions: HashMap<String, UserTurnRevisionState> = HashMap::new();
     let mut next_turn = if task.trim().is_empty() {
         None
     } else {
@@ -9132,6 +9362,7 @@ async fn run_external_agent_mode(
                                         handle_side_undo_thread_action(
                                             &mut agent,
                                             &mut side_rounds,
+                                            &mut side_turn_revisions,
                                             &side_thread_id,
                                             params,
                                             &drain_config,
@@ -9140,6 +9371,18 @@ async fn run_external_agent_mode(
                                         turn_bus_rx = bus.subscribe();
                                         continue;
                                     }
+                                }
+                                if action == "undo" {
+                                    handle_parent_undo_thread_action(
+                                        &mut agent,
+                                        &mut round,
+                                        &mut user_turn_revisions,
+                                        params,
+                                        &drain_config,
+                                    )
+                                    .await;
+                                    turn_bus_rx = bus.subscribe();
+                                    continue;
                                 }
                                 let effect = handle_external_thread_action(
                                     &mut agent,
@@ -9160,6 +9403,13 @@ async fn run_external_agent_mode(
                                         parent_thread_id.clone(),
                                     );
                                     side_rounds.entry(child_thread_id.clone()).or_insert(1);
+                                    side_turn_revisions
+                                        .entry(child_thread_id.clone())
+                                        .or_insert_with(|| {
+                                            let mut state = UserTurnRevisionState::default();
+                                            state.record_next_turn();
+                                            state
+                                        });
                                     emit_side_session_started(
                                         &drain_config,
                                         &parent_thread_id,
@@ -9189,6 +9439,7 @@ async fn run_external_agent_mode(
                                 {
                                     open_side_threads.remove(&child_thread_id);
                                     side_rounds.remove(&child_thread_id);
+                                    side_turn_revisions.remove(&child_thread_id);
                                 }
                                 turn_bus_rx = bus.subscribe();
                             }
@@ -9220,6 +9471,7 @@ async fn run_external_agent_mode(
         let attachments = followup.attachments;
         let steer_id = followup.steer_id;
         let edit_user_turn_index = followup.edit_user_turn_index;
+        let edit_user_turn_revision = followup.edit_user_turn_revision;
         let target_session_id = followup.target_session_id.clone();
 
         if let Some(side_thread_id) = target_session_id
@@ -9229,9 +9481,28 @@ async fn run_external_agent_mode(
         {
             let mut replacement_for_user_turn_index = None;
             if let Some(user_turn_index) = edit_user_turn_index {
+                if !agent.supports_user_message_rewind() {
+                    let message = format!("{} does not support user-message rewind", agent.name());
+                    slog(&session_log, |l| l.warn(&message));
+                    bus.send(AppEvent::LoopError(message));
+                    continue;
+                }
+                let current_side_round = *side_rounds.entry(side_thread_id.clone()).or_insert(1);
+                let revisions = side_turn_revisions
+                    .entry(side_thread_id.clone())
+                    .or_default();
+                revisions.seed_active_turns_to(current_side_round as u32);
+                if let Err(message) =
+                    revisions.validate_expected_revision(user_turn_index, edit_user_turn_revision)
+                {
+                    slog(&session_log, |l| l.warn(&message));
+                    bus.send(AppEvent::LoopError(message));
+                    continue;
+                }
                 match rollback_side_thread_from_turn(
                     &mut agent,
                     &mut side_rounds,
+                    &mut side_turn_revisions,
                     &side_thread_id,
                     user_turn_index,
                     &drain_config,
@@ -9258,11 +9529,16 @@ async fn run_external_agent_mode(
 
             let side_round = side_rounds.entry(side_thread_id.clone()).or_insert(0);
             *side_round += 1;
+            let user_turn_revision = side_turn_revisions
+                .entry(side_thread_id.clone())
+                .or_default()
+                .record_active_turn(*side_round as u32);
             emit_user_message_log(
                 &bus,
                 &session_log,
                 Some(&side_thread_id),
                 Some(*side_round as u32),
+                Some(user_turn_revision),
                 replacement_for_user_turn_index,
                 &turn_text,
             );
@@ -9315,6 +9591,12 @@ async fn run_external_agent_mode(
 
         let mut replacement_for_user_turn_index = None;
         if let Some(user_turn_index) = edit_user_turn_index {
+            if !agent.supports_user_message_rewind() {
+                let message = format!("{} does not support user-message rewind", agent.name());
+                slog(&session_log, |l| l.warn(&message));
+                bus.send(AppEvent::LoopError(message));
+                continue;
+            }
             if user_turn_index == 0 || user_turn_index as usize > round {
                 let message = format!(
                     "Cannot edit user turn {} in {} session {}; current user turn count is {}",
@@ -9330,9 +9612,17 @@ async fn run_external_agent_mode(
                 bus.send(AppEvent::LoopError(message));
                 continue;
             }
+            if let Err(message) = user_turn_revisions
+                .validate_expected_revision(user_turn_index, edit_user_turn_revision)
+            {
+                slog(&session_log, |l| l.warn(&message));
+                bus.send(AppEvent::LoopError(message));
+                continue;
+            }
             let turns_to_drop = round as u32 - user_turn_index + 1;
             match agent.rollback_turns(turns_to_drop).await {
                 Ok(()) => {
+                    user_turn_revisions.rewind_from_turn(user_turn_index);
                     round = user_turn_index.saturating_sub(1) as usize;
                     replacement_for_user_turn_index = Some(user_turn_index);
                     let message = format!(
@@ -9361,6 +9651,7 @@ async fn run_external_agent_mode(
         }
 
         round += 1;
+        let user_turn_revision = user_turn_revisions.record_active_turn(round as u32);
         stats.turns = 0;
         let attachment_count = attachments.len();
         emit_user_message_log(
@@ -9368,6 +9659,7 @@ async fn run_external_agent_mode(
             &session_log,
             live_session_id.as_deref(),
             Some(round as u32),
+            Some(user_turn_revision),
             replacement_for_user_turn_index,
             &turn_text,
         );

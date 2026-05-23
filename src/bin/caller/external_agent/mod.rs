@@ -181,6 +181,10 @@ impl AgentBackend {
             AgentBackend::ClaudeCode => thread_id != "claude-code-session",
         }
     }
+
+    pub fn supports_user_message_rewind(&self) -> bool {
+        matches!(self, AgentBackend::Codex)
+    }
 }
 
 pub fn source_session_id_is_canonical(source: &str, session_id: &str) -> bool {
@@ -482,6 +486,10 @@ pub trait ExternalAgent: Send + Sync {
         )))
     }
 
+    fn supports_user_message_rewind(&self) -> bool {
+        false
+    }
+
     /// Ask the backend to drop the last `turns_to_drop` conversational
     /// turns from the active thread. Backends that implement this
     /// (Codex, via `thread/rollback`) override it; backends that don't
@@ -610,6 +618,13 @@ mod tests {
         assert!(AgentBackend::ClaudeCode.thread_id_is_canonical("real-claude-session"));
         assert!(!source_session_id_is_canonical("unknown", "abc"));
         assert!(source_session_id_is_canonical("codex", "019abc"));
+    }
+
+    #[test]
+    fn user_message_rewind_capability_is_explicit() {
+        assert!(AgentBackend::Codex.supports_user_message_rewind());
+        assert!(!AgentBackend::ClaudeCode.supports_user_message_rewind());
+        assert!(!AgentBackend::GeminiCli.supports_user_message_rewind());
     }
 
     #[test]

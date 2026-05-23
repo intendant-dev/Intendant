@@ -1878,12 +1878,14 @@ async fn handle_control_command_mcp(
         ControlMsg::EditUserMessage {
             session_id,
             user_turn_index,
+            user_turn_revision,
             text,
             attachments,
         } => {
             bus.send(AppEvent::ControlCommand(ControlMsg::EditUserMessage {
                 session_id,
                 user_turn_index,
+                user_turn_revision,
                 text,
                 attachments,
             }));

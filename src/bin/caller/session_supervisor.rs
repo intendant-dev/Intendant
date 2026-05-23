@@ -299,11 +299,18 @@ impl SessionSupervisor {
             event::ControlMsg::EditUserMessage {
                 session_id,
                 user_turn_index,
+                user_turn_revision,
                 text,
                 attachments,
             } => {
-                self.route_edit_user_message(session_id, user_turn_index, text, attachments)
-                    .await;
+                self.route_edit_user_message(
+                    session_id,
+                    user_turn_index,
+                    user_turn_revision,
+                    text,
+                    attachments,
+                )
+                .await;
             }
             event::ControlMsg::Interrupt {
                 session_id,
@@ -1032,6 +1039,7 @@ impl SessionSupervisor {
         &self,
         session_id: Option<String>,
         user_turn_index: u32,
+        user_turn_revision: Option<u32>,
         text: String,
         attachments: Vec<String>,
     ) {
@@ -1065,21 +1073,39 @@ impl SessionSupervisor {
             ));
             return;
         };
-        if source != "codex" {
+        let Some(backend) = external_agent::AgentBackend::from_str_loose(&source) else {
+            self.warn(&format!(
+                "Edit dropped: unknown external-agent source {} for session {}",
+                source,
+                short_session(&managed_id)
+            ));
+            return;
+        };
+        if !backend.supports_user_message_rewind() {
             self.warn(&format!(
                 "Edit dropped: {} session {} does not support user-message rewind yet",
-                source,
+                backend,
                 short_session(&managed_id)
             ));
             return;
         }
         if user_turn_index == 0 {
             self.warn(&format!(
-                "Edit dropped: invalid user turn index 0 for Codex session {}",
+                "Edit dropped: invalid user turn index 0 for {} session {}",
+                backend,
                 short_session(&managed_id)
             ));
             return;
         }
+        let Some(user_turn_revision) = user_turn_revision else {
+            self.warn(&format!(
+                "Edit dropped: missing active-message revision for {} session {} user turn {}",
+                backend,
+                short_session(&managed_id),
+                user_turn_index
+            ));
+            return;
+        };
 
         let resolved_attachments = if attachments.is_empty() {
             Vec::new()
@@ -1094,9 +1120,10 @@ impl SessionSupervisor {
         };
         if resolved_attachments.len() < attachments.len() {
             self.warn(&format!(
-                "Only resolved {} of {} edit attachment(s) for Codex session {}",
+                "Only resolved {} of {} edit attachment(s) for {} session {}",
                 resolved_attachments.len(),
                 attachments.len(),
+                backend,
                 short_session(&managed_id)
             ));
         }
@@ -1104,10 +1131,12 @@ impl SessionSupervisor {
             text,
             UserAttachments::from_items(resolved_attachments),
             user_turn_index,
+            user_turn_revision,
         );
         if tx.send(msg).await.is_err() {
             self.warn(&format!(
-                "Edit dropped: Codex session {} in {} is not accepting input",
+                "Edit dropped: {} session {} in {} is not accepting input",
+                backend,
                 short_session(&managed_id),
                 project_root.display()
             ));

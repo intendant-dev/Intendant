@@ -642,6 +642,7 @@ pub enum AppEvent {
         session_id: Option<String>,
         content: String,
         user_turn_index: Option<u32>,
+        user_turn_revision: Option<u32>,
         replacement_for_user_turn_index: Option<u32>,
     },
 
@@ -1083,12 +1084,16 @@ pub enum ControlMsg {
     /// Replace a previous user message by rewinding the target session to the
     /// selected user turn and submitting replacement text.
     ///
-    /// Currently this is implemented for managed Codex-backed sessions, whose
-    /// app-server protocol exposes thread rollback.
+    /// Only backends that expose precise conversation rollback support this.
     EditUserMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         user_turn_index: u32,
+        /// Revision of the active user turn the frontend rendered. This lets
+        /// the backend reject stale edit requests after a message has already
+        /// been overwritten and replaced.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_turn_revision: Option<u32>,
         text: String,
         /// Frame/upload IDs attached via the dashboard. These are resolved
         /// just like StartTask.attachments before the replacement turn is sent.
@@ -1735,6 +1740,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             turn: *turn,
             session_id: session_id.clone(),
             user_turn_index: None,
+            user_turn_revision: None,
             replacement_for_user_turn_index: None,
         }),
         AppEvent::UserMessageRewind {
@@ -1750,6 +1756,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id,
             content,
             user_turn_index,
+            user_turn_revision,
             replacement_for_user_turn_index,
         } => Some(OutboundEvent::LogEntry {
             level: "info".to_string(),
@@ -1758,6 +1765,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             turn: None,
             session_id: session_id.clone(),
             user_turn_index: *user_turn_index,
+            user_turn_revision: *user_turn_revision,
             replacement_for_user_turn_index: *replacement_for_user_turn_index,
         }),
         AppEvent::RecordingStarted { stream_name } => Some(OutboundEvent::RecordingStarted {
@@ -3238,12 +3246,14 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             content: "New prompt".to_string(),
             user_turn_index: Some(4),
+            user_turn_revision: Some(2),
             replacement_for_user_turn_index: Some(4),
         };
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"log_entry\""));
         assert!(json.contains("\"user_turn_index\":4"));
+        assert!(json.contains("\"user_turn_revision\":2"));
         assert!(json.contains("\"replacement_for_user_turn_index\":4"));
     }
 

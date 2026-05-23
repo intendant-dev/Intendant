@@ -483,6 +483,8 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         user_turn_index: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        user_turn_revision: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         replacement_for_user_turn_index: Option<u32>,
     },
     /// Live user-message edit rewound an active external-agent session.

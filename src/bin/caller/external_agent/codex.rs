@@ -2807,6 +2807,10 @@ impl ExternalAgent for CodexAgent {
         CodexAgent::dispatch_thread_action(self, op, params).await
     }
 
+    fn supports_user_message_rewind(&self) -> bool {
+        true
+    }
+
     /// Native implementation of conversation rollback. Reuses the
     /// `thread/rollback` RPC under `numTurns` — same as `/undo`,
     /// just without the status string and with a guard allowing 0 to be
@@ -4439,7 +4443,10 @@ mod tests {
             .unwrap_err();
         match err {
             CallerError::ExternalAgent(msg) => {
-                assert!(msg.contains("cannot /fork a /side conversation"), "got: {msg}");
+                assert!(
+                    msg.contains("cannot /fork a /side conversation"),
+                    "got: {msg}"
+                );
                 assert!(msg.contains("parent-thread"), "got: {msg}");
             }
             other => panic!("expected ExternalAgent error, got {:?}", other),

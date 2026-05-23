@@ -34,6 +34,8 @@ pub enum UiCommand {
         turn: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_turn_index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_turn_revision: Option<u32>,
         #[serde(default, skip_serializing_if = "is_false")]
         superseded: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -937,6 +939,7 @@ struct LogEntry {
     collapsible: bool,
     turn: Option<u64>,
     user_turn_index: Option<u32>,
+    user_turn_revision: Option<u32>,
     superseded: bool,
     replacement_for_user_turn_index: Option<u32>,
 }
@@ -1089,6 +1092,7 @@ impl AppState {
                 collapsible: entry.collapsible,
                 turn: None, // separator already handled
                 user_turn_index: entry.user_turn_index,
+                user_turn_revision: entry.user_turn_revision,
                 superseded: entry.superseded,
                 replacement_for_user_turn_index: entry.replacement_for_user_turn_index,
                 images: vec![],
@@ -1411,6 +1415,7 @@ impl AppState {
                                 Some("agent_output"),
                                 output_id.clone(),
                                 None,
+                                None,
                                 false,
                                 None,
                             ));
@@ -1427,6 +1432,7 @@ impl AppState {
                             Vec::new(),
                             Some("agent_output"),
                             output_id.clone(),
+                            None,
                             None,
                             false,
                             None,
@@ -2228,6 +2234,9 @@ impl AppState {
                 let user_turn_index = msg["user_turn_index"]
                     .as_u64()
                     .and_then(|v| u32::try_from(v).ok());
+                let user_turn_revision = msg["user_turn_revision"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok());
                 let superseded = msg["superseded"].as_bool().unwrap_or(false);
                 let replacement_for_user_turn_index = msg["replacement_for_user_turn_index"]
                     .as_u64()
@@ -2242,6 +2251,7 @@ impl AppState {
                     kind,
                     None,
                     user_turn_index,
+                    user_turn_revision,
                     superseded,
                     replacement_for_user_turn_index,
                 ));
@@ -2288,6 +2298,7 @@ impl AppState {
                     "system",
                     Vec::new(),
                     Some("rollback_marker"),
+                    None,
                     None,
                     None,
                     false,
@@ -2573,7 +2584,7 @@ impl AppState {
         images: Vec<String>,
     ) -> Vec<UiCommand> {
         self.add_log_with_metadata(
-            level, content, turn, source, images, None, None, None, false, None,
+            level, content, turn, source, images, None, None, None, None, false, None,
         )
     }
 
@@ -2587,6 +2598,7 @@ impl AppState {
         kind: Option<&str>,
         output_id: Option<String>,
         user_turn_index: Option<u32>,
+        user_turn_revision: Option<u32>,
         superseded: bool,
         replacement_for_user_turn_index: Option<u32>,
     ) -> Vec<UiCommand> {
@@ -2622,6 +2634,7 @@ impl AppState {
             collapsible: is_collapsible,
             turn,
             user_turn_index,
+            user_turn_revision,
             superseded,
             replacement_for_user_turn_index,
         };
@@ -2652,6 +2665,7 @@ impl AppState {
             collapsible: is_collapsible,
             turn: None, // separator already emitted
             user_turn_index,
+            user_turn_revision,
             superseded,
             replacement_for_user_turn_index,
             images,
@@ -4146,6 +4160,7 @@ mod tests {
             "content": "Old prompt",
             "session_id": "session-1",
             "user_turn_index": 3,
+            "user_turn_revision": 2,
             "superseded": true,
             "kind": "rollback_marker",
             "replacement_for_user_turn_index": 3
@@ -4159,6 +4174,7 @@ mod tests {
                     content,
                     kind,
                     user_turn_index,
+                    user_turn_revision,
                     superseded,
                     replacement_for_user_turn_index,
                     ..
@@ -4166,6 +4182,7 @@ mod tests {
                     content,
                     kind,
                     user_turn_index,
+                    user_turn_revision,
                     superseded,
                     replacement_for_user_turn_index,
                 )),
@@ -4176,8 +4193,9 @@ mod tests {
         assert_eq!(entry.0, "Old prompt");
         assert_eq!(entry.1.as_deref(), Some("rollback_marker"));
         assert_eq!(*entry.2, Some(3));
-        assert!(*entry.3);
-        assert_eq!(*entry.4, Some(3));
+        assert_eq!(*entry.3, Some(2));
+        assert!(*entry.4);
+        assert_eq!(*entry.5, Some(3));
     }
 
     #[test]
@@ -4262,6 +4280,7 @@ mod tests {
             collapsible: false,
             turn: None,
             user_turn_index: None,
+            user_turn_revision: None,
             superseded: false,
             replacement_for_user_turn_index: None,
             images: vec![],

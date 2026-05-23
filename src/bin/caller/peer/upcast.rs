@@ -2143,6 +2143,7 @@ impl WireEventUpcaster {
                 turn: _,
                 session_id: _,
                 user_turn_index: _,
+                user_turn_revision: _,
                 replacement_for_user_turn_index: _,
             } => {
                 vec![log_event(wire_log_level(level), source, content.clone())]
