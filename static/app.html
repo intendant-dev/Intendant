@@ -1758,9 +1758,10 @@ html, body {
   padding: 2px 8px;
   font-size: 12px;
 }
-.session-window-log .log-icon,
-.session-window-log .log-host,
-.session-window-log .log-session {
+/* Per-session windows use their header/context for identity; keep rows compact. */
+.session-window-log .log-entry .log-icon,
+.session-window-log .log-entry .log-host,
+.session-window-log .log-entry .log-session {
   display: none;
 }
 .session-window-log .log-ts { width: 58px; }
