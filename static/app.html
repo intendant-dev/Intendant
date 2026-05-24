@@ -11404,6 +11404,12 @@ function normalizeSessionWindowMeta(meta = {}) {
   if (backendSessionId) out.backendSessionId = backendSessionId;
   const intendantSessionId = compactSessionText(meta.intendant_session_id || meta.intendantSessionId);
   if (intendantSessionId) out.intendantSessionId = intendantSessionId;
+  const parentId = compactSessionText(meta.parent_session_id || meta.parentSessionId || meta.parent_id || meta.parentId);
+  if (parentId) out.parentId = parentId;
+  const relationshipRaw = meta.relationship_kind || meta.relationshipKind || meta.relationship;
+  if (relationshipRaw) out.relationshipKind = normalizeSessionRelationshipKind(relationshipRaw);
+  const relationshipEphemeral = meta.relationship_ephemeral ?? meta.relationshipEphemeral ?? meta.ephemeral;
+  if (relationshipEphemeral !== undefined) out.relationshipEphemeral = !!relationshipEphemeral;
   if (meta.phase) out.phase = meta.phase;
   if (meta.ended !== undefined) out.ended = !!meta.ended;
   return out;
@@ -11419,6 +11425,12 @@ function sessionWindowMetadataSignature(meta = {}) {
     meta.cwdLabel || '',
     meta.source || '',
     meta.sourceLabel || '',
+    meta.backendSource || '',
+    meta.backendSessionId || '',
+    meta.intendantSessionId || '',
+    meta.parentId || '',
+    meta.relationshipKind || '',
+    meta.relationshipEphemeral === undefined ? '' : (meta.relationshipEphemeral ? '1' : '0'),
     meta.phase || '',
     meta.ended === undefined ? '' : (meta.ended ? '1' : '0'),
   ].join('\u001f');
@@ -11451,6 +11463,18 @@ function sessionWindowMetaFromSession(session) {
   });
 }
 
+function applySessionRelationshipsFromSession(session) {
+  if (!session || typeof session !== 'object') return;
+  const relationships = [
+    ...(Array.isArray(session.relationships) ? session.relationships : []),
+    ...(Array.isArray(session.related_sessions) ? session.related_sessions : []),
+  ];
+  for (const rel of relationships) {
+    if (!rel || typeof rel !== 'object') continue;
+    applySessionRelationship(rel);
+  }
+}
+
 function cacheSessionWindowMetadata(sessions) {
   if (!Array.isArray(sessions)) return;
   for (const session of sessions) {
@@ -11475,6 +11499,9 @@ function cacheSessionWindowMetadata(sessions) {
         backend_source_label: session.backend_source_label,
       });
     }
+  }
+  for (const session of sessions) {
+    applySessionRelationshipsFromSession(session);
   }
   persistSessionWindowState();
 }
@@ -11502,13 +11529,33 @@ function sessionWindowPersistedSource(sessionId, win = null) {
   );
 }
 
+function persistedSessionWindowRecord(sessionId, win = null) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const meta = sessionMetadataById.get(sid) || {};
+  const source = sessionWindowPersistedSource(sid, win);
+  if (!source) return null;
+  const record = { session_id: sid, source };
+  if (meta.sourceLabel) record.source_label = meta.sourceLabel;
+  if (meta.backendSource) record.backend_source = meta.backendSource;
+  if (meta.backendSessionId) record.backend_session_id = meta.backendSessionId;
+  if (meta.intendantSessionId) record.intendant_session_id = meta.intendantSessionId;
+  if (meta.projectRoot) record.project_root = meta.projectRoot;
+  if (meta.cwd) record.cwd = meta.cwd;
+  if (meta.parentId && meta.relationshipKind) {
+    record.parent_session_id = meta.parentId;
+    record.relationship = meta.relationshipKind;
+    record.ephemeral = !!meta.relationshipEphemeral;
+  }
+  return record;
+}
+
 function persistSessionWindowState() {
   if (restoringPersistedSessionWindows) return;
   const windows = [];
   for (const [sid, win] of sessionWindows) {
-    const source = sessionWindowPersistedSource(sid, win);
-    if (!source) continue;
-    windows.push({ session_id: sid, source });
+    const record = persistedSessionWindowRecord(sid, win);
+    if (record) windows.push(record);
   }
   try {
     if (windows.length) {
@@ -11519,6 +11566,17 @@ function persistSessionWindowState() {
   } catch (_) {}
 }
 
+function normalizePersistedSessionWindowRecord(record = {}) {
+  const sessionId = String(record?.session_id || record?.sessionId || record?.id || '').trim();
+  if (!sessionId) return null;
+  const meta = normalizeSessionWindowMeta(record);
+  const source = normalizeAgentId(record?.source || record?.backendSource || record?.backend_source || meta.backendSource || meta.source || '');
+  if (!source) return null;
+  meta.source = source;
+  if (!meta.sourceLabel) meta.sourceLabel = prettyAgentName(source);
+  return { sessionId, source, meta };
+}
+
 function restorePersistedSessionWindowsSoon(delay = 1200) {
   if (restoredPersistedSessionWindows) return;
   restoredPersistedSessionWindows = true;
@@ -11527,14 +11585,27 @@ function restorePersistedSessionWindowsSoon(delay = 1200) {
 
 async function restorePersistedSessionWindows() {
   const records = readPersistedSessionWindowState()
-    .map(record => ({
-      sessionId: String(record?.session_id || record?.id || '').trim(),
-      source: normalizeAgentId(record?.source || record?.backendSource || ''),
-    }))
-    .filter(record => record.sessionId && record.source);
+    .map(normalizePersistedSessionWindowRecord)
+    .filter(Boolean);
   if (!records.length) return;
   restoringPersistedSessionWindows = true;
   try {
+    for (const record of records) {
+      sessionMetadataById.set(record.sessionId, {
+        ...(sessionMetadataById.get(record.sessionId) || {}),
+        ...record.meta,
+      });
+    }
+    for (const record of records) {
+      if (record.meta.parentId && record.meta.relationshipKind) {
+        applySessionRelationship({
+          parent_session_id: record.meta.parentId,
+          child_session_id: record.sessionId,
+          relationship: record.meta.relationshipKind,
+          ephemeral: !!record.meta.relationshipEphemeral,
+        });
+      }
+    }
     await Promise.all(records.map(record => restorePersistedSessionWindow(record)));
   } finally {
     restoringPersistedSessionWindows = false;
@@ -11551,6 +11622,7 @@ async function restorePersistedSessionWindow(record) {
   sessionWindowRestoreInFlight.add(sid);
   try {
     const win = ensureSessionWindow(sid, {
+      ...(record.meta || {}),
       source,
       source_label: prettyAgentName(source),
       phase: 'idle',
@@ -11561,6 +11633,7 @@ async function restorePersistedSessionWindow(record) {
     const resp = await authedFetch(`/api/session/${encodeURIComponent(sid)}?source=${encodeURIComponent(source)}`);
     const data = await resp.json();
     if (!resp.ok || data?.error) return;
+    applySessionRelationshipsFromSession(data);
     const entries = Array.isArray(data.entries) ? data.entries : [];
     if (!entries.length) return;
 
