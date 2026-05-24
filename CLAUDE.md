@@ -272,4 +272,9 @@ you didn't spawn; they belong to other agents.
 
 ## CI/CD
 
-None configured. Run `cargo test --bins` and `cargo clippy` locally before committing.
+GitHub Actions (on push / PR to `main`): a cross-platform `cargo check` on
+Windows + macOS + Linux (`.github/workflows/windows.yml`) to catch
+platform-specific build breaks, plus `cargo audit` (`audit.yml`) and an mdBook
+docs deploy (`docs.yml`). The `tests/e2e/` integration tests are NOT in CI
+(they make real API calls). Run `cargo test --bins` and `cargo clippy` locally
+before committing.
