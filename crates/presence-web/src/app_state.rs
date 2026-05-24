@@ -975,6 +975,7 @@ pub struct AppState {
     // Usage
     main_usage: Option<UsageSnapshot>,
     session_main_usage: std::collections::HashMap<String, UsageSnapshot>,
+    usage_log_bands: std::collections::HashMap<String, u8>,
     presence_usage: Option<UsageSnapshot>,
     live_usage: Option<LiveUsageSnapshot>,
     token_history: Vec<TokenHistoryEntry>,
@@ -1017,6 +1018,7 @@ impl AppState {
             event_session_id: None,
             main_usage: None,
             session_main_usage: std::collections::HashMap::new(),
+            usage_log_bands: std::collections::HashMap::new(),
             presence_usage: None,
             live_usage: None,
             token_history: Vec::new(),
@@ -1968,17 +1970,7 @@ impl AppState {
                         if let Some(sid) = self.event_session_id.clone() {
                             self.session_main_usage.insert(sid, u.clone());
                         }
-                        cmds.extend(self.add_log(
-                            "detail",
-                            &format!(
-                                "tokens: {} / {} ({:.1}%)",
-                                format_number(u.tokens_used),
-                                format_number(u.context_window),
-                                u.usage_pct
-                            ),
-                            None,
-                            "system",
-                        ));
+                        cmds.extend(self.add_usage_log_if_milestone(&u));
                         if current_session_event {
                             self.budget_pct = u.usage_pct;
                             cmds.push(UiCommand::UpdateStatusBar {
@@ -2676,6 +2668,39 @@ impl AppState {
         cmds
     }
 
+    fn add_usage_log_if_milestone(&mut self, usage: &UsageSnapshot) -> Vec<UiCommand> {
+        let Some(band) = usage_log_band(usage) else {
+            return Vec::new();
+        };
+        let key = self
+            .event_session_id
+            .as_deref()
+            .filter(|sid| !sid.is_empty())
+            .unwrap_or("__global__")
+            .to_string();
+        let previous = self.usage_log_bands.get(&key).copied();
+        let should_log = match previous {
+            None => true,
+            Some(prev) => band > prev || band.saturating_add(10) <= prev,
+        };
+        if !should_log {
+            return Vec::new();
+        }
+
+        self.usage_log_bands.insert(key, band);
+        self.add_log(
+            "detail",
+            &format!(
+                "tokens: {} / {} ({:.1}%)",
+                format_number(usage.tokens_used),
+                format_number(usage.context_window),
+                usage.usage_pct
+            ),
+            None,
+            "system",
+        )
+    }
+
     /// Update live model usage and return commands to re-render the Usage tab.
     pub fn update_live_usage(&mut self, usage: LiveUsageSnapshot) -> Vec<UiCommand> {
         self.live_usage = Some(usage);
@@ -3129,6 +3154,22 @@ fn format_number(n: u64) -> String {
     result.chars().rev().collect()
 }
 
+fn usage_log_band(usage: &UsageSnapshot) -> Option<u8> {
+    if usage.context_window == 0 || !usage.usage_pct.is_finite() || usage.usage_pct < 10.0 {
+        return None;
+    }
+    let pct = usage.usage_pct.clamp(0.0, 100.0);
+    if pct >= 95.0 {
+        Some(95)
+    } else if pct >= 90.0 {
+        Some(90)
+    } else if pct >= 75.0 {
+        Some(75)
+    } else {
+        Some(((pct / 10.0).floor() as u8) * 10)
+    }
+}
+
 /// Get current time as HH:MM:SS string.
 /// In WASM, uses js_sys::Date. In tests, returns a fixed string.
 #[cfg(target_arch = "wasm32")]
@@ -3194,6 +3235,26 @@ mod tests {
         assert_eq!(format_number(999), "999");
         assert_eq!(format_number(1000), "1,000");
         assert_eq!(format_number(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn usage_log_band_uses_coarse_context_milestones() {
+        let mut u = UsageSnapshot {
+            tokens_used: 9_000,
+            context_window: 100_000,
+            usage_pct: 9.0,
+            ..Default::default()
+        };
+        assert_eq!(usage_log_band(&u), None);
+
+        u.usage_pct = 31.8;
+        assert_eq!(usage_log_band(&u), Some(30));
+
+        u.usage_pct = 75.1;
+        assert_eq!(usage_log_band(&u), Some(75));
+
+        u.usage_pct = 96.0;
+        assert_eq!(usage_log_band(&u), Some(95));
     }
 
     #[test]
@@ -3833,6 +3894,54 @@ mod tests {
         assert!(cmds
             .iter()
             .any(|c| matches!(c, UiCommand::UpdateUsage { .. })));
+    }
+
+    #[test]
+    fn usage_update_logs_only_new_context_milestones() {
+        fn usage_msg(tokens_used: u64, usage_pct: f64) -> serde_json::Value {
+            json!({
+                "event": "usage_update",
+                "session_id": "sess-a",
+                "main": {
+                    "provider": "openai",
+                    "model": "gpt-5",
+                    "tokens_used": tokens_used,
+                    "context_window": 10000,
+                    "usage_pct": usage_pct,
+                    "prompt_tokens": tokens_used,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0
+                }
+            })
+        }
+
+        fn token_log_count(cmds: &[UiCommand]) -> usize {
+            cmds.iter()
+                .filter(|cmd| {
+                    matches!(
+                        cmd,
+                        UiCommand::AddLogEntry { content, .. }
+                            if content.starts_with("tokens: ")
+                    )
+                })
+                .count()
+        }
+
+        let mut s = AppState::new();
+        s.session_id = "sess-a".to_string();
+        s.verbosity = "verbose".to_string();
+
+        let first = s.handle_message(&usage_msg(3_130, 31.3));
+        assert_eq!(token_log_count(&first), 1);
+
+        let same_band = s.handle_message(&usage_msg(3_350, 33.5));
+        assert_eq!(token_log_count(&same_band), 0);
+        assert!(same_band
+            .iter()
+            .any(|cmd| matches!(cmd, UiCommand::UpdateUsage { .. })));
+
+        let next_band = s.handle_message(&usage_msg(4_000, 40.0));
+        assert_eq!(token_log_count(&next_band), 1);
     }
 
     #[test]
