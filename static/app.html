@@ -40,6 +40,9 @@
   --log-presence: var(--green);
   --concurrent-view-bg: color-mix(in srgb, var(--mantle) 92%, transparent);
   --concurrent-view-hover-bg: color-mix(in srgb, var(--mantle) 96%, transparent);
+  --session-window-bg: color-mix(in srgb, var(--mantle) 82%, transparent);
+  --session-window-header-bg: color-mix(in srgb, var(--crust) 86%, transparent);
+  --session-window-hover-bg: color-mix(in srgb, var(--mantle) 90%, transparent);
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1486,7 +1489,7 @@ html, body {
   flex-direction: column;
   border: 1px solid var(--surface1);
   border-radius: 6px;
-  background: var(--mantle);
+  background: var(--session-window-bg);
   overflow: hidden;
   cursor: pointer;
 }
@@ -1560,7 +1563,7 @@ html, body {
   gap: 8px;
   padding: 6px 8px;
   border-bottom: 1px solid var(--surface0);
-  background: var(--crust);
+  background: var(--session-window-header-bg);
   flex-shrink: 0;
 }
 .session-window:not(.header-collapsed):not(.minimized) .session-window-header {
@@ -1844,6 +1847,7 @@ html, body {
   border-left: 2px solid transparent;
 }
 .log-entry:hover { background: var(--mantle); }
+.session-window .log-entry:hover { background: var(--session-window-hover-bg); }
 .concurrent-log-region .log-entry:hover { background: var(--concurrent-view-hover-bg); }
 .log-entry.level-model { border-left-color: rgba(137, 180, 250, 0.55); }
 .log-entry.level-agent { border-left-color: rgba(148, 226, 213, 0.55); }
