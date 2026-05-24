@@ -1518,7 +1518,8 @@ html, body {
 }
 .session-window.minimized .session-window-log,
 .session-window.minimized .session-window-cwd,
-.session-window.minimized .session-window-task {
+.session-window.minimized .session-window-task,
+.session-window.minimized .session-window-jump-bottom {
   display: none;
 }
 .session-window.minimized .session-window-header {
@@ -1770,6 +1771,29 @@ html, body {
   min-height: 0;
   overflow-y: auto;
   padding: 3px 0;
+}
+.session-window-jump-bottom {
+  position: absolute;
+  right: 10px;
+  bottom: 8px;
+  z-index: 12;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--crust) 92%, transparent);
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1;
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.32);
+  cursor: pointer;
+}
+.session-window-jump-bottom:hover {
+  border-color: var(--blue);
+  color: var(--blue);
 }
 .session-window-log .log-entry {
   padding: 2px 8px;
@@ -10492,6 +10516,9 @@ function renderDiffLogBody(body, parsed, options = {}) {
 function resetSessionWindowLog(win) {
   if (!win || !win.log) return;
   win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+  win.followOutput = true;
+  win.pendingOutput = false;
+  updateSessionWindowJumpButton(win);
 }
 
 function resetSessionWindowsForReplay(entries) {
@@ -11450,6 +11477,61 @@ function sessionWindowShouldStartHeaderCollapsed(meta = {}) {
   return String(meta.relationshipKind || '').trim().toLowerCase() === 'subagent';
 }
 
+const SESSION_WINDOW_BOTTOM_THRESHOLD_PX = 28;
+
+function sessionWindowLogIsAtBottom(log) {
+  if (!log) return true;
+  return log.scrollHeight - log.scrollTop - log.clientHeight <= SESSION_WINDOW_BOTTOM_THRESHOLD_PX;
+}
+
+function sessionWindowShouldFollowNextOutput(win) {
+  if (!win || !win.log) return true;
+  return !!win.followOutput || sessionWindowLogIsAtBottom(win.log);
+}
+
+function updateSessionWindowJumpButton(win) {
+  if (!win || !win.jumpBottom) return;
+  const show = !!win.pendingOutput && !win.followOutput && !win.minimized;
+  win.jumpBottom.classList.toggle('hidden', !show);
+  win.jumpBottom.setAttribute('aria-hidden', show ? 'false' : 'true');
+}
+
+function scrollSessionWindowToBottom(win) {
+  if (!win || !win.log) return;
+  win.log.scrollTop = win.log.scrollHeight;
+  win.followOutput = true;
+  win.pendingOutput = false;
+  updateSessionWindowJumpButton(win);
+}
+
+function applySessionWindowOutputScroll(win, shouldFollow) {
+  if (!win || !win.log) return;
+  if (shouldFollow) {
+    scrollSessionWindowToBottom(win);
+  } else {
+    win.followOutput = false;
+    win.pendingOutput = true;
+    updateSessionWindowJumpButton(win);
+  }
+}
+
+function updateSessionWindowFollowFromScroll(win) {
+  if (!win || !win.log) return;
+  if (sessionWindowLogIsAtBottom(win.log)) {
+    win.followOutput = true;
+    win.pendingOutput = false;
+  } else {
+    win.followOutput = false;
+  }
+  updateSessionWindowJumpButton(win);
+}
+
+function sessionWindowForLogDescendant(node) {
+  const root = node?.closest?.('.session-window');
+  const sid = root?.dataset?.sessionId || '';
+  return sid ? sessionWindows.get(sid) : null;
+}
+
 function codexThreadActionAllowedForSide(op) {
   const normalized = String(op || '').trim().toLowerCase().replace(/_/g, '-');
   return normalized === 'side-close' || normalized === 'undo';
@@ -12075,11 +12157,26 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const log = document.createElement('div');
   log.className = 'session-window-log';
   log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+  const jumpBottom = document.createElement('button');
+  jumpBottom.className = 'session-window-jump-bottom hidden';
+  jumpBottom.type = 'button';
+  jumpBottom.title = 'Jump to latest output';
+  jumpBottom.setAttribute('aria-label', jumpBottom.title);
+  jumpBottom.setAttribute('aria-hidden', 'true');
+  jumpBottom.textContent = '\u2193';
 
   el.appendChild(header);
   el.appendChild(log);
+  el.appendChild(jumpBottom);
   el.addEventListener('mousedown', () => focusSessionWindow(sid));
   el.addEventListener('focus', () => focusSessionWindow(sid));
+  log.addEventListener('scroll', () => updateSessionWindowFollowFromScroll(sessionWindows.get(sid)));
+  jumpBottom.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    focusSessionWindow(sid);
+    scrollSessionWindowToBottom(sessionWindows.get(sid));
+  });
   header.addEventListener('click', (e) => {
     if (e.target.closest?.('button, a, input, textarea, select, [role="menu"]')) return;
     if (sessionWindows.get(sid)?.minimized) return;
@@ -12141,10 +12238,13 @@ function ensureSessionWindow(sessionId, meta = {}) {
     header,
     minimize,
     maximize,
+    jumpBottom,
     phase: normalizeSessionPhase(meta.phase || 'idle'),
     pendingActiveUntil: 0,
     ended: false,
     minimized: false,
+    followOutput: true,
+    pendingOutput: false,
     headerCollapsed: startHeaderCollapsed,
   };
   sessionWindows.set(sid, win);
@@ -12222,6 +12322,7 @@ function updateSessionWindowMinimizeState(sessionId) {
     win.minimize.setAttribute('aria-label', win.minimize.title);
     win.minimize.setAttribute('aria-pressed', minimized ? 'true' : 'false');
   }
+  updateSessionWindowJumpButton(win);
 }
 
 function updateSessionWindowHeaderCollapseState(sessionId) {
@@ -12414,7 +12515,7 @@ function flushLogReplayAppendBatch() {
     while (state.win.log.children.length > SESSION_WINDOW_LOG_LIMIT) {
       state.win.log.removeChild(state.win.log.firstElementChild);
     }
-    state.win.log.scrollTop = state.win.log.scrollHeight;
+    applySessionWindowOutputScroll(state.win, state.shouldFollow);
   }
   batch.sessionFragments.clear();
   batch.added = 0;
@@ -12427,6 +12528,7 @@ function appendLogEntryToSessionWindow(entry, batch = null) {
   if (!win) return;
   const empty = win.log.querySelector('.session-window-empty');
   if (empty) empty.remove();
+  const shouldFollow = sessionWindowShouldFollowNextOutput(win);
   const clone = entry.cloneNode(true);
   clone.removeAttribute('id');
   clone.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
@@ -12434,7 +12536,7 @@ function appendLogEntryToSessionWindow(entry, batch = null) {
   if (batch) {
     let state = batch.sessionFragments.get(sid);
     if (!state || state.win !== win) {
-      state = { win, fragment: document.createDocumentFragment() };
+      state = { win, fragment: document.createDocumentFragment(), shouldFollow };
       batch.sessionFragments.set(sid, state);
     }
     state.fragment.appendChild(clone);
@@ -12444,7 +12546,7 @@ function appendLogEntryToSessionWindow(entry, batch = null) {
   while (win.log.children.length > SESSION_WINDOW_LOG_LIMIT) {
     win.log.removeChild(win.log.firstElementChild);
   }
-  win.log.scrollTop = win.log.scrollHeight;
+  applySessionWindowOutputScroll(win, shouldFollow);
 }
 
 function inferSessionPhaseFromLog(c) {
@@ -12863,6 +12965,13 @@ function wireDiffLogEntry(entry) {
 
 function appendCommandOutputChunk(group, c) {
   const text = c.content ?? '';
+  const sessionScrollStates = new Map();
+  for (const view of commandOutputCloneViews(group)) {
+    const win = sessionWindowForLogDescendant(view.entry);
+    if (win && !sessionScrollStates.has(win)) {
+      sessionScrollStates.set(win, sessionWindowShouldFollowNextOutput(win));
+    }
+  }
   if (group.copyRef && text) group.copyRef.text += text;
   if (c.output_id && !group.outputIdSet.has(c.output_id)) {
     group.outputIdSet.add(c.output_id);
@@ -12881,6 +12990,9 @@ function appendCommandOutputChunk(group, c) {
         appendCommandOutputText(view.body, text);
       }
     }
+  }
+  for (const [win, shouldFollow] of sessionScrollStates.entries()) {
+    applySessionWindowOutputScroll(win, shouldFollow);
   }
 }
 
