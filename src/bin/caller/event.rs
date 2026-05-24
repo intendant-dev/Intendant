@@ -2052,7 +2052,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             log.session_capabilities(session_id, capabilities);
         }
         AppEvent::SessionAttached { session_id, source } => {
-            log.info(&format!("Session attached: {} ({})", session_id, source));
+            log.session_attached(session_id, source);
         }
         AppEvent::SessionEnded { session_id, reason } => {
             log.session_ended(session_id, reason);

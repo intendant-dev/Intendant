@@ -1435,8 +1435,11 @@ fn replay_jsonl_to_outbound_entries(
     log_dir: &std::path::Path,
 ) -> Vec<serde_json::Value> {
     let (provider, model, autonomy) = scan_replay_status(contents);
-    let replay_session_id = external_backend_session_id_from_replay(contents)
-        .or_else(|| replay_session_id_from_dir(log_dir));
+    let external_replay_session_id = external_backend_session_id_from_replay(contents);
+    let wrapper_replay_session_id = replay_session_id_from_dir(log_dir);
+    let replay_session_id = external_replay_session_id
+        .clone()
+        .or_else(|| wrapper_replay_session_id.clone());
 
     let mut entries: Vec<serde_json::Value> = Vec::new();
     entries.push(serde_json::json!({
@@ -1479,6 +1482,18 @@ fn replay_jsonl_to_outbound_entries(
                     obj.insert(
                         "session_id".to_string(),
                         serde_json::Value::String(session_id.to_string()),
+                    );
+                }
+            } else if let (Some(external_id), Some(wrapper_id)) = (
+                external_replay_session_id.as_deref(),
+                wrapper_replay_session_id.as_deref(),
+            ) {
+                let event = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                let session_id = obj.get("session_id").and_then(|v| v.as_str());
+                if event != "session_identity" && session_id == Some(wrapper_id) {
+                    obj.insert(
+                        "session_id".to_string(),
+                        serde_json::Value::String(external_id.to_string()),
                     );
                 }
             }
@@ -4793,11 +4808,24 @@ fn external_attached_session_from_wire(line: &str) -> Option<(String, String)> {
         return None;
     }
     let session_id = parsed.get("session_id").and_then(|v| v.as_str())?;
-    let source = parsed.get("source").and_then(|v| v.as_str())?;
-    if source == "intendant" {
+    let source = parsed
+        .get("source")
+        .and_then(|v| v.as_str())
+        .map(crate::session_names::normalize_source)?;
+    if session_id.trim().is_empty() || source.is_empty() || source == "intendant" {
         return None;
     }
-    Some((session_id.to_string(), source.to_string()))
+    Some((session_id.to_string(), source))
+}
+
+fn update_external_attached_sessions_from_wire(sessions: &mut HashMap<String, String>, line: &str) {
+    if let Some((session_id, source)) = external_attached_session_from_wire(line) {
+        sessions.insert(session_id, source);
+        return;
+    }
+    if let Some(ended_id) = session_ended_id_from_wire(line) {
+        sessions.remove(&ended_id);
+    }
 }
 
 fn session_ended_id_from_wire(line: &str) -> Option<String> {
@@ -7343,10 +7371,13 @@ pub fn spawn_web_gateway(
     // "None (internal agent)" on every page refresh even though the
     // daemon still has the value in memory.
     let last_external_agent_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    // Cache the current externally-attached session so refreshed browsers
-    // can rehydrate Activity with the same compact transcript shown in the
-    // Sessions tab instead of coming back empty.
-    let last_session_attached_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Cache all currently externally-attached sessions so refreshed browsers
+    // can rehydrate every open Activity window with the same compact
+    // transcript shown in the Sessions tab. This must be a set, not "last
+    // attached", because multiple Codex/Claude/Gemini session windows may be
+    // open at once.
+    let attached_external_sessions: Arc<Mutex<HashMap<String, String>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     // Cache the latest user_display_granted event. The authoritative
     // state lives in AutonomyState.user_display_granted on the server,
     // but the dashboard only learns about it via the broadcast; without
@@ -7369,7 +7400,7 @@ pub fn spawn_web_gateway(
         let status_cache = last_status_json.clone();
         let autonomy_cache = last_autonomy_json.clone();
         let external_agent_cache = last_external_agent_json.clone();
-        let session_attached_cache = last_session_attached_json.clone();
+        let session_attached_cache = attached_external_sessions.clone();
         let user_display_cache = last_user_display_json.clone();
         let display_cache = display_ready_cache.clone();
         let mut usage_rx = broadcast_tx.subscribe();
@@ -7440,27 +7471,12 @@ pub fn spawn_web_gateway(
                         }
                         if line.contains("\"event\":\"session_attached\"") {
                             if let Ok(mut guard) = session_attached_cache.lock() {
-                                *guard = external_attached_session_from_wire(&line)
-                                    .map(|_| line.clone());
-                            }
-                        }
-                        if line.contains("\"event\":\"session_started\"") {
-                            if let Ok(mut guard) = session_attached_cache.lock() {
-                                *guard = None;
+                                update_external_attached_sessions_from_wire(&mut guard, &line);
                             }
                         }
                         if line.contains("\"event\":\"session_ended\"") {
-                            if let Some(ended_id) = session_ended_id_from_wire(&line) {
-                                if let Ok(mut guard) = session_attached_cache.lock() {
-                                    let should_clear = guard
-                                        .as_deref()
-                                        .and_then(external_attached_session_from_wire)
-                                        .map(|(session_id, _)| session_id == ended_id)
-                                        .unwrap_or(false);
-                                    if should_clear {
-                                        *guard = None;
-                                    }
-                                }
+                            if let Ok(mut guard) = session_attached_cache.lock() {
+                                update_external_attached_sessions_from_wire(&mut guard, &line);
                             }
                         }
                     }
@@ -7591,7 +7607,7 @@ pub fn spawn_web_gateway(
             let last_status_json = last_status_json.clone();
             let last_autonomy_json = last_autonomy_json.clone();
             let last_external_agent_json = last_external_agent_json.clone();
-            let last_session_attached_json = last_session_attached_json.clone();
+            let attached_external_sessions = attached_external_sessions.clone();
             let last_user_display_json = last_user_display_json.clone();
             let display_ready_cache = display_ready_cache.clone();
             let web_tui_tx = web_tui_tx.clone();
@@ -8101,12 +8117,21 @@ pub fn spawn_web_gateway(
                         }
                     }
 
-                    let active_external_session = last_session_attached_json
-                        .lock()
-                        .ok()
-                        .and_then(|guard| guard.clone())
-                        .and_then(|line| external_attached_session_from_wire(&line));
-                    if let Some((session_id, source)) = active_external_session {
+                    let mut active_external_sessions: Vec<(String, String)> =
+                        attached_external_sessions
+                            .lock()
+                            .ok()
+                            .map(|guard| {
+                                guard
+                                    .iter()
+                                    .map(|(session_id, source)| {
+                                        (session_id.clone(), source.clone())
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    active_external_sessions.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (session_id, source) in active_external_sessions {
                         if let Some(replay) = external_session_activity_replay(
                             &source,
                             &session_id,
@@ -17010,6 +17035,52 @@ mod tests {
     }
 
     #[test]
+    fn external_attached_session_cache_tracks_all_live_external_sessions() {
+        let mut sessions = HashMap::new();
+        for (session_id, source) in [("codex-a", "codex"), ("claude-b", "claude_code")] {
+            update_external_attached_sessions_from_wire(
+                &mut sessions,
+                &serde_json::json!({
+                    "event": "session_attached",
+                    "session_id": session_id,
+                    "source": source,
+                })
+                .to_string(),
+            );
+        }
+
+        update_external_attached_sessions_from_wire(
+            &mut sessions,
+            &serde_json::json!({
+                "event": "session_started",
+                "session_id": "internal-wrapper",
+            })
+            .to_string(),
+        );
+
+        assert_eq!(sessions.get("codex-a").map(String::as_str), Some("codex"));
+        assert_eq!(
+            sessions.get("claude-b").map(String::as_str),
+            Some("claude-code")
+        );
+
+        update_external_attached_sessions_from_wire(
+            &mut sessions,
+            &serde_json::json!({
+                "event": "session_ended",
+                "session_id": "codex-a",
+            })
+            .to_string(),
+        );
+
+        assert!(!sessions.contains_key("codex-a"));
+        assert_eq!(
+            sessions.get("claude-b").map(String::as_str),
+            Some("claude-code")
+        );
+    }
+
+    #[test]
     fn settings_payload_accepts_settings_tab_save_without_agent_runtime_fields() {
         let body = serde_json::json!({
             "cu_provider": null,
@@ -17862,6 +17933,8 @@ mod tests {
         let log_dir = dir.path().join("wrapper-session");
         let backend_id = "019e598b-256e-7b61-8816-22908ece438a";
         let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.session_started("wrapper-session", Some("external task"));
+        log.session_identity("wrapper-session", "codex", backend_id);
         log.info("Mode: external agent (Codex)");
         log.debug(&format!("External agent thread: {backend_id}"));
         log.info("[user] continue here");
@@ -17869,6 +17942,14 @@ mod tests {
 
         let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
         let entries = replay_jsonl_to_outbound_entries(&contents, &log_dir);
+        let started_row = entries
+            .iter()
+            .find(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("session_started"))
+            .expect("wrapper session_started should replay");
+        let identity_row = entries
+            .iter()
+            .find(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("session_identity"))
+            .expect("wrapper session_identity should replay");
         let user_row = entries
             .iter()
             .find(|entry| {
@@ -17877,6 +17958,14 @@ mod tests {
             })
             .expect("wrapper log entry should replay");
 
+        assert_eq!(
+            started_row.get("session_id").and_then(|v| v.as_str()),
+            Some(backend_id)
+        );
+        assert_eq!(
+            identity_row.get("session_id").and_then(|v| v.as_str()),
+            Some("wrapper-session")
+        );
         assert_eq!(
             user_row.get("session_id").and_then(|v| v.as_str()),
             Some(backend_id)

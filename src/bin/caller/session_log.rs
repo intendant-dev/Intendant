@@ -1163,6 +1163,23 @@ impl SessionLog {
         });
     }
 
+    /// Log that a frontend-visible session is attached to an external agent.
+    pub fn session_attached(&mut self, session_id: &str, source: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "session_attached".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Session attached: {} ({})", session_id, source)),
+            data: Some(serde_json::json!({
+                "session_id": session_id,
+                "source": source,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Persist a visible parent/child session relationship.
     pub fn session_relationship(
         &mut self,
@@ -2379,6 +2396,17 @@ pub fn agent_output_chunks_by_id(log_dir: &Path, ids: &[String]) -> Vec<AgentOut
 /// For events with a `file` field (`model_response`, `agent_output`,
 /// `reasoning`), reads the full content from the turn file under `log_dir`
 /// and substitutes it for the 200-char `message` preview.
+fn parse_session_attached_message(message: &str) -> Option<(String, String)> {
+    let rest = message.strip_prefix("Session attached: ")?;
+    let (session_id, source) = rest.rsplit_once(" (")?;
+    let session_id = session_id.trim();
+    let source = source.trim().strip_suffix(')')?.trim();
+    if session_id.is_empty() || source.is_empty() {
+        return None;
+    }
+    Some((session_id.to_string(), source.to_string()))
+}
+
 pub fn session_log_entry_to_app_event(
     entry: &serde_json::Value,
     log_dir: &Path,
@@ -2667,6 +2695,19 @@ pub fn session_log_entry_to_app_event(
                 source,
                 backend_session_id,
             })
+        }
+        "session_attached" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let source = data
+                .and_then(|d| d.get("source"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(AppEvent::SessionAttached { session_id, source })
         }
         "session_relationship" => {
             let parent_session_id = data
@@ -2984,6 +3025,11 @@ pub fn session_log_entry_to_app_event(
         // "system".  `[model] Thinking` / `[model] Tool call:` are demoted
         // to "detail" so they only show under verbose verbosity.
         "info" | "warn" | "error" | "debug" => {
+            if event_type == "info" {
+                if let Some((session_id, source)) = parse_session_attached_message(message) {
+                    return Some(AppEvent::SessionAttached { session_id, source });
+                }
+            }
             let (source, content) = if let Some(rest) = message.strip_prefix("[user] ") {
                 ("User", rest.to_string())
             } else if message.starts_with("[presence]")
@@ -4157,6 +4203,7 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.session_identity("child", "codex", "thread-child");
+        log.session_attached("child", "codex");
         log.session_relationship("parent", "child", "subagent", false);
         log.session_capabilities(
             "child",
@@ -4181,6 +4228,15 @@ mod tests {
                 assert_eq!(backend_session_id, "thread-child");
             }
             other => panic!("expected SessionIdentity, got {:?}", other),
+        }
+
+        let attached = read_last_event(&log_dir, "session_attached");
+        match session_log_entry_to_app_event(&attached, &log_dir).unwrap() {
+            AppEvent::SessionAttached { session_id, source } => {
+                assert_eq!(session_id, "child");
+                assert_eq!(source, "codex");
+            }
+            other => panic!("expected SessionAttached, got {:?}", other),
         }
 
         let relationship = read_last_event(&log_dir, "session_relationship");
@@ -4212,6 +4268,24 @@ mod tests {
                 assert!(capabilities.codex_thread_actions.is_empty());
             }
             other => panic!("expected SessionCapabilities, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_legacy_session_attached_info_replays_structured() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.info("Session attached: child (codex)");
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "info");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::SessionAttached { session_id, source } => {
+                assert_eq!(session_id, "child");
+                assert_eq!(source, "codex");
+            }
+            other => panic!("expected SessionAttached, got {:?}", other),
         }
     }
 

@@ -7991,6 +7991,7 @@ async function main() {
           ...d,
           entries: d.entries.filter(entry => !entry || entry.event !== 'context_snapshot'),
         };
+        applySessionIdentitiesFromReplayEntries(filtered.entries);
         resetSessionWindowsForReplay(filtered.entries);
         const wasProcessingLogReplay = processingLogReplay;
         processingLogReplay = true;
@@ -8579,8 +8580,12 @@ function processCommands(cmds) {
   const previousLogReplayBatch = logReplayAppendBatch;
   const createdLogReplayBatch = processingLogReplay && !logReplayAppendBatch;
   if (createdLogReplayBatch) logReplayAppendBatch = createLogReplayAppendBatch();
+  let pendingStatusPhaseGuard = null;
   try {
     for (const c of cmds) {
+      if (c.cmd !== 'update_status_bar' && c.cmd !== 'set_phase') {
+        pendingStatusPhaseGuard = null;
+      }
       switch (c.cmd) {
       case 'add_log_entry': renderLogEntry(c); break;
       case 'mark_activity_context_rewind':
@@ -8595,8 +8600,17 @@ function processCommands(cmds) {
         flushLogReplayAppendBatch();
         renderTurnSeparator(c.turn);
         break;
-      case 'update_status_bar': updateStatusBar(c); break;
-      case 'set_phase': setPhase(c.phase); break;
+      case 'update_status_bar':
+        pendingStatusPhaseGuard = { allow: shouldApplyStatusPhaseForSession(c.session_id) };
+        updateStatusBar(c);
+        break;
+      case 'set_phase': {
+        const guard = pendingStatusPhaseGuard;
+        pendingStatusPhaseGuard = null;
+        if (guard && !guard.allow) break;
+        setPhase(c.phase);
+        break;
+      }
       case 'show_approval': showApproval(c.id, c.command, c.category, c.session_id); break;
       case 'hide_approval': clearPendingApproval(); hidePanel('approval-panel'); break;
       case 'show_human_input': showHumanInput(c.question); break;
@@ -10772,7 +10786,116 @@ function applySessionIdentity(meta = {}) {
       });
     }
   }
-  if (sessionWindows.has(sid)) updateSessionWindow(sid, next);
+  const externalSource = normalizeAgentId(backendSource);
+  if (externalSource && backendSessionId && backendSessionId !== sid) {
+    retireExternalWrapperSessionWindow(sid, backendSessionId);
+  } else if (sessionWindows.has(sid)) {
+    updateSessionWindow(sid, next);
+  }
+  persistSessionWindowState();
+}
+
+function applySessionIdentitiesFromReplayEntries(entries) {
+  if (!Array.isArray(entries)) return;
+  for (const entry of entries) {
+    if (entry?.event !== 'session_identity') continue;
+    applySessionIdentity(entry);
+  }
+}
+
+function externalSourceForSessionWindow(sessionId, win = null) {
+  const sid = String(sessionId || '').trim();
+  const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
+  return normalizeAgentId(
+    meta.backendSource ||
+    meta.source ||
+    meta.sourceLabel ||
+    win?.source ||
+    ''
+  );
+}
+
+function externalBackendAliasForSession(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const meta = sessionMetadataById.get(sid) || {};
+  const backendSessionId = String(meta.backendSessionId || '').trim();
+  const source = externalSourceForSessionWindow(sid);
+  if (!backendSessionId || backendSessionId === sid || !source) return null;
+  return { backendSessionId, source };
+}
+
+function statusSessionWindowTarget(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const alias = externalBackendAliasForSession(sid);
+  return alias?.backendSessionId || sid;
+}
+
+function shouldMaterializeStatusSessionWindow(sessionId) {
+  const sid = statusSessionWindowTarget(sessionId);
+  if (!sid || sid === daemonSessionFullId) return false;
+  const win = sessionWindows.get(sid);
+  if (win) return true;
+  return !!externalSourceForSessionWindow(sid, win);
+}
+
+function shouldApplyStatusPhaseForSession(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || sid === daemonSessionFullId) return true;
+  return shouldMaterializeStatusSessionWindow(sid);
+}
+
+function focusSessionWindowFromLifecycle(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  if (!processingLogReplay || !foregroundSessionFullId) {
+    focusSessionWindow(sid);
+  } else {
+    updateTaskTargetChip();
+  }
+}
+
+function retireExternalWrapperSessionWindow(wrapperId, backendId) {
+  const wrapperSid = String(wrapperId || '').trim();
+  const backendSid = String(backendId || '').trim();
+  if (!wrapperSid || !backendSid || wrapperSid === backendSid) return;
+  const wrapperWin = sessionWindows.get(wrapperSid);
+  if (!wrapperWin) return;
+
+  const wrapperMeta = sessionMetadataById.get(wrapperSid) || {};
+  const backendMeta = sessionMetadataById.get(backendSid) || {};
+  const source = externalSourceForSessionWindow(wrapperSid, wrapperWin)
+    || externalSourceForSessionWindow(backendSid);
+  const phase = processingLogReplay
+    ? 'idle'
+    : (wrapperWin.phase || backendMeta.phase || 'idle');
+  ensureSessionWindow(backendSid, {
+    ...wrapperMeta,
+    ...backendMeta,
+    ...(source ? { source, backendSource: source } : {}),
+    phase,
+    ended: wrapperWin.ended,
+  });
+
+  for (const entry of wrapperWin.logHistory || []) {
+    if (entry?.dataset) delete entry.dataset.sessionWindowHistory;
+  }
+  wrapperWin.el.remove();
+  sessionWindows.delete(wrapperSid);
+  if (maximizedSessionWindowId === wrapperSid) maximizedSessionWindowId = backendSid;
+  const wasForeground = foregroundSessionFullId === wrapperSid;
+  const wasCurrent = currentSessionFullId === wrapperSid;
+  if (wasForeground) foregroundSessionFullId = backendSid;
+  if (wasCurrent) currentSessionFullId = backendSid;
+  if (wasForeground || wasCurrent) {
+    focusSessionWindow(backendSid);
+  } else {
+    updateTaskTargetChip();
+  }
+  updateSessionWindowMaximizeState();
+  syncSessionWindowGridControls();
+  syncSessionWindowMetadataRefresh();
+  scheduleSessionRelationshipRender();
   persistSessionWindowState();
 }
 
@@ -13826,8 +13949,11 @@ function updateStatusBar(d) {
     // wrapper sessions. The status bar's session id represents the daemon
     // process session and is initialized only from the bootstrap snapshot.
     if (sid && sid !== daemonSessionFullId) {
-      ensureSessionWindow(sid, { ended: false });
-      updateTaskTargetChip();
+      const targetSid = statusSessionWindowTarget(sid);
+      if (shouldMaterializeStatusSessionWindow(targetSid)) {
+        ensureSessionWindow(targetSid, { ended: false });
+        updateTaskTargetChip();
+      }
     }
   }
   if (d.external_agent !== undefined) {
@@ -23402,10 +23528,18 @@ function renderDiskUsage(sessions) {
 
 // ── Session Lifecycle ──
 function onSessionStarted(sessionId, task) {
-  currentSessionFullId = sessionId || '';
-  if (sessionId) {
-    ensureSessionWindow(sessionId, { task: task || 'session', phase: 'thinking', ended: false });
-    focusSessionWindow(sessionId);
+  const sid = String(sessionId || '').trim();
+  const alias = externalBackendAliasForSession(sid);
+  const visibleSessionId = alias?.backendSessionId || sid;
+  currentSessionFullId = visibleSessionId || '';
+  if (visibleSessionId) {
+    ensureSessionWindow(visibleSessionId, {
+      task: task || 'session',
+      phase: processingLogReplay ? 'idle' : 'thinking',
+      ended: false,
+      ...(alias?.source ? { source: alias.source, backendSource: alias.source } : {}),
+    });
+    focusSessionWindowFromLifecycle(visibleSessionId);
   } else {
     updateTaskTargetChip();
   }
@@ -23420,7 +23554,7 @@ function onSessionStarted(sessionId, task) {
   if (sessionsLoaded) {
     loadSessions();
     setTimeout(loadSessions, 1000);
-  } else if (sessionId) {
+  } else if (visibleSessionId) {
     refreshSessionWindowMetadata(250);
     refreshSessionWindowMetadata(1250);
   }
@@ -23432,7 +23566,7 @@ function onSessionAttached(sessionId, source) {
     const existingPhase = sessionWindows.get(sessionId)?.phase;
     const phase = existingPhase && existingPhase !== 'done' ? existingPhase : 'idle';
     ensureSessionWindow(sessionId, { source: source || 'session', phase, ended: false });
-    focusSessionWindow(sessionId);
+    focusSessionWindowFromLifecycle(sessionId);
   } else {
     updateTaskTargetChip();
   }
