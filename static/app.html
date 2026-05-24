@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>Intendant</title>
-<link rel="icon" type="image/png" sizes="128x128" href="/icon-128.png">
+<link rel="icon" type="image/png" sizes="128x128" href="/icon-128.png" id="favicon">
 <link rel="apple-touch-icon" href="/icon-128.png">
 <style>
 :root {
@@ -2474,12 +2474,37 @@ html, body {
   padding: 4px 12px 8px;
 }
 
-/* Approval */
+/* Approval — modern card matching the dashboard notification banners */
+#approval-panel {
+  border-top: none;
+  background: transparent;
+}
+#approval-panel .panel-body { padding: 8px 12px; }
+.approval-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: rgba(249, 226, 175, 0.12);
+  border: 1px solid rgba(249, 226, 175, 0.4);
+  box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+  animation: control-toast-in 160ms ease-out;
+}
+.approval-card .approval-icon { font-size: 20px; line-height: 1.2; flex: 0 0 auto; }
+.approval-card .approval-content { flex: 1; min-width: 0; }
+.approval-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--yellow);
+  margin-bottom: 6px;
+}
 .approval-command {
   padding: 6px 10px;
   background: var(--mantle);
-  border-radius: 4px;
-  font-size: 13px;
+  border-radius: 6px;
+  font-family: 'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace;
+  font-size: 12px;
   margin-bottom: 8px;
   white-space: pre-wrap;
   word-break: break-all;
@@ -2487,32 +2512,54 @@ html, body {
   overflow-y: auto;
 }
 .approval-category {
-  font-size: 11px;
-  color: var(--overlay1);
+  display: inline-block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--subtext0);
+  background: var(--surface0);
+  border-radius: 999px;
+  padding: 2px 8px;
   margin-bottom: 8px;
 }
+.approval-category:empty { display: none; }
 .approval-actions {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
 }
 .approval-actions button {
-  padding: 6px 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
   border: 1px solid var(--surface1);
-  border-radius: 4px;
-  background: var(--mantle);
+  border-radius: 6px;
+  background: var(--surface0);
   color: var(--text);
   font-family: inherit;
   font-size: 12px;
   cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
+  transition: background 0.15s, border-color 0.15s, transform 0.05s;
 }
 .approval-actions button:hover {
   background: var(--surface1);
   border-color: var(--overlay0);
 }
+.approval-actions button:active { transform: translateY(1px); }
+.approval-actions button kbd {
+  font-family: inherit;
+  font-size: 10px;
+  background: var(--mantle);
+  border: 1px solid var(--surface1);
+  border-radius: 3px;
+  padding: 0 4px;
+  color: var(--overlay1);
+}
 .approval-actions button.approve { border-color: var(--green); color: var(--green); }
+.approval-actions button.approve:hover { background: rgba(166, 227, 161, 0.12); }
 .approval-actions button.deny { border-color: var(--red); color: var(--red); }
+.approval-actions button.deny:hover { background: rgba(243, 139, 168, 0.12); }
 
 /* Input / Follow-up */
 .input-question {
@@ -6107,15 +6154,20 @@ html, body {
 
           <!-- Approval Panel -->
           <div class="bottom-panel" id="approval-panel">
-            <div class="panel-header">Approval Required</div>
             <div class="panel-body">
-              <div class="approval-command" id="approval-command"></div>
-              <div class="approval-category" id="approval-category"></div>
-              <div class="approval-actions">
-                <button class="approve" onclick="sendApproval('approve')">Approve (y)</button>
-                <button onclick="sendApproval('skip')">Skip (s)</button>
-                <button onclick="sendApproval('approve_all')">Approve All (a)</button>
-                <button class="deny" onclick="sendApproval('deny')">Deny (n)</button>
+              <div class="approval-card">
+                <div class="approval-icon">&#x1F510;</div>
+                <div class="approval-content">
+                  <div class="approval-title">Approval needed</div>
+                  <div class="approval-command" id="approval-command"></div>
+                  <div class="approval-category" id="approval-category"></div>
+                  <div class="approval-actions">
+                    <button class="approve" onclick="sendApproval('approve')">Approve <kbd>y</kbd></button>
+                    <button onclick="sendApproval('skip')">Skip <kbd>s</kbd></button>
+                    <button onclick="sendApproval('approve_all')">Approve all <kbd>a</kbd></button>
+                    <button class="deny" onclick="sendApproval('deny')">Deny <kbd>n</kbd></button>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -14390,9 +14442,43 @@ function setPhase(phase) {
   }
 }
 
+// Cross-tab pending-approval indicator: badge the favicon + prefix the page
+// title so a pending approval is visible even when this tab is in the
+// background. The favicon is redrawn on a canvas (app icon + attention dot);
+// if canvas is unavailable the title change still signals it.
+const _origDocTitle = document.title;
+let _approvalIndicatorOn = false;
+function setApprovalIndicator(pending) {
+  if (pending === _approvalIndicatorOn) return;
+  _approvalIndicatorOn = pending;
+  document.title = pending ? '● Approval needed — ' + _origDocTitle : _origDocTitle;
+  const link = document.getElementById('favicon');
+  if (!link) return;
+  if (!pending) { link.href = '/icon-128.png'; return; }
+  try {
+    const img = new Image();
+    img.onload = function() {
+      const c = document.createElement('canvas');
+      c.width = 64; c.height = 64;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0, 64, 64);
+      ctx.beginPath();
+      ctx.arc(47, 17, 15, 0, 2 * Math.PI);
+      ctx.fillStyle = '#f38ba0';
+      ctx.fill();
+      ctx.lineWidth = 5;
+      ctx.strokeStyle = '#1e1e2e';
+      ctx.stroke();
+      if (_approvalIndicatorOn) link.href = c.toDataURL('image/png');
+    };
+    img.src = '/icon-128.png';
+  } catch (_) { /* canvas unavailable — title change still signals */ }
+}
+
 function clearPendingApproval() {
   pendingApprovalId = null;
   pendingApprovalSessionId = '';
+  setApprovalIndicator(false);
 }
 
 function showApproval(id, command, category, sessionId) {
@@ -14408,8 +14494,9 @@ function showApproval(id, command, category, sessionId) {
     focusSessionWindow(pendingApprovalSessionId);
   }
   document.getElementById('approval-command').textContent = command;
-  document.getElementById('approval-category').textContent = category ? 'Category: ' + category : '';
+  document.getElementById('approval-category').textContent = category || '';
   document.getElementById('approval-panel').classList.add('visible');
+  setApprovalIndicator(true);
 }
 
 function showHumanInput(question) {
