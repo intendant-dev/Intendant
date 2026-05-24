@@ -1146,6 +1146,38 @@ fn flush_pending_runtime_steers_for_session(
     delivered
 }
 
+fn flush_pending_runtime_steers_for_model_checkpoint(
+    bus: &EventBus,
+    pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    session_id: &Option<String>,
+) -> usize {
+    flush_pending_runtime_steers_for_session(bus, pending_runtime_steers, session_id)
+}
+
+fn mark_pending_runtime_steers_delivered_at_model_checkpoint(
+    config: &DrainConfig<'_>,
+    pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    agent_name: &str,
+) {
+    // Codex records turn/steer input in its conversation log, but does not
+    // reliably echo it back through the app-server stream as a userMessage.
+    // Once the model produces new output, the runtime checkpoint happened and
+    // the accepted steer should no longer stay pinned in the dashboard queue.
+    let delivered = flush_pending_runtime_steers_for_model_checkpoint(
+        config.bus,
+        pending_runtime_steers,
+        &config.session_id,
+    );
+    if delivered > 0 {
+        slog(config.session_log, |l| {
+            l.info(&format!(
+                "Marked {} accepted {} steer(s) delivered at model checkpoint",
+                delivered, agent_name
+            ))
+        });
+    }
+}
+
 const EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 const EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT: usize = 64 * 1024;
 
@@ -2722,12 +2754,22 @@ async fn drain_external_agent_events(
 
         match event {
             external_agent::AgentEvent::MessageDelta { text } => {
+                mark_pending_runtime_steers_delivered_at_model_checkpoint(
+                    config,
+                    pending_runtime_steers,
+                    agent.name(),
+                );
                 config.bus.send(AppEvent::ModelResponseDelta {
                     session_id: config.session_id.clone(),
                     text,
                 });
             }
             external_agent::AgentEvent::Message { text } => {
+                mark_pending_runtime_steers_delivered_at_model_checkpoint(
+                    config,
+                    pending_runtime_steers,
+                    agent.name(),
+                );
                 stats.last_response = Some(text.clone());
                 persist_external_model_response_if_needed(config, &text, None);
                 config.bus.send(AppEvent::ModelResponse {
@@ -2758,6 +2800,11 @@ async fn drain_external_agent_events(
                 }
             }
             external_agent::AgentEvent::Reasoning { text } => {
+                mark_pending_runtime_steers_delivered_at_model_checkpoint(
+                    config,
+                    pending_runtime_steers,
+                    agent.name(),
+                );
                 // Surface reasoning via ModelResponse with empty content +
                 // reasoning set.  WASM renders this at "detail" verbosity
                 // (visible in Verbose + Debug, hidden in Normal) via the
@@ -2773,6 +2820,11 @@ async fn drain_external_agent_events(
                 });
             }
             external_agent::AgentEvent::PlanUpdate { entries } => {
+                mark_pending_runtime_steers_delivered_at_model_checkpoint(
+                    config,
+                    pending_runtime_steers,
+                    agent.name(),
+                );
                 let mut md = String::from("**Plan**\n");
                 for (content, _priority, status) in &entries {
                     let marker = match status.as_str() {
@@ -6637,6 +6689,50 @@ Also: {"source": "bare"}"#;
             }
             other => panic!("expected SteerDelivered, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn model_checkpoint_flushes_pending_runtime_steers() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut pending = std::collections::VecDeque::from([
+            PendingRuntimeSteer {
+                session_id: Some("codex-thread".to_string()),
+                id: "steer-1".to_string(),
+                text: "first steer".to_string(),
+            },
+            PendingRuntimeSteer {
+                session_id: Some("codex-thread".to_string()),
+                id: "steer-2".to_string(),
+                text: "second steer".to_string(),
+            },
+        ]);
+
+        let delivered = flush_pending_runtime_steers_for_model_checkpoint(
+            &bus,
+            &mut pending,
+            &Some("codex-thread".into()),
+        );
+
+        assert_eq!(delivered, 2);
+        assert!(pending.is_empty());
+
+        let mut ids = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AppEvent::SteerDelivered {
+                    session_id,
+                    id,
+                    mid_turn,
+                } => {
+                    assert_eq!(session_id.as_deref(), Some("codex-thread"));
+                    assert!(mid_turn);
+                    ids.push(id);
+                }
+                other => panic!("expected SteerDelivered, got {:?}", other),
+            }
+        }
+        assert_eq!(ids, vec!["steer-1".to_string(), "steer-2".to_string()]);
     }
 }
 
