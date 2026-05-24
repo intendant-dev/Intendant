@@ -10582,7 +10582,7 @@ function resetSessionWindowsForReplay(entries) {
   const ids = new Set();
   for (const entry of entries || []) {
     const sid = entry && entry.session_id;
-    if (sid) ids.add(String(sid));
+    if (sid) ids.add(sessionWindowTargetForLogSession(sid));
   }
   for (const sid of ids) {
     const win = sessionWindows.get(sid);
@@ -10883,10 +10883,15 @@ function externalBackendAliasForSession(sessionId) {
   return { backendSessionId, source };
 }
 
-function statusSessionWindowTarget(sessionId) {
+function sessionWindowTargetForLogSession(sessionId) {
   const sid = String(sessionId || '').trim();
+  if (!sid) return '';
   const alias = externalBackendAliasForSession(sid);
   return alias?.backendSessionId || sid;
+}
+
+function statusSessionWindowTarget(sessionId) {
+  return sessionWindowTargetForLogSession(sessionId);
 }
 
 function shouldMaterializeStatusSessionWindow(sessionId) {
@@ -10913,6 +10918,39 @@ function focusSessionWindowFromLifecycle(sessionId) {
   }
 }
 
+function retargetSessionWindowLogEntry(entry, sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!entry || !sid) return;
+  entry.dataset.sessionId = sid;
+  const badge = entry.querySelector(':scope > .log-session');
+  if (badge) {
+    renderSessionIdentity(badge, sid, { showName: false });
+    applySessionBadgeStyle(badge, sid);
+  }
+  const edit = entry.querySelector(':scope > .log-edit-message');
+  if (edit) edit.dataset.sessionId = sid;
+  applyPromptTargetLogSessionBadgeState(entry);
+}
+
+function transferSessionWindowHistory(fromWin, toWin, targetSessionId) {
+  if (!fromWin || !toWin || fromWin === toWin) return;
+  const sourceHistory = ensureSessionWindowHistory(fromWin);
+  if (!sourceHistory.length) return;
+  const targetHistory = ensureSessionWindowHistory(toWin);
+  const seen = new Set(targetHistory);
+  const shouldFollow = sessionWindowShouldFollowNextOutput(toWin);
+  for (const entry of sourceHistory) {
+    if (!entry || seen.has(entry)) continue;
+    retargetSessionWindowLogEntry(entry, targetSessionId);
+    entry.dataset.sessionWindowHistory = '1';
+    targetHistory.push(entry);
+    seen.add(entry);
+  }
+  sourceHistory.length = 0;
+  renderSessionWindowTail(toWin);
+  applySessionWindowOutputScroll(toWin, shouldFollow);
+}
+
 function retireExternalWrapperSessionWindow(wrapperId, backendId) {
   const wrapperSid = String(wrapperId || '').trim();
   const backendSid = String(backendId || '').trim();
@@ -10927,17 +10965,14 @@ function retireExternalWrapperSessionWindow(wrapperId, backendId) {
   const phase = processingLogReplay
     ? 'idle'
     : (wrapperWin.phase || backendMeta.phase || 'idle');
-  ensureSessionWindow(backendSid, {
+  const backendWin = ensureSessionWindow(backendSid, {
     ...wrapperMeta,
     ...backendMeta,
     ...(source ? { source, backendSource: source } : {}),
     phase,
     ended: wrapperWin.ended,
   });
-
-  for (const entry of wrapperWin.logHistory || []) {
-    if (entry?.dataset) delete entry.dataset.sessionWindowHistory;
-  }
+  transferSessionWindowHistory(wrapperWin, backendWin, backendSid);
   wrapperWin.el.remove();
   sessionWindows.delete(wrapperSid);
   if (maximizedSessionWindowId === wrapperSid) maximizedSessionWindowId = backendSid;
@@ -13068,7 +13103,9 @@ function flushLogReplayAppendBatch() {
 function appendLogEntryToSessionWindow(entry, batch = null) {
   const sid = entry?.dataset?.sessionId || '';
   if (!sid) return;
-  const win = ensureSessionWindow(sid);
+  const targetSid = sessionWindowTargetForLogSession(sid);
+  if (!targetSid) return;
+  const win = ensureSessionWindow(targetSid);
   if (!win) return;
   const empty = win.log.querySelector('.session-window-empty');
   if (empty) empty.remove();
@@ -13076,12 +13113,13 @@ function appendLogEntryToSessionWindow(entry, batch = null) {
   const clone = entry.cloneNode(true);
   clone.removeAttribute('id');
   clone.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
+  if (targetSid !== sid) retargetSessionWindowLogEntry(clone, targetSid);
   wireSessionWindowLogClone(clone, entry);
   if (batch) {
-    let state = batch.sessionFragments.get(sid);
+    let state = batch.sessionFragments.get(targetSid);
     if (!state || state.win !== win) {
       state = { win, items: [], shouldFollow };
-      batch.sessionFragments.set(sid, state);
+      batch.sessionFragments.set(targetSid, state);
     }
     state.items.push(clone);
     return;
@@ -13090,7 +13128,7 @@ function appendLogEntryToSessionWindow(entry, batch = null) {
 }
 
 function inferSessionPhaseFromLog(c) {
-  const sid = c && c.session_id;
+  const sid = sessionWindowTargetForLogSession(c && c.session_id);
   if (!sid) return;
   const content = String(c.content || '');
   const level = String(c.level || '').toLowerCase();

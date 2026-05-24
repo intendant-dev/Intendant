@@ -1090,6 +1090,10 @@ struct DrainConfig<'a> {
     /// emitting `AgentStarted`. The presence path sets this to avoid
     /// duplicating the model reasoning that's already shown via ModelResponse.
     suppress_agent_started: bool,
+    /// Supervised external sessions have their own session log in addition to
+    /// the daemon's root log writer. Persist model responses here too so
+    /// per-session replay does not depend on the root session log.
+    persist_model_responses_inline: bool,
     /// When true and no `json_approval` slot is set, auto-deny approval
     /// requests (headless mode with no interactive input).
     headless: bool,
@@ -2211,6 +2215,7 @@ async fn drain_external_child_turn(
         json_approval: config.json_approval.clone(),
         agent_source: config.agent_source.clone(),
         suppress_agent_started: config.suppress_agent_started,
+        persist_model_responses_inline: config.persist_model_responses_inline,
         headless: config.headless,
         context_injection: config.context_injection,
     };
@@ -2275,6 +2280,26 @@ async fn drain_external_child_turn(
                 ))
             });
         }
+    }
+}
+
+fn persist_external_model_response_if_needed(
+    config: &DrainConfig<'_>,
+    content: &str,
+    reasoning: Option<&str>,
+) {
+    if !config.persist_model_responses_inline {
+        return;
+    }
+    if !content.is_empty() {
+        slog(config.session_log, |l| {
+            l.model_response(content, 0, 0, 0, 0, config.agent_source.as_deref())
+        });
+    }
+    if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
+        slog(config.session_log, |l| {
+            l.reasoning_content(Some(reasoning), None)
+        });
     }
 }
 
@@ -2581,6 +2606,7 @@ async fn drain_external_agent_events(
             }
             external_agent::AgentEvent::Message { text } => {
                 stats.last_response = Some(text.clone());
+                persist_external_model_response_if_needed(config, &text, None);
                 config.bus.send(AppEvent::ModelResponse {
                     session_id: config.session_id.clone(),
                     turn: stats.turns,
@@ -2613,6 +2639,7 @@ async fn drain_external_agent_events(
                 // reasoning set.  WASM renders this at "detail" verbosity
                 // (visible in Verbose + Debug, hidden in Normal) via the
                 // existing reasoning_summary path in app_state.rs.
+                persist_external_model_response_if_needed(config, "", Some(&text));
                 config.bus.send(AppEvent::ModelResponse {
                     session_id: config.session_id.clone(),
                     turn: stats.turns,
@@ -2632,6 +2659,7 @@ async fn drain_external_agent_events(
                     };
                     md.push_str(&format!("- {} {}\n", marker, content));
                 }
+                persist_external_model_response_if_needed(config, &md, None);
                 config.bus.send(AppEvent::ModelResponse {
                     session_id: config.session_id.clone(),
                     turn: stats.turns,
@@ -8675,6 +8703,7 @@ async fn run_with_presence(
                                 json_approval: None,
                                 agent_source: Some("Codex".to_string()),
                                 suppress_agent_started: true,
+                                persist_model_responses_inline: false,
                                 headless: false,
                                 context_injection: &context_injection,
                             };
@@ -9160,6 +9189,7 @@ async fn run_with_presence(
                 json_approval: None,
                 agent_source: Some(backend.to_string()),
                 suppress_agent_started: true,
+                persist_model_responses_inline: false,
                 headless: false,
                 context_injection: &context_injection,
             };
@@ -9832,6 +9862,7 @@ async fn run_external_agent_mode(
 
     // Construct, initialize, and start a thread for the external agent
     let resumed_external_session = resume_session.clone();
+    let persist_model_responses_inline = control_session_id.is_some();
     let intendant_session_id = control_session_id.or_else(|| session_log_id(&session_log));
     let (mut agent, thread, mut event_rx) =
         match create_external_agent(&backend, &project, &session_log, web_port, resume_session)
@@ -9927,6 +9958,7 @@ async fn run_external_agent_mode(
         json_approval: json_approval.as_ref(),
         agent_source: Some(backend.to_string()),
         suppress_agent_started: false,
+        persist_model_responses_inline,
         headless,
         context_injection: &context_injection,
     };
