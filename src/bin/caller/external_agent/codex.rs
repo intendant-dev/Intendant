@@ -191,12 +191,6 @@ impl CodexAgent {
         params: &serde_json::Value,
     ) -> Result<String, CallerError> {
         let parent_thread_id = self.thread_id_for_action(params).await?;
-        if self.active_turn_id.lock().await.is_some() {
-            return Err(CallerError::ExternalAgent(
-                "/side is not yet available while the active Codex turn is running in Intendant"
-                    .into(),
-            ));
-        }
         let prompt = side_prompt_from_params(params)?;
 
         let developer_instructions = self.effective_side_developer_instructions().await;
@@ -235,9 +229,11 @@ impl CodexAgent {
         match self.send_request("turn/start", Some(turn_params)).await {
             Ok(response) => {
                 if let Some(id) = extract_turn_id(&response) {
-                    *self.active_turn_id.lock().await = Some(id);
+                    self.active_turns
+                        .lock()
+                        .await
+                        .insert(child_thread_id.clone(), id);
                 }
-                *self.active_thread_id.lock().await = Some(child_thread_id.clone());
                 self.side_threads
                     .lock()
                     .await
@@ -282,7 +278,12 @@ impl CodexAgent {
                 CallerError::ExternalAgent("side parent thread id is required".into())
             })?;
 
-        self.active_turn_id.lock().await.take();
+        let parent_turn_id = {
+            let mut active_turns = self.active_turns.lock().await;
+            active_turns.remove(&child_thread_id);
+            active_turns.get(&parent_thread_id).cloned()
+        };
+        *self.active_turn_id.lock().await = parent_turn_id;
         *self.active_thread_id.lock().await = Some(parent_thread_id.clone());
         let _ = self
             .send_request(
@@ -857,6 +858,11 @@ type PendingRequests = Arc<Mutex<HashMap<u64, oneshot::Sender<RequestResult>>>>;
 /// Stores (jsonrpc_id, method) so resolve_approval knows the response format.
 type PendingApprovals = Arc<Mutex<HashMap<String, (u64, String)>>>;
 
+/// Active Codex turns keyed by native thread id. Codex can run multiple
+/// threads through one app-server process, so one global active turn is not
+/// enough once `/side` can start while the parent turn is still running.
+type ActiveTurns = Arc<Mutex<HashMap<String, String>>>;
+
 // ---------------------------------------------------------------------------
 // CodexAgent
 // ---------------------------------------------------------------------------
@@ -902,6 +908,8 @@ pub struct CodexAgent {
     /// as a fallback) and cleared on `turn/completed` / `turn/interrupted` /
     /// `Terminated`.
     active_turn_id: Arc<Mutex<Option<String>>>,
+    /// Per-thread active turn ids for Codex's multiplexed app-server stream.
+    active_turns: ActiveTurns,
     /// Ephemeral side-conversation child threads keyed by child thread id,
     /// with the parent thread id as value. Used to keep slash/thread actions
     /// scoped to durable Codex threads while still allowing side follow-ups.
@@ -973,6 +981,7 @@ impl CodexAgent {
             reader_handle: None,
             active_thread_id: Arc::new(Mutex::new(None)),
             active_turn_id: Arc::new(Mutex::new(None)),
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
             side_threads: Arc::new(Mutex::new(HashMap::new())),
             latest_token_usage: Arc::new(Mutex::new(None)),
         }
@@ -1078,6 +1087,35 @@ impl CodexAgent {
             item_count: codex_request_item_count(&trace.payload),
             raw: trace.payload,
         })
+    }
+
+    async fn active_thread_and_turn(&self, action: &str) -> Result<(String, String), CallerError> {
+        let fallback_turn_id = self.active_turn_id.lock().await.clone();
+        let has_any_active_turn =
+            fallback_turn_id.is_some() || !self.active_turns.lock().await.is_empty();
+        let thread_id = match self.active_thread_id.lock().await.clone() {
+            Some(thread_id) => thread_id,
+            None if has_any_active_turn => {
+                return Err(CallerError::ExternalAgent(format!(
+                    "no active thread to {action}"
+                )));
+            }
+            None => {
+                return Err(CallerError::ExternalAgent(format!(
+                    "no active turn to {action}"
+                )));
+            }
+        };
+        let turn_id = {
+            let active_turns = self.active_turns.lock().await;
+            active_turns.get(&thread_id).cloned()
+        };
+        let turn_id = match turn_id {
+            Some(turn_id) => turn_id,
+            None => fallback_turn_id
+                .ok_or_else(|| CallerError::ExternalAgent(format!("no active turn to {action}")))?,
+        };
+        Ok((thread_id, turn_id))
     }
 }
 
@@ -1610,12 +1648,13 @@ async fn reader_task(
     approval_counter: Arc<AtomicU64>,
     active_thread_id: Arc<Mutex<Option<String>>>,
     active_turn_id: Arc<Mutex<Option<String>>>,
+    active_turns: ActiveTurns,
     latest_token_usage: Arc<Mutex<Option<serde_json::Value>>>,
     model: Option<String>,
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
-    let mut turn_terminal_observed = false;
+    let mut terminal_turns_observed: HashSet<String> = HashSet::new();
     let mut notification_state = CodexNotificationState::default();
 
     loop {
@@ -1625,6 +1664,7 @@ async fn reader_task(
                 // EOF — clear any active turn so a later interrupt_turn
                 // doesn't fire against a dead process.
                 active_turn_id.lock().await.take();
+                active_turns.lock().await.clear();
                 let _ = event_tx.send(AgentEvent::Terminated {
                     reason: "Process stdout closed".into(),
                     exit_code: None,
@@ -1633,6 +1673,7 @@ async fn reader_task(
             }
             Err(e) => {
                 active_turn_id.lock().await.take();
+                active_turns.lock().await.clear();
                 let _ = event_tx.send(AgentEvent::Terminated {
                     reason: format!("IO error reading stdout: {}", e),
                     exit_code: None,
@@ -1688,6 +1729,8 @@ async fn reader_task(
 
             let params = msg.params.unwrap_or(serde_json::Value::Null);
 
+            let (thread_id, turn_id) = codex_event_scope(&params);
+
             if method == "item/fileChange/requestApproval" {
                 let path = params
                     .pointer("/item/path")
@@ -1701,11 +1744,16 @@ async fn reader_task(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let _ = event_tx.send(AgentEvent::FileApprovalRequest {
-                    request_id,
-                    path,
-                    diff,
-                });
+                send_scoped_agent_event(
+                    &event_tx,
+                    thread_id.as_deref(),
+                    turn_id.as_deref(),
+                    AgentEvent::FileApprovalRequest {
+                        request_id,
+                        path,
+                        diff,
+                    },
+                );
             } else {
                 // item/commandExecution/requestApproval or unknown server requests
                 let command = params
@@ -1714,11 +1762,16 @@ async fn reader_task(
                     .and_then(|v| v.as_str())
                     .unwrap_or("<unknown>")
                     .to_string();
-                let _ = event_tx.send(AgentEvent::ApprovalRequest {
-                    request_id,
-                    command,
-                    category: ApprovalCategory::CommandExecution,
-                });
+                send_scoped_agent_event(
+                    &event_tx,
+                    thread_id.as_deref(),
+                    turn_id.as_deref(),
+                    AgentEvent::ApprovalRequest {
+                        request_id,
+                        command,
+                        category: ApprovalCategory::CommandExecution,
+                    },
+                );
             }
             continue;
         }
@@ -1734,23 +1787,25 @@ async fn reader_task(
         // subagent threads. Child or stale scoped notifications must not
         // appear in the active parent turn, mutate parent usage, or complete
         // the parent drain.
+        let (thread_id, turn_id) = codex_event_scope(&params);
         let active_thread_snapshot = active_thread_id.lock().await.clone();
-        let active_turn_snapshot = active_turn_id.lock().await.clone();
-        let targets_active_thread =
-            codex_notification_targets_active_thread(&params, active_thread_snapshot.as_deref());
-        let targets_active_turn = codex_notification_targets_active_turn(
-            &params,
-            active_thread_snapshot.as_deref(),
-            active_turn_snapshot.as_deref(),
-        );
-        if !targets_active_thread || !targets_active_turn {
-            continue;
-        }
+        let active_turn_for_thread = if let Some(thread_id) = thread_id.as_deref() {
+            active_turns.lock().await.get(thread_id).cloned()
+        } else {
+            active_turn_id.lock().await.clone()
+        };
+        let terminal_key = turn_id
+            .clone()
+            .or_else(|| active_turn_for_thread.clone())
+            .or_else(|| thread_id.clone());
+        let turn_terminal_observed = terminal_key
+            .as_ref()
+            .is_some_and(|key| terminal_turns_observed.contains(key));
 
         let status_can_complete_turn = method != "thread/status/changed"
             || codex_thread_status_can_complete_turn(
                 &params,
-                active_turn_snapshot.as_deref(),
+                active_turn_for_thread.as_deref(),
                 turn_terminal_observed,
             );
         if method == "thread/status/changed" && !status_can_complete_turn {
@@ -1763,31 +1818,79 @@ async fn reader_task(
                 .cloned()
                 .unwrap_or_else(|| params.clone());
             let snapshot = codex_usage_snapshot(&usage, model.as_deref().unwrap_or("codex"));
-            *latest_token_usage.lock().await = Some(usage);
+            let usage_targets_active_thread = thread_id.as_deref().map_or(true, |thread_id| {
+                active_thread_snapshot.as_deref() == Some(thread_id)
+            });
+            if usage_targets_active_thread {
+                *latest_token_usage.lock().await = Some(usage);
+            }
             if let Some(snapshot) = snapshot {
-                let _ = event_tx.send(AgentEvent::Usage { usage: snapshot });
+                send_scoped_agent_event(
+                    &event_tx,
+                    thread_id.as_deref(),
+                    turn_id.as_deref(),
+                    AgentEvent::Usage { usage: snapshot },
+                );
             }
         }
 
         match method {
             "turn/started" | "thread/started" => {
-                turn_terminal_observed = false;
-                if let Some(id) = extract_turn_id(&params) {
-                    *active_turn_id.lock().await = Some(id);
+                if let Some(key) = terminal_key.as_ref() {
+                    terminal_turns_observed.remove(key);
+                }
+                if let (Some(thread_id), Some(turn_id)) = (thread_id.as_deref(), turn_id.as_deref())
+                {
+                    active_turns
+                        .lock()
+                        .await
+                        .insert(thread_id.to_string(), turn_id.to_string());
+                    if active_thread_snapshot.as_deref() == Some(thread_id) {
+                        *active_turn_id.lock().await = Some(turn_id.to_string());
+                    }
                 }
             }
             "turn/completed" | "turn/interrupted" | "turn/failed" => {
-                active_turn_id.lock().await.take();
-                turn_terminal_observed = true;
+                if let Some(key) = terminal_key.as_ref() {
+                    terminal_turns_observed.insert(key.clone());
+                }
+                if let Some(thread_id) = thread_id.as_deref() {
+                    active_turns.lock().await.remove(thread_id);
+                    if active_thread_snapshot.as_deref() == Some(thread_id) {
+                        active_turn_id.lock().await.take();
+                    }
+                } else {
+                    active_turn_id.lock().await.take();
+                }
             }
             "thread/status/changed" => {
-                active_turn_id.lock().await.take();
-                turn_terminal_observed = true;
+                if codex_thread_status_type(&params)
+                    .is_some_and(|status| matches!(status, "completed" | "idle"))
+                {
+                    if let Some(key) = terminal_key.as_ref() {
+                        terminal_turns_observed.insert(key.clone());
+                    }
+                    if let Some(thread_id) = thread_id.as_deref() {
+                        active_turns.lock().await.remove(thread_id);
+                        if active_thread_snapshot.as_deref() == Some(thread_id) {
+                            active_turn_id.lock().await.take();
+                        }
+                    } else {
+                        active_turn_id.lock().await.take();
+                    }
+                }
             }
             _ => {}
         }
 
-        translate_notification_with_state(method, &params, &event_tx, &mut notification_state);
+        translate_notification_with_scope(
+            method,
+            &params,
+            &event_tx,
+            &mut notification_state,
+            thread_id.as_deref(),
+            turn_id.as_deref(),
+        );
     }
 }
 
@@ -1812,6 +1915,23 @@ fn extract_turn_id(value: &serde_json::Value) -> Option<String> {
     None
 }
 
+fn codex_event_scope(params: &serde_json::Value) -> (Option<String>, Option<String>) {
+    (extract_thread_id(params), extract_turn_id(params))
+}
+
+fn send_scoped_agent_event(
+    event_tx: &mpsc::UnboundedSender<AgentEvent>,
+    thread_id: Option<&str>,
+    turn_id: Option<&str>,
+    event: AgentEvent,
+) {
+    let _ = event_tx.send(AgentEvent::scoped(
+        thread_id.map(str::to_string),
+        turn_id.map(str::to_string),
+        event,
+    ));
+}
+
 fn codex_thread_status_type(params: &serde_json::Value) -> Option<&str> {
     match params.get("status")? {
         serde_json::Value::String(status) => Some(status.as_str()),
@@ -1820,6 +1940,7 @@ fn codex_thread_status_type(params: &serde_json::Value) -> Option<&str> {
     }
 }
 
+#[cfg(test)]
 fn codex_notification_targets_active_thread(
     params: &serde_json::Value,
     active_thread_id: Option<&str>,
@@ -1830,6 +1951,7 @@ fn codex_notification_targets_active_thread(
     }
 }
 
+#[cfg(test)]
 fn codex_notification_targets_active_turn(
     params: &serde_json::Value,
     active_thread_id: Option<&str>,
@@ -2134,6 +2256,7 @@ struct CodexNotificationState {
 }
 
 /// Translate a Codex notification into one or more `AgentEvent`s.
+#[cfg(test)]
 fn translate_notification(
     method: &str,
     params: &serde_json::Value,
@@ -2143,11 +2266,23 @@ fn translate_notification(
     translate_notification_with_state(method, params, event_tx, &mut state);
 }
 
+#[cfg(test)]
 fn translate_notification_with_state(
     method: &str,
     params: &serde_json::Value,
     event_tx: &mpsc::UnboundedSender<AgentEvent>,
     state: &mut CodexNotificationState,
+) {
+    translate_notification_with_scope(method, params, event_tx, state, None, None);
+}
+
+fn translate_notification_with_scope(
+    method: &str,
+    params: &serde_json::Value,
+    event_tx: &mpsc::UnboundedSender<AgentEvent>,
+    state: &mut CodexNotificationState,
+    thread_id: Option<&str>,
+    turn_id: Option<&str>,
 ) {
     match method {
         "item/agentMessage/delta" => {
@@ -2156,7 +2291,12 @@ fn translate_notification_with_state(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let _ = event_tx.send(AgentEvent::MessageDelta { text });
+            send_scoped_agent_event(
+                event_tx,
+                thread_id,
+                turn_id,
+                AgentEvent::MessageDelta { text },
+            );
         }
 
         "item/started" => {
@@ -2178,11 +2318,16 @@ fn translate_notification_with_state(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let _ = event_tx.send(AgentEvent::ToolStarted {
-                        item_id,
-                        tool_name: "command".to_string(),
-                        preview: command,
-                    });
+                    send_scoped_agent_event(
+                        event_tx,
+                        thread_id,
+                        turn_id,
+                        AgentEvent::ToolStarted {
+                            item_id,
+                            tool_name: "command".to_string(),
+                            preview: command,
+                        },
+                    );
                 }
                 "fileChange" => {
                     // Codex can emit a fileChange item before the concrete
@@ -2190,11 +2335,16 @@ fn translate_notification_with_state(
                     // "file_change:" activity row; the filesystem watcher
                     // will still report the actual changed files.
                     if let Some(preview) = codex_file_change_preview(params) {
-                        let _ = event_tx.send(AgentEvent::ToolStarted {
-                            item_id,
-                            tool_name: "file_change".to_string(),
-                            preview,
-                        });
+                        send_scoped_agent_event(
+                            event_tx,
+                            thread_id,
+                            turn_id,
+                            AgentEvent::ToolStarted {
+                                item_id,
+                                tool_name: "file_change".to_string(),
+                                preview,
+                            },
+                        );
                     }
                 }
                 "agentMessage" | "userMessage" | "reasoning" | "imageView" => {
@@ -2209,10 +2359,15 @@ fn translate_notification_with_state(
                     } else {
                         format!("Codex compacted context ({item_id})")
                     };
-                    let _ = event_tx.send(AgentEvent::Log {
-                        level: "info".to_string(),
-                        message: detail,
-                    });
+                    send_scoped_agent_event(
+                        event_tx,
+                        thread_id,
+                        turn_id,
+                        AgentEvent::Log {
+                            level: "info".to_string(),
+                            message: detail,
+                        },
+                    );
                 }
                 "mcpToolCall" => {
                     // Codex is calling an MCP tool (e.g. spawn_live_audio, take_screenshot).
@@ -2234,22 +2389,32 @@ fn translate_notification_with_state(
                     } else {
                         format!("{}:{}", server, tool_name)
                     };
-                    let _ = event_tx.send(AgentEvent::ToolStarted {
-                        item_id,
-                        tool_name: "mcp".to_string(),
-                        preview,
-                    });
+                    send_scoped_agent_event(
+                        event_tx,
+                        thread_id,
+                        turn_id,
+                        AgentEvent::ToolStarted {
+                            item_id,
+                            tool_name: "mcp".to_string(),
+                            preview,
+                        },
+                    );
                 }
                 "webSearch" => {
-                    let _ = event_tx.send(AgentEvent::ToolStarted {
-                        item_id,
-                        tool_name: "web_search".to_string(),
-                        preview: codex_web_search_preview(params),
-                    });
+                    send_scoped_agent_event(
+                        event_tx,
+                        thread_id,
+                        turn_id,
+                        AgentEvent::ToolStarted {
+                            item_id,
+                            tool_name: "web_search".to_string(),
+                            preview: codex_web_search_preview(params),
+                        },
+                    );
                 }
                 "collabAgentToolCall" => {
                     if let Some(event) = codex_collab_agent_tool_call(params) {
-                        let _ = event_tx.send(event);
+                        send_scoped_agent_event(event_tx, thread_id, turn_id, event);
                     }
                 }
                 other => {
@@ -2269,7 +2434,12 @@ fn translate_notification_with_state(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let _ = event_tx.send(AgentEvent::ToolOutputDelta { item_id, text });
+            send_scoped_agent_event(
+                event_tx,
+                thread_id,
+                turn_id,
+                AgentEvent::ToolOutputDelta { item_id, text },
+            );
         }
 
         "item/completed" => {
@@ -2287,7 +2457,12 @@ fn translate_notification_with_state(
             if item_type == "reasoning" {
                 if let Some(text) = extract_reasoning_text(item) {
                     if !text.is_empty() {
-                        let _ = event_tx.send(AgentEvent::Reasoning { text });
+                        send_scoped_agent_event(
+                            event_tx,
+                            thread_id,
+                            turn_id,
+                            AgentEvent::Reasoning { text },
+                        );
                     }
                 }
                 return;
@@ -2301,9 +2476,14 @@ fn translate_notification_with_state(
             if item_type == "agentMessage" {
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     if !text.is_empty() {
-                        let _ = event_tx.send(AgentEvent::Message {
-                            text: text.to_string(),
-                        });
+                        send_scoped_agent_event(
+                            event_tx,
+                            thread_id,
+                            turn_id,
+                            AgentEvent::Message {
+                                text: text.to_string(),
+                            },
+                        );
                     }
                 }
                 return;
@@ -2312,9 +2492,14 @@ fn translate_notification_with_state(
             if item_type == "userMessage" {
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     if !text.is_empty() {
-                        let _ = event_tx.send(AgentEvent::UserMessage {
-                            text: text.to_string(),
-                        });
+                        send_scoped_agent_event(
+                            event_tx,
+                            thread_id,
+                            turn_id,
+                            AgentEvent::UserMessage {
+                                text: text.to_string(),
+                            },
+                        );
                     }
                 }
                 return;
@@ -2322,7 +2507,7 @@ fn translate_notification_with_state(
 
             if item_type == "collabAgentToolCall" {
                 if let Some(event) = codex_collab_agent_tool_call(item) {
-                    let _ = event_tx.send(event);
+                    send_scoped_agent_event(event_tx, thread_id, turn_id, event);
                 }
                 return;
             }
@@ -2336,10 +2521,15 @@ fn translate_notification_with_state(
             if item_type == "commandExecution" {
                 if let Some(output) = item.get("aggregatedOutput").and_then(|v| v.as_str()) {
                     if !output.is_empty() {
-                        let _ = event_tx.send(AgentEvent::ToolOutputDelta {
-                            item_id: item_id.clone(),
-                            text: output.to_string(),
-                        });
+                        send_scoped_agent_event(
+                            event_tx,
+                            thread_id,
+                            turn_id,
+                            AgentEvent::ToolOutputDelta {
+                                item_id: item_id.clone(),
+                                text: output.to_string(),
+                            },
+                        );
                     }
                 }
             }
@@ -2354,10 +2544,15 @@ fn translate_notification_with_state(
                         serde_json::to_string_pretty(result).unwrap_or_default()
                     };
                     if !text.is_empty() {
-                        let _ = event_tx.send(AgentEvent::ToolOutputDelta {
-                            item_id: item_id.clone(),
-                            text,
-                        });
+                        send_scoped_agent_event(
+                            event_tx,
+                            thread_id,
+                            turn_id,
+                            AgentEvent::ToolOutputDelta {
+                                item_id: item_id.clone(),
+                                text,
+                            },
+                        );
                     }
                 }
             }
@@ -2374,7 +2569,12 @@ fn translate_notification_with_state(
                 "cancelled" => ToolCompletionStatus::Cancelled,
                 _ => ToolCompletionStatus::Success,
             };
-            let _ = event_tx.send(AgentEvent::ToolCompleted { item_id, status });
+            send_scoped_agent_event(
+                event_tx,
+                thread_id,
+                turn_id,
+                AgentEvent::ToolCompleted { item_id, status },
+            );
         }
 
         "turn/completed" => {
@@ -2382,7 +2582,12 @@ fn translate_notification_with_state(
                 .get("message")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let _ = event_tx.send(AgentEvent::TurnCompleted { message });
+            send_scoped_agent_event(
+                event_tx,
+                thread_id,
+                turn_id,
+                AgentEvent::TurnCompleted { message },
+            );
         }
 
         "turn/diff/updated" => {
@@ -2400,16 +2605,26 @@ fn translate_notification_with_state(
                         .collect()
                 })
                 .unwrap_or_default();
-            let _ = event_tx.send(AgentEvent::DiffUpdated {
-                files_changed,
-                unified_diff,
-            });
+            send_scoped_agent_event(
+                event_tx,
+                thread_id,
+                turn_id,
+                AgentEvent::DiffUpdated {
+                    files_changed,
+                    unified_diff,
+                },
+            );
         }
 
         "turn/plan/updated" => {
             let entries = codex_plan_entries(params);
             if !entries.is_empty() {
-                let _ = event_tx.send(AgentEvent::PlanUpdate { entries });
+                send_scoped_agent_event(
+                    event_tx,
+                    thread_id,
+                    turn_id,
+                    AgentEvent::PlanUpdate { entries },
+                );
             }
         }
 
@@ -2420,18 +2635,28 @@ fn translate_notification_with_state(
                 return;
             }
             state.goal_known_active = true;
-            let _ = event_tx.send(AgentEvent::Log {
-                level: "info".to_string(),
-                message: format!("Codex goal updated: {}", format_goal(goal)),
-            });
+            send_scoped_agent_event(
+                event_tx,
+                thread_id,
+                turn_id,
+                AgentEvent::Log {
+                    level: "info".to_string(),
+                    message: format!("Codex goal updated: {}", format_goal(goal)),
+                },
+            );
         }
 
         "thread/goal/cleared" => {
             if state.goal_known_active {
-                let _ = event_tx.send(AgentEvent::Log {
-                    level: "info".to_string(),
-                    message: "Codex goal cleared".to_string(),
-                });
+                send_scoped_agent_event(
+                    event_tx,
+                    thread_id,
+                    turn_id,
+                    AgentEvent::Log {
+                        level: "info".to_string(),
+                        message: "Codex goal cleared".to_string(),
+                    },
+                );
             }
             state.goal_known_active = false;
         }
@@ -2444,27 +2669,37 @@ fn translate_notification_with_state(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("<unnamed>");
-            let _ = event_tx.send(AgentEvent::Log {
-                level: "info".to_string(),
-                message: format!("Codex thread renamed: {}", name),
-            });
+            send_scoped_agent_event(
+                event_tx,
+                thread_id,
+                turn_id,
+                AgentEvent::Log {
+                    level: "info".to_string(),
+                    message: format!("Codex thread renamed: {}", name),
+                },
+            );
         }
 
         "thread/compacted" => {
-            let turn_id = params
+            let compacted_turn_id = params
                 .get("turnId")
                 .or_else(|| params.get("turn_id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let message = if turn_id.is_empty() {
+            let message = if compacted_turn_id.is_empty() {
                 "Codex compacted context".to_string()
             } else {
-                format!("Codex compacted context for turn {turn_id}")
+                format!("Codex compacted context for turn {compacted_turn_id}")
             };
-            let _ = event_tx.send(AgentEvent::Log {
-                level: "info".to_string(),
-                message,
-            });
+            send_scoped_agent_event(
+                event_tx,
+                thread_id,
+                turn_id,
+                AgentEvent::Log {
+                    level: "info".to_string(),
+                    message,
+                },
+            );
         }
 
         // Informational Codex v2 notifications — no action needed.
@@ -2492,7 +2727,12 @@ fn translate_notification_with_state(
         "thread/status/changed" => {
             if let Some(status) = codex_thread_status_type(params) {
                 if status == "completed" || status == "idle" {
-                    let _ = event_tx.send(AgentEvent::TurnCompleted { message: None });
+                    send_scoped_agent_event(
+                        event_tx,
+                        thread_id,
+                        turn_id,
+                        AgentEvent::TurnCompleted { message: None },
+                    );
                 }
             }
         }
@@ -2739,6 +2979,7 @@ impl ExternalAgent for CodexAgent {
         let pending_approvals = Arc::clone(&self.pending_approvals);
         let approval_counter = Arc::new(AtomicU64::new(1));
         let active_turn_id = Arc::clone(&self.active_turn_id);
+        let active_turns = Arc::clone(&self.active_turns);
         let active_thread_id = Arc::clone(&self.active_thread_id);
         let latest_token_usage = Arc::clone(&self.latest_token_usage);
         let model = self.model.clone();
@@ -2751,6 +2992,7 @@ impl ExternalAgent for CodexAgent {
             approval_counter,
             active_thread_id,
             active_turn_id,
+            active_turns,
             latest_token_usage,
             model,
         ));
@@ -2898,6 +3140,10 @@ impl ExternalAgent for CodexAgent {
         // turn/started notification hook if the response shape differs.
         let response = self.send_request("turn/start", Some(params)).await?;
         if let Some(id) = extract_turn_id(&response) {
+            self.active_turns
+                .lock()
+                .await
+                .insert(thread.thread_id.clone(), id.clone());
             *self.active_turn_id.lock().await = Some(id);
         }
         // Also make sure the thread id cache matches the thread we were handed
@@ -2950,18 +3196,7 @@ impl ExternalAgent for CodexAgent {
     }
 
     async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
-        let turn_id = {
-            let guard = self.active_turn_id.lock().await;
-            guard.clone()
-        };
-        let turn_id = turn_id
-            .ok_or_else(|| CallerError::ExternalAgent("no active turn to interrupt".into()))?;
-        let thread_id = {
-            let guard = self.active_thread_id.lock().await;
-            guard.clone()
-        };
-        let thread_id = thread_id
-            .ok_or_else(|| CallerError::ExternalAgent("no active thread to interrupt".into()))?;
+        let (thread_id, turn_id) = self.active_thread_and_turn("interrupt").await?;
         let params = serde_json::json!({
             "threadId": thread_id,
             "turnId": turn_id,
@@ -2983,18 +3218,7 @@ impl ExternalAgent for CodexAgent {
         // messages are consistent: "no active turn to steer" /
         // "no active thread to steer" both map to typed ExternalAgent
         // errors that `drain_external_agent_events` can fall back on.
-        let turn_id = {
-            let guard = self.active_turn_id.lock().await;
-            guard.clone()
-        };
-        let turn_id =
-            turn_id.ok_or_else(|| CallerError::ExternalAgent("no active turn to steer".into()))?;
-        let thread_id = {
-            let guard = self.active_thread_id.lock().await;
-            guard.clone()
-        };
-        let thread_id = thread_id
-            .ok_or_else(|| CallerError::ExternalAgent("no active thread to steer".into()))?;
+        let (thread_id, turn_id) = self.active_thread_and_turn("steer").await?;
         let params = serde_json::json!({
             "threadId": thread_id,
             "input": [{"type": "text", "text": text}],
@@ -3049,7 +3273,8 @@ impl ExternalAgent for CodexAgent {
     }
 
     async fn activate_thread(&mut self, thread_id: &str) -> Result<(), CallerError> {
-        self.active_turn_id.lock().await.take();
+        let active_turn = self.active_turns.lock().await.get(thread_id).cloned();
+        *self.active_turn_id.lock().await = active_turn;
         *self.active_thread_id.lock().await = Some(thread_id.to_string());
         Ok(())
     }
@@ -4216,6 +4441,40 @@ mod tests {
     }
 
     #[test]
+    fn translate_scoped_notification_preserves_thread_and_turn_ids() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({"message": "All done"});
+        let mut state = CodexNotificationState::default();
+
+        translate_notification_with_scope(
+            "turn/completed",
+            &params,
+            &tx,
+            &mut state,
+            Some("thread-abc"),
+            Some("turn-xyz"),
+        );
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::Scoped {
+                thread_id,
+                turn_id,
+                event,
+            } => {
+                assert_eq!(thread_id.as_deref(), Some("thread-abc"));
+                assert_eq!(turn_id.as_deref(), Some("turn-xyz"));
+                match *event {
+                    AgentEvent::TurnCompleted { message } => {
+                        assert_eq!(message, Some("All done".into()));
+                    }
+                    other => panic!("expected scoped TurnCompleted, got {:?}", other),
+                }
+            }
+            other => panic!("expected Scoped event, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn translate_diff_updated() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({
@@ -4612,6 +4871,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_thread_and_turn_uses_thread_specific_turn_ids() {
+        let mut agent = CodexAgent::new(
+            "codex".into(),
+            None,
+            "on-request".into(),
+            "danger-full-access".into(),
+            None,
+        );
+        *agent.active_thread_id.lock().await = Some("parent-thread".into());
+        *agent.active_turn_id.lock().await = Some("fallback-turn".into());
+        {
+            let mut active_turns = agent.active_turns.lock().await;
+            active_turns.insert("parent-thread".into(), "parent-turn".into());
+            active_turns.insert("side-thread".into(), "side-turn".into());
+        }
+
+        let (thread_id, turn_id) = agent.active_thread_and_turn("steer").await.unwrap();
+        assert_eq!(thread_id, "parent-thread");
+        assert_eq!(turn_id, "parent-turn");
+
+        agent.activate_thread("side-thread").await.unwrap();
+        assert_eq!(
+            agent.active_turn_id.lock().await.as_deref(),
+            Some("side-turn")
+        );
+        let (thread_id, turn_id) = agent.active_thread_and_turn("steer").await.unwrap();
+        assert_eq!(thread_id, "side-thread");
+        assert_eq!(turn_id, "side-turn");
+    }
+
+    #[tokio::test]
     async fn interrupt_turn_wire_format_is_jsonrpc_request() {
         // Confirm the shape of the JSON-RPC request we emit matches what Codex
         // v2 expects: {"jsonrpc":"2.0","id":<N>,"method":"turn/interrupt",
@@ -4780,7 +5070,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_action_side_rejects_running_parent_turn() {
+    async fn thread_action_side_allows_running_parent_turn() {
         let mut agent = test_agent();
         *agent.active_thread_id.lock().await = Some("thread-abc".into());
         *agent.active_turn_id.lock().await = Some("turn-abc".into());
@@ -4790,7 +5080,11 @@ mod tests {
             .unwrap_err();
         match err {
             CallerError::ExternalAgent(msg) => {
-                assert!(msg.contains("active Codex turn"), "got: {}", msg);
+                assert!(
+                    msg.contains("Not initialized"),
+                    "running parent turns should not be rejected before the RPC path; got: {}",
+                    msg
+                );
             }
             other => panic!("expected ExternalAgent error, got {:?}", other),
         }

@@ -206,6 +206,17 @@ impl std::fmt::Display for AgentBackend {
 /// Events emitted by an external agent, normalized to Intendant concepts.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// Backend event scoped to a native conversation thread / turn.
+    ///
+    /// Codex's app-server can run and report multiple threads through one
+    /// process connection. Keep scope at the common boundary so the controller
+    /// can demultiplex those streams without pretending each thread is a
+    /// separate backend process.
+    Scoped {
+        thread_id: Option<String>,
+        turn_id: Option<String>,
+        event: Box<AgentEvent>,
+    },
     /// Incremental text from the agent's message.
     MessageDelta { text: String },
     /// Complete agent message.
@@ -280,6 +291,31 @@ pub enum AgentEvent {
         reason: String,
         exit_code: Option<i32>,
     },
+}
+
+impl AgentEvent {
+    pub fn scoped(thread_id: Option<String>, turn_id: Option<String>, event: AgentEvent) -> Self {
+        if thread_id.is_none() && turn_id.is_none() {
+            event
+        } else {
+            Self::Scoped {
+                thread_id,
+                turn_id,
+                event: Box::new(event),
+            }
+        }
+    }
+
+    pub fn into_scope(self) -> (Option<String>, Option<String>, AgentEvent) {
+        match self {
+            Self::Scoped {
+                thread_id,
+                turn_id,
+                event,
+            } => (thread_id, turn_id, *event),
+            event => (None, None, event),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
