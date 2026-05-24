@@ -1871,6 +1871,19 @@ fn merge_intendant_wrapper_into_external_session(
         "can_delete_intendant_log".to_string(),
         serde_json::json!(true),
     );
+    if let Some(value) = wrapper_obj.get("relationships") {
+        if let Some(existing) = obj.get_mut("relationships").and_then(|v| v.as_array_mut()) {
+            if let Some(items) = value.as_array() {
+                for item in items {
+                    if !existing.contains(item) {
+                        existing.push(item.clone());
+                    }
+                }
+            }
+        } else {
+            obj.insert("relationships".to_string(), value.clone());
+        }
+    }
 
     if let (Some(current), Some(wrapper_updated)) = (
         obj.get("updated_at").and_then(|v| v.as_str()),
@@ -2220,8 +2233,56 @@ fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<serde_json::V
     entries
 }
 
+fn session_relationships_from_log_dir(session_dir: &Path) -> Vec<serde_json::Value> {
+    let Ok(contents) = std::fs::read_to_string(session_dir.join("session.jsonl")) else {
+        return Vec::new();
+    };
+
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("session_relationship"))
+        .filter_map(|entry| {
+            let data = entry.get("data")?;
+            let parent_session_id = data
+                .get("parent_session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let child_session_id = data
+                .get("child_session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let relationship = data
+                .get("relationship")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if parent_session_id.is_empty()
+                || child_session_id.is_empty()
+                || parent_session_id == child_session_id
+                || !matches!(relationship.as_str(), "side" | "subagent" | "fork")
+            {
+                return None;
+            }
+            Some(serde_json::json!({
+                "parent_session_id": parent_session_id,
+                "child_session_id": child_session_id,
+                "relationship": relationship,
+                "ephemeral": data.get("ephemeral").and_then(|v| v.as_bool()).unwrap_or(false),
+            }))
+        })
+        .collect()
+}
+
 fn get_session_detail(session_id: &str) -> String {
-    let session_dir = match resolve_session_dir(session_id) {
+    get_session_detail_from_home(&crate::platform::home_dir(), session_id)
+}
+
+fn get_session_detail_from_home(home: &Path, session_id: &str) -> String {
+    let session_dir = match resolve_session_dir_from_home(home, session_id) {
         Some(d) => d,
         None => return serde_json::json!({"error": "session not found"}).to_string(),
     };
@@ -2252,6 +2313,7 @@ fn get_session_detail(session_id: &str) -> String {
         "session_id": session_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
         "entries": entries,
         "frames": frames,
+        "relationships": session_relationships_from_log_dir(&session_dir),
     }).to_string()
 }
 
@@ -5306,6 +5368,7 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
     let created_at = created_at.unwrap_or_default();
     let updated_at = mtime_secs_to_string(updated_at_secs).unwrap_or_else(|| created_at.clone());
     let backend_source_label: Option<String> = None;
+    let relationships = session_relationships_from_log_dir(dir);
 
     let wrapper_session = serde_json::json!({
         "source": "intendant",
@@ -5344,6 +5407,7 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
         "path": dir.to_string_lossy().to_string(),
         "can_delete": true,
         "can_resume": true,
+        "relationships": relationships,
     });
 
     store_intendant_session_list_row(fingerprint, &wrapper_session);
@@ -17065,6 +17129,74 @@ mod tests {
         assert!(replay["entries"].as_array().unwrap().iter().any(|entry| {
             entry["event"] == "model_response" && entry["summary"] == "internal history"
         }));
+    }
+
+    #[test]
+    fn session_detail_exposes_persisted_relationships() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join(".intendant").join("logs").join("parent");
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.session_relationship("parent", "child", "subagent", false);
+        drop(log);
+
+        let detail: serde_json::Value =
+            serde_json::from_str(&get_session_detail_from_home(dir.path(), "parent")).unwrap();
+        let relationships = detail["relationships"].as_array().unwrap();
+
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0]["parent_session_id"], "parent");
+        assert_eq!(relationships[0]["child_session_id"], "child");
+        assert_eq!(relationships[0]["relationship"], "subagent");
+        assert_eq!(relationships[0]["ephemeral"], false);
+    }
+
+    #[test]
+    fn list_sessions_exposes_persisted_relationships() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join(".intendant").join("logs").join("parent");
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.session_relationship("parent", "child", "subagent", false);
+        drop(log);
+
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(dir.path())).unwrap();
+        let parent = sessions
+            .iter()
+            .find(|session| session["session_id"] == "parent")
+            .expect("parent session should be listed");
+        let relationships = parent["relationships"].as_array().unwrap();
+
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0]["parent_session_id"], "parent");
+        assert_eq!(relationships[0]["child_session_id"], "child");
+        assert_eq!(relationships[0]["relationship"], "subagent");
+    }
+
+    #[test]
+    fn merged_external_session_preserves_wrapper_relationships() {
+        let mut external = serde_json::json!({
+            "source": "codex",
+            "session_id": "parent",
+            "resume_id": "parent",
+        });
+        let wrapper = serde_json::json!({
+            "session_id": "wrapper",
+            "backend_source": "codex",
+            "backend_session_id": "parent",
+            "relationships": [{
+                "parent_session_id": "parent",
+                "child_session_id": "child",
+                "relationship": "subagent",
+                "ephemeral": false,
+            }],
+        });
+
+        merge_intendant_wrapper_into_external_session(&mut external, &wrapper);
+
+        let relationships = external["relationships"].as_array().unwrap();
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0]["parent_session_id"], "parent");
+        assert_eq!(relationships[0]["child_session_id"], "child");
     }
 
     #[test]
