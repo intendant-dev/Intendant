@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -3049,7 +3048,7 @@ fn metadata_mtime_nanos(metadata: &std::fs::Metadata) -> u128 {
 }
 
 fn metadata_ctime_nanos(metadata: &std::fs::Metadata) -> i128 {
-    metadata.ctime() as i128 * 1_000_000_000 + metadata.ctime_nsec() as i128
+    crate::platform::metadata_ctime_nanos(metadata)
 }
 
 fn session_list_path_key(path: &Path) -> String {
@@ -3060,14 +3059,17 @@ fn session_list_path_key(path: &Path) -> String {
 fn file_dependency_fingerprint(path: &Path) -> String {
     let path_key = session_list_path_key(path);
     match std::fs::metadata(path) {
-        Ok(metadata) => format!(
-            "{path_key}\0{}\0{}\0{}\0{}\0{}",
-            metadata.len(),
-            metadata_mtime_nanos(&metadata),
-            metadata_ctime_nanos(&metadata),
-            metadata.dev(),
-            metadata.ino()
-        ),
+        Ok(metadata) => {
+            let (dev, ino) = crate::platform::metadata_dev_ino(&metadata);
+            format!(
+                "{path_key}\0{}\0{}\0{}\0{}\0{}",
+                metadata.len(),
+                metadata_mtime_nanos(&metadata),
+                metadata_ctime_nanos(&metadata),
+                dev,
+                ino
+            )
+        }
         Err(_) => format!("{path_key}\0missing"),
     }
 }
@@ -3081,14 +3083,15 @@ fn session_list_cache_key(
     if !metadata.is_file() {
         return None;
     }
+    let (dev, ino) = crate::platform::metadata_dev_ino(&metadata);
     Some(SessionListCacheKey {
         namespace,
         path: session_list_path_key(path),
         len: metadata.len(),
         mtime_nanos: metadata_mtime_nanos(&metadata),
         ctime_nanos: metadata_ctime_nanos(&metadata),
-        dev: metadata.dev(),
-        ino: metadata.ino(),
+        dev,
+        ino,
         extra: extra.into(),
     })
 }
@@ -4883,13 +4886,14 @@ fn push_session_file_fingerprint(
         .unwrap_or(path)
         .to_string_lossy()
         .to_string();
+    let (dev, ino) = crate::platform::metadata_dev_ino(&metadata);
     entries.push(SessionFileFingerprint {
         rel,
         len: metadata.len(),
         mtime_nanos: metadata_mtime_nanos(&metadata),
         ctime_nanos: metadata_ctime_nanos(&metadata),
-        dev: metadata.dev(),
-        ino: metadata.ino(),
+        dev,
+        ino,
         is_dir,
     });
 }
@@ -6560,10 +6564,13 @@ fn delete_session_data(session_id: &str, target: &str) -> String {
                         if p.is_dir() {
                             walk(&p, total, seen);
                         } else if let Ok(m) = p.metadata() {
-                            if m.nlink() > 1 && !seen.insert((m.dev(), m.ino())) {
+                            if crate::platform::metadata_is_multiply_linked(&m)
+                                && !seen.insert(crate::platform::metadata_dev_ino(&m))
+                            {
                                 continue;
                             }
-                            *total = total.saturating_add(m.blocks().saturating_mul(512));
+                            *total = total
+                                .saturating_add(crate::platform::metadata_on_disk_bytes(&m));
                         }
                     }
                 }

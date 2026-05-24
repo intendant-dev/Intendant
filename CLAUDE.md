@@ -9,7 +9,7 @@ Two binaries form a security boundary:
 - **intendant-runtime** — Sandboxed command executor. Reads JSON commands from stdin, executes them sequentially, writes results to stdout. Runs under Landlock filesystem restrictions. Never holds API keys.
 - **intendant** — Controller/caller. Manages the LLM conversation loop, calls model APIs, dispatches tool calls to the runtime subprocess, and runs all user-facing interfaces (CLI, TUI, Web, MCP).
 
-The system is **provider-agnostic** (OpenAI, Anthropic, Gemini), **cross-platform** (macOS, Linux/Debian), and designed around the principle that every capability should be accessible through any interface — TUI, web dashboard, MCP, voice, or programmatic control.
+The system is **provider-agnostic** (OpenAI, Anthropic, Gemini), **cross-platform** (macOS, Linux/Debian, Windows), and designed around the principle that every capability should be accessible through any interface — TUI, web dashboard, MCP, voice, or programmatic control.
 
 ## Vision and Direction
 
@@ -225,7 +225,17 @@ cargo test --test e2e test_voice -- --nocapture           # Tier 3: needs Xvfb +
 
 ### Platform Support
 
-Target platforms: macOS, Linux (Debian, X11 and Wayland).
+Target platforms: **macOS, Linux** (Debian, X11 and Wayland), **and Windows**
+(`x86_64-pc-windows-msvc`). Windows is a first-class target — capture, input
+injection, H.264 encode, and the gateway all have Windows backends, built and
+run via `scripts/setup-windows.ps1` (see `docs/src/windows-support.md`).
+
+**OS-specific `std` APIs must be `#[cfg]`-guarded.** Don't
+`use std::os::unix::fs::MetadataExt;` (→ `.ctime()/.dev()/.ino()/.nlink()/.blocks()`),
+or any `std::os::unix::*` / `std::os::windows::*` item, unconditionally — it
+breaks the other platform's build. Wrap the platform call in a
+`#[cfg(unix)]`/`#[cfg(windows)]`-paired helper in `platform.rs` (the existing
+convention) with a portable fallback, and route callers through it.
 
 Prefer platform-agnostic code by default. When platform-specific behavior is
 unavoidable, use `cfg!(target_os = ...)` runtime checks for small branches or
@@ -239,7 +249,7 @@ supported platforms — never panic or silently do nothing.
 
 ## Environment Requirements
 
-- **OS**: macOS or Linux (Debian), unprivileged user with passwordless sudo (Linux)
+- **OS**: macOS, Linux (Debian), or Windows (Server 2022 / 11); unprivileged user with passwordless sudo on Linux
 - **API keys**: `.env` with `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`
 - **Display capture**: libxcb + libxcb-shm (Linux X11), PipeWire (Linux Wayland), ScreenCaptureKit (macOS)
 - **Input injection**: xdotool (Linux X11), ydotool (Linux Wayland), cliclick (macOS)
@@ -262,4 +272,9 @@ you didn't spawn; they belong to other agents.
 
 ## CI/CD
 
-None configured. Run `cargo test --bins` and `cargo clippy` locally before committing.
+GitHub Actions (on push / PR to `main`): a cross-platform `cargo check` on
+Windows + macOS + Linux (`.github/workflows/windows.yml`) to catch
+platform-specific build breaks, plus `cargo audit` (`audit.yml`) and an mdBook
+docs deploy (`docs.yml`). The `tests/e2e/` integration tests are NOT in CI
+(they make real API calls). Run `cargo test --bins` and `cargo clippy` locally
+before committing.

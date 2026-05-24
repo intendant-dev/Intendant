@@ -473,6 +473,103 @@ pub async fn spawn_detached_restart(cmd: &str) -> Result<u32, String> {
         .ok_or_else(|| "Detached restart child has no PID".to_string())
 }
 
+// ── Cross-platform std::fs::Metadata extras ────────────────────────────────
+//
+// `std::os::unix::fs::MetadataExt` exposes inode-level fields (ctime, dev,
+// ino, nlink, blocks) that have no portable equivalent. The session-list
+// cache fingerprints and the worktree disk-usage walk used them directly,
+// which broke the Windows build. These helpers wrap each access behind a
+// `#[cfg(unix)]`/`#[cfg(windows)]` pair so callers stay platform-agnostic.
+
+/// Change-time of a file as whole + sub-second nanoseconds since the Unix
+/// epoch, used purely as a cache-invalidation fingerprint.
+///
+/// - **Unix**: `ctime`/`ctime_nsec` (inode change time — flips on metadata
+///   edits that leave mtime untouched, so it's a stricter cache key).
+/// - **Windows**: there is no ctime; fall back to the creation time when
+///   available, else 0. The fingerprint already folds in `len` + mtime, so
+///   a coarser ctime only widens cache hits slightly, never causing a stale
+///   read.
+pub fn metadata_ctime_nanos(metadata: &std::fs::Metadata) -> i128 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.ctime() as i128 * 1_000_000_000 + metadata.ctime_nsec() as i128
+    }
+    #[cfg(not(unix))]
+    {
+        metadata
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i128)
+            .unwrap_or(0)
+    }
+}
+
+/// `(device, inode)` identity pair for a file, used to fingerprint cache
+/// keys and to de-duplicate hardlinked files in disk-usage walks.
+///
+/// - **Unix**: the real `(dev, ino)`.
+/// - **Windows**: NTFS has an analogous `(volume-serial, file-index)` but it
+///   is not surfaced by `std::fs::Metadata`. Returning `(0, 0)` is correct
+///   for both callers: cache keys still vary on `len`+mtime+ctime, and the
+///   disk-usage de-dup is paired with [`metadata_is_multiply_linked`] which
+///   reports `false` on Windows, so the de-dup set is never consulted.
+pub fn metadata_dev_ino(metadata: &std::fs::Metadata) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        (0, 0)
+    }
+}
+
+/// Whether a file has more than one hardlink (so a disk-usage walk should
+/// de-duplicate it by `(dev, ino)`).
+///
+/// - **Unix**: `nlink() > 1`.
+/// - **Windows**: hardlinks exist but `nlink` is not exposed by
+///   `std::fs::Metadata`; report `false` so each path is counted once. The
+///   apparent-size fallback in [`metadata_on_disk_bytes`] already avoids the
+///   inode model entirely, so no double-counting results.
+pub fn metadata_is_multiply_linked(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() > 1
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+/// On-disk byte allocation for a file (what `du` reports), not apparent size.
+///
+/// - **Unix**: `blocks() * 512` — the actual allocated 512-byte blocks, which
+///   correctly discounts sparse files and (combined with the `(dev, ino)`
+///   de-dup) hardlink-dense trees like Cargo `target/`.
+/// - **Windows**: `std::fs::Metadata` exposes no block count; fall back to
+///   apparent `len()`. This over-counts sparse files, but the figure is only
+///   an informational disk-usage estimate, never a correctness input.
+pub fn metadata_on_disk_bytes(metadata: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
