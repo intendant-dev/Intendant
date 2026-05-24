@@ -1703,6 +1703,20 @@ html, body {
 .session-window-status.active { color: var(--teal); }
 .session-window-status.waiting { color: var(--yellow); }
 .session-window-status.done { color: var(--green); }
+.session-window-action-cluster {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.session-window-menu-cluster {
+  position: relative;
+  margin-left: 2px;
+}
+.session-window-state-cluster {
+  padding-left: 6px;
+  border-left: 1px solid var(--surface0);
+}
 .session-window-action {
   flex-shrink: 0;
   width: 22px;
@@ -1720,8 +1734,8 @@ html, body {
 .session-window-action:hover { background: var(--surface0); color: var(--text); }
 .session-window-menu {
   position: absolute;
-  top: 32px;
-  right: 34px;
+  top: 28px;
+  right: 0;
   z-index: 30;
   min-width: 138px;
   padding: 4px;
@@ -11432,6 +11446,10 @@ function sessionWindowIsSide(sessionId) {
   return meta.relationshipKind === 'side';
 }
 
+function sessionWindowShouldStartHeaderCollapsed(meta = {}) {
+  return String(meta.relationshipKind || '').trim().toLowerCase() === 'subagent';
+}
+
 function codexThreadActionAllowedForSide(op) {
   const normalized = String(op || '').trim().toLowerCase().replace(/_/g, '-');
   return normalized === 'side-close' || normalized === 'undo';
@@ -11522,6 +11540,7 @@ function applySessionRelationshipMetadata(rel) {
   sessionMetadataById.set(rel.parentId, { ...parentMeta, children: parentChildren });
 
   const childMeta = sessionMetadataById.get(rel.childId) || {};
+  const childHadRelationship = !!childMeta.relationshipKind;
   const inheritedMeta = {};
   for (const key of ['projectRoot', 'projectLabel', 'cwd', 'cwdLabel', 'source', 'sourceLabel', 'backendSource']) {
     if (!childMeta[key] && parentMeta[key]) inheritedMeta[key] = parentMeta[key];
@@ -11538,6 +11557,9 @@ function applySessionRelationshipMetadata(rel) {
   updateSessionRelationshipBadges(rel.childId);
   if (sessionWindows.has(rel.childId) && Object.keys(inheritedMeta).length > 0) {
     updateSessionWindow(rel.childId, inheritedMeta);
+  }
+  if (rel.kind === 'subagent' && !childHadRelationship && sessionWindows.has(rel.childId)) {
+    setSessionWindowHeaderCollapsed(rel.childId, true);
   }
   updateSessionWindowActionMenuVisibility(rel.childId);
   updateSessionWindowRelationshipStyle(rel.childId);
@@ -11982,6 +12004,10 @@ function ensureSessionWindow(sessionId, meta = {}) {
   status.className = 'session-window-status';
   status.textContent = normalizeSessionPhase(meta.phase || 'idle');
   header.title = 'Click header to collapse or expand';
+  const menuControls = document.createElement('div');
+  menuControls.className = 'session-window-action-cluster session-window-menu-cluster';
+  const windowControls = document.createElement('div');
+  windowControls.className = 'session-window-action-cluster session-window-state-cluster';
   const minimize = document.createElement('button');
   minimize.className = 'session-window-action session-window-minimize';
   minimize.type = 'button';
@@ -12036,13 +12062,15 @@ function ensureSessionWindow(sessionId, meta = {}) {
   close.type = 'button';
   close.title = 'Close window';
   close.textContent = '\u00d7';
+  menuControls.appendChild(actions);
+  menuControls.appendChild(actionMenu);
+  windowControls.appendChild(minimize);
+  windowControls.appendChild(maximize);
+  windowControls.appendChild(close);
   header.appendChild(title);
   header.appendChild(status);
-  header.appendChild(minimize);
-  header.appendChild(actions);
-  header.appendChild(maximize);
-  header.appendChild(close);
-  header.appendChild(actionMenu);
+  header.appendChild(menuControls);
+  header.appendChild(windowControls);
 
   const log = document.createElement('div');
   log.className = 'session-window-log';
@@ -12097,6 +12125,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   });
 
   grid.appendChild(el);
+  const startHeaderCollapsed = sessionWindowShouldStartHeaderCollapsed(meta);
   win = {
     el,
     log,
@@ -12116,9 +12145,10 @@ function ensureSessionWindow(sessionId, meta = {}) {
     pendingActiveUntil: 0,
     ended: false,
     minimized: false,
-    headerCollapsed: false,
+    headerCollapsed: startHeaderCollapsed,
   };
   sessionWindows.set(sid, win);
+  updateSessionWindowHeaderCollapseState(sid);
   syncSessionWindowMetadataRefresh();
   updateSessionWindow(sid, meta);
   updateSessionWindowMaximizeState();
