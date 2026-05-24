@@ -1649,8 +1649,7 @@ fn current_agent_output_response_for_ids(ids: Vec<String>, log_dir: &Path) -> St
         return upload_error_response("400 Bad Request", "missing output ids");
     }
 
-    let fallback_logs_dir =
-        Some(crate::platform::home_dir().join(".intendant").join("logs"));
+    let fallback_logs_dir = Some(crate::platform::home_dir().join(".intendant").join("logs"));
     let chunks = agent_output_chunks_with_fallback(log_dir, &ids, fallback_logs_dir.as_deref());
     let found: HashSet<&str> = chunks
         .iter()
@@ -4352,11 +4351,7 @@ fn find_codex_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
     let codex = codex_dir(home);
     let mut files = Vec::new();
     collect_files(&codex.join("sessions"), ".jsonl", &mut files);
-    collect_files(
-        &codex.join("archived_sessions"),
-        ".jsonl",
-        &mut files,
-    );
+    collect_files(&codex.join("archived_sessions"), ".jsonl", &mut files);
 
     files
         .into_iter()

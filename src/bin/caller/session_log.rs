@@ -1956,6 +1956,27 @@ impl SessionLog {
         cached_tokens: u64,
         source: Option<&str>,
     ) {
+        self.model_response_for_session(
+            None,
+            content,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens,
+            source,
+        );
+    }
+
+    pub fn model_response_for_session(
+        &mut self,
+        session_id: Option<&str>,
+        content: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+        cached_tokens: u64,
+        source: Option<&str>,
+    ) {
         self.summary_builder.total_tokens += total_tokens;
         // Codex fires multiple `model_response` events per turn (one per
         // assistant message in the same turn). Appending keeps the full
@@ -1974,6 +1995,9 @@ impl SessionLog {
         });
         if let Some(src) = source {
             data["source"] = serde_json::Value::String(src.to_string());
+        }
+        if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            data["session_id"] = serde_json::Value::String(session_id.to_string());
         }
         self.emit(LogEvent {
             ts: Self::ts(),
@@ -2041,6 +2065,17 @@ impl SessionLog {
         source: Option<&str>,
         output_id: Option<&str>,
     ) {
+        self.agent_output_with_session_id(None, stdout, stderr, source, output_id);
+    }
+
+    pub fn agent_output_with_session_id(
+        &mut self,
+        session_id: Option<&str>,
+        stdout: &str,
+        stderr: &str,
+        source: Option<&str>,
+        output_id: Option<&str>,
+    ) {
         let stdout_span = if !stdout.is_empty() {
             self.append_turn_file_span("stdout.txt", stdout)
         } else {
@@ -2062,6 +2097,9 @@ impl SessionLog {
         }
         if let Some(src) = source {
             data["source"] = serde_json::Value::String(src.to_string());
+        }
+        if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            data["session_id"] = serde_json::Value::String(session_id.to_string());
         }
         if let Some(span) = stdout_span.as_ref() {
             data["stdout_offset"] = serde_json::Value::from(span.offset);
@@ -2558,8 +2596,12 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|d| d.get("source"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
             Some(AppEvent::ModelResponse {
-                session_id: None,
+                session_id,
                 turn: turn.unwrap_or(0),
                 content,
                 usage,
@@ -2634,8 +2676,12 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|d| d.get("output_id"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
             Some(AppEvent::AgentOutput {
-                session_id: None,
+                session_id,
                 stdout,
                 stderr,
                 source,
@@ -4156,6 +4202,73 @@ mod tests {
                 assert_eq!(source.as_deref(), Some("Codex"));
             }
             other => panic!("expected ModelResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_model_response_preserves_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(3, 0.5, 100_000);
+        log.model_response_for_session(
+            Some("child-thread"),
+            "child response",
+            1,
+            2,
+            3,
+            0,
+            Some("Codex"),
+        );
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "model_response");
+        let evt = session_log_entry_to_app_event(&entry, &log_dir).unwrap();
+        match evt {
+            AppEvent::ModelResponse {
+                session_id,
+                content,
+                source,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("child-thread"));
+                assert_eq!(content, "child response");
+                assert_eq!(source.as_deref(), Some("Codex"));
+            }
+            other => panic!("expected ModelResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_agent_output_preserves_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(2, 0.5, 100_000);
+        log.agent_output_with_session_id(
+            Some("child-thread"),
+            "child stdout",
+            "",
+            Some("Codex"),
+            Some("out-1"),
+        );
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "agent_output");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::AgentOutput {
+                session_id,
+                stdout,
+                source,
+                output_id,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("child-thread"));
+                assert_eq!(stdout, "child stdout");
+                assert_eq!(source.as_deref(), Some("Codex"));
+                assert_eq!(output_id.as_deref(), Some("out-1"));
+            }
+            other => panic!("expected AgentOutput, got {:?}", other),
         }
     }
 

@@ -2235,6 +2235,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         }
 
         AppEvent::ModelResponse {
+            session_id,
             content,
             usage,
             reasoning,
@@ -2242,7 +2243,8 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             ..
         } => {
             if !content.is_empty() {
-                log.model_response(
+                log.model_response_for_session(
+                    session_id.as_deref(),
                     content,
                     usage.prompt_tokens,
                     usage.completion_tokens,

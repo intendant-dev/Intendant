@@ -334,10 +334,7 @@ impl AutonomyState {
     /// - `Full` autonomy → auto-approve (no human in the loop at all).
     /// - An explicit category `Deny` rule → reject.
     /// - Everything else → surface to the frontend `y/s/a/n` gate.
-    pub fn external_approval_decision(
-        &self,
-        category: ActionCategory,
-    ) -> ExternalApprovalDecision {
+    pub fn external_approval_decision(&self, category: ActionCategory) -> ExternalApprovalDecision {
         // Full autonomy keeps the human entirely out of the loop.
         if self.level == AutonomyLevel::Full {
             return ExternalApprovalDecision::AutoApprove;

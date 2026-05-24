@@ -1390,17 +1390,31 @@ fn emit_child_turn_complete(
     conversation_kind: &str,
     message: Option<String>,
 ) {
+    emit_child_turn_complete_for_session(
+        config.bus,
+        config.session_id.clone(),
+        conversation_kind,
+        message,
+    );
+}
+
+fn emit_child_turn_complete_for_session(
+    bus: &EventBus,
+    session_id: Option<String>,
+    conversation_kind: &str,
+    message: Option<String>,
+) {
     if let Some(message) = message {
-        config.bus.send(AppEvent::LogEntry {
-            session_id: config.session_id.clone(),
+        bus.send(AppEvent::LogEntry {
+            session_id: session_id.clone(),
             level: "info".to_string(),
             source: "Codex".to_string(),
             content: message,
             turn: None,
         });
     }
-    config.bus.send(AppEvent::LogEntry {
-        session_id: config.session_id.clone(),
+    bus.send(AppEvent::LogEntry {
+        session_id,
         level: "info".to_string(),
         source: "Codex".to_string(),
         content: format!(
@@ -2383,18 +2397,206 @@ fn persist_external_model_response_if_needed(
     content: &str,
     reasoning: Option<&str>,
 ) {
+    persist_external_model_response_for_session_if_needed(
+        config,
+        config.session_id.as_deref(),
+        content,
+        reasoning,
+    );
+}
+
+fn persist_external_model_response_for_session_if_needed(
+    config: &DrainConfig<'_>,
+    session_id: Option<&str>,
+    content: &str,
+    reasoning: Option<&str>,
+) {
     if !config.persist_model_responses_inline {
         return;
     }
     if !content.is_empty() {
         slog(config.session_log, |l| {
-            l.model_response(content, 0, 0, 0, 0, config.agent_source.as_deref())
+            l.model_response_for_session(
+                session_id,
+                content,
+                0,
+                0,
+                0,
+                0,
+                config.agent_source.as_deref(),
+            )
         });
     }
     if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
         slog(config.session_log, |l| {
             l.reasoning_content(Some(reasoning), None)
         });
+    }
+}
+
+fn scoped_event_codex_subagent_thread_id(
+    event_thread_id: &Option<String>,
+    stats: &LoopStats,
+) -> Option<String> {
+    event_thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())
+        .filter(|thread_id| stats.codex_subagent_parent_threads.contains_key(*thread_id))
+        .map(str::to_string)
+}
+
+fn handle_idle_codex_subagent_event(
+    config: &DrainConfig<'_>,
+    stats: &mut LoopStats,
+    child_thread_id: String,
+    event: external_agent::AgentEvent,
+) {
+    let session_id = Some(child_thread_id.clone());
+    match event {
+        external_agent::AgentEvent::MessageDelta { text } => {
+            config
+                .bus
+                .send(AppEvent::ModelResponseDelta { session_id, text });
+        }
+        external_agent::AgentEvent::Message { text } => {
+            persist_external_model_response_for_session_if_needed(
+                config,
+                Some(&child_thread_id),
+                &text,
+                None,
+            );
+            config.bus.send(AppEvent::ModelResponse {
+                session_id,
+                turn: stats
+                    .codex_subagent_rounds
+                    .get(&child_thread_id)
+                    .copied()
+                    .unwrap_or(0),
+                content: text,
+                usage: provider::TokenUsage::default(),
+                reasoning: None,
+                source: config.agent_source.clone(),
+            });
+        }
+        external_agent::AgentEvent::UserMessage { text } => {
+            config.bus.send(AppEvent::UserMessageLog {
+                session_id,
+                content: text,
+                user_turn_index: None,
+                user_turn_revision: None,
+                replacement_for_user_turn_index: None,
+            });
+        }
+        external_agent::AgentEvent::Reasoning { text } => {
+            persist_external_model_response_for_session_if_needed(
+                config,
+                Some(&child_thread_id),
+                "",
+                Some(&text),
+            );
+            config.bus.send(AppEvent::ModelResponse {
+                session_id,
+                turn: stats
+                    .codex_subagent_rounds
+                    .get(&child_thread_id)
+                    .copied()
+                    .unwrap_or(0),
+                content: String::new(),
+                usage: provider::TokenUsage::default(),
+                reasoning: Some(text),
+                source: config.agent_source.clone(),
+            });
+        }
+        external_agent::AgentEvent::Log { level, message } => {
+            config.bus.send(AppEvent::LogEntry {
+                session_id,
+                level,
+                source: config
+                    .agent_source
+                    .clone()
+                    .unwrap_or_else(|| "worker".to_string()),
+                content: message,
+                turn: None,
+            });
+        }
+        external_agent::AgentEvent::ToolStarted {
+            tool_name, preview, ..
+        } => {
+            let turn = stats
+                .codex_subagent_rounds
+                .entry(child_thread_id.clone())
+                .or_insert(0);
+            *turn += 1;
+            config.bus.send(AppEvent::AgentStarted {
+                session_id,
+                turn: *turn,
+                commands_preview: format!("{tool_name}: {preview}"),
+                source: config.agent_source.clone(),
+            });
+        }
+        external_agent::AgentEvent::ToolOutputDelta { text, .. } => {
+            let output_id = event::next_agent_output_id();
+            slog(config.session_log, |l| {
+                l.agent_output_with_session_id(
+                    Some(&child_thread_id),
+                    &text,
+                    "",
+                    config.agent_source.as_deref(),
+                    Some(&output_id),
+                )
+            });
+            config.bus.send(AppEvent::AgentOutput {
+                session_id,
+                stdout: text,
+                stderr: String::new(),
+                source: config.agent_source.clone(),
+                output_id: Some(output_id),
+            });
+        }
+        external_agent::AgentEvent::ToolCompleted { item_id, status } => {
+            if let external_agent::ToolCompletionStatus::Failed { message } = status {
+                let content = external_tool_failure_content(&item_id, &message, None);
+                config.bus.send(AppEvent::LogEntry {
+                    session_id,
+                    level: "warn".to_string(),
+                    source: external_agent_log_source(config.agent_source.as_deref()),
+                    content,
+                    turn: None,
+                });
+            }
+        }
+        external_agent::AgentEvent::TurnCompleted { message } => {
+            emit_child_turn_complete_for_session(config.bus, session_id, "subagent", message);
+        }
+        external_agent::AgentEvent::SubAgentToolCall { agents, .. } => {
+            for state in &agents {
+                emit_codex_subagent_state(config, state);
+                emit_codex_subagent_terminal(config, stats, state);
+            }
+        }
+        external_agent::AgentEvent::Usage { usage } => {
+            config.bus.send(AppEvent::UsageSnapshot {
+                session_id,
+                main: frontend::ModelUsageSnapshot {
+                    provider: usage.provider,
+                    model: usage.model,
+                    tokens_used: usage.tokens_used,
+                    context_window: usage.context_window,
+                    usage_pct: usage.usage_pct,
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    cached_tokens: usage.cached_tokens,
+                },
+                presence: None,
+            });
+        }
+        external_agent::AgentEvent::PlanUpdate { .. }
+        | external_agent::AgentEvent::ApprovalRequest { .. }
+        | external_agent::AgentEvent::FileApprovalRequest { .. }
+        | external_agent::AgentEvent::DiffUpdated { .. }
+        | external_agent::AgentEvent::Terminated { .. }
+        | external_agent::AgentEvent::Scoped { .. } => {}
     }
 }
 
@@ -2740,34 +2942,40 @@ async fn drain_external_agent_events(
                     .then(|| thread_id.to_string())
             })
         });
-        if !event_is_primary && side_thread_id.is_none() {
+        let codex_subagent_thread_id =
+            scoped_event_codex_subagent_thread_id(&event_thread_id, stats);
+        if !event_is_primary && side_thread_id.is_none() && codex_subagent_thread_id.is_none() {
             continue;
         }
 
         let child_config_storage;
         let event_is_side = side_thread_id.is_some() && !event_is_primary;
-        let config =
-            if let Some(side_thread_id) = side_thread_id.as_ref().filter(|_| !event_is_primary) {
-                child_config_storage = DrainConfig {
-                    bus: config.bus,
-                    session_id: Some(side_thread_id.clone()),
-                    alias_session_id: None,
-                    autonomy: config.autonomy.clone(),
-                    session_log: config.session_log,
-                    project_root: config.project_root,
-                    log_dir: config.log_dir,
-                    approval_registry: config.approval_registry,
-                    json_approval: config.json_approval.clone(),
-                    agent_source: config.agent_source.clone(),
-                    suppress_agent_started: config.suppress_agent_started,
-                    persist_model_responses_inline: config.persist_model_responses_inline,
-                    headless: config.headless,
-                    context_injection: config.context_injection,
-                };
-                &child_config_storage
-            } else {
-                config
+        let event_is_codex_subagent =
+            codex_subagent_thread_id.is_some() && !event_is_primary && !event_is_side;
+        let child_thread_id = side_thread_id
+            .as_ref()
+            .or(codex_subagent_thread_id.as_ref());
+        let config = if let Some(child_thread_id) = child_thread_id.filter(|_| !event_is_primary) {
+            child_config_storage = DrainConfig {
+                bus: config.bus,
+                session_id: Some(child_thread_id.clone()),
+                alias_session_id: None,
+                autonomy: config.autonomy.clone(),
+                session_log: config.session_log,
+                project_root: config.project_root,
+                log_dir: config.log_dir,
+                approval_registry: config.approval_registry,
+                json_approval: config.json_approval.clone(),
+                agent_source: config.agent_source.clone(),
+                suppress_agent_started: config.suppress_agent_started,
+                persist_model_responses_inline: config.persist_model_responses_inline,
+                headless: config.headless,
+                context_injection: config.context_injection,
             };
+            &child_config_storage
+        } else {
+            config
+        };
 
         match event {
             external_agent::AgentEvent::MessageDelta { text } => {
@@ -2787,7 +2995,9 @@ async fn drain_external_agent_events(
                     pending_runtime_steers,
                     agent.name(),
                 );
-                stats.last_response = Some(text.clone());
+                if event_is_primary {
+                    stats.last_response = Some(text.clone());
+                }
                 persist_external_model_response_if_needed(config, &text, None);
                 config.bus.send(AppEvent::ModelResponse {
                     session_id: config.session_id.clone(),
@@ -3039,7 +3249,8 @@ async fn drain_external_agent_events(
                 if let Some(stdout) = tool_output_limiter.filter(&item_id, stdout) {
                     let output_id = event::next_agent_output_id();
                     slog(config.session_log, |l| {
-                        l.agent_output_with_id(
+                        l.agent_output_with_session_id(
+                            config.session_id.as_deref(),
                             &stdout,
                             "",
                             config.agent_source.as_deref(),
@@ -3388,12 +3599,18 @@ async fn drain_external_agent_events(
                 }
             }
             external_agent::AgentEvent::TurnCompleted { message } => {
-                if event_is_side {
+                if event_is_side || event_is_codex_subagent {
                     if let Some(session_id) = config.session_id.as_deref() {
-                        active_side_turns.remove(session_id);
+                        if event_is_side {
+                            active_side_turns.remove(session_id);
+                        }
                     }
-                    emit_child_turn_complete(config, "side", message);
-                    if pending_turn_completion.is_some() && active_side_turns.is_empty() {
+                    let conversation_kind = if event_is_side { "side" } else { "subagent" };
+                    emit_child_turn_complete(config, conversation_kind, message);
+                    if event_is_side
+                        && pending_turn_completion.is_some()
+                        && active_side_turns.is_empty()
+                    {
                         post_turn_sleep_active = true;
                         post_turn_sleep
                             .as_mut()
@@ -5067,6 +5284,91 @@ mod tests {
             &Some("intendant-session".to_string()),
             &Some("codex-thread".to_string()),
         ));
+    }
+
+    #[test]
+    fn scoped_codex_subagent_events_match_known_child_threads() {
+        let mut stats = LoopStats::default();
+        stats
+            .codex_subagent_parent_threads
+            .insert("child-thread".to_string(), "parent-thread".to_string());
+
+        assert_eq!(
+            scoped_event_codex_subagent_thread_id(&Some(" child-thread ".to_string()), &stats),
+            Some("child-thread".to_string())
+        );
+        assert_eq!(
+            scoped_event_codex_subagent_thread_id(&Some("parent-thread".to_string()), &stats),
+            None
+        );
+        assert_eq!(scoped_event_codex_subagent_thread_id(&None, &stats), None);
+    }
+
+    #[test]
+    fn idle_codex_subagent_turn_completed_marks_child_ready() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            session_id: Some("parent-thread".to_string()),
+            alias_session_id: None,
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Codex".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+        };
+        let mut stats = LoopStats::default();
+
+        handle_idle_codex_subagent_event(
+            &config,
+            &mut stats,
+            "child-thread".to_string(),
+            external_agent::AgentEvent::TurnCompleted {
+                message: Some("child final answer".to_string()),
+            },
+        );
+
+        match rx.try_recv().expect("child final message") {
+            AppEvent::LogEntry {
+                session_id,
+                content,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("child-thread"));
+                assert_eq!(content, "child final answer");
+            }
+            other => panic!("expected child final LogEntry, got {:?}", other),
+        }
+
+        match rx.try_recv().expect("child round completion") {
+            AppEvent::LogEntry {
+                session_id,
+                content,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("child-thread"));
+                assert_eq!(
+                    content,
+                    "Round complete: subagent conversation ready for follow-up"
+                );
+            }
+            other => panic!("expected child completion LogEntry, got {:?}", other),
+        }
     }
 
     #[test]
@@ -10371,6 +10673,44 @@ async fn run_external_agent_mode(
                             None => {
                                 slog(&session_log, |l| {
                                     l.info("Follow-up channel closed, exiting")
+                                });
+                                break 'outer;
+                            }
+                        }
+                    }
+                    maybe_event = event_rx.recv() => {
+                        match maybe_event {
+                            Some(event) => {
+                                let (event_thread_id, _event_turn_id, event) = event.into_scope();
+                                if let Some(child_thread_id) =
+                                    scoped_event_codex_subagent_thread_id(&event_thread_id, &stats)
+                                {
+                                    handle_idle_codex_subagent_event(
+                                        &drain_config,
+                                        &mut stats,
+                                        child_thread_id,
+                                        event,
+                                    );
+                                    continue;
+                                }
+                                if let external_agent::AgentEvent::Terminated { reason, exit_code } =
+                                    event
+                                {
+                                    let message = format!(
+                                        "{} terminated while idle: {} (exit code: {:?})",
+                                        agent.name(),
+                                        reason,
+                                        exit_code
+                                    );
+                                    slog(&session_log, |l| l.warn(&message));
+                                    bus.send(AppEvent::LoopError(message));
+                                    break 'outer;
+                                }
+                                continue;
+                            }
+                            None => {
+                                slog(&session_log, |l| {
+                                    l.info("External agent event channel closed, exiting")
                                 });
                                 break 'outer;
                             }

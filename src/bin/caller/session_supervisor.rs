@@ -1253,7 +1253,10 @@ impl SessionSupervisor {
     }
 
     async fn route_interrupt(&self, session_id: Option<String>) {
-        eprintln!("[APPROVAL-DIAG] route_interrupt called session_id={:?}", session_id);
+        eprintln!(
+            "[APPROVAL-DIAG] route_interrupt called session_id={:?}",
+            session_id
+        );
         let requested_id = session_id.clone();
         let Some(target_id) = self.resolve_target_session_id(session_id).await else {
             self.warn("Interrupt dropped: no active managed session");

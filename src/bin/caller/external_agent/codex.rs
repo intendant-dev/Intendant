@@ -1005,7 +1005,10 @@ impl CodexAgent {
             params,
         };
         let line = serde_json::to_string(&request)?;
-        eprintln!("[CODEX-WIRE] out request: {}", line.chars().take(600).collect::<String>());
+        eprintln!(
+            "[CODEX-WIRE] out request: {}",
+            line.chars().take(600).collect::<String>()
+        );
 
         let writer = self
             .writer
@@ -1033,7 +1036,10 @@ impl CodexAgent {
             params,
         };
         let line = serde_json::to_string(&notification)?;
-        eprintln!("[CODEX-WIRE] out notification: {}", line.chars().take(600).collect::<String>());
+        eprintln!(
+            "[CODEX-WIRE] out notification: {}",
+            line.chars().take(600).collect::<String>()
+        );
 
         let writer = self
             .writer
@@ -1058,7 +1064,11 @@ impl CodexAgent {
             result,
         };
         let line = serde_json::to_string(&response)?;
-        eprintln!("[CODEX-WIRE] out response id={}: {}", id, line.chars().take(600).collect::<String>());
+        eprintln!(
+            "[CODEX-WIRE] out response id={}: {}",
+            id,
+            line.chars().take(600).collect::<String>()
+        );
 
         let writer = self
             .writer
