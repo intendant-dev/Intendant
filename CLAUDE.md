@@ -6,7 +6,8 @@
 > code** — Intendant moves fast (~500 commits/month) and the docs are *not* updated on
 > every change. When this file, the docs, and the source disagree, **trust the source**,
 > then fix the doc. See what changed since this was written with
-> `git log --oneline 58c264d..HEAD`. (`AGENTS.md` is a gitignored symlink to this file.)
+> `git log --oneline 58c264d..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
+> file — when you edit CLAUDE.md, run `cp CLAUDE.md AGENTS.md` in the same commit; CI enforces they match.)
 
 ## What Intendant Is
 
