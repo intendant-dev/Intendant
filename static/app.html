@@ -7407,7 +7407,7 @@ let activeTab = 'activity';
 let autoScroll = true;
 let logEntryCount = 0;
 let commandOutputGroupSeq = 0;
-let activeCommandOutputGroup = null;
+const activeCommandOutputGroups = new Map();
 const commandOutputGroups = new Map();
 const commandOutputGroupByEntry = new WeakMap();
 const logEntryCopyTextByEntry = new WeakMap();
@@ -10594,7 +10594,7 @@ function clearLogs(options = {}) {
   const clearSessionWindows = options.clearSessionWindows !== false;
   document.getElementById('log-stream').innerHTML = '';
   logEntryCount = 0;
-  activeCommandOutputGroup = null;
+  activeCommandOutputGroups.clear();
   commandOutputGroups.clear();
   if (clearSessionWindows) {
     for (const win of sessionWindows.values()) {
@@ -13479,6 +13479,13 @@ function commandOutputCloneViews(group) {
   return group.clones;
 }
 
+function commandOutputGroupKey(c) {
+  const sid = String(c?.session_id || '').trim();
+  const targetSid = sid ? sessionWindowTargetForLogSession(sid) : '';
+  const source = String(c?.source || '').trim().toLowerCase();
+  return `${targetSid || sid || 'global'}\u001f${source}`;
+}
+
 function commandOutputSummaryHtml(group) {
   const parts = [];
   if (group.chunks > 0) parts.push(group.chunks + ' chunk' + (group.chunks === 1 ? '' : 's'));
@@ -13575,6 +13582,8 @@ function appendCommandOutputChunk(group, c) {
 }
 
 function renderCommandOutputEntry(c) {
+  const groupKey = commandOutputGroupKey(c);
+  let activeCommandOutputGroup = activeCommandOutputGroups.get(groupKey);
   if (!activeCommandOutputGroup || activeCommandOutputGroup.finalized) {
     const groupId = 'cmdout-' + (++commandOutputGroupSeq);
     const { entry } = createLogScaffold(c, 'command-output-group expanded');
@@ -13597,6 +13606,7 @@ function renderCommandOutputEntry(c) {
 
     const group = {
       id: groupId,
+      key: groupKey,
       entry,
       summary,
       body,
@@ -13615,6 +13625,7 @@ function renderCommandOutputEntry(c) {
     commandOutputGroupByEntry.set(entry, group);
     entry.addEventListener('click', () => toggleCommandOutputGroup(group));
     commandOutputGroups.set(groupId, group);
+    activeCommandOutputGroups.set(groupKey, group);
     activeCommandOutputGroup = group;
     updateCommandOutputSummary(group);
     appendLogEntryElement(entry);
@@ -13624,8 +13635,7 @@ function renderCommandOutputEntry(c) {
   if (autoScroll) stream.scrollTop = stream.scrollHeight;
 }
 
-function finalizeActiveCommandOutputGroup() {
-  const group = activeCommandOutputGroup;
+function finalizeCommandOutputGroup(group) {
   if (!group || group.finalized) return;
   group.finalized = true;
   group.entry.classList.add('finalized');
@@ -13640,7 +13650,18 @@ function finalizeActiveCommandOutputGroup() {
     view.loaded = false;
     view.loading = false;
   }
-  activeCommandOutputGroup = null;
+  if (group.key) activeCommandOutputGroups.delete(group.key);
+}
+
+function finalizeActiveCommandOutputGroup(groupKey = null) {
+  if (groupKey !== null && groupKey !== undefined) {
+    finalizeCommandOutputGroup(activeCommandOutputGroups.get(groupKey));
+    return;
+  }
+  for (const group of Array.from(activeCommandOutputGroups.values())) {
+    finalizeCommandOutputGroup(group);
+  }
+  activeCommandOutputGroups.clear();
 }
 
 async function loadCommandOutputIntoBody(group, body) {
@@ -13693,7 +13714,7 @@ async function toggleCommandOutputGroup(group) {
 }
 
 function renderDiffLogEntry(c) {
-  finalizeActiveCommandOutputGroup();
+  finalizeActiveCommandOutputGroup(commandOutputGroupKey(c));
   const diffText = diffLogContent(c);
   const parsed = parseUnifiedDiff(diffText);
   const { entry } = createLogScaffold(c, 'diff-log-entry');
@@ -13892,7 +13913,7 @@ function renderLogEntry(c) {
     renderDiffLogEntry(c);
     return;
   }
-  finalizeActiveCommandOutputGroup();
+  finalizeActiveCommandOutputGroup(commandOutputGroupKey(c));
   if (shouldSuppressAttachmentReceiptDuplicate(c)) return;
   inferSessionPhaseFromLog(c);
 

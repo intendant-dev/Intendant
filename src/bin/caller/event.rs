@@ -139,6 +139,7 @@ pub enum AppEvent {
         preview: String,
     },
     DoneSignal {
+        session_id: Option<String>,
         message: Option<String>,
     },
     AgentStarted {
@@ -1378,7 +1379,11 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             source: source.clone(),
             output_id: output_id.clone(),
         }),
-        AppEvent::DoneSignal { message } => Some(OutboundEvent::DoneSignal {
+        AppEvent::DoneSignal {
+            session_id,
+            message,
+        } => Some(OutboundEvent::DoneSignal {
+            session_id: session_id.clone(),
             message: message.clone(),
         }),
         AppEvent::TaskComplete {
@@ -2008,7 +2013,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         } => {
             log.agent_started(*turn, commands_preview);
         }
-        AppEvent::DoneSignal { message } => {
+        AppEvent::DoneSignal { message, .. } => {
             log.done_signal(message.as_deref());
         }
         AppEvent::TaskComplete {
@@ -3222,11 +3227,13 @@ mod tests {
     #[test]
     fn outbound_done_signal() {
         let event = AppEvent::DoneSignal {
+            session_id: Some("sess-1".to_string()),
             message: Some("All done".to_string()),
         };
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"done_signal\""));
+        assert!(json.contains("\"session_id\":\"sess-1\""));
         assert!(json.contains("\"All done\""));
     }
 
