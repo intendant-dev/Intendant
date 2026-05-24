@@ -1436,7 +1436,8 @@ fn replay_jsonl_to_outbound_entries(
     log_dir: &std::path::Path,
 ) -> Vec<serde_json::Value> {
     let (provider, model, autonomy) = scan_replay_status(contents);
-    let replay_session_id = replay_session_id_from_dir(log_dir);
+    let replay_session_id = external_backend_session_id_from_replay(contents)
+        .or_else(|| replay_session_id_from_dir(log_dir));
 
     let mut entries: Vec<serde_json::Value> = Vec::new();
     entries.push(serde_json::json!({
@@ -1487,6 +1488,41 @@ fn replay_jsonl_to_outbound_entries(
     }
 
     entries
+}
+
+fn external_backend_session_id_from_replay(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if entry_json.get("event").and_then(|v| v.as_str()) == Some("session_identity") {
+            let data = entry_json.get("data");
+            let source = data
+                .and_then(|d| d.get("source"))
+                .and_then(|v| v.as_str())
+                .map(crate::session_names::normalize_source)
+                .unwrap_or_default();
+            if !source.is_empty() && source != "intendant" {
+                if let Some(id) = data
+                    .and_then(|d| d.get("backend_session_id"))
+                    .and_then(|v| v.as_str())
+                    .and_then(clean_external_thread_id)
+                {
+                    return Some(id);
+                }
+            }
+        }
+        if let Some(message) = entry_json.get("message").and_then(|v| v.as_str()) {
+            if let Some(id) = external_agent_thread_id_from_message(message) {
+                return Some(id);
+            }
+        }
+    }
+    None
 }
 
 fn replay_session_id_from_dir(log_dir: &std::path::Path) -> Option<String> {
@@ -17761,6 +17797,33 @@ mod tests {
         assert_eq!(
             round.get("turns_in_round").and_then(|v| v.as_u64()),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn test_external_wrapper_replay_uses_backend_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("wrapper-session");
+        let backend_id = "019e598b-256e-7b61-8816-22908ece438a";
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.info("Mode: external agent (Codex)");
+        log.debug(&format!("External agent thread: {backend_id}"));
+        log.info("[user] continue here");
+        drop(log);
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let entries = replay_jsonl_to_outbound_entries(&contents, &log_dir);
+        let user_row = entries
+            .iter()
+            .find(|entry| {
+                entry.get("event").and_then(|v| v.as_str()) == Some("log_entry")
+                    && entry.get("content").and_then(|v| v.as_str()) == Some("continue here")
+            })
+            .expect("wrapper log entry should replay");
+
+        assert_eq!(
+            user_row.get("session_id").and_then(|v| v.as_str()),
+            Some(backend_id)
         );
     }
 
