@@ -38,11 +38,12 @@
   --log-detail: #a2a8be;
   --log-debug: var(--overlay1);
   --log-presence: var(--green);
-  --concurrent-view-bg: color-mix(in srgb, var(--mantle) 82%, transparent);
-  --concurrent-view-hover-bg: color-mix(in srgb, var(--mantle) 90%, transparent);
-  --session-window-bg: color-mix(in srgb, var(--mantle) 82%, transparent);
-  --session-window-header-bg: color-mix(in srgb, var(--crust) 86%, transparent);
-  --session-window-hover-bg: color-mix(in srgb, var(--mantle) 90%, transparent);
+  --concurrent-view-bg: rgba(24, 24, 37, 0.76);
+  --concurrent-view-hover-bg: rgba(24, 24, 37, 0.84);
+  --session-window-bg: rgba(24, 24, 37, 0.76);
+  --session-window-header-bg: rgba(17, 17, 27, 0.72);
+  --session-window-hover-bg: rgba(24, 24, 37, 0.84);
+  --session-window-chip-bg: rgba(49, 50, 68, 0.72);
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1593,7 +1594,7 @@ html, body {
   min-width: 0;
   max-width: 260px;
   color: var(--session-badge-fg, var(--text));
-  background: var(--session-badge-bg, var(--surface0));
+  background: var(--session-badge-bg, var(--session-window-chip-bg));
   border: 1px solid var(--session-badge-border, transparent);
   border-radius: 3px;
   padding: 1px 5px;
@@ -1617,7 +1618,7 @@ html, body {
   border: 1px solid var(--surface1);
   border-radius: 999px;
   padding: 1px 5px;
-  background: var(--surface0);
+  background: var(--session-window-chip-bg);
   color: var(--overlay1);
   font-size: 9px;
   font-weight: 800;
@@ -1706,7 +1707,7 @@ html, body {
   flex-shrink: 0;
   padding: 1px 6px;
   border-radius: 999px;
-  background: var(--surface0);
+  background: var(--session-window-chip-bg);
   color: var(--overlay1);
   font-size: 10px;
   font-weight: 700;
