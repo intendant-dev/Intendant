@@ -3937,12 +3937,25 @@ fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListS
     Some(summary)
 }
 
+/// Resolve Codex's home directory: `$CODEX_HOME` if set (non-empty), else
+/// `<home>/.codex`. Codex writes its session rollouts under `CODEX_HOME` when
+/// that env var is set (common on managed/headless installs), so the dashboard
+/// session scan must honor it rather than assuming `~/.codex` — otherwise
+/// codex sessions never appear in the listing.
+fn codex_dir(home: &Path) -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| home.join(".codex"))
+}
+
 fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
+    let codex = codex_dir(home);
     let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
     let mut model_by_id: HashMap<String, String> = HashMap::new();
     let mut parent_by_id: HashMap<String, String> = HashMap::new();
     let mut usage_events_by_id: HashMap<String, Vec<CodexUsageEvent>> = HashMap::new();
-    let index_path = home.join(".codex").join("session_index.jsonl");
+    let index_path = codex.join("session_index.jsonl");
     if let Ok(contents) = std::fs::read_to_string(&index_path) {
         for line in contents.lines() {
             let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -3977,12 +3990,12 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
     }
 
     let mut files = collect_recent_files(
-        &home.join(".codex").join("sessions"),
+        &codex.join("sessions"),
         ".jsonl",
         EXTERNAL_SESSION_SCAN_LIMIT,
     );
     files.extend(collect_recent_files(
-        &home.join(".codex").join("archived_sessions"),
+        &codex.join("archived_sessions"),
         ".jsonl",
         EXTERNAL_SESSION_SCAN_LIMIT,
     ));
@@ -4327,10 +4340,11 @@ fn codex_session_file_id(path: &Path) -> Option<String> {
 }
 
 fn find_codex_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let codex = codex_dir(home);
     let mut files = Vec::new();
-    collect_files(&home.join(".codex").join("sessions"), ".jsonl", &mut files);
+    collect_files(&codex.join("sessions"), ".jsonl", &mut files);
     collect_files(
-        &home.join(".codex").join("archived_sessions"),
+        &codex.join("archived_sessions"),
         ".jsonl",
         &mut files,
     );
