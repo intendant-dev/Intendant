@@ -2308,7 +2308,7 @@ pub fn spawn_event_listener(
                         s.push_log(LogLevel::Debug, format!("JSON: {}", preview));
                     }
 
-                    AppEvent::DoneSignal { message } => {
+                    AppEvent::DoneSignal { message, .. } => {
                         s.set_phase(Phase::Done);
                         s.push_log(
                             LogLevel::Info,

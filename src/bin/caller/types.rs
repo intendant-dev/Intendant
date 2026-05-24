@@ -402,6 +402,8 @@ pub enum OutboundEvent {
         source: Option<String>,
     },
     DoneSignal {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },

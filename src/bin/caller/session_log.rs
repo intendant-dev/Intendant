@@ -2644,6 +2644,7 @@ pub fn session_log_entry_to_app_event(
         }
 
         "done_signal" => Some(AppEvent::DoneSignal {
+            session_id: None,
             message: Some(message.to_string()).filter(|m| !m.is_empty()),
         }),
         "task_complete" => {

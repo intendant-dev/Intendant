@@ -7172,6 +7172,7 @@ async fn run_agent_loop(
                     conversation.add_tool_result(&call_id, &tool_name, "OK");
                 }
                 bus.send(AppEvent::DoneSignal {
+                    session_id: local_session_id.clone(),
                     message: batch.done_message.clone(),
                 });
                 exit_reason = LoopExitReason::DoneSignal;
@@ -7750,6 +7751,7 @@ async fn run_agent_loop(
                         ))
                     });
                     bus.send(AppEvent::DoneSignal {
+                        session_id: local_session_id.clone(),
                         message: message.clone(),
                     });
                     exit_reason = LoopExitReason::DoneSignal;
@@ -9446,6 +9448,7 @@ async fn run_with_presence(
                     cumulative_stats.turns += 1;
                     cumulative_stats.rounds += 1;
                     bus.send(AppEvent::DoneSignal {
+                        session_id: session_log_id(&session_log),
                         message: message.clone(),
                     });
                     // External-agent rounds: no native conversation to snapshot.
@@ -10800,6 +10803,7 @@ async fn run_external_agent_mode(
                 stats.rounds = round;
 
                 bus.send(AppEvent::DoneSignal {
+                    session_id: live_session_id.clone(),
                     message: message.clone(),
                 });
                 bus.send(AppEvent::RoundComplete {

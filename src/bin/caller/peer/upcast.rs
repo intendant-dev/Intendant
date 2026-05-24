@@ -406,7 +406,7 @@ impl AppEventUpcaster {
                 out
             }
 
-            AppEvent::DoneSignal { message } => {
+            AppEvent::DoneSignal { message, .. } => {
                 self.current_message_id = None;
                 let mut out = vec![];
                 // Close the in-flight agent first (if any), then the
@@ -1519,7 +1519,7 @@ impl WireEventUpcaster {
                 out
             }
 
-            OutboundEvent::DoneSignal { message } => {
+            OutboundEvent::DoneSignal { message, .. } => {
                 self.current_message_id = None;
                 let mut out = vec![];
                 if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
@@ -2622,7 +2622,10 @@ mod tests {
         };
         assert_eq!(start_id.0, "turn-7");
 
-        let done = u.upcast(&AppEvent::DoneSignal { message: None });
+        let done = u.upcast(&AppEvent::DoneSignal {
+            session_id: None,
+            message: None,
+        });
         let complete_id = done
             .iter()
             .find_map(|e| match e {
@@ -2686,7 +2689,10 @@ mod tests {
         assert_eq!(progress_id, start_id, "progress id must match started id");
 
         // Close the turn → agent activity should close with the same id.
-        let done = u.upcast(&AppEvent::DoneSignal { message: None });
+        let done = u.upcast(&AppEvent::DoneSignal {
+            session_id: None,
+            message: None,
+        });
         let completed_ids: Vec<_> = done
             .iter()
             .filter_map(|e| match e {
@@ -2723,7 +2729,10 @@ mod tests {
             .expect("expected ActivityStarted");
         assert_eq!(start_id.0, "turn-7");
 
-        let done = u.upcast(&OutboundEvent::DoneSignal { message: None });
+        let done = u.upcast(&OutboundEvent::DoneSignal {
+            session_id: None,
+            message: None,
+        });
         let complete_id = done
             .iter()
             .find_map(|e| match e {
@@ -2900,8 +2909,14 @@ mod tests {
         });
 
         // Both see DoneSignal.
-        let app_out = app.upcast(&AppEvent::DoneSignal { message: None });
-        let wire_out = wire.upcast(&OutboundEvent::DoneSignal { message: None });
+        let app_out = app.upcast(&AppEvent::DoneSignal {
+            session_id: None,
+            message: None,
+        });
+        let wire_out = wire.upcast(&OutboundEvent::DoneSignal {
+            session_id: None,
+            message: None,
+        });
 
         let app_completed_ids: Vec<_> = app_out
             .iter()

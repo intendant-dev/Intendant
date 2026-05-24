@@ -1822,7 +1822,7 @@ impl App {
                     if t > 0 { Some(t) } else { None },
                 );
             }
-            AppEvent::DoneSignal { message } => {
+            AppEvent::DoneSignal { message, .. } => {
                 if let Some(msg) = message {
                     let t = self.turn;
                     // Local-only: OutboundEvent::DoneSignal already reaches
@@ -2979,6 +2979,7 @@ mod tests {
     fn handle_event_done_signal_with_message() {
         let mut app = test_app();
         app.handle_event(AppEvent::DoneSignal {
+            session_id: None,
             message: Some("All done!".to_string()),
         });
         assert_eq!(app.current_phase, Phase::Done);
@@ -2989,7 +2990,10 @@ mod tests {
     #[test]
     fn handle_event_done_signal_without_message() {
         let mut app = test_app();
-        app.handle_event(AppEvent::DoneSignal { message: None });
+        app.handle_event(AppEvent::DoneSignal {
+            session_id: None,
+            message: None,
+        });
         assert_eq!(app.current_phase, Phase::Done);
         assert!(app.log_entries.is_empty());
     }
