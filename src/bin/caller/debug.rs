@@ -55,7 +55,9 @@ pub fn find_free_debug_display() -> u32 {
 
 /// Returns `~/.intendant/recordings/` for daemon-scoped recordings.
 pub fn daemon_recordings_dir() -> PathBuf {
-    crate::platform::home_dir().join(".intendant").join("recordings")
+    crate::platform::home_dir()
+        .join(".intendant")
+        .join("recordings")
 }
 
 /// Set up a debug screen.

@@ -677,9 +677,7 @@ pub fn metadata_on_disk_bytes(metadata: &std::fs::Metadata) -> u64 {
 pub fn home_dir() -> std::path::PathBuf {
     #[cfg(not(windows))]
     {
-        std::path::PathBuf::from(
-            std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()),
-        )
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
     }
     #[cfg(windows)]
     {
