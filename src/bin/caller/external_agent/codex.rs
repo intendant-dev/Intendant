@@ -1616,6 +1616,7 @@ async fn reader_task(
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
     let mut turn_terminal_observed = false;
+    let mut notification_state = CodexNotificationState::default();
 
     loop {
         let line = match lines.next_line().await {
@@ -1786,7 +1787,7 @@ async fn reader_task(
             _ => {}
         }
 
-        translate_notification(method, &params, &event_tx);
+        translate_notification_with_state(method, &params, &event_tx, &mut notification_state);
     }
 }
 
@@ -2127,11 +2128,26 @@ fn codex_plan_entries(params: &serde_json::Value) -> Vec<(String, String, String
         .collect()
 }
 
+#[derive(Default)]
+struct CodexNotificationState {
+    goal_known_active: bool,
+}
+
 /// Translate a Codex notification into one or more `AgentEvent`s.
 fn translate_notification(
     method: &str,
     params: &serde_json::Value,
     event_tx: &mpsc::UnboundedSender<AgentEvent>,
+) {
+    let mut state = CodexNotificationState::default();
+    translate_notification_with_state(method, params, event_tx, &mut state);
+}
+
+fn translate_notification_with_state(
+    method: &str,
+    params: &serde_json::Value,
+    event_tx: &mpsc::UnboundedSender<AgentEvent>,
+    state: &mut CodexNotificationState,
 ) {
     match method {
         "item/agentMessage/delta" => {
@@ -2399,6 +2415,11 @@ fn translate_notification(
 
         "thread/goal/updated" => {
             let goal = params.get("goal").unwrap_or(params);
+            if goal.is_null() {
+                state.goal_known_active = false;
+                return;
+            }
+            state.goal_known_active = true;
             let _ = event_tx.send(AgentEvent::Log {
                 level: "info".to_string(),
                 message: format!("Codex goal updated: {}", format_goal(goal)),
@@ -2406,10 +2427,13 @@ fn translate_notification(
         }
 
         "thread/goal/cleared" => {
-            let _ = event_tx.send(AgentEvent::Log {
-                level: "info".to_string(),
-                message: "Codex goal cleared".to_string(),
-            });
+            if state.goal_known_active {
+                let _ = event_tx.send(AgentEvent::Log {
+                    level: "info".to_string(),
+                    message: "Codex goal cleared".to_string(),
+                });
+            }
+            state.goal_known_active = false;
         }
 
         "thread/name/updated" => {
@@ -5100,6 +5124,48 @@ mod tests {
                 assert_eq!(level, "info");
                 assert!(message.contains("Ship feature parity"));
                 assert!(message.contains("paused"));
+            }
+            other => panic!("expected Log, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn startup_goal_cleared_notification_is_silent_until_goal_seen() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState::default();
+        let params = serde_json::json!({ "threadId": "thread-abc" });
+
+        translate_notification_with_state("thread/goal/cleared", &params, &tx, &mut state);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "cleared notifications without known prior goal are startup noise"
+        );
+    }
+
+    #[test]
+    fn goal_cleared_notification_logs_after_goal_update() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState::default();
+        let update = serde_json::json!({
+            "threadId": "thread-abc",
+            "goal": {
+                "threadId": "thread-abc",
+                "objective": "Ship feature parity",
+                "status": "active"
+            }
+        });
+        let clear = serde_json::json!({ "threadId": "thread-abc" });
+
+        translate_notification_with_state("thread/goal/updated", &update, &tx, &mut state);
+        let _ = rx.try_recv().expect("goal update should log");
+
+        translate_notification_with_state("thread/goal/cleared", &clear, &tx, &mut state);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::Log { level, message } => {
+                assert_eq!(level, "info");
+                assert_eq!(message, "Codex goal cleared");
             }
             other => panic!("expected Log, got {:?}", other),
         }
