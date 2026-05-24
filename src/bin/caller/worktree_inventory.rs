@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
@@ -954,12 +953,14 @@ fn measure_tree(root: &Path) -> TreeMeasure {
             // reclaimed by deleting the worktree. `meta.len()` (apparent size)
             // over-counts both sparse files and hardlink-dense trees like Cargo
             // `target/` dirs (e.g. a 5.6 GiB worktree reported as 9+ GiB).
-            if meta.nlink() > 1 && !seen_inodes.insert((meta.dev(), meta.ino())) {
+            if crate::platform::metadata_is_multiply_linked(&meta)
+                && !seen_inodes.insert(crate::platform::metadata_dev_ino(&meta))
+            {
                 continue;
             }
             measure.bytes = measure
                 .bytes
-                .saturating_add(meta.blocks().saturating_mul(512));
+                .saturating_add(crate::platform::metadata_on_disk_bytes(&meta));
         }
     }
     measure
@@ -1317,8 +1318,14 @@ mod tests {
         assert!(wt.exists());
     }
 
+    // du-style block accounting + hardlink de-dup is Unix-only semantics
+    // (`MetadataExt::blocks`/`nlink`). On Windows the disk-usage walk falls
+    // back to apparent `len()` with no inode de-dup, so this assertion does
+    // not apply — see `crate::platform::metadata_on_disk_bytes`.
+    #[cfg(unix)]
     #[test]
     fn measure_tree_counts_hardlinks_once() {
+        use std::os::unix::fs::MetadataExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("tree");
         std::fs::create_dir(&dir).unwrap();

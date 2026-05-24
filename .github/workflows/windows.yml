@@ -1,0 +1,114 @@
+name: Cross-platform check
+
+# Type-checks the controller (`intendant`) on every supported platform so
+# cross-platform regressions surface in CI rather than only when someone
+# builds on a non-Linux box.
+#
+# Windows is the point: the codebase is mostly developed on macOS/Linux, and
+# Unix-only APIs (`std::os::unix::fs::MetadataExt`, libc, /proc, …) slip in
+# unnoticed because they compile fine on the author's machine. This workflow
+# runs `cargo check -p intendant` for the `x86_64-pc-windows-msvc` target and
+# catches that whole class — e.g. an unconditional
+# `use std::os::unix::fs::MetadataExt;` plus `.blocks()`/`.dev()`/`.ino()`
+# calls that broke the MSVC build.
+#
+# `cargo check` (not full build/test) is deliberate: it does the type/cfg
+# resolution that catches platform breakage at a fraction of the cost, and
+# the Windows display/audio runtime can't be exercised on a headless runner
+# anyway. macOS and Linux jobs ride along as a bonus tripwire.
+
+on:
+  push:
+    branches: [main]
+    # Only platform-relevant sources can introduce a compile regression, so
+    # skip pure-docs / static-asset pushes. Mirrors audit.yml's scoping.
+    paths:
+      - "**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/Cargo.toml"
+      - ".github/workflows/windows.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/Cargo.toml"
+      - ".github/workflows/windows.yml"
+
+permissions:
+  contents: read
+
+# Don't pile up redundant runs on a fast-moving branch: a newer push to the
+# same ref cancels the in-flight check.
+concurrency:
+  group: cross-platform-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing shouldn't mask the others — we want to see every
+      # target's result on a regression.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup ships preinstalled on the GitHub-hosted runners; just pin the
+      # target this job type-checks against.
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      # `ring` (our TLS provider — aws-lc-rs is deliberately disabled) builds
+      # its x86_64 perlasm assembly with NASM on the MSVC target. The GitHub
+      # windows-latest image ships NASM, but install it explicitly so the
+      # workflow doesn't silently break if that ever changes; choco is a no-op
+      # when it's already present.
+      - name: Install NASM (Windows, for ring)
+        if: runner.os == 'Windows'
+        run: |
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm --no-progress -y
+            "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+        shell: pwsh
+
+      # Linux build deps for the `-sys` crates that have a native backend
+      # there (the subset of scripts/setup-linux.sh's APT_PACKAGES that are
+      # build-time, not runtime): libclang for the bindgen used by
+      # env-libvpx-sys + pipewire-sys, libvpx + libpipewire + libxcb headers
+      # for those crates' link/pkg-config steps. macOS and Windows pull their
+      # platform deps as prebuilt FFI crates, so no system package step is
+      # needed there. (No libssl-dev / libpng-dev: the tree is on pure-Rust
+      # ring + the `png` crate, not openssl-sys / libpng.)
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libclang-dev libvpx-dev libpipewire-0.3-dev \
+            libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Type-check the whole `intendant` package — both binaries (the
+      # `intendant` controller and the `intendant-runtime` executor) and their
+      # shared modules — for this target. `-p intendant` deliberately excludes
+      # the `presence-web` workspace member, which is a wasm32 crate with its
+      # own wasm-pack build and doesn't type-check against a native target.
+      - name: cargo check
+        run: cargo check -p intendant --target ${{ matrix.target }}
