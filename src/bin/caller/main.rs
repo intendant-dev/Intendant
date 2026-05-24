@@ -1094,6 +1094,10 @@ struct DrainConfig<'a> {
     log_dir: &'a Path,
     approval_registry: &'a event::ApprovalRegistry,
     json_approval: Option<&'a JsonApprovalSlot>,
+    /// Web dashboard port when serving (`--web`). `Some` means an interactive
+    /// frontend exists, so external-agent approval requests are surfaced to
+    /// the gate rather than auto-denied as if truly headless.
+    web_port: Option<u16>,
     agent_source: Option<String>,
     /// When true, `ToolStarted` just increments the turn counter without
     /// emitting `AgentStarted`. The presence path sets this to avoid
@@ -2317,6 +2321,7 @@ async fn drain_external_child_turn(
     let child_session_id = Some(child_thread_id.clone());
     let child_config = DrainConfig {
         bus: config.bus,
+        web_port: config.web_port,
         session_id: child_session_id.clone(),
         alias_session_id: None,
         autonomy: config.autonomy.clone(),
@@ -2750,6 +2755,7 @@ async fn drain_external_agent_events(
             if let Some(side_thread_id) = side_thread_id.as_ref().filter(|_| !event_is_primary) {
                 child_config_storage = DrainConfig {
                     bus: config.bus,
+                    web_port: config.web_port,
                     session_id: Some(side_thread_id.clone()),
                     alias_session_id: None,
                     autonomy: config.autonomy.clone(),
@@ -3131,7 +3137,10 @@ async fn drain_external_agent_events(
                     let _ = agent
                         .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
                         .await;
-                } else if config.headless && config.json_approval.is_none() {
+                } else if config.headless
+                    && config.json_approval.is_none()
+                    && config.web_port.is_none()
+                {
                     slog(config.session_log, |l| {
                         l.warn(&format!("Headless auto-deny: {}", command))
                     });
@@ -3248,7 +3257,10 @@ async fn drain_external_agent_events(
                     let _ = agent
                         .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
                         .await;
-                } else if config.headless && config.json_approval.is_none() {
+                } else if config.headless
+                    && config.json_approval.is_none()
+                    && config.web_port.is_none()
+                {
                     slog(config.session_log, |l| {
                         l.warn(&format!("Headless auto-deny: {}", preview))
                     });
@@ -9046,6 +9058,7 @@ async fn run_with_presence(
                         {
                             let drain_config = DrainConfig {
                                 bus: &bus,
+                                web_port,
                                 session_id: session_log_id(&session_log),
                                 alias_session_id: None,
                                 autonomy: autonomy.clone(),
@@ -9548,6 +9561,7 @@ async fn run_with_presence(
             let event_rx = persistent_event_rx.as_mut().unwrap();
             let drain_config = DrainConfig {
                 bus: &bus,
+                web_port,
                 session_id: session_log_id(&session_log),
                 alias_session_id: if matches!(backend, external_agent::AgentBackend::Codex) {
                     persistent_thread
@@ -10334,6 +10348,7 @@ async fn run_external_agent_mode(
 
     let drain_config = DrainConfig {
         bus: &bus,
+        web_port,
         session_id: live_session_id.clone(),
         alias_session_id: if intendant_session_id != live_session_id {
             intendant_session_id.clone()
