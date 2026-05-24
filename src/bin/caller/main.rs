@@ -1299,6 +1299,77 @@ enum DrainOutcome {
     Interrupted { reason: String },
 }
 
+struct ExternalSideSessionState<'a> {
+    open_side_threads: &'a mut HashMap<String, String>,
+    side_rounds: &'a mut HashMap<String, usize>,
+    side_turn_revisions: &'a mut HashMap<String, UserTurnRevisionState>,
+}
+
+impl<'a> ExternalSideSessionState<'a> {
+    fn has_side_thread(&self, thread_id: &str) -> bool {
+        self.open_side_threads.contains_key(thread_id)
+    }
+
+    fn record_started(&mut self, parent_thread_id: String, child_thread_id: String) {
+        self.open_side_threads
+            .insert(child_thread_id.clone(), parent_thread_id);
+        self.side_rounds.entry(child_thread_id.clone()).or_insert(1);
+        self.side_turn_revisions
+            .entry(child_thread_id)
+            .or_insert_with(|| {
+                let mut state = UserTurnRevisionState::default();
+                state.record_next_turn();
+                state
+            });
+    }
+
+    fn record_closed(&mut self, child_thread_id: &str) {
+        self.open_side_threads.remove(child_thread_id);
+        self.side_rounds.remove(child_thread_id);
+        self.side_turn_revisions.remove(child_thread_id);
+    }
+}
+
+fn scoped_event_targets_config(
+    thread_id: &Option<String>,
+    session_id: &Option<String>,
+    alias_session_id: &Option<String>,
+) -> bool {
+    match thread_id {
+        Some(thread_id) => {
+            session_id.as_deref() == Some(thread_id.as_str())
+                || alias_session_id.as_deref() == Some(thread_id.as_str())
+        }
+        None => true,
+    }
+}
+
+fn emit_child_turn_complete(
+    config: &DrainConfig<'_>,
+    conversation_kind: &str,
+    message: Option<String>,
+) {
+    if let Some(message) = message {
+        config.bus.send(AppEvent::LogEntry {
+            session_id: config.session_id.clone(),
+            level: "info".to_string(),
+            source: "Codex".to_string(),
+            content: message,
+            turn: None,
+        });
+    }
+    config.bus.send(AppEvent::LogEntry {
+        session_id: config.session_id.clone(),
+        level: "info".to_string(),
+        source: "Codex".to_string(),
+        content: format!(
+            "Round complete: {} conversation ready for follow-up",
+            conversation_kind
+        ),
+        turn: None,
+    });
+}
+
 fn external_context_snapshot_key(snapshot: &external_agent::AgentContextSnapshot) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -2228,29 +2299,12 @@ async fn drain_external_child_turn(
         stats,
         diff_tracker,
         pending_runtime_steers,
+        None,
     )
     .await
     {
         DrainOutcome::TurnCompleted { message, .. } => {
-            if let Some(message) = message {
-                child_config.bus.send(AppEvent::LogEntry {
-                    session_id: child_config.session_id.clone(),
-                    level: "info".to_string(),
-                    source: "Codex".to_string(),
-                    content: message,
-                    turn: None,
-                });
-            }
-            child_config.bus.send(AppEvent::LogEntry {
-                session_id: child_config.session_id.clone(),
-                level: "info".to_string(),
-                source: "Codex".to_string(),
-                content: format!(
-                    "Round complete: {} conversation ready for follow-up",
-                    conversation_kind
-                ),
-                turn: None,
-            });
+            emit_child_turn_complete(&child_config, conversation_kind, message);
         }
         DrainOutcome::Interrupted { reason } => {
             child_config.bus.send(AppEvent::LogEntry {
@@ -2330,6 +2384,7 @@ async fn drain_external_agent_events(
     stats: &mut LoopStats,
     diff_tracker: &mut ExternalDiffDeltaTracker,
     pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    mut side_sessions: Option<&mut ExternalSideSessionState<'_>>,
 ) -> DrainOutcome {
     use std::sync::atomic::Ordering;
 
@@ -2361,6 +2416,7 @@ async fn drain_external_agent_events(
     tokio::pin!(post_turn_sleep);
     let mut post_turn_sleep_active = false;
     let mut pending_turn_completion: Option<(Option<String>, usize)> = None;
+    let mut active_side_turns: HashSet<String> = HashSet::new();
 
     // Background watcher: if an interrupt arrives while an approval handler
     // below is blocked on `rx.await`, we need to drain the approval registry
@@ -2548,8 +2604,36 @@ async fn drain_external_agent_events(
                             });
                             continue;
                         }
-                        handle_external_thread_action(agent, action, params, session_id, config)
-                            .await;
+                        let effect =
+                            handle_external_thread_action(agent, action, params, session_id, config)
+                                .await;
+                        match effect {
+                            ExternalThreadActionEffect::SideTurnStarted {
+                                parent_thread_id,
+                                child_thread_id,
+                                prompt,
+                            } => {
+                                if let Some(state) = side_sessions.as_deref_mut() {
+                                    state.record_started(
+                                        parent_thread_id.clone(),
+                                        child_thread_id.clone(),
+                                    );
+                                    active_side_turns.insert(child_thread_id.clone());
+                                    emit_side_session_started(
+                                        config,
+                                        &parent_thread_id,
+                                        &child_thread_id,
+                                        prompt.as_deref(),
+                                    );
+                                }
+                            }
+                            ExternalThreadActionEffect::SideTurnClosed { child_thread_id } => {
+                                if let Some(state) = side_sessions.as_deref_mut() {
+                                    state.record_closed(&child_thread_id);
+                                }
+                            }
+                            ExternalThreadActionEffect::None => {}
+                        }
                         continue;
                     }
                     Ok(_) => continue,
@@ -2597,6 +2681,45 @@ async fn drain_external_agent_events(
             }
         };
 
+        let (event_thread_id, _event_turn_id, event) = event.into_scope();
+        let event_is_primary =
+            scoped_event_targets_config(&event_thread_id, &local_session_id, &alias_session_id);
+        let side_thread_id = event_thread_id.as_deref().and_then(|thread_id| {
+            side_sessions.as_ref().and_then(|state| {
+                state
+                    .has_side_thread(thread_id)
+                    .then(|| thread_id.to_string())
+            })
+        });
+        if !event_is_primary && side_thread_id.is_none() {
+            continue;
+        }
+
+        let child_config_storage;
+        let event_is_side = side_thread_id.is_some() && !event_is_primary;
+        let config =
+            if let Some(side_thread_id) = side_thread_id.as_ref().filter(|_| !event_is_primary) {
+                child_config_storage = DrainConfig {
+                    bus: config.bus,
+                    session_id: Some(side_thread_id.clone()),
+                    alias_session_id: None,
+                    autonomy: config.autonomy.clone(),
+                    session_log: config.session_log,
+                    project_root: config.project_root,
+                    log_dir: config.log_dir,
+                    approval_registry: config.approval_registry,
+                    json_approval: config.json_approval.clone(),
+                    agent_source: config.agent_source.clone(),
+                    suppress_agent_started: config.suppress_agent_started,
+                    persist_model_responses_inline: config.persist_model_responses_inline,
+                    headless: config.headless,
+                    context_injection: config.context_injection,
+                };
+                &child_config_storage
+            } else {
+                config
+            };
+
         match event {
             external_agent::AgentEvent::MessageDelta { text } => {
                 config.bus.send(AppEvent::ModelResponseDelta {
@@ -2618,7 +2741,7 @@ async fn drain_external_agent_events(
             }
             external_agent::AgentEvent::UserMessage { text } => {
                 if let Some(pos) = pending_runtime_steers.iter().position(|pending| {
-                    pending_runtime_steer_targets_session(pending, &local_session_id)
+                    pending_runtime_steer_targets_session(pending, &config.session_id)
                         && (pending.text == text || pending.text.trim() == text.trim())
                 }) {
                     let Some(pending) = pending_runtime_steers.remove(pos) else {
@@ -2628,7 +2751,7 @@ async fn drain_external_agent_events(
                         l.info(&format!("Steer observed in {} conversation", agent.name()))
                     });
                     config.bus.send(AppEvent::SteerDelivered {
-                        session_id: pending.session_id.or_else(|| local_session_id.clone()),
+                        session_id: pending.session_id.or_else(|| config.session_id.clone()),
                         id: pending.id,
                         mid_turn: true,
                     });
@@ -3168,6 +3291,19 @@ async fn drain_external_agent_events(
                 }
             }
             external_agent::AgentEvent::TurnCompleted { message } => {
+                if event_is_side {
+                    if let Some(session_id) = config.session_id.as_deref() {
+                        active_side_turns.remove(session_id);
+                    }
+                    emit_child_turn_complete(config, "side", message);
+                    if pending_turn_completion.is_some() && active_side_turns.is_empty() {
+                        post_turn_sleep_active = true;
+                        post_turn_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + EXTERNAL_POST_TURN_DRAIN_GRACE);
+                    }
+                    continue;
+                }
                 if let Some(ref msg) = message {
                     stats.last_response = Some(msg.clone());
                 }
@@ -3203,10 +3339,12 @@ async fn drain_external_agent_events(
                     });
                 }
                 pending_turn_completion = Some((message, turns_in_round));
-                post_turn_sleep_active = true;
-                post_turn_sleep
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + EXTERNAL_POST_TURN_DRAIN_GRACE);
+                if active_side_turns.is_empty() {
+                    post_turn_sleep_active = true;
+                    post_turn_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + EXTERNAL_POST_TURN_DRAIN_GRACE);
+                }
                 continue;
             }
             external_agent::AgentEvent::Terminated { reason, exit_code } => {
@@ -3221,6 +3359,7 @@ async fn drain_external_agent_events(
                 }
                 return DrainOutcome::Terminated { reason, exit_code };
             }
+            external_agent::AgentEvent::Scoped { .. } => continue,
         }
     }
 }
@@ -4807,6 +4946,30 @@ mod tests {
             side_thread_ids_from_message("forked into thread child"),
             None
         );
+    }
+
+    #[test]
+    fn scoped_event_targets_config_matches_session_or_alias() {
+        assert!(scoped_event_targets_config(
+            &Some("session-1".to_string()),
+            &Some("session-1".to_string()),
+            &None,
+        ));
+        assert!(scoped_event_targets_config(
+            &Some("codex-thread".to_string()),
+            &Some("intendant-session".to_string()),
+            &Some("codex-thread".to_string()),
+        ));
+        assert!(!scoped_event_targets_config(
+            &Some("side-thread".to_string()),
+            &Some("intendant-session".to_string()),
+            &Some("codex-thread".to_string()),
+        ));
+        assert!(scoped_event_targets_config(
+            &None,
+            &Some("intendant-session".to_string()),
+            &Some("codex-thread".to_string()),
+        ));
     }
 
     #[test]
@@ -8505,6 +8668,9 @@ async fn run_with_presence(
     let mut persistent_diff_tracker = ExternalDiffDeltaTracker::default();
     let mut persistent_pending_runtime_steers: std::collections::VecDeque<PendingRuntimeSteer> =
         std::collections::VecDeque::new();
+    let mut persistent_open_side_threads: HashMap<String, String> = HashMap::new();
+    let mut persistent_side_rounds: HashMap<String, usize> = HashMap::new();
+    let mut persistent_side_turn_revisions: HashMap<String, UserTurnRevisionState> = HashMap::new();
     // Track which backend the persistent agent was created for, so we can reset
     // when the web UI changes the selection between tasks.
     let mut persistent_agent_backend: Option<external_agent::AgentBackend> = None;
@@ -8573,7 +8739,12 @@ async fn run_with_presence(
                     session_id,
                     action,
                     params,
-                }) if event_targets_session(&session_id, &local_session_id) => {
+                }) if event_targets_external_session_or_side(
+                    &session_id,
+                    &local_session_id,
+                    &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
+                    &persistent_open_side_threads,
+                ) => {
                     OuterSignal::ThreadAction {
                         session_id,
                         op: action,
@@ -8625,6 +8796,9 @@ async fn run_with_presence(
                     persistent_event_rx = None;
                     persistent_codex_config = None;
                     persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                    persistent_open_side_threads.clear();
+                    persistent_side_rounds.clear();
+                    persistent_side_turn_revisions.clear();
                     Ok("agent torn down; next task will start a fresh thread".to_string())
                 } else if let Some(ref mut agent) = persistent_agent {
                     let target_thread_id = session_id
@@ -8688,6 +8862,15 @@ async fn run_with_presence(
                         side_thread_ids_from_message(&message)
                     {
                         let side_prompt = side_session_prompt_from_params(&action_params);
+                        {
+                            let mut side_state = ExternalSideSessionState {
+                                open_side_threads: &mut persistent_open_side_threads,
+                                side_rounds: &mut persistent_side_rounds,
+                                side_turn_revisions: &mut persistent_side_turn_revisions,
+                            };
+                            side_state
+                                .record_started(parent_thread_id.clone(), child_thread_id.clone());
+                        }
                         if let (Some(agent), Some(event_rx)) =
                             (persistent_agent.as_mut(), persistent_event_rx.as_mut())
                         {
@@ -8736,6 +8919,16 @@ async fn run_with_presence(
                                 l.warn("Codex side conversation started but no event receiver is available")
                             });
                         }
+                    }
+                } else if success && matches!(op.as_str(), "side-close" | "side_close") {
+                    if let Some(child_thread_id) = side_child_thread_id_from_params(&action_params)
+                    {
+                        let mut side_state = ExternalSideSessionState {
+                            open_side_threads: &mut persistent_open_side_threads,
+                            side_rounds: &mut persistent_side_rounds,
+                            side_turn_revisions: &mut persistent_side_turn_revisions,
+                        };
+                        side_state.record_closed(&child_thread_id);
                     }
                 }
                 turn_bus_rx = bus.subscribe();
@@ -9032,6 +9225,9 @@ async fn run_with_presence(
             persistent_gemini_config = None;
             persistent_diff_tracker = ExternalDiffDeltaTracker::default();
             persistent_pending_runtime_steers.clear();
+            persistent_open_side_threads.clear();
+            persistent_side_rounds.clear();
+            persistent_side_turn_revisions.clear();
         }
 
         if let Some(ref backend) = agent_backend {
@@ -9101,6 +9297,9 @@ async fn run_with_presence(
                 persistent_event_rx = Some(event_rx);
                 persistent_diff_tracker = ExternalDiffDeltaTracker::default();
                 persistent_pending_runtime_steers.clear();
+                persistent_open_side_threads.clear();
+                persistent_side_rounds.clear();
+                persistent_side_turn_revisions.clear();
                 persistent_agent_backend = agent_backend.clone();
                 // Remember the Codex config this agent was spawned with so
                 // we can detect drift at the next task and rebuild.
@@ -9180,7 +9379,13 @@ async fn run_with_presence(
             let drain_config = DrainConfig {
                 bus: &bus,
                 session_id: session_log_id(&session_log),
-                alias_session_id: None,
+                alias_session_id: if matches!(backend, external_agent::AgentBackend::Codex) {
+                    persistent_thread
+                        .as_ref()
+                        .map(|thread| thread.thread_id.clone())
+                } else {
+                    None
+                },
                 autonomy: autonomy.clone(),
                 session_log: &session_log,
                 project_root: &project.root,
@@ -9193,6 +9398,11 @@ async fn run_with_presence(
                 headless: false,
                 context_injection: &context_injection,
             };
+            let mut side_session_state = ExternalSideSessionState {
+                open_side_threads: &mut persistent_open_side_threads,
+                side_rounds: &mut persistent_side_rounds,
+                side_turn_revisions: &mut persistent_side_turn_revisions,
+            };
             match drain_external_agent_events(
                 agent,
                 event_rx,
@@ -9201,6 +9411,7 @@ async fn run_with_presence(
                 &mut cumulative_stats,
                 &mut persistent_diff_tracker,
                 &mut persistent_pending_runtime_steers,
+                Some(&mut side_session_state),
             )
             .await
             {
@@ -9246,6 +9457,10 @@ async fn run_with_presence(
                     persistent_thread = None;
                     persistent_event_rx = None;
                     persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                    persistent_pending_runtime_steers.clear();
+                    persistent_open_side_threads.clear();
+                    persistent_side_rounds.clear();
+                    persistent_side_turn_revisions.clear();
                 }
                 DrainOutcome::ChannelClosed => {
                     // Channel closed unexpectedly
@@ -9253,6 +9468,10 @@ async fn run_with_presence(
                     persistent_thread = None;
                     persistent_event_rx = None;
                     persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                    persistent_pending_runtime_steers.clear();
+                    persistent_open_side_threads.clear();
+                    persistent_side_rounds.clear();
+                    persistent_side_turn_revisions.clear();
                 }
             }
             turn_bus_rx = bus.subscribe();
@@ -10254,6 +10473,7 @@ async fn run_external_agent_mode(
                 });
             }
             let mut side_bus_rx = bus.subscribe();
+            let parent_thread_id = open_side_threads.get(&side_thread_id).cloned();
             drain_external_child_turn(
                 &mut agent,
                 &mut event_rx,
@@ -10266,6 +10486,13 @@ async fn run_external_agent_mode(
                 "side",
             )
             .await;
+            if let Some(parent_thread_id) = parent_thread_id {
+                if let Err(e) = agent.activate_thread(&parent_thread_id).await {
+                    let message = format!("Failed to restore Codex parent thread: {}", e);
+                    slog(&session_log, |l| l.warn(&message));
+                    bus.send(AppEvent::LoopError(message));
+                }
+            }
             turn_bus_rx = bus.subscribe();
             continue;
         }
@@ -10525,6 +10752,11 @@ async fn run_external_agent_mode(
             });
         }
 
+        let mut side_session_state = ExternalSideSessionState {
+            open_side_threads: &mut open_side_threads,
+            side_rounds: &mut side_rounds,
+            side_turn_revisions: &mut side_turn_revisions,
+        };
         match drain_external_agent_events(
             &mut agent,
             &mut event_rx,
@@ -10533,6 +10765,7 @@ async fn run_external_agent_mode(
             &mut stats,
             &mut diff_tracker,
             &mut pending_runtime_steers,
+            Some(&mut side_session_state),
         )
         .await
         {
