@@ -8021,7 +8021,7 @@ async function main() {
         applySessionCapabilities(d);
       }
       if (d.event === 'follow_up_status') {
-        onSteerStatusUpdate(d.id, d.text || '', d.status, d.reason);
+        handleFollowUpStatusUpdate(d);
         return;
       }
       if (d.event === 'approval_required' && d.id !== undefined && d.session_id) {
@@ -8700,7 +8700,7 @@ function processCommands(cmds) {
         onSteerStatusUpdate(c.id, c.text, c.status, c.reason);
         break;
       case 'follow_up_status':
-        onSteerStatusUpdate(c.id, c.text || '', c.status, c.reason);
+        handleFollowUpStatusUpdate(c);
         break;
       // Per-peer event stream (phase B of the secondary migration).
       // Each command carries `host_id` as a typed field so we route
@@ -10755,7 +10755,11 @@ function shortSessionId(sessionId) {
 function setDaemonSessionId(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
+  const previous = daemonSessionFullId;
   daemonSessionFullId = sid;
+  if (previous && previous !== sid) {
+    markSessionWindowsDetachedAfterDaemonRestart();
+  }
   const el = document.getElementById('sb-session');
   if (el) {
     el.textContent = shortSessionId(sid);
@@ -10813,6 +10817,60 @@ function externalSourceForSessionWindow(sessionId, win = null) {
     win?.source ||
     ''
   );
+}
+
+function setSessionWindowDetached(sessionId, detached, reason = '') {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const meta = sessionMetadataById.get(sid) || {};
+  const next = {
+    ...meta,
+    detached: !!detached,
+    managed: !detached,
+    ...(reason ? { detachReason: reason } : {}),
+  };
+  if (detached) {
+    if (!meta.detachedCapabilities) {
+      next.detachedPreviousCapabilities = meta.capabilities || null;
+    }
+    next.capabilities = {
+      ...(meta.capabilities || {}),
+      steer: false,
+      interrupt: false,
+    };
+    next.detachedCapabilities = true;
+  } else if (next.detachReason) {
+    delete next.detachReason;
+  }
+  if (!detached && next.detachedCapabilities) {
+    if (next.detachedPreviousCapabilities) {
+      next.capabilities = next.detachedPreviousCapabilities;
+    } else {
+      delete next.capabilities;
+    }
+    delete next.detachedCapabilities;
+    delete next.detachedPreviousCapabilities;
+  }
+  sessionMetadataById.set(sid, next);
+  updateSessionWindowActionMenuVisibility(sid);
+  if (detached) clearSessionWindowPendingActive(sid, 'idle');
+  updateStopButtonVisibility(currentPhase);
+  updateSubmitButtonLabel(currentPhase);
+  persistSessionWindowState();
+}
+
+function markSessionWindowsDetachedAfterDaemonRestart() {
+  for (const [sid, win] of sessionWindows) {
+    if (!externalSourceForSessionWindow(sid, win)) continue;
+    setSessionWindowDetached(sid, true, 'daemon restarted');
+  }
+}
+
+function sessionWindowIsDetached(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return false;
+  const meta = sessionMetadataById.get(sid) || {};
+  return meta.detached === true || meta.managed === false;
 }
 
 function externalBackendAliasForSession(sessionId) {
@@ -10958,6 +11016,26 @@ function isSessionWindowSteerActive(sessionId) {
   return isSteerPhase(win.phase);
 }
 
+function clearSessionWindowPendingActive(sessionId, phase = '') {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const win = sessionWindows.get(sid);
+  if (win) {
+    win.pendingActiveUntil = 0;
+    const current = normalizeSessionPhase(win.phase || 'idle');
+    const nextPhase = phase || (current === 'thinking' ? 'idle' : current);
+    updateSessionWindow(sid, { phase: nextPhase, ended: false });
+  }
+  if (sid === resolvePromptTargetSessionId()) {
+    const nextPhase = phase || sessionWindows.get(sid)?.phase || 'idle';
+    setPhase(nextPhase);
+  } else {
+    updateSubmitButtonLabel(currentPhase);
+    updateStopButtonVisibility(currentPhase);
+    updateTaskTargetChip();
+  }
+}
+
 function markSessionWindowPendingActive(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -10974,11 +11052,7 @@ function markSessionWindowPendingActive(sessionId) {
   setTimeout(() => {
     const latest = sessionWindows.get(sid);
     if (!latest || latest.pendingActiveUntil !== expiresAt) return;
-    latest.pendingActiveUntil = 0;
-    if (sid === resolvePromptTargetSessionId()) {
-      updateSubmitButtonLabel(currentPhase);
-      updateStopButtonVisibility(currentPhase);
-    }
+    clearSessionWindowPendingActive(sid);
   }, SESSION_PENDING_ACTIVE_MS + 50);
 }
 
@@ -11308,6 +11382,7 @@ async function restorePersistedSessionWindow(record) {
       ended: false,
     });
     if (!win) return;
+    setSessionWindowDetached(sid, true, 'restored from browser state');
     const resp = await authedFetch(`/api/session/${encodeURIComponent(sid)}?source=${encodeURIComponent(source)}`);
     const data = await resp.json();
     if (!resp.ok || data?.error) return;
@@ -12301,10 +12376,12 @@ function removeSessionWindow(sessionId) {
       if (currentSessionFullId === sid) {
         currentSessionFullId = '';
       }
+      setPhase('idle');
       updateTaskTargetChip();
     }
   } else if (currentSessionFullId === sid) {
     currentSessionFullId = '';
+    if (!resolvePromptTargetSessionId()) setPhase('idle');
     updateTaskTargetChip();
   }
   const grid = document.getElementById('session-window-grid');
@@ -23533,6 +23610,7 @@ function onSessionStarted(sessionId, task) {
   const visibleSessionId = alias?.backendSessionId || sid;
   currentSessionFullId = visibleSessionId || '';
   if (visibleSessionId) {
+    setSessionWindowDetached(visibleSessionId, false);
     ensureSessionWindow(visibleSessionId, {
       task: task || 'session',
       phase: processingLogReplay ? 'idle' : 'thinking',
@@ -23563,6 +23641,7 @@ function onSessionStarted(sessionId, task) {
 function onSessionAttached(sessionId, source) {
   currentSessionFullId = sessionId || '';
   if (sessionId) {
+    setSessionWindowDetached(sessionId, false);
     const existingPhase = sessionWindows.get(sessionId)?.phase;
     const phase = existingPhase && existingPhase !== 'done' ? existingPhase : 'idle';
     ensureSessionWindow(sessionId, { source: source || 'session', phase, ended: false });
@@ -23731,6 +23810,24 @@ function wireTaskTextarea(id, submit) {
   resizeTaskTextarea(input);
 }
 
+function detachedSessionResumeMessage(sessionId, task, direct, attachments = []) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const meta = sessionMetadataById.get(sid) || {};
+  const source = externalSourceForSessionWindow(sid) || normalizeAgentId(meta.source) || 'intendant';
+  const msg = {
+    action: 'resume_session',
+    source,
+    session_id: sid,
+    resume_id: meta.backendSessionId || sid,
+    project_root: meta.projectRoot || null,
+    task,
+    direct: direct !== false,
+  };
+  if (attachments.length > 0) msg.attachments = attachments;
+  return msg;
+}
+
 window.submitActivityTask = function(options = {}) {
   const input = document.getElementById('activity-task-input');
   if (!input || !app) return;
@@ -23747,9 +23844,12 @@ window.submitActivityTask = function(options = {}) {
   const attachmentReceipt = pendingAttachments.slice();
   const direct = document.getElementById('direct-mode-toggle')?.checked || false;
   const targetSessionId = resolvePromptTargetSessionId();
-  const msg = targetSessionId
-    ? { action: 'start_task', task: text, session_id: targetSessionId }
-    : { action: 'create_session', task: text };
+  const msg = targetSessionId && sessionWindowIsDetached(targetSessionId)
+    ? detachedSessionResumeMessage(targetSessionId, text, direct, attachments)
+    : (targetSessionId
+      ? { action: 'start_task', task: text, session_id: targetSessionId }
+      : { action: 'create_session', task: text });
+  if (!msg) return;
   if (targetSessionId && options.queuedFollowUp) {
     followUpCounter = (followUpCounter + 1) >>> 0;
     const id = 'follow-' + Date.now() + '-' + followUpCounter;
@@ -23887,6 +23987,24 @@ function updateSubmitButtonLabel(phase) {
 // removal on delivered is delayed (~1.2s) so the user sees the
 // checkmark before the entry disappears.
 const steerRows = new Map(); // id -> { el, timeout }
+function handleFollowUpStatusUpdate(evt = {}) {
+  const status = String(evt.status || '').trim().toLowerCase();
+  const reason = String(evt.reason || '').trim();
+  const sessionId = String(evt.session_id || evt.sessionId || '').trim();
+  onSteerStatusUpdate(evt.id, evt.text || '', status, reason);
+  if (status !== 'failed') return;
+
+  if (sessionId) {
+    clearSessionWindowPendingActive(sessionId, 'idle');
+    if (reason.toLowerCase().includes('not managed by this daemon')) {
+      setSessionWindowDetached(sessionId, true, reason);
+    }
+  } else {
+    setPhase('idle');
+  }
+  showControlToast('error', reason || 'Follow-up failed');
+}
+
 function onSteerStatusUpdate(id, text, status, reason) {
   const strip = document.getElementById('steer-strip');
   if (!strip) return;
