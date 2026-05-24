@@ -89,10 +89,9 @@ jobs:
       # there (the subset of scripts/setup-linux.sh's APT_PACKAGES that are
       # build-time, not runtime): libclang for the bindgen used by
       # env-libvpx-sys + pipewire-sys, libvpx + libpipewire + libxcb headers
-      # for those crates' link/pkg-config steps. macOS and Windows pull their
-      # platform deps as prebuilt FFI crates, so no system package step is
-      # needed there. (No libssl-dev / libpng-dev: the tree is on pure-Rust
-      # ring + the `png` crate, not openssl-sys / libpng.)
+      # for those crates' link/pkg-config steps. (No libssl-dev / libpng-dev:
+      # the tree is on pure-Rust ring + the `png` crate, not openssl-sys /
+      # libpng.)
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |
@@ -101,9 +100,27 @@ jobs:
             pkg-config libclang-dev libvpx-dev libpipewire-0.3-dev \
             libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
 
+      # macOS build deps. `env-libvpx-sys` (the VP8 encoder backend) is gated to
+      # non-Windows, so the aarch64-apple-darwin target *does* build it and its
+      # build.rs runs `pkg-config --libs --cflags vpx`. The GitHub macos-latest
+      # image ships neither pkg-config nor a `vpx.pc`; on a dev box setup-macos.sh
+      # pulls both in transitively via `brew install ffmpeg`. Install them
+      # directly here (leaner than all of ffmpeg). The other macOS FFI deps
+      # (ScreenCaptureKit, VideoToolbox, CoreFoundation) bind system frameworks
+      # at link time only, which `cargo check` never reaches.
+      - name: Install macOS build deps
+        if: runner.os == 'macOS'
+        run: brew install pkg-config libvpx
+
+      # Restore the cargo cache on every run, but only *save* it on pushes to
+      # main. PR caches live in an isolated scope GitHub discards on merge, so
+      # saving them buys nothing — and the Windows tar/zstd save step is flaky
+      # enough to fail an otherwise-green job. `save-if` keeps the speed-up on
+      # restore while removing the unreliable post-run save from PR checks.
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Type-check the whole `intendant` package — both binaries (the
       # `intendant` controller and the `intendant-runtime` executor) and their
