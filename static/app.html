@@ -1325,6 +1325,10 @@ html, body {
   color: var(--text);
   outline: none;
 }
+.concurrent-log-action[aria-pressed="true"] {
+  background: var(--surface0);
+  color: var(--text);
+}
 .concurrent-log-action:focus-visible {
   outline: 1px solid var(--blue);
   outline-offset: 1px;
@@ -6093,6 +6097,7 @@ html, body {
           <div class="concurrent-log-region" id="concurrent-log-region">
             <div class="concurrent-log-label hidden" id="concurrent-log-label" title="Concurrent agent view">
               <span>Concurrent view</span>
+              <button type="button" class="concurrent-log-action" id="concurrent-log-resize" title="Resize concurrent view around session windows" aria-label="Resize concurrent view around session windows" aria-pressed="true">&#x21F5;</button>
               <button type="button" class="concurrent-log-action" id="concurrent-log-minimize" title="Minimize concurrent view" aria-label="Minimize concurrent view">-</button>
               <button type="button" class="concurrent-log-action" id="concurrent-log-maximize" title="Maximize concurrent view" aria-label="Maximize concurrent view">&#x26F6;</button>
             </div>
@@ -7498,6 +7503,8 @@ const SESSION_PENDING_ACTIVE_MS = 30000;
 const SESSION_METADATA_REFRESH_MS = 15000;
 const SESSION_WINDOW_GRID_HEIGHT_KEY = 'intendant_session_window_grid_height_v3';
 const SESSION_WINDOW_GRID_MIN_HEIGHT = 180;
+const SESSION_WINDOW_GRID_FIT_MIN_HEIGHT = 72;
+const CONCURRENT_LOG_MIN_HEIGHT = 180;
 const SESSION_WINDOW_GRID_DEFAULT_RATIO = 0.5;
 const SESSION_WINDOW_GRID_MAX_RATIO = 0.8;
 const SESSION_RELATIONSHIP_KINDS = new Set(['side', 'fork', 'subagent']);
@@ -7509,6 +7516,7 @@ let sessionMetadataRefreshInFlight = null;
 let sessionWindowGridHeightPx = readStoredSessionWindowGridHeight();
 let sessionWindowGridResizeDrag = null;
 let concurrentLogMode = CONCURRENT_LOG_MODE_NORMAL;
+let concurrentLogFitToSessionWindows = true;
 let restoredPersistedSessionWindows = false;
 let restoringPersistedSessionWindows = false;
 const sessionWindowRestoreInFlight = new Set();
@@ -11600,7 +11608,10 @@ function sessionWindowGridAvailableHeight() {
   const gridRect = grid.getBoundingClientRect();
   const gridTop = gridRect.height > 0 ? gridRect.top : paneRect.top;
   const topOffset = Math.max(0, gridTop - paneRect.top);
-  return Math.max(SESSION_WINDOW_GRID_MIN_HEIGHT * 2, paneRect.height - topOffset);
+  return Math.max(
+    SESSION_WINDOW_GRID_MIN_HEIGHT + CONCURRENT_LOG_MIN_HEIGHT,
+    paneRect.height - topOffset
+  );
 }
 
 function maxSessionWindowGridHeight() {
@@ -11609,7 +11620,7 @@ function maxSessionWindowGridHeight() {
     SESSION_WINDOW_GRID_MIN_HEIGHT,
     Math.min(
       Math.round(availableHeight * SESSION_WINDOW_GRID_MAX_RATIO),
-      availableHeight - SESSION_WINDOW_GRID_MIN_HEIGHT
+      availableHeight - CONCURRENT_LOG_MIN_HEIGHT
     )
   );
 }
@@ -11626,6 +11637,41 @@ function clampSessionWindowGridHeight(heightPx) {
 function defaultSessionWindowGridHeight() {
   const availableHeight = sessionWindowGridAvailableHeight();
   return clampSessionWindowGridHeight(Math.round(availableHeight * SESSION_WINDOW_GRID_DEFAULT_RATIO));
+}
+
+function measureSessionWindowGridNaturalHeight() {
+  const grid = document.getElementById('session-window-grid');
+  if (!grid || grid.classList.contains('hidden')) return null;
+  const previousHeight = grid.style.height;
+  const previousMaxHeight = grid.style.maxHeight;
+  const wasResized = grid.classList.contains('resized');
+  const overlay = grid.querySelector(':scope > .session-relationship-wires');
+  const previousOverlayDisplay = overlay?.style.display || '';
+
+  grid.classList.remove('resized');
+  grid.style.height = 'auto';
+  grid.style.maxHeight = 'none';
+  if (overlay) overlay.style.display = 'none';
+  const naturalHeight = grid.scrollHeight;
+
+  if (overlay) overlay.style.display = previousOverlayDisplay;
+  grid.style.height = previousHeight;
+  grid.style.maxHeight = previousMaxHeight;
+  grid.classList.toggle('resized', wasResized);
+
+  return Number.isFinite(naturalHeight) && naturalHeight > 0 ? naturalHeight : null;
+}
+
+function fitSessionWindowGridHeight() {
+  const naturalHeight = measureSessionWindowGridNaturalHeight();
+  const maxHeight = maxSessionWindowGridHeight();
+  const height = naturalHeight === null
+    ? defaultSessionWindowGridHeight()
+    : Math.min(Math.round(naturalHeight), maxHeight);
+  return Math.round(Math.max(
+    SESSION_WINDOW_GRID_FIT_MIN_HEIGHT,
+    Math.min(height, maxHeight)
+  ));
 }
 
 function syncSessionWindowGridControls() {
@@ -11650,6 +11696,7 @@ function syncConcurrentLogModeUi() {
   const pane = document.getElementById('activity-log-pane');
   const grid = document.getElementById('session-window-grid');
   const label = document.getElementById('concurrent-log-label');
+  const resize = document.getElementById('concurrent-log-resize');
   const minimize = document.getElementById('concurrent-log-minimize');
   const maximize = document.getElementById('concurrent-log-maximize');
   const showGrid = !!grid && !grid.classList.contains('hidden');
@@ -11658,6 +11705,14 @@ function syncConcurrentLogModeUi() {
   pane.classList.toggle('concurrent-log-minimized', mode === CONCURRENT_LOG_MODE_MINIMIZED);
   pane.classList.toggle('concurrent-log-maximized', mode === CONCURRENT_LOG_MODE_MAXIMIZED);
   if (label) label.classList.toggle('hidden', !showGrid);
+  if (resize) {
+    const fitted = showGrid && concurrentLogFitToSessionWindows && mode === CONCURRENT_LOG_MODE_NORMAL;
+    resize.title = fitted
+      ? 'Restore previous concurrent view size'
+      : 'Resize concurrent view around session windows';
+    resize.setAttribute('aria-label', resize.title);
+    resize.setAttribute('aria-pressed', fitted ? 'true' : 'false');
+  }
   if (minimize) {
     const minimized = mode === CONCURRENT_LOG_MODE_MINIMIZED;
     minimize.textContent = minimized ? '+' : '-';
@@ -11679,17 +11734,38 @@ function setConcurrentLogMode(mode) {
     ? mode
     : CONCURRENT_LOG_MODE_NORMAL;
   concurrentLogMode = next;
-  syncSessionWindowGridControls();
+  if (next === CONCURRENT_LOG_MODE_NORMAL) {
+    applySessionWindowGridHeight();
+  } else {
+    syncSessionWindowGridControls();
+  }
+}
+
+function setConcurrentLogFitToSessionWindows(fitted) {
+  concurrentLogFitToSessionWindows = !!fitted;
+  if (concurrentLogFitToSessionWindows) {
+    concurrentLogMode = CONCURRENT_LOG_MODE_NORMAL;
+  }
+  applySessionWindowGridHeight();
+}
+
+function toggleConcurrentLogFitToSessionWindows() {
+  const active = concurrentLogFitToSessionWindows && concurrentLogMode === CONCURRENT_LOG_MODE_NORMAL;
+  setConcurrentLogFitToSessionWindows(!active);
 }
 
 function applySessionWindowGridHeight() {
   const grid = document.getElementById('session-window-grid');
   if (!grid) return;
   const hasCustomHeight = sessionWindowGridHeightPx !== null;
-  const height = hasCustomHeight
-    ? clampSessionWindowGridHeight(sessionWindowGridHeightPx)
-    : defaultSessionWindowGridHeight();
-  if (hasCustomHeight) sessionWindowGridHeightPx = height;
+  const useFitHeight = concurrentLogFitToSessionWindows
+    && concurrentLogMode === CONCURRENT_LOG_MODE_NORMAL;
+  const height = useFitHeight
+    ? fitSessionWindowGridHeight()
+    : (hasCustomHeight
+      ? clampSessionWindowGridHeight(sessionWindowGridHeightPx)
+      : defaultSessionWindowGridHeight());
+  if (!useFitHeight && hasCustomHeight) sessionWindowGridHeightPx = height;
   if (height) {
     grid.style.setProperty('--session-window-grid-height', `${height}px`);
     grid.classList.add('resized');
@@ -11702,12 +11778,14 @@ function applySessionWindowGridHeight() {
 }
 
 function setSessionWindowGridHeight(heightPx, persist = true) {
+  concurrentLogFitToSessionWindows = false;
   sessionWindowGridHeightPx = clampSessionWindowGridHeight(heightPx);
   if (persist) storeSessionWindowGridHeight(sessionWindowGridHeightPx);
   applySessionWindowGridHeight();
 }
 
 function resetSessionWindowGridHeight() {
+  concurrentLogFitToSessionWindows = true;
   sessionWindowGridHeightPx = null;
   storeSessionWindowGridHeight(null);
   applySessionWindowGridHeight();
@@ -12495,7 +12573,7 @@ function removeSessionWindow(sessionId) {
   const grid = document.getElementById('session-window-grid');
   if (grid && !grid.querySelector('.session-window')) grid.classList.add('hidden');
   updateSessionWindowMaximizeState();
-  syncSessionWindowGridControls();
+  applySessionWindowGridHeight();
   syncSessionWindowMetadataRefresh();
   scheduleSessionRelationshipRender();
   persistSessionWindowState();
@@ -12904,6 +12982,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   syncSessionWindowMetadataRefresh();
   updateSessionWindow(sid, meta);
   updateSessionWindowMaximizeState();
+  applySessionWindowGridHeight();
   scheduleSessionRelationshipRender();
   return win;
 }
@@ -13018,6 +13097,7 @@ function setSessionWindowMinimized(sessionId, minimized) {
     updateSessionWindowMaximizeState();
   }
   updateSessionWindowMinimizeState(sid);
+  applySessionWindowGridHeight();
   scheduleSessionRelationshipRender();
 }
 
@@ -13060,6 +13140,7 @@ function setSessionWindowMaximized(sessionId, maximized) {
     maximizedSessionWindowId = '';
   }
   updateSessionWindowMaximizeState();
+  applySessionWindowGridHeight();
   scheduleSessionRelationshipRender();
 }
 
@@ -13117,6 +13198,11 @@ document.getElementById('session-window-grid-resize-handle')?.addEventListener('
 document.getElementById('session-window-grid-resize-handle')?.addEventListener('pointerup', endSessionWindowGridResize);
 document.getElementById('session-window-grid-resize-handle')?.addEventListener('pointercancel', endSessionWindowGridResize);
 document.getElementById('session-window-grid-resize-handle')?.addEventListener('dblclick', resetSessionWindowGridHeight);
+document.getElementById('concurrent-log-resize')?.addEventListener('click', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  toggleConcurrentLogFitToSessionWindows();
+});
 document.getElementById('concurrent-log-minimize')?.addEventListener('click', (e) => {
   e.preventDefault();
   e.stopPropagation();
