@@ -1782,7 +1782,38 @@ async fn reader_task(
 
             let (thread_id, turn_id) = codex_event_scope(&params);
 
-            if method == "item/fileChange/requestApproval" {
+            if method.contains("mcpServer")
+                || method.contains("elicit")
+                || method.contains("mcpTool")
+            {
+                // Tool / MCP call approval (e.g. Codex invoking Intendant's
+                // own MCP server tools, or an MCP elicitation). Resolved with
+                // the `{"action": ...}` shape in `resolve_approval`, which uses
+                // the same substring test. Build a best-effort human-readable
+                // label — never the bare "<unknown>" placeholder.
+                let label = params
+                    .pointer("/params/message")
+                    .or_else(|| params.pointer("/message"))
+                    .or_else(|| params.pointer("/item/name"))
+                    .or_else(|| params.pointer("/item/tool"))
+                    .or_else(|| params.pointer("/item/toolName"))
+                    .or_else(|| params.pointer("/item/title"))
+                    .or_else(|| params.pointer("/tool"))
+                    .or_else(|| params.pointer("/name"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("MCP tool call ({method})"));
+                send_scoped_agent_event(
+                    &event_tx,
+                    thread_id.as_deref(),
+                    turn_id.as_deref(),
+                    AgentEvent::ApprovalRequest {
+                        request_id,
+                        command: label,
+                        category: ApprovalCategory::McpTool,
+                    },
+                );
+            } else if method == "item/fileChange/requestApproval" {
                 let path = params
                     .pointer("/item/path")
                     .or_else(|| params.pointer("/path"))

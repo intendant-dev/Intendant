@@ -3315,6 +3315,9 @@ async fn drain_external_agent_events(
                     external_agent::ApprovalCategory::FileChange => {
                         autonomy::ActionCategory::FileWrite
                     }
+                    external_agent::ApprovalCategory::McpTool => {
+                        autonomy::ActionCategory::ToolCall
+                    }
                 };
                 let decision = { config.autonomy.read().await.external_approval_decision(cat) };
                 if approve_all_session

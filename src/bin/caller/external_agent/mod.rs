@@ -348,6 +348,10 @@ pub enum ToolCompletionStatus {
 pub enum ApprovalCategory {
     CommandExecution,
     FileChange,
+    /// A tool / MCP call the external agent wants to make (e.g. Codex
+    /// invoking Intendant's own MCP server tools like computer-use
+    /// `take_screenshot` / `execute_cu_actions`, or an MCP elicitation).
+    McpTool,
 }
 
 /// Re-export of the shared approval decision type. The canonical

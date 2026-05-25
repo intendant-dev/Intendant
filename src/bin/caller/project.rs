@@ -1072,6 +1072,7 @@ file_delete = "deny"
 command_exec = "auto"
 network = "ask"
 destructive = "deny"
+tool_call = "ask"
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(
@@ -1089,6 +1090,10 @@ destructive = "deny"
         assert_eq!(
             config.approval.destructive,
             crate::autonomy::ApprovalRule::Deny
+        );
+        assert_eq!(
+            config.approval.tool_call,
+            crate::autonomy::ApprovalRule::Ask
         );
     }
 
@@ -1153,6 +1158,10 @@ args = ["mcp-server-sqlite", "--db-path", "/tmp/test.db"]
         );
         assert_eq!(
             config.approval.command_exec,
+            crate::autonomy::ApprovalRule::Auto
+        );
+        assert_eq!(
+            config.approval.tool_call,
             crate::autonomy::ApprovalRule::Auto
         );
     }

@@ -128,6 +128,7 @@ pub(crate) fn action_category_wire(cat: &crate::autonomy::ActionCategory) -> Str
         C::HumanInput => "human_input",
         C::LiveAudioSpawn => "live_audio_spawn",
         C::DisplayControl => "display_control",
+        C::ToolCall => "tool_call",
     }
     .to_string()
 }

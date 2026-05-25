@@ -78,6 +78,9 @@ pub enum ActionCategory {
     LiveAudioSpawn,
     /// Accessing the user's session display (screenshot, mouse, keyboard).
     DisplayControl,
+    /// An external agent invoking a tool / MCP call (e.g. Codex calling
+    /// Intendant's own MCP server tools, or an MCP elicitation request).
+    ToolCall,
 }
 
 impl ActionCategory {
@@ -88,6 +91,7 @@ impl ActionCategory {
         match self {
             Self::FileRead => 0,
             Self::CommandExec => 1,
+            Self::ToolCall => 1,
             Self::NetworkRequest => 2,
             Self::FileWrite => 3,
             Self::FileDelete => 4,
@@ -112,6 +116,7 @@ impl ActionCategory {
             "human_input" => Some(Self::HumanInput),
             "live_audio_spawn" => Some(Self::LiveAudioSpawn),
             "display_control" => Some(Self::DisplayControl),
+            "tool_call" => Some(Self::ToolCall),
             _ => None,
         }
     }
@@ -129,6 +134,7 @@ impl fmt::Display for ActionCategory {
             Self::HumanInput => write!(f, "human_input"),
             Self::LiveAudioSpawn => write!(f, "live_audio_spawn"),
             Self::DisplayControl => write!(f, "display_control"),
+            Self::ToolCall => write!(f, "tool_call"),
         }
     }
 }
@@ -165,6 +171,11 @@ pub struct ApprovalConfig {
     pub destructive: ApprovalRule,
     #[serde(default)]
     pub display_control: ApprovalRule,
+    /// External-agent tool / MCP calls (e.g. Codex invoking Intendant's
+    /// own MCP server tools). Defaults to `Auto` so users can auto-allow
+    /// these without going Full autonomy.
+    #[serde(default = "default_auto")]
+    pub tool_call: ApprovalRule,
 }
 
 fn default_auto() -> ApprovalRule {
@@ -181,6 +192,7 @@ impl Default for ApprovalConfig {
             network: ApprovalRule::Auto,
             destructive: ApprovalRule::Ask,
             display_control: ApprovalRule::Ask,
+            tool_call: ApprovalRule::Auto,
         }
     }
 }
@@ -197,6 +209,7 @@ impl ApprovalConfig {
             ActionCategory::HumanInput => ApprovalRule::Ask, // always ask
             ActionCategory::LiveAudioSpawn => ApprovalRule::Ask, // always ask
             ActionCategory::DisplayControl => self.display_control,
+            ActionCategory::ToolCall => self.tool_call,
         }
     }
 }
@@ -341,8 +354,18 @@ impl AutonomyState {
         }
 
         // An explicit per-category Deny rule rejects outright.
-        if self.rules.rule_for(category) == ApprovalRule::Deny {
+        let rule = self.rules.rule_for(category);
+        if rule == ApprovalRule::Deny {
             return ExternalApprovalDecision::Reject;
+        }
+
+        // Tool-call (MCP / computer-use) approvals honor an explicit `Auto`
+        // rule so users can auto-allow Intendant's own tools without going
+        // Full autonomy. Other categories keep prompting — their `Auto`
+        // default is for intendant-initiated actions, not external-agent
+        // escalations.
+        if matches!(category, ActionCategory::ToolCall) && rule == ApprovalRule::Auto {
+            return ExternalApprovalDecision::AutoApprove;
         }
 
         // The external agent asked: let the human decide.
@@ -579,6 +602,7 @@ mod tests {
         assert_eq!(config.command_exec, ApprovalRule::Auto);
         assert_eq!(config.network, ApprovalRule::Auto);
         assert_eq!(config.destructive, ApprovalRule::Ask);
+        assert_eq!(config.tool_call, ApprovalRule::Auto);
     }
 
     #[test]
@@ -1017,6 +1041,41 @@ destructive = "deny"
         let state = AutonomyState::new(AutonomyLevel::High, rules);
         assert_eq!(
             state.external_approval_decision(ActionCategory::CommandExec),
+            ExternalApprovalDecision::Reject
+        );
+    }
+
+    #[test]
+    fn external_approval_tool_call_auto_approves() {
+        // ToolCall honors an explicit Auto rule (the default) without Full
+        // autonomy, so Intendant's own MCP tools can be auto-allowed.
+        let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
+        assert_eq!(state.rules.tool_call, ApprovalRule::Auto);
+        assert_eq!(
+            state.external_approval_decision(ActionCategory::ToolCall),
+            ExternalApprovalDecision::AutoApprove
+        );
+    }
+
+    #[test]
+    fn external_approval_command_exec_auto_still_asks() {
+        // Regression guard: CommandExec's Auto default must NOT auto-approve
+        // external-agent escalations below Full autonomy — only ToolCall does.
+        let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
+        assert_eq!(state.rules.command_exec, ApprovalRule::Auto);
+        assert_eq!(
+            state.external_approval_decision(ActionCategory::CommandExec),
+            ExternalApprovalDecision::Ask
+        );
+    }
+
+    #[test]
+    fn external_approval_tool_call_deny_rejects() {
+        let mut rules = ApprovalConfig::default();
+        rules.tool_call = ApprovalRule::Deny;
+        let state = AutonomyState::new(AutonomyLevel::Medium, rules);
+        assert_eq!(
+            state.external_approval_decision(ActionCategory::ToolCall),
             ExternalApprovalDecision::Reject
         );
     }
