@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
 use super::*;
@@ -33,6 +33,8 @@ pub struct SessionSupervisor {
     config: Arc<SessionSupervisorConfig>,
     state: Arc<AsyncMutex<SupervisorState>>,
 }
+
+const EXTERNAL_ATTACH_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Default)]
 struct SupervisorState {
@@ -601,6 +603,7 @@ impl SessionSupervisor {
             session_name,
             None,
             emit_session_started_after_identity,
+            None,
         )
         .await;
     }
@@ -667,6 +670,7 @@ impl SessionSupervisor {
                 }
                 self.emit_attached_status(&session_id, &source_norm).await;
             } else {
+                let (ready_tx, ready_rx) = oneshot::channel();
                 let log_dir = session_log::SessionLog::resolve_path(None);
                 let session_log = match session_log::SessionLog::open(log_dir.clone()) {
                     Ok(log) => Arc::new(Mutex::new(log)),
@@ -701,9 +705,11 @@ impl SessionSupervisor {
                     None,
                     Some(resume_token.clone()),
                     false,
+                    Some(ready_tx),
                 )
                 .await;
-                self.emit_attached_status(&resume_token, &source_norm).await;
+                self.emit_external_attached_when_ready(resume_token, source_norm, ready_rx);
+                return;
             }
 
             self.config.bus.send(AppEvent::SessionAttached {
@@ -777,6 +783,7 @@ impl SessionSupervisor {
             None,
             Some(resume_token),
             false,
+            None,
         )
         .await;
     }
@@ -817,6 +824,7 @@ impl SessionSupervisor {
         session_name: Option<String>,
         resume_token: Option<String>,
         emit_session_started_after_identity: bool,
+        ready_for_thread_actions: Option<oneshot::Sender<()>>,
     ) {
         let (follow_up_tx, follow_up_rx) = mpsc::channel::<FollowUpMessage>(16);
         let approval_registry = event::ApprovalRegistry::default();
@@ -861,6 +869,7 @@ impl SessionSupervisor {
                     resume_token,
                     Some(session_id.clone()),
                     emit_session_started_after_identity,
+                    ready_for_thread_actions,
                 )
                 .await
             } else {
@@ -906,6 +915,41 @@ impl SessionSupervisor {
             supervisor
                 .finish_session(session_id, session_log, task, result)
                 .await;
+        });
+    }
+
+    fn emit_external_attached_when_ready(
+        &self,
+        session_id: String,
+        source: String,
+        ready_rx: oneshot::Receiver<()>,
+    ) {
+        let supervisor = self.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(EXTERNAL_ATTACH_READY_TIMEOUT, ready_rx).await {
+                Ok(Ok(())) => {
+                    supervisor.emit_attached_status(&session_id, &source).await;
+                    supervisor
+                        .config
+                        .bus
+                        .send(AppEvent::SessionAttached { session_id, source });
+                }
+                Ok(Err(_)) => {
+                    supervisor.loop_error(format!(
+                        "{} session {} stopped before it was ready for thread actions",
+                        source,
+                        short_session(&session_id)
+                    ));
+                }
+                Err(_) => {
+                    supervisor.loop_error(format!(
+                        "{} session {} did not become ready for thread actions within {}s",
+                        source,
+                        short_session(&session_id),
+                        EXTERNAL_ATTACH_READY_TIMEOUT.as_secs()
+                    ));
+                }
+            }
         });
     }
 

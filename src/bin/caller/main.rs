@@ -3317,7 +3317,9 @@ async fn drain_external_agent_events(
                     }
                 };
                 let decision = { config.autonomy.read().await.external_approval_decision(cat) };
-                if approve_all_session || decision == autonomy::ExternalApprovalDecision::AutoApprove {
+                if approve_all_session
+                    || decision == autonomy::ExternalApprovalDecision::AutoApprove
+                {
                     config.bus.send(AppEvent::AutoApproved {
                         preview: command.clone(),
                     });
@@ -3439,7 +3441,9 @@ async fn drain_external_agent_events(
                 let decision = { config.autonomy.read().await.external_approval_decision(cat) };
                 let preview = format!("file change: {}", path);
 
-                if approve_all_session || decision == autonomy::ExternalApprovalDecision::AutoApprove {
+                if approve_all_session
+                    || decision == autonomy::ExternalApprovalDecision::AutoApprove
+                {
                     config.bus.send(AppEvent::AutoApproved {
                         preview: preview.clone(),
                     });
@@ -10552,6 +10556,7 @@ async fn run_external_agent_mode(
     resume_session: Option<String>,
     control_session_id: Option<String>,
     emit_session_started_after_identity: bool,
+    ready_for_thread_actions: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<LoopStats, CallerError> {
     slog(&session_log, |l| {
         l.info(&format!("Mode: external agent ({})", backend));
@@ -10673,6 +10678,9 @@ async fn run_external_agent_mode(
     // Subscribe while idle so a steer sent immediately after the prompt
     // (before turn/start returns) is still available to the turn drain.
     let mut turn_bus_rx = bus.subscribe();
+    if let Some(ready_tx) = ready_for_thread_actions {
+        let _ = ready_tx.send(());
+    }
 
     'outer: loop {
         let followup = match next_turn.take() {
@@ -13505,6 +13513,7 @@ async fn main() -> Result<(), CallerError> {
                             None,
                             None,
                             false,
+                            None,
                         )
                         .await
                     } else if use_orchestration {
@@ -14193,6 +14202,7 @@ async fn main() -> Result<(), CallerError> {
                         None,
                         None,
                         false,
+                        None,
                     )
                     .await
                 } else {
@@ -14647,6 +14657,7 @@ async fn main() -> Result<(), CallerError> {
                 None,
                 None,
                 false,
+                None,
             )
             .await
         } else {
