@@ -234,8 +234,8 @@ fn generate_self_signed(
 
 /// Load a PEM cert chain and private key from disk (operator override).
 ///
-/// Accepts PKCS#8, PKCS#1 (RSA), and SEC1 (EC) private keys — `rustls_pemfile`
-/// returns whichever it finds first in the key file.
+/// Accepts PKCS#8, PKCS#1 (RSA), and SEC1 (EC) private keys, returning
+/// whichever appears first in the key file.
 fn load_pem_cert_and_key(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
@@ -246,13 +246,12 @@ fn load_pem_cert_and_key(
     ),
     String,
 > {
-    use std::io::BufReader;
+    use rustls::pki_types::pem::{Error as PemError, PemObject};
 
     let cert_bytes = std::fs::read(cert_path)
         .map_err(|e| format!("reading TLS cert {}: {e}", cert_path.display()))?;
-    let mut cert_reader = BufReader::new(cert_bytes.as_slice());
     let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_reader)
+        rustls::pki_types::CertificateDer::pem_slice_iter(&cert_bytes)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("parsing TLS cert {}: {e}", cert_path.display()))?;
     if cert_chain.is_empty() {
@@ -264,14 +263,15 @@ fn load_pem_cert_and_key(
 
     let key_bytes = std::fs::read(key_path)
         .map_err(|e| format!("reading TLS key {}: {e}", key_path.display()))?;
-    let mut key_reader = BufReader::new(key_bytes.as_slice());
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| format!("parsing TLS key {}: {e}", key_path.display()))?
-        .ok_or_else(|| {
-            format!(
-                "no private key found in {} (expected PKCS#8/PKCS#1/SEC1 PEM)",
-                key_path.display()
-            )
+    let key: rustls::pki_types::PrivateKeyDer<'static> =
+        rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| match e {
+            PemError::NoItemsFound => {
+                format!(
+                    "no private key found in {} (expected PKCS#8/PKCS#1/SEC1 PEM)",
+                    key_path.display()
+                )
+            }
+            err => format!("parsing TLS key {}: {err}", key_path.display()),
         })?;
 
     Ok((cert_chain, key))
@@ -341,6 +341,23 @@ mod tests {
         let src = TlsCertSource::SelfSigned {
             bind_ip: Some("0.0.0.0".parse().unwrap()),
             hostname: None,
+        };
+        assert!(build_acceptor(&src).is_ok());
+    }
+
+    #[test]
+    fn file_acceptor_loads_pem_cert_and_key() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+
+        let src = TlsCertSource::Files {
+            cert_path,
+            key_path,
         };
         assert!(build_acceptor(&src).is_ok());
     }
