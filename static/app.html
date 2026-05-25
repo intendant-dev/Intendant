@@ -38,12 +38,12 @@
   --log-detail: #a2a8be;
   --log-debug: var(--overlay1);
   --log-presence: var(--green);
-  --concurrent-view-bg: rgba(24, 24, 37, 0.76);
-  --concurrent-view-hover-bg: rgba(24, 24, 37, 0.84);
-  --session-window-bg: rgba(24, 24, 37, 0.76);
-  --session-window-header-bg: rgba(17, 17, 27, 0.72);
-  --session-window-hover-bg: rgba(24, 24, 37, 0.84);
-  --session-window-chip-bg: rgba(49, 50, 68, 0.72);
+  --concurrent-view-bg: rgba(24, 24, 37, 0.68);
+  --concurrent-view-hover-bg: rgba(24, 24, 37, 0.78);
+  --session-window-bg: rgba(24, 24, 37, 0.72);
+  --session-window-header-bg: rgba(17, 17, 27, 0.64);
+  --session-window-hover-bg: rgba(24, 24, 37, 0.80);
+  --session-window-chip-bg: rgba(49, 50, 68, 0.64);
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1289,6 +1289,7 @@ html, body {
 /* ── Log Stream ── */
 .concurrent-log-region {
   position: relative;
+  z-index: 3;
   display: flex;
   flex: 1;
   min-height: 0;
@@ -1351,6 +1352,7 @@ html, body {
   background: var(--base);
   flex-shrink: 0;
   position: relative;
+  z-index: 1;
 }
 .session-relationship-wires {
   position: absolute;
@@ -1400,6 +1402,7 @@ html, body {
 .session-window-grid.resized {
   height: var(--session-window-grid-height);
   max-height: none;
+  overflow: visible;
 }
 .session-window-grid.maximized {
   display: flex;
@@ -1430,6 +1433,7 @@ html, body {
   height: auto;
   min-height: 0;
   max-height: none;
+  overflow-y: auto;
 }
 .subtab-pane.concurrent-log-minimized .concurrent-log-region {
   flex: 0 0 30px;
@@ -1452,6 +1456,7 @@ html, body {
 }
 .session-window-grid-resize-handle {
   position: relative;
+  z-index: 4;
   height: 10px;
   flex-shrink: 0;
   cursor: row-resize;
