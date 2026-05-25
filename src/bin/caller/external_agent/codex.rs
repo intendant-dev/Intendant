@@ -2753,15 +2753,9 @@ fn translate_notification_with_scope(
                 return;
             }
             state.goal_known_active = true;
-            send_scoped_agent_event(
-                event_tx,
-                thread_id,
-                turn_id,
-                AgentEvent::Log {
-                    level: "info".to_string(),
-                    message: format!("Codex goal updated: {}", format_goal(goal)),
-                },
-            );
+            // Codex refreshes active goal metadata frequently. Keep those
+            // updates structured-only so normal activity logs do not fill with
+            // status churn.
             if let Some(goal) = session_goal_from_value(goal) {
                 send_scoped_agent_event(
                     event_tx,
@@ -5546,7 +5540,7 @@ mod tests {
     }
 
     #[test]
-    fn goal_notifications_emit_log_events() {
+    fn goal_notifications_emit_structured_goal_updates_without_log_spam() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({
             "threadId": "thread-abc",
@@ -5564,13 +5558,18 @@ mod tests {
         });
         translate_notification("thread/goal/updated", &params, &tx);
         match rx.try_recv().unwrap() {
-            AgentEvent::Log { level, message } => {
-                assert_eq!(level, "info");
-                assert!(message.contains("Ship feature parity"));
-                assert!(message.contains("paused"));
+            AgentEvent::GoalUpdated { goal } => {
+                assert_eq!(goal.objective, "Ship feature parity");
+                assert_eq!(goal.status.as_deref(), Some("paused"));
+                assert_eq!(goal.tokens_used, Some(10));
+                assert_eq!(goal.elapsed_seconds, Some(2));
             }
-            other => panic!("expected Log, got {:?}", other),
+            other => panic!("expected GoalUpdated, got {:?}", other),
         }
+        assert!(
+            rx.try_recv().is_err(),
+            "goal updates should not emit normal log entries"
+        );
     }
 
     #[test]
@@ -5602,10 +5601,16 @@ mod tests {
         let clear = serde_json::json!({ "threadId": "thread-abc" });
 
         translate_notification_with_state("thread/goal/updated", &update, &tx, &mut state);
-        let _ = rx.try_recv().expect("goal update should log");
-        let _ = rx
+        match rx
             .try_recv()
-            .expect("goal update should publish structured state");
+            .expect("goal update should publish structured state")
+        {
+            AgentEvent::GoalUpdated { goal } => {
+                assert_eq!(goal.objective, "Ship feature parity");
+                assert_eq!(goal.status.as_deref(), Some("active"));
+            }
+            other => panic!("expected GoalUpdated, got {:?}", other),
+        }
 
         translate_notification_with_state("thread/goal/cleared", &clear, &tx, &mut state);
 
@@ -5615,6 +5620,10 @@ mod tests {
                 assert_eq!(message, "Codex goal cleared");
             }
             other => panic!("expected Log, got {:?}", other),
+        }
+        match rx.try_recv().unwrap() {
+            AgentEvent::GoalCleared => {}
+            other => panic!("expected GoalCleared, got {:?}", other),
         }
     }
 
