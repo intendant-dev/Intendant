@@ -2494,6 +2494,9 @@ impl App {
             AppEvent::SessionCapabilities { .. } => {
                 // Frontend-neutral metadata for dashboard controls.
             }
+            AppEvent::SessionGoal { .. } => {
+                // Frontend-neutral metadata for dashboard goal indicators.
+            }
             AppEvent::SessionAttached {
                 ref session_id,
                 ref source,

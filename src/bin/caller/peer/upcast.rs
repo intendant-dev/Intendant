@@ -278,6 +278,7 @@ impl AppEventUpcaster {
             | AppEvent::SessionIdentity { .. }
             | AppEvent::SessionRelationship { .. }
             | AppEvent::SessionCapabilities { .. }
+            | AppEvent::SessionGoal { .. }
             | AppEvent::FollowUpStatus { .. }
             | AppEvent::SessionRenameResult { .. }
             | AppEvent::FileChanged { .. }
@@ -1357,6 +1358,7 @@ impl WireEventUpcaster {
             | OutboundEvent::SessionIdentity { .. }
             | OutboundEvent::SessionRelationship { .. }
             | OutboundEvent::SessionCapabilities { .. }
+            | OutboundEvent::SessionGoal { .. }
             | OutboundEvent::FollowUpStatus { .. }
             | OutboundEvent::SessionRenameResult { .. }
             | OutboundEvent::PeerAdded { .. }

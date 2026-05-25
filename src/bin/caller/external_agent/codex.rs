@@ -697,6 +697,39 @@ fn format_goal(goal: &serde_json::Value) -> String {
     format!("{} ({})", objective, details.join(", "))
 }
 
+fn session_goal_from_value(goal: &serde_json::Value) -> Option<crate::types::SessionGoal> {
+    let objective = goal
+        .get("objective")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("<unknown objective>")
+        .to_string();
+
+    Some(crate::types::SessionGoal {
+        objective,
+        status: goal
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        elapsed_seconds: goal
+            .get("timeUsedSeconds")
+            .or_else(|| goal.get("elapsedSeconds"))
+            .or_else(|| goal.get("elapsed_seconds"))
+            .and_then(|v| v.as_u64()),
+        tokens_used: goal
+            .get("tokensUsed")
+            .or_else(|| goal.get("tokens_used"))
+            .and_then(|v| v.as_u64()),
+        token_budget: goal
+            .get("tokenBudget")
+            .or_else(|| goal.get("token_budget"))
+            .and_then(|v| v.as_u64()),
+    })
+}
+
 fn format_duration_short(seconds: u64) -> String {
     let days = seconds / 86_400;
     let hours = (seconds % 86_400) / 3_600;
@@ -2713,6 +2746,9 @@ fn translate_notification_with_scope(
         "thread/goal/updated" => {
             let goal = params.get("goal").unwrap_or(params);
             if goal.is_null() {
+                if state.goal_known_active {
+                    send_scoped_agent_event(event_tx, thread_id, turn_id, AgentEvent::GoalCleared);
+                }
                 state.goal_known_active = false;
                 return;
             }
@@ -2726,6 +2762,14 @@ fn translate_notification_with_scope(
                     message: format!("Codex goal updated: {}", format_goal(goal)),
                 },
             );
+            if let Some(goal) = session_goal_from_value(goal) {
+                send_scoped_agent_event(
+                    event_tx,
+                    thread_id,
+                    turn_id,
+                    AgentEvent::GoalUpdated { goal },
+                );
+            }
         }
 
         "thread/goal/cleared" => {
@@ -2739,6 +2783,7 @@ fn translate_notification_with_scope(
                         message: "Codex goal cleared".to_string(),
                     },
                 );
+                send_scoped_agent_event(event_tx, thread_id, turn_id, AgentEvent::GoalCleared);
             }
             state.goal_known_active = false;
         }
@@ -5558,6 +5603,9 @@ mod tests {
 
         translate_notification_with_state("thread/goal/updated", &update, &tx, &mut state);
         let _ = rx.try_recv().expect("goal update should log");
+        let _ = rx
+            .try_recv()
+            .expect("goal update should publish structured state");
 
         translate_notification_with_state("thread/goal/cleared", &clear, &tx, &mut state);
 

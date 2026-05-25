@@ -2591,6 +2591,18 @@ fn handle_idle_codex_subagent_event(
                 presence: None,
             });
         }
+        external_agent::AgentEvent::GoalUpdated { goal } => {
+            config.bus.send(AppEvent::SessionGoal {
+                session_id: child_thread_id,
+                goal: Some(goal),
+            });
+        }
+        external_agent::AgentEvent::GoalCleared => {
+            config.bus.send(AppEvent::SessionGoal {
+                session_id: child_thread_id,
+                goal: None,
+            });
+        }
         external_agent::AgentEvent::PlanUpdate { .. }
         | external_agent::AgentEvent::ApprovalRequest { .. }
         | external_agent::AgentEvent::FileApprovalRequest { .. }
@@ -3091,6 +3103,28 @@ async fn drain_external_agent_events(
                     presence: None,
                 });
             }
+            external_agent::AgentEvent::GoalUpdated { goal } => {
+                let session_id = event_thread_id
+                    .clone()
+                    .or_else(|| config.session_id.clone());
+                if let Some(session_id) = session_id {
+                    config.bus.send(AppEvent::SessionGoal {
+                        session_id,
+                        goal: Some(goal),
+                    });
+                }
+            }
+            external_agent::AgentEvent::GoalCleared => {
+                let session_id = event_thread_id
+                    .clone()
+                    .or_else(|| config.session_id.clone());
+                if let Some(session_id) = session_id {
+                    config.bus.send(AppEvent::SessionGoal {
+                        session_id,
+                        goal: None,
+                    });
+                }
+            }
             external_agent::AgentEvent::Log { level, message } => {
                 slog(config.session_log, |l| match level.as_str() {
                     "warn" => l.warn(&message),
@@ -3315,9 +3349,7 @@ async fn drain_external_agent_events(
                     external_agent::ApprovalCategory::FileChange => {
                         autonomy::ActionCategory::FileWrite
                     }
-                    external_agent::ApprovalCategory::McpTool => {
-                        autonomy::ActionCategory::ToolCall
-                    }
+                    external_agent::ApprovalCategory::McpTool => autonomy::ActionCategory::ToolCall,
                 };
                 let decision = { config.autonomy.read().await.external_approval_decision(cat) };
                 if approve_all_session

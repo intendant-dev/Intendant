@@ -1242,6 +1242,26 @@ impl SessionLog {
         });
     }
 
+    /// Persist the latest visible Codex `/goal` state for a session.
+    pub fn session_goal(&mut self, session_id: &str, goal: Option<&crate::types::SessionGoal>) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "session_goal".to_string(),
+            level: Some("info".to_string()),
+            message: Some(match goal {
+                Some(goal) => format!("Session goal: {} ({})", session_id, goal.objective),
+                None => format!("Session goal cleared: {}", session_id),
+            }),
+            data: Some(serde_json::json!({
+                "session_id": session_id,
+                "goal": goal,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log a session ending (MCP multi-task).
     pub fn session_ended(&mut self, session_id: &str, reason: &str) {
         self.emit(LogEvent {
@@ -2518,7 +2538,7 @@ pub fn session_log_entry_to_app_event(
 ) -> Option<crate::event::AppEvent> {
     use crate::event::AppEvent;
     use crate::provider::TokenUsage;
-    use crate::types::{LogLevel, SessionCapabilities};
+    use crate::types::{LogLevel, SessionCapabilities, SessionGoal};
 
     let event_type = entry.get("event").and_then(|v| v.as_str())?;
     let message = entry.get("message").and_then(|v| v.as_str()).unwrap_or("");
@@ -2886,6 +2906,21 @@ pub fn session_log_entry_to_app_event(
                 session_id,
                 capabilities,
             })
+        }
+        "session_goal" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let goal = data.and_then(|d| d.get("goal")).and_then(|v| {
+                if v.is_null() {
+                    None
+                } else {
+                    serde_json::from_value::<SessionGoal>(v.clone()).ok()
+                }
+            });
+            Some(AppEvent::SessionGoal { session_id, goal })
         }
         "session_ended" => {
             let session_id = data
@@ -4419,6 +4454,16 @@ mod tests {
                 codex_thread_actions: vec![],
             },
         );
+        log.session_goal(
+            "child",
+            Some(&crate::types::SessionGoal {
+                objective: "Ship feature parity".to_string(),
+                status: Some("active".to_string()),
+                elapsed_seconds: Some(42),
+                tokens_used: Some(10),
+                token_budget: Some(1000),
+            }),
+        );
         drop(log);
 
         let identity = read_last_event(&log_dir, "session_identity");
@@ -4473,6 +4518,18 @@ mod tests {
                 assert!(capabilities.codex_thread_actions.is_empty());
             }
             other => panic!("expected SessionCapabilities, got {:?}", other),
+        }
+
+        let goal = read_last_event(&log_dir, "session_goal");
+        match session_log_entry_to_app_event(&goal, &log_dir).unwrap() {
+            AppEvent::SessionGoal { session_id, goal } => {
+                let goal = goal.expect("goal should be present");
+                assert_eq!(session_id, "child");
+                assert_eq!(goal.objective, "Ship feature parity");
+                assert_eq!(goal.status.as_deref(), Some("active"));
+                assert_eq!(goal.elapsed_seconds, Some(42));
+            }
+            other => panic!("expected SessionGoal, got {:?}", other),
         }
     }
 

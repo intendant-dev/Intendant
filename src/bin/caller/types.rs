@@ -119,6 +119,20 @@ pub struct SessionCapabilities {
     pub codex_thread_actions: Vec<String>,
 }
 
+/// Per-session Codex `/goal` state shown by the dashboard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionGoal {
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_used: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+}
+
 /// Events sent to connected control socket clients, web gateway, and MCP.
 ///
 /// Also deserialized by `crate::peer::upcast::OutboundEventUpcaster`
@@ -184,6 +198,11 @@ pub enum OutboundEvent {
     SessionCapabilities {
         session_id: String,
         capabilities: SessionCapabilities,
+    },
+    SessionGoal {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<SessionGoal>,
     },
     SessionAttached {
         session_id: String,

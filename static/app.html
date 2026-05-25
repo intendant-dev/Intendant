@@ -1487,6 +1487,7 @@ html, body {
 }
 .session-window {
   position: relative;
+  container-type: inline-size;
   z-index: 2;
   align-self: start;
   min-height: 180px;
@@ -1550,6 +1551,10 @@ html, body {
   max-height: 320px;
 }
 .session-window.header-collapsed .session-window-task {
+  display: none;
+}
+.session-window.header-collapsed .session-window-goal,
+.session-window.minimized .session-window-goal {
   display: none;
 }
 .session-window.header-collapsed .session-window-title {
@@ -1721,6 +1726,53 @@ html, body {
 .session-window-status.active { color: var(--teal); }
 .session-window-status.waiting { color: var(--yellow); }
 .session-window-status.done { color: var(--green); }
+.session-window-goal {
+  flex: 0 2 230px;
+  min-width: 0;
+  max-width: 280px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border: 1px solid rgba(249, 226, 175, 0.28);
+  border-radius: 999px;
+  background: rgba(249, 226, 175, 0.08);
+  color: var(--yellow);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.session-window-goal::before {
+  content: "/goal";
+  flex-shrink: 0;
+  color: var(--overlay0);
+  font-size: 9px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+.session-window-goal-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-window-goal.paused {
+  border-color: rgba(250, 179, 135, 0.30);
+  background: rgba(250, 179, 135, 0.08);
+  color: var(--peach);
+}
+.session-window-goal.complete,
+.session-window-goal.budget-limited {
+  border-color: rgba(166, 227, 161, 0.28);
+  background: rgba(166, 227, 161, 0.08);
+  color: var(--green);
+}
+@container (max-width: 560px) {
+  .session-window-goal {
+    display: none;
+  }
+}
 .session-window-action-cluster {
   flex-shrink: 0;
   display: inline-flex;
@@ -1785,6 +1837,44 @@ html, body {
 }
 .session-window-menu button:disabled:hover {
   background: transparent;
+}
+.session-window-submenu {
+  position: relative;
+}
+.session-window-submenu.hidden,
+.session-window-menu .hidden {
+  display: none;
+}
+.session-window-submenu-trigger::after {
+  content: "\2039";
+  margin-left: auto;
+  color: var(--overlay0);
+}
+.session-window-submenu.open > .session-window-submenu-trigger,
+.session-window-submenu:focus-within > .session-window-submenu-trigger,
+.session-window-submenu:hover > .session-window-submenu-trigger {
+  background: var(--surface0);
+}
+.session-window-submenu-panel {
+  display: none;
+  position: absolute;
+  top: -4px;
+  right: calc(100% + 4px);
+  z-index: 31;
+  min-width: 142px;
+  padding: 4px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--mantle);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+}
+.session-window-submenu.open > .session-window-submenu-panel,
+.session-window-submenu:focus-within > .session-window-submenu-panel,
+.session-window-submenu:hover > .session-window-submenu-panel {
+  display: block;
+}
+.session-window-submenu-panel button {
+  padding-left: 10px;
 }
 .session-window-menu-separator {
   height: 1px;
@@ -7632,6 +7722,7 @@ let latestGlobalUsage = null;
 let dashboardProjectRoot = '';
 let sessionRelationshipRenderHandle = 0;
 let sessionWindowGridFitRenderHandle = 0;
+let sessionGoalTicker = null;
 const SESSION_WINDOW_RENDER_LIMIT = 600;
 const SESSION_WINDOW_PREPEND_CHUNK = 300;
 const SESSION_WINDOW_TOP_LOAD_THRESHOLD_PX = 64;
@@ -8202,6 +8293,7 @@ async function main() {
           entries: d.entries.filter(entry => !entry || entry.event !== 'context_snapshot'),
         };
         applySessionIdentitiesFromReplayEntries(filtered.entries);
+        applySessionGoalsFromReplayEntries(filtered.entries);
         resetSessionWindowsForReplay(filtered.entries);
         const wasProcessingLogReplay = processingLogReplay;
         processingLogReplay = true;
@@ -8229,6 +8321,9 @@ async function main() {
       }
       if (d.event === 'session_capabilities') {
         applySessionCapabilities(d);
+      }
+      if (d.event === 'session_goal') {
+        applySessionGoal(d);
       }
       if (d.event === 'follow_up_status') {
         handleFollowUpStatusUpdate(d);
@@ -8848,6 +8943,7 @@ function processCommands(cmds) {
       case 'session_started': onSessionStarted(c.session_id, c.task); break;
       case 'session_relationship': applySessionRelationship(c); break;
       case 'session_capabilities': applySessionCapabilities(c); break;
+      case 'session_goal': applySessionGoal(c); break;
       case 'session_attached': onSessionAttached(c.session_id, c.source); break;
       case 'session_ended': onSessionEnded(c.session_id, c.reason); break;
       case 'external_agent_changed': updateStatusBar({ external_agent: c.agent }); break;
@@ -10128,8 +10224,45 @@ function releaseActionPending(op) {
   controlPendingActions.delete(op);
 }
 
+function parseGoalElapsedText(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  const match = raw.match(/(?:(\d+)d\s*)?(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s\s*)?$/i);
+  if (!match || !match[0].trim()) return null;
+  const days = parseInt(match[1] || '0', 10);
+  const hours = parseInt(match[2] || '0', 10);
+  const minutes = parseInt(match[3] || '0', 10);
+  const seconds = parseInt(match[4] || '0', 10);
+  return (((days * 24 + hours) * 60 + minutes) * 60) + seconds;
+}
+
+function goalFromCodexActionResult(evt = {}) {
+  if (!evt.success || !String(evt.action || '').startsWith('goal')) return undefined;
+  const message = String(evt.message || '').trim();
+  if (/^(goal cleared|no goal to clear|no goal set)$/i.test(message)) return null;
+  const match = message.match(/^(?:goal updated|current goal):\s+([\s\S]+)$/i);
+  if (!match) return undefined;
+  const body = match[1].trim();
+  const detailsMatch = body.match(/^([\s\S]*)\s+\(([\s\S]*)\)$/);
+  const objective = (detailsMatch ? detailsMatch[1] : body).trim();
+  if (!objective) return undefined;
+  const details = detailsMatch ? detailsMatch[2] : '';
+  const status = details.match(/(?:^|,\s*)status\s+([^,]+)/i)?.[1]?.trim();
+  const elapsedText = details.match(/(?:^|,\s*)elapsed\s+([^,]+)/i)?.[1]?.trim();
+  return normalizeSessionGoal({
+    objective,
+    status: status || 'active',
+    elapsedSeconds: parseGoalElapsedText(elapsedText),
+  });
+}
+
 function handleCodexThreadActionResult(evt) {
   releaseActionPending(evt.action);
+  const goal = goalFromCodexActionResult(evt);
+  const goalSessionId = evt.session_id || evt.sessionId;
+  if (goal !== undefined && goalSessionId) {
+    applySessionGoal({ session_id: goalSessionId, goal });
+  }
   let successText = `/${evt.action}: ${evt.message}`;
   if (evt.success && evt.action === 'rename') {
     const sid = String(evt.session_id || '').trim();
@@ -11547,6 +11680,53 @@ function compactPathLabel(value, preserveAbsolute = false) {
   return path;
 }
 
+function numberOrNull(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+}
+
+function normalizeGoalStatus(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return 'active';
+  if (raw === 'budgetLimited' || raw === 'budget_limited') return 'budget-limited';
+  return raw.replace(/_/g, '-').toLowerCase();
+}
+
+function normalizeSessionGoal(raw = null) {
+  if (raw === null || raw === false) return null;
+  const goal = raw && typeof raw === 'object' && raw.goal !== undefined ? raw.goal : raw;
+  if (goal === null || goal === false) return null;
+  if (!goal || typeof goal !== 'object') return null;
+  const objective = compactSessionText(goal.objective || goal.goal || goal.title);
+  if (!objective) return null;
+  const elapsedSeconds = numberOrNull(
+    goal.elapsed_seconds ??
+    goal.elapsedSeconds ??
+    goal.timeUsedSeconds ??
+    goal.time_used_seconds
+  );
+  return {
+    objective,
+    status: normalizeGoalStatus(goal.status),
+    elapsedSeconds,
+    tokensUsed: numberOrNull(goal.tokens_used ?? goal.tokensUsed),
+    tokenBudget: numberOrNull(goal.token_budget ?? goal.tokenBudget),
+    observedAtMs: Number.isFinite(goal.observedAtMs) ? goal.observedAtMs : performance.now(),
+  };
+}
+
+function sessionGoalSignature(goal) {
+  if (!goal) return '';
+  return [
+    goal.objective || '',
+    goal.status || '',
+    goal.elapsedSeconds ?? '',
+    goal.tokensUsed ?? '',
+    goal.tokenBudget ?? '',
+  ].join('\u001f');
+}
+
 function normalizeSessionWindowMeta(meta = {}) {
   const out = {};
   const name = compactSessionText(meta.name || meta.display_name || meta.displayName || meta.thread_name || meta.threadName || meta.title);
@@ -11573,6 +11753,16 @@ function normalizeSessionWindowMeta(meta = {}) {
   if (backendSessionId) out.backendSessionId = backendSessionId;
   const intendantSessionId = compactSessionText(meta.intendant_session_id || meta.intendantSessionId);
   if (intendantSessionId) out.intendantSessionId = intendantSessionId;
+  if (
+    Object.prototype.hasOwnProperty.call(meta, 'goal') ||
+    Object.prototype.hasOwnProperty.call(meta, 'session_goal') ||
+    Object.prototype.hasOwnProperty.call(meta, 'sessionGoal')
+  ) {
+    const rawGoal = Object.prototype.hasOwnProperty.call(meta, 'goal')
+      ? meta.goal
+      : (Object.prototype.hasOwnProperty.call(meta, 'session_goal') ? meta.session_goal : meta.sessionGoal);
+    out.goal = normalizeSessionGoal(rawGoal);
+  }
   const parentId = compactSessionText(meta.parent_session_id || meta.parentSessionId || meta.parent_id || meta.parentId);
   if (parentId) out.parentId = parentId;
   const relationshipRaw = meta.relationship_kind || meta.relationshipKind || meta.relationship;
@@ -11597,6 +11787,7 @@ function sessionWindowMetadataSignature(meta = {}) {
     meta.backendSource || '',
     meta.backendSessionId || '',
     meta.intendantSessionId || '',
+    sessionGoalSignature(meta.goal),
     meta.parentId || '',
     meta.relationshipKind || '',
     meta.relationshipEphemeral === undefined ? '' : (meta.relationshipEphemeral ? '1' : '0'),
@@ -11617,9 +11808,117 @@ function mergeSessionWindowMetadata(sessionId, meta = {}) {
   return { meta: merged, changed };
 }
 
+function currentSessionGoalElapsedSeconds(goal) {
+  if (!goal) return null;
+  const base = numberOrNull(goal.elapsedSeconds) ?? 0;
+  if (goal.status !== 'active' || !Number.isFinite(goal.observedAtMs)) return base;
+  return base + Math.max(0, Math.floor((performance.now() - goal.observedAtMs) / 1000));
+}
+
+function formatGoalElapsed(seconds) {
+  const n = numberOrNull(seconds) ?? 0;
+  const days = Math.floor(n / 86400);
+  const hours = Math.floor((n % 86400) / 3600);
+  const minutes = Math.floor((n % 3600) / 60);
+  const secs = n % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${secs}s`;
+  return `${secs}s`;
+}
+
+function goalStatusClass(status) {
+  if (status === 'budget-limited') return 'budget-limited';
+  if (status === 'complete') return 'complete';
+  if (status === 'paused') return 'paused';
+  return 'active';
+}
+
+function renderSessionWindowGoal(win, goal) {
+  if (!win?.goal || !win?.goalText) return false;
+  if (!goal?.objective) {
+    win.goal.className = 'session-window-goal hidden';
+    win.goalText.textContent = '';
+    win.goal.title = '';
+    return false;
+  }
+  const status = normalizeGoalStatus(goal.status);
+  const elapsed = formatGoalElapsed(currentSessionGoalElapsedSeconds(goal));
+  win.goal.className = `session-window-goal ${goalStatusClass(status)}`;
+  win.goalText.textContent = status === 'active'
+    ? `${goal.objective} · ${elapsed}`
+    : `${status} · ${goal.objective} · ${elapsed}`;
+  const tokenText = goal.tokensUsed !== null && goal.tokensUsed !== undefined
+    ? `\nTokens: ${goal.tokensUsed.toLocaleString()}${goal.tokenBudget ? ` / ${goal.tokenBudget.toLocaleString()}` : ''}`
+    : (goal.tokenBudget ? `\nBudget: ${goal.tokenBudget.toLocaleString()} tokens` : '');
+  win.goal.title = `Goal: ${goal.objective}\nStatus: ${status}\nElapsed: ${elapsed}${tokenText}`;
+  return status === 'active';
+}
+
+function refreshSessionGoalTicker() {
+  let hasActiveGoal = false;
+  for (const [sid, win] of sessionWindows) {
+    const goal = (sessionMetadataById.get(sid) || {}).goal || null;
+    if (renderSessionWindowGoal(win, goal)) hasActiveGoal = true;
+  }
+  if (hasActiveGoal && !sessionGoalTicker) {
+    sessionGoalTicker = setInterval(refreshSessionGoalTicker, 1000);
+  } else if (!hasActiveGoal && sessionGoalTicker) {
+    clearInterval(sessionGoalTicker);
+    sessionGoalTicker = null;
+  }
+}
+
+function sessionGoalUpdateIds(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return [];
+  const ids = new Set([sid]);
+  const direct = sessionMetadataById.get(sid) || {};
+  if (direct.backendSessionId) ids.add(direct.backendSessionId);
+  if (direct.intendantSessionId) ids.add(direct.intendantSessionId);
+  for (const [id, meta] of sessionMetadataById) {
+    if (meta?.backendSessionId === sid || meta?.intendantSessionId === sid) ids.add(id);
+  }
+  return Array.from(ids);
+}
+
+function applySessionGoal(raw = {}) {
+  const data = raw?.data && typeof raw.data === 'object' ? raw.data : raw;
+  const sid = String(data?.session_id || data?.sessionId || '').trim();
+  if (!sid) return;
+  const hasGoalField =
+    data && (
+      Object.prototype.hasOwnProperty.call(data, 'goal') ||
+      Object.prototype.hasOwnProperty.call(data, 'session_goal') ||
+      Object.prototype.hasOwnProperty.call(data, 'sessionGoal')
+    );
+  const rawGoal = Object.prototype.hasOwnProperty.call(data, 'goal')
+    ? data.goal
+    : (Object.prototype.hasOwnProperty.call(data, 'session_goal') ? data.session_goal : data.sessionGoal);
+  const goal = hasGoalField ? normalizeSessionGoal(rawGoal) : normalizeSessionGoal(data);
+  for (const id of sessionGoalUpdateIds(sid)) {
+    const meta = { ...(sessionMetadataById.get(id) || {}), goal };
+    sessionMetadataById.set(id, meta);
+    if (sessionWindows.has(id)) {
+      const win = sessionWindows.get(id);
+      win.metadataSignature = '';
+      updateSessionWindow(id, meta);
+    }
+  }
+  refreshSessionGoalTicker();
+}
+
+function applySessionGoalsFromReplayEntries(entries) {
+  if (!Array.isArray(entries)) return;
+  for (const entry of entries) {
+    if (entry?.event !== 'session_goal') continue;
+    applySessionGoal(entry);
+  }
+}
+
 function sessionWindowMetaFromSession(session) {
   if (!session || typeof session !== 'object') return {};
-  return normalizeSessionWindowMeta({
+  const meta = {
     name: session.name || session.display_name || session.thread_name,
     task: session.task,
     cwd: session.cwd || session.workdir || session.workDir,
@@ -11629,7 +11928,15 @@ function sessionWindowMetaFromSession(session) {
     backend_source: session.backend_source,
     backend_session_id: session.backend_session_id,
     intendant_session_id: session.intendant_session_id,
-  });
+  };
+  if (
+    Object.prototype.hasOwnProperty.call(session, 'goal') ||
+    Object.prototype.hasOwnProperty.call(session, 'session_goal') ||
+    Object.prototype.hasOwnProperty.call(session, 'sessionGoal')
+  ) {
+    meta.goal = session.goal ?? session.session_goal ?? session.sessionGoal;
+  }
+  return normalizeSessionWindowMeta(meta);
 }
 
 function applySessionRelationshipsFromSession(session) {
@@ -12339,10 +12646,33 @@ const SESSION_WINDOW_GENERIC_ACTIONS = [
 const SESSION_WINDOW_CODEX_ACTIONS = [
   { op: 'fork', label: 'Fork...', title: 'Fork this Codex thread', promptName: true },
   { op: 'side', label: 'Side...', title: 'Ask a side question in an ephemeral Codex fork', promptSide: true },
-  { op: 'goal', label: 'Configure goal...', title: 'Create or update this thread goal', promptGoal: true },
+  {
+    label: 'Configure goal...',
+    title: 'Configure this thread goal',
+    children: [
+      { op: 'goal', label: 'Set goal...', title: 'Create or update this thread goal', promptGoal: true },
+      { op: 'goal-clear', label: 'Clear goal', title: 'Clear this thread goal', confirm: 'Clear the current Codex goal?' },
+    ],
+  },
   { op: 'goal-get', label: 'Goal status', title: 'Fetch this thread goal' },
   { op: 'compact', label: 'Compact', title: 'Compact this thread history' },
 ];
+
+function flattenSessionWindowActions(actions, out = []) {
+  for (const action of actions || []) {
+    if (action?.op) out.push(action);
+    if (Array.isArray(action?.children)) flattenSessionWindowActions(action.children, out);
+  }
+  return out;
+}
+
+const SESSION_WINDOW_CODEX_ACTION_BY_OP = new Map(
+  flattenSessionWindowActions(SESSION_WINDOW_CODEX_ACTIONS).map(action => [action.op, action])
+);
+
+function sessionWindowCodexActionByOp(op) {
+  return SESSION_WINDOW_CODEX_ACTION_BY_OP.get(String(op || '').trim()) || null;
+}
 
 function sessionWindowIsCodex(sessionId, win = null) {
   const sid = String(sessionId || '').trim();
@@ -12582,6 +12912,10 @@ function closeSessionWindowMenus(exceptSessionId = '') {
     if (sid === except || !win.actionMenu) continue;
     if (!win.actionMenu.classList.contains('hidden')) closed = true;
     win.actionMenu.classList.add('hidden');
+    win.actionMenu.querySelectorAll('.session-window-submenu.open').forEach(submenu => {
+      submenu.classList.remove('open');
+      submenu.querySelector('[data-session-window-submenu-trigger]')?.setAttribute('aria-expanded', 'false');
+    });
     win.el?.classList.remove('menu-open');
     win.actionMenuButton?.setAttribute('aria-expanded', 'false');
   }
@@ -12595,6 +12929,12 @@ function setSessionWindowMenuOpen(sessionId, open) {
   const nextOpen = !!open;
   closeSessionWindowMenus(nextOpen ? sid : '');
   win.actionMenu.classList.toggle('hidden', !nextOpen);
+  if (!nextOpen) {
+    win.actionMenu.querySelectorAll('.session-window-submenu.open').forEach(submenu => {
+      submenu.classList.remove('open');
+      submenu.querySelector('[data-session-window-submenu-trigger]')?.setAttribute('aria-expanded', 'false');
+    });
+  }
   win.el.classList.toggle('menu-open', nextOpen);
   win.actionMenuButton.setAttribute('aria-expanded', nextOpen ? 'true' : 'false');
   return nextOpen;
@@ -12619,12 +12959,24 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
   win.actionMenuButton.setAttribute('aria-label', win.actionMenuButton.title);
   win.actionMenu?.querySelectorAll('[data-session-window-codex-action]').forEach(item => {
     const op = item.dataset.sessionWindowAction || '';
-    const spec = SESSION_WINDOW_CODEX_ACTIONS.find(action => action.op === op);
+    const spec = sessionWindowCodexActionByOp(op);
     const state = codexThreadActionStateForSession(sid, op);
     item.classList.toggle('hidden', !isCodex || isSide);
     item.disabled = isCodex && !isSide ? !state.allowed : false;
     item.title = state.allowed ? (spec?.title || '') : state.reason;
     item.setAttribute('aria-disabled', item.disabled ? 'true' : 'false');
+  });
+  win.actionMenu?.querySelectorAll('[data-session-window-codex-submenu]').forEach(submenu => {
+    submenu.classList.toggle('hidden', !isCodex || isSide);
+    if (!isCodex || isSide) submenu.classList.remove('open');
+    const trigger = submenu.querySelector('[data-session-window-submenu-trigger]');
+    const childActions = Array.from(submenu.querySelectorAll('[data-session-window-codex-action]'));
+    const hasEnabledChild = childActions.some(item => !item.disabled && !item.classList.contains('hidden'));
+    if (trigger) {
+      trigger.disabled = isCodex && !isSide ? !hasEnabledChild : false;
+      trigger.setAttribute('aria-disabled', trigger.disabled ? 'true' : 'false');
+      trigger.setAttribute('aria-expanded', submenu.classList.contains('open') ? 'true' : 'false');
+    }
   });
   win.actionMenu?.querySelectorAll('[data-session-window-codex-separator]').forEach(item => {
     item.classList.toggle('hidden', !isCodex || isSide);
@@ -13085,7 +13437,7 @@ function runSessionWindowAction(sessionId, op) {
 
 function runSessionWindowCodexAction(sessionId, op) {
   const sid = String(sessionId || '').trim();
-  const spec = SESSION_WINDOW_CODEX_ACTIONS.find(action => action.op === op);
+  const spec = sessionWindowCodexActionByOp(op);
   if (!sid || !spec) return;
   if (!sessionWindowIsCodex(sid)) {
     showControlToast('error', 'Codex actions are only available for Codex sessions');
@@ -13101,6 +13453,42 @@ function runSessionWindowCodexAction(sessionId, op) {
   if (dispatchCodexThreadAction(op, params, sid)) {
     markActionPending(op);
   }
+}
+
+function appendSessionWindowActionMenuItem(parent, action, codex = false) {
+  if (!parent || !action) return null;
+  if (Array.isArray(action.children) && action.children.length > 0) {
+    const submenu = document.createElement('div');
+    submenu.className = 'session-window-submenu';
+    if (codex) submenu.dataset.sessionWindowCodexSubmenu = '1';
+    const trigger = document.createElement('button');
+    trigger.type = 'button';
+    trigger.className = 'session-window-submenu-trigger';
+    trigger.textContent = action.label;
+    trigger.title = action.title || action.label;
+    trigger.dataset.sessionWindowSubmenuTrigger = '1';
+    trigger.setAttribute('role', 'menuitem');
+    trigger.setAttribute('aria-haspopup', 'menu');
+    trigger.setAttribute('aria-expanded', 'false');
+    const panel = document.createElement('div');
+    panel.className = 'session-window-submenu-panel';
+    panel.setAttribute('role', 'menu');
+    action.children.forEach(child => appendSessionWindowActionMenuItem(panel, child, codex));
+    submenu.appendChild(trigger);
+    submenu.appendChild(panel);
+    parent.appendChild(submenu);
+    return submenu;
+  }
+
+  const item = document.createElement('button');
+  item.type = 'button';
+  item.textContent = action.label;
+  item.title = action.title;
+  item.dataset.sessionWindowAction = action.op;
+  if (codex) item.dataset.sessionWindowCodexAction = '1';
+  item.setAttribute('role', 'menuitem');
+  parent.appendChild(item);
+  return item;
 }
 
 function ensureSessionWindow(sessionId, meta = {}) {
@@ -13157,6 +13545,11 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const status = document.createElement('span');
   status.className = 'session-window-status';
   status.textContent = normalizeSessionPhase(meta.phase || 'idle');
+  const goal = document.createElement('span');
+  goal.className = 'session-window-goal hidden';
+  const goalText = document.createElement('span');
+  goalText.className = 'session-window-goal-text';
+  goal.appendChild(goalText);
   header.title = 'Click header to collapse or expand';
   const menuControls = document.createElement('div');
   menuControls.className = 'session-window-action-cluster session-window-menu-cluster';
@@ -13181,13 +13574,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   actionMenu.className = 'session-window-menu hidden';
   actionMenu.setAttribute('role', 'menu');
   SESSION_WINDOW_GENERIC_ACTIONS.forEach(action => {
-    const item = document.createElement('button');
-    item.type = 'button';
-    item.textContent = action.label;
-    item.title = action.title;
-    item.dataset.sessionWindowAction = action.op;
-    item.setAttribute('role', 'menuitem');
-    actionMenu.appendChild(item);
+    appendSessionWindowActionMenuItem(actionMenu, action, false);
   });
   const codexSeparator = document.createElement('div');
   codexSeparator.className = 'session-window-menu-separator';
@@ -13195,14 +13582,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   codexSeparator.setAttribute('role', 'separator');
   actionMenu.appendChild(codexSeparator);
   SESSION_WINDOW_CODEX_ACTIONS.forEach(action => {
-    const item = document.createElement('button');
-    item.type = 'button';
-    item.textContent = action.label;
-    item.title = action.title;
-    item.dataset.sessionWindowAction = action.op;
-    item.dataset.sessionWindowCodexAction = '1';
-    item.setAttribute('role', 'menuitem');
-    actionMenu.appendChild(item);
+    appendSessionWindowActionMenuItem(actionMenu, action, true);
   });
   const maximize = document.createElement('button');
   maximize.className = 'session-window-action session-window-maximize';
@@ -13222,6 +13602,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   windowControls.appendChild(maximize);
   windowControls.appendChild(close);
   header.appendChild(title);
+  header.appendChild(goal);
   header.appendChild(status);
   header.appendChild(menuControls);
   header.appendChild(windowControls);
@@ -13266,6 +13647,22 @@ function ensureSessionWindow(sessionId, meta = {}) {
   });
   actionMenu.addEventListener('mousedown', (e) => e.stopPropagation());
   actionMenu.addEventListener('click', (e) => {
+    const trigger = e.target.closest?.('[data-session-window-submenu-trigger]');
+    if (trigger) {
+      e.preventDefault();
+      e.stopPropagation();
+      const submenu = trigger.closest('.session-window-submenu');
+      if (!submenu || trigger.disabled) return;
+      const nextOpen = !submenu.classList.contains('open');
+      actionMenu.querySelectorAll('.session-window-submenu.open').forEach(openSubmenu => {
+        if (openSubmenu === submenu) return;
+        openSubmenu.classList.remove('open');
+        openSubmenu.querySelector('[data-session-window-submenu-trigger]')?.setAttribute('aria-expanded', 'false');
+      });
+      submenu.classList.toggle('open', nextOpen);
+      trigger.setAttribute('aria-expanded', nextOpen ? 'true' : 'false');
+      return;
+    }
     const item = e.target.closest?.('[data-session-window-action]');
     if (!item) return;
     e.preventDefault();
@@ -13304,6 +13701,8 @@ function ensureSessionWindow(sessionId, meta = {}) {
     cwd,
     task,
     status,
+    goal,
+    goalText,
     source: meta.source || '',
     actionMenuButton: actions,
     actionMenu,
@@ -13383,6 +13782,8 @@ function updateSessionWindow(sessionId, meta = {}) {
     const cls = sessionPhaseClass(win.phase);
     if (cls) win.status.classList.add(cls);
   }
+  renderSessionWindowGoal(win, meta.goal || null);
+  refreshSessionGoalTicker();
   updateSessionWindowActionMenuVisibility(sid);
   updateSessionRelationshipBadges(sid);
   if (meta.parentId) updateSessionRelationshipBadges(meta.parentId);

@@ -6,7 +6,7 @@
 
 use crate::autonomy::ActionCategory;
 use crate::provider::TokenUsage;
-use crate::types::{LogLevel, SessionCapabilities};
+use crate::types::{LogLevel, SessionCapabilities, SessionGoal};
 use crossterm::event::KeyEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -270,6 +270,10 @@ pub enum AppEvent {
     SessionCapabilities {
         session_id: String,
         capabilities: SessionCapabilities,
+    },
+    SessionGoal {
+        session_id: String,
+        goal: Option<SessionGoal>,
     },
     SessionAttached {
         session_id: String,
@@ -1491,6 +1495,10 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             capabilities: capabilities.clone(),
         }),
+        AppEvent::SessionGoal { session_id, goal } => Some(OutboundEvent::SessionGoal {
+            session_id: session_id.clone(),
+            goal: goal.clone(),
+        }),
         AppEvent::SessionAttached { session_id, source } => Some(OutboundEvent::SessionAttached {
             session_id: session_id.clone(),
             source: source.clone(),
@@ -2075,6 +2083,9 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             capabilities,
         } => {
             log.session_capabilities(session_id, capabilities);
+        }
+        AppEvent::SessionGoal { session_id, goal } => {
+            log.session_goal(session_id, goal.as_ref());
         }
         AppEvent::SessionAttached { session_id, source } => {
             log.session_attached(session_id, source);
@@ -3363,6 +3374,26 @@ mod tests {
         assert!(json.contains("\"follow_up\":true"));
         assert!(json.contains("\"steer\":false"));
         assert!(json.contains("\"codex_thread_actions\":[\"undo\"]"));
+    }
+
+    #[test]
+    fn outbound_session_goal_preserves_goal_state() {
+        let event = AppEvent::SessionGoal {
+            session_id: "thread-1".to_string(),
+            goal: Some(SessionGoal {
+                objective: "Ship feature parity".to_string(),
+                status: Some("active".to_string()),
+                elapsed_seconds: Some(42),
+                tokens_used: Some(10),
+                token_budget: Some(1000),
+            }),
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"session_goal\""));
+        assert!(json.contains("\"session_id\":\"thread-1\""));
+        assert!(json.contains("\"objective\":\"Ship feature parity\""));
+        assert!(json.contains("\"elapsed_seconds\":42"));
     }
 
     #[test]

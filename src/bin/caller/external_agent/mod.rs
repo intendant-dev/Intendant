@@ -242,6 +242,10 @@ pub enum AgentEvent {
     Usage { usage: AgentUsageSnapshot },
     /// Informational backend event that should be written to the activity log.
     Log { level: String, message: String },
+    /// Latest Codex `/goal` state for a thread.
+    GoalUpdated { goal: crate::types::SessionGoal },
+    /// The Codex `/goal` state was cleared for a thread.
+    GoalCleared,
     /// An external runtime spawned or interacted with native sub-agents.
     SubAgentToolCall {
         item_id: String,
