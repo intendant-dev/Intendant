@@ -12281,6 +12281,17 @@ function ensureSessionWindowHistory(win) {
   return win.logHistory;
 }
 
+function sessionWindowTailStart(historyLength) {
+  return Math.max(0, Number(historyLength || 0) - SESSION_WINDOW_RENDER_LIMIT);
+}
+
+function sessionWindowIsRenderingTail(win, historyLength = null) {
+  if (!win) return true;
+  const history = ensureSessionWindowHistory(win);
+  const len = historyLength === null ? history.length : Number(historyLength || 0);
+  return win.renderStart >= sessionWindowTailStart(len);
+}
+
 function renderSessionWindowRange(win, start) {
   if (!win || !win.log) return;
   const history = ensureSessionWindowHistory(win);
@@ -12299,15 +12310,16 @@ function renderSessionWindowRange(win, start) {
 function renderSessionWindowTail(win) {
   if (!win) return;
   const history = ensureSessionWindowHistory(win);
-  renderSessionWindowRange(win, Math.max(0, history.length - SESSION_WINDOW_RENDER_LIMIT));
+  renderSessionWindowRange(win, sessionWindowTailStart(history.length));
 }
 
 function appendSessionWindowHistory(win, entry, shouldFollow) {
   if (!win || !entry) return;
   const history = ensureSessionWindowHistory(win);
+  const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
   entry.dataset.sessionWindowHistory = '1';
   history.push(entry);
-  if (shouldFollow) {
+  if (shouldFollow || wasRenderingTail) {
     renderSessionWindowTail(win);
   }
   applySessionWindowOutputScroll(win, shouldFollow);
@@ -12316,12 +12328,15 @@ function appendSessionWindowHistory(win, entry, shouldFollow) {
 function appendSessionWindowHistoryBatch(win, entries, shouldFollow) {
   if (!win || !Array.isArray(entries) || entries.length === 0) return;
   const history = ensureSessionWindowHistory(win);
+  const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
   for (const entry of entries) {
     if (!entry) continue;
     entry.dataset.sessionWindowHistory = '1';
     history.push(entry);
   }
-  renderSessionWindowTail(win);
+  if (shouldFollow || wasRenderingTail) {
+    renderSessionWindowTail(win);
+  }
   applySessionWindowOutputScroll(win, shouldFollow);
 }
 

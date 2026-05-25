@@ -2007,19 +2007,30 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
 
         // Agent lifecycle
         AppEvent::AgentStarted {
+            session_id,
             turn,
             commands_preview,
-            ..
+            source,
         } => {
-            log.agent_started(*turn, commands_preview);
+            log.agent_started_with_session_id(
+                session_id.as_deref(),
+                *turn,
+                commands_preview,
+                source.as_deref(),
+            );
         }
-        AppEvent::DoneSignal { message, .. } => {
-            log.done_signal(message.as_deref());
+        AppEvent::DoneSignal {
+            session_id,
+            message,
+        } => {
+            log.done_signal_for_session(session_id.as_deref(), message.as_deref());
         }
         AppEvent::TaskComplete {
-            reason, summary, ..
+            session_id,
+            reason,
+            summary,
         } => {
-            log.task_complete(reason, summary.as_deref());
+            log.task_complete_for_session(session_id.as_deref(), reason, summary.as_deref());
         }
         AppEvent::InterruptRequested { .. } => {
             log.info("Interrupt requested");
@@ -2191,7 +2202,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             log.live_usage_update(provider, model, *total_tokens);
         }
         AppEvent::ContextSnapshot {
-            session_id: _,
+            session_id,
             source,
             label,
             turn,
@@ -2201,7 +2212,8 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             item_count,
             raw,
         } => {
-            log.context_snapshot(
+            log.context_snapshot_for_session(
+                session_id.as_deref(),
                 source,
                 label,
                 *turn,
