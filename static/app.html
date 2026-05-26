@@ -7754,6 +7754,7 @@ let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
 let steerCounter = 0;
 let followUpCounter = 0;
+const pendingFollowUpsById = new Map();
 let editMessageDraft = null;
 const approvalSessionIds = new Map();
 let spinnerIdx = 0;
@@ -9983,6 +9984,10 @@ function flushPendingDetachedCodexThreadActions(sessionId) {
 
 function dispatchCodexThreadAction(op, params, sessionId = '', options = {}) {
   const sid = String(sessionId || '').trim() || resolvePromptTargetSessionId();
+  if (!sid) {
+    showControlToast('error', `/${op} needs a target Codex session`);
+    return false;
+  }
   if (sid && sessionWindowIsSide(sid) && !codexThreadActionAllowedForSide(op)) {
     showControlToast('error', `/${op} is not available in a /side window; use the parent thread`);
     return false;
@@ -24930,6 +24935,49 @@ function detachedSessionResumeMessage(sessionId, task, direct, attachments = [])
   return msg;
 }
 
+function nextFollowUpId() {
+  followUpCounter = (followUpCounter + 1) >>> 0;
+  return 'follow-' + Date.now() + '-' + followUpCounter;
+}
+
+function rememberPendingFollowUp(id, payload) {
+  const key = String(id || '').trim();
+  if (!key) return;
+  pendingFollowUpsById.set(key, {
+    sessionId: String(payload.sessionId || '').trim(),
+    text: String(payload.text || ''),
+    direct: payload.direct === true,
+    attachments: Array.isArray(payload.attachments) ? payload.attachments.slice() : [],
+    attempts: Number(payload.attempts || 0),
+  });
+}
+
+function forgetPendingFollowUp(id) {
+  const key = String(id || '').trim();
+  if (key) pendingFollowUpsById.delete(key);
+}
+
+function autoAttachUnmanagedFollowUp(evt = {}) {
+  const id = String(evt.id || '').trim();
+  const pending = id ? pendingFollowUpsById.get(id) : null;
+  const sessionId = String(evt.session_id || evt.sessionId || pending?.sessionId || '').trim();
+  if (!sessionId || !pending || pending.attempts > 0) return false;
+  const resume = detachedSessionResumeMessage(
+    sessionId,
+    pending.text,
+    pending.direct,
+    pending.attachments
+  );
+  if (!resume) return false;
+  pending.attempts += 1;
+  pendingFollowUpsById.set(id, pending);
+  dispatchControlMsg(resume);
+  markSessionWindowPendingActive(sessionId);
+  onSteerStatusUpdate(id, pending.text, 'delivered', 'reattaching session');
+  showControlToast('info', `Reattaching session ${shortSessionId(sessionId)} and retrying follow-up`);
+  return true;
+}
+
 window.submitActivityTask = function(options = {}) {
   const input = document.getElementById('activity-task-input');
   if (!input || !app) return;
@@ -24952,15 +25000,20 @@ window.submitActivityTask = function(options = {}) {
       ? { action: 'start_task', task: text, session_id: targetSessionId }
       : { action: 'create_session', task: text });
   if (!msg) return;
-  if (targetSessionId && options.queuedFollowUp) {
-    followUpCounter = (followUpCounter + 1) >>> 0;
-    const id = 'follow-' + Date.now() + '-' + followUpCounter;
+  if (targetSessionId && msg.action === 'start_task') {
+    const id = nextFollowUpId();
     msg.follow_up_id = id;
+    rememberPendingFollowUp(id, {
+      sessionId: targetSessionId,
+      text,
+      direct,
+      attachments,
+    });
     onSteerStatusUpdate(
       id,
       attachments.length > 0 ? `${text} (${attachments.length} attachment${attachments.length === 1 ? '' : 's'})` : text,
-      'queued',
-      'queued for next turn'
+      options.queuedFollowUp ? 'queued' : 'pending',
+      options.queuedFollowUp ? 'queued for next turn' : null
     );
   }
   if (direct) msg.direct = true;
@@ -25095,16 +25148,25 @@ function handleFollowUpStatusUpdate(evt = {}) {
   const reason = String(evt.reason || '').trim();
   const sessionId = String(evt.session_id || evt.sessionId || '').trim();
   onSteerStatusUpdate(evt.id, evt.text || '', status, reason);
+  if (status === 'delivered') {
+    forgetPendingFollowUp(evt.id);
+    return;
+  }
   if (status !== 'failed') return;
 
   if (sessionId) {
     clearSessionWindowPendingActive(sessionId, 'idle');
     if (reason.toLowerCase().includes('not managed by this daemon')) {
       setSessionWindowDetached(sessionId, true, reason);
+      if (autoAttachUnmanagedFollowUp(evt)) {
+        forgetPendingFollowUp(evt.id);
+        return;
+      }
     }
   } else {
     setPhase('idle');
   }
+  forgetPendingFollowUp(evt.id);
   showControlToast('error', reason || 'Follow-up failed');
 }
 

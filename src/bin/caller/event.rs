@@ -912,6 +912,9 @@ pub enum ControlMsg {
     /// The variant's field is named `op` (not `action`) because ControlMsg's
     /// serde tag is already `action`, and nested fields can't share the tag.
     CodexThreadAction {
+        /// Target Codex thread/session. Kept optional on the wire for
+        /// compatibility, but the control plane rejects missing values so an
+        /// action cannot fan out to every live Codex loop.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         op: String,
@@ -1094,8 +1097,8 @@ pub enum ControlMsg {
         /// (Codex `LocalImage`, Gemini ACP `ContentBlock::Image`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<String>,
-        /// Optional client-generated id for a follow-up that the frontend
-        /// knows will be queued rather than steered mid-turn.
+        /// Optional client-generated id for a targeted follow-up. Frontends
+        /// use it to correlate queued/delivered/failed status updates.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         follow_up_id: Option<String>,
     },

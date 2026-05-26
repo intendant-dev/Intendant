@@ -309,6 +309,20 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             op,
             params,
         } => {
+            if session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .is_none()
+            {
+                state.bus.send(AppEvent::CodexThreadActionResult {
+                    session_id: None,
+                    action: op.clone(),
+                    success: false,
+                    message: "Codex thread action requires a target session".to_string(),
+                });
+                return;
+            }
             // Republish as an AppEvent so the daemon-side watcher (which
             // owns the persistent Codex agent) can pick it up and run the
             // RPC. We don't own the agent here, so we only translate.
@@ -1191,6 +1205,63 @@ mod tests {
             }
         }
         assert!(found, "expected CodexThreadActionRequested on bus");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_thread_action_without_session_is_rejected() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        let mut rx = bus.subscribe();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config,
+                gemini_config: test_gemini_config(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+            session_id: None,
+            op: "goal-clear".to_string(),
+            params: serde_json::json!({}),
+        }));
+
+        let mut found_result = false;
+        let mut found_request = false;
+        for _ in 0..20 {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(AppEvent::CodexThreadActionResult {
+                    session_id,
+                    action,
+                    success,
+                    message,
+                })) => {
+                    assert!(session_id.is_none());
+                    assert_eq!(action, "goal-clear");
+                    assert!(!success);
+                    assert!(message.contains("requires a target session"));
+                    found_result = true;
+                }
+                Ok(Ok(AppEvent::CodexThreadActionRequested { .. })) => {
+                    found_request = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(found_result, "expected missing-session rejection");
+        assert!(!found_request, "sessionless action must not fan out");
 
         handle.abort();
     }
