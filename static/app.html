@@ -1553,7 +1553,6 @@ html, body {
 .session-window.header-collapsed .session-window-task {
   display: none;
 }
-.session-window.header-collapsed .session-window-goal,
 .session-window.minimized .session-window-goal {
   display: none;
 }
@@ -1581,12 +1580,19 @@ html, body {
   align-items: flex-start;
   cursor: pointer;
 }
+.session-window.header-collapsed .session-window-header {
+  align-items: flex-start;
+}
 .session-window-title {
   min-width: 0;
   flex: 1;
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+.session-window.header-collapsed .session-window-title {
+  flex: 0 1 min(520px, 46%);
+  max-width: min(520px, 46%);
 }
 .session-window-meta {
   min-width: 0;
@@ -1744,6 +1750,10 @@ html, body {
   white-space: nowrap;
   overflow: hidden;
 }
+.session-window.header-collapsed .session-window-goal {
+  flex: 1 1 220px;
+  max-width: min(460px, 38%);
+}
 .session-window-goal::before {
   content: "/goal";
   flex-shrink: 0;
@@ -1769,6 +1779,16 @@ html, body {
   color: var(--green);
 }
 @container (max-width: 560px) {
+  .session-window:not(.header-collapsed) .session-window-goal {
+    display: none;
+  }
+  .session-window.header-collapsed .session-window-goal {
+    flex-basis: 120px;
+    max-width: 180px;
+    padding-inline: 6px;
+  }
+}
+@container (max-width: 420px) {
   .session-window-goal {
     display: none;
   }
@@ -1782,6 +1802,9 @@ html, body {
 .session-window-menu-cluster {
   position: relative;
   margin-left: 2px;
+}
+.session-window.header-collapsed .session-window-menu-cluster {
+  margin-left: auto;
 }
 .session-window-state-cluster {
   padding-left: 6px;
