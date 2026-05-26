@@ -1129,10 +1129,37 @@ fn pending_runtime_steer_targets_session(
     pending.session_id.as_deref() == session_id.as_deref()
 }
 
-fn has_queued_steers(context_injection: &event::ContextInjectionQueue) -> bool {
+fn queued_steer_targets_session(
+    injection: &event::ContextInjection,
+    session_id: Option<&str>,
+    alias_session_id: Option<&str>,
+) -> bool {
+    if injection.steer_id.is_none() {
+        return false;
+    }
+    let Some(target) = injection
+        .target_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    else {
+        return true;
+    };
+    session_id == Some(target) || alias_session_id == Some(target)
+}
+
+fn has_queued_steers_for_session(
+    context_injection: &event::ContextInjectionQueue,
+    session_id: Option<&str>,
+    alias_session_id: Option<&str>,
+) -> bool {
     context_injection
         .lock()
-        .map(|queue| queue.iter().any(|injection| injection.steer_id.is_some()))
+        .map(|queue| {
+            queue.iter().any(|injection| {
+                queued_steer_targets_session(injection, session_id, alias_session_id)
+            })
+        })
         .unwrap_or(false)
 }
 
@@ -2830,9 +2857,10 @@ async fn drain_external_agent_events(
                                     agent.name(), e
                                 );
                                 if let Ok(mut q) = config.context_injection.lock() {
-                                    q.push(event::ContextInjection::text_with_steer_id(
+                                    q.push(event::ContextInjection::text_with_steer_id_for_target(
                                         text.clone(),
                                         id.clone(),
+                                        local_session_id.clone(),
                                     ));
                                 }
                                 slog(config.session_log, |l| l.info(&reason));
@@ -3753,17 +3781,23 @@ fn drain_steer_queue_as_followup(
     followup: &str,
     bus: &EventBus,
     session_id: Option<&str>,
+    alias_session_id: Option<&str>,
 ) -> Option<String> {
     let mut prefix_lines: Vec<String> = Vec::new();
     if let Ok(mut q) = context_injection.lock() {
-        // Partition: keep non-steer entries, pull out steer entries.
+        // Partition: keep non-steer entries and steers for other sessions,
+        // pull out steer entries for this session.
         let mut kept = Vec::with_capacity(q.len());
         for inj in q.drain(..) {
-            if inj.steer_id.is_some() {
+            if queued_steer_targets_session(&inj, session_id, alias_session_id) {
                 prefix_lines.push(format!("[User] {}", inj.text));
                 let id = inj.steer_id.clone().unwrap_or_default();
                 bus.send(AppEvent::SteerDelivered {
-                    session_id: session_id.map(str::to_string),
+                    session_id: inj
+                        .target_session_id
+                        .as_deref()
+                        .map(str::to_string)
+                        .or_else(|| session_id.map(str::to_string)),
                     id,
                     mid_turn: false,
                 });
@@ -6977,7 +7011,7 @@ Also: {"source": "bare"}"#;
                 "steer-1".into(),
             ));
 
-        let merged = drain_steer_queue_as_followup(&queue, "original follow-up", &bus, None)
+        let merged = drain_steer_queue_as_followup(&queue, "original follow-up", &bus, None, None)
             .expect("should produce a message");
 
         assert_eq!(merged, "[User] switch to Python\noriginal follow-up");
@@ -7007,7 +7041,7 @@ Also: {"source": "bare"}"#;
             .unwrap()
             .push(event::ContextInjection::text("display grant".into()));
 
-        let merged = drain_steer_queue_as_followup(&queue, "follow-up", &bus, None)
+        let merged = drain_steer_queue_as_followup(&queue, "follow-up", &bus, None, None)
             .expect("should produce a message");
         assert_eq!(merged, "follow-up");
         assert_eq!(queue.lock().unwrap().len(), 1, "non-steer entry preserved");
@@ -7020,7 +7054,7 @@ Also: {"source": "bare"}"#;
         // case doesn't produce an empty agent message.
         let bus = EventBus::new();
         let queue = event::ContextInjectionQueue::default();
-        assert!(drain_steer_queue_as_followup(&queue, "", &bus, None).is_none());
+        assert!(drain_steer_queue_as_followup(&queue, "", &bus, None, None).is_none());
     }
 
     #[tokio::test]
@@ -7040,7 +7074,8 @@ Also: {"source": "bare"}"#;
             ));
         }
 
-        let merged = drain_steer_queue_as_followup(&queue, "main", &bus, None).expect("merged");
+        let merged =
+            drain_steer_queue_as_followup(&queue, "main", &bus, None, None).expect("merged");
         assert_eq!(merged, "[User] first\n[User] second\nmain");
 
         let mut delivered_ids: Vec<String> = Vec::new();
@@ -7051,6 +7086,75 @@ Also: {"source": "bare"}"#;
             }
         }
         assert_eq!(delivered_ids, vec!["s1".to_string(), "s2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn drain_steer_queue_as_followup_keeps_other_session_items() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let queue = event::ContextInjectionQueue::default();
+        {
+            let mut q = queue.lock().unwrap();
+            q.push(event::ContextInjection::text_with_steer_id_for_target(
+                "for session a".into(),
+                "s-a".into(),
+                Some("session-a".into()),
+            ));
+            q.push(event::ContextInjection::text_with_steer_id_for_target(
+                "for session b".into(),
+                "s-b".into(),
+                Some("session-b".into()),
+            ));
+        }
+
+        let merged = drain_steer_queue_as_followup(&queue, "main", &bus, Some("session-b"), None)
+            .expect("merged");
+        assert_eq!(merged, "[User] for session b\nmain");
+
+        let remaining = queue.lock().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].text, "for session a");
+        assert_eq!(remaining[0].target_session_id.as_deref(), Some("session-a"));
+        drop(remaining);
+
+        let ev = rx.try_recv().expect("SteerDelivered event");
+        match ev {
+            AppEvent::SteerDelivered {
+                session_id,
+                id,
+                mid_turn,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("session-b"));
+                assert_eq!(id, "s-b");
+                assert!(!mid_turn);
+            }
+            other => panic!("expected SteerDelivered, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err(), "only matching steer should drain");
+    }
+
+    #[test]
+    fn has_queued_steers_for_session_matches_target_or_alias() {
+        let queue = event::ContextInjectionQueue::default();
+        queue
+            .lock()
+            .unwrap()
+            .push(event::ContextInjection::text_with_steer_id_for_target(
+                "for alias".into(),
+                "s-alias".into(),
+                Some("alias-session".into()),
+            ));
+
+        assert!(has_queued_steers_for_session(
+            &queue,
+            Some("live-session"),
+            Some("alias-session")
+        ));
+        assert!(!has_queued_steers_for_session(
+            &queue,
+            Some("other-session"),
+            None
+        ));
     }
 
     #[test]
@@ -7228,9 +7332,10 @@ async fn run_agent_loop(
                         // hook — model calls are atomic — so acceptance and
                         // delivery are separate UI states.
                         if let Ok(mut q) = watcher_injection.lock() {
-                            q.push(event::ContextInjection::text_with_steer_id(
+                            q.push(event::ContextInjection::text_with_steer_id_for_target(
                                 text,
                                 id.clone(),
+                                watcher_session_id.clone(),
                             ));
                         }
                         watcher_bus.send(AppEvent::SteerAccepted {
@@ -9855,6 +9960,7 @@ async fn run_with_presence(
                 &task_text,
                 &bus,
                 session_log_id(&session_log).as_deref(),
+                None,
             )
             .unwrap_or_else(|| task_text.clone());
             persistent_diff_tracker.seed_from_session_log(&project.root, &log_dir);
@@ -10721,7 +10827,11 @@ async fn run_external_agent_mode(
         let followup = match next_turn.take() {
             Some(turn) => turn,
             None => loop {
-                if has_queued_steers(&context_injection) {
+                if has_queued_steers_for_session(
+                    &context_injection,
+                    live_session_id.as_deref(),
+                    drain_config.alias_session_id.as_deref(),
+                ) {
                     break FollowUpMessage::text(String::new());
                 }
                 tokio::select! {
@@ -10999,6 +11109,7 @@ async fn run_external_agent_mode(
                 &turn_text,
                 &bus,
                 Some(&side_thread_id),
+                None,
             )
             .unwrap_or_else(|| turn_text.clone());
             let side_thread = external_agent::AgentThread {
@@ -11100,6 +11211,7 @@ async fn run_external_agent_mode(
                 &turn_text,
                 &bus,
                 Some(&subagent_thread_id),
+                None,
             )
             .unwrap_or_else(|| turn_text.clone());
             let subagent_thread = external_agent::AgentThread {
@@ -11240,6 +11352,7 @@ async fn run_external_agent_mode(
             &turn_text,
             &bus,
             live_session_id.as_deref(),
+            drain_config.alias_session_id.as_deref(),
         )
         .unwrap_or_else(|| turn_text.clone());
         let user_log_text = if turn_text.trim().is_empty() {

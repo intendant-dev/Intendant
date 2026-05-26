@@ -24722,8 +24722,10 @@ function onSessionAttached(sessionId, source) {
   currentSessionFullId = sessionId || '';
   if (sessionId) {
     setSessionWindowDetached(sessionId, false);
-    const existingPhase = sessionWindows.get(sessionId)?.phase;
-    const phase = existingPhase && existingPhase !== 'done' ? existingPhase : 'idle';
+    const existingPhase = normalizeSessionPhase(sessionWindows.get(sessionId)?.phase || '');
+    const phase = existingPhase && !isAgentActivePhase(existingPhase) && existingPhase !== 'done'
+      ? existingPhase
+      : 'idle';
     ensureSessionWindow(sessionId, { source: source || 'session', phase, ended: false });
     focusSessionWindowFromLifecycle(sessionId);
     flushPendingDetachedCodexThreadActions(sessionId);

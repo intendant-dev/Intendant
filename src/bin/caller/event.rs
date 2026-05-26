@@ -46,6 +46,11 @@ pub struct ContextInjection {
     pub text: String,
     pub images: Vec<crate::conversation::ImageData>,
     pub source: InjectionSource,
+    /// Optional session/thread that a queued steer is meant for.
+    ///
+    /// `None` preserves legacy/global behavior for non-steer injections and
+    /// for any older queued steer entries that predate targeted routing.
+    pub target_session_id: Option<String>,
     /// When this injection was queued by a steer, this carries the steer id so a
     /// `SteerDelivered` event can be emitted with the right correlation id
     /// when the item is eventually drained into the agent's conversation.
@@ -62,6 +67,7 @@ impl ContextInjection {
             text: msg,
             images: vec![],
             source: InjectionSource::System,
+            target_session_id: None,
             steer_id: None,
         }
     }
@@ -73,6 +79,7 @@ impl ContextInjection {
             text: msg,
             images: vec![],
             source: InjectionSource::User,
+            target_session_id: None,
             steer_id: None,
         }
     }
@@ -81,10 +88,20 @@ impl ContextInjection {
     /// round-trips back out via `AppEvent::SteerDelivered` when the item is
     /// drained so frontends can correlate their pending-steer UI.
     pub fn text_with_steer_id(msg: String, steer_id: String) -> Self {
+        Self::text_with_steer_id_for_target(msg, steer_id, None)
+    }
+
+    /// Create a queued steer injection scoped to a specific session/thread.
+    pub fn text_with_steer_id_for_target(
+        msg: String,
+        steer_id: String,
+        target_session_id: Option<String>,
+    ) -> Self {
         Self {
             text: msg,
             images: vec![],
             source: InjectionSource::User,
+            target_session_id,
             steer_id: Some(steer_id),
         }
     }

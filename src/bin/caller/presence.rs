@@ -778,6 +778,7 @@ pub async fn handle_tool_query(
                         text: format!("[Presence] {}", msg),
                         images,
                         source: crate::event::InjectionSource::User,
+                        target_session_id: None,
                         steer_id: None,
                     });
                 }
