@@ -851,6 +851,11 @@ pub(super) const DISPLAY_TOOLS_PROMPT: &str = "\n\n\
 \n\
 You have access to these tools through the `intendant` MCP server.\n\
 \n\
+### Context Management (always available)\n\
+- **get_status()**: Report current Intendant state, including backend-reported Codex context pressure.\n\
+- **rewind_context(anchor, reason, primer, preserve?, discard?, artifacts?, next_steps?)**: Schedule a same-thread Codex context rewind to an exact item/tool-call anchor. Use this when context pressure is high; include a detailed carry-forward primer.\n\
+- **rewind_backout(record_id, mode?, allow_cache_reset?)**: Inspect or restore a prior rewind record. Use `mode=\"restore\"` for same-thread recovery; `fork`/`backout` require `allow_cache_reset=true` because they create a new cache key.\n\
+\n\
 **GUI interaction rule:** For all GUI tasks, use take_screenshot and execute_cu_actions. Look at screenshots and click what you see. Do NOT use osascript, accessibility queries, shell commands, or app binary inspection for GUI interaction.\n\
 \n\
 ### Computer Use (always available)\n\
