@@ -1921,6 +1921,43 @@ fn external_context_snapshot_turn(stats: &LoopStats) -> Option<usize> {
     }
 }
 
+fn external_context_snapshot_usage(
+    snapshot: &external_agent::AgentContextSnapshot,
+) -> Option<frontend::ModelUsageSnapshot> {
+    let tokens_used = snapshot.token_count?;
+    let context_window = snapshot.context_window?;
+    if context_window == 0 {
+        return None;
+    }
+
+    let provider = if snapshot.format.starts_with("openai.") {
+        "openai"
+    } else if snapshot.format.starts_with("anthropic.") {
+        "anthropic"
+    } else if snapshot.format.starts_with("gemini.") {
+        "gemini"
+    } else {
+        snapshot.source.as_str()
+    };
+    let model = snapshot
+        .raw
+        .get("model")
+        .and_then(|value| value.as_str())
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or(snapshot.source.as_str());
+
+    Some(frontend::ModelUsageSnapshot {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        tokens_used,
+        context_window,
+        usage_pct: tokens_used as f64 / context_window as f64 * 100.0,
+        prompt_tokens: tokens_used,
+        completion_tokens: 0,
+        cached_tokens: 0,
+    })
+}
+
 async fn emit_external_context_snapshot_if_changed(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     config: &DrainConfig<'_>,
@@ -1936,6 +1973,7 @@ async fn emit_external_context_snapshot_if_changed(
             }
             state.last_key = Some(key);
             state.last_error = None;
+            let usage = external_context_snapshot_usage(&snapshot);
             config.bus.send(AppEvent::ContextSnapshot {
                 session_id: config.session_id.clone(),
                 source: snapshot.source,
@@ -1947,6 +1985,13 @@ async fn emit_external_context_snapshot_if_changed(
                 item_count: snapshot.item_count,
                 raw: snapshot.raw,
             });
+            if let Some(main) = usage {
+                config.bus.send(AppEvent::UsageSnapshot {
+                    session_id: config.session_id.clone(),
+                    main,
+                    presence: None,
+                });
+            }
         }
         Ok(None) => {
             state.last_error = None;
@@ -6252,6 +6297,31 @@ mod tests {
             &Some("intendant-session".to_string()),
             &Some("codex-thread".to_string()),
         ));
+    }
+
+    #[test]
+    fn external_context_snapshot_usage_tracks_codex_backend_pressure() {
+        let snapshot = external_agent::AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex resolved request payload".to_string(),
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(71_876),
+            context_window: Some(258_400),
+            item_count: Some(51),
+            raw: serde_json::json!({
+                "model": "gpt-5.5",
+                "input": []
+            }),
+        };
+
+        let usage = external_context_snapshot_usage(&snapshot).unwrap();
+        assert_eq!(usage.provider, "openai");
+        assert_eq!(usage.model, "gpt-5.5");
+        assert_eq!(usage.tokens_used, 71_876);
+        assert_eq!(usage.context_window, 258_400);
+        assert_eq!(usage.prompt_tokens, 71_876);
+        assert_eq!(usage.completion_tokens, 0);
+        assert!((usage.usage_pct - (71_876.0 / 258_400.0 * 100.0)).abs() < 1e-12);
     }
 
     #[test]
