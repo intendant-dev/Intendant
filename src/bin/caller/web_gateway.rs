@@ -2992,6 +2992,19 @@ fn codex_event_message_text(payload: &serde_json::Value) -> Option<(String, Stri
     }
 }
 
+fn codex_thread_rollback_anchor(payload: &serde_json::Value) -> Option<(String, String)> {
+    let anchor = payload.get("anchor")?;
+    let item_id = value_str(anchor, "itemId")
+        .or_else(|| value_str(anchor, "item_id"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let position = value_str(anchor, "position")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| s == "before" || s == "after")
+        .unwrap_or_else(|| "after".to_string());
+    Some((item_id, position))
+}
+
 fn is_codex_injected_user_text(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("# AGENTS.md instructions for ")
@@ -4585,6 +4598,7 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                         .get("num_turns")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
+                    let anchor = codex_thread_rollback_anchor(payload);
                     let ts = value_str(&obj, "timestamp").unwrap_or_default();
                     let mut superseded_user_turns = Vec::new();
                     for _ in 0..turns {
@@ -4597,19 +4611,38 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                     if let Some(replacement_turn) = superseded_user_turns.iter().copied().min() {
                         pending_replacement_for_user_turn = Some(replacement_turn);
                     }
-                    if turns > 0 {
-                        entries.push(serde_json::json!({
+                    if turns > 0 || anchor.is_some() {
+                        let content = match (turns, anchor.as_ref()) {
+                            (0, Some((item_id, position))) => format!(
+                                "Rewound to {position} item {item_id}; overwritten entries are no longer active context."
+                            ),
+                            (1, Some((item_id, position))) => format!(
+                                "Rewound 1 user turn and trimmed to {position} item {item_id}; overwritten entries are no longer active context."
+                            ),
+                            (_, Some((item_id, position))) => format!(
+                                "Rewound {turns} user turns and trimmed to {position} item {item_id}; overwritten entries are no longer active context."
+                            ),
+                            (1, None) => {
+                                "Rewound 1 user turn; overwritten entries are no longer active context."
+                                    .to_string()
+                            }
+                            (_, None) => format!(
+                                "Rewound {turns} user turns; overwritten entries are no longer active context."
+                            ),
+                        };
+                        let mut marker = serde_json::json!({
                             "ts": ts,
                             "level": "warn",
                             "source": "system",
-                            "content": if turns == 1 {
-                                "Rewound 1 user turn; overwritten entries are no longer active context.".to_string()
-                            } else {
-                                format!("Rewound {turns} user turns; overwritten entries are no longer active context.")
-                            },
+                            "content": content,
                             "kind": "rollback_marker",
                             "rollback_turns": turns,
-                        }));
+                        });
+                        if let Some((item_id, position)) = anchor {
+                            marker["rollback_anchor_item_id"] = serde_json::json!(item_id);
+                            marker["rollback_anchor_position"] = serde_json::json!(position);
+                        }
+                        entries.push(marker);
                     }
                     continue;
                 }
@@ -4875,6 +4908,13 @@ fn external_session_activity_replay_from_home_with_attach(
                 .get("superseded_reason")
                 .and_then(|v| v.as_str()),
             "kind": entry.get("kind").and_then(|v| v.as_str()),
+            "rollback_turns": entry.get("rollback_turns").and_then(|v| v.as_u64()),
+            "rollback_anchor_item_id": entry
+                .get("rollback_anchor_item_id")
+                .and_then(|v| v.as_str()),
+            "rollback_anchor_position": entry
+                .get("rollback_anchor_position")
+                .and_then(|v| v.as_str()),
         }));
     }
 
@@ -16775,6 +16815,74 @@ mod tests {
         assert_eq!(new_prompt["user_turn_revision"], 2);
         assert_eq!(new_prompt["replacement_for_user_turn_index"], 1);
         assert_ne!(new_prompt["superseded"], true);
+    }
+
+    #[test]
+    fn external_activity_replay_preserves_anchor_rollback_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-anchor-rewind-activity";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Prompt" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Kept answer" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:02Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_rolled_back",
+                        "num_turns": 0,
+                        "anchor": { "itemId": "call-keep", "position": "after" }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+
+        let marker = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["kind"] == "rollback_marker")
+            .expect("anchor rollback marker should replay");
+        assert_eq!(marker["rollback_turns"], 0);
+        assert_eq!(marker["rollback_anchor_item_id"], "call-keep");
+        assert_eq!(marker["rollback_anchor_position"], "after");
+        assert!(marker["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Rewound to after item call-keep")));
     }
 
     #[test]

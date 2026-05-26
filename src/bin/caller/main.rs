@@ -4,6 +4,7 @@ mod approval;
 mod audio_routing;
 mod autonomy;
 mod computer_use;
+mod context_rewind;
 mod control;
 mod control_plane;
 mod conversation;
@@ -15,10 +16,12 @@ mod error;
 mod event;
 mod external_agent;
 mod file_watcher;
+mod fission_ledger;
 mod frames;
 mod frontend;
 mod knowledge;
 mod lan;
+mod lineage_ledger;
 mod live_audio;
 mod live_audio_types;
 mod mcp;
@@ -58,7 +61,7 @@ use conversation::Conversation;
 use error::CallerError;
 use event::{AppEvent, EventBus};
 use project::Project;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -1336,12 +1339,475 @@ enum DrainOutcome {
     },
     /// The event channel was closed unexpectedly.
     ChannelClosed,
+    /// The backend finished a turn in a recoverable error state. The external
+    /// agent process is still usable, but the caller must not immediately
+    /// submit another ordinary continuation.
+    RecoveryRequired {
+        message: String,
+        recovery_hint: Option<String>,
+        turns_in_round: usize,
+    },
     /// A user-requested interrupt completed cleanly. The agent was asked to
     /// cancel its turn (e.g. via `session/cancel` or `turn/interrupt`) and
     /// acknowledged with a terminal event. The caller should break its
     /// outer loop the same way it would for `TurnCompleted`, but MUST NOT
     /// wait for a follow-up message — the interrupt *is* the follow-up.
     Interrupted { reason: String },
+    /// A model/tool requested context rewind during the active turn. The drain
+    /// waits until the backend reports the turn complete, then returns this so
+    /// the caller can apply the rollback while the thread is idle.
+    ContextRewindRequested {
+        request: ExternalContextRewindRequest,
+        message: Option<String>,
+        turns_in_round: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalBackendRecovery {
+    message: String,
+    recovery_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalContextRewindRequest {
+    session_id: Option<String>,
+    item_id: String,
+    position: external_agent::RollbackAnchorPosition,
+    reason: Option<String>,
+    primer: Option<String>,
+    preserve: Vec<String>,
+    discard: Vec<String>,
+    artifacts: Vec<String>,
+    next_steps: Vec<String>,
+    auto_resume: bool,
+}
+
+#[derive(Debug, Default)]
+struct CodexThreadActionDedupe {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl CodexThreadActionDedupe {
+    const MAX_SEEN: usize = 512;
+
+    fn mark_seen(&mut self, request_id: &str) -> bool {
+        if self.seen.contains(request_id) {
+            return false;
+        }
+        let request_id = request_id.to_string();
+        self.seen.insert(request_id.clone());
+        self.order.push_back(request_id);
+        while self.order.len() > Self::MAX_SEEN {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        true
+    }
+}
+
+impl ExternalContextRewindRequest {
+    fn rendered_primer(&self) -> Option<String> {
+        let primer = self.primer.as_deref()?.trim();
+        if primer.is_empty() {
+            return None;
+        }
+        let mut out = String::from(
+            "<model_context_rewind_primer>\nHistory after the rewind target was pruned by rewind_context. Earlier history before the target is still present. Treat this primer as the carry-forward summary of only the pruned span.\n\n",
+        );
+        push_context_rewind_text_section(
+            &mut out,
+            "Reason",
+            self.reason.as_deref().unwrap_or("context rewind"),
+        );
+        push_context_rewind_text_section(&mut out, "Primer", primer);
+        push_context_rewind_list_section(&mut out, "Preserve", &self.preserve);
+        push_context_rewind_list_section(&mut out, "Discard", &self.discard);
+        push_context_rewind_list_section(&mut out, "Artifacts", &self.artifacts);
+        push_context_rewind_list_section(&mut out, "Next steps", &self.next_steps);
+        out.push_str("</model_context_rewind_primer>");
+        Some(out)
+    }
+
+    fn resume_followup(&self) -> Option<FollowUpMessage> {
+        if !self.auto_resume || self.primer.as_deref()?.trim().is_empty() {
+            return None;
+        }
+        Some(FollowUpMessage::text(
+            "<context_rewind_resumed>\nContinue from the model_context_rewind_primer that Intendant injected as developer context for the pruned span. Do not redo discarded work; continue with the next useful step.\n</context_rewind_resumed>"
+                .to_string(),
+        ))
+    }
+
+    fn target_label(&self) -> String {
+        format!("{} item {}", self.position.as_str(), self.item_id)
+    }
+}
+
+fn push_context_rewind_text_section(out: &mut String, label: &str, value: &str) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    out.push_str(label);
+    out.push_str(":\n");
+    out.push_str(value);
+    out.push_str("\n\n");
+}
+
+fn push_context_rewind_list_section(out: &mut String, label: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    out.push_str(label);
+    out.push_str(":\n");
+    for value in values {
+        out.push_str("- ");
+        out.push_str(value);
+        out.push('\n');
+    }
+    out.push('\n');
+}
+
+fn clean_context_rewind_list(params: &serde_json::Value, key: &str) -> Vec<String> {
+    params
+        .get(key)
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn optional_trimmed_string(params: &serde_json::Value, key: &str) -> Option<String> {
+    params
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn context_rewind_anchor_item_id(params: &serde_json::Value) -> Option<String> {
+    params
+        .pointer("/anchor/itemId")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            params
+                .pointer("/anchor/item_id")
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| params.get("itemId").and_then(|value| value.as_str()))
+        .or_else(|| params.get("item_id").and_then(|value| value.as_str()))
+        .or_else(|| params.as_str())
+        .map(str::trim)
+        .filter(|item_id| !item_id.is_empty())
+        .map(str::to_string)
+}
+
+fn context_rewind_anchor_position(
+    params: &serde_json::Value,
+) -> Option<external_agent::RollbackAnchorPosition> {
+    match params
+        .pointer("/anchor/position")
+        .and_then(|value| value.as_str())
+        .or_else(|| params.get("position").and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => external_agent::RollbackAnchorPosition::from_str(value),
+        None => Some(external_agent::RollbackAnchorPosition::After),
+    }
+}
+
+fn is_context_rewind_action(action: &str) -> bool {
+    matches!(
+        action,
+        "rewind_context"
+            | "rewind-context"
+            | "rewind-anchor"
+            | "rewind_anchor"
+            | "rewind-to-item"
+            | "rewind_to_item"
+            | "rollback-anchor"
+            | "rollback_anchor"
+            | "rollback-to-item"
+            | "rollback_to_item"
+    )
+}
+
+fn external_context_rewind_request_from_action(
+    action: &str,
+    params: &serde_json::Value,
+    session_id: Option<String>,
+) -> Option<Result<ExternalContextRewindRequest, String>> {
+    if !is_context_rewind_action(action) {
+        return None;
+    }
+
+    let item_id = match context_rewind_anchor_item_id(params) {
+        Some(item_id) => item_id,
+        None => {
+            return Some(Err(
+                "rewind_context requires anchor.item_id or itemId".to_string()
+            ));
+        }
+    };
+    let position = match context_rewind_anchor_position(params) {
+        Some(position) => position,
+        None => {
+            return Some(Err(
+                "rewind_context anchor.position must be `before` or `after`".to_string(),
+            ));
+        }
+    };
+    let is_model_rewind = matches!(action, "rewind_context" | "rewind-context");
+    let reason = optional_trimmed_string(params, "reason");
+    let primer = optional_trimmed_string(params, "primer");
+    if is_model_rewind {
+        if reason.is_none() {
+            return Some(Err("rewind_context requires a non-empty reason".to_string()));
+        }
+        if primer.is_none() {
+            return Some(Err("rewind_context requires a non-empty primer".to_string()));
+        }
+    }
+
+    Some(Ok(ExternalContextRewindRequest {
+        session_id,
+        item_id,
+        position,
+        reason,
+        primer,
+        preserve: clean_context_rewind_list(params, "preserve"),
+        discard: clean_context_rewind_list(params, "discard"),
+        artifacts: clean_context_rewind_list(params, "artifacts"),
+        next_steps: clean_context_rewind_list(params, "next_steps"),
+        auto_resume: is_model_rewind,
+    }))
+}
+
+fn backend_recovery_outcome_or_context_rewind(
+    request: Option<ExternalContextRewindRequest>,
+    recovery: Option<ExternalBackendRecovery>,
+    message: Option<String>,
+    turns_in_round: usize,
+) -> DrainOutcome {
+    if let Some(request) = request {
+        return DrainOutcome::ContextRewindRequested {
+            request,
+            message,
+            turns_in_round,
+        };
+    }
+    if let Some(recovery) = recovery {
+        return DrainOutcome::RecoveryRequired {
+            message: recovery.message,
+            recovery_hint: recovery.recovery_hint,
+            turns_in_round,
+        };
+    }
+    DrainOutcome::TurnCompleted {
+        message,
+        turns_in_round,
+    }
+}
+
+fn recovery_required_message(message: &str, recovery_hint: Option<&str>) -> String {
+    let mut out = format!("External agent recovery required after backend error: {message}");
+    if let Some(hint) = recovery_hint.filter(|hint| !hint.trim().is_empty()) {
+        out.push_str("\nRecovery: ");
+        out.push_str(hint.trim());
+    }
+    out
+}
+
+async fn apply_external_context_rewind(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    thread_id: &str,
+    request: &ExternalContextRewindRequest,
+    config: &DrainConfig<'_>,
+) -> Result<Option<FollowUpMessage>, String> {
+    if !agent.supports_item_anchor_rewind() {
+        return Err(format!(
+            "{} does not support item-anchor rewind",
+            agent.name()
+        ));
+    }
+
+    let record_id = format!("rewind-{}", uuid::Uuid::new_v4().simple());
+    let snapshot = agent
+        .read_thread_snapshot(thread_id)
+        .await
+        .map_err(|e| format!("failed to read thread metadata before rewind: {}", e))?;
+    let source_rollout_path = snapshot
+        .rollout_path
+        .clone()
+        .ok_or_else(|| "thread metadata did not include a rollout path".to_string())?;
+    let recovery_rollout_path =
+        context_rewind::copy_recovery_rollout(config.log_dir, &record_id, &source_rollout_path)
+            .map_err(|e| format!("failed to copy pre-rewind rollout: {}", e))?;
+    let fission_snapshot = match context_rewind::read_fission_snapshot(config.log_dir, thread_id) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            slog(config.session_log, |log| {
+                log.warn(&format!(
+                    "Could not snapshot fission/session relationships before rewind: {err}"
+                ))
+            });
+            None
+        }
+    };
+    let lineage_ledger = match lineage_ledger::read_lineage_ledger(config.log_dir, thread_id) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            slog(config.session_log, |log| {
+                log.warn(&format!(
+                    "Could not snapshot lineage ledger before rewind: {err}"
+                ))
+            });
+            None
+        }
+    };
+    let fission_ledger =
+        match fission_ledger::read_fission_ledger_for_session(config.log_dir, thread_id) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                slog(config.session_log, |log| {
+                    log.warn(&format!(
+                        "Could not snapshot fission ledger before rewind: {err}"
+                    ))
+                });
+                None
+            }
+        };
+
+    let record = context_rewind::ContextRewindRecord {
+        record_id: record_id.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        session_id: request
+            .session_id
+            .clone()
+            .or_else(|| config.session_id.clone()),
+        thread_id: snapshot.thread_id,
+        item_id: request.item_id.clone(),
+        position: request.position.as_str().to_string(),
+        reason: request.reason.clone(),
+        primer: request.primer.clone(),
+        preserve: request.preserve.clone(),
+        discard: request.discard.clone(),
+        artifacts: request.artifacts.clone(),
+        next_steps: request.next_steps.clone(),
+        source_rollout_path: Some(source_rollout_path),
+        recovery_rollout_path: Some(recovery_rollout_path),
+        fission_snapshot,
+        lineage_ledger,
+        fission_ledger,
+    };
+    context_rewind::persist_record(config.log_dir, &record)
+        .map_err(|e| format!("failed to persist context rewind record: {}", e))?;
+
+    agent
+        .rollback_thread_to_item_anchor(thread_id, &request.item_id, request.position)
+        .await
+        .map_err(|e| {
+            format!(
+                "thread rollback failed after saving record {record_id}: {}",
+                e
+            )
+        })?;
+
+    if let Some(primer) = request.rendered_primer() {
+        agent
+            .inject_thread_developer_message(thread_id, &primer)
+            .await
+            .map_err(|e| format!("failed to inject context rewind primer: {}", e))?;
+    }
+
+    let message = if request.primer.is_some() {
+        format!(
+            "context rewound to {}; primer injected; record {}",
+            request.target_label(),
+            record_id
+        )
+    } else {
+        format!(
+            "rewound to {}; record {}",
+            request.target_label(),
+            record_id
+        )
+    };
+    slog(config.session_log, |l| l.info(&message));
+    config.bus.send(AppEvent::CodexThreadActionResult {
+        session_id: request
+            .session_id
+            .clone()
+            .or_else(|| config.session_id.clone()),
+        action: "rewind_context".to_string(),
+        success: true,
+        message,
+    });
+
+    Ok(request.resume_followup())
+}
+
+fn emit_context_rewind_failure(
+    request: &ExternalContextRewindRequest,
+    message: String,
+    config: &DrainConfig<'_>,
+) {
+    slog(config.session_log, |l| {
+        l.warn(&format!("Context rewind failed: {message}"))
+    });
+    config.bus.send(AppEvent::CodexThreadActionResult {
+        session_id: request
+            .session_id
+            .clone()
+            .or_else(|| config.session_id.clone()),
+        action: "rewind_context".to_string(),
+        success: false,
+        message,
+    });
+}
+
+struct ExternalContextRewindResume<'a, 'b> {
+    event_rx: &'a mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
+    turn_bus_rx: &'a mut tokio::sync::broadcast::Receiver<AppEvent>,
+    config: &'a DrainConfig<'b>,
+    stats: &'a mut LoopStats,
+    diff_tracker: &'a mut ExternalDiffDeltaTracker,
+    pending_runtime_steers: &'a mut std::collections::VecDeque<PendingRuntimeSteer>,
+    codex_thread_action_dedupe: &'a mut CodexThreadActionDedupe,
+    side_sessions: Option<&'a mut ExternalSideSessionState<'b>>,
+}
+
+async fn send_external_context_rewind_resume_turn(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    thread: &external_agent::AgentThread,
+    followup: FollowUpMessage,
+    resume: ExternalContextRewindResume<'_, '_>,
+) -> Result<DrainOutcome, String> {
+    agent
+        .send_message(thread, &followup.text)
+        .await
+        .map_err(|e| format!("failed to start resumed context-rewind turn: {}", e))?;
+    Ok(drain_external_agent_events(
+        agent,
+        resume.event_rx,
+        resume.turn_bus_rx,
+        resume.config,
+        resume.stats,
+        resume.diff_tracker,
+        resume.pending_runtime_steers,
+        resume.codex_thread_action_dedupe,
+        resume.side_sessions,
+    )
+    .await)
 }
 
 struct ExternalSideSessionState<'a> {
@@ -1559,6 +2025,69 @@ fn side_child_thread_id_from_params(params: &serde_json::Value) -> Option<String
         .map(str::to_string)
 }
 
+fn is_context_rewind_backout_action(op: &str) -> bool {
+    matches!(
+        op,
+        "rewind-backout"
+            | "rewind_backout"
+            | "rewind-inspect"
+            | "rewind_inspect"
+            | "rewind-restore"
+            | "rewind_restore"
+            | "context-rewind-backout"
+            | "context_rewind_backout"
+            | "context-rewind-restore"
+            | "context_rewind_restore"
+    )
+}
+
+fn context_rewind_record_id_from_params(params: &serde_json::Value) -> Option<String> {
+    params
+        .get("recordId")
+        .or_else(|| params.get("record_id"))
+        .or_else(|| params.get("id"))
+        .and_then(|value| value.as_str())
+        .or_else(|| params.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn context_rewind_backout_mode(op: &str, params: &serde_json::Value) -> String {
+    if let Some(mode) = params
+        .get("mode")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+    {
+        return mode.to_string();
+    }
+    match op {
+        "rewind-restore"
+        | "rewind_restore"
+        | "context-rewind-restore"
+        | "context_rewind_restore" => "restore".to_string(),
+        "rewind-inspect" | "rewind_inspect" => "inspect".to_string(),
+        _ => "inspect".to_string(),
+    }
+}
+
+fn context_rewind_allows_cache_reset(params: &serde_json::Value) -> bool {
+    [
+        "allowCacheReset",
+        "allow_cache_reset",
+        "allowCacheBreakingFork",
+        "allow_cache_breaking_fork",
+    ]
+    .iter()
+    .any(|key| {
+        params
+            .get(*key)
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    })
+}
+
 fn thread_id_from_action_params(params: &serde_json::Value) -> Option<String> {
     params
         .pointer("/thread/id")
@@ -1666,6 +2195,109 @@ fn emit_codex_fork_session_name(bus: &EventBus, child_id: &str, params: &serde_j
     }));
 }
 
+async fn apply_context_rewind_backout_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    op: &str,
+    params: &serde_json::Value,
+    config: &DrainConfig<'_>,
+) -> Result<String, String> {
+    let mode = context_rewind_backout_mode(op, params).to_ascii_lowercase();
+    let restore = mode == "restore";
+    if !matches!(mode.as_str(), "inspect" | "fork" | "backout" | "restore") {
+        return Err(format!(
+            "context rewind backout mode `{mode}` is not supported; use `inspect`, `fork`, or `restore`"
+        ));
+    }
+    let record_id = context_rewind_record_id_from_params(params)
+        .ok_or_else(|| "context rewind backout requires recordId".to_string())?;
+    let record = context_rewind::read_record(config.log_dir, &record_id)
+        .map_err(|e| format!("failed to read context rewind record {record_id}: {e}"))?;
+    let recovery_rollout_path = record
+        .recovery_rollout_path
+        .as_deref()
+        .ok_or_else(|| format!("context rewind record {record_id} has no recovery rollout"))?;
+    if mode == "inspect" {
+        let source = record
+            .source_rollout_path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        return Ok(format!(
+            "context rewind record {record_id}: pre-rewind rollout copied from {source} to {}; restore uses same-thread Codex thread/restore when available; fork/backout still requires allow_cache_reset=true",
+            recovery_rollout_path.display()
+        ));
+    }
+    if restore {
+        let target_thread_id = thread_id_from_action_params(params)
+            .or_else(|| record.session_id.clone())
+            .unwrap_or_else(|| record.thread_id.clone());
+        agent
+            .restore_thread_from_rollout_path(
+                &target_thread_id,
+                recovery_rollout_path,
+                Some(record_id.as_str()),
+            )
+            .await
+            .map_err(|e| {
+                format!("failed to restore recovery rollout into thread {target_thread_id}: {e}")
+            })?;
+        return Ok(format!(
+            "restored context rewind record {} into existing Codex thread {}",
+            record_id, target_thread_id
+        ));
+    }
+    if !context_rewind_allows_cache_reset(params) {
+        return Err(format!(
+            "context rewind {mode} for record {record_id} would fork the saved rollout into a new Codex thread, which changes the prompt cache key. Use mode=restore for same-thread recovery, mode=inspect for a cache-safe record lookup, or retry with allow_cache_reset=true if a cache-reset fork is acceptable"
+        ));
+    }
+    let default_name = if restore {
+        format!("Rewind restore {}", record_id)
+    } else {
+        format!("Rewind backout {}", record_id)
+    };
+    let name = fork_session_name_from_params(params).unwrap_or(default_name);
+    let child = agent
+        .fork_thread_from_rollout_path(recovery_rollout_path, Some(&name))
+        .await
+        .map_err(|e| format!("failed to fork recovery rollout: {e}"))?;
+
+    config
+        .bus
+        .send(AppEvent::ControlCommand(event::ControlMsg::RenameSession {
+            source: Some("codex".to_string()),
+            session_id: child.thread_id.clone(),
+            backend_session_id: Some(child.thread_id.clone()),
+            name,
+        }));
+    emit_session_relationship(
+        config.bus,
+        Some(record.thread_id.as_str()),
+        &child.thread_id,
+        if restore {
+            "rewind-restore"
+        } else {
+            "rewind-backout"
+        },
+        false,
+    );
+    config
+        .bus
+        .send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+            source: "codex".to_string(),
+            session_id: child.thread_id.clone(),
+            resume_id: Some(child.thread_id.clone()),
+            project_root: Some(config.project_root.to_string_lossy().to_string()),
+            task: None,
+            direct: Some(true),
+        }));
+
+    Ok(format!(
+        "forked context rewind record {} with cache reset into thread {}",
+        record_id, child.thread_id
+    ))
+}
+
 async fn handle_external_thread_action(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     op: String,
@@ -1676,10 +2308,14 @@ async fn handle_external_thread_action(
     let params = thread_action_params_for_target(&op, params, &target_session_id, config);
     let action_thread_id = thread_id_from_action_params(&params);
     let result_session_id = target_session_id.or_else(|| config.session_id.clone());
-    let result = agent
-        .thread_action(&op, &params)
-        .await
-        .map_err(|e| e.to_string());
+    let result = if is_context_rewind_backout_action(&op) {
+        apply_context_rewind_backout_action(agent, &op, &params, config).await
+    } else {
+        agent
+            .thread_action(&op, &params)
+            .await
+            .map_err(|e| e.to_string())
+    };
     let (success, message) = match result {
         Ok(msg) => (true, msg),
         Err(e) => (false, e),
@@ -2282,6 +2918,107 @@ fn codex_subagent_thread_ids(
     ids
 }
 
+struct CodexFissionObservationInput<'a> {
+    item_id: &'a str,
+    tool: &'a str,
+    status: &'a str,
+    sender_thread_id: &'a str,
+    subagent_thread_ids: &'a [String],
+    prompt: Option<&'a str>,
+    model: Option<&'a str>,
+    reasoning_effort: Option<&'a str>,
+    agents: &'a [external_agent::SubAgentState],
+}
+
+fn record_codex_fission_observation(
+    config: &DrainConfig<'_>,
+    input: CodexFissionObservationInput<'_>,
+) {
+    let parent_session_id = {
+        let sender_thread_id = input.sender_thread_id.trim();
+        if sender_thread_id.is_empty() {
+            config.session_id.clone().unwrap_or_default()
+        } else {
+            sender_thread_id.to_string()
+        }
+    };
+    if parent_session_id.trim().is_empty() || input.item_id.trim().is_empty() {
+        return;
+    }
+
+    let default_branch_status = if input.status.trim() == "failed" {
+        "failed"
+    } else {
+        "running"
+    };
+    let mut branches = std::collections::BTreeMap::new();
+    for id in input.subagent_thread_ids {
+        let id = id.trim();
+        if !id.is_empty() && id != parent_session_id {
+            branches.insert(
+                id.to_string(),
+                fission_ledger::FissionBranchObservation {
+                    session_id: id.to_string(),
+                    status: default_branch_status.to_string(),
+                    summary: None,
+                },
+            );
+        }
+    }
+    for state in input.agents {
+        let id = state.thread_id.trim();
+        if id.is_empty() || id == parent_session_id {
+            continue;
+        }
+        branches.insert(
+            id.to_string(),
+            fission_ledger::FissionBranchObservation {
+                session_id: id.to_string(),
+                status: state.status.trim().to_string(),
+                summary: state
+                    .message
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|message| !message.is_empty())
+                    .map(str::to_string),
+            },
+        );
+    }
+    if branches.is_empty() {
+        return;
+    }
+
+    let observation = fission_ledger::FissionObservation {
+        parent_session_id,
+        anchor_item_id: input.item_id.trim().to_string(),
+        tool: input.tool.trim().to_string(),
+        status: input.status.trim().to_string(),
+        prompt: input
+            .prompt
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        model: input
+            .model
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        reasoning_effort: input
+            .reasoning_effort
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        branches: branches.into_values().collect(),
+    };
+    if let Err(err) = fission_ledger::record_fission_observation(config.log_dir, observation) {
+        slog(config.session_log, |log| {
+            log.warn(&format!(
+                "Could not persist fission ledger observation: {err}"
+            ))
+        });
+    }
+}
+
 fn short_external_session_id(session_id: &str) -> String {
     session_id.chars().take(8).collect()
 }
@@ -2317,6 +3054,7 @@ async fn drain_external_child_turn(
     stats: &mut LoopStats,
     diff_tracker: &mut ExternalDiffDeltaTracker,
     pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    codex_thread_action_dedupe: &mut CodexThreadActionDedupe,
     child_thread_id: String,
     conversation_kind: &str,
 ) {
@@ -2354,12 +3092,44 @@ async fn drain_external_child_turn(
         stats,
         diff_tracker,
         pending_runtime_steers,
+        codex_thread_action_dedupe,
         None,
     )
     .await
     {
         DrainOutcome::TurnCompleted { message, .. } => {
             emit_child_turn_complete(&child_config, conversation_kind, message);
+        }
+        DrainOutcome::ContextRewindRequested { request, .. } => {
+            emit_context_rewind_failure(
+                &request,
+                format!(
+                    "context rewind is not supported inside {} conversations",
+                    conversation_kind
+                ),
+                &child_config,
+            );
+        }
+        DrainOutcome::RecoveryRequired {
+            message,
+            recovery_hint,
+            ..
+        } => {
+            let mut content = format!(
+                "Agent recovery required: {} conversation stopped after backend error: {}",
+                conversation_kind, message
+            );
+            if let Some(hint) = recovery_hint {
+                content.push_str("\nRecovery: ");
+                content.push_str(&hint);
+            }
+            child_config.bus.send(AppEvent::LogEntry {
+                session_id: child_config.session_id.clone(),
+                level: "error".to_string(),
+                source: "Codex".to_string(),
+                content,
+                turn: None,
+            });
         }
         DrainOutcome::Interrupted { reason } => {
             child_config.bus.send(AppEvent::LogEntry {
@@ -2520,6 +3290,34 @@ fn handle_idle_codex_subagent_event(
                 turn: None,
             });
         }
+        external_agent::AgentEvent::BackendError {
+            message,
+            code,
+            details,
+            recovery_hint,
+            ..
+        } => {
+            let mut content = if let Some(code) = code {
+                format!("Codex subagent backend error ({code}): {message}")
+            } else {
+                format!("Codex subagent backend error: {message}")
+            };
+            if let Some(details) = details.filter(|s| !s.trim().is_empty()) {
+                content.push('\n');
+                content.push_str(details.trim());
+            }
+            if let Some(hint) = recovery_hint {
+                content.push_str("\nRecovery: ");
+                content.push_str(&hint);
+            }
+            config.bus.send(AppEvent::LogEntry {
+                session_id,
+                level: "error".to_string(),
+                source: external_agent_log_source(config.agent_source.as_deref()),
+                content,
+                turn: None,
+            });
+        }
         external_agent::AgentEvent::ToolStarted {
             tool_name, preview, ..
         } => {
@@ -2569,7 +3367,32 @@ fn handle_idle_codex_subagent_event(
         external_agent::AgentEvent::TurnCompleted { message } => {
             emit_child_turn_complete_for_session(config.bus, session_id, "subagent", message);
         }
-        external_agent::AgentEvent::SubAgentToolCall { agents, .. } => {
+        external_agent::AgentEvent::SubAgentToolCall {
+            item_id,
+            tool,
+            status,
+            sender_thread_id,
+            receiver_thread_ids,
+            prompt,
+            model,
+            reasoning_effort,
+            agents,
+        } => {
+            let subagent_thread_ids = codex_subagent_thread_ids(&receiver_thread_ids, &agents);
+            record_codex_fission_observation(
+                config,
+                CodexFissionObservationInput {
+                    item_id: &item_id,
+                    tool: &tool,
+                    status: &status,
+                    sender_thread_id: &sender_thread_id,
+                    subagent_thread_ids: &subagent_thread_ids,
+                    prompt: prompt.as_deref(),
+                    model: model.as_deref(),
+                    reasoning_effort: reasoning_effort.as_deref(),
+                    agents: &agents,
+                },
+            );
             for state in &agents {
                 emit_codex_subagent_state(config, state);
                 emit_codex_subagent_terminal(config, stats, state);
@@ -2627,6 +3450,7 @@ async fn drain_external_agent_events(
     stats: &mut LoopStats,
     diff_tracker: &mut ExternalDiffDeltaTracker,
     pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    codex_thread_action_dedupe: &mut CodexThreadActionDedupe,
     mut side_sessions: Option<&mut ExternalSideSessionState<'_>>,
 ) -> DrainOutcome {
     use std::sync::atomic::Ordering;
@@ -2660,6 +3484,8 @@ async fn drain_external_agent_events(
     let mut post_turn_sleep_active = false;
     let mut pending_turn_completion: Option<(Option<String>, usize)> = None;
     let mut active_side_turns: HashSet<String> = HashSet::new();
+    let mut pending_context_rewind: Option<ExternalContextRewindRequest> = None;
+    let mut pending_backend_recovery: Option<ExternalBackendRecovery> = None;
 
     // Background watcher: if an interrupt arrives while an approval handler
     // below is blocked on `rx.await`, we need to drain the approval registry
@@ -2834,6 +3660,7 @@ async fn drain_external_agent_events(
                         continue;
                     }
                     Ok(AppEvent::CodexThreadActionRequested {
+                        request_id,
                         session_id,
                         action,
                         params,
@@ -2842,6 +3669,9 @@ async fn drain_external_agent_events(
                         &local_session_id,
                         &alias_session_id,
                     ) => {
+                        if !codex_thread_action_dedupe.mark_seen(&request_id) {
+                            continue;
+                        }
                         if action == "undo" {
                             let message =
                                 "/undo is only available between turns for this session"
@@ -2852,6 +3682,65 @@ async fn drain_external_agent_events(
                                 success: false,
                                 message,
                             });
+                            continue;
+                        }
+                        if let Some(request) =
+                            external_context_rewind_request_from_action(
+                                &action,
+                                &params,
+                                session_id.clone(),
+                            )
+                        {
+                            match request {
+                                Ok(request) => {
+                                    if pending_context_rewind.is_some() {
+                                        config.bus.send(AppEvent::CodexThreadActionResult {
+                                            session_id: local_session_id.clone(),
+                                            action,
+                                            success: false,
+                                            message:
+                                                "a context rewind is already scheduled for this turn"
+                                                    .to_string(),
+                                        });
+                                    } else {
+                                        let target = request.target_label();
+                                        let should_stop_turn = request.auto_resume;
+                                        pending_context_rewind = Some(request);
+                                        let mut message = format!(
+                                            "context rewind scheduled to {target}; it will apply when the current turn is idle"
+                                        );
+                                        if should_stop_turn {
+                                            match agent.interrupt_turn().await {
+                                                Ok(()) => {
+                                                    message.push_str(
+                                                        "; active turn stop requested",
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    message.push_str(&format!(
+                                                        "; active turn stop failed: {e}"
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        slog(config.session_log, |l| l.info(&message));
+                                        config.bus.send(AppEvent::CodexThreadActionResult {
+                                            session_id: local_session_id.clone(),
+                                            action,
+                                            success: true,
+                                            message,
+                                        });
+                                    }
+                                }
+                                Err(message) => {
+                                    config.bus.send(AppEvent::CodexThreadActionResult {
+                                        session_id: local_session_id.clone(),
+                                        action,
+                                        success: false,
+                                        message,
+                                    });
+                                }
+                            }
                             continue;
                         }
                         let effect =
@@ -2912,10 +3801,12 @@ async fn drain_external_agent_events(
                         let (message, turns_in_round) = pending_turn_completion
                             .take()
                             .expect("checked pending turn completion");
-                        return DrainOutcome::TurnCompleted {
+                        return backend_recovery_outcome_or_context_rewind(
+                            pending_context_rewind.take(),
+                            pending_backend_recovery.take(),
                             message,
                             turns_in_round,
-                        };
+                        );
                     }
                     None => return DrainOutcome::ChannelClosed,
                 }
@@ -2924,10 +3815,12 @@ async fn drain_external_agent_events(
                 let (message, turns_in_round) = pending_turn_completion
                     .take()
                     .expect("post-turn sleep active only while completion is pending");
-                return DrainOutcome::TurnCompleted {
+                return backend_recovery_outcome_or_context_rewind(
+                    pending_context_rewind.take(),
+                    pending_backend_recovery.take(),
                     message,
                     turns_in_round,
-                };
+                );
             }
         };
 
@@ -3108,6 +4001,51 @@ async fn drain_external_agent_events(
                     turn: None,
                 });
             }
+            external_agent::AgentEvent::BackendError {
+                message,
+                code,
+                details,
+                will_retry,
+                likely_generation_starvation,
+                recovery_hint,
+            } => {
+                let mut content = if let Some(code) = code.as_deref() {
+                    format!("{} backend error ({code}): {message}", agent.name())
+                } else {
+                    format!("{} backend error: {message}", agent.name())
+                };
+                if let Some(details) = details.as_deref().filter(|s| !s.trim().is_empty()) {
+                    content.push('\n');
+                    content.push_str(details.trim());
+                }
+                if let Some(hint) = recovery_hint.as_deref() {
+                    content.push('\n');
+                    content.push_str("Recovery: ");
+                    content.push_str(hint);
+                }
+
+                slog(config.session_log, |l| {
+                    if will_retry {
+                        l.warn(&content);
+                    } else {
+                        l.error(&content);
+                    }
+                });
+                config.bus.send(AppEvent::LogEntry {
+                    session_id: config.session_id.clone(),
+                    level: if will_retry { "warn" } else { "error" }.to_string(),
+                    source: external_agent_log_source(config.agent_source.as_deref()),
+                    content,
+                    turn: None,
+                });
+
+                if !will_retry && likely_generation_starvation && event_is_primary {
+                    pending_backend_recovery = Some(ExternalBackendRecovery {
+                        message,
+                        recovery_hint,
+                    });
+                }
+            }
             external_agent::AgentEvent::SubAgentToolCall {
                 item_id,
                 tool,
@@ -3121,6 +4059,20 @@ async fn drain_external_agent_events(
             } => {
                 let prompt_ref = prompt.as_deref();
                 let subagent_thread_ids = codex_subagent_thread_ids(&receiver_thread_ids, &agents);
+                record_codex_fission_observation(
+                    config,
+                    CodexFissionObservationInput {
+                        item_id: &item_id,
+                        tool: &tool,
+                        status: &status,
+                        sender_thread_id: &sender_thread_id,
+                        subagent_thread_ids: &subagent_thread_ids,
+                        prompt: prompt_ref,
+                        model: model.as_deref(),
+                        reasoning_effort: reasoning_effort.as_deref(),
+                        agents: &agents,
+                    },
+                );
                 if status == "inProgress" {
                     turns_in_round += 1;
                     if !config.suppress_agent_started {
@@ -3315,9 +4267,7 @@ async fn drain_external_agent_events(
                     external_agent::ApprovalCategory::FileChange => {
                         autonomy::ActionCategory::FileWrite
                     }
-                    external_agent::ApprovalCategory::McpTool => {
-                        autonomy::ActionCategory::ToolCall
-                    }
+                    external_agent::ApprovalCategory::McpTool => autonomy::ActionCategory::ToolCall,
                 };
                 let decision = { config.autonomy.read().await.external_approval_decision(cat) };
                 if approve_all_session
@@ -5434,6 +6384,95 @@ mod tests {
         let stale = state.validate_expected_revision(1, Some(1)).unwrap_err();
         assert!(stale.contains("stale"), "got: {stale}");
         assert!(state.validate_expected_revision(1, Some(2)).is_ok());
+    }
+
+    #[test]
+    fn context_rewind_request_requires_primer_for_model_tool() {
+        let params = serde_json::json!({
+            "anchor": {"item_id": "call-123", "position": "after"},
+            "reason": "prune noisy output"
+        });
+        let err = external_context_rewind_request_from_action("rewind_context", &params, None)
+            .expect("rewind action")
+            .unwrap_err();
+        assert!(err.contains("primer"), "got: {err}");
+    }
+
+    #[test]
+    fn context_rewind_request_renders_developer_primer() {
+        let params = serde_json::json!({
+            "anchor": {"item_id": "call-123", "position": "before"},
+            "reason": "dead end",
+            "primer": "Keep the useful result.",
+            "preserve": [" fact A ", ""],
+            "discard": ["bad assumption"],
+            "artifacts": ["log.txt"],
+            "next_steps": ["continue"]
+        });
+        let request = external_context_rewind_request_from_action(
+            "rewind_context",
+            &params,
+            Some("s".into()),
+        )
+        .expect("rewind action")
+        .expect("valid request");
+        assert_eq!(request.item_id, "call-123");
+        assert_eq!(
+            request.position,
+            external_agent::RollbackAnchorPosition::Before
+        );
+        assert!(request.auto_resume);
+
+        let primer = request.rendered_primer().expect("primer");
+        assert!(primer.contains("<model_context_rewind_primer>"));
+        assert!(primer.contains("Earlier history before the target is still present"));
+        assert!(primer.contains("Keep the useful result."));
+        assert!(primer.contains("- fact A"));
+        assert!(primer.contains("- bad assumption"));
+        assert!(!primer.contains("- \n"));
+        assert!(request.resume_followup().is_some());
+    }
+
+    #[test]
+    fn codex_thread_action_dedupe_rejects_replayed_broadcast_ids() {
+        let mut dedupe = CodexThreadActionDedupe::default();
+        assert!(dedupe.mark_seen("request-1"));
+        assert!(!dedupe.mark_seen("request-1"));
+        assert!(dedupe.mark_seen("request-2"));
+    }
+
+    #[test]
+    fn context_rewind_backout_mode_supports_restore_aliases() {
+        assert_eq!(
+            context_rewind_backout_mode("rewind_backout", &serde_json::json!({})),
+            "inspect"
+        );
+        assert_eq!(
+            context_rewind_backout_mode(
+                "rewind_backout",
+                &serde_json::json!({"mode": " restore "})
+            ),
+            "restore"
+        );
+        assert_eq!(
+            context_rewind_backout_mode("rewind-restore", &serde_json::json!({})),
+            "restore"
+        );
+        assert!(is_context_rewind_backout_action("context-rewind-restore"));
+    }
+
+    #[test]
+    fn context_rewind_backout_cache_reset_requires_explicit_opt_in() {
+        assert!(!context_rewind_allows_cache_reset(&serde_json::json!({})));
+        assert!(!context_rewind_allows_cache_reset(&serde_json::json!({
+            "allowCacheReset": false,
+        })));
+        assert!(context_rewind_allows_cache_reset(&serde_json::json!({
+            "allowCacheReset": true,
+        })));
+        assert!(context_rewind_allows_cache_reset(&serde_json::json!({
+            "allow_cache_breaking_fork": true,
+        })));
     }
 
     #[test]
@@ -9187,6 +10226,7 @@ async fn run_with_presence(
     // turn-start RPC. Otherwise an immediate follow-up can land during the
     // handoff and miss the running-turn drain entirely.
     let mut turn_bus_rx = bus.subscribe();
+    let mut codex_thread_action_dedupe = CodexThreadActionDedupe::default();
 
     // Outer loop: either a task envelope arrives (run the agent), a thread
     // action arrives (invoke it on the persistent agent), or the task
@@ -9227,6 +10267,7 @@ async fn run_with_presence(
             },
             msg = outer_bus_rx.recv() => match msg {
                 Ok(AppEvent::CodexThreadActionRequested {
+                    request_id,
                     session_id,
                     action,
                     params,
@@ -9236,6 +10277,9 @@ async fn run_with_presence(
                     &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
                     &persistent_open_side_threads,
                 ) => {
+                    if !codex_thread_action_dedupe.mark_seen(&request_id) {
+                        continue;
+                    }
                     OuterSignal::ThreadAction {
                         session_id,
                         op: action,
@@ -9277,6 +10321,200 @@ async fn run_with_presence(
                 params,
             } => {
                 let mut action_params = params;
+                if let Some(request) = external_context_rewind_request_from_action(
+                    &op,
+                    &action_params,
+                    session_id.clone(),
+                ) {
+                    let request = match request {
+                        Ok(request) => request,
+                        Err(message) => {
+                            bus.send(AppEvent::CodexThreadActionResult {
+                                session_id: session_id.clone().or_else(|| local_session_id.clone()),
+                                action: op,
+                                success: false,
+                                message,
+                            });
+                            turn_bus_rx = bus.subscribe();
+                            continue;
+                        }
+                    };
+                    let Some(ref mut agent) = persistent_agent else {
+                        bus.send(AppEvent::CodexThreadActionResult {
+                            session_id: session_id.clone().or_else(|| local_session_id.clone()),
+                            action: op,
+                            success: false,
+                            message: "no active agent — start a task first".to_string(),
+                        });
+                        turn_bus_rx = bus.subscribe();
+                        continue;
+                    };
+                    let Some(thread) = persistent_thread.as_ref() else {
+                        bus.send(AppEvent::CodexThreadActionResult {
+                            session_id: session_id.clone().or_else(|| local_session_id.clone()),
+                            action: op,
+                            success: false,
+                            message: "no active Codex thread — start a task first".to_string(),
+                        });
+                        turn_bus_rx = bus.subscribe();
+                        continue;
+                    };
+                    let drain_config = DrainConfig {
+                        bus: &bus,
+                        web_port,
+                        session_id: session_log_id(&session_log),
+                        alias_session_id: Some(thread.thread_id.clone()),
+                        autonomy: autonomy.clone(),
+                        session_log: &session_log,
+                        project_root: &project.root,
+                        log_dir: &log_dir,
+                        approval_registry: &approval_registry,
+                        json_approval: None,
+                        agent_source: Some("Codex".to_string()),
+                        suppress_agent_started: true,
+                        persist_model_responses_inline: false,
+                        headless: false,
+                        context_injection: &context_injection,
+                    };
+                    match apply_external_context_rewind(
+                        agent,
+                        &thread.thread_id,
+                        &request,
+                        &drain_config,
+                    )
+                    .await
+                    {
+                        Ok(Some(followup)) => {
+                            if let Some(event_rx) = persistent_event_rx.as_mut() {
+                                let mut side_session_state = ExternalSideSessionState {
+                                    open_side_threads: &mut persistent_open_side_threads,
+                                    side_rounds: &mut persistent_side_rounds,
+                                    side_turn_revisions: &mut persistent_side_turn_revisions,
+                                };
+                                match send_external_context_rewind_resume_turn(
+                                    agent,
+                                    thread,
+                                    followup,
+                                    ExternalContextRewindResume {
+                                        event_rx,
+                                        turn_bus_rx: &mut turn_bus_rx,
+                                        config: &drain_config,
+                                        stats: &mut cumulative_stats,
+                                        diff_tracker: &mut persistent_diff_tracker,
+                                        pending_runtime_steers:
+                                            &mut persistent_pending_runtime_steers,
+                                        codex_thread_action_dedupe: &mut codex_thread_action_dedupe,
+                                        side_sessions: Some(&mut side_session_state),
+                                    },
+                                )
+                                .await
+                                {
+                                    Ok(DrainOutcome::TurnCompleted {
+                                        message,
+                                        turns_in_round,
+                                    }) => {
+                                        cumulative_stats.turns += 1;
+                                        cumulative_stats.rounds += 1;
+                                        bus.send(AppEvent::DoneSignal {
+                                            session_id: session_log_id(&session_log),
+                                            message: message.clone(),
+                                        });
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: session_log_id(&session_log),
+                                            round: cumulative_stats.rounds,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                        });
+                                    }
+                                    Ok(DrainOutcome::ContextRewindRequested {
+                                        request, ..
+                                    }) => {
+                                        emit_context_rewind_failure(
+                                            &request,
+                                            "nested context rewind during resumed turn is not supported yet"
+                                                .to_string(),
+                                            &drain_config,
+                                        );
+                                    }
+                                    Ok(DrainOutcome::RecoveryRequired {
+                                        message,
+                                        recovery_hint,
+                                        turns_in_round,
+                                    }) => {
+                                        cumulative_stats.rounds += 1;
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: session_log_id(&session_log),
+                                            round: cumulative_stats.rounds,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                        });
+                                        bus.send(AppEvent::PresenceLog {
+                                            message: recovery_required_message(
+                                                &message,
+                                                recovery_hint.as_deref(),
+                                            ),
+                                            level: Some(types::LogLevel::Warn),
+                                            turn: None,
+                                        });
+                                    }
+                                    Ok(DrainOutcome::Interrupted { reason }) => {
+                                        bus.send(AppEvent::PresenceLog {
+                                            message: format!(
+                                                "External agent interrupted during resumed context-rewind turn: {}",
+                                                reason
+                                            ),
+                                            level: None,
+                                            turn: None,
+                                        });
+                                    }
+                                    Ok(DrainOutcome::Terminated { reason, .. }) => {
+                                        bus.send(AppEvent::PresenceLog {
+                                            message: format!(
+                                                "External agent terminated: {}",
+                                                reason
+                                            ),
+                                            level: Some(types::LogLevel::Error),
+                                            turn: None,
+                                        });
+                                        persistent_agent = None;
+                                        persistent_thread = None;
+                                        persistent_event_rx = None;
+                                        persistent_diff_tracker =
+                                            ExternalDiffDeltaTracker::default();
+                                        persistent_pending_runtime_steers.clear();
+                                        persistent_open_side_threads.clear();
+                                        persistent_side_rounds.clear();
+                                        persistent_side_turn_revisions.clear();
+                                    }
+                                    Ok(DrainOutcome::ChannelClosed) => {
+                                        persistent_agent = None;
+                                        persistent_thread = None;
+                                        persistent_event_rx = None;
+                                        persistent_diff_tracker =
+                                            ExternalDiffDeltaTracker::default();
+                                        persistent_pending_runtime_steers.clear();
+                                        persistent_open_side_threads.clear();
+                                        persistent_side_rounds.clear();
+                                        persistent_side_turn_revisions.clear();
+                                    }
+                                    Err(message) => {
+                                        emit_context_rewind_failure(
+                                            &request,
+                                            message,
+                                            &drain_config,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(message) => {
+                            emit_context_rewind_failure(&request, message, &drain_config);
+                        }
+                    }
+                    turn_bus_rx = bus.subscribe();
+                    continue;
+                }
                 // `/new` is a daemon-side operation (not a Codex RPC): clear
                 // the persistent agent so the next task creates a fresh
                 // thread. Handled here — not inside dispatch_thread_action
@@ -9291,6 +10529,48 @@ async fn run_with_presence(
                     persistent_side_rounds.clear();
                     persistent_side_turn_revisions.clear();
                     Ok("agent torn down; next task will start a fresh thread".to_string())
+                } else if is_context_rewind_backout_action(&op) {
+                    let Some(ref mut agent) = persistent_agent else {
+                        turn_bus_rx = bus.subscribe();
+                        bus.send(AppEvent::CodexThreadActionResult {
+                            session_id: session_id.clone().or_else(|| local_session_id.clone()),
+                            action: op,
+                            success: false,
+                            message: "no active agent — start a task first".to_string(),
+                        });
+                        continue;
+                    };
+                    let target_thread_id = session_id
+                        .as_deref()
+                        .filter(|id| Some(*id) != local_session_id.as_deref())
+                        .or_else(|| {
+                            persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.as_str())
+                        });
+                    action_params =
+                        thread_action_params_with_thread_id(&op, action_params, target_thread_id);
+                    let drain_config = DrainConfig {
+                        bus: &bus,
+                        web_port,
+                        session_id: session_log_id(&session_log),
+                        alias_session_id: persistent_thread
+                            .as_ref()
+                            .map(|thread| thread.thread_id.clone()),
+                        autonomy: autonomy.clone(),
+                        session_log: &session_log,
+                        project_root: &project.root,
+                        log_dir: &log_dir,
+                        approval_registry: &approval_registry,
+                        json_approval: None,
+                        agent_source: Some("Codex".to_string()),
+                        suppress_agent_started: true,
+                        persist_model_responses_inline: false,
+                        headless: false,
+                        context_injection: &context_injection,
+                    };
+                    apply_context_rewind_backout_action(agent, &op, &action_params, &drain_config)
+                        .await
                 } else if let Some(ref mut agent) = persistent_agent {
                     let target_thread_id = session_id
                         .as_deref()
@@ -9402,6 +10682,7 @@ async fn run_with_presence(
                                 &mut cumulative_stats,
                                 &mut persistent_diff_tracker,
                                 &mut persistent_pending_runtime_steers,
+                                &mut codex_thread_action_dedupe,
                                 child_thread_id,
                                 "side",
                             )
@@ -9904,6 +11185,7 @@ async fn run_with_presence(
                 &mut cumulative_stats,
                 &mut persistent_diff_tracker,
                 &mut persistent_pending_runtime_steers,
+                &mut codex_thread_action_dedupe,
                 Some(&mut side_session_state),
             )
             .await
@@ -9927,6 +11209,165 @@ async fn run_with_presence(
                         round: cumulative_stats.rounds,
                         turns_in_round,
                         native_message_count: None,
+                    });
+                }
+                DrainOutcome::ContextRewindRequested {
+                    request,
+                    message,
+                    turns_in_round,
+                } => {
+                    cumulative_stats.turns += 1;
+                    cumulative_stats.rounds += 1;
+                    bus.send(AppEvent::DoneSignal {
+                        session_id: session_log_id(&session_log),
+                        message: message.clone(),
+                    });
+                    bus.send(AppEvent::RoundComplete {
+                        session_id: session_log_id(&session_log),
+                        round: cumulative_stats.rounds,
+                        turns_in_round,
+                        native_message_count: None,
+                    });
+                    match apply_external_context_rewind(
+                        agent,
+                        &thread.thread_id,
+                        &request,
+                        &drain_config,
+                    )
+                    .await
+                    {
+                        Ok(Some(followup)) => {
+                            let mut resume_side_state = ExternalSideSessionState {
+                                open_side_threads: &mut persistent_open_side_threads,
+                                side_rounds: &mut persistent_side_rounds,
+                                side_turn_revisions: &mut persistent_side_turn_revisions,
+                            };
+                            match send_external_context_rewind_resume_turn(
+                                agent,
+                                thread,
+                                followup,
+                                ExternalContextRewindResume {
+                                    event_rx,
+                                    turn_bus_rx: &mut turn_bus_rx,
+                                    config: &drain_config,
+                                    stats: &mut cumulative_stats,
+                                    diff_tracker: &mut persistent_diff_tracker,
+                                    pending_runtime_steers: &mut persistent_pending_runtime_steers,
+                                    codex_thread_action_dedupe: &mut codex_thread_action_dedupe,
+                                    side_sessions: Some(&mut resume_side_state),
+                                },
+                            )
+                            .await
+                            {
+                                Ok(DrainOutcome::TurnCompleted {
+                                    message,
+                                    turns_in_round,
+                                }) => {
+                                    cumulative_stats.turns += 1;
+                                    cumulative_stats.rounds += 1;
+                                    bus.send(AppEvent::DoneSignal {
+                                        session_id: session_log_id(&session_log),
+                                        message: message.clone(),
+                                    });
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: session_log_id(&session_log),
+                                        round: cumulative_stats.rounds,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
+                                }
+                                Ok(DrainOutcome::ContextRewindRequested { request, .. }) => {
+                                    emit_context_rewind_failure(
+                                        &request,
+                                        "nested context rewind during resumed turn is not supported yet"
+                                            .to_string(),
+                                        &drain_config,
+                                    );
+                                }
+                                Ok(DrainOutcome::RecoveryRequired {
+                                    message,
+                                    recovery_hint,
+                                    turns_in_round,
+                                }) => {
+                                    cumulative_stats.rounds += 1;
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: session_log_id(&session_log),
+                                        round: cumulative_stats.rounds,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
+                                    bus.send(AppEvent::PresenceLog {
+                                        message: recovery_required_message(
+                                            &message,
+                                            recovery_hint.as_deref(),
+                                        ),
+                                        level: Some(types::LogLevel::Warn),
+                                        turn: None,
+                                    });
+                                }
+                                Ok(DrainOutcome::Interrupted { reason }) => {
+                                    bus.send(AppEvent::PresenceLog {
+                                        message: format!(
+                                            "External agent interrupted during resumed context-rewind turn: {}",
+                                            reason
+                                        ),
+                                        level: None,
+                                        turn: None,
+                                    });
+                                    cumulative_stats.rounds += 1;
+                                }
+                                Ok(DrainOutcome::Terminated { reason, .. }) => {
+                                    bus.send(AppEvent::PresenceLog {
+                                        message: format!("External agent terminated: {}", reason),
+                                        level: Some(types::LogLevel::Error),
+                                        turn: None,
+                                    });
+                                    persistent_agent = None;
+                                    persistent_thread = None;
+                                    persistent_event_rx = None;
+                                    persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                                    persistent_pending_runtime_steers.clear();
+                                    persistent_open_side_threads.clear();
+                                    persistent_side_rounds.clear();
+                                    persistent_side_turn_revisions.clear();
+                                }
+                                Ok(DrainOutcome::ChannelClosed) => {
+                                    persistent_agent = None;
+                                    persistent_thread = None;
+                                    persistent_event_rx = None;
+                                    persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                                    persistent_pending_runtime_steers.clear();
+                                    persistent_open_side_threads.clear();
+                                    persistent_side_rounds.clear();
+                                    persistent_side_turn_revisions.clear();
+                                }
+                                Err(message) => {
+                                    emit_context_rewind_failure(&request, message, &drain_config);
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(message) => {
+                            emit_context_rewind_failure(&request, message, &drain_config);
+                        }
+                    }
+                }
+                DrainOutcome::RecoveryRequired {
+                    message,
+                    recovery_hint,
+                    turns_in_round,
+                } => {
+                    cumulative_stats.rounds += 1;
+                    bus.send(AppEvent::RoundComplete {
+                        session_id: session_log_id(&session_log),
+                        round: cumulative_stats.rounds,
+                        turns_in_round,
+                        native_message_count: None,
+                    });
+                    bus.send(AppEvent::PresenceLog {
+                        message: recovery_required_message(&message, recovery_hint.as_deref()),
+                        level: Some(types::LogLevel::Warn),
+                        turn: None,
                     });
                 }
                 DrainOutcome::Interrupted { reason } => {
@@ -10681,6 +12122,7 @@ async fn run_external_agent_mode(
     // Subscribe while idle so a steer sent immediately after the prompt
     // (before turn/start returns) is still available to the turn drain.
     let mut turn_bus_rx = bus.subscribe();
+    let mut codex_thread_action_dedupe = CodexThreadActionDedupe::default();
     if let Some(ready_tx) = ready_for_thread_actions {
         let _ = ready_tx.send(());
     }
@@ -10762,6 +12204,7 @@ async fn run_external_agent_mode(
                                 .for_target(session_id);
                             }
                             Ok(AppEvent::CodexThreadActionRequested {
+                                request_id,
                                 session_id,
                                 action,
                                 params,
@@ -10771,6 +12214,66 @@ async fn run_external_agent_mode(
                                 &drain_config.alias_session_id,
                                 &open_side_threads,
                             ) => {
+                                if !codex_thread_action_dedupe.mark_seen(&request_id) {
+                                    continue;
+                                }
+                                if let Some(request) =
+                                    external_context_rewind_request_from_action(
+                                        &action,
+                                        &params,
+                                        session_id.clone(),
+                                    )
+                                {
+                                    let request = match request {
+                                        Ok(request) => request,
+                                        Err(message) => {
+                                            bus.send(AppEvent::CodexThreadActionResult {
+                                                session_id: session_id.clone().or_else(|| live_session_id.clone()),
+                                                action,
+                                                success: false,
+                                                message,
+                                            });
+                                            continue;
+                                        }
+                                    };
+                                    if session_id
+                                        .as_deref()
+                                        .is_some_and(|id| open_side_threads.contains_key(id))
+                                    {
+                                        emit_context_rewind_failure(
+                                            &request,
+                                            "context rewind is not supported for side conversations".to_string(),
+                                            &drain_config,
+                                        );
+                                        continue;
+                                    }
+                                    match apply_external_context_rewind(
+                                        &mut agent,
+                                        &thread.thread_id,
+                                        &request,
+                                        &drain_config,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(followup)) => {
+                                            turn_bus_rx = bus.subscribe();
+                                            break followup;
+                                        }
+                                        Ok(None) => {
+                                            turn_bus_rx = bus.subscribe();
+                                            continue;
+                                        }
+                                        Err(message) => {
+                                            emit_context_rewind_failure(
+                                                &request,
+                                                message,
+                                                &drain_config,
+                                            );
+                                            turn_bus_rx = bus.subscribe();
+                                            continue;
+                                        }
+                                    }
+                                }
                                 if let Some(side_thread_id) = session_id
                                     .as_deref()
                                     .filter(|id| open_side_threads.contains_key(*id))
@@ -10848,6 +12351,7 @@ async fn run_external_agent_mode(
                                         &mut stats,
                                         &mut diff_tracker,
                                         &mut pending_runtime_steers,
+                                        &mut codex_thread_action_dedupe,
                                         child_thread_id,
                                         "side",
                                     )
@@ -11019,6 +12523,7 @@ async fn run_external_agent_mode(
                 &mut stats,
                 &mut diff_tracker,
                 &mut pending_runtime_steers,
+                &mut codex_thread_action_dedupe,
                 side_thread_id,
                 "side",
             )
@@ -11125,6 +12630,7 @@ async fn run_external_agent_mode(
                 &mut stats,
                 &mut diff_tracker,
                 &mut pending_runtime_steers,
+                &mut codex_thread_action_dedupe,
                 subagent_thread_id,
                 "subagent",
             )
@@ -11302,6 +12808,7 @@ async fn run_external_agent_mode(
             &mut stats,
             &mut diff_tracker,
             &mut pending_runtime_steers,
+            &mut codex_thread_action_dedupe,
             Some(&mut side_session_state),
         )
         .await
@@ -11323,6 +12830,65 @@ async fn run_external_agent_mode(
                     native_message_count: None,
                 });
                 slog(&session_log, |l| l.round_complete(round, turns_in_round));
+            }
+            DrainOutcome::ContextRewindRequested {
+                request,
+                message,
+                turns_in_round,
+            } => {
+                stats.rounds = round;
+                bus.send(AppEvent::DoneSignal {
+                    session_id: live_session_id.clone(),
+                    message: message.clone(),
+                });
+                bus.send(AppEvent::RoundComplete {
+                    session_id: live_session_id.clone(),
+                    round,
+                    turns_in_round,
+                    native_message_count: None,
+                });
+                slog(&session_log, |l| l.round_complete(round, turns_in_round));
+                match apply_external_context_rewind(
+                    &mut agent,
+                    &thread.thread_id,
+                    &request,
+                    &drain_config,
+                )
+                .await
+                {
+                    Ok(Some(followup)) => {
+                        next_turn = Some(followup);
+                    }
+                    Ok(None) => {}
+                    Err(message) => {
+                        emit_context_rewind_failure(&request, message, &drain_config);
+                    }
+                }
+            }
+            DrainOutcome::RecoveryRequired {
+                message,
+                recovery_hint,
+                turns_in_round,
+            } => {
+                stats.rounds = round;
+                slog(&session_log, |l| {
+                    l.warn(&recovery_required_message(
+                        &message,
+                        recovery_hint.as_deref(),
+                    ))
+                });
+                bus.send(AppEvent::RoundComplete {
+                    session_id: live_session_id.clone(),
+                    round,
+                    turns_in_round,
+                    native_message_count: None,
+                });
+                bus.send(AppEvent::TaskComplete {
+                    session_id: live_session_id.clone(),
+                    reason: "recovery required".to_string(),
+                    summary: recovery_hint.or(Some(message)),
+                });
+                break;
             }
             DrainOutcome::Interrupted { reason } => {
                 // User-requested interrupt. Emit RoundComplete so the
@@ -13122,7 +14688,7 @@ async fn main() -> Result<(), CallerError> {
         mcp_http_state.frame_registry = Some(frame_registry.clone());
         mcp_http_state.session_registry = Some(session_registry.clone());
         mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
-        let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
+        let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
             Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
             bus.clone(),
         )));
@@ -13343,7 +14909,7 @@ async fn main() -> Result<(), CallerError> {
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
-            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
+            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
                 Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
                 bus.clone(),
             )));
@@ -13939,7 +15505,7 @@ async fn main() -> Result<(), CallerError> {
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
-            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
+            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
                 Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
                 bus.clone(),
             )));
@@ -14445,7 +16011,7 @@ async fn main() -> Result<(), CallerError> {
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
-            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
+            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
                 Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
                 bus.clone(),
             )));

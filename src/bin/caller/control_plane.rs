@@ -313,6 +313,7 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             // owns the persistent Codex agent) can pick it up and run the
             // RPC. We don't own the agent here, so we only translate.
             state.bus.send(AppEvent::CodexThreadActionRequested {
+                request_id: uuid::Uuid::new_v4().simple().to_string(),
                 session_id: session_id.clone(),
                 action: op.clone(),
                 params: params.clone(),
@@ -1176,10 +1177,12 @@ mod tests {
         for _ in 0..20 {
             match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
                 Ok(Ok(AppEvent::CodexThreadActionRequested {
+                    request_id,
                     session_id,
                     action,
                     params,
                 })) => {
+                    assert!(!request_id.is_empty());
                     assert_eq!(session_id.as_deref(), Some("sess-action"));
                     assert_eq!(action, "compact");
                     assert_eq!(params["extra"], "data");

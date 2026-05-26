@@ -2,7 +2,7 @@ use crate::conversation::ImageData;
 use crate::error::CallerError;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 pub mod claude_code;
@@ -185,6 +185,10 @@ impl AgentBackend {
     pub fn supports_user_message_rewind(&self) -> bool {
         matches!(self, AgentBackend::Codex)
     }
+
+    pub fn supports_item_anchor_rewind(&self) -> bool {
+        matches!(self, AgentBackend::Codex)
+    }
 }
 
 pub fn source_session_id_is_canonical(source: &str, session_id: &str) -> bool {
@@ -242,6 +246,15 @@ pub enum AgentEvent {
     Usage { usage: AgentUsageSnapshot },
     /// Informational backend event that should be written to the activity log.
     Log { level: String, message: String },
+    /// A backend/runtime error for the active turn.
+    BackendError {
+        message: String,
+        code: Option<String>,
+        details: Option<String>,
+        will_retry: bool,
+        likely_generation_starvation: bool,
+        recovery_hint: Option<String>,
+    },
     /// An external runtime spawned or interacted with native sub-agents.
     SubAgentToolCall {
         item_id: String,
@@ -392,6 +405,35 @@ pub struct AgentConfig {
 /// Handle to a conversation thread within an external agent.
 pub struct AgentThread {
     pub thread_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentThreadSnapshot {
+    pub thread_id: String,
+    pub rollout_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackAnchorPosition {
+    Before,
+    After,
+}
+
+impl RollbackAnchorPosition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Before => "before",
+            Self::After => "after",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "before" => Some(Self::Before),
+            "after" => Some(Self::After),
+            _ => None,
+        }
+    }
 }
 
 /// Exact model request payload exposed by an external agent backend.
@@ -545,7 +587,53 @@ pub trait ExternalAgent: Send + Sync {
         )))
     }
 
+    /// Read backend-owned thread metadata. The rollout path is important for
+    /// Intendant-owned rewind records: copying it before a rollback preserves a
+    /// backout/fork handle without teaching Codex about Intendant's policy.
+    async fn read_thread_snapshot(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<AgentThreadSnapshot, CallerError> {
+        let _ = thread_id;
+        Err(CallerError::ExternalAgent(
+            "thread metadata read not supported by this backend".into(),
+        ))
+    }
+
+    /// Fork a backend thread from a persisted rollout path. For Codex this
+    /// creates a new thread id and therefore a new Responses prompt cache key;
+    /// callers must keep this behind an explicit cache-reset opt-in.
+    async fn fork_thread_from_rollout_path(
+        &mut self,
+        rollout_path: &Path,
+        name: Option<&str>,
+    ) -> Result<AgentThread, CallerError> {
+        let _ = (rollout_path, name);
+        Err(CallerError::ExternalAgent(
+            "rollout-path thread fork not supported by this backend".into(),
+        ))
+    }
+
+    /// Restore a loaded backend thread from a persisted rollout path while
+    /// preserving the same backend thread id. Codex implements this through
+    /// app-server `thread/restore`; other backends use the default error.
+    async fn restore_thread_from_rollout_path(
+        &mut self,
+        thread_id: &str,
+        rollout_path: &Path,
+        record_id: Option<&str>,
+    ) -> Result<(), CallerError> {
+        let _ = (thread_id, rollout_path, record_id);
+        Err(CallerError::ExternalAgent(
+            "same-thread rollout restore not supported by this backend".into(),
+        ))
+    }
+
     fn supports_user_message_rewind(&self) -> bool {
+        false
+    }
+
+    fn supports_item_anchor_rewind(&self) -> bool {
         false
     }
 
@@ -578,6 +666,36 @@ pub trait ExternalAgent: Send + Sync {
         let _ = (thread_id, turns_to_drop);
         Err(CallerError::ExternalAgent(
             "targeted conversation rollback not supported by this backend".into(),
+        ))
+    }
+
+    /// Ask the backend to truncate a specific thread at a provider-visible
+    /// item anchor. This is intentionally narrower than Intendant's lineage
+    /// policy: Codex owns exact rollout mutation, while Intendant decides
+    /// which anchor is valid for a rewind.
+    async fn rollback_thread_to_item_anchor(
+        &mut self,
+        thread_id: &str,
+        item_id: &str,
+        position: RollbackAnchorPosition,
+    ) -> Result<(), CallerError> {
+        let _ = (thread_id, item_id, position);
+        Err(CallerError::ExternalAgent(
+            "item-anchor conversation rollback not supported by this backend".into(),
+        ))
+    }
+
+    /// Append a developer-role item to a loaded backend thread without
+    /// starting a user turn. Used by Intendant-owned context rewind so the
+    /// carry-forward primer is instruction context, not user intent.
+    async fn inject_thread_developer_message(
+        &mut self,
+        thread_id: &str,
+        message: &str,
+    ) -> Result<(), CallerError> {
+        let _ = (thread_id, message);
+        Err(CallerError::ExternalAgent(
+            "developer-message injection not supported by this backend".into(),
         ))
     }
 
@@ -692,6 +810,13 @@ mod tests {
         assert!(AgentBackend::Codex.supports_user_message_rewind());
         assert!(!AgentBackend::ClaudeCode.supports_user_message_rewind());
         assert!(!AgentBackend::GeminiCli.supports_user_message_rewind());
+    }
+
+    #[test]
+    fn item_anchor_rewind_capability_is_explicit() {
+        assert!(AgentBackend::Codex.supports_item_anchor_rewind());
+        assert!(!AgentBackend::ClaudeCode.supports_item_anchor_rewind());
+        assert!(!AgentBackend::GeminiCli.supports_item_anchor_rewind());
     }
 
     #[test]

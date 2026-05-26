@@ -10077,6 +10077,60 @@ function parseCodexSlashCommand(text) {
     if (prompt) params.prompt = prompt;
     return { op: 'side', params };
   }
+  if (
+    name === 'rewind-anchor' ||
+    name === 'rewind-to-item' ||
+    name === 'rollback-anchor' ||
+    name === 'rollback-to-item'
+  ) {
+    const tokens = rest.split(/\s+/).map(s => s.trim()).filter(Boolean);
+    if (tokens.length === 0) {
+      return { error: `/${name} requires an item id` };
+    }
+    let position = 'after';
+    const last = tokens[tokens.length - 1].toLowerCase();
+    if (last === 'before' || last === 'after') {
+      position = last;
+      tokens.pop();
+    }
+    const itemId = unquoteSlashValue(tokens.join(' '));
+    if (!itemId) return { error: `/${name} requires an item id` };
+    return { op: 'rewind-anchor', params: { itemId, position } };
+  }
+  if (
+    name === 'rewind-backout' ||
+    name === 'rewind-inspect' ||
+    name === 'context-rewind-backout'
+  ) {
+    const cacheReset = takeGoalFlag(rest, ['allow-cache-reset', 'allow-cache-breaking-fork']);
+    const recordId = unquoteSlashValue(cacheReset.text);
+    if (!recordId) return { error: `/${name} requires a rewind record id` };
+    const params = { recordId, mode: 'inspect' };
+    if (cacheReset.found) params.allowCacheReset = true;
+    return { op: 'rewind-backout', params };
+  }
+  if (
+    name === 'rewind-restore' ||
+    name === 'context-rewind-restore'
+  ) {
+    const cacheReset = takeGoalFlag(rest, ['allow-cache-reset', 'allow-cache-breaking-fork']);
+    const recordId = unquoteSlashValue(cacheReset.text);
+    if (!recordId) return { error: `/${name} requires a rewind record id` };
+    const params = { recordId, mode: 'restore' };
+    if (cacheReset.found) params.allowCacheReset = true;
+    return { op: 'rewind-backout', params };
+  }
+  if (name === 'rewind') {
+    const tokens = rest.split(/\s+/).map(s => s.trim()).filter(Boolean);
+    const mode = (tokens.shift() || '').toLowerCase();
+    if (mode !== 'inspect' && mode !== 'backout' && mode !== 'fork' && mode !== 'restore') return null;
+    const cacheReset = takeGoalFlag(tokens.join(' '), ['allow-cache-reset', 'allow-cache-breaking-fork']);
+    const recordId = unquoteSlashValue(cacheReset.text);
+    if (!recordId) return { error: `/rewind ${mode} requires a rewind record id` };
+    const params = { recordId, mode: mode === 'backout' ? 'inspect' : mode };
+    if (cacheReset.found) params.allowCacheReset = true;
+    return { op: 'rewind-backout', params };
+  }
   if (name === 'goal') return parseGoalSlash(rest);
   return null;
 }

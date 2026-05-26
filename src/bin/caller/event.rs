@@ -554,6 +554,7 @@ pub enum AppEvent {
     /// its params — one-way, no ack on this variant. The watcher emits a
     /// `CodexThreadActionResult` after the agent call returns.
     CodexThreadActionRequested {
+        request_id: String,
         session_id: Option<String>,
         action: String,
         params: serde_json::Value,
