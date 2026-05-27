@@ -50,9 +50,17 @@ class IntendantCodex(Codex):
                 "if ldd --version 2>&1 | grep -qi musl || [ -f /etc/alpine-release ]; then"
                 "  echo 'IntendantCodex requires a glibc Linux task image' >&2; exit 1;"
                 " elif command -v apt-get &>/dev/null; then"
-                "  apt-get update && apt-get install -y "
-                "curl ripgrep ca-certificates libssl3 libzstd1 zlib1g "
-                "libpipewire-0.3-0 libvpx7 libxcb1 libxcb-shm0 libxcb-randr0;"
+                "  apt-get update &&"
+                "  apt-get install -y --no-install-recommends "
+                "curl ripgrep ca-certificates libzstd1 zlib1g "
+                "libpipewire-0.3-0 libxcb1 libxcb-shm0 libxcb-randr0 &&"
+                "  (apt-get install -y --no-install-recommends libssl3 ||"
+                "   apt-get install -y --no-install-recommends libssl3t64) &&"
+                "  (apt-get install -y --no-install-recommends libvpx7 ||"
+                "   (curl -fsSL -o /tmp/libvpx7.deb "
+                "http://archive.ubuntu.com/ubuntu/pool/main/libv/libvpx/"
+                "libvpx7_1.11.0-2ubuntu2.5_amd64.deb &&"
+                "    apt-get install -y --no-install-recommends /tmp/libvpx7.deb));"
                 " elif command -v yum &>/dev/null; then"
                 "  yum install -y curl ripgrep ca-certificates;"
                 " else"
@@ -238,6 +246,14 @@ class IntendantCodex(Codex):
                 )
             except Exception:
                 pass
+            if auth_json_path:
+                try:
+                    await environment.download_file(remote_auth_path, auth_json_path)
+                    auth_json_path.chmod(0o600)
+                except Exception as exc:
+                    self.logger.warning(
+                        "Failed to persist refreshed Codex auth.json: %s", exc
+                    )
             try:
                 await self.exec_as_agent(
                     environment,
