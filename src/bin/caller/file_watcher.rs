@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
@@ -130,6 +131,8 @@ pub(crate) struct BaselineFileMeta {
 }
 
 pub(crate) type BaselineManifest = HashMap<String, BaselineFileMeta>;
+
+type FileFingerprint = (u64, Option<u128>);
 
 #[derive(Debug, Clone)]
 pub(crate) struct TextFileSnapshot {
@@ -255,6 +258,15 @@ fn sha256_file(path: &Path) -> std::io::Result<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&result);
     Ok(out)
+}
+
+fn metadata_fingerprint(meta: &std::fs::Metadata) -> FileFingerprint {
+    let modified_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    (meta.len(), modified_nanos)
 }
 
 pub(crate) fn inspect_file(path: &Path) -> std::io::Result<InspectedFile> {
@@ -397,6 +409,10 @@ pub struct FileWatcher {
     baseline_manifest: BaselineManifest,
     /// SHA-256 hashes of last-known content, for change deduplication.
     hashes: HashMap<PathBuf, [u8; 32]>,
+    /// Last-known metadata fingerprints for oversized files. These files are
+    /// not snapshotted, and duplicate notify events can otherwise re-hash tens
+    /// of megabytes repeatedly while an editor writes temp files.
+    large_file_fingerprints: HashMap<PathBuf, FileFingerprint>,
     /// Persistent session history of per-round snapshots.
     history: History,
 }
@@ -419,6 +435,7 @@ impl FileWatcher {
         let mut baselines = HashMap::new();
         let mut baseline_manifest = BaselineManifest::new();
         let mut hashes = HashMap::new();
+        let mut large_file_fingerprints = HashMap::new();
 
         let mut stack = vec![project_root.clone()];
         while let Some(dir) = stack.pop() {
@@ -484,6 +501,12 @@ impl FileWatcher {
                         );
                     }
                     Ok(InspectedFile::Unsupported(snapshot)) => {
+                        if snapshot.size > SNAPSHOT_MAX_FILE_BYTES {
+                            if let Ok(meta) = std::fs::metadata(&path) {
+                                large_file_fingerprints
+                                    .insert(rel.clone(), metadata_fingerprint(&meta));
+                            }
+                        }
                         hashes.insert(rel, snapshot.hash);
                         baseline_manifest.insert(
                             rel_key,
@@ -519,6 +542,7 @@ impl FileWatcher {
             baselines,
             baseline_manifest,
             hashes,
+            large_file_fingerprints,
             history,
         })
     }
@@ -632,8 +656,21 @@ impl FileWatcher {
 
         match change_kind {
             FileChangeKind::Created | FileChangeKind::Modified => {
+                let large_file_fingerprint = match std::fs::metadata(abs_path) {
+                    Ok(meta) if meta.len() > SNAPSHOT_MAX_FILE_BYTES => {
+                        let fingerprint = metadata_fingerprint(&meta);
+                        if self.large_file_fingerprints.get(&rel) == Some(&fingerprint) {
+                            return;
+                        }
+                        Some(fingerprint)
+                    }
+                    Ok(_) => None,
+                    Err(_) => return,
+                };
+
                 match inspect_file(abs_path) {
                     Ok(InspectedFile::Text(snapshot)) => {
+                        self.large_file_fingerprints.remove(&rel);
                         if self.hashes.get(&rel) == Some(&snapshot.hash) {
                             return; // no actual change
                         }
@@ -657,6 +694,19 @@ impl FileWatcher {
                         });
                     }
                     Ok(InspectedFile::Unsupported(snapshot)) => {
+                        if snapshot.size > SNAPSHOT_MAX_FILE_BYTES {
+                            let fingerprint = large_file_fingerprint.or_else(|| {
+                                std::fs::metadata(abs_path)
+                                    .ok()
+                                    .map(|meta| metadata_fingerprint(&meta))
+                            });
+                            if let Some(fingerprint) = fingerprint {
+                                self.large_file_fingerprints
+                                    .insert(rel.clone(), fingerprint);
+                            }
+                        } else {
+                            self.large_file_fingerprints.remove(&rel);
+                        }
                         if self.hashes.get(&rel) == Some(&snapshot.hash) {
                             return; // no actual change
                         }
@@ -686,6 +736,7 @@ impl FileWatcher {
                     });
                 }
                 self.hashes.remove(&rel);
+                self.large_file_fingerprints.remove(&rel);
             }
         }
     }
@@ -908,6 +959,12 @@ impl FileWatcher {
                 if should_ignore(&rel) {
                     continue;
                 }
+                if std::fs::metadata(&path)
+                    .map(|meta| meta.len() > SNAPSHOT_MAX_FILE_BYTES)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let snapshot = match inspect_file(&path) {
                     Ok(InspectedFile::Text(snapshot)) => snapshot,
                     Ok(InspectedFile::Unsupported(_)) | Err(_) => continue,
@@ -1006,6 +1063,12 @@ impl FileWatcher {
                 if should_ignore(&rel) {
                     continue;
                 }
+                if std::fs::metadata(&path)
+                    .map(|meta| meta.len() > SNAPSHOT_MAX_FILE_BYTES)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let snapshot = match inspect_file(&path) {
                     Ok(InspectedFile::Text(snapshot)) => snapshot,
                     Ok(InspectedFile::Unsupported(_)) | Err(_) => continue,
@@ -1066,6 +1129,7 @@ impl FileWatcher {
     /// `FileChanged` events for paths we just rewrote.
     fn refresh_hashes_from_tree(&mut self) {
         let mut new_hashes = HashMap::new();
+        let mut large_file_fingerprints = HashMap::new();
         let mut stack = vec![self.project_root.clone()];
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
@@ -1096,6 +1160,12 @@ impl FileWatcher {
                 if should_ignore(&rel) {
                     continue;
                 }
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if meta.len() > SNAPSHOT_MAX_FILE_BYTES {
+                        large_file_fingerprints.insert(rel, metadata_fingerprint(&meta));
+                        continue;
+                    }
+                }
                 if let Ok(snapshot) = inspect_file(&path) {
                     let hash = match snapshot {
                         InspectedFile::Text(snapshot) => snapshot.hash,
@@ -1106,6 +1176,7 @@ impl FileWatcher {
             }
         }
         self.hashes = new_hashes;
+        self.large_file_fingerprints = large_file_fingerprints;
     }
 
     /// Persist `history.json` atomically via tmp + rename.
@@ -1410,6 +1481,61 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn oversized_file_duplicate_events_are_deduped_by_metadata() {
+        let root = TempDir::new().unwrap();
+        let snap = TempDir::new().unwrap();
+        let file_path = root.path().join("large.csv");
+        let mut content = vec![b'a'; SNAPSHOT_MAX_FILE_BYTES as usize + 1];
+        std::fs::write(&file_path, &content).unwrap();
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut watcher =
+            FileWatcher::new(root.path().to_path_buf(), snap.path().to_path_buf(), bus)
+                .expect("watcher");
+
+        watcher.process_change(
+            &file_path,
+            &notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )),
+        );
+        assert!(rx.try_recv().is_err());
+
+        content.push(b'\n');
+        std::fs::write(&file_path, &content).unwrap();
+        watcher.process_change(
+            &file_path,
+            &notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )),
+        );
+
+        match rx.try_recv().expect("large file changed event") {
+            AppEvent::FileChanged {
+                path,
+                kind,
+                lines_added,
+                lines_removed,
+            } => {
+                assert_eq!(path, "large.csv");
+                assert_eq!(kind, FileChangeKind::Modified);
+                assert_eq!(lines_added, 0);
+                assert_eq!(lines_removed, 0);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        watcher.process_change(
+            &file_path,
+            &notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )),
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
