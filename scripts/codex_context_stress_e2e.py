@@ -661,7 +661,7 @@ def run_managed(args: argparse.Namespace, root: Path, workspace: Path) -> dict[s
         home,
         model=args.model,
         reasoning_effort=args.reasoning_effort,
-        context_window=args.context_window,
+        context_window=args.managed_context_window,
     )
     port = args.managed_port or free_port()
     if port == 8765:
@@ -952,6 +952,7 @@ def main() -> int:
     parser.add_argument("--model", default="gpt-5.5")
     parser.add_argument("--reasoning-effort", default="low")
     parser.add_argument("--context-window", type=int, default=30000)
+    parser.add_argument("--managed-context-window", type=int, default=20500)
     parser.add_argument("--vanilla-compact-limit", type=int, default=5000)
     parser.add_argument("--vanilla-resume-turns", type=int, default=2)
     parser.add_argument("--line-count", type=int, default=3000)
@@ -961,6 +962,8 @@ def main() -> int:
     parser.add_argument("--skip-vanilla", action="store_true")
     parser.add_argument("--skip-managed", action="store_true")
     args = parser.parse_args()
+
+    args.output_root = args.output_root.expanduser().resolve()
 
     if not args.vanilla_codex_bin.exists():
         raise SystemExit(f"vanilla Codex binary not found: {args.vanilla_codex_bin}")
@@ -980,6 +983,7 @@ def main() -> int:
             "model": args.model,
             "reasoning_effort": args.reasoning_effort,
             "context_window": args.context_window,
+            "managed_context_window": args.managed_context_window,
             "vanilla_compact_limit": args.vanilla_compact_limit,
             "line_count": args.line_count,
             "managed_idle_seconds": args.managed_idle_seconds,
