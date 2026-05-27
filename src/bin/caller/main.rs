@@ -7396,6 +7396,42 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
+    fn shared_external_control_receiver_consumes_turn_controls_once() {
+        let bus = EventBus::new();
+        let mut control_rx = bus.subscribe();
+
+        bus.send(AppEvent::SteerRequested {
+            session_id: Some("codex-thread".to_string()),
+            text: "steer once".to_string(),
+            id: "s1".to_string(),
+        });
+
+        match control_rx.try_recv() {
+            Ok(AppEvent::SteerRequested { id, .. }) => assert_eq!(id, "s1"),
+            other => panic!("expected control receiver to see steer, got {:?}", other),
+        }
+
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        bus.send(AppEvent::SteerRequested {
+            session_id: Some("codex-thread".to_string()),
+            text: "steer later".to_string(),
+            id: "s2".to_string(),
+        });
+
+        match control_rx.try_recv() {
+            Ok(AppEvent::SteerRequested { id, .. }) => assert_eq!(id, "s2"),
+            other => panic!(
+                "expected shared receiver to see later steer, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
     fn flush_pending_runtime_steers_delivers_only_matching_session() {
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
@@ -11053,10 +11089,10 @@ async fn run_external_agent_mode(
         headless,
         context_injection: &context_injection,
     };
-    let mut idle_bus_rx = bus.subscribe();
-    // Subscribe while idle so a steer sent immediately after the prompt
-    // (before turn/start returns) is still available to the turn drain.
-    let mut turn_bus_rx = bus.subscribe();
+    // Use one control receiver across idle waits and active turn drains.
+    // A second parked receiver would retain mid-turn controls and replay them
+    // as new idle follow-ups after the turn completes.
+    let mut external_control_rx = bus.subscribe();
     if let Some(ready_tx) = ready_for_thread_actions {
         let _ = ready_tx.send(());
     }
@@ -11122,7 +11158,7 @@ async fn run_external_agent_mode(
                             }
                         }
                     }
-                    bus_event = idle_bus_rx.recv() => {
+                    bus_event = external_control_rx.recv() => {
                         match bus_event {
                             Ok(AppEvent::SteerRequested {
                                 session_id,
@@ -11184,7 +11220,6 @@ async fn run_external_agent_mode(
                                             &drain_config,
                                         )
                                         .await;
-                                        turn_bus_rx = bus.subscribe();
                                         continue;
                                     }
                                 }
@@ -11197,7 +11232,6 @@ async fn run_external_agent_mode(
                                         &drain_config,
                                     )
                                     .await;
-                                    turn_bus_rx = bus.subscribe();
                                     continue;
                                 }
                                 let effect = handle_external_thread_action(
@@ -11232,16 +11266,10 @@ async fn run_external_agent_mode(
                                         &child_thread_id,
                                         prompt.as_deref(),
                                     );
-                                    // `turn_bus_rx` can still have the
-                                    // triggering `/side` event queued because
-                                    // the idle loop consumed it through a
-                                    // separate receiver. A fresh receiver keeps
-                                    // the side drain from replaying the action.
-                                    let mut side_bus_rx = bus.subscribe();
                                     drain_external_child_turn(
                                         &mut agent,
                                         &mut event_rx,
-                                        &mut side_bus_rx,
+                                        &mut external_control_rx,
                                         &drain_config,
                                         &mut stats,
                                         &mut diff_tracker,
@@ -11258,7 +11286,6 @@ async fn run_external_agent_mode(
                                     side_rounds.remove(&child_thread_id);
                                     side_turn_revisions.remove(&child_thread_id);
                                 }
-                                turn_bus_rx = bus.subscribe();
                             }
                             Ok(AppEvent::InterruptRequested { session_id })
                                 if event_targets_external_session_or_side(
@@ -11268,10 +11295,9 @@ async fn run_external_agent_mode(
                                     &open_side_threads,
                                 ) =>
                             {
-                                // Ignore idle interrupts and reset the turn
-                                // receiver so the next task does not inherit
-                                // a stale Stop request.
-                                turn_bus_rx = bus.subscribe();
+                                // Ignore idle interrupts; this shared receiver
+                                // consumed the event, so the next task will not
+                                // inherit a stale Stop request.
                             }
                             Ok(_) => continue,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -11408,12 +11434,11 @@ async fn run_external_agent_mode(
                     mid_turn: false,
                 });
             }
-            let mut side_bus_rx = bus.subscribe();
             let parent_thread_id = open_side_threads.get(&side_thread_id).cloned();
             drain_external_child_turn(
                 &mut agent,
                 &mut event_rx,
-                &mut side_bus_rx,
+                &mut external_control_rx,
                 &drain_config,
                 &mut stats,
                 &mut diff_tracker,
@@ -11429,7 +11454,6 @@ async fn run_external_agent_mode(
                     bus.send(AppEvent::LoopError(message));
                 }
             }
-            turn_bus_rx = bus.subscribe();
             continue;
         }
 
@@ -11516,11 +11540,10 @@ async fn run_external_agent_mode(
                     mid_turn: false,
                 });
             }
-            let mut subagent_bus_rx = bus.subscribe();
             drain_external_child_turn(
                 &mut agent,
                 &mut event_rx,
-                &mut subagent_bus_rx,
+                &mut external_control_rx,
                 &drain_config,
                 &mut stats,
                 &mut diff_tracker,
@@ -11534,7 +11557,6 @@ async fn run_external_agent_mode(
                 slog(&session_log, |l| l.warn(&message));
                 bus.send(AppEvent::LoopError(message));
             }
-            turn_bus_rx = bus.subscribe();
             continue;
         }
 
@@ -11698,7 +11720,7 @@ async fn run_external_agent_mode(
         match drain_external_agent_events(
             &mut agent,
             &mut event_rx,
-            &mut turn_bus_rx,
+            &mut external_control_rx,
             &drain_config,
             &mut stats,
             &mut diff_tracker,
@@ -11763,7 +11785,6 @@ async fn run_external_agent_mode(
                 break;
             }
         }
-        turn_bus_rx = bus.subscribe();
     }
 
     if let Err(e) = agent.shutdown().await {
