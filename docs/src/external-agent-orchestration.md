@@ -139,6 +139,12 @@ features they lack.
   `sandbox_workspace_write.network_access=true` (only in `workspace-write`), and
   `sandbox_workspace_write.writable_roots=[…]`.
 
+  `[agent.codex] context_recovery = "off"` is the default and is safe for
+  upstream Codex or the original Codex fork. Set it to `"patched"` only when
+  launching the Intendant-aware Codex fork; that mode advertises
+  `rewind_context` / `rewind_backout`, suppresses Codex auto-compaction, and
+  relies on patched same-thread rollback/restore support.
+
 - **Rich `thread_action` ops** (`codex.rs`): `compact`, `fork`,
   `side`/`btw` (open a side conversation) and `side-close`, `review`,
   `goal`/`goal-set`/`goal-clear`/`goal-pause`/`goal-resume`/`goal-complete`, and
@@ -235,6 +241,7 @@ reasoning_effort = "medium"           # ""(default) | minimal | low | medium | h
 web_search       = false              # enable the Responses web_search tool
 network_access   = false              # outbound net inside workspace-write only
 writable_roots   = []                 # extra writable dirs (absolute), each → -c writable_roots
+context_recovery = "off"              # off | patched
 
 [agent.claude_code]
 command         = "claude"

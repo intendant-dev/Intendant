@@ -638,6 +638,7 @@ fn codex_runtime_config_equal(
         && a.web_search == b.web_search
         && a.network_access == b.network_access
         && a.writable_roots == b.writable_roots
+        && a.context_recovery == b.context_recovery
 }
 
 /// Structural equality for `GeminiRuntimeConfig`. Every field here is a
@@ -983,11 +984,14 @@ async fn create_external_agent(
             let sandbox_mode = project::normalize_sandbox_mode(&cfg.sandbox);
             let reasoning_effort =
                 project::normalize_reasoning_effort(cfg.reasoning_effort.as_deref());
+            let codex_context_recovery =
+                project::codex_context_recovery_enabled(&cfg.context_recovery);
             let opts = external_agent::codex::CodexAgentOptions {
                 reasoning_effort: reasoning_effort.clone(),
                 web_search: cfg.web_search,
                 network_access: cfg.network_access,
                 writable_roots: cfg.writable_roots.clone(),
+                context_recovery: codex_context_recovery,
             };
             let agent = Box::new(external_agent::codex::CodexAgent::with_options(
                 cfg.command.clone(),
@@ -1007,6 +1011,7 @@ async fn create_external_agent(
                 web_search: cfg.web_search,
                 network_access: cfg.network_access,
                 writable_roots: cfg.writable_roots.clone(),
+                codex_context_recovery,
                 web_port,
                 resume_session: resume_session.clone(),
             };
@@ -1044,6 +1049,7 @@ async fn create_external_agent(
                 web_search: false,
                 network_access: false,
                 writable_roots: Vec::new(),
+                codex_context_recovery: false,
                 web_port,
                 resume_session: resume_session.clone(),
             };
@@ -1068,6 +1074,7 @@ async fn create_external_agent(
                 web_search: false,
                 network_access: false,
                 writable_roots: Vec::new(),
+                codex_context_recovery: false,
                 web_port,
                 resume_session: resume_session.clone(),
             };
@@ -11105,6 +11112,7 @@ async fn run_with_presence(
                     cx.web_search = current_codex_config.web_search;
                     cx.network_access = current_codex_config.network_access;
                     cx.writable_roots = current_codex_config.writable_roots.clone();
+                    cx.context_recovery = current_codex_config.context_recovery.clone();
                 }
                 if matches!(backend, external_agent::AgentBackend::GeminiCli) {
                     let gm = &mut proj.config.agent.gemini_cli;
@@ -14755,6 +14763,9 @@ async fn main() -> Result<(), CallerError> {
             autonomy.clone(),
             log_dir.clone(),
         );
+        mcp_http_state.codex_context_recovery =
+            project::codex_context_recovery_enabled(&project.config.agent.codex.context_recovery);
+        mcp_http_state.configured_codex_context_recovery = mcp_http_state.codex_context_recovery;
         mcp_http_state.frame_registry = Some(frame_registry.clone());
         mcp_http_state.session_registry = Some(session_registry.clone());
         mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
@@ -14806,6 +14817,9 @@ async fn main() -> Result<(), CallerError> {
                     web_search: cfg.web_search,
                     network_access: cfg.network_access,
                     writable_roots: cfg.writable_roots.clone(),
+                    context_recovery: project::normalize_codex_context_recovery(
+                        &cfg.context_recovery,
+                    ),
                 },
             ))
         };
@@ -14976,6 +14990,11 @@ async fn main() -> Result<(), CallerError> {
                 autonomy.clone(),
                 log_dir.clone(),
             );
+            mcp_http_state.codex_context_recovery = project::codex_context_recovery_enabled(
+                &project.config.agent.codex.context_recovery,
+            );
+            mcp_http_state.configured_codex_context_recovery =
+                mcp_http_state.codex_context_recovery;
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
@@ -15028,6 +15047,9 @@ async fn main() -> Result<(), CallerError> {
             autonomy.clone(),
             log_dir.clone(),
         );
+        mcp_app_state.codex_context_recovery =
+            project::codex_context_recovery_enabled(&project.config.agent.codex.context_recovery);
+        mcp_app_state.configured_codex_context_recovery = mcp_app_state.codex_context_recovery;
         mcp_app_state.context_window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
         mcp_app_state.session_id = session_log
             .lock()
@@ -15572,6 +15594,11 @@ async fn main() -> Result<(), CallerError> {
                 autonomy.clone(),
                 log_dir.clone(),
             );
+            mcp_http_state.codex_context_recovery = project::codex_context_recovery_enabled(
+                &project.config.agent.codex.context_recovery,
+            );
+            mcp_http_state.configured_codex_context_recovery =
+                mcp_http_state.codex_context_recovery;
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
@@ -15658,6 +15685,9 @@ async fn main() -> Result<(), CallerError> {
                     web_search: cfg.web_search,
                     network_access: cfg.network_access,
                     writable_roots: cfg.writable_roots.clone(),
+                    context_recovery: project::normalize_codex_context_recovery(
+                        &cfg.context_recovery,
+                    ),
                 },
             ))
         };
@@ -16078,6 +16108,11 @@ async fn main() -> Result<(), CallerError> {
                 autonomy.clone(),
                 log_dir.clone(),
             );
+            mcp_http_state.codex_context_recovery = project::codex_context_recovery_enabled(
+                &project.config.agent.codex.context_recovery,
+            );
+            mcp_http_state.configured_codex_context_recovery =
+                mcp_http_state.codex_context_recovery;
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
@@ -16248,6 +16283,9 @@ async fn main() -> Result<(), CallerError> {
                     web_search: cfg.web_search,
                     network_access: cfg.network_access,
                     writable_roots: cfg.writable_roots.clone(),
+                    context_recovery: project::normalize_codex_context_recovery(
+                        &cfg.context_recovery,
+                    ),
                 },
             ))
         };

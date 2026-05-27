@@ -6876,6 +6876,8 @@ pub struct SettingsPayload {
     pub codex_network_access: bool,
     #[serde(default)]
     pub codex_writable_roots: Vec<String>,
+    #[serde(default)]
+    pub codex_context_recovery: Option<String>,
     // Other external-agent executable commands. The Settings pane does not
     // edit these today, but the New Session pane uses them as per-launch
     // command/path defaults.
@@ -7004,6 +7006,9 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
         codex_web_search: config.agent.codex.web_search,
         codex_network_access: config.agent.codex.network_access,
         codex_writable_roots: config.agent.codex.writable_roots.clone(),
+        codex_context_recovery: Some(crate::project::normalize_codex_context_recovery(
+            &config.agent.codex.context_recovery,
+        )),
         claude_command: Some(config.agent.claude_code.command.clone()),
         gemini_command: Some(config.agent.gemini_cli.command.clone()),
         gemini_model: config.agent.gemini_cli.model.clone(),
@@ -7057,6 +7062,10 @@ fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &
     if payload.codex_command.is_some() {
         config.agent.codex.command =
             normalize_settings_codex_command(payload.codex_command.as_deref());
+    }
+    if let Some(mode) = payload.codex_context_recovery.as_deref() {
+        config.agent.codex.context_recovery =
+            crate::project::normalize_codex_context_recovery(mode);
     }
     if payload.claude_command.is_some() {
         config.agent.claude_code.command =
@@ -7261,7 +7270,7 @@ async fn handle_mcp_http_request(
             // All notification methods: acknowledge and return 202.
             return McpHttpOutcome::Accepted;
         }
-        "tools/list" => Ok(server.list_tools_json()),
+        "tools/list" => Ok(server.list_tools_json().await),
         "tools/call" => {
             let params = request.params.unwrap_or_default();
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -17445,17 +17454,20 @@ mod tests {
         assert_eq!(payload.external_agent.as_deref(), Some("codex"));
         assert_eq!(payload.codex_sandbox, "workspace-write");
         assert_eq!(payload.codex_approval_policy, "on-request");
+        assert_eq!(payload.codex_context_recovery, None);
         assert_eq!(payload.gemini_approval_mode, "default");
 
         let mut config = crate::project::ProjectConfig::default();
         config.agent.codex.command = "/opt/codex/bin/codex".to_string();
         config.agent.codex.sandbox = "danger-full-access".to_string();
+        config.agent.codex.context_recovery = "patched".to_string();
         config.agent.gemini_cli.approval_mode = "yolo".to_string();
         apply_settings_payload(&mut config, &payload);
 
         assert_eq!(config.agent.default_backend.as_deref(), Some("codex"));
         assert_eq!(config.agent.codex.command, "/opt/codex/bin/codex");
         assert_eq!(config.agent.codex.sandbox, "danger-full-access");
+        assert_eq!(config.agent.codex.context_recovery, "patched");
         assert_eq!(config.agent.gemini_cli.approval_mode, "yolo");
     }
 
@@ -17463,6 +17475,7 @@ mod tests {
     fn settings_payload_round_trips_codex_command() {
         let mut config = crate::project::ProjectConfig::default();
         config.agent.codex.command = "/usr/local/bin/codex".to_string();
+        config.agent.codex.context_recovery = "patched".to_string();
         config.agent.claude_code.command = "/usr/local/bin/claude".to_string();
         config.agent.gemini_cli.command = "/usr/local/bin/gemini".to_string();
 
@@ -17471,6 +17484,7 @@ mod tests {
             payload.codex_command.as_deref(),
             Some("/usr/local/bin/codex")
         );
+        assert_eq!(payload.codex_context_recovery.as_deref(), Some("patched"));
         assert_eq!(
             payload.claude_command.as_deref(),
             Some("/usr/local/bin/claude")
@@ -17501,6 +17515,7 @@ mod tests {
             "live_audio_timeout_secs": 300,
             "external_agent": "codex",
             "codex_command": "  /opt/homebrew/bin/codex  ",
+            "codex_context_recovery": "true",
             "claude_command": "  /opt/claude/bin/claude  ",
             "gemini_command": "  /opt/gemini/bin/gemini  "
         })
@@ -17510,6 +17525,7 @@ mod tests {
         apply_settings_payload(&mut config, &payload);
 
         assert_eq!(config.agent.codex.command, "/opt/homebrew/bin/codex");
+        assert_eq!(config.agent.codex.context_recovery, "patched");
         assert_eq!(config.agent.claude_code.command, "/opt/claude/bin/claude");
         assert_eq!(config.agent.gemini_cli.command, "/opt/gemini/bin/gemini");
     }

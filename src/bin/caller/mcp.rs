@@ -119,6 +119,11 @@ pub struct McpAppState {
     pub screenshot_counter: std::sync::atomic::AtomicU64,
     /// External agent backend selected via web UI (deferred: takes effect on next task).
     pub external_agent: Option<crate::external_agent::AgentBackend>,
+    /// Desired Codex context-recovery mode for the next managed Codex task.
+    pub configured_codex_context_recovery: bool,
+    /// Whether the active Codex backend supports Intendant's patched
+    /// same-thread context-recovery protocol.
+    pub codex_context_recovery: bool,
     /// Source for the currently active session, when it is known.
     pub active_session_source: Option<String>,
     /// Map Intendant wrapper session IDs and backend session IDs to their external source.
@@ -190,6 +195,8 @@ impl McpAppState {
             screenshot_dir: None,
             screenshot_counter: std::sync::atomic::AtomicU64::new(0),
             external_agent: None,
+            configured_codex_context_recovery: false,
+            codex_context_recovery: false,
             active_session_source: None,
             session_sources: std::collections::HashMap::new(),
             pending_rewind_pressure_check: None,
@@ -291,7 +298,7 @@ impl McpAppState {
         let Some(record_id) = self.pending_rewind_pressure_check.take() else {
             return;
         };
-        if !self.is_active_codex_session() {
+        if !self.active_codex_context_recovery_enabled() {
             return;
         }
         if let Some((used_tokens, rewind_only_limit, _status)) = self.context_pressure_rewind_only()
@@ -321,6 +328,7 @@ impl McpAppState {
                 "recommended_rewind_limit": null,
                 "hard_limit": null,
                 "rewind_only": false,
+                "context_recovery": if self.codex_context_recovery { "patched" } else { "off" },
                 "last_rewind_insufficient": null,
             });
         }
@@ -346,7 +354,8 @@ impl McpAppState {
             "remaining_percent": remaining_percent,
             "recommended_rewind_limit": recommended_rewind_limit,
             "hard_limit": context_window,
-            "rewind_only": status == "high" || status == "critical",
+            "rewind_only": self.codex_context_recovery && (status == "high" || status == "critical"),
+            "context_recovery": if self.codex_context_recovery { "patched" } else { "off" },
             "last_rewind_insufficient": self.insufficient_rewind_notice.as_ref().map(|notice| {
                 serde_json::json!({
                     "record_id": notice.record_id,
@@ -363,6 +372,18 @@ impl McpAppState {
         self.active_session_source
             .as_deref()
             .is_some_and(|source| source.eq_ignore_ascii_case("codex"))
+    }
+
+    fn active_codex_context_recovery_enabled(&self) -> bool {
+        self.is_active_codex_session() && self.codex_context_recovery
+    }
+
+    fn exposed_codex_context_recovery_enabled(&self) -> bool {
+        if self.is_active_codex_session() {
+            self.codex_context_recovery
+        } else {
+            self.configured_codex_context_recovery
+        }
     }
 
     fn context_pressure_rewind_only(&self) -> Option<(u64, u64, &'static str)> {
@@ -383,7 +404,7 @@ impl McpAppState {
     }
 
     fn rewind_only_gate_message(&self, tool_name: &str) -> Option<String> {
-        if !self.is_active_codex_session() || rewind_only_allowed_tool(tool_name) {
+        if !self.active_codex_context_recovery_enabled() || rewind_only_allowed_tool(tool_name) {
             return None;
         }
         let (used_tokens, rewind_only_limit, status) = self.context_pressure_rewind_only()?;
@@ -416,6 +437,10 @@ impl McpAppState {
 
 fn rewind_only_allowed_tool(name: &str) -> bool {
     matches!(name, "get_status" | "rewind_context" | "rewind_backout")
+}
+
+fn context_recovery_tool(name: &str) -> bool {
+    matches!(name, "rewind_context" | "rewind_backout")
 }
 
 fn context_rewind_record_id_from_message(message: &str) -> Option<String> {
@@ -1402,6 +1427,20 @@ async fn handle_control_command_mcp(
                 format!(
                     "Codex writable roots set to {} path(s) (applies on next task)",
                     roots.len()
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetCodexContextRecovery { mode } => {
+            let normalized = crate::project::normalize_codex_context_recovery(&mode);
+            emit_control_result(
+                control_tx,
+                "set_codex_context_recovery",
+                true,
+                format!(
+                    "Codex context recovery set to {} (applies on next task)",
+                    normalized
                 ),
                 None,
             );
@@ -2429,7 +2468,6 @@ pub fn spawn_event_listener(
                     | AppEvent::UserMessageLog { .. }
                     | AppEvent::ExternalAgentChanged { .. }
                     | AppEvent::AutonomyChanged { .. }
-                    | AppEvent::CodexConfigChanged { .. }
                     | AppEvent::CodexThreadActionRequested { .. }
                     | AppEvent::SessionIdentity { .. }
                     | AppEvent::SessionRelationship { .. }
@@ -2438,6 +2476,18 @@ pub fn spawn_event_listener(
                     | AppEvent::GeminiConfigChanged { .. }
                     | AppEvent::GeminiThreadActionRequested { .. }
                     | AppEvent::GeminiThreadActionResult { .. } => {} // Derived events — handled by outbound broadcaster
+                    AppEvent::CodexConfigChanged {
+                        context_recovery, ..
+                    } => {
+                        if let Some(mode) = context_recovery {
+                            s.configured_codex_context_recovery =
+                                crate::project::codex_context_recovery_enabled(&mode);
+                            if !s.is_active_codex_session() {
+                                s.codex_context_recovery = s.configured_codex_context_recovery;
+                            }
+                            resource_changed = Some("intendant://status");
+                        }
+                    }
                     AppEvent::CodexThreadActionResult {
                         action,
                         success,
@@ -3098,6 +3148,19 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
                 .and_then(crate::external_agent::AgentBackend::from_str_loose);
             true
         }
+        AppEvent::CodexConfigChanged {
+            context_recovery, ..
+        } => {
+            if let Some(mode) = context_recovery {
+                s.configured_codex_context_recovery =
+                    crate::project::codex_context_recovery_enabled(mode);
+                if !s.is_active_codex_session() {
+                    s.codex_context_recovery = s.configured_codex_context_recovery;
+                }
+                return true;
+            }
+            false
+        }
         AppEvent::SessionIdentity {
             session_id,
             source,
@@ -3127,6 +3190,9 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             s.session_completion_tokens = 0;
             s.session_cached_tokens = 0;
             s.active_session_source = s.session_sources.get(session_id).cloned();
+            if s.is_active_codex_session() {
+                s.codex_context_recovery = s.configured_codex_context_recovery;
+            }
             s.set_phase(Phase::Thinking);
             true
         }
@@ -3175,6 +3241,7 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
                 s.set_phase(Phase::Done);
                 s.active_session_source = None;
                 s.pending_rewind_pressure_check = None;
+                s.codex_context_recovery = s.configured_codex_context_recovery;
             }
             true
         }
@@ -3684,11 +3751,17 @@ impl IntendantServer {
     /// Return MCP tool definitions as JSON for the HTTP transport.
     /// Schemas are flattened (all `$ref`/`$defs` inlined) for compatibility
     /// with clients that don't resolve JSON Schema references (e.g. Codex).
-    pub fn list_tools_json(&self) -> serde_json::Value {
+    pub async fn list_tools_json(&self) -> serde_json::Value {
+        let context_recovery = self
+            .state
+            .read()
+            .await
+            .exposed_codex_context_recovery_enabled();
         let tools: Vec<serde_json::Value> = self
             .tool_router
             .list_all()
             .iter()
+            .filter(|tool| context_recovery || !context_recovery_tool(tool.name.as_ref()))
             .map(|tool| {
                 let mut schema = serde_json::to_value(&*tool.input_schema).unwrap_or_default();
                 inline_schema_refs(&mut schema);
@@ -3718,6 +3791,17 @@ impl IntendantServer {
 
         if let Some(message) = self.state.read().await.rewind_only_gate_message(name) {
             return Ok(text_tool_error(message));
+        }
+        if context_recovery_tool(name)
+            && !self
+                .state
+                .read()
+                .await
+                .exposed_codex_context_recovery_enabled()
+        {
+            return Ok(text_tool_error(
+                "Codex context recovery is disabled for this managed backend. Set `[agent.codex] context_recovery = \"patched\"` before starting the task to enable rewind_context/rewind_backout.".to_string(),
+            ));
         }
 
         match name {
@@ -5914,7 +5998,34 @@ mod tests {
             assert_eq!(pressure["used_tokens"], 86_000);
             assert_eq!(pressure["context_window"], 100_000);
             assert_eq!(pressure["recommended_rewind_limit"], 85_000);
+            assert_eq!(pressure["rewind_only"], false);
+            assert_eq!(pressure["context_recovery"], "off");
+        });
+    }
+
+    #[test]
+    fn context_pressure_marks_rewind_only_only_when_context_recovery_enabled() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.codex_context_recovery = true;
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 86_000,
+                context_window: 100_000,
+                usage_pct: 86.0,
+                prompt_tokens: 80_000,
+                completion_tokens: 6_000,
+                cached_tokens: 10_000,
+            });
+            let pressure = s.context_pressure_snapshot();
             assert_eq!(pressure["rewind_only"], true);
+            assert_eq!(pressure["context_recovery"], "patched");
         });
     }
 
@@ -5928,6 +6039,7 @@ mod tests {
             let state = test_state();
             let mut s = state.write().await;
             s.active_session_source = Some("codex".to_string());
+            s.codex_context_recovery = true;
             s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
                 provider: "openai".to_string(),
                 model: "gpt-5.2-codex".to_string(),
@@ -5975,6 +6087,154 @@ mod tests {
     }
 
     #[test]
+    fn rewind_only_gate_does_not_block_vanilla_codex_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.active_session_source = Some("codex".to_string());
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 95_000,
+                context_window: 100_000,
+                usage_pct: 95.0,
+                prompt_tokens: 90_000,
+                completion_tokens: 5_000,
+                cached_tokens: 0,
+            });
+
+            assert!(s.rewind_only_gate_message("take_screenshot").is_none());
+        });
+    }
+
+    #[test]
+    fn list_tools_hides_rewind_tools_until_context_recovery_is_enabled() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let server = IntendantServer::new(state.clone(), EventBus::new());
+
+            let tools = server.list_tools_json().await;
+            let names: Vec<_> = tools["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(names.contains(&"get_status"));
+            assert!(!names.contains(&"rewind_context"));
+            assert!(!names.contains(&"rewind_backout"));
+
+            {
+                let mut s = state.write().await;
+                s.configured_codex_context_recovery = true;
+                s.codex_context_recovery = true;
+            }
+            let tools = server.list_tools_json().await;
+            let names: Vec<_> = tools["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(names.contains(&"rewind_context"));
+            assert!(names.contains(&"rewind_backout"));
+        });
+    }
+
+    #[test]
+    fn call_tool_rejects_rewind_tools_when_context_recovery_is_disabled() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let server = IntendantServer::new(test_state(), EventBus::new());
+            let result = server
+                .call_tool_by_name(
+                    "rewind_context",
+                    serde_json::json!({
+                        "item_id": "call-1",
+                        "primer": "carry forward enough state"
+                    }),
+                )
+                .await
+                .unwrap();
+            let rendered = format!("{result:?}");
+            assert!(rendered.contains("context recovery is disabled"));
+        });
+    }
+
+    #[test]
+    fn observed_codex_config_change_toggles_context_recovery() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+
+        assert!(!s.codex_context_recovery);
+        assert!(apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::CodexConfigChanged {
+                command: None,
+                sandbox: None,
+                approval_policy: None,
+                model: None,
+                model_cleared: false,
+                reasoning_effort: None,
+                reasoning_effort_cleared: false,
+                web_search: None,
+                network_access: None,
+                writable_roots: None,
+                context_recovery: Some("patched".to_string()),
+            },
+        ));
+        assert!(s.codex_context_recovery);
+    }
+
+    #[test]
+    fn observed_codex_config_change_does_not_mutate_active_session_capability() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        s.active_session_source = Some("codex".to_string());
+
+        assert!(apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::CodexConfigChanged {
+                command: None,
+                sandbox: None,
+                approval_policy: None,
+                model: None,
+                model_cleared: false,
+                reasoning_effort: None,
+                reasoning_effort_cleared: false,
+                web_search: None,
+                network_access: None,
+                writable_roots: None,
+                context_recovery: Some("patched".to_string()),
+            },
+        ));
+        assert!(s.configured_codex_context_recovery);
+        assert!(
+            !s.codex_context_recovery,
+            "active Codex session capability should not flip until next task"
+        );
+    }
+
+    #[test]
     fn context_rewind_record_id_from_message_extracts_rewind_id() {
         assert_eq!(
             context_rewind_record_id_from_message(
@@ -5999,6 +6259,7 @@ mod tests {
         );
         s.session_id = "codex-thread".to_string();
         s.active_session_source = Some("codex".to_string());
+        s.codex_context_recovery = true;
 
         apply_observed_event_to_mcp_state(
             &mut s,
@@ -6063,6 +6324,7 @@ mod tests {
         );
         s.session_id = "codex-thread".to_string();
         s.active_session_source = Some("codex".to_string());
+        s.codex_context_recovery = true;
         s.insufficient_rewind_notice = Some(InsufficientRewindNotice {
             record_id: "rewind-old".to_string(),
             used_tokens: 95_000,
@@ -6117,6 +6379,7 @@ mod tests {
                 let mut s = state.write().await;
                 s.session_id = "codex-thread".to_string();
                 s.active_session_source = Some("codex".to_string());
+                s.codex_context_recovery = true;
             }
             let bus = EventBus::new();
             let listener = spawn_event_listener(
@@ -6178,6 +6441,8 @@ mod tests {
             autonomy::shared_autonomy(AutonomyState::default()),
             std::path::PathBuf::from("/tmp/test_session"),
         );
+        s.configured_codex_context_recovery = true;
+        s.codex_context_recovery = true;
 
         apply_observed_event_to_mcp_state(
             &mut s,

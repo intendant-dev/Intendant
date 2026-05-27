@@ -309,6 +309,8 @@ pub enum OutboundEvent {
         network_access: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         writable_roots: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_recovery: Option<String>,
     },
     /// Mirror of `CodexConfigChanged` for the Gemini CLI backend. Fields
     /// omitted (or `Option::None`) mean "no change since the last emission".

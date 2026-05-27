@@ -803,7 +803,7 @@ fn format_duration_short(seconds: u64) -> String {
 }
 
 /// Guidance about the sandbox Codex is running under, appended to the first
-/// user message alongside [`DISPLAY_TOOLS_PROMPT`]. The string is dynamic so
+/// user message alongside the Intendant MCP tool prompt. The string is dynamic so
 /// the model sees the actual sandbox for this session, not a baked-in default.
 ///
 /// Steered by a concrete failure mode: under `workspace-write`, Codex tried
@@ -846,15 +846,19 @@ before retrying."
     format!("\n\n## Environment\n\n{}\n", body)
 }
 
+const CONTEXT_RECOVERY_TOOLS_PROMPT: &str = "\n\
+### Context Management (patched Codex only)\n\
+- **rewind_context(anchor, reason, primer, preserve?, discard?, artifacts?, next_steps?)**: Schedule a same-thread Codex context rewind to an exact item/tool-call anchor. Use this when context pressure is high; include a detailed carry-forward primer.\n\
+- **rewind_backout(record_id, mode?, allow_cache_reset?)**: Inspect or restore a prior rewind record. Use `mode=\"restore\"` for same-thread recovery; `fork`/`backout` require `allow_cache_reset=true` because they create a new cache key.\n\
+\n";
+
 pub(super) const DISPLAY_TOOLS_PROMPT: &str = "\n\n\
 ## Intendant MCP Tools\n\
 \n\
 You have access to these tools through the `intendant` MCP server.\n\
 \n\
-### Context Management (always available)\n\
+### Session Status (always available)\n\
 - **get_status()**: Report current Intendant state, including backend-reported Codex context pressure.\n\
-- **rewind_context(anchor, reason, primer, preserve?, discard?, artifacts?, next_steps?)**: Schedule a same-thread Codex context rewind to an exact item/tool-call anchor. Use this when context pressure is high; include a detailed carry-forward primer.\n\
-- **rewind_backout(record_id, mode?, allow_cache_reset?)**: Inspect or restore a prior rewind record. Use `mode=\"restore\"` for same-thread recovery; `fork`/`backout` require `allow_cache_reset=true` because they create a new cache key.\n\
 \n\
 **GUI interaction rule:** For all GUI tasks, use take_screenshot and execute_cu_actions. Look at screenshots and click what you see. Do NOT use osascript, accessibility queries, shell commands, or app binary inspection for GUI interaction.\n\
 \n\
@@ -891,6 +895,19 @@ display stream. Returns empty if no dashboard is streaming.\n\
 \n\
 Display targets: \"user_session\" (user's display), \":99\" (virtual display 99).\n\
 ";
+
+fn intendant_mcp_tools_prompt(context_recovery: bool) -> String {
+    if !context_recovery {
+        return DISPLAY_TOOLS_PROMPT.to_string();
+    }
+    let mut out = DISPLAY_TOOLS_PROMPT.to_string();
+    if let Some(insert_at) = out.find("**GUI interaction rule:**") {
+        out.insert_str(insert_at, CONTEXT_RECOVERY_TOOLS_PROMPT);
+    } else {
+        out.push_str(CONTEXT_RECOVERY_TOOLS_PROMPT);
+    }
+    out
+}
 
 // ---------------------------------------------------------------------------
 // JSON-RPC wire types
@@ -977,6 +994,9 @@ pub struct CodexAgent {
     network_access: bool,
     /// Extra writable roots beyond the project. Absolute paths.
     writable_roots: Vec<String>,
+    /// Enables the patched Intendant/Codex same-thread context-recovery
+    /// protocol. Disabled for vanilla/fork-safe managed Codex.
+    context_recovery: bool,
     web_port: Option<u16>,
     resume_session: Option<String>,
     prompt_sent: bool,
@@ -1023,6 +1043,7 @@ pub struct CodexAgentOptions {
     pub web_search: bool,
     pub network_access: bool,
     pub writable_roots: Vec<String>,
+    pub context_recovery: bool,
 }
 
 impl CodexAgent {
@@ -1060,6 +1081,7 @@ impl CodexAgent {
             web_search: opts.web_search,
             network_access: opts.network_access,
             writable_roots: opts.writable_roots,
+            context_recovery: opts.context_recovery,
             web_port,
             resume_session: None,
             prompt_sent: false,
@@ -3133,6 +3155,7 @@ impl ExternalAgent for CodexAgent {
         self.web_search = config.web_search;
         self.network_access = config.network_access;
         self.writable_roots = config.writable_roots;
+        self.context_recovery = config.codex_context_recovery;
         self.request_trace_root = config.request_trace_dir;
         self.resume_session = config.resume_session;
         self.working_dir = Some(config.working_dir.clone());
@@ -3188,16 +3211,18 @@ impl ExternalAgent for CodexAgent {
             "mcp_servers.intendant.type=\"http\"".to_string(),
             "-c".to_string(),
             format!("mcp_servers.intendant.url=\"{}\"", mcp_url),
+        ];
+        if self.context_recovery {
             // Intendant owns context rewind/backout policy for managed Codex
             // sessions. Our minimal Codex fork treats this sentinel as
             // disabling automatic compaction; stock Codex treats it as an
             // unreachable body-after-prefix budget instead of compacting
             // eagerly.
-            "-c".to_string(),
-            "model_auto_compact_token_limit=9223372036854775807".to_string(),
-            "-c".to_string(),
-            "model_auto_compact_token_limit_scope=\"body_after_prefix\"".to_string(),
-        ];
+            args.push("-c".to_string());
+            args.push("model_auto_compact_token_limit=9223372036854775807".to_string());
+            args.push("-c".to_string());
+            args.push("model_auto_compact_token_limit_scope=\"body_after_prefix\"".to_string());
+        }
         if self.web_search {
             args.push("-c".to_string());
             args.push("tools.web_search=true".to_string());
@@ -3390,7 +3415,12 @@ impl ExternalAgent for CodexAgent {
             // new thread, whether or not the MCP display tools are wired.
             let sandbox = sandbox_hint(&self.sandbox);
             if self.web_port.is_some() {
-                format!("{}{}{}", message, sandbox, DISPLAY_TOOLS_PROMPT)
+                format!(
+                    "{}{}{}",
+                    message,
+                    sandbox,
+                    intendant_mcp_tools_prompt(self.context_recovery)
+                )
             } else {
                 format!("{}{}", message, sandbox)
             }
@@ -3538,7 +3568,7 @@ impl ExternalAgent for CodexAgent {
     }
 
     fn supports_item_anchor_rewind(&self) -> bool {
-        true
+        self.context_recovery
     }
 
     /// Native implementation of conversation rollback. Reuses the
@@ -5945,6 +5975,21 @@ mod tests {
         assert_eq!(init_params["capabilities"]["experimentalApi"], true);
     }
 
+    #[test]
+    fn intendant_mcp_prompt_advertises_rewind_tools_only_for_patched_codex() {
+        let vanilla = intendant_mcp_tools_prompt(false);
+        assert!(vanilla.contains("take_screenshot"));
+        assert!(vanilla.contains("get_status"));
+        assert!(!vanilla.contains("rewind_context"));
+        assert!(!vanilla.contains("rewind_backout"));
+
+        let patched = intendant_mcp_tools_prompt(true);
+        assert!(patched.contains("take_screenshot"));
+        assert!(patched.contains("get_status"));
+        assert!(patched.contains("rewind_context"));
+        assert!(patched.contains("rewind_backout"));
+    }
+
     #[tokio::test]
     #[ignore = "requires INTENDANT_CODEX_E2E_BIN to point at a Codex app-server binary; run with an isolated CODEX_HOME"]
     async fn e2e_codex_app_server_initializes_and_starts_thread() {
@@ -5955,15 +6000,17 @@ mod tests {
         let tools = {
             let autonomy =
                 crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default());
-            let state =
-                std::sync::Arc::new(tokio::sync::RwLock::new(crate::mcp::McpAppState::new(
-                    "openai".to_string(),
-                    "gpt-5".to_string(),
-                    autonomy,
-                    tmp.path().join("logs"),
-                )));
+            let mut mcp_state = crate::mcp::McpAppState::new(
+                "openai".to_string(),
+                "gpt-5".to_string(),
+                autonomy,
+                tmp.path().join("logs"),
+            );
+            mcp_state.codex_context_recovery = true;
+            mcp_state.configured_codex_context_recovery = true;
+            let state = std::sync::Arc::new(tokio::sync::RwLock::new(mcp_state));
             let server = crate::mcp::IntendantServer::new(state, crate::event::EventBus::new());
-            server.list_tools_json()
+            server.list_tools_json().await
         };
         let (mcp_port, mcp_handle) = spawn_minimal_mcp_http_server(tools).await;
         let mut agent = CodexAgent::with_options(
@@ -5972,7 +6019,10 @@ mod tests {
             "never".into(),
             "danger-full-access".into(),
             Some(mcp_port),
-            CodexAgentOptions::default(),
+            CodexAgentOptions {
+                context_recovery: true,
+                ..CodexAgentOptions::default()
+            },
         );
 
         let config = AgentConfig {
@@ -5985,6 +6035,7 @@ mod tests {
             web_search: false,
             network_access: false,
             writable_roots: Vec::new(),
+            codex_context_recovery: true,
             web_port: Some(mcp_port),
             resume_session: None,
         };

@@ -395,6 +395,9 @@ pub struct AgentConfig {
     /// Extra writable roots for Codex's sandbox. Codex-only; other backends
     /// ignore.
     pub writable_roots: Vec<String>,
+    /// Whether Codex has Intendant's patched same-thread context-recovery
+    /// protocol. Codex-only; vanilla/fork-safe mode leaves this false.
+    pub codex_context_recovery: bool,
     /// Web gateway port for MCP-over-HTTP config generation.
     pub web_port: Option<u16>,
     /// Persisted backend-native session/thread id to resume instead of

@@ -161,6 +161,13 @@ pub struct CodexConfig {
     /// are resolved against the project root at dispatch time.
     #[serde(default)]
     pub writable_roots: Vec<String>,
+    /// Managed Codex context-recovery capability. `off` is vanilla/fork-safe:
+    /// Codex keeps its normal compaction behavior and Intendant does not
+    /// advertise or enforce same-thread context rewind. `patched` enables the
+    /// minimal Codex fork protocol: disabled auto-compaction, item-anchor
+    /// rollback, developer-primer injection, and same-thread restore/backout.
+    #[serde(default = "default_codex_context_recovery")]
+    pub context_recovery: String,
 }
 
 fn default_codex_command() -> String {
@@ -173,6 +180,10 @@ fn default_codex_approval_policy() -> String {
 
 fn default_codex_sandbox() -> String {
     "workspace-write".to_string()
+}
+
+fn default_codex_context_recovery() -> String {
+    "off".to_string()
 }
 
 /// Valid Codex sandbox modes, in the order we present them in the UI.
@@ -234,6 +245,17 @@ pub fn normalize_reasoning_effort(input: Option<&str>) -> Option<String> {
     }
 }
 
+pub fn normalize_codex_context_recovery(input: &str) -> String {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "patched" | "managed" | "intendant" | "on" | "true" | "enabled" => "patched".to_string(),
+        _ => "off".to_string(),
+    }
+}
+
+pub fn codex_context_recovery_enabled(mode: &str) -> bool {
+    normalize_codex_context_recovery(mode) == "patched"
+}
+
 impl Default for CodexConfig {
     fn default() -> Self {
         Self {
@@ -245,6 +267,7 @@ impl Default for CodexConfig {
             web_search: false,
             network_access: false,
             writable_roots: Vec::new(),
+            context_recovery: default_codex_context_recovery(),
         }
     }
 }

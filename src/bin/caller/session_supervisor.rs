@@ -1837,6 +1837,7 @@ impl SessionSupervisor {
                 cfg.web_search = current.web_search;
                 cfg.network_access = current.network_access;
                 cfg.writable_roots = current.writable_roots;
+                cfg.context_recovery = current.context_recovery;
             }
             Some(external_agent::AgentBackend::GeminiCli) => {
                 let current = self.config.shared_gemini_config.read().await.clone();

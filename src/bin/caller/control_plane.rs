@@ -31,6 +31,7 @@ pub struct CodexRuntimeConfig {
     pub web_search: bool,
     pub network_access: bool,
     pub writable_roots: Vec<String>,
+    pub context_recovery: String,
 }
 
 pub type SharedCodexConfig = Arc<RwLock<CodexRuntimeConfig>>;
@@ -339,6 +340,26 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 ..Default::default()
             }));
         }
+        ControlMsg::SetCodexContextRecovery { mode } => {
+            let normalized = crate::project::normalize_codex_context_recovery(mode);
+            {
+                let mut guard = state.codex_config.write().await;
+                guard.context_recovery = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_codex_field(root, |cfg| {
+                    cfg.context_recovery = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist codex.context_recovery to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                context_recovery: Some(normalized),
+                ..Default::default()
+            }));
+        }
         ControlMsg::SetGeminiModel { model } => {
             // Treat empty/whitespace as "clear the override", matching the
             // dashboard input semantics for the Codex-model field.
@@ -602,6 +623,7 @@ struct CodexConfigDelta {
     web_search: Option<bool>,
     network_access: Option<bool>,
     writable_roots: Option<Vec<String>>,
+    context_recovery: Option<String>,
 }
 
 fn codex_config_changed_event(delta: CodexConfigDelta) -> AppEvent {
@@ -616,6 +638,7 @@ fn codex_config_changed_event(delta: CodexConfigDelta) -> AppEvent {
         web_search: delta.web_search,
         network_access: delta.network_access,
         writable_roots: delta.writable_roots,
+        context_recovery: delta.context_recovery,
     }
 }
 
@@ -725,6 +748,7 @@ mod tests {
             web_search: false,
             network_access: false,
             writable_roots: Vec::new(),
+            context_recovery: "off".to_string(),
         }))
     }
 
@@ -1231,6 +1255,44 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let got = codex_config.read().await.writable_roots.clone();
         assert_eq!(got, vec!["/tmp/a".to_string(), "/tmp/b".to_string()]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_codex_context_recovery_normalizes_and_updates_shared_state() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexContextRecovery {
+                mode: "on".to_string(),
+            },
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.context_recovery, "patched");
+
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexContextRecovery {
+                mode: "vanilla".to_string(),
+            },
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.context_recovery, "off");
 
         handle.abort();
     }
