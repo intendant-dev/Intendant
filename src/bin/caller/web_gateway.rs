@@ -81,6 +81,9 @@ static INTENDANT_SESSION_LIST_CACHE: OnceLock<
 
 const EXTERNAL_SESSION_SCAN_LIMIT: usize = 2_000;
 const EXTERNAL_SESSION_READ_LIMIT: u64 = 512 * 1024;
+const WORKTREE_OBSERVED_SESSION_FILE_LIMIT: usize = 1_000;
+const WORKTREE_OBSERVED_HINT_LIMIT: usize = 1_000;
+const WORKTREE_OBSERVED_PATHS_PER_SESSION: usize = 32;
 const EXTERNAL_TRANSCRIPT_CACHE_LIMIT: usize = 32;
 const EXTERNAL_TRANSCRIPT_DEDUPE_WINDOW_MILLIS: i64 = 2_000;
 const SESSION_LIST_ROW_CACHE_LIMIT: usize = 8_192;
@@ -4977,44 +4980,482 @@ fn worktree_session_hints_from_home(
 ) -> Vec<crate::worktree_inventory::WorktreeSessionHint> {
     let sessions: Vec<serde_json::Value> =
         serde_json::from_str(&list_sessions_from_home(home)).unwrap_or_default();
-    sessions
-        .into_iter()
-        .filter_map(|session| {
-            let session_id = session.get("session_id")?.as_str()?.to_string();
-            let source = session
-                .get("source")
-                .and_then(|v| v.as_str())
-                .unwrap_or("intendant")
-                .to_string();
-            let status = session
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let project_root = session
-                .get("project_root")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from);
-            let cwd = session
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from);
-            let updated_at = session
-                .get("updated_at")
-                .and_then(|v| v.as_str())
-                .map(ToString::to_string);
-            Some(crate::worktree_inventory::WorktreeSessionHint {
-                session_id,
-                source,
-                status,
-                project_root,
-                cwd,
-                updated_at,
-            })
-        })
-        .collect()
+    let mut hints = Vec::new();
+    let mut status_by_session = HashMap::new();
+    for session in &sessions {
+        let Some(hint) = worktree_session_hint_from_json(session) else {
+            continue;
+        };
+        status_by_session.insert(
+            (hint.source.clone(), hint.session_id.clone()),
+            (hint.status.clone(), hint.updated_at.clone()),
+        );
+        hints.push(hint);
+    }
+
+    let mut observed =
+        agent_observed_worktree_session_hints_from_home(home, &sessions, &status_by_session);
+    observed.extend(hints);
+    dedupe_worktree_session_hints(observed)
+}
+
+type WorktreeHintStatusMap = HashMap<(String, String), (String, Option<String>)>;
+
+fn worktree_session_hint_from_json(
+    session: &serde_json::Value,
+) -> Option<crate::worktree_inventory::WorktreeSessionHint> {
+    let session_id = session.get("session_id")?.as_str()?.to_string();
+    let source = session
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("intendant")
+        .to_string();
+    let status = session
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let project_root = session
+        .get("project_root")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let cwd = session
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let updated_at = session
+        .get("updated_at")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    Some(crate::worktree_inventory::WorktreeSessionHint {
+        session_id,
+        source,
+        status,
+        project_root,
+        cwd,
+        updated_at,
+    })
+}
+
+fn agent_observed_worktree_session_hints_from_home(
+    home: &Path,
+    sessions: &[serde_json::Value],
+    status_by_session: &WorktreeHintStatusMap,
+) -> Vec<crate::worktree_inventory::WorktreeSessionHint> {
+    let mut hints = Vec::new();
+    extend_codex_observed_worktree_session_hints(home, sessions, status_by_session, &mut hints);
+    extend_claude_observed_worktree_session_hints(home, sessions, status_by_session, &mut hints);
+    extend_gemini_observed_worktree_session_hints(home, &mut hints);
+    hints
+}
+
+fn extend_codex_observed_worktree_session_hints(
+    home: &Path,
+    sessions: &[serde_json::Value],
+    status_by_session: &WorktreeHintStatusMap,
+    hints: &mut Vec<crate::worktree_inventory::WorktreeSessionHint>,
+) {
+    let mut files = agent_session_files_from_rows(
+        sessions,
+        "codex",
+        ".jsonl",
+        WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
+    );
+    if files.is_empty() {
+        let codex = codex_dir(home);
+        files = collect_recent_files(
+            &codex.join("sessions"),
+            ".jsonl",
+            WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
+        );
+        files.extend(collect_recent_files(
+            &codex.join("archived_sessions"),
+            ".jsonl",
+            WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
+        ));
+        files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
+        files.truncate(WORKTREE_OBSERVED_SESSION_FILE_LIMIT);
+    }
+
+    for path in files {
+        if hints.len() >= WORKTREE_OBSERVED_HINT_LIMIT {
+            break;
+        }
+        hints.extend(codex_observed_worktree_session_hints_from_file(
+            home,
+            &path,
+            status_by_session,
+        ));
+    }
+}
+
+fn extend_claude_observed_worktree_session_hints(
+    home: &Path,
+    sessions: &[serde_json::Value],
+    status_by_session: &WorktreeHintStatusMap,
+    hints: &mut Vec<crate::worktree_inventory::WorktreeSessionHint>,
+) {
+    let mut files = agent_session_files_from_rows(
+        sessions,
+        "claude-code",
+        ".jsonl",
+        WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
+    );
+    if files.is_empty() {
+        files = collect_recent_files(
+            &home.join(".claude").join("projects"),
+            ".jsonl",
+            WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
+        );
+    }
+    for path in files {
+        if hints.len() >= WORKTREE_OBSERVED_HINT_LIMIT {
+            break;
+        }
+        hints.extend(claude_observed_worktree_session_hints_from_file(
+            home,
+            &path,
+            status_by_session,
+        ));
+    }
+}
+
+fn agent_session_files_from_rows(
+    sessions: &[serde_json::Value],
+    source: &str,
+    suffix: &str,
+    limit: usize,
+) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    for session in sessions {
+        if session.get("source").and_then(|v| v.as_str()) != Some(source) {
+            continue;
+        }
+        let Some(path) = session
+            .get("path")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.ends_with(suffix))
+            .map(PathBuf::from)
+        else {
+            continue;
+        };
+        if !path.is_file() {
+            continue;
+        }
+        let key = worktree_hint_path_key(&path);
+        if seen.insert(key) {
+            files.push(path);
+        }
+    }
+    files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
+    files.truncate(limit);
+    files
+}
+
+fn extend_gemini_observed_worktree_session_hints(
+    home: &Path,
+    hints: &mut Vec<crate::worktree_inventory::WorktreeSessionHint>,
+) {
+    for (alias, root) in gemini_project_roots(home) {
+        if hints.len() >= WORKTREE_OBSERVED_HINT_LIMIT {
+            break;
+        }
+        let mut seen_paths = HashSet::new();
+        push_agent_observed_worktree_hint(
+            hints,
+            home,
+            "gemini",
+            &format!("gemini-project:{alias}"),
+            "external",
+            None,
+            &root,
+            &mut seen_paths,
+        );
+    }
+}
+
+fn codex_observed_worktree_session_hints_from_file(
+    home: &Path,
+    path: &Path,
+    status_by_session: &WorktreeHintStatusMap,
+) -> Vec<crate::worktree_inventory::WorktreeSessionHint> {
+    let contents = match read_text_head_tail(
+        path,
+        EXTERNAL_SESSION_READ_LIMIT,
+        EXTERNAL_SESSION_READ_LIMIT,
+    ) {
+        Some(contents) => contents,
+        None => return Vec::new(),
+    };
+    let mut session_id = None;
+    let mut updated_at = file_mtime_string(path);
+    let mut observed_paths = Vec::new();
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || !codex_line_may_affect_session_list(line) {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        updated_at = value_str(&obj, "timestamp").or(updated_at);
+        match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "session_meta" => {
+                if let Some(payload) = obj.get("payload") {
+                    session_id = session_id.or_else(|| value_str(payload, "id"));
+                    if let Some(value) = value_str(payload, "cwd") {
+                        observed_paths.push(value);
+                    }
+                }
+            }
+            "turn_context" => {
+                if let Some(payload) = obj.get("payload") {
+                    if let Some(value) = value_str(payload, "cwd") {
+                        observed_paths.push(value);
+                    }
+                }
+            }
+            "event_msg" => {
+                if let Some(payload) = obj.get("payload") {
+                    let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if payload_type.starts_with("exec_command") {
+                        if let Some(value) =
+                            value_str(payload, "workdir").or_else(|| value_str(payload, "cwd"))
+                        {
+                            observed_paths.push(value);
+                        }
+                    }
+                }
+            }
+            "response_item" => {
+                if let Some(payload) = obj.get("payload") {
+                    if let Some(value) = codex_exec_command_workdir(payload) {
+                        observed_paths.push(value);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let session_id = session_id
+        .or_else(|| codex_session_file_id(path))
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .map(ToString::to_string)
+        });
+    let Some(session_id) = session_id else {
+        return Vec::new();
+    };
+    let (status, updated_at) =
+        worktree_hint_status("codex", &session_id, status_by_session, updated_at);
+    let mut hints = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for observed_path in observed_paths {
+        if seen_paths.len() >= WORKTREE_OBSERVED_PATHS_PER_SESSION {
+            break;
+        }
+        push_agent_observed_worktree_hint(
+            &mut hints,
+            home,
+            "codex",
+            &session_id,
+            &status,
+            updated_at.as_deref(),
+            &observed_path,
+            &mut seen_paths,
+        );
+    }
+    hints
+}
+
+fn claude_observed_worktree_session_hints_from_file(
+    home: &Path,
+    path: &Path,
+    status_by_session: &WorktreeHintStatusMap,
+) -> Vec<crate::worktree_inventory::WorktreeSessionHint> {
+    let contents = match read_text_head_tail(
+        path,
+        EXTERNAL_SESSION_READ_LIMIT,
+        EXTERNAL_SESSION_READ_LIMIT,
+    ) {
+        Some(contents) => contents,
+        None => return Vec::new(),
+    };
+    let Some(session_id) = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map(ToString::to_string)
+    else {
+        return Vec::new();
+    };
+    let mut updated_at = file_mtime_string(path);
+    let mut observed_paths = Vec::new();
+
+    for line in contents.lines() {
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        updated_at = value_str(&obj, "timestamp").or(updated_at);
+        if let Some(value) = value_str(&obj, "cwd") {
+            observed_paths.push(value);
+        }
+        if let Some(message) = obj.get("message") {
+            if let Some(value) = value_str(message, "cwd") {
+                observed_paths.push(value);
+            }
+        }
+    }
+
+    let (status, updated_at) =
+        worktree_hint_status("claude-code", &session_id, status_by_session, updated_at);
+    let mut hints = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for observed_path in observed_paths {
+        if seen_paths.len() >= WORKTREE_OBSERVED_PATHS_PER_SESSION {
+            break;
+        }
+        push_agent_observed_worktree_hint(
+            &mut hints,
+            home,
+            "claude-code",
+            &session_id,
+            &status,
+            updated_at.as_deref(),
+            &observed_path,
+            &mut seen_paths,
+        );
+    }
+    hints
+}
+
+fn worktree_hint_status(
+    source: &str,
+    session_id: &str,
+    status_by_session: &WorktreeHintStatusMap,
+    fallback_updated_at: Option<String>,
+) -> (String, Option<String>) {
+    if let Some((status, updated_at)) =
+        status_by_session.get(&(source.to_string(), session_id.to_string()))
+    {
+        (status.clone(), updated_at.clone().or(fallback_updated_at))
+    } else {
+        ("external".to_string(), fallback_updated_at)
+    }
+}
+
+fn push_agent_observed_worktree_hint(
+    hints: &mut Vec<crate::worktree_inventory::WorktreeSessionHint>,
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    status: &str,
+    updated_at: Option<&str>,
+    observed_path: &str,
+    seen_paths: &mut HashSet<String>,
+) {
+    let Some((project_root, cwd)) = normalize_agent_observed_git_path(home, observed_path) else {
+        return;
+    };
+    let key = format!(
+        "{}\0{}",
+        worktree_hint_path_key(&project_root),
+        worktree_hint_path_key(&cwd)
+    );
+    if !seen_paths.insert(key) {
+        return;
+    }
+    hints.push(crate::worktree_inventory::WorktreeSessionHint {
+        session_id: session_id.to_string(),
+        source: source.to_string(),
+        status: status.to_string(),
+        project_root: Some(project_root),
+        cwd: Some(cwd),
+        updated_at: updated_at.map(ToString::to_string),
+    });
+}
+
+fn normalize_agent_observed_git_path(home: &Path, raw_path: &str) -> Option<(PathBuf, PathBuf)> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() || should_skip_agent_observed_path(home, &path) {
+        return None;
+    }
+
+    let mut cwd = path;
+    while !cwd.exists() {
+        if !cwd.pop() {
+            return None;
+        }
+    }
+    if cwd.is_file() {
+        cwd.pop();
+    }
+    let mut project_root = cwd.clone();
+    loop {
+        if project_root.join(".git").exists() {
+            return Some((project_root, cwd));
+        }
+        if !project_root.pop() {
+            return None;
+        }
+    }
+}
+
+fn should_skip_agent_observed_path(home: &Path, path: &Path) -> bool {
+    if worktree_hint_path_key(home) == worktree_hint_path_key(path) {
+        return true;
+    }
+    if path.parent().is_none() {
+        return true;
+    }
+    matches!(
+        path.to_string_lossy().as_ref(),
+        "/" | "/tmp" | "/private/tmp" | "/var/tmp"
+    )
+}
+
+fn dedupe_worktree_session_hints(
+    hints: Vec<crate::worktree_inventory::WorktreeSessionHint>,
+) -> Vec<crate::worktree_inventory::WorktreeSessionHint> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for hint in hints {
+        let project_root = hint
+            .project_root
+            .as_ref()
+            .map(|path| worktree_hint_path_key(path))
+            .unwrap_or_default();
+        let cwd = hint
+            .cwd
+            .as_ref()
+            .map(|path| worktree_hint_path_key(path))
+            .unwrap_or_default();
+        let key = format!(
+            "{}\0{}\0{}\0{}",
+            hint.source, hint.session_id, project_root, cwd
+        );
+        if seen.insert(key) {
+            out.push(hint);
+        }
+    }
+    out
+}
+
+fn worktree_hint_path_key(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn push_session_file_fingerprint(
@@ -14618,6 +15059,91 @@ mod tests {
         assert_eq!(
             wrapped.get("intendant_session_id").and_then(|v| v.as_str()),
             Some(intendant_id)
+        );
+    }
+
+    #[test]
+    fn codex_observed_worktree_hints_include_exec_workdirs() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("projects").join("codex");
+        let worktree = repo.join(".worktrees").join("vanilla-upstream");
+        let worktree_src = worktree.join("src");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&worktree_src).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../.git/worktrees/vanilla\n",
+        )
+        .unwrap();
+
+        let session_id = "019e37ae-worktree-hints";
+        let rollout = home.path().join("rollout.jsonl");
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-27T13:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "cwd": repo.to_string_lossy()
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-27T13:01:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": serde_json::json!({
+                        "workdir": worktree_src.to_string_lossy().to_string()
+                    }).to_string()
+                }
+            }),
+        ];
+        std::fs::write(
+            &rollout,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let mut status_by_session = HashMap::new();
+        status_by_session.insert(
+            ("codex".to_string(), session_id.to_string()),
+            (
+                "running".to_string(),
+                Some("2026-05-27T13:02:00Z".to_string()),
+            ),
+        );
+
+        let hints = codex_observed_worktree_session_hints_from_file(
+            home.path(),
+            &rollout,
+            &status_by_session,
+        );
+
+        assert!(hints.iter().any(|hint| {
+            hint.project_root
+                .as_ref()
+                .map(|root| worktree_hint_path_key(root) == worktree_hint_path_key(&repo))
+                .unwrap_or(false)
+        }));
+        let worktree_hint = hints
+            .iter()
+            .find(|hint| {
+                hint.project_root
+                    .as_ref()
+                    .map(|root| worktree_hint_path_key(root) == worktree_hint_path_key(&worktree))
+                    .unwrap_or(false)
+            })
+            .expect("exec workdir hint should resolve to linked worktree root");
+        assert_eq!(worktree_hint.source, "codex");
+        assert_eq!(worktree_hint.session_id, session_id);
+        assert_eq!(worktree_hint.status, "running");
+        assert_eq!(
+            worktree_hint.updated_at.as_deref(),
+            Some("2026-05-27T13:02:00Z")
         );
     }
 

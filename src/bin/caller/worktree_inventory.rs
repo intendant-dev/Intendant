@@ -1009,6 +1009,7 @@ fn should_skip_discovery_dir(name: &str) -> bool {
             | ".cache"
             | ".cargo"
             | ".rustup"
+            | ".worktrees"
             | ".Trash"
             | "Library"
             | "Applications"
@@ -1095,6 +1096,24 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
+        init_repo_at(&repo);
+        tmp
+    }
+
+    fn tempdir_in_target() -> tempfile::TempDir {
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("worktree-inventory-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::Builder::new()
+            .prefix("scan-")
+            .tempdir_in(base)
+            .unwrap()
+    }
+
+    fn init_repo_at(repo: &Path) {
+        std::fs::create_dir_all(repo).unwrap();
         git(&repo, &["init"]);
         git(&repo, &["checkout", "-b", "main"]);
         git(&repo, &["config", "user.email", "test@example.com"]);
@@ -1102,7 +1121,6 @@ mod tests {
         std::fs::write(repo.join("README.md"), "hello\n").unwrap();
         git(&repo, &["add", "README.md"]);
         git(&repo, &["commit", "-m", "initial"]);
-        tmp
     }
 
     fn repo_path(tmp: &tempfile::TempDir) -> PathBuf {
@@ -1187,6 +1205,45 @@ mod tests {
         assert_eq!(found.default_ahead, 0);
         assert_eq!(found.default_behind, 1);
         assert_eq!(found.merge_status, "merged");
+    }
+
+    #[test]
+    fn scan_discovers_agent_observed_repo_worktrees_from_session_hint() {
+        let tmp = tempdir_in_target();
+        let projects = tmp.path().join("projects");
+        let current = projects.join("intendant");
+        let sibling = projects.join("codex");
+        init_repo_at(&current);
+        init_repo_at(&sibling);
+
+        let wt_parent = sibling.join(".worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let wt = wt_parent.join("vanilla-upstream");
+        let wt_str = wt.to_string_lossy().to_string();
+        git(&sibling, &["worktree", "add", "--detach", &wt_str, "main"]);
+
+        let hints = vec![WorktreeSessionHint {
+            session_id: "codex-session".to_string(),
+            source: "codex".to_string(),
+            status: "external".to_string(),
+            project_root: Some(sibling.clone()),
+            cwd: Some(sibling.clone()),
+            updated_at: None,
+        }];
+        let scan = scan_worktrees(tmp.path(), Some(&current), &hints);
+        assert!(scan.roots.iter().any(|root| {
+            root.kind == "session-project"
+                && same_path(&root.path, &sibling)
+                && root.repo_count >= 1
+        }));
+        let found = scan
+            .worktrees
+            .iter()
+            .find(|entry| same_path(&entry.path, &wt))
+            .expect("sibling repo worktree found");
+
+        assert_eq!(found.repo_name, "codex");
+        assert!(found.detached);
     }
 
     #[test]
