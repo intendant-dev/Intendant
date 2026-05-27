@@ -2393,6 +2393,7 @@ impl App {
             | AppEvent::ExternalAgentChanged { .. }
             | AppEvent::CodexConfigChanged { .. }
             | AppEvent::CodexThreadActionRequested { .. }
+            | AppEvent::ExternalFollowUpRequested { .. }
             | AppEvent::CodexThreadActionResult { .. }
             | AppEvent::SessionRelationship { .. }
             | AppEvent::SessionRenameResult { .. }

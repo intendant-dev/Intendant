@@ -274,6 +274,7 @@ impl AppEventUpcaster {
             | AppEvent::DisplayMetrics { .. }
             | AppEvent::ContextSnapshot { .. }
             | AppEvent::CodexThreadActionRequested { .. }
+            | AppEvent::ExternalFollowUpRequested { .. }
             | AppEvent::GeminiThreadActionRequested { .. }
             | AppEvent::SessionIdentity { .. }
             | AppEvent::SessionRelationship { .. }

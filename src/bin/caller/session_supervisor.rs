@@ -750,6 +750,18 @@ impl SessionSupervisor {
         }
         let resume_task = resume_task.expect("checked above");
 
+        if external_backend.is_some() {
+            if self
+                .find_managed_session_id(&source_norm, &session_id, &resume_token)
+                .await
+                .is_some()
+            {
+                self.route_follow_up(Some(session_id), resume_task, direct, Vec::new(), None)
+                    .await;
+                return;
+            }
+        }
+
         let log_dir = if external_backend.is_none() {
             match session_log::SessionLog::find_session_by_id(&session_id) {
                 Some(dir) => dir,
@@ -1163,6 +1175,44 @@ impl SessionSupervisor {
                         source,
                         short_session(&managed_id)
                     ));
+                }
+                if relation
+                    .as_ref()
+                    .is_some_and(|rel| rel.relationship == "side")
+                    && source == "codex"
+                {
+                    if tx.is_closed() {
+                        emit_follow_up_status(
+                            &self.config.bus,
+                            Some(requested_id.clone()),
+                            &follow_up_id,
+                            None,
+                            "failed",
+                            Some("target session is not accepting input"),
+                        );
+                        self.warn(&format!(
+                            "FollowUp dropped: {} side session {} in {} is not accepting input",
+                            source,
+                            short_session(&requested_id),
+                            project_root.display()
+                        ));
+                    } else {
+                        self.config.bus.send(AppEvent::ExternalFollowUpRequested {
+                            session_id: requested_id.clone(),
+                            text: text.clone(),
+                            attachments: resolved_attachments,
+                            follow_up_id: follow_up_id.clone(),
+                        });
+                        emit_follow_up_status(
+                            &self.config.bus,
+                            Some(requested_id),
+                            &follow_up_id,
+                            Some(&text),
+                            "queued",
+                            Some("queued for side conversation"),
+                        );
+                    }
+                    return;
                 }
                 let msg = FollowUpMessage::with_attachments(
                     text.clone(),
@@ -2411,6 +2461,44 @@ mod tests {
         }
     }
 
+    fn test_supervisor(project_root: PathBuf, bus: EventBus) -> SessionSupervisor {
+        SessionSupervisor::new(SessionSupervisorConfig {
+            bus,
+            project_root,
+            autonomy: crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default()),
+            shared_external_agent: Arc::new(tokio::sync::RwLock::new(None)),
+            shared_codex_config: Arc::new(tokio::sync::RwLock::new(
+                control_plane::CodexRuntimeConfig {
+                    command: "codex".to_string(),
+                    sandbox: "workspace-write".to_string(),
+                    approval_policy: "on-request".to_string(),
+                    model: None,
+                    reasoning_effort: None,
+                    web_search: false,
+                    network_access: false,
+                    writable_roots: Vec::new(),
+                },
+            )),
+            shared_gemini_config: Arc::new(tokio::sync::RwLock::new(
+                control_plane::GeminiRuntimeConfig {
+                    model: None,
+                    approval_mode: "default".to_string(),
+                    sandbox: false,
+                    extensions: Vec::new(),
+                    allowed_mcp_servers: Vec::new(),
+                    include_directories: Vec::new(),
+                    debug: false,
+                },
+            )),
+            frame_registry: Arc::new(tokio::sync::RwLock::new(frames::FrameRegistry::new(
+                std::env::temp_dir().as_path(),
+            ))),
+            web_port: None,
+            flags_direct: false,
+            shared_session: None,
+        })
+    }
+
     fn slash(text: &str) -> CodexSlashCommand {
         parse_codex_slash_command(text)
             .expect("recognized slash command")
@@ -2483,6 +2571,104 @@ mod tests {
         assert!(removed.is_some());
         assert!(!state.session_is_managed("sub-child"));
         assert!(!state.related_sessions.contains_key("sub-child"));
+    }
+
+    #[tokio::test]
+    async fn resume_managed_external_session_with_task_routes_follow_up() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let (tx, mut rx) = mpsc::channel(1);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "parent-thread".to_string(),
+                ManagedSession {
+                    session_id: "parent-thread".to_string(),
+                    source: "codex".to_string(),
+                    name: None,
+                    phase: "idle".to_string(),
+                    project_root: PathBuf::from("/tmp/project"),
+                    session_dir: PathBuf::from("/tmp/session"),
+                    follow_up_tx: tx,
+                    approval_registry: event::ApprovalRegistry::default(),
+                },
+            );
+        }
+
+        supervisor
+            .resume_session(
+                "codex".to_string(),
+                "parent-thread".to_string(),
+                Some("parent-thread".to_string()),
+                Some("/tmp/project".to_string()),
+                Some("continue parent".to_string()),
+                Some(true),
+            )
+            .await;
+
+        let msg = rx
+            .try_recv()
+            .expect("resume task should route to existing runner");
+        assert_eq!(msg.text, "continue parent");
+        assert_eq!(msg.target_session_id.as_deref(), Some("parent-thread"));
+
+        let state = supervisor.state.lock().await;
+        assert!(state.session_is_managed("parent-thread"));
+    }
+
+    #[tokio::test]
+    async fn side_follow_up_routes_to_external_follow_up_event() {
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let (tx, mut rx) = mpsc::channel(1);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "parent-thread".to_string(),
+                ManagedSession {
+                    session_id: "parent-thread".to_string(),
+                    source: "codex".to_string(),
+                    name: None,
+                    phase: "idle".to_string(),
+                    project_root: PathBuf::from("/tmp/project"),
+                    session_dir: PathBuf::from("/tmp/session"),
+                    follow_up_tx: tx,
+                    approval_registry: event::ApprovalRegistry::default(),
+                },
+            );
+            assert!(state.apply_related_session("parent-thread", "side-thread", "side"));
+        }
+
+        supervisor
+            .route_follow_up(
+                Some("side-thread".to_string()),
+                "continue side".to_string(),
+                Some(true),
+                Vec::new(),
+                Some("follow-1".to_string()),
+            )
+            .await;
+
+        assert!(rx.try_recv().is_err());
+        match bus_rx.recv().await.expect("side follow-up event") {
+            AppEvent::ExternalFollowUpRequested {
+                session_id,
+                text,
+                attachments,
+                follow_up_id,
+            } => {
+                assert_eq!(session_id, "side-thread");
+                assert_eq!(text, "continue side");
+                assert!(attachments.is_empty());
+                assert_eq!(follow_up_id.as_deref(), Some("follow-1"));
+            }
+            other => panic!("expected external follow-up request, got {other:?}"),
+        }
+
+        let state = supervisor.state.lock().await;
+        assert!(state.session_is_managed("parent-thread"));
+        assert!(state.session_is_managed("side-thread"));
     }
 
     #[test]

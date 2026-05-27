@@ -2248,6 +2248,7 @@ pub fn spawn_event_listener(
                     | AppEvent::AutonomyChanged { .. }
                     | AppEvent::CodexConfigChanged { .. }
                     | AppEvent::CodexThreadActionRequested { .. }
+                    | AppEvent::ExternalFollowUpRequested { .. }
                     | AppEvent::CodexThreadActionResult { .. }
                     | AppEvent::SessionIdentity { .. }
                     | AppEvent::SessionRelationship { .. }

@@ -24781,6 +24781,7 @@ function onSessionEnded(sessionId, reason) {
     String(reason || '').toLowerCase().includes('side conversation closed')
   );
   if (shouldRemoveSideWindow) {
+    clearPendingFollowUpsForSession(sid, 'side conversation closed');
     removeSessionRelationshipsForSession(sid);
     removeSessionWindow(sid);
   } else if (sid) {
@@ -24978,6 +24979,34 @@ function rememberPendingFollowUp(id, payload) {
 function forgetPendingFollowUp(id) {
   const key = String(id || '').trim();
   if (key) pendingFollowUpsById.delete(key);
+}
+
+function removeSteerRowSoon(id, delayMs = 1400) {
+  const key = String(id || '').trim();
+  if (!key) return;
+  const entry = steerRows.get(key);
+  if (!entry) return;
+  if (entry.timeout) clearTimeout(entry.timeout);
+  entry.timeout = setTimeout(() => {
+    entry.el.classList.add('fading');
+    entry.timeout = setTimeout(() => {
+      entry.el.remove();
+      steerRows.delete(key);
+      const strip = document.getElementById('steer-strip');
+      if (strip && strip.childElementCount === 0) strip.classList.add('empty');
+    }, 220);
+  }, delayMs);
+}
+
+function clearPendingFollowUpsForSession(sessionId, reason = 'session closed') {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  for (const [id, pending] of Array.from(pendingFollowUpsById.entries())) {
+    if (String(pending.sessionId || '').trim() !== sid) continue;
+    pendingFollowUpsById.delete(id);
+    onSteerStatusUpdate(id, pending.text || '', 'failed', reason);
+    removeSteerRowSoon(id);
+  }
 }
 
 function autoAttachUnmanagedFollowUp(evt = {}) {

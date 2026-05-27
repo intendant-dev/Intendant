@@ -2873,6 +2873,87 @@ async fn drain_external_agent_events(
                         }
                         continue;
                     }
+                    Ok(AppEvent::ExternalFollowUpRequested {
+                        session_id,
+                        text,
+                        attachments,
+                        follow_up_id,
+                    }) => {
+                        let side_turn = if let Some(state) = side_sessions.as_deref_mut() {
+                            if state.has_side_thread(&session_id) {
+                                let side_round =
+                                    state.side_rounds.entry(session_id.clone()).or_insert(0);
+                                *side_round += 1;
+                                let user_turn_revision = state
+                                    .side_turn_revisions
+                                    .entry(session_id.clone())
+                                    .or_default()
+                                    .record_active_turn(*side_round as u32);
+                                Some((*side_round, user_turn_revision))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let Some((side_round, user_turn_revision)) = side_turn else {
+                            continue;
+                        };
+
+                        emit_user_message_log(
+                            config.bus,
+                            config.session_log,
+                            Some(&session_id),
+                            Some(side_round as u32),
+                            Some(user_turn_revision),
+                            None,
+                            &text,
+                        );
+                        let attachments = UserAttachments::from_items(attachments);
+                        let merged = drain_steer_queue_as_followup(
+                            config.context_injection,
+                            &text,
+                            config.bus,
+                            Some(&session_id),
+                            None,
+                        )
+                        .unwrap_or_else(|| text.clone());
+                        let side_thread = external_agent::AgentThread {
+                            thread_id: session_id.clone(),
+                        };
+                        let send_result = if attachments.is_empty() {
+                            agent.send_message(&side_thread, &merged).await
+                        } else {
+                            agent
+                                .send_message_with_attachments(&side_thread, &merged, &attachments.items)
+                                .await
+                        };
+                        if let Err(e) = send_result {
+                            emit_follow_up_status(
+                                config.bus,
+                                Some(&session_id),
+                                &follow_up_id,
+                                Some(&text),
+                                "failed",
+                                Some("failed to send side follow-up"),
+                            );
+                            config.bus.send(AppEvent::LoopError(format!(
+                                "Failed to send side follow-up: {}",
+                                e
+                            )));
+                            continue;
+                        }
+                        emit_follow_up_status(
+                            config.bus,
+                            Some(&session_id),
+                            &follow_up_id,
+                            Some(&text),
+                            "delivered",
+                            None,
+                        );
+                        active_side_turns.insert(session_id);
+                        continue;
+                    }
                     Ok(AppEvent::CodexThreadActionRequested {
                         session_id,
                         action,
@@ -10902,6 +10983,24 @@ async fn run_external_agent_mode(
                                     id,
                                 )
                                 .for_target(session_id);
+                            }
+                            Ok(AppEvent::ExternalFollowUpRequested {
+                                session_id,
+                                text,
+                                attachments,
+                                follow_up_id,
+                            }) if event_targets_external_session_or_side(
+                                &Some(session_id.clone()),
+                                &live_session_id,
+                                &drain_config.alias_session_id,
+                                &open_side_threads,
+                            ) => {
+                                break FollowUpMessage::with_attachments(
+                                    text,
+                                    UserAttachments::from_items(attachments),
+                                )
+                                .for_target(Some(session_id))
+                                .with_follow_up_id(follow_up_id);
                             }
                             Ok(AppEvent::CodexThreadActionRequested {
                                 session_id,

@@ -259,6 +259,15 @@ pub enum AppEvent {
         status: String,
         reason: Option<String>,
     },
+    /// Internal request to send a follow-up to a backend-native child thread
+    /// without waiting for the parent session's next turn. The active external
+    /// agent drain consumes this directly; browsers only see FollowUpStatus.
+    ExternalFollowUpRequested {
+        session_id: String,
+        text: String,
+        attachments: Vec<crate::external_agent::AgentAttachment>,
+        follow_up_id: Option<String>,
+    },
     SessionStarted {
         session_id: String,
         task: Option<String>,
@@ -1772,6 +1781,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         // The "requested" half is server-internal (daemon action watcher
         // consumes it directly); browsers don't need it.
         AppEvent::CodexThreadActionRequested { .. } => None,
+        AppEvent::ExternalFollowUpRequested { .. } => None,
         AppEvent::CodexConfigChanged {
             command,
             sandbox,
