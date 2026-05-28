@@ -6656,26 +6656,99 @@ fn request_query_param(request_line: &str, key: &str) -> Option<String> {
     None
 }
 
-fn managed_context_records_response(request_line: &str, log_dir: &Path) -> String {
+fn managed_context_record_matches_session(
+    record: &crate::context_rewind::ContextRewindRecord,
+    session_id: &str,
+) -> bool {
+    record.thread_id == session_id || record.session_id.as_deref() == Some(session_id)
+}
+
+fn append_managed_context_records_from_dir(
+    records: &mut Vec<crate::context_rewind::ContextRewindRecord>,
+    seen_dirs: &mut std::collections::HashSet<String>,
+    log_dir: &Path,
+    session_id: Option<&str>,
+) -> std::io::Result<()> {
+    let key = std::fs::canonicalize(log_dir)
+        .unwrap_or_else(|_| log_dir.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    if !seen_dirs.insert(key) {
+        return Ok(());
+    }
+    let mut from_dir = crate::context_rewind::list_records(log_dir)?;
+    if let Some(session_id) = session_id {
+        from_dir.retain(|record| managed_context_record_matches_session(record, session_id));
+    }
+    records.extend(from_dir);
+    Ok(())
+}
+
+fn managed_context_records_response_from_home(
+    request_line: &str,
+    active_log_dir: Option<&Path>,
+    home: &Path,
+) -> String {
     let session_id = request_query_param(request_line, "session_id")
         .or_else(|| request_query_param(request_line, "session"))
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty());
-    match crate::context_rewind::list_records(log_dir) {
-        Ok(mut records) => {
-            if let Some(session_id) = session_id.as_deref() {
-                records.retain(|record| {
-                    record.thread_id == session_id
-                        || record.session_id.as_deref() == Some(session_id)
-                });
-            }
-            json_ok(serde_json::json!({ "records": records }))
+    let mut records = Vec::new();
+    let mut seen_dirs = std::collections::HashSet::new();
+
+    if let Some(log_dir) = active_log_dir {
+        if let Err(err) = append_managed_context_records_from_dir(
+            &mut records,
+            &mut seen_dirs,
+            log_dir,
+            session_id.as_deref(),
+        ) {
+            return json_error(
+                "500 Internal Server Error",
+                format!("failed to read managed-context records: {err}"),
+            );
         }
-        Err(err) => json_error(
-            "500 Internal Server Error",
-            format!("failed to read managed-context records: {err}"),
-        ),
+    } else if session_id.is_none() {
+        return json_error(
+            "404 Not Found",
+            "managed-context records need an active session log",
+        );
     }
+
+    if session_id.is_some() {
+        let logs_dir = home.join(".intendant").join("logs");
+        if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+            for entry in entries.flatten() {
+                let log_dir = entry.path();
+                if !log_dir.is_dir() {
+                    continue;
+                }
+                if let Err(err) = append_managed_context_records_from_dir(
+                    &mut records,
+                    &mut seen_dirs,
+                    &log_dir,
+                    session_id.as_deref(),
+                ) {
+                    return json_error(
+                        "500 Internal Server Error",
+                        format!("failed to read managed-context records: {err}"),
+                    );
+                }
+            }
+        }
+    }
+
+    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    json_ok(serde_json::json!({ "records": records }))
+}
+
+#[cfg(test)]
+fn managed_context_records_response(request_line: &str, log_dir: &Path) -> String {
+    managed_context_records_response_from_home(
+        request_line,
+        Some(log_dir),
+        &crate::platform::home_dir(),
+    )
 }
 
 fn effective_upload_destination(
@@ -12076,16 +12149,22 @@ pub fn spawn_web_gateway(
                         let response = match session_log.as_ref() {
                             Some(log) => match log.lock() {
                                 Ok(log) => {
-                                    managed_context_records_response(&request_line, log.dir())
+                                    let active_log_dir = log.dir().to_path_buf();
+                                    managed_context_records_response_from_home(
+                                        &request_line,
+                                        Some(active_log_dir.as_path()),
+                                        &crate::platform::home_dir(),
+                                    )
                                 }
                                 Err(_) => json_error(
                                     "500 Internal Server Error",
                                     "session log lock poisoned",
                                 ),
                             },
-                            None => json_error(
-                                "404 Not Found",
-                                "managed-context records need an active session log",
+                            None => managed_context_records_response_from_home(
+                                &request_line,
+                                None,
+                                &crate::platform::home_dir(),
                             ),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
@@ -15068,6 +15147,47 @@ mod tests {
         let body = response_json_body(&response);
         assert_eq!(body["records"].as_array().unwrap().len(), 1);
         assert_eq!(body["records"][0]["record_id"], "visible");
+    }
+
+    #[test]
+    fn managed_context_records_response_scans_historical_logs_for_session_id() {
+        let home = tempfile::tempdir().unwrap();
+        let active = tempfile::tempdir().unwrap();
+        let old_log = home.path().join(".intendant").join("logs").join("wrapper-a");
+        crate::context_rewind::persist_record(
+            &old_log,
+            &managed_context_test_record(
+                "historical",
+                Some("wrapper-a"),
+                "codex-thread-a",
+                "2026-05-27T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        crate::context_rewind::persist_record(
+            active.path(),
+            &managed_context_test_record(
+                "active-other",
+                Some("active-session"),
+                "active-thread",
+                "2026-05-28T00:00:00Z",
+            ),
+        )
+        .unwrap();
+
+        let response = managed_context_records_response_from_home(
+            "GET /api/managed-context/records?session_id=codex-thread-a HTTP/1.1",
+            Some(active.path()),
+            home.path(),
+        );
+        let body = response_json_body(&response);
+        let ids: Vec<_> = body["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["record_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["historical"]);
     }
 
     #[test]

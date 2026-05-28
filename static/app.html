@@ -11002,19 +11002,44 @@ if (document.readyState === 'loading') {
 }
 
 // ── Managed context dashboard ──
+let sessionsLoaded = false;
+let _cachedSessions = [];
 let managedContextStatus = null;
 let managedContextRecords = [];
 let managedContextLastError = '';
 let managedContextRefreshTimer = null;
 let managedContextRpcSeq = 1;
 let managedContextSessionManuallySelected = false;
+let managedContextSessionsLoadInFlight = null;
 
 function managedContextEl(id) {
   return document.getElementById(id);
 }
 
+async function ensureManagedContextSessionsLoaded() {
+  if (typeof sessionsLoaded !== 'undefined' && sessionsLoaded) return;
+  if (managedContextSessionsLoadInFlight) return managedContextSessionsLoadInFlight;
+  managedContextSessionsLoadInFlight = fetchSessionsForHost(selfPeerId, { force: false })
+    .then(sessions => {
+      applyLoadedSessions(sessions, document.getElementById('sessions-aggregate'));
+    })
+    .catch(() => {})
+    .finally(() => {
+      managedContextSessionsLoadInFlight = null;
+    });
+  return managedContextSessionsLoadInFlight;
+}
+
 function managedContextModeFromStatus() {
   return managedContextStatus?.context_pressure?.managed_context || 'unknown';
+}
+
+function managedContextConfiguredMode(meta = {}) {
+  return String(
+    meta.capabilities?.codexManagedContext ||
+    meta.capabilities?.codex_managed_context ||
+    ''
+  ).trim();
 }
 
 function managedContextCurrentSessionId() {
@@ -11022,37 +11047,140 @@ function managedContextCurrentSessionId() {
   return String(sel?.value || '').trim();
 }
 
+function managedContextBackendSessionId(meta = {}) {
+  return String(meta.backend_session_id || meta.backendSessionId || '').trim();
+}
+
+function managedContextIntendantSessionId(meta = {}) {
+  return String(meta.intendant_session_id || meta.intendantSessionId || '').trim();
+}
+
+function managedContextBackendSource(meta = {}) {
+  return String(meta.backend_source || meta.backendSource || '').trim();
+}
+
+function managedContextSourceLabel(meta = {}) {
+  return String(
+    meta.backend_source_label ||
+    meta.backendSourceLabel ||
+    meta.source_label ||
+    meta.sourceLabel ||
+    meta.backend_source ||
+    meta.backendSource ||
+    meta.source ||
+    ''
+  ).trim();
+}
+
+function managedContextCanonicalSource(meta = {}) {
+  return normalizeAgentId(
+    meta.backend_source ||
+    meta.backendSource ||
+    meta.source ||
+    meta.source_label ||
+    meta.sourceLabel ||
+    meta.provider ||
+    ''
+  );
+}
+
+function managedContextNormalizeSessionMeta(meta = {}, fallbackSessionId = '') {
+  const backendSessionId = managedContextBackendSessionId(meta);
+  const fallbackId = String(fallbackSessionId || '').trim();
+  const ownSessionId = String(meta.session_id || meta.sessionId || fallbackId || '').trim();
+  const intendantSessionId =
+    managedContextIntendantSessionId(meta) ||
+    (backendSessionId && ownSessionId && ownSessionId !== backendSessionId ? ownSessionId : '');
+  const backendSource = managedContextBackendSource(meta);
+  const sourceLabel = managedContextSourceLabel(meta);
+  return {
+    ...meta,
+    ...(backendSessionId ? { backendSessionId } : {}),
+    ...(intendantSessionId ? { intendantSessionId } : {}),
+    ...(backendSource ? { backendSource, source: backendSource } : {}),
+    ...(sourceLabel ? { sourceLabel } : {}),
+  };
+}
+
+function managedContextSessionIsLive(sessionId, meta = {}) {
+  const sid = String(sessionId || '').trim();
+  const backendSessionId = managedContextBackendSessionId(meta);
+  const intendantSessionId = managedContextIntendantSessionId(meta);
+  return [sid, backendSessionId, intendantSessionId].some(id => {
+    if (!id) return false;
+    const win = sessionWindows.get(id);
+    if (!win) return false;
+    const liveMeta = sessionMetadataById.get(id) || {};
+    return win.detached !== true && win.managed !== false && liveMeta.detached !== true;
+  });
+}
+
 function managedContextSessionMeta(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return {};
-  return sessionMetadataById.get(sid) || _cachedSessions.find(s => s.session_id === sid) || {};
+  const liveMeta = sessionMetadataById.get(sid);
+  const cached = (_cachedSessions || []).find(session => {
+    if (!session) return false;
+    return String(session.session_id || '').trim() === sid ||
+      String(session.resume_id || '').trim() === sid ||
+      managedContextBackendSessionId(session) === sid ||
+      managedContextIntendantSessionId(session) === sid;
+  });
+  if (liveMeta && cached) {
+    return managedContextNormalizeSessionMeta({
+      ...cached,
+      ...liveMeta,
+      capabilities: liveMeta.capabilities || cached.capabilities,
+    }, sid);
+  }
+  if (liveMeta) return managedContextNormalizeSessionMeta(liveMeta, sid);
+  return cached ? managedContextNormalizeSessionMeta(cached, sid) : {};
 }
 
 function managedContextIsCodexLike(meta = {}) {
-  const source = normalizeAgentId(meta.source || meta.source_label || meta.sourceLabel || '');
+  const source = managedContextCanonicalSource(meta);
   if (source === 'codex') return true;
-  const label = String(meta.source || meta.source_label || meta.sourceLabel || '').toLowerCase();
+  if (source && source !== 'codex') return false;
+  const backendSessionId = managedContextBackendSessionId(meta);
+  const label = managedContextSourceLabel(meta).toLowerCase();
   if (label.includes('codex')) return true;
+  if (/\b(claude|gemini)\b/.test(label)) return false;
+  if (label === 'intendant' && !backendSessionId) return false;
+  const configuredMode = managedContextConfiguredMode(meta);
+  if ((configuredMode === 'managed' || configuredMode === 'vanilla') && (backendSessionId || !label)) {
+    return true;
+  }
+  const command = String(meta.capabilities?.codexCommand || meta.capabilities?.codex_command || '').trim();
+  if (command && (backendSessionId || !label)) return true;
   const actions = meta.capabilities?.codexThreadActions || meta.capabilities?.codex_thread_actions || [];
   return Array.isArray(actions) && actions.length > 0;
+}
+
+function managedContextShouldOfferSession(sessionId, meta = {}, target = '') {
+  if (managedContextIsCodexLike(meta)) return true;
+  if (String(sessionId || '').trim() !== String(target || '').trim()) return false;
+  return !managedContextCanonicalSource(meta) && !managedContextSourceLabel(meta);
 }
 
 function managedContextSessionLabel(sessionId, meta = {}) {
   const sid = String(sessionId || '').trim();
   const name = compactSessionText(meta.name) || compactSessionText(meta.task);
-  const source = meta.source_label || meta.sourceLabel || meta.source || '';
+  const source = managedContextSourceLabel(meta);
+  const wrapper = managedContextIntendantSessionId(meta);
   const prefix = name ? `${name} ` : '';
   const suffix = source ? ` · ${source}` : '';
-  return `${prefix}${shortSessionId(sid)}${suffix}`;
+  const wrapperSuffix = wrapper && wrapper !== sid ? ` via ${shortSessionId(wrapper)}` : '';
+  return `${prefix}${shortSessionId(sid)}${suffix}${wrapperSuffix}`;
 }
 
 function managedContextAddSessionOption(map, sessionId, meta = {}, preferred = false) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
   const existing = map.get(sid) || {};
+  const normalized = managedContextNormalizeSessionMeta(meta, sid);
   map.set(sid, {
     ...existing,
-    ...meta,
+    ...normalized,
     preferred: preferred || existing.preferred || false,
   });
 }
@@ -11061,33 +11189,52 @@ function managedContextSessionOptions() {
   const options = new Map();
   const target = resolvePromptTargetSessionId();
   if (target) {
-    managedContextAddSessionOption(
-      options,
-      target,
-      managedContextSessionMeta(target),
-      true
-    );
+    const targetMeta = managedContextSessionMeta(target);
+    if (managedContextShouldOfferSession(target, targetMeta, target)) {
+      managedContextAddSessionOption(options, target, targetMeta, true);
+    }
   }
   for (const [sid, win] of sessionWindows) {
-    const meta = sessionMetadataById.get(sid) || {};
-    if (managedContextIsCodexLike(meta) || sid === target || win?.source === 'Codex') {
+    const meta = managedContextNormalizeSessionMeta(sessionMetadataById.get(sid) || win || {}, sid);
+    if (managedContextShouldOfferSession(sid, meta, target) || win?.source === 'Codex') {
       managedContextAddSessionOption(options, sid, meta, sid === target);
     }
   }
   for (const [sid, meta] of sessionMetadataById) {
-    if (managedContextIsCodexLike(meta) || sid === target) {
-      managedContextAddSessionOption(options, sid, meta, sid === target);
+    const normalized = managedContextNormalizeSessionMeta(meta, sid);
+    if (managedContextShouldOfferSession(sid, normalized, target)) {
+      managedContextAddSessionOption(options, sid, normalized, sid === target);
     }
   }
   for (const session of _cachedSessions || []) {
-    if (normalizeAgentId(session.source) === 'codex' || session.session_id === target) {
-      managedContextAddSessionOption(options, session.session_id, session, session.session_id === target);
+    const meta = managedContextNormalizeSessionMeta(session, session.session_id);
+    const backendSessionId = managedContextBackendSessionId(meta);
+    const optionSessionId = backendSessionId || session.session_id;
+    if (
+      managedContextShouldOfferSession(optionSessionId, meta, target) ||
+      managedContextShouldOfferSession(session.session_id, meta, target)
+    ) {
+      managedContextAddSessionOption(
+        options,
+        optionSessionId,
+        meta,
+        optionSessionId === target || session.session_id === target
+      );
     }
   }
   return Array.from(options.entries()).sort((a, b) => {
     const pa = a[1].preferred ? 1 : 0;
     const pb = b[1].preferred ? 1 : 0;
     if (pa !== pb) return pb - pa;
+    const ma = managedContextConfiguredMode(a[1]) === 'managed' ? 1 : 0;
+    const mb = managedContextConfiguredMode(b[1]) === 'managed' ? 1 : 0;
+    if (ma !== mb) return mb - ma;
+    const la = managedContextSessionIsLive(a[0], a[1]) ? 1 : 0;
+    const lb = managedContextSessionIsLive(b[0], b[1]) ? 1 : 0;
+    if (la !== lb) return lb - la;
+    const ta = Date.parse(a[1].updated_at || a[1].updatedAt || a[1].created_at || a[1].createdAt || '') || 0;
+    const tb = Date.parse(b[1].updated_at || b[1].updatedAt || b[1].created_at || b[1].createdAt || '') || 0;
+    if (ta !== tb) return tb - ta;
     return managedContextSessionLabel(a[0], a[1]).localeCompare(
       managedContextSessionLabel(b[0], b[1]),
       undefined,
@@ -11158,11 +11305,17 @@ function renderManagedContextStats() {
   const fill = managedContextEl('managed-context-pressure-fill');
   if (!host) return;
   host.innerHTML = '';
+  const sessionId = managedContextCurrentSessionId();
+  const meta = managedContextSessionMeta(sessionId);
+  const live = managedContextSessionIsLive(sessionId, meta);
   const pressure = managedContextStatus?.context_pressure || {};
-  const status = pressure.status || 'unknown';
-  const mode = pressure.managed_context || 'unknown';
-  const used = pressure.used_tokens;
-  const windowSize = pressure.context_window;
+  const configuredMode = managedContextConfiguredMode(meta);
+  const status = live ? (pressure.status || 'unknown') : (sessionId ? 'historical' : 'unknown');
+  const mode = live
+    ? (pressure.managed_context || configuredMode || 'unknown')
+    : (configuredMode || 'unknown');
+  const used = live ? pressure.used_tokens : null;
+  const windowSize = live ? pressure.context_window : null;
   const pct = managedContextPercent(used, windowSize);
   host.appendChild(managedContextStat('Mode', mode, mode === 'managed' ? 'ok' : 'vanilla'));
   host.appendChild(managedContextStat('Pressure', status, status));
@@ -11195,13 +11348,19 @@ function renderManagedContextAlerts() {
   const mode = pressure.managed_context || 'unknown';
   const sessionId = managedContextCurrentSessionId();
   const meta = managedContextSessionMeta(sessionId);
+  const live = managedContextSessionIsLive(sessionId, meta);
   if (sessionId && !managedContextIsCodexLike(meta)) {
     const alert = document.createElement('div');
     alert.className = 'managed-context-alert';
     alert.textContent = 'Selected session is not reported as Codex.';
     host.appendChild(alert);
   }
-  if (mode !== 'managed') {
+  if (sessionId && !live) {
+    const alert = document.createElement('div');
+    alert.className = 'managed-context-alert';
+    alert.textContent = 'Historical session: records are available, live managed actions require a running Codex session.';
+    host.appendChild(alert);
+  } else if (mode !== 'managed') {
     const alert = document.createElement('div');
     alert.className = 'managed-context-alert';
     alert.textContent = 'Managed actions are disabled for this session.';
@@ -11323,9 +11482,12 @@ function scheduleManagedContextRefresh(delay = 500) {
 }
 
 async function refreshManagedContextPane(options = {}) {
+  await ensureManagedContextSessionsLoaded();
   renderManagedContextSessionSelect();
   renderManagedContextAnchors();
   const sessionId = managedContextCurrentSessionId();
+  const meta = managedContextSessionMeta(sessionId);
+  const live = managedContextSessionIsLive(sessionId, meta);
   if (!sessionId) {
     managedContextStatus = null;
     managedContextRecords = [];
@@ -11333,18 +11495,29 @@ async function refreshManagedContextPane(options = {}) {
     renderManagedContextPane();
     return;
   }
-  try {
-    managedContextLastError = '';
-    const [status, records] = await Promise.all([
-      fetchManagedContextStatus(),
-      fetchManagedContextRecords(),
-    ]);
-    managedContextStatus = status;
-    managedContextRecords = records;
-  } catch (err) {
-    if (options.force) console.warn('Managed context refresh failed:', err);
-    managedContextLastError = err?.message || String(err);
+  managedContextLastError = '';
+  const [statusResult, recordsResult] = await Promise.allSettled([
+    live ? fetchManagedContextStatus() : Promise.resolve(null),
+    fetchManagedContextRecords(),
+  ]);
+  const errors = [];
+  if (statusResult.status === 'fulfilled') {
+    managedContextStatus = statusResult.value;
+  } else {
+    managedContextStatus = null;
+    const message = statusResult.reason?.message || String(statusResult.reason || 'unknown error');
+    errors.push(`Live status unavailable: ${message}`);
+    if (options.force) console.warn('Managed context status refresh failed:', statusResult.reason);
   }
+  if (recordsResult.status === 'fulfilled') {
+    managedContextRecords = recordsResult.value;
+  } else {
+    managedContextRecords = [];
+    const message = recordsResult.reason?.message || String(recordsResult.reason || 'unknown error');
+    errors.push(`Records unavailable: ${message}`);
+    if (options.force) console.warn('Managed context records refresh failed:', recordsResult.reason);
+  }
+  managedContextLastError = errors.join(' ');
   renderManagedContextPane();
 }
 
@@ -11424,10 +11597,14 @@ function renderManagedContextPane() {
   renderManagedContextAnchors();
   renderManagedContextRecords();
   renderManagedContextLedgers();
-  const managed = managedContextModeFromStatus() === 'managed';
+  const sessionId = managedContextCurrentSessionId();
+  const meta = managedContextSessionMeta(sessionId);
+  const managed =
+    managedContextSessionIsLive(sessionId, meta) &&
+    managedContextModeFromStatus() === 'managed';
   ['managed-context-submit-rewind', 'managed-context-submit-backout'].forEach(id => {
     const btn = managedContextEl(id);
-    if (btn) btn.disabled = !managed || !managedContextCurrentSessionId();
+    if (btn) btn.disabled = !managed || !sessionId;
   });
 }
 
@@ -27078,8 +27255,6 @@ function onDebugScreenTornDown() {
 }
 
 // ── Sessions Tab ──
-let sessionsLoaded = false;
-let _cachedSessions = [];
 let worktreesLoaded = false;
 let _cachedWorktreeScan = null;
 let _sessionsLoadToken = 0;
