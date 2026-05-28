@@ -1834,6 +1834,7 @@ fn merge_intendant_wrapper_into_external_session(
         ("backend_source", "backend_source"),
         ("backend_source_label", "backend_source_label"),
         ("backend_session_id", "backend_session_id"),
+        ("capabilities", "capabilities"),
     ] {
         if let Some(value) = wrapper_obj.get(wrapper_key) {
             obj.insert(target_key.to_string(), value.clone());
@@ -5616,6 +5617,7 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
     let mut role: Option<String> = None;
     let mut external_resume_id: Option<String> = None;
     let mut external_source: Option<String> = None;
+    let mut capabilities: Option<serde_json::Value> = None;
     let mut updated_at_secs = file_mtime_secs(dir);
 
     if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
@@ -5718,6 +5720,12 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
                 }
                 "task_complete" | "session_end" | "session_ended" => {
                     status = "completed".to_string();
+                }
+                "session_capabilities" => {
+                    capabilities = obj
+                        .get("data")
+                        .and_then(|data| data.get("capabilities"))
+                        .cloned();
                 }
                 "round_complete" => {
                     if status != "interrupted" {
@@ -5859,6 +5867,7 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
         "backend_source": external_source.clone(),
         "backend_source_label": backend_source_label,
         "backend_session_id": external_resume_id.clone(),
+        "capabilities": capabilities,
         "created_at": created_at,
         "updated_at": updated_at,
         "name": name,
@@ -15242,6 +15251,21 @@ mod tests {
                 "message": "Mode: external agent (Codex)"
             }),
             serde_json::json!({
+                "ts": "2026-05-17T20:44:01.500Z",
+                "event": "session_capabilities",
+                "data": {
+                    "session_id": intendant_id,
+                    "capabilities": {
+                        "follow_up": true,
+                        "steer": true,
+                        "interrupt": true,
+                        "codex_thread_actions": ["compact", "fork", "side"],
+                        "codex_managed_context": "managed",
+                        "codex_command": "/tmp/codex-managed"
+                    }
+                }
+            }),
+            serde_json::json!({
                 "ts": "2026-05-17T20:44:02",
                 "event": "debug",
                 "message": format!("External agent thread: {codex_id}")
@@ -15335,6 +15359,20 @@ mod tests {
         assert_eq!(
             wrapped.get("intendant_session_id").and_then(|v| v.as_str()),
             Some(intendant_id)
+        );
+        let capabilities = wrapped
+            .get("capabilities")
+            .and_then(|v| v.as_object())
+            .expect("capabilities should be merged from wrapper session");
+        assert_eq!(
+            capabilities
+                .get("codex_managed_context")
+                .and_then(|v| v.as_str()),
+            Some("managed")
+        );
+        assert_eq!(
+            capabilities.get("codex_command").and_then(|v| v.as_str()),
+            Some("/tmp/codex-managed")
         );
     }
 

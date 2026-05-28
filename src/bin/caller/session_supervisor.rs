@@ -635,6 +635,9 @@ impl SessionSupervisor {
         }
 
         emit_task_dispatched_log(&self.config.bus, &session_log, &task, attachments.len());
+        if backend == Some(external_agent::AgentBackend::Codex) {
+            emit_codex_session_capabilities(&self.config.bus, &session_log, &session_id, &project);
+        }
         self.spawn_agent_session(
             session_id,
             source,
@@ -2161,6 +2164,48 @@ fn write_session_meta(
 ) {
     if let Ok(log) = session_log.lock() {
         log.write_meta_with_name(Some(project_root), task, name);
+    }
+}
+
+fn codex_session_capabilities(project: &Project) -> types::SessionCapabilities {
+    types::SessionCapabilities {
+        follow_up: true,
+        steer: true,
+        interrupt: true,
+        codex_thread_actions: vec![
+            "compact".to_string(),
+            "fork".to_string(),
+            "side".to_string(),
+            "undo".to_string(),
+            "review".to_string(),
+            "rename".to_string(),
+            "goal".to_string(),
+            "goal-set".to_string(),
+            "goal-clear".to_string(),
+            "goal-pause".to_string(),
+            "goal-resume".to_string(),
+            "memory-reset".to_string(),
+        ],
+        codex_managed_context: Some(crate::project::normalize_codex_managed_context(
+            &project.config.agent.codex.managed_context,
+        )),
+        codex_command: Some(project.config.agent.codex.command.clone()),
+    }
+}
+
+fn emit_codex_session_capabilities(
+    bus: &EventBus,
+    session_log: &Arc<std::sync::Mutex<session_log::SessionLog>>,
+    session_id: &str,
+    project: &Project,
+) {
+    let capabilities = codex_session_capabilities(project);
+    bus.send(AppEvent::SessionCapabilities {
+        session_id: session_id.to_string(),
+        capabilities: capabilities.clone(),
+    });
+    if let Ok(mut log) = session_log.lock() {
+        log.session_capabilities(session_id, &capabilities);
     }
 }
 

@@ -12292,21 +12292,26 @@ function applySessionIdentity(meta = {}) {
   const backendSessionId = String(meta.backend_session_id || meta.backendSessionId || '').trim();
   const backendSource = String(meta.backend_source || meta.backendSource || meta.source || '').trim();
   if (!sid || (!backendSessionId && !backendSource)) return;
+  const wrapperMeta = sessionMetadataById.get(sid) || {};
   const next = {
     ...(backendSessionId ? { backendSessionId } : {}),
     ...(backendSource ? { backendSource, source: backendSource } : {}),
     ...(meta.backend_source_label || meta.backendSourceLabel ? { sourceLabel: meta.backend_source_label || meta.backendSourceLabel } : {}),
   };
-  sessionMetadataById.set(sid, { ...(sessionMetadataById.get(sid) || {}), ...next });
+  sessionMetadataById.set(sid, { ...wrapperMeta, ...next });
   if (backendSessionId) {
+    const backendMeta = sessionMetadataById.get(backendSessionId) || {};
+    const capabilities = backendMeta.capabilities || wrapperMeta.capabilities || null;
     sessionMetadataById.set(backendSessionId, {
-      ...(sessionMetadataById.get(backendSessionId) || {}),
+      ...backendMeta,
       intendantSessionId: sid,
       ...(backendSource ? { backendSource, source: backendSource } : {}),
+      ...(capabilities ? { capabilities } : {}),
     });
     if (sessionWindows.has(backendSessionId)) {
       updateSessionWindow(backendSessionId, {
         ...(backendSource ? { backendSource, source: backendSource } : {}),
+        ...(capabilities ? { capabilities } : {}),
       });
     }
   }
@@ -13941,8 +13946,22 @@ function applySessionCapabilities(evt = {}) {
   if (!sid) return;
   const capabilities = normalizeSessionCapabilities(evt.capabilities || evt);
   if (!capabilities) return;
+  const related = new Set([sid]);
   const meta = sessionMetadataById.get(sid) || {};
-  sessionMetadataById.set(sid, { ...meta, capabilities });
+  if (meta.backendSessionId) related.add(meta.backendSessionId);
+  if (meta.intendantSessionId) related.add(meta.intendantSessionId);
+  for (const [id, existing] of sessionMetadataById) {
+    if (existing.backendSessionId === sid || existing.intendantSessionId === sid) {
+      related.add(id);
+    }
+  }
+  for (const id of related) {
+    const existing = sessionMetadataById.get(id) || {};
+    sessionMetadataById.set(id, { ...existing, capabilities });
+    if (sessionWindows.has(id)) {
+      updateSessionWindow(id, { capabilities });
+    }
+  }
   updateSessionWindowActionMenuVisibility(sid);
   updateStopButtonVisibility(currentPhase);
   updateSubmitButtonLabel(currentPhase);
