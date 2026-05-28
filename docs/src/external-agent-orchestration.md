@@ -298,6 +298,12 @@ shared state (when driven over MCP) → config default → native.
   Changing these mid-session requires a teardown + respawn. The daemon's
   `codex_runtime_config_equal` / `gemini_runtime_config_equal` checks detect drift
   across tasks and force a rebuild when any latched field changes.
+- **Per-session launch config beats global defaults.** Dashboard-created and
+  dashboard-configured external sessions persist their binary command and, for
+  Codex, `managed_context` mode. Resume/attach first applies explicit dashboard
+  overrides, then the persisted per-session config, then the global Settings
+  pane. This keeps old sessions from silently adopting a new global Codex binary
+  or managed-context mode after a daemon restart.
 - **Load-bearing fallback error strings.** Several trait methods return a *typed
   error* by default (`steer_turn`, `rollback_turns`, `interrupt_turn`,
   `thread_action`). `drain_external_agent_events` distinguishes "feature

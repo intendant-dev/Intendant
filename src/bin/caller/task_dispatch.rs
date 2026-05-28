@@ -294,6 +294,7 @@ fn control_target_session_id(msg: &ControlMsg) -> Option<&str> {
         | ControlMsg::Steer { session_id, .. }
         | ControlMsg::StartTask { session_id, .. }
         | ControlMsg::FollowUp { session_id, .. } => session_id.as_deref(),
+        ControlMsg::ConfigureSessionAgent { session_id, .. } => Some(session_id.as_str()),
         ControlMsg::ResumeSession { .. } => None,
         _ => None,
     }

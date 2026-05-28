@@ -1652,6 +1652,16 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::ConfigureSessionAgent { session_id, .. } => {
+            emit_control_result(
+                control_tx,
+                "configure_session_agent",
+                true,
+                format!("Session launch config save requested: {}", session_id),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::SetGeminiModel { model } => {
             let label = model
                 .as_deref()

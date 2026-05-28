@@ -36,6 +36,7 @@ mod quarantine;
 mod recording;
 mod sandbox;
 mod schema_validator;
+mod session_config;
 mod session_log;
 mod session_names;
 mod session_supervisor;
@@ -2413,6 +2414,10 @@ async fn apply_context_rewind_backout_action(
             project_root: Some(config.project_root.to_string_lossy().to_string()),
             task: None,
             direct: Some(true),
+            agent_command: crate::session_config::read_log_dir_config(config.log_dir)
+                .and_then(|cfg| cfg.agent_command),
+            codex_managed_context: crate::session_config::read_log_dir_config(config.log_dir)
+                .and_then(|cfg| cfg.codex_managed_context),
         }));
 
     Ok(format!(
@@ -2480,6 +2485,12 @@ async fn handle_external_thread_action(
                     project_root: Some(config.project_root.to_string_lossy().to_string()),
                     task: None,
                     direct: Some(true),
+                    agent_command: crate::session_config::read_log_dir_config(config.log_dir)
+                        .and_then(|cfg| cfg.agent_command),
+                    codex_managed_context: crate::session_config::read_log_dir_config(
+                        config.log_dir,
+                    )
+                    .and_then(|cfg| cfg.codex_managed_context),
                 }));
         }
     }
@@ -11143,6 +11154,12 @@ async fn run_with_presence(
                             project_root: Some(project_root.to_string_lossy().to_string()),
                             task: None,
                             direct: Some(true),
+                            agent_command: Some(project.config.agent.codex.command.clone()),
+                            codex_managed_context: Some(
+                                crate::project::normalize_codex_managed_context(
+                                    &project.config.agent.codex.managed_context,
+                                ),
+                            ),
                         }));
                     }
                 }
@@ -12516,7 +12533,7 @@ async fn run_external_agent_mode(
     bus: EventBus,
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
-    _log_dir: PathBuf,
+    log_dir: PathBuf,
     mut follow_up_rx: FollowUpReceiver,
     json_approval: Option<JsonApprovalSlot>,
     approval_registry: event::ApprovalRegistry,
@@ -12605,6 +12622,24 @@ async fn run_external_agent_mode(
         }
     };
     let backend_session_id = thread.thread_id.clone();
+    let session_agent_config = session_config::from_project(&backend, &project);
+    if let Err(e) = session_config::write_log_dir_config(&log_dir, &session_agent_config) {
+        slog(&session_log, |l| {
+            l.debug(&format!("Persist session launch config failed: {e}"))
+        });
+    }
+    if backend.thread_id_is_canonical(&backend_session_id) {
+        if let Err(e) = session_config::write_external_overlay(
+            &platform::home_dir(),
+            backend.as_short_str(),
+            &backend_session_id,
+            &session_agent_config,
+        ) {
+            slog(&session_log, |l| {
+                l.debug(&format!("Persist external launch config failed: {e}"))
+            });
+        }
+    }
     let live_session_id = if backend.thread_id_is_canonical(&backend_session_id) {
         Some(backend_session_id.clone())
     } else {
@@ -12644,7 +12679,7 @@ async fn run_external_agent_mode(
     let mut round = user_turn_revisions.active_count() as usize;
     let mut stats = LoopStats::default();
     if backend == external_agent::AgentBackend::Codex {
-        stats.codex_subagent_parent_threads = codex_subagent_parent_threads_from_log(&_log_dir);
+        stats.codex_subagent_parent_threads = codex_subagent_parent_threads_from_log(&log_dir);
         for child_id in stats.codex_subagent_parent_threads.keys().cloned() {
             stats.codex_subagent_rounds.entry(child_id).or_insert(0);
         }
@@ -12673,7 +12708,7 @@ async fn run_external_agent_mode(
         autonomy: autonomy.clone(),
         session_log: &session_log,
         project_root: &project.root,
-        log_dir: &_log_dir,
+        log_dir: &log_dir,
         approval_registry: &approval_registry,
         json_approval: json_approval.as_ref(),
         agent_source: Some(backend.to_string()),
@@ -13325,7 +13360,7 @@ async fn run_external_agent_mode(
                 ));
             }
         });
-        diff_tracker.seed_from_session_log(&project.root, &_log_dir);
+        diff_tracker.seed_from_session_log(&project.root, &log_dir);
         let send_result = if attachments.is_empty() {
             agent.send_message(&thread, &merged).await
         } else {

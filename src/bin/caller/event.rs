@@ -953,6 +953,21 @@ pub enum ControlMsg {
         source: Option<String>,
         name: String,
     },
+    /// Persist per-session external-agent launch settings. These override the
+    /// global Settings pane when a historical session is resumed or reattached.
+    ConfigureSessionAgent {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intendant_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_managed_context: Option<String>,
+    },
     /// Set the Gemini model override. `None`/missing lets Gemini pick.
     /// Applies to the NEXT task because Gemini latches `--model` at
     /// process spawn.
@@ -1148,6 +1163,15 @@ pub enum ControlMsg {
         /// Bypass presence/orchestration, matching StartTask.direct.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         direct: Option<bool>,
+        /// Per-session executable override. When omitted, the supervisor
+        /// rehydrates the persisted session value before falling back to the
+        /// global Settings value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_command: Option<String>,
+        /// Per-session Codex managed-context override. Only applies when
+        /// `source` resolves to Codex.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_managed_context: Option<String>,
     },
     FollowUp {
         /// Optional target session. Omitted means "current active session"
@@ -3023,6 +3047,57 @@ mod tests {
                 assert_eq!(name, "UI polish");
             }
             _ => panic!("expected RenameSession"),
+        }
+    }
+
+    #[test]
+    fn control_msg_configure_session_agent_deserializes() {
+        let json = r#"{"action":"configure_session_agent","session_id":"abc123","source":"codex","backend_session_id":"thread-1","intendant_session_id":"wrap-1","agent_command":"/tmp/codex","codex_managed_context":"managed"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ConfigureSessionAgent {
+                session_id,
+                source,
+                backend_session_id,
+                intendant_session_id,
+                agent_command,
+                codex_managed_context,
+            } => {
+                assert_eq!(session_id, "abc123");
+                assert_eq!(source.as_deref(), Some("codex"));
+                assert_eq!(backend_session_id.as_deref(), Some("thread-1"));
+                assert_eq!(intendant_session_id.as_deref(), Some("wrap-1"));
+                assert_eq!(agent_command.as_deref(), Some("/tmp/codex"));
+                assert_eq!(codex_managed_context.as_deref(), Some("managed"));
+            }
+            _ => panic!("expected ConfigureSessionAgent"),
+        }
+    }
+
+    #[test]
+    fn control_msg_resume_session_deserializes_launch_overrides() {
+        let json = r#"{"action":"resume_session","source":"codex","session_id":"thread-1","resume_id":"thread-1","project_root":"/repo","direct":true,"agent_command":"/tmp/codex","codex_managed_context":"managed"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ResumeSession {
+                source,
+                session_id,
+                resume_id,
+                project_root,
+                direct,
+                agent_command,
+                codex_managed_context,
+                ..
+            } => {
+                assert_eq!(source, "codex");
+                assert_eq!(session_id, "thread-1");
+                assert_eq!(resume_id.as_deref(), Some("thread-1"));
+                assert_eq!(project_root.as_deref(), Some("/repo"));
+                assert_eq!(direct, Some(true));
+                assert_eq!(agent_command.as_deref(), Some("/tmp/codex"));
+                assert_eq!(codex_managed_context.as_deref(), Some("managed"));
+            }
+            _ => panic!("expected ResumeSession"),
         }
     }
 

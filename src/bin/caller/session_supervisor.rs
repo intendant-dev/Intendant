@@ -369,9 +369,20 @@ impl SessionSupervisor {
                 project_root,
                 task,
                 direct,
+                agent_command,
+                codex_managed_context,
             } => {
-                self.resume_session(source, session_id, resume_id, project_root, task, direct)
-                    .await;
+                self.resume_session(
+                    source,
+                    session_id,
+                    resume_id,
+                    project_root,
+                    task,
+                    direct,
+                    agent_command,
+                    codex_managed_context,
+                )
+                .await;
             }
             event::ControlMsg::FollowUp {
                 session_id,
@@ -450,6 +461,24 @@ impl SessionSupervisor {
                 self.rename_session(session_id, backend_session_id, source, name)
                     .await;
             }
+            event::ControlMsg::ConfigureSessionAgent {
+                session_id,
+                source,
+                backend_session_id,
+                intendant_session_id,
+                agent_command,
+                codex_managed_context,
+            } => {
+                self.configure_session_agent(
+                    session_id,
+                    source,
+                    backend_session_id,
+                    intendant_session_id,
+                    agent_command,
+                    codex_managed_context,
+                )
+                .await;
+            }
             _ => {}
         }
     }
@@ -459,6 +488,7 @@ impl SessionSupervisor {
             event::ControlMsg::CreateSession { .. } => true,
             event::ControlMsg::ResumeSession { .. } => true,
             event::ControlMsg::RenameSession { .. } => true,
+            event::ControlMsg::ConfigureSessionAgent { .. } => true,
             msg if control_msg_can_attach_unmanaged_session(msg) => true,
             _ => {
                 if let Some(session_id) = control_target_session_id(msg) {
@@ -601,6 +631,16 @@ impl SessionSupervisor {
                 return;
             }
         }
+        if let Some(backend) = backend.as_ref() {
+            let config = crate::session_config::from_project(backend, &project);
+            if let Err(e) = crate::session_config::write_log_dir_config(&log_dir, &config) {
+                self.warn(&format!(
+                    "Session launch config was not persisted for {}: {}",
+                    short_session(&session_id),
+                    e
+                ));
+            }
+        }
         let session_dir = session_log
             .lock()
             .map(|log| log.dir().to_path_buf())
@@ -664,6 +704,8 @@ impl SessionSupervisor {
         project_root: Option<String>,
         task: Option<String>,
         direct: Option<bool>,
+        agent_command: Option<String>,
+        codex_managed_context: Option<String>,
     ) {
         let source_norm = source.trim().to_lowercase();
         let resume_task = task.and_then(|task| {
@@ -690,6 +732,22 @@ impl SessionSupervisor {
         };
         let is_external = external_backend.is_some();
         let resume_token = resume_id.unwrap_or_else(|| session_id.clone());
+        let session_agent_config = external_backend.as_ref().map(|backend| {
+            let mut config = crate::session_config::from_wire(
+                Some(backend.as_short_str()),
+                agent_command.as_deref(),
+                codex_managed_context.as_deref(),
+            );
+            if let Some(persisted) = crate::session_config::load_for_resume(
+                &crate::platform::home_dir(),
+                backend.as_short_str(),
+                &session_id,
+                Some(&resume_token),
+            ) {
+                config.merge_missing_from(persisted);
+            }
+            config
+        });
 
         if resume_task.is_none() {
             if let Some(existing_id) = self
@@ -727,7 +785,7 @@ impl SessionSupervisor {
                         return;
                     }
                 };
-                let project = match self
+                let mut project = match self
                     .project_with_runtime_config(project_root.clone(), external_backend.as_ref())
                     .await
                 {
@@ -737,8 +795,16 @@ impl SessionSupervisor {
                         return;
                     }
                 };
+                if let (Some(backend), Some(config)) =
+                    (external_backend.as_ref(), session_agent_config.as_ref())
+                {
+                    crate::session_config::apply_to_project(&mut project, backend, config);
+                }
 
                 write_session_meta(&session_log, &project.root, None, None);
+                if let Some(config) = session_agent_config.as_ref() {
+                    let _ = crate::session_config::write_log_dir_config(&log_dir, config);
+                }
                 self.activate_shared_session(session_log.clone()).await;
                 self.spawn_agent_session(
                     resume_token.clone(),
@@ -811,7 +877,7 @@ impl SessionSupervisor {
         } else {
             intendant_session_id.clone()
         };
-        let project = match self
+        let mut project = match self
             .project_with_runtime_config(project_root.clone(), external_backend.as_ref())
             .await
         {
@@ -821,8 +887,16 @@ impl SessionSupervisor {
                 return;
             }
         };
+        if let (Some(backend), Some(config)) =
+            (external_backend.as_ref(), session_agent_config.as_ref())
+        {
+            crate::session_config::apply_to_project(&mut project, backend, config);
+        }
 
         write_session_meta(&session_log, &project.root, Some(&resume_task), None);
+        if let Some(config) = session_agent_config.as_ref() {
+            let _ = crate::session_config::write_log_dir_config(&log_dir, config);
+        }
         self.activate_shared_session(session_log.clone()).await;
         self.config.bus.send(AppEvent::SessionStarted {
             session_id: live_session_id.clone(),
@@ -1324,6 +1398,8 @@ impl SessionSupervisor {
                     attach.project_root,
                     None,
                     Some(attach.direct.unwrap_or(true)),
+                    None,
+                    None,
                 )
                 .await;
                 (target_id, entry) = self.lookup_edit_route_target(&lookup_id).await;
@@ -1681,6 +1757,115 @@ impl SessionSupervisor {
         }
     }
 
+    async fn configure_session_agent(
+        &self,
+        session_id: String,
+        source: Option<String>,
+        backend_session_id: Option<String>,
+        intendant_session_id: Option<String>,
+        agent_command: Option<String>,
+        codex_managed_context: Option<String>,
+    ) {
+        let managed = {
+            let state = self.state.lock().await;
+            state
+                .resolve_session_id(&session_id)
+                .and_then(|resolved_id| state.sessions.get(&resolved_id))
+                .map(|session| {
+                    (
+                        session.session_id.clone(),
+                        session.source.clone(),
+                        session.session_dir.clone(),
+                    )
+                })
+        };
+
+        let normalized_source = managed
+            .as_ref()
+            .map(|(_, source, _)| source.clone())
+            .or(source)
+            .map(|source| crate::session_names::normalize_source(&source))
+            .unwrap_or_default();
+        let Some(backend) = external_agent::AgentBackend::from_str_loose(&normalized_source) else {
+            self.loop_error("Session config failed: choose an external agent session".to_string());
+            return;
+        };
+        let config = crate::session_config::from_wire(
+            Some(backend.as_short_str()),
+            agent_command.as_deref(),
+            codex_managed_context.as_deref(),
+        );
+        if config.is_empty() {
+            self.loop_error("Session config failed: no launch settings supplied".to_string());
+            return;
+        }
+
+        let mut errors = Vec::new();
+        if let Some((_, _, session_dir)) = managed.as_ref() {
+            if let Err(e) = crate::session_config::write_log_dir_config(session_dir, &config) {
+                errors.push(e);
+            }
+        }
+        let intendant_id = intendant_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        if let Some(intendant_id) = intendant_id {
+            if let Some(dir) = session_log::SessionLog::find_session_by_id(intendant_id) {
+                if let Err(e) = crate::session_config::write_log_dir_config(&dir, &config) {
+                    errors.push(e);
+                }
+            }
+        }
+
+        let external_ids = [
+            backend_session_id.as_deref(),
+            Some(session_id.as_str()),
+            managed
+                .as_ref()
+                .map(|(managed_id, _, _)| managed_id.as_str()),
+        ];
+        let home = crate::platform::home_dir();
+        let mut wrote_external = false;
+        for external_id in external_ids
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            if !external_agent::source_session_id_is_canonical(backend.as_short_str(), external_id)
+            {
+                continue;
+            }
+            wrote_external = true;
+            if let Err(e) = crate::session_config::write_external_overlay(
+                &home,
+                backend.as_short_str(),
+                external_id,
+                &config,
+            ) {
+                errors.push(e);
+            }
+        }
+
+        if !wrote_external && managed.is_none() && intendant_id.is_none() {
+            self.loop_error("Session config failed: no persistable session id".to_string());
+            return;
+        }
+        if errors.is_empty() {
+            self.info(&format!(
+                "Session {} launch config saved for {} (takes effect on next attach/resume)",
+                short_session(&session_id),
+                backend.as_short_str()
+            ));
+        } else {
+            self.loop_error(format!(
+                "Session config partially failed: {}",
+                errors.join("; ")
+            ));
+        }
+    }
+
     async fn apply_session_identity(
         &self,
         session_id: String,
@@ -1996,6 +2181,16 @@ impl SessionSupervisor {
         self.config.bus.send(AppEvent::LogEntry {
             session_id: None,
             level: "warn".to_string(),
+            source: "session-supervisor".to_string(),
+            content: message.to_string(),
+            turn: None,
+        });
+    }
+
+    fn info(&self, message: &str) {
+        self.config.bus.send(AppEvent::LogEntry {
+            session_id: None,
+            level: "info".to_string(),
             source: "session-supervisor".to_string(),
             content: message.to_string(),
             turn: None,
@@ -2412,6 +2607,7 @@ fn control_target_session_id(msg: &event::ControlMsg) -> Option<&str> {
         | event::ControlMsg::EditUserMessage { session_id, .. }
         | event::ControlMsg::FollowUp { session_id, .. } => session_id.as_deref(),
         event::ControlMsg::RenameSession { session_id, .. } => Some(session_id.as_str()),
+        event::ControlMsg::ConfigureSessionAgent { session_id, .. } => Some(session_id.as_str()),
         event::ControlMsg::ResumeSession { .. } => None,
         _ => None,
     }
@@ -2688,6 +2884,8 @@ mod tests {
                 Some("/tmp/project".to_string()),
                 Some("continue parent".to_string()),
                 Some(true),
+                None,
+                None,
             )
             .await;
 

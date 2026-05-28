@@ -4634,6 +4634,59 @@ html, body {
   color: var(--overlay0);
   font-size: 11px;
 }
+.session-config-dialog {
+  width: min(640px, calc(100vw - 32px));
+  max-width: 640px;
+}
+.session-config-row {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  margin: 10px 0;
+}
+.session-config-row label {
+  color: var(--subtext0);
+  font-size: 12px;
+  font-weight: 600;
+}
+.session-config-command-row {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+.session-config-row input,
+.session-config-row select {
+  min-width: 0;
+  width: 100%;
+  padding: 7px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+}
+.session-config-row input:focus,
+.session-config-row select:focus { outline: none; border-color: var(--blue); }
+.session-config-browse {
+  flex: 0 0 auto;
+  padding: 7px 12px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+.session-config-status {
+  min-height: 18px;
+  margin-top: 8px;
+  color: var(--overlay0);
+  font-size: 12px;
+}
+.session-config-status.error { color: var(--red); }
+.session-config-status.ok { color: var(--green); }
 
 /* ── Control sub-tab ── */
 .control-pane-body {
@@ -7297,6 +7350,7 @@ html, body {
                 <button class="session-back-btn" onclick="closeSessionDetail()">&larr; Back</button>
                 <span class="session-detail-title" id="session-detail-title"></span>
                 <button class="session-detail-action-btn session-resume-btn" id="session-detail-resume" type="button" title="Resume this session in Activity">Resume session</button>
+                <button class="session-detail-action-btn session-config-btn" id="session-detail-config" type="button" title="Configure binary and managed context for this session">Configure</button>
                 <button class="session-detail-action-btn session-rename-btn" id="session-detail-rename" type="button" title="Rename this session">Rename</button>
               </div>
               <div class="session-detail-body" id="session-detail-body">
@@ -7928,6 +7982,42 @@ html, body {
       <button class="modal-cancel" type="button" onclick="closeFsPicker()">Cancel</button>
       <button class="modal-cancel" id="fs-picker-create-btn" type="button" onclick="createPickerDirectory()">Create directory</button>
       <button class="modal-confirm" id="fs-picker-use-btn" type="button" onclick="useFsPickerSelection()">Use directory</button>
+    </div>
+  </div>
+</div>
+
+<div id="session-config-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog session-config-dialog">
+    <h3 id="session-config-title">Session launch config</h3>
+    <p class="modal-description" id="session-config-description">
+      These settings are stored on this session and are used when it is next attached or resumed.
+    </p>
+    <div class="session-config-row">
+      <label>Session</label>
+      <input id="session-config-session" type="text" readonly>
+    </div>
+    <div class="session-config-row">
+      <label>Agent</label>
+      <input id="session-config-source" type="text" readonly>
+    </div>
+    <div class="session-config-row">
+      <label for="session-config-command">Binary path</label>
+      <div class="session-config-command-row">
+        <input id="session-config-command" type="text" autocomplete="off" spellcheck="false" placeholder="Use global setting">
+        <button type="button" class="session-config-browse" onclick="openSessionConfigBinaryPicker()">Browse</button>
+      </div>
+    </div>
+    <div class="session-config-row" id="session-config-managed-row">
+      <label for="session-config-managed-context">Managed context</label>
+      <select id="session-config-managed-context">
+        <option value="vanilla">vanilla</option>
+        <option value="managed">managed</option>
+      </select>
+    </div>
+    <div class="session-config-status" id="session-config-status"></div>
+    <div class="modal-actions">
+      <button class="modal-cancel" type="button" onclick="closeSessionConfigModal()">Cancel</button>
+      <button class="modal-confirm" type="button" id="session-config-save" onclick="saveSessionConfigModal()">Save config</button>
     </div>
   </div>
 </div>
@@ -10046,6 +10136,7 @@ let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
 let newSessionSpawnTimeout = null;
 let newSessionSpawnClearTimeout = null;
+let sessionConfigEditing = null;
 const NEW_SESSION_SPAWN_TIMEOUT_MS = 90000;
 
 async function refreshControlPane() {
@@ -11052,6 +11143,8 @@ async function ensureManagedContextSessionsLoaded() {
 
 function managedContextConfiguredMode(meta = {}) {
   return String(
+    meta.codexManagedContext ||
+    meta.codex_managed_context ||
     meta.capabilities?.codexManagedContext ||
     meta.capabilities?.codex_managed_context ||
     ''
@@ -11189,7 +11282,7 @@ function managedContextIsCodexLike(meta = {}) {
   if ((configuredMode === 'managed' || configuredMode === 'vanilla') && (backendSessionId || !label)) {
     return true;
   }
-  const command = String(meta.capabilities?.codexCommand || meta.capabilities?.codex_command || '').trim();
+  const command = String(meta.agentCommand || meta.agent_command || meta.codexCommand || meta.codex_command || meta.capabilities?.codexCommand || meta.capabilities?.codex_command || '').trim();
   if (command && (backendSessionId || !label)) return true;
   const actions = meta.capabilities?.codexThreadActions || meta.capabilities?.codex_thread_actions || [];
   return Array.isArray(actions) && actions.length > 0;
@@ -11458,7 +11551,7 @@ function renderManagedContextAlerts() {
     alert.textContent = pressure.last_rewind_insufficient.message;
     host.appendChild(alert);
   }
-  const command = meta.capabilities?.codexCommand || meta.capabilities?.codex_command || controlCodexConfig.command || '';
+  const command = sessionConfigCommand(meta) || controlCodexConfig.command || '';
   if (mode === 'managed' && /(^|\/)codex$/.test(command) && !/target\/(debug|release)\/codex/.test(command)) {
     const alert = document.createElement('div');
     alert.className = 'managed-context-alert';
@@ -13189,6 +13282,11 @@ function normalizeSessionWindowMeta(meta = {}) {
   if (backendSessionId) out.backendSessionId = backendSessionId;
   const intendantSessionId = compactSessionText(meta.intendant_session_id || meta.intendantSessionId);
   if (intendantSessionId) out.intendantSessionId = intendantSessionId;
+  const agentCommand = compactSessionText(meta.agent_command || meta.agentCommand || meta.codex_command || meta.codexCommand);
+  if (agentCommand) out.agentCommand = agentCommand;
+  const managedMode = String(meta.codex_managed_context || meta.codexManagedContext || '').trim();
+  if (managedMode === 'managed' || managedMode === 'vanilla') out.codexManagedContext = managedMode;
+  if (meta.capabilities) out.capabilities = normalizeSessionCapabilities(meta.capabilities);
   if (
     Object.prototype.hasOwnProperty.call(meta, 'goal') ||
     Object.prototype.hasOwnProperty.call(meta, 'session_goal') ||
@@ -13223,6 +13321,10 @@ function sessionWindowMetadataSignature(meta = {}) {
     meta.backendSource || '',
     meta.backendSessionId || '',
     meta.intendantSessionId || '',
+    meta.agentCommand || '',
+    meta.codexManagedContext || '',
+    meta.capabilities?.codexCommand || '',
+    meta.capabilities?.codexManagedContext || '',
     sessionGoalSignature(meta.goal),
     meta.parentId || '',
     meta.relationshipKind || '',
@@ -13364,6 +13466,9 @@ function sessionWindowMetaFromSession(session) {
     backend_source: session.backend_source,
     backend_session_id: session.backend_session_id,
     intendant_session_id: session.intendant_session_id,
+    agent_command: session.agent_command || session.codex_command,
+    codex_managed_context: session.codex_managed_context,
+    capabilities: session.capabilities,
   };
   if (
     Object.prototype.hasOwnProperty.call(session, 'goal') ||
@@ -13452,6 +13557,8 @@ function persistedSessionWindowRecord(sessionId, win = null) {
   if (meta.backendSource) record.backend_source = meta.backendSource;
   if (meta.backendSessionId) record.backend_session_id = meta.backendSessionId;
   if (meta.intendantSessionId) record.intendant_session_id = meta.intendantSessionId;
+  if (meta.agentCommand) record.agent_command = meta.agentCommand;
+  if (meta.codexManagedContext) record.codex_managed_context = meta.codexManagedContext;
   if (meta.projectRoot) record.project_root = meta.projectRoot;
   if (meta.cwd) record.cwd = meta.cwd;
   if (meta.parentId && meta.relationshipKind) {
@@ -14074,9 +14181,222 @@ function requestSessionRename(sessionOrId, sourceArg = '') {
   return true;
 }
 
+function findCachedSessionByAnyId(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  return (_cachedSessions || []).find(session => {
+    if (!session) return false;
+    return [
+      session.session_id,
+      session.resume_id,
+      session.backend_session_id,
+      session.intendant_session_id,
+    ].some(id => String(id || '').trim() === sid);
+  }) || null;
+}
+
+function sessionConfigSource(meta = {}) {
+  return normalizeAgentId(
+    meta.backendSource ||
+    meta.backend_source ||
+    meta.source ||
+    meta.source_label ||
+    meta.sourceLabel ||
+    ''
+  );
+}
+
+function sessionConfigCommand(meta = {}) {
+  return String(
+    meta.agentCommand ||
+    meta.agent_command ||
+    meta.codexCommand ||
+    meta.codex_command ||
+    meta.capabilities?.codexCommand ||
+    meta.capabilities?.codex_command ||
+    ''
+  ).trim();
+}
+
+function sessionConfigManagedMode(meta = {}) {
+  const mode = String(
+    meta.codexManagedContext ||
+    meta.codex_managed_context ||
+    meta.capabilities?.codexManagedContext ||
+    meta.capabilities?.codex_managed_context ||
+    ''
+  ).trim();
+  return mode === 'managed' ? 'managed' : 'vanilla';
+}
+
+function sessionConfigMetadata(sessionOrId) {
+  const raw = typeof sessionOrId === 'object'
+    ? sessionOrId
+    : (findCachedSessionByAnyId(sessionOrId) || { session_id: sessionOrId });
+  const sid = String(raw?.session_id || raw?.resume_id || sessionOrId || '').trim();
+  const cached = findCachedSessionByAnyId(sid) || {};
+  const live = sessionMetadataById.get(sid) || {};
+  const backendId = String(raw?.backend_session_id || raw?.backendSessionId || cached.backend_session_id || cached.backendSessionId || live.backendSessionId || '').trim();
+  const intendantId = String(raw?.intendant_session_id || raw?.intendantSessionId || cached.intendant_session_id || cached.intendantSessionId || live.intendantSessionId || '').trim();
+  const backendLive = backendId ? (sessionMetadataById.get(backendId) || {}) : {};
+  const merged = {
+    ...cached,
+    ...raw,
+    ...live,
+    ...backendLive,
+    session_id: sid || raw?.session_id || raw?.resume_id || backendId,
+    backendSessionId: backendId || live.backendSessionId || backendLive.backendSessionId || '',
+    intendantSessionId: intendantId || live.intendantSessionId || backendLive.intendantSessionId || '',
+    capabilities: live.capabilities || backendLive.capabilities || raw?.capabilities || cached.capabilities || null,
+  };
+  return managedContextNormalizeSessionMeta(merged, sid || backendId);
+}
+
+function sessionLaunchOverridesForSession(sessionOrId) {
+  const meta = sessionConfigMetadata(sessionOrId);
+  const source = sessionConfigSource(meta);
+  const overrides = {};
+  const command = sessionConfigCommand(meta);
+  if (command) overrides.agent_command = command;
+  if (source === 'codex') overrides.codex_managed_context = sessionConfigManagedMode(meta);
+  return overrides;
+}
+
+function openSessionConfigModal(sessionOrId) {
+  const meta = sessionConfigMetadata(sessionOrId);
+  const sid = String(meta.session_id || meta.sessionId || sessionOrId || '').trim();
+  const source = sessionConfigSource(meta);
+  if (!sid || !source || source === 'intendant') {
+    showControlToast('error', 'Session launch config is only available for external-agent sessions');
+    return false;
+  }
+  sessionConfigEditing = {
+    sessionId: sid,
+    source,
+    backendSessionId: String(meta.backendSessionId || meta.backend_session_id || '').trim(),
+    intendantSessionId: String(meta.intendantSessionId || meta.intendant_session_id || '').trim(),
+  };
+  const title = document.getElementById('session-config-title');
+  if (title) title.textContent = `${prettyAgentName(source)} launch config`;
+  const sessionInput = document.getElementById('session-config-session');
+  if (sessionInput) {
+    sessionInput.value = sid;
+    sessionInput.title = sid;
+  }
+  const sourceInput = document.getElementById('session-config-source');
+  if (sourceInput) sourceInput.value = prettyAgentName(source) || source;
+  const commandInput = document.getElementById('session-config-command');
+  const command = sessionConfigCommand(meta);
+  if (commandInput) {
+    commandInput.value = command;
+    commandInput.placeholder = commandDefaultForNewSessionAgent(source) || 'Use global setting';
+    commandInput.title = command || commandInput.placeholder;
+  }
+  const managedRow = document.getElementById('session-config-managed-row');
+  const managedSel = document.getElementById('session-config-managed-context');
+  if (managedRow) managedRow.style.display = source === 'codex' ? '' : 'none';
+  if (managedSel) managedSel.value = sessionConfigManagedMode(meta);
+  const status = document.getElementById('session-config-status');
+  if (status) {
+    status.className = 'session-config-status';
+    status.textContent = source === 'codex'
+      ? 'Managed requires a patched Codex binary. Changes apply the next time this session is attached or resumed.'
+      : 'Changes apply the next time this session is attached or resumed.';
+  }
+  const modal = document.getElementById('session-config-modal');
+  if (modal) modal.style.display = 'flex';
+  return true;
+}
+
+function closeSessionConfigModal() {
+  const modal = document.getElementById('session-config-modal');
+  if (modal) modal.style.display = 'none';
+  sessionConfigEditing = null;
+}
+
+function applySessionConfigLocal(meta, command, mode) {
+  const ids = Array.from(new Set([
+    meta.sessionId,
+    meta.backendSessionId,
+    meta.intendantSessionId,
+  ].map(id => String(id || '').trim()).filter(Boolean)));
+  for (const id of ids) {
+    const existing = sessionMetadataById.get(id) || {};
+    const next = {
+      ...existing,
+      source: existing.source || meta.source,
+      backendSource: existing.backendSource || meta.source,
+      ...(meta.backendSessionId ? { backendSessionId: meta.backendSessionId } : {}),
+      ...(meta.intendantSessionId ? { intendantSessionId: meta.intendantSessionId } : {}),
+      ...(command ? { agentCommand: command } : {}),
+      ...(meta.source === 'codex' ? { codexManagedContext: mode } : {}),
+    };
+    sessionMetadataById.set(id, next);
+    if (sessionWindows.has(id)) updateSessionWindow(id, next);
+  }
+  for (const session of _cachedSessions || []) {
+    if (!session) continue;
+    const matches = [
+      session.session_id,
+      session.resume_id,
+      session.backend_session_id,
+      session.intendant_session_id,
+    ].some(id => ids.includes(String(id || '').trim()));
+    if (!matches) continue;
+    if (command) {
+      session.agent_command = command;
+      if (meta.source === 'codex') session.codex_command = command;
+    } else {
+      delete session.agent_command;
+      delete session.codex_command;
+    }
+    if (meta.source === 'codex') session.codex_managed_context = mode;
+  }
+  persistSessionWindowState();
+}
+
+function saveSessionConfigModal() {
+  if (!sessionConfigEditing || !app) return;
+  const command = document.getElementById('session-config-command')?.value.trim() || '';
+  const mode = document.getElementById('session-config-managed-context')?.value === 'managed'
+    ? 'managed'
+    : 'vanilla';
+  const payload = {
+    action: 'configure_session_agent',
+    session_id: sessionConfigEditing.sessionId,
+    source: sessionConfigEditing.source,
+    ...(sessionConfigEditing.backendSessionId ? { backend_session_id: sessionConfigEditing.backendSessionId } : {}),
+    ...(sessionConfigEditing.intendantSessionId ? { intendant_session_id: sessionConfigEditing.intendantSessionId } : {}),
+    agent_command: command,
+    ...(sessionConfigEditing.source === 'codex' ? { codex_managed_context: mode } : {}),
+  };
+  try {
+    dispatchControlMsg(payload);
+    applySessionConfigLocal(sessionConfigEditing, command, mode);
+    const status = document.getElementById('session-config-status');
+    if (status) {
+      status.className = 'session-config-status ok';
+      status.textContent = 'Saved for the next attach/resume.';
+    }
+    showControlToast('success', 'Session launch config saved');
+    setTimeout(closeSessionConfigModal, 350);
+  } catch (e) {
+    const status = document.getElementById('session-config-status');
+    if (status) {
+      status.className = 'session-config-status error';
+      status.textContent = e?.message || 'Save failed';
+    }
+  }
+}
+
+window.openSessionConfigModal = openSessionConfigModal;
+window.closeSessionConfigModal = closeSessionConfigModal;
+window.saveSessionConfigModal = saveSessionConfigModal;
+
 const SESSION_WINDOW_GENERIC_ACTIONS = [
   { op: 'copy-session-id', label: 'Copy full session ID', title: 'Copy the full session ID' },
   { op: 'rename-session', label: 'Rename session...', title: 'Rename this session' },
+  { op: 'configure-launch', label: 'Launch config...', title: 'Configure the binary and managed-context mode used on next attach/resume' },
 ];
 
 const SESSION_WINDOW_CODEX_ACTIONS = [
@@ -14884,6 +15204,10 @@ function runSessionWindowAction(sessionId, op) {
     });
     return;
   }
+  if (op === 'configure-launch') {
+    openSessionConfigModal(sid);
+    return;
+  }
   runSessionWindowCodexAction(sid, op);
 }
 
@@ -15352,8 +15676,10 @@ function shouldDeferSessionWindowEscape() {
   if (annotationMode || clipMode || clipAnnotatingRange || displayPickerVisible) return true;
   const rollbackModal = document.getElementById('rollback-modal');
   const fsPickerModal = document.getElementById('fs-picker-modal');
+  const sessionConfigModal = document.getElementById('session-config-modal');
   return (!!rollbackModal && rollbackModal.style.display !== 'none')
-    || (!!fsPickerModal && fsPickerModal.style.display !== 'none');
+    || (!!fsPickerModal && fsPickerModal.style.display !== 'none')
+    || (!!sessionConfigModal && sessionConfigModal.style.display !== 'none');
 }
 
 function focusSessionWindow(sessionId) {
@@ -26409,7 +26735,8 @@ function detachedSessionResumeMessage(sessionId, task, direct, attachments = [])
   const sid = String(sessionId || '').trim();
   if (!sid) return null;
   const meta = sessionMetadataById.get(sid) || {};
-  const source = externalSourceForSessionWindow(sid) || normalizeAgentId(meta.source) || 'intendant';
+  const source = externalSourceForSessionWindow(sid) || normalizeAgentId(meta.backendSource || meta.source) || 'intendant';
+  const overrides = sessionLaunchOverridesForSession(sid);
   const msg = {
     action: 'resume_session',
     source,
@@ -26418,6 +26745,7 @@ function detachedSessionResumeMessage(sessionId, task, direct, attachments = [])
     project_root: meta.projectRoot || null,
     task,
     direct: direct !== false,
+    ...overrides,
   };
   if (attachments.length > 0) msg.attachments = attachments;
   return msg;
@@ -27087,6 +27415,24 @@ function openAgentBinaryPicker() {
   loadFsPicker(fsPathLooksAbsolute(current) ? current : '~');
 }
 
+function openSessionConfigBinaryPicker() {
+  if (!sessionConfigEditing) return;
+  configureFsPicker({
+    mode: 'file',
+    target: 'sessionAgentBinary',
+    title: `Choose ${prettyAgentName(sessionConfigEditing.source)} binary`,
+    placeholder: '/path/to/binary',
+    useLabel: 'Use binary',
+    showCreate: false,
+  });
+  const modal = document.getElementById('fs-picker-modal');
+  if (modal) modal.style.display = 'flex';
+  const current = document.getElementById('session-config-command')?.value.trim()
+    || commandDefaultForNewSessionAgent(sessionConfigEditing.source)
+    || '';
+  loadFsPicker(fsPathLooksAbsolute(current) ? current : '~');
+}
+
 function closeFsPicker() {
   const modal = document.getElementById('fs-picker-modal');
   if (modal) modal.style.display = 'none';
@@ -27100,6 +27446,16 @@ function useFsPickerSelection() {
   if (fsPickerTarget === 'agentBinary') {
     if (!fsPickerSelectedPath) return;
     const input = document.getElementById('new-session-agent-command');
+    if (input) {
+      input.value = fsPickerSelectedPath;
+      input.title = fsPickerSelectedPath;
+    }
+    closeFsPicker();
+    return;
+  }
+  if (fsPickerTarget === 'sessionAgentBinary') {
+    if (!fsPickerSelectedPath) return;
+    const input = document.getElementById('session-config-command');
     if (input) {
       input.value = fsPickerSelectedPath;
       input.title = fsPickerSelectedPath;
@@ -27156,6 +27512,7 @@ window.closeFsPicker = closeFsPicker;
 window.loadFsPickerPath = loadFsPickerPath;
 window.useFsPickerSelection = useFsPickerSelection;
 window.openAgentBinaryPicker = openAgentBinaryPicker;
+window.openSessionConfigBinaryPicker = openSessionConfigBinaryPicker;
 window.createPickerDirectory = createPickerDirectory;
 
 function setNewSessionAgentDefaults(settings) {
@@ -27814,6 +28171,10 @@ document.getElementById('session-detail-rename')?.addEventListener('click', (ev)
 document.getElementById('session-detail-resume')?.addEventListener('click', (ev) => {
   ev.preventDefault();
   if (currentSessionDetail) resumeSession(currentSessionDetail);
+});
+document.getElementById('session-detail-config')?.addEventListener('click', (ev) => {
+  ev.preventDefault();
+  if (currentSessionDetail) openSessionConfigModal(currentSessionDetail);
 });
 document.getElementById('worktrees-search')?.addEventListener('input', _refilterWorktrees);
 document.getElementById('sort-worktrees')?.addEventListener('change', _refilterWorktrees);
@@ -28559,6 +28920,19 @@ function renderSessionsList(sessions, el, options = {}) {
         actions.appendChild(renameBtn);
       }
 
+      const configSource = sessionConfigSource(sessionConfigMetadata(s));
+      if (sessionId && configSource && configSource !== 'intendant') {
+        const configBtn = document.createElement('button');
+        configBtn.className = 'sc-rename-btn';
+        configBtn.textContent = 'Configure';
+        configBtn.title = 'Configure binary and managed context for this session';
+        configBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openSessionConfigModal(s);
+        });
+        actions.appendChild(configBtn);
+      }
+
       if (!isExternal && s.can_delete !== false) {
       const btn = document.createElement('button');
       btn.className = 'sc-delete-btn';
@@ -29042,14 +29416,16 @@ function renderWorktreesList(scan, el) {
 
 function resumeSession(s) {
   if (!app || !s || !s.session_id) return;
-  const source = s.source || 'intendant';
+  const source = normalizeAgentId(s.backend_source || s.source || '') || 'intendant';
+  const overrides = sessionLaunchOverridesForSession(s);
   app.send_server_action({
     action: 'resume_session',
     source,
     session_id: s.session_id,
-    resume_id: s.resume_id || s.session_id,
+    resume_id: s.backend_session_id || s.resume_id || s.session_id,
     project_root: s.project_root || null,
     direct: true,
+    ...overrides,
   });
   switchTab('activity');
 }
@@ -29153,6 +29529,16 @@ function renderSessionDetailTitle(session) {
     resumeBtn.disabled = !canResume;
     resumeBtn.style.display = canResume ? '' : 'none';
     resumeBtn.title = canResume ? 'Resume this session in Activity' : 'Session cannot be resumed';
+  }
+  const configBtn = document.getElementById('session-detail-config');
+  if (configBtn) {
+    const source = sessionConfigSource(sessionConfigMetadata(session));
+    const canConfigure = !!sessionId && !!source && source !== 'intendant';
+    configBtn.disabled = !canConfigure;
+    configBtn.style.display = canConfigure ? '' : 'none';
+    configBtn.title = canConfigure
+      ? 'Configure binary and managed context for this session'
+      : 'Only external-agent sessions have launch config';
   }
 }
 
@@ -29880,14 +30266,22 @@ document.addEventListener('keydown', (e) => {
   }
   const fsPickerModal = document.getElementById('fs-picker-modal');
   if (fsPickerModal && fsPickerModal.style.display !== 'none') {
-    closeProjectDirectoryPicker();
+    closeFsPicker();
+    return;
+  }
+  const sessionConfigModal = document.getElementById('session-config-modal');
+  if (sessionConfigModal && sessionConfigModal.style.display !== 'none') {
+    closeSessionConfigModal();
   }
 });
 document.getElementById('rollback-modal')?.addEventListener('click', (e) => {
   if (e.target && e.target.id === 'rollback-modal') closeRollbackModal();
 });
 document.getElementById('fs-picker-modal')?.addEventListener('click', (e) => {
-  if (e.target && e.target.id === 'fs-picker-modal') closeProjectDirectoryPicker();
+  if (e.target && e.target.id === 'fs-picker-modal') closeFsPicker();
+});
+document.getElementById('session-config-modal')?.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'session-config-modal') closeSessionConfigModal();
 });
 
 // Enter to submit

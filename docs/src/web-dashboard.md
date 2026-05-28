@@ -111,8 +111,14 @@ A browser of past and current sessions. Four subtabs:
 - **Deep Search** — search across session history.
 - **Worktrees** — the git worktrees in use by sub-agents.
 - **New Session** — start a fresh session from the dashboard.
-  External Codex sessions can choose both the binary path and the one-shot
+  External Codex sessions can choose both the binary path and the
   `managed_context` mode (`vanilla` or `managed`) for that session.
+
+External-agent session cards and Activity windows also expose **Launch config**
+for per-session binary and managed-context settings. These settings are stored
+with the Intendant wrapper session and, for canonical backend session IDs, in an
+external-session overlay. They are used on the next attach/resume so a daemon
+restart or page refresh does not fall back to the current global Settings pane.
 
 ### Debug
 

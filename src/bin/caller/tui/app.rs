@@ -1463,6 +1463,15 @@ impl App {
                     ),
                 );
             }
+            ControlMsg::ConfigureSessionAgent { ref session_id, .. } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Session launch config requested for {}",
+                        truncate_str(session_id, 12)
+                    ),
+                );
+            }
             ControlMsg::ScheduleControllerRestart { .. }
             | ControlMsg::ControllerTurnComplete { .. }
             | ControlMsg::GetRestartStatus

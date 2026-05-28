@@ -1837,6 +1837,9 @@ fn merge_intendant_wrapper_into_external_session(
         ("backend_source_label", "backend_source_label"),
         ("backend_session_id", "backend_session_id"),
         ("capabilities", "capabilities"),
+        ("agent_command", "agent_command"),
+        ("codex_command", "codex_command"),
+        ("codex_managed_context", "codex_managed_context"),
     ] {
         if let Some(value) = wrapper_obj.get(wrapper_key) {
             obj.insert(target_key.to_string(), value.clone());
@@ -5537,6 +5540,7 @@ fn intendant_session_dir_fingerprint(dir: &Path) -> Option<SessionDirFingerprint
     for name in [
         "session.jsonl",
         "session_meta.json",
+        crate::session_config::SESSION_AGENT_CONFIG_FILE,
         "summary.json",
         "conversation.jsonl",
     ] {
@@ -5620,6 +5624,7 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
     let mut external_resume_id: Option<String> = None;
     let mut external_source: Option<String> = None;
     let mut capabilities: Option<serde_json::Value> = None;
+    let mut session_agent_config = crate::session_config::read_log_dir_config(dir);
     let mut updated_at_secs = file_mtime_secs(dir);
 
     if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
@@ -5728,6 +5733,19 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
                         .get("data")
                         .and_then(|data| data.get("capabilities"))
                         .cloned();
+                    if session_agent_config.is_none() {
+                        let source = external_source.as_deref().or(Some("codex"));
+                        let command = capabilities
+                            .as_ref()
+                            .and_then(|caps| caps.get("codex_command"))
+                            .and_then(|v| v.as_str());
+                        let mode = capabilities
+                            .as_ref()
+                            .and_then(|caps| caps.get("codex_managed_context"))
+                            .and_then(|v| v.as_str());
+                        session_agent_config =
+                            Some(crate::session_config::from_wire(source, command, mode));
+                    }
                 }
                 "round_complete" => {
                     if status != "interrupted" {
@@ -5817,6 +5835,7 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
     for name in [
         "session.jsonl",
         "session_meta.json",
+        crate::session_config::SESSION_AGENT_CONFIG_FILE,
         "summary.json",
         "conversation.jsonl",
     ] {
@@ -5861,7 +5880,7 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
     let backend_source_label: Option<String> = None;
     let relationships = session_relationships_from_log_dir(dir);
 
-    let wrapper_session = serde_json::json!({
+    let mut wrapper_session = serde_json::json!({
         "source": "intendant",
         "source_label": "Intendant",
         "session_id": session_id,
@@ -5901,6 +5920,9 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
         "can_resume": true,
         "relationships": relationships,
     });
+    if let Some(config) = session_agent_config.as_ref() {
+        crate::session_config::apply_config_to_session_json(&mut wrapper_session, config);
+    }
 
     store_intendant_session_list_row(fingerprint, &wrapper_session);
     Some(wrapper_session)
@@ -5976,6 +5998,7 @@ fn list_sessions_from_home(home_path: &Path) -> String {
     external_sessions.extend(list_claude_sessions(home_path));
     external_sessions.extend(list_gemini_sessions(home_path));
     crate::session_names::apply_session_name_overlays(home_path, &mut external_sessions);
+    crate::session_config::apply_overlays_to_sessions(home_path, &mut external_sessions);
     if !logs_dir.is_dir() {
         sort_sessions_newest_first(&mut external_sessions);
         truncate_sessions_preserving_sources(&mut external_sessions);
@@ -16004,6 +16027,16 @@ mod tests {
         );
         assert_eq!(
             capabilities.get("codex_command").and_then(|v| v.as_str()),
+            Some("/tmp/codex-managed")
+        );
+        assert_eq!(
+            wrapped
+                .get("codex_managed_context")
+                .and_then(|v| v.as_str()),
+            Some("managed")
+        );
+        assert_eq!(
+            wrapped.get("agent_command").and_then(|v| v.as_str()),
             Some("/tmp/codex-managed")
         );
     }
