@@ -1275,12 +1275,12 @@ impl App {
                     format!("Codex writable roots → {} (applies on next task)", summary),
                 );
             }
-            ControlMsg::SetCodexContextRecovery { ref mode } => {
-                let normalized = crate::project::normalize_codex_context_recovery(mode);
+            ControlMsg::SetCodexManagedContext { ref mode } => {
+                let normalized = crate::project::normalize_codex_managed_context(mode);
                 self.log(
                     LogLevel::Info,
                     format!(
-                        "Codex context recovery → {} (applies on next task)",
+                        "Codex managed context → {} (applies on next task)",
                         normalized
                     ),
                 );

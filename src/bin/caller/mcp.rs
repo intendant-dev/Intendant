@@ -119,19 +119,25 @@ pub struct McpAppState {
     pub screenshot_counter: std::sync::atomic::AtomicU64,
     /// External agent backend selected via web UI (deferred: takes effect on next task).
     pub external_agent: Option<crate::external_agent::AgentBackend>,
-    /// Desired Codex context-recovery mode for the next managed Codex task.
-    pub configured_codex_context_recovery: bool,
-    /// Whether the active Codex backend supports Intendant's patched
-    /// same-thread context-recovery protocol.
-    pub codex_context_recovery: bool,
+    /// Desired Codex managed-context mode for the next managed Codex task.
+    pub configured_codex_managed_context: bool,
+    /// Whether the active Codex backend supports Intendant's managed-context
+    /// protocol.
+    pub codex_managed_context: bool,
+    /// Managed-context capability latched per Intendant/backend session id.
+    pub session_codex_managed_context: std::collections::HashMap<String, bool>,
+    /// Latest backend usage sample by Intendant/backend session id.
+    session_usage: std::collections::HashMap<String, frontend::ModelUsageSnapshot>,
     /// Source for the currently active session, when it is known.
     pub active_session_source: Option<String>,
     /// Map Intendant wrapper session IDs and backend session IDs to their external source.
     pub session_sources: std::collections::HashMap<String, String>,
-    /// Successful rewind record awaiting the next backend usage sample.
-    pending_rewind_pressure_check: Option<String>,
-    /// Last successful rewind that did not reduce backend-reported pressure below the gate.
-    insufficient_rewind_notice: Option<InsufficientRewindNotice>,
+    /// Successful rewind records awaiting the next backend usage sample, keyed
+    /// by Intendant/backend session id.
+    pending_rewind_pressure_checks: std::collections::HashMap<String, String>,
+    /// Last successful rewinds that did not reduce backend-reported pressure
+    /// below the gate, keyed by Intendant/backend session id.
+    insufficient_rewind_notices: std::collections::HashMap<String, InsufficientRewindNotice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,12 +201,14 @@ impl McpAppState {
             screenshot_dir: None,
             screenshot_counter: std::sync::atomic::AtomicU64::new(0),
             external_agent: None,
-            configured_codex_context_recovery: false,
-            codex_context_recovery: false,
+            configured_codex_managed_context: false,
+            codex_managed_context: false,
+            session_codex_managed_context: std::collections::HashMap::new(),
+            session_usage: std::collections::HashMap::new(),
             active_session_source: None,
             session_sources: std::collections::HashMap::new(),
-            pending_rewind_pressure_check: None,
-            insufficient_rewind_notice: None,
+            pending_rewind_pressure_checks: std::collections::HashMap::new(),
+            insufficient_rewind_notices: std::collections::HashMap::new(),
         }
     }
 
@@ -269,12 +277,22 @@ impl McpAppState {
         }
     }
 
+    fn usage_snapshot_for(&self, session_id: Option<&str>) -> crate::frontend::UsageSnapshot {
+        let mut usage = self.usage_snapshot();
+        if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+            if let Some(main) = self.session_usage.get(id) {
+                usage.main = main.clone();
+            }
+        }
+        usage
+    }
+
     fn apply_main_usage_snapshot(&mut self, usage: frontend::ModelUsageSnapshot) {
         if !usage.provider.is_empty() {
-            self.provider_name = usage.provider;
+            self.provider_name = usage.provider.clone();
         }
         if !usage.model.is_empty() {
-            self.model_name = usage.model;
+            self.model_name = usage.model.clone();
         }
         self.session_tokens = usage.tokens_used;
         self.context_window = usage.context_window;
@@ -285,38 +303,104 @@ impl McpAppState {
         self.complete_pending_rewind_pressure_check();
     }
 
-    fn note_context_rewind_result(&mut self, success: bool, message: &str) {
+    fn rewind_session_key(&self, session_id: Option<&str>) -> Option<String> {
+        session_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let id = self.session_id.trim();
+                if id.is_empty() {
+                    None
+                } else {
+                    Some(id.to_string())
+                }
+            })
+    }
+
+    fn note_context_rewind_result_for(
+        &mut self,
+        session_id: Option<&str>,
+        success: bool,
+        message: &str,
+    ) {
         if success {
-            if let Some(record_id) = context_rewind_record_id_from_message(message) {
-                self.pending_rewind_pressure_check = Some(record_id);
-                self.insufficient_rewind_notice = None;
+            if let (Some(key), Some(record_id)) = (
+                self.rewind_session_key(session_id),
+                context_rewind_record_id_from_message(message),
+            ) {
+                self.pending_rewind_pressure_checks
+                    .insert(key.clone(), record_id);
+                self.insufficient_rewind_notices.remove(&key);
             }
         }
     }
 
     fn complete_pending_rewind_pressure_check(&mut self) {
-        let Some(record_id) = self.pending_rewind_pressure_check.take() else {
+        self.complete_pending_rewind_pressure_check_for(None);
+    }
+
+    fn complete_pending_rewind_pressure_check_for(&mut self, session_id: Option<&str>) {
+        let Some(key) = self.rewind_session_key(session_id) else {
             return;
         };
-        if !self.active_codex_context_recovery_enabled() {
+        let Some(record_id) = self.pending_rewind_pressure_checks.remove(&key) else {
+            return;
+        };
+        if !self.active_codex_managed_context_enabled_for(Some(&key), None) {
             return;
         }
-        if let Some((used_tokens, rewind_only_limit, _status)) = self.context_pressure_rewind_only()
+        if let Some((used_tokens, rewind_only_limit, _status)) =
+            self.context_pressure_rewind_only_for(Some(&key))
         {
-            self.insufficient_rewind_notice = Some(InsufficientRewindNotice {
-                record_id,
-                used_tokens,
-                rewind_only_limit,
-                context_window: self.context_window,
-            });
+            let context_window = self.session_usage_values(Some(&key)).1;
+            self.insufficient_rewind_notices.insert(
+                key,
+                InsufficientRewindNotice {
+                    record_id,
+                    used_tokens,
+                    rewind_only_limit,
+                    context_window,
+                },
+            );
         } else {
-            self.insufficient_rewind_notice = None;
+            self.insufficient_rewind_notices.remove(&key);
         }
     }
 
-    fn context_pressure_snapshot(&self) -> serde_json::Value {
-        let context_window = self.context_window;
-        let used_tokens = self.session_tokens;
+    fn insufficient_rewind_notice_for(
+        &self,
+        session_id: Option<&str>,
+    ) -> Option<&InsufficientRewindNotice> {
+        let key = self.rewind_session_key(session_id)?;
+        self.insufficient_rewind_notices.get(&key)
+    }
+
+    fn managed_context_mode(enabled: bool) -> &'static str {
+        if enabled {
+            "managed"
+        } else {
+            "vanilla"
+        }
+    }
+
+    fn session_usage_values(&self, session_id: Option<&str>) -> (u64, u64) {
+        if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+            if let Some(usage) = self.session_usage.get(id) {
+                return (usage.tokens_used, usage.context_window);
+            }
+        }
+        (self.session_tokens, self.context_window)
+    }
+
+    fn context_pressure_snapshot_for(
+        &self,
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> serde_json::Value {
+        let (used_tokens, context_window) = self.session_usage_values(session_id);
+        let managed_context =
+            self.exposed_codex_managed_context_enabled_for(session_id, managed_context_override);
         if context_window == 0 {
             return serde_json::json!({
                 "source": "backend_reported",
@@ -328,7 +412,7 @@ impl McpAppState {
                 "recommended_rewind_limit": null,
                 "hard_limit": null,
                 "rewind_only": false,
-                "context_recovery": if self.codex_context_recovery { "patched" } else { "off" },
+                "managed_context": Self::managed_context_mode(managed_context),
                 "last_rewind_insufficient": null,
             });
         }
@@ -354,18 +438,22 @@ impl McpAppState {
             "remaining_percent": remaining_percent,
             "recommended_rewind_limit": recommended_rewind_limit,
             "hard_limit": context_window,
-            "rewind_only": self.codex_context_recovery && (status == "high" || status == "critical"),
-            "context_recovery": if self.codex_context_recovery { "patched" } else { "off" },
-            "last_rewind_insufficient": self.insufficient_rewind_notice.as_ref().map(|notice| {
+            "rewind_only": managed_context && (status == "high" || status == "critical"),
+            "managed_context": Self::managed_context_mode(managed_context),
+            "last_rewind_insufficient": self.insufficient_rewind_notice_for(session_id).map(|notice| {
                 serde_json::json!({
                     "record_id": notice.record_id,
                     "used_tokens": notice.used_tokens,
                     "rewind_only_limit": notice.rewind_only_limit,
                     "context_window": notice.context_window,
-                    "message": "The previous rewind did not reduce backend-reported context pressure enough. Choose an earlier or larger exact item anchor and include a more complete carry-forward primer before using ordinary tools.",
+                    "message": "The previous managed-context rewind did not reduce backend-reported pressure enough. Choose an earlier or larger exact item anchor and include a denser carry-forward primer before using ordinary tools.",
                 })
             }),
         })
+    }
+
+    fn context_pressure_snapshot(&self) -> serde_json::Value {
+        self.context_pressure_snapshot_for(None, None)
     }
 
     fn is_active_codex_session(&self) -> bool {
@@ -374,46 +462,93 @@ impl McpAppState {
             .is_some_and(|source| source.eq_ignore_ascii_case("codex"))
     }
 
-    fn active_codex_context_recovery_enabled(&self) -> bool {
-        self.is_active_codex_session() && self.codex_context_recovery
+    fn active_codex_managed_context_enabled(&self) -> bool {
+        self.is_active_codex_session() && self.codex_managed_context
     }
 
-    fn exposed_codex_context_recovery_enabled(&self) -> bool {
+    fn exposed_codex_managed_context_enabled(&self) -> bool {
         if self.is_active_codex_session() {
-            self.codex_context_recovery
+            self.codex_managed_context
         } else {
-            self.configured_codex_context_recovery
+            self.configured_codex_managed_context
         }
     }
 
-    fn context_pressure_rewind_only(&self) -> Option<(u64, u64, &'static str)> {
-        if self.context_window == 0 {
+    fn exposed_codex_managed_context_enabled_for(
+        &self,
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> bool {
+        if let Some(enabled) = managed_context_override {
+            return enabled;
+        }
+        if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+            if let Some(enabled) = self.session_codex_managed_context.get(id) {
+                return *enabled;
+            }
+        }
+        self.exposed_codex_managed_context_enabled()
+    }
+
+    fn active_codex_managed_context_enabled_for(
+        &self,
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> bool {
+        if let Some(enabled) = managed_context_override {
+            return enabled;
+        }
+        if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+            if let Some(enabled) = self.session_codex_managed_context.get(id) {
+                return *enabled;
+            }
+        }
+        self.active_codex_managed_context_enabled()
+    }
+
+    fn context_pressure_rewind_only_for(
+        &self,
+        session_id: Option<&str>,
+    ) -> Option<(u64, u64, &'static str)> {
+        let (used_tokens, context_window) = self.session_usage_values(session_id);
+        if context_window == 0 {
             return None;
         }
         let recommended_rewind_limit =
-            (self.context_window as f64 * CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT / 100.0).floor()
-                as u64;
-        let status = if self.session_tokens >= self.context_window {
+            (context_window as f64 * CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT / 100.0).floor() as u64;
+        let status = if used_tokens >= context_window {
             "critical"
-        } else if self.session_tokens >= recommended_rewind_limit {
+        } else if used_tokens >= recommended_rewind_limit {
             "high"
         } else {
             return None;
         };
-        Some((self.session_tokens, recommended_rewind_limit, status))
+        Some((used_tokens, recommended_rewind_limit, status))
     }
 
     fn rewind_only_gate_message(&self, tool_name: &str) -> Option<String> {
-        if !self.active_codex_context_recovery_enabled() || rewind_only_allowed_tool(tool_name) {
+        self.rewind_only_gate_message_for(tool_name, None, None)
+    }
+
+    fn rewind_only_gate_message_for(
+        &self,
+        tool_name: &str,
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> Option<String> {
+        if !self.active_codex_managed_context_enabled_for(session_id, managed_context_override)
+            || rewind_only_allowed_tool(tool_name)
+        {
             return None;
         }
-        let (used_tokens, rewind_only_limit, status) = self.context_pressure_rewind_only()?;
+        let (used_tokens, rewind_only_limit, status) =
+            self.context_pressure_rewind_only_for(session_id)?;
         let mut message = format!(
-            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Only get_status, rewind_context, and rewind_backout are available until context is reduced below the threshold. Call rewind_context with an exact item anchor and detailed primer before using other tools."
+            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Managed context is now in density-preservation mode: only get_status, rewind_context, and rewind_backout are available until pressure is reduced below the threshold. Call rewind_context with an exact item anchor and a dense carry-forward primer before using other tools."
         );
-        if let Some(notice) = &self.insufficient_rewind_notice {
+        if let Some(notice) = self.insufficient_rewind_notice_for(session_id) {
             message.push_str(&format!(
-                " Previous rewind record {} was insufficient; choose an earlier or larger exact item anchor and include a more complete carry-forward primer.",
+                " Previous managed-context record {} was insufficient; choose an earlier or larger exact item anchor and include a denser carry-forward primer.",
                 notice.record_id
             ));
         }
@@ -439,7 +574,7 @@ fn rewind_only_allowed_tool(name: &str) -> bool {
     matches!(name, "get_status" | "rewind_context" | "rewind_backout")
 }
 
-fn context_recovery_tool(name: &str) -> bool {
+fn managed_context_tool(name: &str) -> bool {
     matches!(name, "rewind_context" | "rewind_backout")
 }
 
@@ -1432,14 +1567,14 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
-        ControlMsg::SetCodexContextRecovery { mode } => {
-            let normalized = crate::project::normalize_codex_context_recovery(&mode);
+        ControlMsg::SetCodexManagedContext { mode } => {
+            let normalized = crate::project::normalize_codex_managed_context(&mode);
             emit_control_result(
                 control_tx,
-                "set_codex_context_recovery",
+                "set_codex_managed_context",
                 true,
                 format!(
-                    "Codex context recovery set to {} (applies on next task)",
+                    "Codex managed context set to {} (applies on next task)",
                     normalized
                 ),
                 None,
@@ -2469,7 +2604,6 @@ pub fn spawn_event_listener(
                     | AppEvent::ExternalAgentChanged { .. }
                     | AppEvent::AutonomyChanged { .. }
                     | AppEvent::CodexThreadActionRequested { .. }
-                    | AppEvent::SessionIdentity { .. }
                     | AppEvent::SessionRelationship { .. }
                     | AppEvent::SessionCapabilities { .. }
                     | AppEvent::SessionRenameResult { .. }
@@ -2477,25 +2611,64 @@ pub fn spawn_event_listener(
                     | AppEvent::GeminiThreadActionRequested { .. }
                     | AppEvent::GeminiThreadActionResult { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::CodexConfigChanged {
-                        context_recovery, ..
+                        managed_context, ..
                     } => {
-                        if let Some(mode) = context_recovery {
-                            s.configured_codex_context_recovery =
-                                crate::project::codex_context_recovery_enabled(&mode);
+                        if let Some(mode) = managed_context {
+                            s.configured_codex_managed_context =
+                                crate::project::codex_managed_context_enabled(&mode);
                             if !s.is_active_codex_session() {
-                                s.codex_context_recovery = s.configured_codex_context_recovery;
+                                s.codex_managed_context = s.configured_codex_managed_context;
                             }
                             resource_changed = Some("intendant://status");
                         }
                     }
+                    AppEvent::SessionIdentity {
+                        ref session_id,
+                        ref source,
+                        ref backend_session_id,
+                    } => {
+                        if !session_id.is_empty() {
+                            s.session_sources.insert(session_id.clone(), source.clone());
+                        }
+                        if !backend_session_id.is_empty() {
+                            s.session_sources
+                                .insert(backend_session_id.clone(), source.clone());
+                        }
+                        if source.eq_ignore_ascii_case("codex") {
+                            if let Some(enabled) =
+                                s.session_codex_managed_context.get(session_id).copied()
+                            {
+                                s.session_codex_managed_context
+                                    .insert(backend_session_id.clone(), enabled);
+                            } else if let Some(enabled) = s
+                                .session_codex_managed_context
+                                .get(backend_session_id)
+                                .copied()
+                            {
+                                s.session_codex_managed_context
+                                    .insert(session_id.clone(), enabled);
+                            }
+                        }
+                        if s.session_id.is_empty()
+                            || s.session_id == session_id.as_str()
+                            || s.session_id == backend_session_id.as_str()
+                        {
+                            s.active_session_source = Some(source.clone());
+                        }
+                        resource_changed = Some("intendant://status");
+                    }
                     AppEvent::CodexThreadActionResult {
+                        session_id,
                         action,
                         success,
                         message,
-                        ..
                     } => {
                         if action == "rewind_context" {
-                            s.note_context_rewind_result(success, &message);
+                            s.note_context_rewind_result_for(
+                                session_id.as_deref(),
+                                success,
+                                &message,
+                            );
                             resource_changed = Some("intendant://status");
                         }
                     }
@@ -2504,6 +2677,13 @@ pub fn spawn_event_listener(
                         main,
                         presence,
                     } => {
+                        if let Some(id) = session_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty())
+                        {
+                            s.session_usage.insert(id.to_string(), main.clone());
+                        }
                         let applies_to_current_session = session_id
                             .as_deref()
                             .is_none_or(|id| s.session_id.is_empty() || id == s.session_id);
@@ -2516,8 +2696,9 @@ pub fn spawn_event_listener(
                                 s.presence_context_window = presence.context_window;
                                 s.presence_usage_pct = presence.usage_pct;
                             }
-                            resource_changed = Some("intendant://status");
                         }
+                        s.complete_pending_rewind_pressure_check_for(session_id.as_deref());
+                        resource_changed = Some("intendant://status");
                     }
                     AppEvent::Tick => {
                         // Detect stuck phases — warn every 30s after 120s
@@ -2922,6 +3103,25 @@ pub fn spawn_event_listener(
                         ref session_id,
                         ref task,
                     } => {
+                        s.session_id = session_id.clone();
+                        s.task_description = task.clone().unwrap_or_default();
+                        s.turn = 0;
+                        s.session_tokens = 0;
+                        s.session_prompt_tokens = 0;
+                        s.session_completion_tokens = 0;
+                        s.session_cached_tokens = 0;
+                        s.active_session_source = s.session_sources.get(session_id).cloned();
+                        if s.is_active_codex_session() {
+                            let enabled = s
+                                .session_codex_managed_context
+                                .get(session_id)
+                                .copied()
+                                .unwrap_or(s.configured_codex_managed_context);
+                            s.session_codex_managed_context
+                                .insert(session_id.clone(), enabled);
+                            s.codex_managed_context = enabled;
+                        }
+                        s.set_phase(Phase::Thinking);
                         s.push_log(
                             LogLevel::Info,
                             format!(
@@ -2944,6 +3144,13 @@ pub fn spawn_event_listener(
                         ref session_id,
                         ref reason,
                     } => {
+                        if s.session_id == session_id.as_str() {
+                            s.set_phase(Phase::Done);
+                            s.active_session_source = None;
+                            s.codex_managed_context = s.configured_codex_managed_context;
+                        }
+                        s.pending_rewind_pressure_checks.remove(session_id);
+                        s.insufficient_rewind_notices.remove(session_id);
                         s.push_log(
                             LogLevel::Info,
                             format!("Session ended: {} — {}", session_id, reason),
@@ -3149,13 +3356,13 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             true
         }
         AppEvent::CodexConfigChanged {
-            context_recovery, ..
+            managed_context, ..
         } => {
-            if let Some(mode) = context_recovery {
-                s.configured_codex_context_recovery =
-                    crate::project::codex_context_recovery_enabled(mode);
+            if let Some(mode) = managed_context {
+                s.configured_codex_managed_context =
+                    crate::project::codex_managed_context_enabled(mode);
                 if !s.is_active_codex_session() {
-                    s.codex_context_recovery = s.configured_codex_context_recovery;
+                    s.codex_managed_context = s.configured_codex_managed_context;
                 }
                 return true;
             }
@@ -3172,6 +3379,19 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             if !backend_session_id.is_empty() {
                 s.session_sources
                     .insert(backend_session_id.clone(), source.clone());
+            }
+            if source.eq_ignore_ascii_case("codex") {
+                if let Some(enabled) = s.session_codex_managed_context.get(session_id).copied() {
+                    s.session_codex_managed_context
+                        .insert(backend_session_id.clone(), enabled);
+                } else if let Some(enabled) = s
+                    .session_codex_managed_context
+                    .get(backend_session_id)
+                    .copied()
+                {
+                    s.session_codex_managed_context
+                        .insert(session_id.clone(), enabled);
+                }
             }
             if s.session_id.is_empty()
                 || s.session_id == session_id.as_str()
@@ -3191,7 +3411,14 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             s.session_cached_tokens = 0;
             s.active_session_source = s.session_sources.get(session_id).cloned();
             if s.is_active_codex_session() {
-                s.codex_context_recovery = s.configured_codex_context_recovery;
+                let enabled = s
+                    .session_codex_managed_context
+                    .get(session_id)
+                    .copied()
+                    .unwrap_or(s.configured_codex_managed_context);
+                s.session_codex_managed_context
+                    .insert(session_id.clone(), enabled);
+                s.codex_managed_context = enabled;
             }
             s.set_phase(Phase::Thinking);
             true
@@ -3201,7 +3428,12 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             main,
             presence,
         } => {
-            if let Some(id) = session_id.as_deref() {
+            if let Some(id) = session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                s.session_usage.insert(id.to_string(), main.clone());
                 if s.session_id.is_empty() {
                     s.session_id = id.to_string();
                 }
@@ -3221,18 +3453,20 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
                     s.presence_context_window = presence.context_window;
                     s.presence_usage_pct = presence.usage_pct;
                 }
+                s.complete_pending_rewind_pressure_check_for(session_id.as_deref());
                 return true;
             }
-            false
+            s.complete_pending_rewind_pressure_check_for(session_id.as_deref());
+            session_id.is_some()
         }
         AppEvent::CodexThreadActionResult {
+            session_id,
             action,
             success,
             message,
-            ..
         } => {
             if action == "rewind_context" {
-                s.note_context_rewind_result(*success, message);
+                s.note_context_rewind_result_for(session_id.as_deref(), *success, message);
             }
             true
         }
@@ -3240,9 +3474,10 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             if s.session_id == session_id.as_str() {
                 s.set_phase(Phase::Done);
                 s.active_session_source = None;
-                s.pending_rewind_pressure_check = None;
-                s.codex_context_recovery = s.configured_codex_context_recovery;
+                s.codex_managed_context = s.configured_codex_managed_context;
             }
+            s.pending_rewind_pressure_checks.remove(session_id);
+            s.insufficient_rewind_notices.remove(session_id);
             true
         }
         AppEvent::SessionDirChanged { path } => {
@@ -3752,16 +3987,24 @@ impl IntendantServer {
     /// Schemas are flattened (all `$ref`/`$defs` inlined) for compatibility
     /// with clients that don't resolve JSON Schema references (e.g. Codex).
     pub async fn list_tools_json(&self) -> serde_json::Value {
-        let context_recovery = self
+        self.list_tools_json_for_session(None, None).await
+    }
+
+    pub async fn list_tools_json_for_session(
+        &self,
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> serde_json::Value {
+        let managed_context = self
             .state
             .read()
             .await
-            .exposed_codex_context_recovery_enabled();
+            .exposed_codex_managed_context_enabled_for(session_id, managed_context_override);
         let tools: Vec<serde_json::Value> = self
             .tool_router
             .list_all()
             .iter()
-            .filter(|tool| context_recovery || !context_recovery_tool(tool.name.as_ref()))
+            .filter(|tool| managed_context || !managed_context_tool(tool.name.as_ref()))
             .map(|tool| {
                 let mut schema = serde_json::to_value(&*tool.input_schema).unwrap_or_default();
                 inline_schema_refs(&mut schema);
@@ -3781,6 +4024,17 @@ impl IntendantServer {
         name: &str,
         args: serde_json::Value,
     ) -> Result<CallToolResult, String> {
+        self.call_tool_by_name_for_session(name, args, None, None)
+            .await
+    }
+
+    pub async fn call_tool_by_name_for_session(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> Result<CallToolResult, String> {
         fn parse_params<T: serde::de::DeserializeOwned>(
             args: serde_json::Value,
         ) -> Result<Parameters<T>, String> {
@@ -3789,23 +4043,30 @@ impl IntendantServer {
                 .map_err(|e| e.to_string())
         }
 
-        if let Some(message) = self.state.read().await.rewind_only_gate_message(name) {
+        if let Some(message) = self.state.read().await.rewind_only_gate_message_for(
+            name,
+            session_id,
+            managed_context_override,
+        ) {
             return Ok(text_tool_error(message));
         }
-        if context_recovery_tool(name)
+        if managed_context_tool(name)
             && !self
                 .state
                 .read()
                 .await
-                .exposed_codex_context_recovery_enabled()
+                .exposed_codex_managed_context_enabled_for(session_id, managed_context_override)
         {
             return Ok(text_tool_error(
-                "Codex context recovery is disabled for this managed backend. Set `[agent.codex] context_recovery = \"patched\"` before starting the task to enable rewind_context/rewind_backout.".to_string(),
+                "Codex managed context is disabled for this session. Set `[agent.codex] managed_context = \"managed\"` before starting the task, or choose Managed context = managed in the dashboard, to enable rewind_context/rewind_backout.".to_string(),
             ));
         }
 
         match name {
-            "get_status" => Ok(text_tool_result(self.get_status().await)),
+            "get_status" => Ok(text_tool_result(
+                self.get_status_for_session(session_id, managed_context_override)
+                    .await,
+            )),
             "get_logs" => {
                 let params = parse_params::<GetLogsParams>(args)?;
                 Ok(text_tool_result(self.get_logs(params).await))
@@ -4080,10 +4341,22 @@ impl IntendantServer {
         description = "Get current status: provider, model, turn, budget, phase, autonomy, verbosity, tokens, and any compact lineage/fission ledger derived from the session log."
     )]
     async fn get_status(&self) -> String {
+        self.get_status_for_session(None, None).await
+    }
+
+    async fn get_status_for_session(
+        &self,
+        session_id_override: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> String {
         let s = self.state.read().await;
         let mut snap = s.status_snapshot();
         let log_dir = s.log_dir.clone();
-        let session_id = s.session_id.clone();
+        let session_id = session_id_override
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| s.session_id.clone());
         let autonomy = s.autonomy.clone();
         // Fill autonomy from shared state
         drop(s);
@@ -4092,13 +4365,36 @@ impl IntendantServer {
         let mut value = serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
         if let Some(obj) = value.as_object_mut() {
             let s = self.state.read().await;
+            let usage = s.usage_snapshot_for(Some(&session_id));
+            obj.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(session_id.clone()),
+            );
+            obj.insert(
+                "provider".to_string(),
+                serde_json::Value::String(usage.main.provider.clone()),
+            );
+            obj.insert(
+                "model".to_string(),
+                serde_json::Value::String(usage.main.model.clone()),
+            );
+            obj.insert(
+                "session_tokens".to_string(),
+                serde_json::Value::Number(usage.main.tokens_used.into()),
+            );
+            obj.insert(
+                "budget_pct".to_string(),
+                serde_json::Number::from_f64(usage.main.usage_pct)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null),
+            );
             obj.insert(
                 "usage".to_string(),
-                serde_json::to_value(s.usage_snapshot()).unwrap_or_else(|_| serde_json::json!({})),
+                serde_json::to_value(usage).unwrap_or_else(|_| serde_json::json!({})),
             );
             obj.insert(
                 "context_pressure".to_string(),
-                s.context_pressure_snapshot(),
+                s.context_pressure_snapshot_for(Some(&session_id), managed_context_override),
             );
         }
         if let Ok(Some(ledger)) = crate::lineage_ledger::read_lineage_ledger(&log_dir, &session_id)
@@ -4374,7 +4670,7 @@ impl IntendantServer {
                     "next_steps": params.next_steps,
                 }),
             }));
-        "ok (context rewind dispatched)".to_string()
+        "ok (managed-context rewind dispatched)".to_string()
     }
 
     #[tool(
@@ -4418,11 +4714,11 @@ impl IntendantServer {
         }
 
         let timeout_message = if mode == "inspect" {
-            "ok (context rewind record inspection dispatched)".to_string()
+            "ok (managed-context rewind record inspection dispatched)".to_string()
         } else if mode == "restore" {
-            "ok (same-thread context rewind restore dispatched)".to_string()
+            "ok (same-thread managed-context restore dispatched)".to_string()
         } else {
-            "ok (cache-reset context rewind fork dispatched)".to_string()
+            "ok (cache-reset managed-context fork dispatched)".to_string()
         };
         self.dispatch_codex_thread_action_and_wait(
             params.session_id.clone(),
@@ -5999,12 +6295,12 @@ mod tests {
             assert_eq!(pressure["context_window"], 100_000);
             assert_eq!(pressure["recommended_rewind_limit"], 85_000);
             assert_eq!(pressure["rewind_only"], false);
-            assert_eq!(pressure["context_recovery"], "off");
+            assert_eq!(pressure["managed_context"], "vanilla");
         });
     }
 
     #[test]
-    fn context_pressure_marks_rewind_only_only_when_context_recovery_enabled() {
+    fn context_pressure_marks_rewind_only_only_when_managed_context_enabled() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6012,7 +6308,8 @@ mod tests {
         rt.block_on(async {
             let state = test_state();
             let mut s = state.write().await;
-            s.codex_context_recovery = true;
+            s.active_session_source = Some("codex".to_string());
+            s.codex_managed_context = true;
             s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
                 provider: "openai".to_string(),
                 model: "gpt-5.2-codex".to_string(),
@@ -6025,7 +6322,7 @@ mod tests {
             });
             let pressure = s.context_pressure_snapshot();
             assert_eq!(pressure["rewind_only"], true);
-            assert_eq!(pressure["context_recovery"], "patched");
+            assert_eq!(pressure["managed_context"], "managed");
         });
     }
 
@@ -6039,7 +6336,7 @@ mod tests {
             let state = test_state();
             let mut s = state.write().await;
             s.active_session_source = Some("codex".to_string());
-            s.codex_context_recovery = true;
+            s.codex_managed_context = true;
             s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
                 provider: "openai".to_string(),
                 model: "gpt-5.2-codex".to_string(),
@@ -6054,7 +6351,7 @@ mod tests {
             let message = s
                 .rewind_only_gate_message("take_screenshot")
                 .expect("Codex action tool should be gated");
-            assert!(message.contains("Only get_status, rewind_context, and rewind_backout"));
+            assert!(message.contains("only get_status, rewind_context, and rewind_backout"));
             assert!(s.rewind_only_gate_message("get_status").is_none());
             assert!(s.rewind_only_gate_message("rewind_context").is_none());
             assert!(s.rewind_only_gate_message("rewind_backout").is_none());
@@ -6112,7 +6409,7 @@ mod tests {
     }
 
     #[test]
-    fn list_tools_hides_rewind_tools_until_context_recovery_is_enabled() {
+    fn list_tools_hides_rewind_tools_until_managed_context_is_enabled() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6134,8 +6431,8 @@ mod tests {
 
             {
                 let mut s = state.write().await;
-                s.configured_codex_context_recovery = true;
-                s.codex_context_recovery = true;
+                s.configured_codex_managed_context = true;
+                s.codex_managed_context = true;
             }
             let tools = server.list_tools_json().await;
             let names: Vec<_> = tools["tools"]
@@ -6150,7 +6447,62 @@ mod tests {
     }
 
     #[test]
-    fn call_tool_rejects_rewind_tools_when_context_recovery_is_disabled() {
+    fn list_tools_uses_session_scoped_managed_context_override() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.configured_codex_managed_context = false;
+                s.session_codex_managed_context
+                    .insert("vanilla-session".to_string(), false);
+                s.session_codex_managed_context
+                    .insert("managed-session".to_string(), true);
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+
+            let vanilla = server
+                .list_tools_json_for_session(Some("vanilla-session"), None)
+                .await;
+            let vanilla_names: Vec<_> = vanilla["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(!vanilla_names.contains(&"rewind_context"));
+            assert!(!vanilla_names.contains(&"rewind_backout"));
+
+            let managed = server
+                .list_tools_json_for_session(Some("managed-session"), None)
+                .await;
+            let managed_names: Vec<_> = managed["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(managed_names.contains(&"rewind_context"));
+            assert!(managed_names.contains(&"rewind_backout"));
+
+            let managed_by_url = server
+                .list_tools_json_for_session(Some("vanilla-session"), Some(true))
+                .await;
+            let managed_by_url_names: Vec<_> = managed_by_url["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(managed_by_url_names.contains(&"rewind_context"));
+        });
+    }
+
+    #[test]
+    fn call_tool_rejects_rewind_tools_when_managed_context_is_disabled() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6168,12 +6520,39 @@ mod tests {
                 .await
                 .unwrap();
             let rendered = format!("{result:?}");
-            assert!(rendered.contains("context recovery is disabled"));
+            assert!(rendered.contains("managed context is disabled"));
         });
     }
 
     #[test]
-    fn observed_codex_config_change_toggles_context_recovery() {
+    fn call_tool_respects_session_scoped_managed_context_override() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.configured_codex_managed_context = true;
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let result = server
+                .call_tool_by_name_for_session(
+                    "rewind_context",
+                    serde_json::json!({}),
+                    Some("vanilla-session"),
+                    Some(false),
+                )
+                .await
+                .unwrap();
+            let rendered = format!("{result:?}");
+            assert!(rendered.contains("managed context is disabled"));
+        });
+    }
+
+    #[test]
+    fn observed_codex_config_change_toggles_managed_context() {
         let mut s = McpAppState::new(
             "none".to_string(),
             "none".to_string(),
@@ -6181,7 +6560,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/test_session"),
         );
 
-        assert!(!s.codex_context_recovery);
+        assert!(!s.codex_managed_context);
         assert!(apply_observed_event_to_mcp_state(
             &mut s,
             &AppEvent::CodexConfigChanged {
@@ -6195,10 +6574,10 @@ mod tests {
                 web_search: None,
                 network_access: None,
                 writable_roots: None,
-                context_recovery: Some("patched".to_string()),
+                managed_context: Some("managed".to_string()),
             },
         ));
-        assert!(s.codex_context_recovery);
+        assert!(s.codex_managed_context);
     }
 
     #[test]
@@ -6224,12 +6603,12 @@ mod tests {
                 web_search: None,
                 network_access: None,
                 writable_roots: None,
-                context_recovery: Some("patched".to_string()),
+                managed_context: Some("managed".to_string()),
             },
         ));
-        assert!(s.configured_codex_context_recovery);
+        assert!(s.configured_codex_managed_context);
         assert!(
-            !s.codex_context_recovery,
+            !s.codex_managed_context,
             "active Codex session capability should not flip until next task"
         );
     }
@@ -6259,7 +6638,7 @@ mod tests {
         );
         s.session_id = "codex-thread".to_string();
         s.active_session_source = Some("codex".to_string());
-        s.codex_context_recovery = true;
+        s.codex_managed_context = true;
 
         apply_observed_event_to_mcp_state(
             &mut s,
@@ -6290,13 +6669,16 @@ mod tests {
         );
 
         let notice = s
-            .insufficient_rewind_notice
-            .as_ref()
+            .insufficient_rewind_notices
+            .get("codex-thread")
             .expect("high pressure after rewind should be remembered");
         assert_eq!(notice.record_id, "rewind-high");
         assert_eq!(notice.used_tokens, 91_000);
         assert_eq!(notice.rewind_only_limit, 85_000);
-        assert!(s.pending_rewind_pressure_check.is_none());
+        assert!(s
+            .pending_rewind_pressure_checks
+            .get("codex-thread")
+            .is_none());
 
         let pressure = s.context_pressure_snapshot();
         assert_eq!(
@@ -6324,13 +6706,16 @@ mod tests {
         );
         s.session_id = "codex-thread".to_string();
         s.active_session_source = Some("codex".to_string());
-        s.codex_context_recovery = true;
-        s.insufficient_rewind_notice = Some(InsufficientRewindNotice {
-            record_id: "rewind-old".to_string(),
-            used_tokens: 95_000,
-            rewind_only_limit: 85_000,
-            context_window: 100_000,
-        });
+        s.codex_managed_context = true;
+        s.insufficient_rewind_notices.insert(
+            "codex-thread".to_string(),
+            InsufficientRewindNotice {
+                record_id: "rewind-old".to_string(),
+                used_tokens: 95_000,
+                rewind_only_limit: 85_000,
+                context_window: 100_000,
+            },
+        );
 
         apply_observed_event_to_mcp_state(
             &mut s,
@@ -6359,11 +6744,62 @@ mod tests {
             },
         );
 
-        assert!(s.pending_rewind_pressure_check.is_none());
-        assert!(s.insufficient_rewind_notice.is_none());
+        assert!(s
+            .pending_rewind_pressure_checks
+            .get("codex-thread")
+            .is_none());
+        assert!(s.insufficient_rewind_notices.get("codex-thread").is_none());
         assert_eq!(
             s.context_pressure_snapshot()["last_rewind_insufficient"],
             serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn insufficient_rewind_notice_is_session_scoped() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        s.session_id = "session-a".to_string();
+        s.active_session_source = Some("codex".to_string());
+        s.codex_managed_context = true;
+        s.session_codex_managed_context
+            .insert("session-a".to_string(), true);
+        s.session_codex_managed_context
+            .insert("session-b".to_string(), true);
+        s.session_usage.insert(
+            "session-b".to_string(),
+            frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 90_000,
+                context_window: 100_000,
+                usage_pct: 90.0,
+                prompt_tokens: 86_000,
+                completion_tokens: 4_000,
+                cached_tokens: 0,
+            },
+        );
+
+        s.note_context_rewind_result_for(
+            Some("session-b"),
+            true,
+            "Rewound Codex thread and saved record rewind-b.",
+        );
+        s.complete_pending_rewind_pressure_check_for(Some("session-b"));
+
+        assert_eq!(
+            s.context_pressure_snapshot_for(Some("session-a"), None)
+                .pointer("/last_rewind_insufficient"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            s.context_pressure_snapshot_for(Some("session-b"), None)
+                .pointer("/last_rewind_insufficient/record_id"),
+            Some(&serde_json::Value::String("rewind-b".to_string()))
         );
     }
 
@@ -6379,7 +6815,7 @@ mod tests {
                 let mut s = state.write().await;
                 s.session_id = "codex-thread".to_string();
                 s.active_session_source = Some("codex".to_string());
-                s.codex_context_recovery = true;
+                s.codex_managed_context = true;
             }
             let bus = EventBus::new();
             let listener = spawn_event_listener(
@@ -6417,8 +6853,8 @@ mod tests {
                     if state
                         .read()
                         .await
-                        .insufficient_rewind_notice
-                        .as_ref()
+                        .insufficient_rewind_notices
+                        .get("codex-thread")
                         .is_some_and(|notice| notice.record_id == "rewind-listener")
                     {
                         break;
@@ -6441,8 +6877,8 @@ mod tests {
             autonomy::shared_autonomy(AutonomyState::default()),
             std::path::PathBuf::from("/tmp/test_session"),
         );
-        s.configured_codex_context_recovery = true;
-        s.codex_context_recovery = true;
+        s.configured_codex_managed_context = true;
+        s.codex_managed_context = true;
 
         apply_observed_event_to_mcp_state(
             &mut s,
@@ -6517,6 +6953,103 @@ mod tests {
             assert_eq!(
                 value.pointer("/context_pressure/source"),
                 Some(&"backend_reported".into())
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_uses_session_scoped_usage_and_managed_context() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_id = "global-session".to_string();
+                s.session_tokens = 10;
+                s.context_window = 1_000;
+                s.session_usage.insert(
+                    "managed-session".to_string(),
+                    frontend::ModelUsageSnapshot {
+                        provider: "openai".to_string(),
+                        model: "gpt-5.2-codex".to_string(),
+                        tokens_used: 900,
+                        context_window: 1_000,
+                        usage_pct: 90.0,
+                        prompt_tokens: 800,
+                        completion_tokens: 100,
+                        cached_tokens: 250,
+                    },
+                );
+                s.session_codex_managed_context
+                    .insert("managed-session".to_string(), true);
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server
+                .get_status_for_session(Some("managed-session"), None)
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(
+                value.pointer("/session_id"),
+                Some(&"managed-session".into())
+            );
+            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&900.into()));
+            assert_eq!(value.pointer("/session_tokens"), Some(&900.into()));
+            assert_eq!(
+                value.pointer("/context_pressure/status"),
+                Some(&"high".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/managed_context"),
+                Some(&"managed".into())
+            );
+        });
+    }
+
+    #[test]
+    fn observed_usage_retains_non_active_session_snapshot() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_id = "active-session".to_string();
+                s.session_sources
+                    .insert("managed-session".to_string(), "codex".to_string());
+                s.session_codex_managed_context
+                    .insert("managed-session".to_string(), true);
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::UsageSnapshot {
+                        session_id: Some("managed-session".to_string()),
+                        main: frontend::ModelUsageSnapshot {
+                            provider: "openai".to_string(),
+                            model: "gpt-5.2-codex".to_string(),
+                            tokens_used: 850,
+                            context_window: 1_000,
+                            usage_pct: 85.0,
+                            prompt_tokens: 800,
+                            completion_tokens: 50,
+                            cached_tokens: 200,
+                        },
+                        presence: None,
+                    },
+                );
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server
+                .get_status_for_session(Some("managed-session"), None)
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&850.into()));
+            assert_eq!(
+                value.pointer("/context_pressure/managed_context"),
+                Some(&"managed".into())
             );
         });
     }

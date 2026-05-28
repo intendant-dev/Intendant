@@ -706,7 +706,7 @@ def run_managed(args: argparse.Namespace, root: Path, workspace: Path) -> dict[s
         ws.send_json({"action": "set_codex_command", "command": str(args.managed_codex_bin)})
         ws.send_json({"action": "set_codex_sandbox", "mode": "read-only"})
         ws.send_json({"action": "set_codex_approval_policy", "policy": "never"})
-        ws.send_json({"action": "set_codex_context_recovery", "mode": "patched"})
+        ws.send_json({"action": "set_codex_managed_context", "mode": "managed"})
         ws.send_json({"action": "set_codex_model", "model": args.model})
         ws.send_json({"action": "set_codex_reasoning_effort", "effort": args.reasoning_effort})
         all_events.extend(collect_until_idle(ws, idle_seconds=1.5, max_seconds=5))

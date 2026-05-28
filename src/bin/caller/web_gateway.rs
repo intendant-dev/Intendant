@@ -6876,8 +6876,8 @@ pub struct SettingsPayload {
     pub codex_network_access: bool,
     #[serde(default)]
     pub codex_writable_roots: Vec<String>,
-    #[serde(default)]
-    pub codex_context_recovery: Option<String>,
+    #[serde(default, alias = "codex_context_recovery")]
+    pub codex_managed_context: Option<String>,
     // Other external-agent executable commands. The Settings pane does not
     // edit these today, but the New Session pane uses them as per-launch
     // command/path defaults.
@@ -7006,8 +7006,8 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
         codex_web_search: config.agent.codex.web_search,
         codex_network_access: config.agent.codex.network_access,
         codex_writable_roots: config.agent.codex.writable_roots.clone(),
-        codex_context_recovery: Some(crate::project::normalize_codex_context_recovery(
-            &config.agent.codex.context_recovery,
+        codex_managed_context: Some(crate::project::normalize_codex_managed_context(
+            &config.agent.codex.managed_context,
         )),
         claude_command: Some(config.agent.claude_code.command.clone()),
         gemini_command: Some(config.agent.gemini_cli.command.clone()),
@@ -7063,9 +7063,8 @@ fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &
         config.agent.codex.command =
             normalize_settings_codex_command(payload.codex_command.as_deref());
     }
-    if let Some(mode) = payload.codex_context_recovery.as_deref() {
-        config.agent.codex.context_recovery =
-            crate::project::normalize_codex_context_recovery(mode);
+    if let Some(mode) = payload.codex_managed_context.as_deref() {
+        config.agent.codex.managed_context = crate::project::normalize_codex_managed_context(mode);
     }
     if payload.claude_command.is_some() {
         config.agent.claude_code.command =
@@ -7231,9 +7230,64 @@ enum McpHttpOutcome {
     Accepted,
 }
 
+fn mcp_context_from_request_line(request_line: &str) -> (Option<String>, Option<bool>) {
+    let Some(path) = request_line.split_whitespace().nth(1) else {
+        return (None, None);
+    };
+    let Some((_, query)) = path.split_once('?') else {
+        return (None, None);
+    };
+    let mut session_id = None;
+    let mut managed_context = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "session_id" | "session" | "intendant_session" => {
+                if !value.trim().is_empty() {
+                    session_id = Some(percent_decode_query_value(value));
+                }
+            }
+            "managed_context" => {
+                managed_context = Some(crate::project::codex_managed_context_enabled(value));
+            }
+            _ => {}
+        }
+    }
+    (session_id, managed_context)
+}
+
+fn percent_decode_query_value(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 async fn handle_mcp_http_request(
     body: &str,
     server: &crate::mcp::IntendantServer,
+    session_id: Option<&str>,
+    codex_managed_context: Option<bool>,
 ) -> McpHttpOutcome {
     let request: McpHttpRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -7270,7 +7324,9 @@ async fn handle_mcp_http_request(
             // All notification methods: acknowledge and return 202.
             return McpHttpOutcome::Accepted;
         }
-        "tools/list" => Ok(server.list_tools_json().await),
+        "tools/list" => Ok(server
+            .list_tools_json_for_session(session_id, codex_managed_context)
+            .await),
         "tools/call" => {
             let params = request.params.unwrap_or_default();
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -7278,7 +7334,10 @@ async fn handle_mcp_http_request(
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
-            match server.call_tool_by_name(name, args).await {
+            match server
+                .call_tool_by_name_for_session(name, args, session_id, codex_managed_context)
+                .await
+            {
                 Ok(result) => Ok(serde_json::to_value(result).unwrap_or_else(|e| {
                     serde_json::json!({
                         "content": [{
@@ -12409,7 +12468,15 @@ pub fn spawn_web_gateway(
                                 body_owned = full;
                                 &body_owned
                             };
-                            let outcome = handle_mcp_http_request(body_text, mcp).await;
+                            let (mcp_session_id, codex_managed_context) =
+                                mcp_context_from_request_line(&request_line);
+                            let outcome = handle_mcp_http_request(
+                                body_text,
+                                mcp,
+                                mcp_session_id.as_deref(),
+                                codex_managed_context,
+                            )
+                            .await;
                             let http_response = match outcome {
                                 McpHttpOutcome::Response(resp) => {
                                     let json = serde_json::to_string(&resp).unwrap_or_default();
@@ -17454,20 +17521,20 @@ mod tests {
         assert_eq!(payload.external_agent.as_deref(), Some("codex"));
         assert_eq!(payload.codex_sandbox, "workspace-write");
         assert_eq!(payload.codex_approval_policy, "on-request");
-        assert_eq!(payload.codex_context_recovery, None);
+        assert_eq!(payload.codex_managed_context, None);
         assert_eq!(payload.gemini_approval_mode, "default");
 
         let mut config = crate::project::ProjectConfig::default();
         config.agent.codex.command = "/opt/codex/bin/codex".to_string();
         config.agent.codex.sandbox = "danger-full-access".to_string();
-        config.agent.codex.context_recovery = "patched".to_string();
+        config.agent.codex.managed_context = "managed".to_string();
         config.agent.gemini_cli.approval_mode = "yolo".to_string();
         apply_settings_payload(&mut config, &payload);
 
         assert_eq!(config.agent.default_backend.as_deref(), Some("codex"));
         assert_eq!(config.agent.codex.command, "/opt/codex/bin/codex");
         assert_eq!(config.agent.codex.sandbox, "danger-full-access");
-        assert_eq!(config.agent.codex.context_recovery, "patched");
+        assert_eq!(config.agent.codex.managed_context, "managed");
         assert_eq!(config.agent.gemini_cli.approval_mode, "yolo");
     }
 
@@ -17475,7 +17542,7 @@ mod tests {
     fn settings_payload_round_trips_codex_command() {
         let mut config = crate::project::ProjectConfig::default();
         config.agent.codex.command = "/usr/local/bin/codex".to_string();
-        config.agent.codex.context_recovery = "patched".to_string();
+        config.agent.codex.managed_context = "managed".to_string();
         config.agent.claude_code.command = "/usr/local/bin/claude".to_string();
         config.agent.gemini_cli.command = "/usr/local/bin/gemini".to_string();
 
@@ -17484,7 +17551,7 @@ mod tests {
             payload.codex_command.as_deref(),
             Some("/usr/local/bin/codex")
         );
-        assert_eq!(payload.codex_context_recovery.as_deref(), Some("patched"));
+        assert_eq!(payload.codex_managed_context.as_deref(), Some("managed"));
         assert_eq!(
             payload.claude_command.as_deref(),
             Some("/usr/local/bin/claude")
@@ -17515,7 +17582,7 @@ mod tests {
             "live_audio_timeout_secs": 300,
             "external_agent": "codex",
             "codex_command": "  /opt/homebrew/bin/codex  ",
-            "codex_context_recovery": "true",
+            "codex_managed_context": "true",
             "claude_command": "  /opt/claude/bin/claude  ",
             "gemini_command": "  /opt/gemini/bin/gemini  "
         })
@@ -17525,9 +17592,24 @@ mod tests {
         apply_settings_payload(&mut config, &payload);
 
         assert_eq!(config.agent.codex.command, "/opt/homebrew/bin/codex");
-        assert_eq!(config.agent.codex.context_recovery, "patched");
+        assert_eq!(config.agent.codex.managed_context, "managed");
         assert_eq!(config.agent.claude_code.command, "/opt/claude/bin/claude");
         assert_eq!(config.agent.gemini_cli.command, "/opt/gemini/bin/gemini");
+    }
+
+    #[test]
+    fn mcp_context_from_request_line_reads_session_scoped_managed_context() {
+        let (session_id, managed_context) = mcp_context_from_request_line(
+            "POST /mcp?session_id=abc-123&managed_context=managed HTTP/1.1",
+        );
+        assert_eq!(session_id.as_deref(), Some("abc-123"));
+        assert_eq!(managed_context, Some(true));
+
+        let (session_id, managed_context) = mcp_context_from_request_line(
+            "POST /mcp?intendant_session=wrapped%20id&managed_context=vanilla HTTP/1.1",
+        );
+        assert_eq!(session_id.as_deref(), Some("wrapped id"));
+        assert_eq!(managed_context, Some(false));
     }
 
     /// A specific bind address is preserved verbatim in the

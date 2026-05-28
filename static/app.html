@@ -6398,14 +6398,14 @@ html, body {
                   Enables the Responses API <code>web_search</code> tool (matches <code>codex --search</code>). No per-call approval.
                 </div>
                 <div class="control-row">
-                  <label for="control-codex-context-recovery">Context recovery</label>
-                  <select id="control-codex-context-recovery">
-                    <option value="off" selected>off</option>
-                    <option value="patched">patched</option>
+                  <label for="control-codex-managed-context">Managed context</label>
+                  <select id="control-codex-managed-context">
+                    <option value="vanilla" selected>vanilla</option>
+                    <option value="managed">managed</option>
                   </select>
                 </div>
                 <div class="control-hint">
-                  <strong>off</strong> keeps vanilla Codex behavior. <strong>patched</strong> enables Intendant rewind/backout tools and suppresses Codex auto-compaction for managed long tasks.
+                  <strong>vanilla</strong> keeps upstream/fork Codex behavior. <strong>managed</strong> enables proactive Intendant context densification, rewind/backout tools, and suppressed Codex auto-compaction for managed long tasks.
                 </div>
               </fieldset>
               <fieldset class="control-group">
@@ -9468,7 +9468,7 @@ let controlCodexConfig = {
   web_search: false,
   network_access: false,
   writable_roots: [],
-  context_recovery: 'off',
+  managed_context: 'vanilla',
 };
 let controlGeminiConfig = {
   model: '',
@@ -9516,7 +9516,7 @@ async function refreshControlPane() {
       web_search: !!d.codex_web_search,
       network_access: !!d.codex_network_access,
       writable_roots: Array.isArray(d.codex_writable_roots) ? d.codex_writable_roots : [],
-      context_recovery: d.codex_context_recovery || 'off',
+      managed_context: d.codex_managed_context || 'vanilla',
     };
     controlGeminiConfig = {
       model: d.gemini_model || '',
@@ -9561,7 +9561,7 @@ function renderControlPane() {
     const reasoningSel = $('control-codex-reasoning');
     const webSearch = $('control-codex-web-search');
     const webSearchStatus = $('control-codex-web-search-status');
-    const contextRecoverySel = $('control-codex-context-recovery');
+    const managedContextSel = $('control-codex-managed-context');
     const networkCb = $('control-codex-network');
     const networkStatus = $('control-codex-network-status');
     const networkRow = $('control-codex-network-row');
@@ -9573,7 +9573,7 @@ function renderControlPane() {
     if (reasoningSel) reasoningSel.value = controlCodexConfig.reasoning_effort || '';
     if (webSearch) webSearch.checked = !!controlCodexConfig.web_search;
     if (webSearchStatus) webSearchStatus.textContent = controlCodexConfig.web_search ? 'on' : 'off';
-    if (contextRecoverySel) contextRecoverySel.value = controlCodexConfig.context_recovery || 'off';
+    if (managedContextSel) managedContextSel.value = controlCodexConfig.managed_context || 'vanilla';
     if (networkCb) networkCb.checked = !!controlCodexConfig.network_access;
     if (networkStatus) networkStatus.textContent = controlCodexConfig.network_access ? 'on' : 'off';
     // Network access only matters inside workspace-write. Grey out + annotate
@@ -9680,11 +9680,11 @@ function onControlWebSearchChange(ev) {
   dispatchControlMsg({ action: 'set_codex_web_search', enabled });
 }
 
-function onControlContextRecoveryChange(ev) {
-  const mode = ev.target.value === 'patched' ? 'patched' : 'off';
-  if (mode === (controlCodexConfig.context_recovery || 'off')) return;
-  controlCodexConfig.context_recovery = mode;
-  dispatchControlMsg({ action: 'set_codex_context_recovery', mode });
+function onControlManagedContextChange(ev) {
+  const mode = ev.target.value === 'managed' ? 'managed' : 'vanilla';
+  if (mode === (controlCodexConfig.managed_context || 'vanilla')) return;
+  controlCodexConfig.managed_context = mode;
+  dispatchControlMsg({ action: 'set_codex_managed_context', mode });
 }
 
 function onControlNetworkChange(ev) {
@@ -9843,7 +9843,7 @@ function applyCodexConfigChanged(evt) {
   if (typeof evt.web_search === 'boolean') controlCodexConfig.web_search = evt.web_search;
   if (typeof evt.network_access === 'boolean') controlCodexConfig.network_access = evt.network_access;
   if (Array.isArray(evt.writable_roots)) controlCodexConfig.writable_roots = evt.writable_roots;
-  if (evt.context_recovery) controlCodexConfig.context_recovery = evt.context_recovery;
+  if (evt.managed_context) controlCodexConfig.managed_context = evt.managed_context;
   // Sandbox change may flip the network-access row's enabled state — full
   // re-render is the simplest way to keep disabled-styling in sync.
   renderControlPane();
@@ -10336,14 +10336,14 @@ function wireControlPaneListeners() {
   const modelInp = $('control-codex-model');
   const reasoningSel = $('control-codex-reasoning');
   const webSearch = $('control-codex-web-search');
-  const contextRecoverySel = $('control-codex-context-recovery');
+  const managedContextSel = $('control-codex-managed-context');
   const networkCb = $('control-codex-network');
   const rootsTA = $('control-codex-writable-roots');
   if (sandboxSel) sandboxSel.addEventListener('change', onControlSandboxChange);
   if (approvalSel) approvalSel.addEventListener('change', onControlApprovalChange);
   if (reasoningSel) reasoningSel.addEventListener('change', onControlReasoningChange);
   if (webSearch) webSearch.addEventListener('change', onControlWebSearchChange);
-  if (contextRecoverySel) contextRecoverySel.addEventListener('change', onControlContextRecoveryChange);
+  if (managedContextSel) managedContextSel.addEventListener('change', onControlManagedContextChange);
   if (networkCb) networkCb.addEventListener('change', onControlNetworkChange);
   // Commit text inputs on blur or Enter so every keystroke doesn't ping the server.
   if (modelInp) {
@@ -23694,7 +23694,7 @@ async function loadSettings() {
     document.getElementById('set-live-audio-timeout').value = d.live_audio_timeout_secs || 300;
     document.getElementById('set-codex-command').value = d.codex_command || 'codex';
     controlCodexConfig.command = d.codex_command || 'codex';
-    controlCodexConfig.context_recovery = d.codex_context_recovery || 'off';
+    controlCodexConfig.managed_context = d.codex_managed_context || 'vanilla';
     setNewSessionAgentDefaults(d);
     // External agent: persisted to intendant.toml via `[agent]
     // default_backend`. Sync both the Settings dropdown AND the
@@ -23781,7 +23781,7 @@ async function saveSettings() {
     codex_writable_roots: Array.isArray(controlCodexConfig.writable_roots)
       ? controlCodexConfig.writable_roots
       : [],
-    codex_context_recovery: controlCodexConfig.context_recovery || 'off',
+    codex_managed_context: controlCodexConfig.managed_context || 'vanilla',
     gemini_model: controlGeminiConfig.model || null,
     gemini_approval_mode: controlGeminiConfig.approval_mode || 'default',
     gemini_sandbox: !!controlGeminiConfig.sandbox,

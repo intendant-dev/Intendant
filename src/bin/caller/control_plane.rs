@@ -31,7 +31,7 @@ pub struct CodexRuntimeConfig {
     pub web_search: bool,
     pub network_access: bool,
     pub writable_roots: Vec<String>,
-    pub context_recovery: String,
+    pub managed_context: String,
 }
 
 pub type SharedCodexConfig = Arc<RwLock<CodexRuntimeConfig>>;
@@ -340,23 +340,23 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 ..Default::default()
             }));
         }
-        ControlMsg::SetCodexContextRecovery { mode } => {
-            let normalized = crate::project::normalize_codex_context_recovery(mode);
+        ControlMsg::SetCodexManagedContext { mode } => {
+            let normalized = crate::project::normalize_codex_managed_context(mode);
             {
                 let mut guard = state.codex_config.write().await;
-                guard.context_recovery = normalized.clone();
+                guard.managed_context = normalized.clone();
             }
             if let Some(ref root) = state.project_root {
                 if let Err(e) = persist_codex_field(root, |cfg| {
-                    cfg.context_recovery = normalized.clone();
+                    cfg.managed_context = normalized.clone();
                 }) {
                     eprintln!(
-                        "[control_plane] failed to persist codex.context_recovery to intendant.toml: {e}"
+                        "[control_plane] failed to persist codex.managed_context to intendant.toml: {e}"
                     );
                 }
             }
             state.bus.send(codex_config_changed_event(CodexConfigDelta {
-                context_recovery: Some(normalized),
+                managed_context: Some(normalized),
                 ..Default::default()
             }));
         }
@@ -623,7 +623,7 @@ struct CodexConfigDelta {
     web_search: Option<bool>,
     network_access: Option<bool>,
     writable_roots: Option<Vec<String>>,
-    context_recovery: Option<String>,
+    managed_context: Option<String>,
 }
 
 fn codex_config_changed_event(delta: CodexConfigDelta) -> AppEvent {
@@ -638,7 +638,7 @@ fn codex_config_changed_event(delta: CodexConfigDelta) -> AppEvent {
         web_search: delta.web_search,
         network_access: delta.network_access,
         writable_roots: delta.writable_roots,
-        context_recovery: delta.context_recovery,
+        managed_context: delta.managed_context,
     }
 }
 
@@ -748,7 +748,7 @@ mod tests {
             web_search: false,
             network_access: false,
             writable_roots: Vec::new(),
-            context_recovery: "off".to_string(),
+            managed_context: "vanilla".to_string(),
         }))
     }
 
@@ -1260,7 +1260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_codex_context_recovery_normalizes_and_updates_shared_state() {
+    async fn set_codex_managed_context_normalizes_and_updates_shared_state() {
         let bus = EventBus::new();
         let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
         let external_agent = Arc::new(RwLock::new(None));
@@ -1279,20 +1279,20 @@ mod tests {
         );
 
         bus.send(AppEvent::ControlCommand(
-            ControlMsg::SetCodexContextRecovery {
+            ControlMsg::SetCodexManagedContext {
                 mode: "on".to_string(),
             },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(codex_config.read().await.context_recovery, "patched");
+        assert_eq!(codex_config.read().await.managed_context, "managed");
 
         bus.send(AppEvent::ControlCommand(
-            ControlMsg::SetCodexContextRecovery {
+            ControlMsg::SetCodexManagedContext {
                 mode: "vanilla".to_string(),
             },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(codex_config.read().await.context_recovery, "off");
+        assert_eq!(codex_config.read().await.managed_context, "vanilla");
 
         handle.abort();
     }

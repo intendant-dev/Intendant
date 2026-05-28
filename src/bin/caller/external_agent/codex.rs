@@ -846,10 +846,10 @@ before retrying."
     format!("\n\n## Environment\n\n{}\n", body)
 }
 
-const CONTEXT_RECOVERY_TOOLS_PROMPT: &str = "\n\
-### Context Management (patched Codex only)\n\
-- **rewind_context(anchor, reason, primer, preserve?, discard?, artifacts?, next_steps?)**: Schedule a same-thread Codex context rewind to an exact item/tool-call anchor. Use this when context pressure is high; include a detailed carry-forward primer.\n\
-- **rewind_backout(record_id, mode?, allow_cache_reset?)**: Inspect or restore a prior rewind record. Use `mode=\"restore\"` for same-thread recovery; `fork`/`backout` require `allow_cache_reset=true` because they create a new cache key.\n\
+const MANAGED_CONTEXT_TOOLS_PROMPT: &str = "\n\
+### Managed Context (managed Codex only)\n\
+- **rewind_context(anchor, reason, primer, preserve?, discard?, artifacts?, next_steps?)**: Rewrite the active Codex thread to a denser continuation at an exact item/tool-call anchor. Use this proactively after noisy tool output, failed exploration, or a long research branch once the durable facts can be crystallized into the primer. Also use it when context pressure is high.\n\
+- **rewind_backout(record_id, mode?, allow_cache_reset?)**: Inspect or restore a prior managed-context record. Use `mode=\"restore\"` for same-thread recovery; `fork`/`backout` require `allow_cache_reset=true` because they create a new cache key.\n\
 \n";
 
 pub(super) const DISPLAY_TOOLS_PROMPT: &str = "\n\n\
@@ -858,7 +858,7 @@ pub(super) const DISPLAY_TOOLS_PROMPT: &str = "\n\n\
 You have access to these tools through the `intendant` MCP server.\n\
 \n\
 ### Session Status (always available)\n\
-- **get_status()**: Report current Intendant state, including backend-reported Codex context pressure.\n\
+- **get_status()**: Report current Intendant state, including backend-reported Codex context density/pressure.\n\
 \n\
 **GUI interaction rule:** For all GUI tasks, use take_screenshot and execute_cu_actions. Look at screenshots and click what you see. Do NOT use osascript, accessibility queries, shell commands, or app binary inspection for GUI interaction.\n\
 \n\
@@ -896,17 +896,30 @@ display stream. Returns empty if no dashboard is streaming.\n\
 Display targets: \"user_session\" (user's display), \":99\" (virtual display 99).\n\
 ";
 
-fn intendant_mcp_tools_prompt(context_recovery: bool) -> String {
-    if !context_recovery {
+fn intendant_mcp_tools_prompt(managed_context: bool) -> String {
+    if !managed_context {
         return DISPLAY_TOOLS_PROMPT.to_string();
     }
     let mut out = DISPLAY_TOOLS_PROMPT.to_string();
     if let Some(insert_at) = out.find("**GUI interaction rule:**") {
-        out.insert_str(insert_at, CONTEXT_RECOVERY_TOOLS_PROMPT);
+        out.insert_str(insert_at, MANAGED_CONTEXT_TOOLS_PROMPT);
     } else {
-        out.push_str(CONTEXT_RECOVERY_TOOLS_PROMPT);
+        out.push_str(MANAGED_CONTEXT_TOOLS_PROMPT);
     }
     out
+}
+
+fn encode_mcp_query_value(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 // ---------------------------------------------------------------------------
@@ -994,10 +1007,11 @@ pub struct CodexAgent {
     network_access: bool,
     /// Extra writable roots beyond the project. Absolute paths.
     writable_roots: Vec<String>,
-    /// Enables the patched Intendant/Codex same-thread context-recovery
-    /// protocol. Disabled for vanilla/fork-safe managed Codex.
-    context_recovery: bool,
+    /// Enables Intendant's managed-context protocol. Disabled for
+    /// vanilla/fork-safe managed Codex.
+    managed_context: bool,
     web_port: Option<u16>,
+    mcp_session_id: Option<String>,
     resume_session: Option<String>,
     prompt_sent: bool,
     /// Working directory used to resolve Codex project config for config/read.
@@ -1043,10 +1057,32 @@ pub struct CodexAgentOptions {
     pub web_search: bool,
     pub network_access: bool,
     pub writable_roots: Vec<String>,
-    pub context_recovery: bool,
+    pub managed_context: bool,
 }
 
 impl CodexAgent {
+    fn intendant_mcp_url(&self, port: u16) -> String {
+        let mode = if self.managed_context {
+            "managed"
+        } else {
+            "vanilla"
+        };
+        match self
+            .mcp_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(session_id) => format!(
+                "http://localhost:{}/mcp?session_id={}&managed_context={}",
+                port,
+                encode_mcp_query_value(session_id),
+                mode
+            ),
+            None => format!("http://localhost:{}/mcp?managed_context={}", port, mode),
+        }
+    }
+
     pub fn new(
         command: String,
         model: Option<String>,
@@ -1081,8 +1117,9 @@ impl CodexAgent {
             web_search: opts.web_search,
             network_access: opts.network_access,
             writable_roots: opts.writable_roots,
-            context_recovery: opts.context_recovery,
+            managed_context: opts.managed_context,
             web_port,
+            mcp_session_id: None,
             resume_session: None,
             prompt_sent: false,
             working_dir: None,
@@ -3155,8 +3192,9 @@ impl ExternalAgent for CodexAgent {
         self.web_search = config.web_search;
         self.network_access = config.network_access;
         self.writable_roots = config.writable_roots;
-        self.context_recovery = config.codex_context_recovery;
+        self.managed_context = config.codex_managed_context;
         self.request_trace_root = config.request_trace_dir;
+        self.mcp_session_id = config.mcp_session_id;
         self.resume_session = config.resume_session;
         self.working_dir = Some(config.working_dir.clone());
 
@@ -3164,6 +3202,7 @@ impl ExternalAgent for CodexAgent {
         // Backup any existing config and restore on shutdown.
         let web_port = config.web_port.or(self.web_port);
         if let Some(port) = web_port {
+            let mcp_url = self.intendant_mcp_url(port);
             let codex_dir = config.working_dir.join(".codex");
             let _ = std::fs::create_dir_all(&codex_dir);
             let config_path = codex_dir.join("config.toml");
@@ -3184,8 +3223,8 @@ impl ExternalAgent for CodexAgent {
                  \n\
                  [mcp_servers.intendant]\n\
                  type = \"http\"\n\
-                 url = \"http://localhost:{}/mcp\"\n",
-                port
+                 url = \"{}\"\n",
+                mcp_url
             );
             if let Err(e) = std::fs::write(&config_path, &config_content) {
                 eprintln!(
@@ -3204,7 +3243,7 @@ impl ExternalAgent for CodexAgent {
         // appended here as `-c key=value` overrides so Codex's app-server picks
         // them up exactly as if they had been written to `~/.codex/config.toml`
         // before launch.
-        let mcp_url = format!("http://localhost:{}/mcp", self.web_port.unwrap_or(8765));
+        let mcp_url = self.intendant_mcp_url(web_port.unwrap_or(8765));
         let mut args: Vec<String> = vec![
             "app-server".to_string(),
             "-c".to_string(),
@@ -3212,7 +3251,7 @@ impl ExternalAgent for CodexAgent {
             "-c".to_string(),
             format!("mcp_servers.intendant.url=\"{}\"", mcp_url),
         ];
-        if self.context_recovery {
+        if self.managed_context {
             // Intendant owns context rewind/backout policy for managed Codex
             // sessions. Our minimal Codex fork treats this sentinel as
             // disabling automatic compaction; stock Codex treats it as an
@@ -3419,7 +3458,7 @@ impl ExternalAgent for CodexAgent {
                     "{}{}{}",
                     message,
                     sandbox,
-                    intendant_mcp_tools_prompt(self.context_recovery)
+                    intendant_mcp_tools_prompt(self.managed_context)
                 )
             } else {
                 format!("{}{}", message, sandbox)
@@ -3568,7 +3607,7 @@ impl ExternalAgent for CodexAgent {
     }
 
     fn supports_item_anchor_rewind(&self) -> bool {
-        self.context_recovery
+        self.managed_context
     }
 
     /// Native implementation of conversation rollback. Reuses the
@@ -5976,18 +6015,40 @@ mod tests {
     }
 
     #[test]
-    fn intendant_mcp_prompt_advertises_rewind_tools_only_for_patched_codex() {
+    fn intendant_mcp_prompt_advertises_rewind_tools_only_for_managed_codex() {
         let vanilla = intendant_mcp_tools_prompt(false);
         assert!(vanilla.contains("take_screenshot"));
         assert!(vanilla.contains("get_status"));
         assert!(!vanilla.contains("rewind_context"));
         assert!(!vanilla.contains("rewind_backout"));
 
-        let patched = intendant_mcp_tools_prompt(true);
-        assert!(patched.contains("take_screenshot"));
-        assert!(patched.contains("get_status"));
-        assert!(patched.contains("rewind_context"));
-        assert!(patched.contains("rewind_backout"));
+        let managed = intendant_mcp_tools_prompt(true);
+        assert!(managed.contains("take_screenshot"));
+        assert!(managed.contains("get_status"));
+        assert!(managed.contains("rewind_context"));
+        assert!(managed.contains("rewind_backout"));
+    }
+
+    #[test]
+    fn intendant_mcp_url_carries_session_scoped_managed_context() {
+        let mut agent = CodexAgent::with_options(
+            "codex".to_string(),
+            None,
+            "never".to_string(),
+            "workspace-write".to_string(),
+            Some(8765),
+            CodexAgentOptions {
+                managed_context: true,
+                ..CodexAgentOptions::default()
+            },
+        );
+        agent.mcp_session_id = Some("session with spaces".to_string());
+
+        let url = agent.intendant_mcp_url(8765);
+        assert_eq!(
+            url,
+            "http://localhost:8765/mcp?session_id=session%20with%20spaces&managed_context=managed"
+        );
     }
 
     #[tokio::test]
@@ -6006,8 +6067,8 @@ mod tests {
                 autonomy,
                 tmp.path().join("logs"),
             );
-            mcp_state.codex_context_recovery = true;
-            mcp_state.configured_codex_context_recovery = true;
+            mcp_state.codex_managed_context = true;
+            mcp_state.configured_codex_managed_context = true;
             let state = std::sync::Arc::new(tokio::sync::RwLock::new(mcp_state));
             let server = crate::mcp::IntendantServer::new(state, crate::event::EventBus::new());
             server.list_tools_json().await
@@ -6020,7 +6081,7 @@ mod tests {
             "danger-full-access".into(),
             Some(mcp_port),
             CodexAgentOptions {
-                context_recovery: true,
+                managed_context: true,
                 ..CodexAgentOptions::default()
             },
         );
@@ -6035,8 +6096,9 @@ mod tests {
             web_search: false,
             network_access: false,
             writable_roots: Vec::new(),
-            codex_context_recovery: true,
+            codex_managed_context: true,
             web_port: Some(mcp_port),
+            mcp_session_id: Some("test-session".to_string()),
             resume_session: None,
         };
 

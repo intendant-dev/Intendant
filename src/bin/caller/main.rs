@@ -638,7 +638,7 @@ fn codex_runtime_config_equal(
         && a.web_search == b.web_search
         && a.network_access == b.network_access
         && a.writable_roots == b.writable_roots
-        && a.context_recovery == b.context_recovery
+        && a.managed_context == b.managed_context
 }
 
 /// Structural equality for `GeminiRuntimeConfig`. Every field here is a
@@ -963,6 +963,7 @@ async fn create_external_agent(
     session_log: &SharedSessionLog,
     web_port: Option<u16>,
     resume_session: Option<String>,
+    mcp_session_id: Option<String>,
 ) -> Result<
     (
         Box<dyn external_agent::ExternalAgent>,
@@ -977,6 +978,7 @@ async fn create_external_agent(
         .lock()
         .ok()
         .map(|log| log.dir().join("model-request-traces"));
+    let mcp_session_id = mcp_session_id.or_else(|| session_log_id(session_log));
 
     let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend {
         AgentBackend::Codex => {
@@ -984,14 +986,14 @@ async fn create_external_agent(
             let sandbox_mode = project::normalize_sandbox_mode(&cfg.sandbox);
             let reasoning_effort =
                 project::normalize_reasoning_effort(cfg.reasoning_effort.as_deref());
-            let codex_context_recovery =
-                project::codex_context_recovery_enabled(&cfg.context_recovery);
+            let codex_managed_context =
+                project::codex_managed_context_enabled(&cfg.managed_context);
             let opts = external_agent::codex::CodexAgentOptions {
                 reasoning_effort: reasoning_effort.clone(),
                 web_search: cfg.web_search,
                 network_access: cfg.network_access,
                 writable_roots: cfg.writable_roots.clone(),
-                context_recovery: codex_context_recovery,
+                managed_context: codex_managed_context,
             };
             let agent = Box::new(external_agent::codex::CodexAgent::with_options(
                 cfg.command.clone(),
@@ -1011,8 +1013,9 @@ async fn create_external_agent(
                 web_search: cfg.web_search,
                 network_access: cfg.network_access,
                 writable_roots: cfg.writable_roots.clone(),
-                codex_context_recovery,
+                codex_managed_context,
                 web_port,
+                mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
             };
             (agent, config)
@@ -1049,8 +1052,9 @@ async fn create_external_agent(
                 web_search: false,
                 network_access: false,
                 writable_roots: Vec::new(),
-                codex_context_recovery: false,
+                codex_managed_context: false,
                 web_port,
+                mcp_session_id: None,
                 resume_session: resume_session.clone(),
             };
             (agent, config)
@@ -1074,8 +1078,9 @@ async fn create_external_agent(
                 web_search: false,
                 network_access: false,
                 writable_roots: Vec::new(),
-                codex_context_recovery: false,
+                codex_managed_context: false,
                 web_port,
+                mcp_session_id: None,
                 resume_session: resume_session.clone(),
             };
             (agent, config)
@@ -11112,7 +11117,7 @@ async fn run_with_presence(
                     cx.web_search = current_codex_config.web_search;
                     cx.network_access = current_codex_config.network_access;
                     cx.writable_roots = current_codex_config.writable_roots.clone();
-                    cx.context_recovery = current_codex_config.context_recovery.clone();
+                    cx.managed_context = current_codex_config.managed_context.clone();
                 }
                 if matches!(backend, external_agent::AgentBackend::GeminiCli) {
                     let gm = &mut proj.config.agent.gemini_cli;
@@ -11124,19 +11129,26 @@ async fn run_with_presence(
                     gm.include_directories = current_gemini_config.include_directories.clone();
                     gm.debug = current_gemini_config.debug;
                 }
-                let (agent, thread, event_rx) =
-                    match create_external_agent(backend, &proj, &session_log, web_port, None).await
-                    {
-                        Ok(result) => result,
-                        Err(e) => {
-                            bus.send(AppEvent::PresenceLog {
-                                message: format!("External agent error: {}", e),
-                                level: Some(types::LogLevel::Error),
-                                turn: None,
-                            });
-                            continue;
-                        }
-                    };
+                let (agent, thread, event_rx) = match create_external_agent(
+                    backend,
+                    &proj,
+                    &session_log,
+                    web_port,
+                    None,
+                    session_log_id(&session_log),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        bus.send(AppEvent::PresenceLog {
+                            message: format!("External agent error: {}", e),
+                            level: Some(types::LogLevel::Error),
+                            turn: None,
+                        });
+                        continue;
+                    }
+                };
                 slog(&session_log, |l| {
                     l.debug(&format!(
                         "Mode: external agent ({}) via presence, thread: {}",
@@ -12097,27 +12109,33 @@ async fn run_external_agent_mode(
     let resumed_external_session = resume_session.clone();
     let persist_model_responses_inline = control_session_id.is_some();
     let intendant_session_id = control_session_id.or_else(|| session_log_id(&session_log));
-    let (mut agent, thread, mut event_rx) =
-        match create_external_agent(&backend, &project, &session_log, web_port, resume_session)
-            .await
-        {
-            Ok(started) => started,
-            Err(e) => {
-                if emit_session_started_after_identity {
-                    if let Some(session_id) = intendant_session_id.clone() {
-                        bus.send(AppEvent::SessionStarted {
-                            session_id,
-                            task: if task.trim().is_empty() {
-                                None
-                            } else {
-                                Some(task.clone())
-                            },
-                        });
-                    }
+    let (mut agent, thread, mut event_rx) = match create_external_agent(
+        &backend,
+        &project,
+        &session_log,
+        web_port,
+        resume_session,
+        intendant_session_id.clone(),
+    )
+    .await
+    {
+        Ok(started) => started,
+        Err(e) => {
+            if emit_session_started_after_identity {
+                if let Some(session_id) = intendant_session_id.clone() {
+                    bus.send(AppEvent::SessionStarted {
+                        session_id,
+                        task: if task.trim().is_empty() {
+                            None
+                        } else {
+                            Some(task.clone())
+                        },
+                    });
                 }
-                return Err(e);
             }
-        };
+            return Err(e);
+        }
+    };
     let backend_session_id = thread.thread_id.clone();
     let live_session_id = if backend.thread_id_is_canonical(&backend_session_id) {
         Some(backend_session_id.clone())
@@ -14763,9 +14781,9 @@ async fn main() -> Result<(), CallerError> {
             autonomy.clone(),
             log_dir.clone(),
         );
-        mcp_http_state.codex_context_recovery =
-            project::codex_context_recovery_enabled(&project.config.agent.codex.context_recovery);
-        mcp_http_state.configured_codex_context_recovery = mcp_http_state.codex_context_recovery;
+        mcp_http_state.codex_managed_context =
+            project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
+        mcp_http_state.configured_codex_managed_context = mcp_http_state.codex_managed_context;
         mcp_http_state.frame_registry = Some(frame_registry.clone());
         mcp_http_state.session_registry = Some(session_registry.clone());
         mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
@@ -14817,9 +14835,7 @@ async fn main() -> Result<(), CallerError> {
                     web_search: cfg.web_search,
                     network_access: cfg.network_access,
                     writable_roots: cfg.writable_roots.clone(),
-                    context_recovery: project::normalize_codex_context_recovery(
-                        &cfg.context_recovery,
-                    ),
+                    managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
                 },
             ))
         };
@@ -14990,11 +15006,9 @@ async fn main() -> Result<(), CallerError> {
                 autonomy.clone(),
                 log_dir.clone(),
             );
-            mcp_http_state.codex_context_recovery = project::codex_context_recovery_enabled(
-                &project.config.agent.codex.context_recovery,
-            );
-            mcp_http_state.configured_codex_context_recovery =
-                mcp_http_state.codex_context_recovery;
+            mcp_http_state.codex_managed_context =
+                project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
+            mcp_http_state.configured_codex_managed_context = mcp_http_state.codex_managed_context;
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
@@ -15047,9 +15061,9 @@ async fn main() -> Result<(), CallerError> {
             autonomy.clone(),
             log_dir.clone(),
         );
-        mcp_app_state.codex_context_recovery =
-            project::codex_context_recovery_enabled(&project.config.agent.codex.context_recovery);
-        mcp_app_state.configured_codex_context_recovery = mcp_app_state.codex_context_recovery;
+        mcp_app_state.codex_managed_context =
+            project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
+        mcp_app_state.configured_codex_managed_context = mcp_app_state.codex_managed_context;
         mcp_app_state.context_window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
         mcp_app_state.session_id = session_log
             .lock()
@@ -15594,11 +15608,9 @@ async fn main() -> Result<(), CallerError> {
                 autonomy.clone(),
                 log_dir.clone(),
             );
-            mcp_http_state.codex_context_recovery = project::codex_context_recovery_enabled(
-                &project.config.agent.codex.context_recovery,
-            );
-            mcp_http_state.configured_codex_context_recovery =
-                mcp_http_state.codex_context_recovery;
+            mcp_http_state.codex_managed_context =
+                project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
+            mcp_http_state.configured_codex_managed_context = mcp_http_state.codex_managed_context;
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
@@ -15685,9 +15697,7 @@ async fn main() -> Result<(), CallerError> {
                     web_search: cfg.web_search,
                     network_access: cfg.network_access,
                     writable_roots: cfg.writable_roots.clone(),
-                    context_recovery: project::normalize_codex_context_recovery(
-                        &cfg.context_recovery,
-                    ),
+                    managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
                 },
             ))
         };
@@ -16108,11 +16118,9 @@ async fn main() -> Result<(), CallerError> {
                 autonomy.clone(),
                 log_dir.clone(),
             );
-            mcp_http_state.codex_context_recovery = project::codex_context_recovery_enabled(
-                &project.config.agent.codex.context_recovery,
-            );
-            mcp_http_state.configured_codex_context_recovery =
-                mcp_http_state.codex_context_recovery;
+            mcp_http_state.codex_managed_context =
+                project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
+            mcp_http_state.configured_codex_managed_context = mcp_http_state.codex_managed_context;
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
@@ -16283,9 +16291,7 @@ async fn main() -> Result<(), CallerError> {
                     web_search: cfg.web_search,
                     network_access: cfg.network_access,
                     writable_roots: cfg.writable_roots.clone(),
-                    context_recovery: project::normalize_codex_context_recovery(
-                        &cfg.context_recovery,
-                    ),
+                    managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
                 },
             ))
         };

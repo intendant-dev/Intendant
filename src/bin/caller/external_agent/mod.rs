@@ -395,11 +395,14 @@ pub struct AgentConfig {
     /// Extra writable roots for Codex's sandbox. Codex-only; other backends
     /// ignore.
     pub writable_roots: Vec<String>,
-    /// Whether Codex has Intendant's patched same-thread context-recovery
-    /// protocol. Codex-only; vanilla/fork-safe mode leaves this false.
-    pub codex_context_recovery: bool,
+    /// Whether Codex has Intendant's managed-context protocol. Codex-only;
+    /// vanilla/fork-safe mode leaves this false.
+    pub codex_managed_context: bool,
     /// Web gateway port for MCP-over-HTTP config generation.
     pub web_port: Option<u16>,
+    /// Intendant session id to include in the injected MCP URL so tool
+    /// exposure can be scoped to the Codex process that is calling.
+    pub mcp_session_id: Option<String>,
     /// Persisted backend-native session/thread id to resume instead of
     /// starting a fresh external conversation.
     pub resume_session: Option<String>,

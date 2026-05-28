@@ -600,7 +600,7 @@ pub enum AppEvent {
         web_search: Option<bool>,
         network_access: Option<bool>,
         writable_roots: Option<Vec<String>>,
-        context_recovery: Option<String>,
+        managed_context: Option<String>,
     },
 
     /// Emitted when one or more Gemini CLI runtime fields change. Mirror of
@@ -876,11 +876,12 @@ pub enum ControlMsg {
         #[serde(default)]
         roots: Vec<String>,
     },
-    /// Set whether managed Codex should use the patched context-recovery
-    /// protocol. `off` is vanilla/fork safe; `patched` enables Intendant
-    /// rewind/backout tooling and disables Codex auto-compaction for the
-    /// managed thread. Applies to the NEXT task.
-    SetCodexContextRecovery {
+    /// Set Codex's managed-context mode. `vanilla` is upstream/original-fork
+    /// safe; `managed` enables Intendant's proactive rewind/fission tooling
+    /// and disables Codex auto-compaction for the managed thread. Applies to
+    /// the NEXT task.
+    #[serde(alias = "set_codex_context_recovery")]
+    SetCodexManagedContext {
         mode: String,
     },
     /// Invoke one of Codex's thread-level actions against the persistent
@@ -1754,7 +1755,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             web_search,
             network_access,
             writable_roots,
-            context_recovery,
+            managed_context,
         } => Some(OutboundEvent::CodexConfigChanged {
             command: command.clone(),
             sandbox: sandbox.clone(),
@@ -1766,7 +1767,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             web_search: *web_search,
             network_access: *network_access,
             writable_roots: writable_roots.clone(),
-            context_recovery: context_recovery.clone(),
+            managed_context: managed_context.clone(),
         }),
         AppEvent::GeminiConfigChanged {
             model,
