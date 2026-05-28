@@ -3205,6 +3205,11 @@ html, body {
   line-height: 1.1;
   text-transform: uppercase;
 }
+.sessions-new-session-field input,
+.sessions-new-session-field textarea,
+.sessions-new-session-field select {
+  text-transform: none;
+}
 .sessions-new-session-task {
   width: 100%;
 }
@@ -3321,6 +3326,16 @@ html, body {
 .sessions-agent-command-row .sessions-project-browse:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+.sessions-agent-note {
+  min-height: 14px;
+  color: var(--overlay0);
+  font-size: 11px;
+  line-height: 1.25;
+  text-transform: none;
+}
+.sessions-agent-note.warn {
+  color: var(--yellow);
 }
 .sessions-project-browse,
 .sessions-project-create-label {
@@ -4784,7 +4799,7 @@ html, body {
   color: var(--text);
 }
 .managed-context-shell {
-  max-width: 1120px;
+  max-width: 1480px;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 12px;
@@ -7490,6 +7505,7 @@ html, body {
                     </select>
                   </label>
                 </div>
+                <div id="new-session-managed-context-note" class="sessions-agent-note"></div>
                 <button class="sessions-start-btn" id="new-session-start-btn" onclick="startNewSession()">Start session</button>
                 <div class="sessions-spawn-notice hidden" id="new-session-spawn-notice" role="status" aria-live="polite">
                   <span class="sessions-spawn-spinner" aria-hidden="true"></span>
@@ -9364,6 +9380,7 @@ function processCommands(cmds) {
       case 'remove_recording': removeRecordingStream(c.stream_name); break;
       case 'recording_error': /* logged via add_log_entry */ break;
       case 'session_started':
+        managedContextSessionManuallySelected = false;
         onSessionStarted(c.session_id, c.task);
         scheduleManagedContextRefresh(400);
         break;
@@ -10990,6 +11007,7 @@ let managedContextRecords = [];
 let managedContextLastError = '';
 let managedContextRefreshTimer = null;
 let managedContextRpcSeq = 1;
+let managedContextSessionManuallySelected = false;
 
 function managedContextEl(id) {
   return document.getElementById(id);
@@ -11015,7 +11033,7 @@ function managedContextIsCodexLike(meta = {}) {
   if (source === 'codex') return true;
   const label = String(meta.source || meta.source_label || meta.sourceLabel || '').toLowerCase();
   if (label.includes('codex')) return true;
-  const actions = meta.capabilities?.codex_thread_actions || [];
+  const actions = meta.capabilities?.codexThreadActions || meta.capabilities?.codex_thread_actions || [];
   return Array.isArray(actions) && actions.length > 0;
 }
 
@@ -11082,6 +11100,7 @@ function renderManagedContextSessionSelect() {
   const sel = managedContextEl('managed-context-session');
   if (!sel) return;
   const previous = sel.value;
+  const target = resolvePromptTargetSessionId();
   const options = managedContextSessionOptions();
   sel.innerHTML = '';
   if (!options.length) {
@@ -11098,7 +11117,9 @@ function renderManagedContextSessionSelect() {
     opt.title = sid;
     sel.appendChild(opt);
   }
-  if (previous && options.some(([sid]) => sid === previous)) {
+  if (!managedContextSessionManuallySelected && target && options.some(([sid]) => sid === target)) {
+    sel.value = target;
+  } else if (previous && options.some(([sid]) => sid === previous)) {
     sel.value = previous;
   } else {
     const preferred = options.find(([, meta]) => meta.preferred) || options[0];
@@ -11494,9 +11515,13 @@ async function claimManagedContextFissionCanonical(groupId, branchId, expectedId
 }
 
 function wireManagedContextListeners() {
-  managedContextEl('managed-context-session')?.addEventListener('change', () => refreshManagedContextPane({ force: true }));
+  managedContextEl('managed-context-session')?.addEventListener('change', () => {
+    managedContextSessionManuallySelected = true;
+    refreshManagedContextPane({ force: true });
+  });
   managedContextEl('managed-context-use-target')?.addEventListener('click', () => {
     const target = resolvePromptTargetSessionId();
+    managedContextSessionManuallySelected = false;
     renderManagedContextSessionSelect();
     const sel = managedContextEl('managed-context-session');
     if (target && sel && Array.from(sel.options).some(o => o.value === target)) sel.value = target;
@@ -13906,6 +13931,7 @@ function normalizeSessionCapabilities(raw = null) {
     codexThreadActions: Array.isArray(actions)
       ? actions.map(op => String(op || '').trim().toLowerCase().replace(/_/g, '-')).filter(Boolean)
       : null,
+    codexManagedContext: raw.codex_managed_context ?? raw.codexManagedContext ?? null,
   };
 }
 
@@ -26785,6 +26811,7 @@ function renderNewSessionAgentControls(options = {}) {
   const commandInput = document.getElementById('new-session-agent-command');
   const browseBtn = document.getElementById('new-session-agent-command-browse');
   const managedContextSel = document.getElementById('new-session-codex-managed-context');
+  const managedContextNote = document.getElementById('new-session-managed-context-note');
   if (!select || !commandInput) return;
 
   const currentOption = select.querySelector('option[value=""]');
@@ -26809,6 +26836,14 @@ function renderNewSessionAgentControls(options = {}) {
     const appliesToCodex = effectiveAgent === 'codex';
     managedContextSel.disabled = !appliesToCodex;
     managedContextSel.value = newSessionCodexManagedContext;
+  }
+  if (managedContextNote) {
+    const mode = managedContextSel?.value || newSessionCodexManagedContext;
+    const appliesToCodex = effectiveAgent === 'codex';
+    managedContextNote.classList.toggle('warn', appliesToCodex && mode === 'managed');
+    managedContextNote.textContent = appliesToCodex && mode === 'managed'
+      ? 'Managed requires a patched Codex binary with the managed app-server protocol.'
+      : '';
   }
 }
 
@@ -27419,6 +27454,10 @@ document.getElementById('new-session-project-root')?.addEventListener('input', (
 document.getElementById('new-session-create-project-dir')?.addEventListener('change', refreshNewSessionProjectStatus);
 document.getElementById('new-session-agent')?.addEventListener('change', () => {
   renderNewSessionAgentControls({ replaceCommand: true });
+});
+document.getElementById('new-session-codex-managed-context')?.addEventListener('change', (ev) => {
+  newSessionCodexManagedContext = ev.currentTarget.value === 'managed' ? 'managed' : 'vanilla';
+  renderNewSessionAgentControls();
 });
 document.getElementById('fs-picker-path')?.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Enter') return;

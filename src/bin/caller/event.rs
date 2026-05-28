@@ -3488,6 +3488,7 @@ mod tests {
                 steer: false,
                 interrupt: false,
                 codex_thread_actions: vec!["undo".to_string()],
+                codex_managed_context: Some("managed".to_string()),
             },
         };
         let outbound = app_event_to_outbound(&event).unwrap();
@@ -3497,6 +3498,7 @@ mod tests {
         assert!(json.contains("\"follow_up\":true"));
         assert!(json.contains("\"steer\":false"));
         assert!(json.contains("\"codex_thread_actions\":[\"undo\"]"));
+        assert!(json.contains("\"codex_managed_context\":\"managed\""));
     }
 
     #[test]

@@ -578,6 +578,27 @@ fn managed_context_tool(name: &str) -> bool {
     matches!(name, "rewind_context" | "rewind_backout")
 }
 
+fn apply_session_capabilities_to_mcp_state(
+    s: &mut McpAppState,
+    session_id: &str,
+    capabilities: &crate::types::SessionCapabilities,
+) -> bool {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return false;
+    }
+    let Some(mode) = capabilities.codex_managed_context.as_deref() else {
+        return false;
+    };
+    let enabled = crate::project::codex_managed_context_enabled(mode);
+    s.session_codex_managed_context
+        .insert(session_id.to_string(), enabled);
+    if s.session_id == session_id {
+        s.codex_managed_context = enabled;
+    }
+    true
+}
+
 fn context_rewind_record_id_from_message(message: &str) -> Option<String> {
     message
         .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | ')' | '('))
@@ -2614,7 +2635,6 @@ pub fn spawn_event_listener(
                     | AppEvent::CodexThreadActionRequested { .. }
                     | AppEvent::ExternalFollowUpRequested { .. }
                     | AppEvent::SessionRelationship { .. }
-                    | AppEvent::SessionCapabilities { .. }
                     | AppEvent::SessionGoal { .. }
                     | AppEvent::SessionRenameResult { .. }
                     | AppEvent::GeminiConfigChanged { .. }
@@ -2629,6 +2649,15 @@ pub fn spawn_event_listener(
                             if !s.is_active_codex_session() {
                                 s.codex_managed_context = s.configured_codex_managed_context;
                             }
+                            resource_changed = Some("intendant://status");
+                        }
+                    }
+                    AppEvent::SessionCapabilities {
+                        ref session_id,
+                        ref capabilities,
+                    } => {
+                        if apply_session_capabilities_to_mcp_state(&mut s, session_id, capabilities)
+                        {
                             resource_changed = Some("intendant://status");
                         }
                     }
@@ -3411,6 +3440,10 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             }
             true
         }
+        AppEvent::SessionCapabilities {
+            session_id,
+            capabilities,
+        } => apply_session_capabilities_to_mcp_state(s, session_id, capabilities),
         AppEvent::SessionStarted { session_id, task } => {
             s.session_id = session_id.clone();
             s.task_description = task.clone().unwrap_or_default();
@@ -6925,6 +6958,62 @@ mod tests {
 
         assert_eq!(s.active_session_source.as_deref(), Some("codex"));
         assert!(s.rewind_only_gate_message("execute_cu_actions").is_some());
+    }
+
+    #[test]
+    fn observed_session_capabilities_follow_codex_backend_identity() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::SessionCapabilities {
+                session_id: "intendant-session".to_string(),
+                capabilities: crate::types::SessionCapabilities {
+                    follow_up: true,
+                    steer: true,
+                    interrupt: true,
+                    codex_thread_actions: vec!["undo".to_string()],
+                    codex_managed_context: Some("managed".to_string()),
+                },
+            },
+        );
+        assert_eq!(
+            s.session_codex_managed_context
+                .get("intendant-session")
+                .copied(),
+            Some(true)
+        );
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::SessionIdentity {
+                session_id: "intendant-session".to_string(),
+                source: "codex".to_string(),
+                backend_session_id: "codex-thread".to_string(),
+            },
+        );
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::SessionStarted {
+                session_id: "codex-thread".to_string(),
+                task: Some("managed dashboard e2e".to_string()),
+            },
+        );
+
+        assert_eq!(s.session_id, "codex-thread");
+        assert_eq!(s.active_session_source.as_deref(), Some("codex"));
+        assert!(s.codex_managed_context);
+        assert_eq!(
+            s.context_pressure_snapshot()
+                .pointer("/managed_context")
+                .and_then(serde_json::Value::as_str),
+            Some("managed")
+        );
     }
 
     #[test]

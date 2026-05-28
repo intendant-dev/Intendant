@@ -308,19 +308,32 @@ mod tests {
         let dir = tempdir().unwrap();
         persist_record(
             dir.path(),
-            &minimal_record("older", "2026-05-25T00:00:00Z", Some("session-a"), "thread-a"),
+            &minimal_record(
+                "older",
+                "2026-05-25T00:00:00Z",
+                Some("session-a"),
+                "thread-a",
+            ),
         )
         .unwrap();
         persist_record(
             dir.path(),
-            &minimal_record("newer", "2026-05-26T00:00:00Z", Some("session-a"), "thread-a"),
+            &minimal_record(
+                "newer",
+                "2026-05-26T00:00:00Z",
+                Some("session-a"),
+                "thread-a",
+            ),
         )
         .unwrap();
         fs::write(records_dir(dir.path()).join("invalid.json"), "{not json").unwrap();
         fs::write(records_dir(dir.path()).join("ignored.txt"), "{}").unwrap();
 
         let records = list_records(dir.path()).unwrap();
-        let ids: Vec<_> = records.iter().map(|record| record.record_id.as_str()).collect();
+        let ids: Vec<_> = records
+            .iter()
+            .map(|record| record.record_id.as_str())
+            .collect();
         assert_eq!(ids, vec!["newer", "older"]);
     }
 

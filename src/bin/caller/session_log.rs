@@ -4464,6 +4464,7 @@ mod tests {
                 steer: false,
                 interrupt: false,
                 codex_thread_actions: vec![],
+                codex_managed_context: Some("managed".to_string()),
             },
         );
         log.session_goal(
@@ -4528,6 +4529,10 @@ mod tests {
                 assert!(!capabilities.steer);
                 assert!(!capabilities.interrupt);
                 assert!(capabilities.codex_thread_actions.is_empty());
+                assert_eq!(
+                    capabilities.codex_managed_context.as_deref(),
+                    Some("managed")
+                );
             }
             other => panic!("expected SessionCapabilities, got {:?}", other),
         }

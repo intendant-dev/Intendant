@@ -12066,10 +12066,9 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let response = match session_log.as_ref() {
                             Some(log) => match log.lock() {
-                                Ok(log) => managed_context_records_response(
-                                    &request_line,
-                                    log.dir(),
-                                ),
+                                Ok(log) => {
+                                    managed_context_records_response(&request_line, log.dir())
+                                }
                                 Err(_) => json_error(
                                     "500 Internal Server Error",
                                     "session log lock poisoned",

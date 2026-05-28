@@ -2774,6 +2774,7 @@ fn emit_codex_subagent_started(
             steer: false,
             interrupt: false,
             codex_thread_actions: Vec::new(),
+            codex_managed_context: None,
         },
     });
     config.bus.send(AppEvent::SessionStarted {
@@ -12530,6 +12531,36 @@ async fn run_external_agent_mode(
     let resumed_external_session = resume_session.clone();
     let persist_model_responses_inline = control_session_id.is_some();
     let intendant_session_id = control_session_id.or_else(|| session_log_id(&session_log));
+    if backend == external_agent::AgentBackend::Codex {
+        if let Some(session_id) = intendant_session_id.as_deref() {
+            let mode = project::normalize_codex_managed_context(
+                &project.config.agent.codex.managed_context,
+            );
+            bus.send(AppEvent::SessionCapabilities {
+                session_id: session_id.to_string(),
+                capabilities: types::SessionCapabilities {
+                    follow_up: true,
+                    steer: true,
+                    interrupt: true,
+                    codex_thread_actions: vec![
+                        "compact".to_string(),
+                        "fork".to_string(),
+                        "side".to_string(),
+                        "undo".to_string(),
+                        "review".to_string(),
+                        "rename".to_string(),
+                        "goal".to_string(),
+                        "goal-set".to_string(),
+                        "goal-clear".to_string(),
+                        "goal-pause".to_string(),
+                        "goal-resume".to_string(),
+                        "memory-reset".to_string(),
+                    ],
+                    codex_managed_context: Some(mode),
+                },
+            });
+        }
+    }
     let (mut agent, thread, mut event_rx) = match create_external_agent(
         &backend,
         &project,
