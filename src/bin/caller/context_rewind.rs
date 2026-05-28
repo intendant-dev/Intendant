@@ -74,6 +74,31 @@ pub fn read_record(log_dir: &Path, record_id: &str) -> io::Result<ContextRewindR
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 
+pub fn list_records(log_dir: &Path) -> io::Result<Vec<ContextRewindRecord>> {
+    let dir = records_dir(log_dir);
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut records: Vec<ContextRewindRecord> = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        match fs::read(&path)
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(io::Error::other))
+        {
+            Ok(record) => records.push(record),
+            Err(_) => continue,
+        }
+    }
+    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(records)
+}
+
 pub fn copy_recovery_rollout(
     log_dir: &Path,
     record_id: &str,
@@ -169,6 +194,33 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn minimal_record(
+        record_id: &str,
+        created_at: &str,
+        session_id: Option<&str>,
+        thread_id: &str,
+    ) -> ContextRewindRecord {
+        ContextRewindRecord {
+            record_id: record_id.to_string(),
+            created_at: created_at.to_string(),
+            session_id: session_id.map(str::to_string),
+            thread_id: thread_id.to_string(),
+            item_id: "call-1".to_string(),
+            position: "after".to_string(),
+            reason: Some("trim noisy output".to_string()),
+            primer: Some("keep this".to_string()),
+            preserve: vec!["fact".to_string()],
+            discard: vec!["noise".to_string()],
+            artifacts: vec!["log.txt".to_string()],
+            next_steps: vec!["continue".to_string()],
+            source_rollout_path: None,
+            recovery_rollout_path: None,
+            fission_snapshot: None,
+            lineage_ledger: None,
+            fission_ledger: None,
+        }
+    }
+
     #[test]
     fn persist_and_read_context_rewind_record() {
         let dir = tempdir().unwrap();
@@ -249,6 +301,33 @@ mod tests {
 
         persist_record(dir.path(), &record).unwrap();
         assert_eq!(read_record(dir.path(), "rewind-1").unwrap(), record);
+    }
+
+    #[test]
+    fn list_records_returns_newest_first_and_skips_invalid_entries() {
+        let dir = tempdir().unwrap();
+        persist_record(
+            dir.path(),
+            &minimal_record("older", "2026-05-25T00:00:00Z", Some("session-a"), "thread-a"),
+        )
+        .unwrap();
+        persist_record(
+            dir.path(),
+            &minimal_record("newer", "2026-05-26T00:00:00Z", Some("session-a"), "thread-a"),
+        )
+        .unwrap();
+        fs::write(records_dir(dir.path()).join("invalid.json"), "{not json").unwrap();
+        fs::write(records_dir(dir.path()).join("ignored.txt"), "{}").unwrap();
+
+        let records = list_records(dir.path()).unwrap();
+        let ids: Vec<_> = records.iter().map(|record| record.record_id.as_str()).collect();
+        assert_eq!(ids, vec!["newer", "older"]);
+    }
+
+    #[test]
+    fn list_records_returns_empty_when_records_dir_is_missing() {
+        let dir = tempdir().unwrap();
+        assert!(list_records(dir.path()).unwrap().is_empty());
     }
 
     #[test]

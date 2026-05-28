@@ -2670,6 +2670,7 @@ mod tests {
             session_id: None,
             turn: 3,
             commands_preview: "ls -la".into(),
+            item_id: None,
             source: None,
         });
         let start_id = started
@@ -2767,6 +2768,7 @@ mod tests {
             session_id: None,
             turn: 3,
             commands_preview: "ls -la".into(),
+            item_id: None,
             source: None,
         });
         let start_id = started
@@ -2819,6 +2821,7 @@ mod tests {
                 session_id: None,
                 turn: 4,
                 commands_preview: "risky".into(),
+                item_id: None,
                 source: None,
             });
             let out = u.upcast(&AppEvent::TaskComplete {
@@ -2869,6 +2872,7 @@ mod tests {
             session_id: None,
             turn: 4,
             commands_preview: "risky".into(),
+            item_id: None,
             source: None,
         });
         let out = u.upcast(&OutboundEvent::TaskComplete {

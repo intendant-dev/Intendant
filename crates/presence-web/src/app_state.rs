@@ -28,6 +28,8 @@ pub enum UiCommand {
         kind: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
         #[serde(default)]
         collapsible: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -936,6 +938,7 @@ struct LogEntry {
     session_id: Option<String>,
     kind: Option<String>,
     output_id: Option<String>,
+    item_id: Option<String>,
     collapsible: bool,
     turn: Option<u64>,
     user_turn_index: Option<u32>,
@@ -1091,6 +1094,7 @@ impl AppState {
                 session_id: entry.session_id.clone(),
                 kind: entry.kind.clone(),
                 output_id: entry.output_id.clone(),
+                item_id: entry.item_id.clone(),
                 collapsible: entry.collapsible,
                 turn: None, // separator already handled
                 user_turn_index: entry.user_turn_index,
@@ -1389,10 +1393,24 @@ impl AppState {
             "agent_started" => {
                 let preview = msg["commands_preview"].as_str().unwrap_or("");
                 let source = msg["source"].as_str().unwrap_or("agent");
+                let item_id = msg["item_id"].as_str().map(str::to_string);
                 if !self.known_displays.is_empty() {
                     cmds.extend(self.add_log("detail", "Running on display", None, source));
                 }
-                cmds.extend(self.add_log("agent", preview, None, source));
+                cmds.extend(self.add_log_with_metadata(
+                    "agent",
+                    preview,
+                    None,
+                    source,
+                    Vec::new(),
+                    None,
+                    None,
+                    item_id,
+                    None,
+                    None,
+                    false,
+                    None,
+                ));
                 if current_session_event {
                     cmds.push(UiCommand::SetPhase {
                         phase: "running".into(),
@@ -1418,6 +1436,7 @@ impl AppState {
                                 output_id.clone(),
                                 None,
                                 None,
+                                None,
                                 false,
                                 None,
                             ));
@@ -1434,6 +1453,7 @@ impl AppState {
                             Vec::new(),
                             Some("agent_output"),
                             output_id.clone(),
+                            None,
                             None,
                             None,
                             false,
@@ -2245,6 +2265,7 @@ impl AppState {
                     Vec::new(),
                     kind,
                     None,
+                    None,
                     user_turn_index,
                     user_turn_revision,
                     superseded,
@@ -2293,6 +2314,7 @@ impl AppState {
                     "system",
                     Vec::new(),
                     Some("rollback_marker"),
+                    None,
                     None,
                     None,
                     None,
@@ -2579,7 +2601,7 @@ impl AppState {
         images: Vec<String>,
     ) -> Vec<UiCommand> {
         self.add_log_with_metadata(
-            level, content, turn, source, images, None, None, None, None, false, None,
+            level, content, turn, source, images, None, None, None, None, None, false, None,
         )
     }
 
@@ -2592,6 +2614,7 @@ impl AppState {
         images: Vec<String>,
         kind: Option<&str>,
         output_id: Option<String>,
+        item_id: Option<String>,
         user_turn_index: Option<u32>,
         user_turn_revision: Option<u32>,
         superseded: bool,
@@ -2626,6 +2649,7 @@ impl AppState {
             content: buffered_content,
             kind: kind_string.clone(),
             output_id: output_id.clone(),
+            item_id: item_id.clone(),
             collapsible: is_collapsible,
             turn,
             user_turn_index,
@@ -2657,6 +2681,7 @@ impl AppState {
             session_id: self.event_session_id.clone(),
             kind: kind_string,
             output_id,
+            item_id,
             collapsible: is_collapsible,
             turn: None, // separator already emitted
             user_turn_index,
@@ -4389,6 +4414,7 @@ mod tests {
             session_id: None,
             kind: None,
             output_id: None,
+            item_id: None,
             collapsible: false,
             turn: None,
             user_turn_index: None,

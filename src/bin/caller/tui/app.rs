@@ -3672,6 +3672,7 @@ mod tests {
             session_id: None,
             turn: 1,
             commands_preview: "ls".to_string(),
+            item_id: None,
             source: None,
         });
         assert_eq!(

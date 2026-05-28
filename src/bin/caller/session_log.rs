@@ -1285,6 +1285,7 @@ impl SessionLog {
         session_id: Option<&str>,
         turn: usize,
         commands_preview: &str,
+        item_id: Option<&str>,
         source: Option<&str>,
     ) {
         let mut data = serde_json::Map::new();
@@ -1292,6 +1293,12 @@ impl SessionLog {
             data.insert(
                 "session_id".to_string(),
                 serde_json::Value::String(session_id.to_string()),
+            );
+        }
+        if let Some(item_id) = item_id.map(str::trim).filter(|s| !s.is_empty()) {
+            data.insert(
+                "item_id".to_string(),
+                serde_json::Value::String(item_id.to_string()),
             );
         }
         if let Some(source) = source.map(str::trim).filter(|s| !s.is_empty()) {
@@ -2743,10 +2750,15 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|d| d.get("source"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            let item_id = data
+                .and_then(|d| d.get("item_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             Some(AppEvent::AgentStarted {
                 session_id,
                 turn: turn.unwrap_or(0),
                 commands_preview,
+                item_id,
                 source,
             })
         }
@@ -4728,7 +4740,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
-        log.agent_started_with_session_id(Some("session-1"), 7, "exec: echo hi", Some("Codex"));
+        log.agent_started_with_session_id(
+            Some("session-1"),
+            7,
+            "exec: echo hi",
+            Some("call-1"),
+            Some("Codex"),
+        );
         drop(log);
 
         let entry = read_last_event(&log_dir, "agent_started");
@@ -4737,6 +4755,7 @@ mod tests {
             data.get("session_id").and_then(|v| v.as_str()),
             Some("session-1")
         );
+        assert_eq!(data.get("item_id").and_then(|v| v.as_str()), Some("call-1"));
         assert_eq!(data.get("source").and_then(|v| v.as_str()), Some("Codex"));
 
         match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
@@ -4744,11 +4763,13 @@ mod tests {
                 session_id,
                 turn,
                 commands_preview,
+                item_id,
                 source,
             } => {
                 assert_eq!(session_id.as_deref(), Some("session-1"));
                 assert_eq!(turn, 7);
                 assert_eq!(commands_preview, "exec: echo hi");
+                assert_eq!(item_id.as_deref(), Some("call-1"));
                 assert_eq!(source.as_deref(), Some("Codex"));
             }
             other => panic!("expected AgentStarted, got {:?}", other),

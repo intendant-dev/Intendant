@@ -163,6 +163,7 @@ pub enum AppEvent {
         session_id: Option<String>,
         turn: usize,
         commands_preview: String,
+        item_id: Option<String>,
         source: Option<String>,
     },
     AgentOutput {
@@ -1426,11 +1427,13 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id,
             turn,
             commands_preview,
+            item_id,
             source,
         } => Some(OutboundEvent::AgentStarted {
             session_id: session_id.clone(),
             turn: *turn,
             commands_preview: commands_preview.clone(),
+            item_id: item_id.clone(),
             source: source.clone(),
         }),
         AppEvent::AgentOutput {
@@ -2084,12 +2087,14 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             session_id,
             turn,
             commands_preview,
+            item_id,
             source,
         } => {
             log.agent_started_with_session_id(
                 session_id.as_deref(),
                 *turn,
                 commands_preview,
+                item_id.as_deref(),
                 source.as_deref(),
             );
         }
@@ -2513,6 +2518,34 @@ mod tests {
                 _ => panic!("expected Quit"),
             }
         });
+    }
+
+    #[test]
+    fn outbound_agent_started_preserves_item_id() {
+        let event = AppEvent::AgentStarted {
+            session_id: Some("session-1".to_string()),
+            turn: 3,
+            commands_preview: "exec: pwd".to_string(),
+            item_id: Some("call-abc".to_string()),
+            source: Some("Codex".to_string()),
+        };
+
+        match app_event_to_outbound(&event).unwrap() {
+            crate::types::OutboundEvent::AgentStarted {
+                session_id,
+                turn,
+                commands_preview,
+                item_id,
+                source,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("session-1"));
+                assert_eq!(turn, 3);
+                assert_eq!(commands_preview, "exec: pwd");
+                assert_eq!(item_id.as_deref(), Some("call-abc"));
+                assert_eq!(source.as_deref(), Some("Codex"));
+            }
+            other => panic!("expected AgentStarted, got {:?}", other),
+        }
     }
 
     #[test]

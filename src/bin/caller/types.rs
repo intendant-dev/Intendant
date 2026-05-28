@@ -418,6 +418,8 @@ pub enum OutboundEvent {
         session_id: Option<String>,
         turn: usize,
         commands_preview: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
         /// When set, overrides the default "agent"/"Run" source label (e.g. "Codex").
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,

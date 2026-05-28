@@ -6635,6 +6635,40 @@ fn json_error(status: &str, message: impl AsRef<str>) -> String {
     )
 }
 
+fn request_query_param(request_line: &str, key: &str) -> Option<String> {
+    let path = request_line.split_whitespace().nth(1)?;
+    let query = path.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == key && !v.trim().is_empty() {
+            return Some(percent_decode_query_value(v));
+        }
+    }
+    None
+}
+
+fn managed_context_records_response(request_line: &str, log_dir: &Path) -> String {
+    let session_id = request_query_param(request_line, "session_id")
+        .or_else(|| request_query_param(request_line, "session"))
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
+    match crate::context_rewind::list_records(log_dir) {
+        Ok(mut records) => {
+            if let Some(session_id) = session_id.as_deref() {
+                records.retain(|record| {
+                    record.thread_id == session_id
+                        || record.session_id.as_deref() == Some(session_id)
+                });
+            }
+            json_ok(serde_json::json!({ "records": records }))
+        }
+        Err(err) => json_error(
+            "500 Internal Server Error",
+            format!("failed to read managed-context records: {err}"),
+        ),
+    }
+}
+
 fn effective_upload_destination(
     requested: crate::upload_store::UploadDestination,
     has_active_session: bool,
@@ -12027,6 +12061,27 @@ pub fn spawn_web_gateway(
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/managed-context/records")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let response = match session_log.as_ref() {
+                            Some(log) => match log.lock() {
+                                Ok(log) => managed_context_records_response(
+                                    &request_line,
+                                    log.dir(),
+                                ),
+                                Err(_) => json_error(
+                                    "500 Internal Server Error",
+                                    "session log lock poisoned",
+                                ),
+                            },
+                            None => json_error(
+                                "404 Not Found",
+                                "managed-context records need an active session log",
+                            ),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET")
                         && request_line.contains("/api/session/current/changes")
                     {
                         // File change tracking endpoints:
@@ -14899,6 +14954,112 @@ mod tests {
             effective_upload_destination(crate::upload_store::UploadDestination::Task, true,),
             crate::upload_store::UploadDestination::Task
         );
+    }
+
+    fn response_json_body(response: &str) -> serde_json::Value {
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("response body");
+        serde_json::from_str(body).expect("json response")
+    }
+
+    fn managed_context_test_record(
+        record_id: &str,
+        session_id: Option<&str>,
+        thread_id: &str,
+        created_at: &str,
+    ) -> crate::context_rewind::ContextRewindRecord {
+        crate::context_rewind::ContextRewindRecord {
+            record_id: record_id.to_string(),
+            created_at: created_at.to_string(),
+            session_id: session_id.map(str::to_string),
+            thread_id: thread_id.to_string(),
+            item_id: "call-1".to_string(),
+            position: "after".to_string(),
+            reason: Some("crystallize branch".to_string()),
+            primer: Some("dense state".to_string()),
+            preserve: Vec::new(),
+            discard: Vec::new(),
+            artifacts: Vec::new(),
+            next_steps: Vec::new(),
+            source_rollout_path: None,
+            recovery_rollout_path: None,
+            fission_snapshot: None,
+            lineage_ledger: None,
+            fission_ledger: None,
+        }
+    }
+
+    #[test]
+    fn managed_context_records_response_filters_by_session_or_thread_id() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::context_rewind::persist_record(
+            dir.path(),
+            &managed_context_test_record(
+                "visible-by-session",
+                Some("dashboard session"),
+                "thread-a",
+                "2026-05-26T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        crate::context_rewind::persist_record(
+            dir.path(),
+            &managed_context_test_record(
+                "visible-by-thread",
+                Some("other-session"),
+                "dashboard session",
+                "2026-05-25T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        crate::context_rewind::persist_record(
+            dir.path(),
+            &managed_context_test_record(
+                "hidden",
+                Some("other-session"),
+                "other-thread",
+                "2026-05-24T00:00:00Z",
+            ),
+        )
+        .unwrap();
+
+        let response = managed_context_records_response(
+            "GET /api/managed-context/records?session_id=dashboard%20session HTTP/1.1",
+            dir.path(),
+        );
+        let body = response_json_body(&response);
+        let ids: Vec<_> = body["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["record_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["visible-by-session", "visible-by-thread"]);
+    }
+
+    #[test]
+    fn managed_context_records_response_accepts_session_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::context_rewind::persist_record(
+            dir.path(),
+            &managed_context_test_record(
+                "visible",
+                Some("session-a"),
+                "thread-a",
+                "2026-05-26T00:00:00Z",
+            ),
+        )
+        .unwrap();
+
+        let response = managed_context_records_response(
+            "GET /api/managed-context/records?session=session-a HTTP/1.1",
+            dir.path(),
+        );
+        let body = response_json_body(&response);
+        assert_eq!(body["records"].as_array().unwrap().len(), 1);
+        assert_eq!(body["records"][0]["record_id"], "visible");
     }
 
     #[test]

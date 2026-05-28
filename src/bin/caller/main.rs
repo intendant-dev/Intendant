@@ -3436,7 +3436,9 @@ fn handle_idle_codex_subagent_event(
             });
         }
         external_agent::AgentEvent::ToolStarted {
-            tool_name, preview, ..
+            item_id,
+            tool_name,
+            preview,
         } => {
             let turn = stats
                 .codex_subagent_rounds
@@ -3447,6 +3449,7 @@ fn handle_idle_codex_subagent_event(
                 session_id,
                 turn: *turn,
                 commands_preview: format!("{tool_name}: {preview}"),
+                item_id: Some(item_id),
                 source: config.agent_source.clone(),
             });
         }
@@ -4355,6 +4358,7 @@ async fn drain_external_agent_events(
                                 &receiver_thread_ids,
                                 prompt_ref,
                             ),
+                            item_id: Some(item_id.clone()),
                             source: config.agent_source.clone(),
                         });
                     }
@@ -4436,7 +4440,7 @@ async fn drain_external_agent_events(
                 turns_in_round += 1;
                 if let Some(preview_text) = external_tool_preview_text(&tool_name, &preview) {
                     if !item_id.is_empty() {
-                        tool_previews.insert(item_id, preview_text);
+                        tool_previews.insert(item_id.clone(), preview_text);
                     }
                 }
                 if !config.suppress_agent_started {
@@ -4446,6 +4450,7 @@ async fn drain_external_agent_events(
                         session_id: config.session_id.clone(),
                         turn: stats.turns,
                         commands_preview: preview_text,
+                        item_id: Some(item_id.clone()),
                         source: config.agent_source.clone(),
                     });
                 }
@@ -9640,6 +9645,7 @@ async fn run_agent_loop(
                 session_id: local_session_id.clone(),
                 turn,
                 commands_preview: preview.clone(),
+                item_id: None,
                 source: None,
             });
 
@@ -10064,6 +10070,7 @@ Proceed with explicit assumptions and continue without additional questions."
                 session_id: local_session_id.clone(),
                 turn,
                 commands_preview: preview.clone(),
+                item_id: None,
                 source: None,
             });
 

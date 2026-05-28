@@ -4775,6 +4775,256 @@ html, body {
   to { transform: translateX(0); opacity: 1; }
 }
 
+/* ── Managed context sub-tab ── */
+.managed-context-pane {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 14px 16px 20px;
+  color: var(--text);
+}
+.managed-context-shell {
+  max-width: 1120px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+.managed-context-toolbar,
+.managed-context-card {
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--mantle);
+}
+.managed-context-toolbar {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 12px;
+}
+.managed-context-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 180px;
+  flex: 1;
+}
+.managed-context-field.short {
+  flex: 0 0 132px;
+  min-width: 112px;
+}
+.managed-context-field.wide {
+  min-width: min(100%, 420px);
+}
+.managed-context-field span,
+.managed-context-card h3,
+.managed-context-card h4 {
+  font-size: 11px;
+  color: var(--overlay1);
+  font-weight: 600;
+  text-transform: uppercase;
+  margin: 0;
+}
+.managed-context-field input,
+.managed-context-field select,
+.managed-context-field textarea,
+.managed-context-action-input {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.managed-context-field textarea {
+  min-height: 76px;
+  resize: vertical;
+  line-height: 1.45;
+}
+.managed-context-btn,
+.log-anchor-btn {
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.managed-context-btn {
+  padding: 6px 10px;
+}
+.managed-context-btn.primary {
+  border-color: var(--blue);
+  color: var(--blue);
+}
+.managed-context-btn.danger {
+  border-color: var(--red);
+  color: var(--red);
+}
+.managed-context-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.managed-context-btn:hover:not(:disabled),
+.log-anchor-btn:hover {
+  background: var(--surface1);
+}
+.managed-context-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+.managed-context-stat {
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  padding: 10px;
+  background: var(--surface0);
+  min-height: 76px;
+}
+.managed-context-stat .label {
+  color: var(--overlay1);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+.managed-context-stat .value {
+  margin-top: 6px;
+  color: var(--text);
+  font-size: 20px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.managed-context-stat.ok .value { color: var(--green); }
+.managed-context-stat.high .value { color: var(--yellow); }
+.managed-context-stat.critical .value,
+.managed-context-stat.vanilla .value { color: var(--red); }
+.managed-context-pressure-track {
+  height: 8px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  overflow: hidden;
+  margin-top: 8px;
+}
+.managed-context-pressure-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--green);
+}
+.managed-context-card {
+  padding: 12px;
+}
+.managed-context-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.managed-context-card-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(260px, 0.85fr);
+  gap: 12px;
+}
+.managed-context-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.managed-context-form-grid .full {
+  grid-column: 1 / -1;
+}
+.managed-context-inline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.managed-context-muted {
+  color: var(--overlay0);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.managed-context-alert {
+  border: 1px solid rgba(249, 226, 175, 0.45);
+  background: rgba(249, 226, 175, 0.10);
+  color: var(--yellow);
+  border-radius: 6px;
+  padding: 9px 10px;
+  font-size: 12px;
+}
+.managed-context-alert.error {
+  border-color: rgba(243, 139, 168, 0.55);
+  background: rgba(243, 139, 168, 0.10);
+  color: var(--red);
+}
+.managed-context-anchor-list,
+.managed-context-record-list,
+.managed-context-ledger-list {
+  display: grid;
+  gap: 6px;
+}
+.managed-context-anchor-item,
+.managed-context-record-item,
+.managed-context-ledger-item {
+  border: 1px solid var(--surface1);
+  border-radius: 5px;
+  background: var(--surface0);
+  padding: 8px;
+  font-size: 12px;
+}
+.managed-context-anchor-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+.managed-context-anchor-id,
+.managed-context-record-id {
+  font-family: var(--font-mono);
+  color: var(--blue);
+  overflow-wrap: anywhere;
+}
+.managed-context-record-item.selected {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 1px rgba(137, 180, 250, 0.25);
+}
+.managed-context-record-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--overlay1);
+  margin-top: 4px;
+}
+.managed-context-raw {
+  max-height: 280px;
+  overflow: auto;
+  padding: 8px;
+  background: var(--crust);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  color: var(--subtext1);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+}
+.log-anchor-btn {
+  padding: 2px 6px;
+  margin-left: 6px;
+  color: var(--blue);
+  font-size: 11px;
+}
+@media (max-width: 920px) {
+  .managed-context-grid,
+  .managed-context-card-grid,
+  .managed-context-form-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .terminal-container {
   flex: 1;
   position: relative;
@@ -6226,6 +6476,7 @@ html, body {
       <div class="subtabs" id="activity-subtabs">
         <button class="subtab-btn active" data-activity-tab="log">Log</button>
         <button class="subtab-btn" data-activity-tab="context">Context</button>
+        <button class="subtab-btn" data-activity-tab="managed">Managed</button>
         <button class="subtab-btn" data-activity-tab="changes">
           Changes <span class="badge" id="badge-changes" style="display:none"></span>
         </button>
@@ -6328,6 +6579,133 @@ html, body {
               <span class="context-meta"><strong>Format</strong><span id="context-format">--</span></span>
             </div>
             <pre class="context-raw" id="context-raw">No context snapshot yet</pre>
+          </div>
+        </div>
+        <div class="subtab-pane" id="activity-managed-pane">
+          <div class="managed-context-pane">
+            <div class="managed-context-shell">
+              <div class="managed-context-toolbar">
+                <label class="managed-context-field wide" for="managed-context-session">
+                  <span>Codex session</span>
+                  <select id="managed-context-session"></select>
+                </label>
+                <label class="managed-context-field short" for="managed-context-position">
+                  <span>Anchor side</span>
+                  <select id="managed-context-position">
+                    <option value="after">after</option>
+                    <option value="before">before</option>
+                  </select>
+                </label>
+                <button type="button" class="managed-context-btn" id="managed-context-use-target">Use target</button>
+                <button type="button" class="managed-context-btn" id="managed-context-refresh">Refresh</button>
+              </div>
+
+              <div class="managed-context-card">
+                <div class="managed-context-card-header">
+                  <h3>Density</h3>
+                  <span class="managed-context-muted" id="managed-context-updated">--</span>
+                </div>
+                <div class="managed-context-grid" id="managed-context-stats"></div>
+                <div class="managed-context-pressure-track">
+                  <div class="managed-context-pressure-fill" id="managed-context-pressure-fill"></div>
+                </div>
+                <div id="managed-context-alerts" style="margin-top:10px"></div>
+              </div>
+
+              <div class="managed-context-card managed-context-card-grid">
+                <div>
+                  <div class="managed-context-card-header">
+                    <h3>Rewind</h3>
+                    <button type="button" class="managed-context-btn primary" id="managed-context-submit-rewind">Dispatch rewind</button>
+                  </div>
+                  <div class="managed-context-form-grid">
+                    <label class="managed-context-field full" for="managed-context-anchor">
+                      <span>Exact item anchor</span>
+                      <input id="managed-context-anchor" type="text" autocomplete="off" spellcheck="false" placeholder="call_id or response item id">
+                    </label>
+                    <label class="managed-context-field full" for="managed-context-reason">
+                      <span>Reason</span>
+                      <input id="managed-context-reason" type="text" autocomplete="off" spellcheck="true" placeholder="why this branch should be crystallized">
+                    </label>
+                    <label class="managed-context-field full" for="managed-context-primer">
+                      <span>Carry-forward primer</span>
+                      <textarea id="managed-context-primer" spellcheck="true" placeholder="dense facts, decisions, constraints, current state"></textarea>
+                    </label>
+                    <label class="managed-context-field" for="managed-context-preserve">
+                      <span>Preserve</span>
+                      <textarea id="managed-context-preserve" placeholder="one durable fact per line"></textarea>
+                    </label>
+                    <label class="managed-context-field" for="managed-context-discard">
+                      <span>Discard</span>
+                      <textarea id="managed-context-discard" placeholder="noise, failed branches, obsolete assumptions"></textarea>
+                    </label>
+                    <label class="managed-context-field" for="managed-context-artifacts">
+                      <span>Artifacts</span>
+                      <textarea id="managed-context-artifacts" placeholder="files, commits, outputs to keep"></textarea>
+                    </label>
+                    <label class="managed-context-field" for="managed-context-next-steps">
+                      <span>Next steps</span>
+                      <textarea id="managed-context-next-steps" placeholder="immediate continuation steps"></textarea>
+                    </label>
+                  </div>
+                </div>
+                <div>
+                  <div class="managed-context-card-header">
+                    <h3>Recent anchors</h3>
+                    <button type="button" class="managed-context-btn" id="managed-context-clear-anchor">Clear</button>
+                  </div>
+                  <div class="managed-context-anchor-list" id="managed-context-anchors"></div>
+                </div>
+              </div>
+
+              <div class="managed-context-card managed-context-card-grid">
+                <div>
+                  <div class="managed-context-card-header">
+                    <h3>Records</h3>
+                    <button type="button" class="managed-context-btn" id="managed-context-refresh-records">Reload</button>
+                  </div>
+                  <div class="managed-context-record-list" id="managed-context-records"></div>
+                </div>
+                <div>
+                  <div class="managed-context-card-header">
+                    <h3>Backout</h3>
+                    <button type="button" class="managed-context-btn primary" id="managed-context-submit-backout">Run</button>
+                  </div>
+                  <div class="managed-context-form-grid">
+                    <label class="managed-context-field full" for="managed-context-record-id">
+                      <span>Record id</span>
+                      <input id="managed-context-record-id" type="text" autocomplete="off" spellcheck="false">
+                    </label>
+                    <label class="managed-context-field" for="managed-context-backout-mode">
+                      <span>Mode</span>
+                      <select id="managed-context-backout-mode">
+                        <option value="inspect">inspect</option>
+                        <option value="restore">restore</option>
+                        <option value="fork">fork</option>
+                        <option value="backout">backout</option>
+                      </select>
+                    </label>
+                    <label class="managed-context-field" for="managed-context-backout-name">
+                      <span>Fork name</span>
+                      <input id="managed-context-backout-name" type="text" autocomplete="off" spellcheck="false">
+                    </label>
+                    <label class="managed-context-inline full">
+                      <input id="managed-context-allow-cache-reset" type="checkbox">
+                      <span class="managed-context-muted">allow cache-reset fork</span>
+                    </label>
+                  </div>
+                  <pre class="managed-context-raw" id="managed-context-action-result">No action yet</pre>
+                </div>
+              </div>
+
+              <div class="managed-context-card">
+                <div class="managed-context-card-header">
+                  <h3>Lineage and fission</h3>
+                  <button type="button" class="managed-context-btn" id="managed-context-copy-status">Copy status JSON</button>
+                </div>
+                <div class="managed-context-ledger-list" id="managed-context-ledgers"></div>
+              </div>
+            </div>
           </div>
         </div>
         <div class="subtab-pane" id="activity-changes-pane">
@@ -8979,12 +9357,16 @@ function processCommands(cmds) {
         if (isStatsShowingSelf()) renderUsageTab(c);
         updateTickerFromUsage(c);
         renderForegroundSessionUsage();
+        scheduleManagedContextRefresh(700);
         break;
       case 'add_display': addDisplaySlot(c.display_id, c.width, c.height); break;
       case 'add_recording': addRecordingStream(c.stream_name); break;
       case 'remove_recording': removeRecordingStream(c.stream_name); break;
       case 'recording_error': /* logged via add_log_entry */ break;
-      case 'session_started': onSessionStarted(c.session_id, c.task); break;
+      case 'session_started':
+        onSessionStarted(c.session_id, c.task);
+        scheduleManagedContextRefresh(400);
+        break;
       case 'session_relationship': applySessionRelationship(c); break;
       case 'session_capabilities': applySessionCapabilities(c); break;
       case 'session_goal': applySessionGoal(c); break;
@@ -9026,6 +9408,7 @@ function processCommands(cmds) {
         break;
       case 'codex_thread_action_result':
         handleCodexThreadActionResult(c);
+        scheduleManagedContextRefresh(700);
         break;
       case 'session_rename_result':
         handleSessionRenameResult(c);
@@ -10599,6 +10982,555 @@ if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', wireControlPaneListeners);
 } else {
   wireControlPaneListeners();
+}
+
+// ── Managed context dashboard ──
+let managedContextStatus = null;
+let managedContextRecords = [];
+let managedContextLastError = '';
+let managedContextRefreshTimer = null;
+let managedContextRpcSeq = 1;
+
+function managedContextEl(id) {
+  return document.getElementById(id);
+}
+
+function managedContextModeFromStatus() {
+  return managedContextStatus?.context_pressure?.managed_context || 'unknown';
+}
+
+function managedContextCurrentSessionId() {
+  const sel = managedContextEl('managed-context-session');
+  return String(sel?.value || '').trim();
+}
+
+function managedContextSessionMeta(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return {};
+  return sessionMetadataById.get(sid) || _cachedSessions.find(s => s.session_id === sid) || {};
+}
+
+function managedContextIsCodexLike(meta = {}) {
+  const source = normalizeAgentId(meta.source || meta.source_label || meta.sourceLabel || '');
+  if (source === 'codex') return true;
+  const label = String(meta.source || meta.source_label || meta.sourceLabel || '').toLowerCase();
+  if (label.includes('codex')) return true;
+  const actions = meta.capabilities?.codex_thread_actions || [];
+  return Array.isArray(actions) && actions.length > 0;
+}
+
+function managedContextSessionLabel(sessionId, meta = {}) {
+  const sid = String(sessionId || '').trim();
+  const name = compactSessionText(meta.name) || compactSessionText(meta.task);
+  const source = meta.source_label || meta.sourceLabel || meta.source || '';
+  const prefix = name ? `${name} ` : '';
+  const suffix = source ? ` · ${source}` : '';
+  return `${prefix}${shortSessionId(sid)}${suffix}`;
+}
+
+function managedContextAddSessionOption(map, sessionId, meta = {}, preferred = false) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const existing = map.get(sid) || {};
+  map.set(sid, {
+    ...existing,
+    ...meta,
+    preferred: preferred || existing.preferred || false,
+  });
+}
+
+function managedContextSessionOptions() {
+  const options = new Map();
+  const target = resolvePromptTargetSessionId();
+  if (target) {
+    managedContextAddSessionOption(
+      options,
+      target,
+      managedContextSessionMeta(target),
+      true
+    );
+  }
+  for (const [sid, win] of sessionWindows) {
+    const meta = sessionMetadataById.get(sid) || {};
+    if (managedContextIsCodexLike(meta) || sid === target || win?.source === 'Codex') {
+      managedContextAddSessionOption(options, sid, meta, sid === target);
+    }
+  }
+  for (const [sid, meta] of sessionMetadataById) {
+    if (managedContextIsCodexLike(meta) || sid === target) {
+      managedContextAddSessionOption(options, sid, meta, sid === target);
+    }
+  }
+  for (const session of _cachedSessions || []) {
+    if (normalizeAgentId(session.source) === 'codex' || session.session_id === target) {
+      managedContextAddSessionOption(options, session.session_id, session, session.session_id === target);
+    }
+  }
+  return Array.from(options.entries()).sort((a, b) => {
+    const pa = a[1].preferred ? 1 : 0;
+    const pb = b[1].preferred ? 1 : 0;
+    if (pa !== pb) return pb - pa;
+    return managedContextSessionLabel(a[0], a[1]).localeCompare(
+      managedContextSessionLabel(b[0], b[1]),
+      undefined,
+      { sensitivity: 'base' }
+    );
+  });
+}
+
+function renderManagedContextSessionSelect() {
+  const sel = managedContextEl('managed-context-session');
+  if (!sel) return;
+  const previous = sel.value;
+  const options = managedContextSessionOptions();
+  sel.innerHTML = '';
+  if (!options.length) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'No Codex session';
+    sel.appendChild(opt);
+    return;
+  }
+  for (const [sid, meta] of options) {
+    const opt = document.createElement('option');
+    opt.value = sid;
+    opt.textContent = managedContextSessionLabel(sid, meta);
+    opt.title = sid;
+    sel.appendChild(opt);
+  }
+  if (previous && options.some(([sid]) => sid === previous)) {
+    sel.value = previous;
+  } else {
+    const preferred = options.find(([, meta]) => meta.preferred) || options[0];
+    sel.value = preferred[0];
+  }
+}
+
+function managedContextNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function managedContextFormatNumber(value) {
+  const n = managedContextNumber(value);
+  return n === null ? '--' : Math.round(n).toLocaleString();
+}
+
+function managedContextPercent(used, windowSize) {
+  const u = managedContextNumber(used);
+  const w = managedContextNumber(windowSize);
+  if (u === null || w === null || w <= 0) return null;
+  return Math.max(0, Math.min(999, (u / w) * 100));
+}
+
+function managedContextStat(label, value, cls = '') {
+  const el = document.createElement('div');
+  el.className = 'managed-context-stat' + (cls ? ' ' + cls : '');
+  el.innerHTML =
+    `<div class="label">${escapeHtml(label)}</div>` +
+    `<div class="value">${escapeHtml(value)}</div>`;
+  return el;
+}
+
+function renderManagedContextStats() {
+  const host = managedContextEl('managed-context-stats');
+  const fill = managedContextEl('managed-context-pressure-fill');
+  if (!host) return;
+  host.innerHTML = '';
+  const pressure = managedContextStatus?.context_pressure || {};
+  const status = pressure.status || 'unknown';
+  const mode = pressure.managed_context || 'unknown';
+  const used = pressure.used_tokens;
+  const windowSize = pressure.context_window;
+  const pct = managedContextPercent(used, windowSize);
+  host.appendChild(managedContextStat('Mode', mode, mode === 'managed' ? 'ok' : 'vanilla'));
+  host.appendChild(managedContextStat('Pressure', status, status));
+  host.appendChild(managedContextStat('Tokens', `${managedContextFormatNumber(used)} / ${managedContextFormatNumber(windowSize)}`, status));
+  host.appendChild(managedContextStat('Rewind-only', pressure.rewind_only ? 'on' : 'off', pressure.rewind_only ? 'critical' : 'ok'));
+  if (fill) {
+    fill.style.width = pct === null ? '0%' : Math.min(pct, 100).toFixed(1) + '%';
+    fill.style.background = status === 'critical'
+      ? 'var(--red)'
+      : status === 'high'
+        ? 'var(--yellow)'
+        : 'var(--green)';
+  }
+  const updated = managedContextEl('managed-context-updated');
+  if (updated) updated.textContent = managedContextStatus ? new Date().toLocaleTimeString() : '--';
+}
+
+function renderManagedContextAlerts() {
+  const host = managedContextEl('managed-context-alerts');
+  if (!host) return;
+  host.innerHTML = '';
+  if (managedContextLastError) {
+    const alert = document.createElement('div');
+    alert.className = 'managed-context-alert error';
+    alert.textContent = managedContextLastError;
+    host.appendChild(alert);
+    return;
+  }
+  const pressure = managedContextStatus?.context_pressure || {};
+  const mode = pressure.managed_context || 'unknown';
+  const sessionId = managedContextCurrentSessionId();
+  const meta = managedContextSessionMeta(sessionId);
+  if (sessionId && !managedContextIsCodexLike(meta)) {
+    const alert = document.createElement('div');
+    alert.className = 'managed-context-alert';
+    alert.textContent = 'Selected session is not reported as Codex.';
+    host.appendChild(alert);
+  }
+  if (mode !== 'managed') {
+    const alert = document.createElement('div');
+    alert.className = 'managed-context-alert';
+    alert.textContent = 'Managed actions are disabled for this session.';
+    host.appendChild(alert);
+  }
+  if (pressure.last_rewind_insufficient?.message) {
+    const alert = document.createElement('div');
+    alert.className = 'managed-context-alert error';
+    alert.textContent = pressure.last_rewind_insufficient.message;
+    host.appendChild(alert);
+  }
+  const command = controlCodexConfig.command || '';
+  if (mode === 'managed' && /(^|\/)codex$/.test(command) && !/target\/(debug|release)\/codex/.test(command)) {
+    const alert = document.createElement('div');
+    alert.className = 'managed-context-alert';
+    alert.textContent = `Codex command is ${command}; managed mode requires the patched app-server build.`;
+    host.appendChild(alert);
+  }
+}
+
+function renderManagedContextAnchors() {
+  const host = managedContextEl('managed-context-anchors');
+  if (!host) return;
+  const sid = managedContextCurrentSessionId();
+  const seen = new Set();
+  const entries = Array.from(document.querySelectorAll('.log-entry[data-item-id]'))
+    .filter(entry => !sid || entry.dataset.sessionId === sid || sessionWindowTargetForLogSession(entry.dataset.sessionId || '') === sid)
+    .reverse()
+    .slice(0, 18);
+  host.innerHTML = '';
+  for (const entry of entries) {
+    const itemId = entry.dataset.itemId;
+    if (!itemId || seen.has(itemId)) continue;
+    seen.add(itemId);
+    const row = document.createElement('div');
+    row.className = 'managed-context-anchor-item';
+    const content = compactSessionText(entry.querySelector('.log-content')?.textContent || entry.textContent || '');
+    row.innerHTML =
+      `<div><div class="managed-context-anchor-id">${escapeHtml(itemId)}</div>` +
+      `<div class="managed-context-muted">${escapeHtml(content || 'tool call')}</div></div>`;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'managed-context-btn';
+    btn.textContent = 'Use';
+    btn.addEventListener('click', () => fillManagedContextAnchor(itemId, entry.dataset.sessionId || sid));
+    row.appendChild(btn);
+    host.appendChild(row);
+  }
+  if (!host.childElementCount) {
+    host.innerHTML = '<div class="managed-context-muted">No item anchors in the visible log yet.</div>';
+  }
+}
+
+function fillManagedContextAnchor(itemId, sessionId = '') {
+  const anchor = managedContextEl('managed-context-anchor');
+  if (anchor) anchor.value = itemId || '';
+  const sid = String(sessionId || '').trim();
+  if (sid) {
+    renderManagedContextSessionSelect();
+    const sel = managedContextEl('managed-context-session');
+    if (sel && Array.from(sel.options).some(o => o.value === sid)) sel.value = sid;
+  }
+  showControlToast('info', 'Managed context anchor selected');
+}
+window.fillManagedContextAnchor = fillManagedContextAnchor;
+
+function managedContextSplitLines(id) {
+  return String(managedContextEl(id)?.value || '')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean);
+}
+
+async function managedContextMcpTool(name, args = {}) {
+  const sessionId = managedContextCurrentSessionId();
+  if (!sessionId) throw new Error('Select a Codex session first.');
+  const resp = await authedFetch(`/mcp?session_id=${encodeURIComponent(sessionId)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: managedContextRpcSeq++,
+      method: 'tools/call',
+      params: { name, arguments: args },
+    }),
+  });
+  const payload = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(payload.error?.message || `MCP HTTP ${resp.status}`);
+  if (payload.error) throw new Error(payload.error.message || 'MCP tool failed');
+  const result = payload.result || {};
+  const text = Array.isArray(result.content)
+    ? result.content.map(part => part.text || '').join('\n').trim()
+    : '';
+  if (result.isError) throw new Error(text || `${name} failed`);
+  return text;
+}
+
+async function fetchManagedContextStatus() {
+  const text = await managedContextMcpTool('get_status', {});
+  return JSON.parse(text || '{}');
+}
+
+async function fetchManagedContextRecords() {
+  const sessionId = managedContextCurrentSessionId();
+  if (!sessionId) return [];
+  const resp = await authedFetch(`/api/managed-context/records?session_id=${encodeURIComponent(sessionId)}`);
+  const payload = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(payload.error || `records HTTP ${resp.status}`);
+  return Array.isArray(payload.records) ? payload.records : [];
+}
+
+function scheduleManagedContextRefresh(delay = 500) {
+  if (activeActivitySubtab !== 'managed') return;
+  if (managedContextRefreshTimer) clearTimeout(managedContextRefreshTimer);
+  managedContextRefreshTimer = setTimeout(() => {
+    managedContextRefreshTimer = null;
+    refreshManagedContextPane();
+  }, delay);
+}
+
+async function refreshManagedContextPane(options = {}) {
+  renderManagedContextSessionSelect();
+  renderManagedContextAnchors();
+  const sessionId = managedContextCurrentSessionId();
+  if (!sessionId) {
+    managedContextStatus = null;
+    managedContextRecords = [];
+    managedContextLastError = '';
+    renderManagedContextPane();
+    return;
+  }
+  try {
+    managedContextLastError = '';
+    const [status, records] = await Promise.all([
+      fetchManagedContextStatus(),
+      fetchManagedContextRecords(),
+    ]);
+    managedContextStatus = status;
+    managedContextRecords = records;
+  } catch (err) {
+    if (options.force) console.warn('Managed context refresh failed:', err);
+    managedContextLastError = err?.message || String(err);
+  }
+  renderManagedContextPane();
+}
+
+function renderManagedContextRecords() {
+  const host = managedContextEl('managed-context-records');
+  if (!host) return;
+  host.innerHTML = '';
+  const selected = String(managedContextEl('managed-context-record-id')?.value || '').trim();
+  if (!managedContextRecords.length) {
+    host.innerHTML = '<div class="managed-context-muted">No rewind records for this session.</div>';
+    return;
+  }
+  for (const record of managedContextRecords) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'managed-context-record-item' + (record.record_id === selected ? ' selected' : '');
+    row.innerHTML =
+      `<div class="managed-context-record-id">${escapeHtml(record.record_id || '')}</div>` +
+      `<div class="managed-context-record-meta">` +
+      `<span>${escapeHtml(record.created_at || '')}</span>` +
+      `<span>${escapeHtml(record.position || 'after')} ${escapeHtml(record.item_id || '')}</span>` +
+      `</div>` +
+      `<div class="managed-context-muted">${escapeHtml(compactSessionText(record.reason) || 'no reason')}</div>`;
+    row.addEventListener('click', () => selectManagedContextRecord(record));
+    host.appendChild(row);
+  }
+}
+
+function selectManagedContextRecord(record) {
+  const input = managedContextEl('managed-context-record-id');
+  if (input) input.value = record?.record_id || '';
+  const result = managedContextEl('managed-context-action-result');
+  if (result) result.textContent = JSON.stringify(record || {}, null, 2);
+  renderManagedContextRecords();
+}
+
+function renderManagedContextLedgers() {
+  const host = managedContextEl('managed-context-ledgers');
+  if (!host) return;
+  host.innerHTML = '';
+  const lineage = managedContextStatus?.lineage_ledger?.groups || [];
+  const fission = managedContextStatus?.fission_ledger?.groups || [];
+  const addGroup = (kind, group) => {
+    const row = document.createElement('div');
+    row.className = 'managed-context-ledger-item';
+    const branches = Array.isArray(group.branches) ? group.branches : [];
+    const branchHtml = branches.map(branch => {
+      const claim = kind === 'fission'
+        ? `<button type="button" class="managed-context-btn" data-claim-fission="${escapeHtml(group.group_id || '')}" data-branch-id="${escapeHtml(branch.session_id || '')}" data-expected-id="${escapeHtml(group.canonical_session_id || '')}">Claim</button>`
+        : '';
+      return `<div class="managed-context-inline" style="margin-top:6px">` +
+        `<span class="managed-context-anchor-id">${escapeHtml(shortSessionId(branch.session_id || ''))}</span>` +
+        `<span class="managed-context-muted">${escapeHtml(branch.relationship || branch.status || '')}</span>` +
+        `<span class="managed-context-muted">${escapeHtml(compactSessionText(branch.summary || branch.task) || '')}</span>` +
+        claim +
+        `</div>`;
+    }).join('');
+    row.innerHTML =
+      `<div class="managed-context-inline">` +
+      `<strong>${escapeHtml(kind)}</strong>` +
+      `<span class="managed-context-anchor-id">${escapeHtml(group.group_id || '')}</span>` +
+      `<span class="managed-context-muted">canonical ${escapeHtml(shortSessionId(group.canonical_session_id || '') || '--')}</span>` +
+      `</div>` +
+      branchHtml;
+    host.appendChild(row);
+  };
+  lineage.forEach(group => addGroup('lineage', group));
+  fission.forEach(group => addGroup('fission', group));
+  if (!host.childElementCount) {
+    host.innerHTML = '<div class="managed-context-muted">No lineage or fission groups reported yet.</div>';
+  }
+}
+
+function renderManagedContextPane() {
+  renderManagedContextStats();
+  renderManagedContextAlerts();
+  renderManagedContextAnchors();
+  renderManagedContextRecords();
+  renderManagedContextLedgers();
+  const managed = managedContextModeFromStatus() === 'managed';
+  ['managed-context-submit-rewind', 'managed-context-submit-backout'].forEach(id => {
+    const btn = managedContextEl(id);
+    if (btn) btn.disabled = !managed || !managedContextCurrentSessionId();
+  });
+}
+
+async function submitManagedContextRewind() {
+  const sessionId = managedContextCurrentSessionId();
+  const itemId = String(managedContextEl('managed-context-anchor')?.value || '').trim();
+  const reason = String(managedContextEl('managed-context-reason')?.value || '').trim();
+  const primer = String(managedContextEl('managed-context-primer')?.value || '').trim();
+  if (!sessionId || !itemId || !reason || !primer) {
+    showControlToast('error', 'Rewind needs session, anchor, reason, and primer');
+    return;
+  }
+  const args = {
+    session_id: sessionId,
+    anchor: {
+      item_id: itemId,
+      position: managedContextEl('managed-context-position')?.value === 'before' ? 'before' : 'after',
+    },
+    reason,
+    primer,
+    preserve: managedContextSplitLines('managed-context-preserve'),
+    discard: managedContextSplitLines('managed-context-discard'),
+    artifacts: managedContextSplitLines('managed-context-artifacts'),
+    next_steps: managedContextSplitLines('managed-context-next-steps'),
+  };
+  const result = managedContextEl('managed-context-action-result');
+  if (result) result.textContent = 'Dispatching rewind...';
+  try {
+    const text = await managedContextMcpTool('rewind_context', args);
+    if (result) result.textContent = text || 'ok';
+    showControlToast('success', 'Managed rewind dispatched');
+    scheduleManagedContextRefresh(1000);
+  } catch (err) {
+    if (result) result.textContent = err?.message || String(err);
+    showControlToast('error', err?.message || 'Managed rewind failed');
+  }
+}
+
+async function submitManagedContextBackout() {
+  const sessionId = managedContextCurrentSessionId();
+  const recordId = String(managedContextEl('managed-context-record-id')?.value || '').trim();
+  if (!sessionId || !recordId) {
+    showControlToast('error', 'Backout needs session and record id');
+    return;
+  }
+  const mode = managedContextEl('managed-context-backout-mode')?.value || 'inspect';
+  const name = String(managedContextEl('managed-context-backout-name')?.value || '').trim();
+  const args = {
+    session_id: sessionId,
+    record_id: recordId,
+    mode,
+    allow_cache_reset: !!managedContextEl('managed-context-allow-cache-reset')?.checked,
+  };
+  if (name) args.name = name;
+  const result = managedContextEl('managed-context-action-result');
+  if (result) result.textContent = `Running ${mode}...`;
+  try {
+    const text = await managedContextMcpTool('rewind_backout', args);
+    if (result) result.textContent = text || 'ok';
+    showControlToast('success', `Managed ${mode} complete`);
+    scheduleManagedContextRefresh(1000);
+  } catch (err) {
+    if (result) result.textContent = err?.message || String(err);
+    showControlToast('error', err?.message || 'Managed backout failed');
+  }
+}
+
+async function claimManagedContextFissionCanonical(groupId, branchId, expectedId) {
+  const args = {
+    group_id: groupId,
+    branch_session_id: branchId,
+  };
+  if (expectedId) args.expected_canonical_session_id = expectedId;
+  const result = managedContextEl('managed-context-action-result');
+  if (result) result.textContent = 'Claiming canonical branch...';
+  try {
+    const text = await managedContextMcpTool('claim_fission_canonical', args);
+    if (result) result.textContent = text || 'ok';
+    showControlToast('success', 'Canonical branch claimed');
+    scheduleManagedContextRefresh(500);
+  } catch (err) {
+    if (result) result.textContent = err?.message || String(err);
+    showControlToast('error', err?.message || 'Canonical claim failed');
+  }
+}
+
+function wireManagedContextListeners() {
+  managedContextEl('managed-context-session')?.addEventListener('change', () => refreshManagedContextPane({ force: true }));
+  managedContextEl('managed-context-use-target')?.addEventListener('click', () => {
+    const target = resolvePromptTargetSessionId();
+    renderManagedContextSessionSelect();
+    const sel = managedContextEl('managed-context-session');
+    if (target && sel && Array.from(sel.options).some(o => o.value === target)) sel.value = target;
+    refreshManagedContextPane({ force: true });
+  });
+  managedContextEl('managed-context-refresh')?.addEventListener('click', () => refreshManagedContextPane({ force: true }));
+  managedContextEl('managed-context-refresh-records')?.addEventListener('click', () => refreshManagedContextPane({ force: true }));
+  managedContextEl('managed-context-clear-anchor')?.addEventListener('click', () => {
+    const anchor = managedContextEl('managed-context-anchor');
+    if (anchor) anchor.value = '';
+  });
+  managedContextEl('managed-context-submit-rewind')?.addEventListener('click', submitManagedContextRewind);
+  managedContextEl('managed-context-submit-backout')?.addEventListener('click', submitManagedContextBackout);
+  managedContextEl('managed-context-copy-status')?.addEventListener('click', () => {
+    const text = JSON.stringify(managedContextStatus || {}, null, 2);
+    navigator.clipboard?.writeText(text)
+      .then(() => showControlToast('success', 'Managed status copied'))
+      .catch(err => showControlToast('error', 'Copy failed: ' + (err?.message || err)));
+  });
+  managedContextEl('managed-context-ledgers')?.addEventListener('click', ev => {
+    const btn = ev.target?.closest?.('button[data-claim-fission]');
+    if (!btn) return;
+    claimManagedContextFissionCanonical(
+      btn.dataset.claimFission || '',
+      btn.dataset.branchId || '',
+      btn.dataset.expectedId || ''
+    );
+  });
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', wireManagedContextListeners);
+} else {
+  wireManagedContextListeners();
 }
 
 const DIFF_LANGUAGE_EXTENSIONS = {
@@ -14466,6 +15398,9 @@ function createLogScaffold(c, extraClass) {
   if (c.user_turn_revision !== undefined && c.user_turn_revision !== null) {
     entry.dataset.userTurnRevision = String(c.user_turn_revision);
   }
+  if (c.item_id) {
+    entry.dataset.itemId = c.item_id;
+  }
 
   const lvl = document.createElement('span');
   lvl.className = 'log-level';
@@ -14479,6 +15414,20 @@ function createLogScaffold(c, extraClass) {
     applyPromptTargetLogSessionBadgeState(entry);
   }
   entry.appendChild(lvl);
+  if (c.item_id) {
+    const anchor = document.createElement('button');
+    anchor.type = 'button';
+    anchor.className = 'log-anchor-btn';
+    anchor.textContent = 'anchor';
+    anchor.title = c.item_id;
+    anchor.dataset.itemId = c.item_id;
+    anchor.dataset.sessionId = sid;
+    anchor.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      fillManagedContextAnchor(c.item_id, sid);
+    });
+    entry.appendChild(anchor);
+  }
   return { entry, hostId };
 }
 
@@ -19563,7 +20512,7 @@ document.querySelectorAll('#sessions-subtabs .subtab-btn[data-sessions-tab]').fo
   btn.addEventListener('click', () => routeTo('sessions', btn.dataset.sessionsTab));
 });
 
-// Activity sub-tab switching (Log | Changes).
+// Activity sub-tab switching (Log | Context | Managed | Changes | Control).
 document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').forEach(btn => {
   btn.addEventListener('click', () => routeTo('activity', btn.dataset.activityTab));
 });
@@ -19589,7 +20538,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 // (verbosity, direct-mode, host filter, sessions filters).
 
 const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'sessions', 'settings'];
-const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'changes', 'control'];
+const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['tui', 'shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
 const VALID_SESSIONS_SUBTABS = ['recent', 'deep', 'worktrees', 'new'];
@@ -19823,11 +20772,15 @@ function switchActivitySubtab(name) {
   });
   document.getElementById('activity-log-pane').classList.toggle('active', name === 'log');
   document.getElementById('activity-context-pane').classList.toggle('active', name === 'context');
+  document.getElementById('activity-managed-pane').classList.toggle('active', name === 'managed');
   document.getElementById('activity-changes-pane').classList.toggle('active', name === 'changes');
   document.getElementById('activity-control-pane').classList.toggle('active', name === 'control');
   syncSessionWindowGridControls();
   if (name === 'context') {
     renderContextPane();
+  }
+  if (name === 'managed') {
+    refreshManagedContextPane({ force: true });
   }
   if (name === 'changes') {
     const badge = document.getElementById('badge-changes');
@@ -26099,6 +27052,10 @@ function applyLoadedSessions(sessions, aggEl) {
   updateSessionProjectFilterOptions(sessions);
   updateNewSessionProjectPrefills(sessions);
   cacheSessionWindowMetadata(sessions);
+  if (activeActivitySubtab === 'managed') {
+    renderManagedContextSessionSelect();
+    renderManagedContextPane();
+  }
   renderSessionsAggregate(sessions, aggEl);
   renderSessionsViews();
 }

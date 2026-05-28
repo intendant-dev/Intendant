@@ -1491,6 +1491,7 @@ mod tests {
                 session_id: None,
                 turn: 5,
                 commands_preview: "echo hello".to_string(),
+                item_id: None,
                 source: None,
             },
             &state,
