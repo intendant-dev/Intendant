@@ -1275,6 +1275,16 @@ impl App {
                     format!("Codex writable roots → {} (applies on next task)", summary),
                 );
             }
+            ControlMsg::SetCodexManagedContext { ref mode } => {
+                let normalized = crate::project::normalize_codex_managed_context(mode);
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Codex managed context → {} (applies on next task)",
+                        normalized
+                    ),
+                );
+            }
             ControlMsg::CodexThreadAction { ref op, .. } => {
                 // The daemon-side watcher logs the result; here we just
                 // acknowledge that the user triggered the action so the TUI

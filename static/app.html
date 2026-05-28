@@ -6510,6 +6510,16 @@ html, body {
                 <div class="control-hint">
                   Enables the Responses API <code>web_search</code> tool (matches <code>codex --search</code>). No per-call approval.
                 </div>
+                <div class="control-row">
+                  <label for="control-codex-managed-context">Managed context</label>
+                  <select id="control-codex-managed-context">
+                    <option value="vanilla" selected>vanilla</option>
+                    <option value="managed">managed</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  <strong>vanilla</strong> keeps upstream/fork Codex behavior. <strong>managed</strong> enables proactive Intendant context densification, rewind/backout tools, and suppressed Codex auto-compaction for managed long tasks.
+                </div>
               </fieldset>
               <fieldset class="control-group">
                 <legend>Sandbox permissions</legend>
@@ -9578,6 +9588,7 @@ let controlCodexConfig = {
   web_search: false,
   network_access: false,
   writable_roots: [],
+  managed_context: 'vanilla',
 };
 let controlGeminiConfig = {
   model: '',
@@ -9625,6 +9636,7 @@ async function refreshControlPane() {
       web_search: !!d.codex_web_search,
       network_access: !!d.codex_network_access,
       writable_roots: Array.isArray(d.codex_writable_roots) ? d.codex_writable_roots : [],
+      managed_context: d.codex_managed_context || 'vanilla',
     };
     controlGeminiConfig = {
       model: d.gemini_model || '',
@@ -9669,6 +9681,7 @@ function renderControlPane() {
     const reasoningSel = $('control-codex-reasoning');
     const webSearch = $('control-codex-web-search');
     const webSearchStatus = $('control-codex-web-search-status');
+    const managedContextSel = $('control-codex-managed-context');
     const networkCb = $('control-codex-network');
     const networkStatus = $('control-codex-network-status');
     const networkRow = $('control-codex-network-row');
@@ -9680,6 +9693,7 @@ function renderControlPane() {
     if (reasoningSel) reasoningSel.value = controlCodexConfig.reasoning_effort || '';
     if (webSearch) webSearch.checked = !!controlCodexConfig.web_search;
     if (webSearchStatus) webSearchStatus.textContent = controlCodexConfig.web_search ? 'on' : 'off';
+    if (managedContextSel) managedContextSel.value = controlCodexConfig.managed_context || 'vanilla';
     if (networkCb) networkCb.checked = !!controlCodexConfig.network_access;
     if (networkStatus) networkStatus.textContent = controlCodexConfig.network_access ? 'on' : 'off';
     // Network access only matters inside workspace-write. Grey out + annotate
@@ -9784,6 +9798,13 @@ function onControlWebSearchChange(ev) {
   const s = document.getElementById('control-codex-web-search-status');
   if (s) s.textContent = enabled ? 'on' : 'off';
   dispatchControlMsg({ action: 'set_codex_web_search', enabled });
+}
+
+function onControlManagedContextChange(ev) {
+  const mode = ev.target.value === 'managed' ? 'managed' : 'vanilla';
+  if (mode === (controlCodexConfig.managed_context || 'vanilla')) return;
+  controlCodexConfig.managed_context = mode;
+  dispatchControlMsg({ action: 'set_codex_managed_context', mode });
 }
 
 function onControlNetworkChange(ev) {
@@ -9942,6 +9963,7 @@ function applyCodexConfigChanged(evt) {
   if (typeof evt.web_search === 'boolean') controlCodexConfig.web_search = evt.web_search;
   if (typeof evt.network_access === 'boolean') controlCodexConfig.network_access = evt.network_access;
   if (Array.isArray(evt.writable_roots)) controlCodexConfig.writable_roots = evt.writable_roots;
+  if (evt.managed_context) controlCodexConfig.managed_context = evt.managed_context;
   // Sandbox change may flip the network-access row's enabled state — full
   // re-render is the simplest way to keep disabled-styling in sync.
   renderControlPane();
@@ -10201,6 +10223,60 @@ function parseCodexSlashCommand(text) {
     if (prompt) params.prompt = prompt;
     return { op: 'side', params };
   }
+  if (
+    name === 'rewind-anchor' ||
+    name === 'rewind-to-item' ||
+    name === 'rollback-anchor' ||
+    name === 'rollback-to-item'
+  ) {
+    const tokens = rest.split(/\s+/).map(s => s.trim()).filter(Boolean);
+    if (tokens.length === 0) {
+      return { error: `/${name} requires an item id` };
+    }
+    let position = 'after';
+    const last = tokens[tokens.length - 1].toLowerCase();
+    if (last === 'before' || last === 'after') {
+      position = last;
+      tokens.pop();
+    }
+    const itemId = unquoteSlashValue(tokens.join(' '));
+    if (!itemId) return { error: `/${name} requires an item id` };
+    return { op: 'rewind-anchor', params: { itemId, position } };
+  }
+  if (
+    name === 'rewind-backout' ||
+    name === 'rewind-inspect' ||
+    name === 'context-rewind-backout'
+  ) {
+    const cacheReset = takeGoalFlag(rest, ['allow-cache-reset', 'allow-cache-breaking-fork']);
+    const recordId = unquoteSlashValue(cacheReset.text);
+    if (!recordId) return { error: `/${name} requires a rewind record id` };
+    const params = { recordId, mode: 'inspect' };
+    if (cacheReset.found) params.allowCacheReset = true;
+    return { op: 'rewind-backout', params };
+  }
+  if (
+    name === 'rewind-restore' ||
+    name === 'context-rewind-restore'
+  ) {
+    const cacheReset = takeGoalFlag(rest, ['allow-cache-reset', 'allow-cache-breaking-fork']);
+    const recordId = unquoteSlashValue(cacheReset.text);
+    if (!recordId) return { error: `/${name} requires a rewind record id` };
+    const params = { recordId, mode: 'restore' };
+    if (cacheReset.found) params.allowCacheReset = true;
+    return { op: 'rewind-backout', params };
+  }
+  if (name === 'rewind') {
+    const tokens = rest.split(/\s+/).map(s => s.trim()).filter(Boolean);
+    const mode = (tokens.shift() || '').toLowerCase();
+    if (mode !== 'inspect' && mode !== 'backout' && mode !== 'fork' && mode !== 'restore') return null;
+    const cacheReset = takeGoalFlag(tokens.join(' '), ['allow-cache-reset', 'allow-cache-breaking-fork']);
+    const recordId = unquoteSlashValue(cacheReset.text);
+    if (!recordId) return { error: `/rewind ${mode} requires a rewind record id` };
+    const params = { recordId, mode: mode === 'backout' ? 'inspect' : mode };
+    if (cacheReset.found) params.allowCacheReset = true;
+    return { op: 'rewind-backout', params };
+  }
   if (name === 'goal') return parseGoalSlash(rest);
   return null;
 }
@@ -10421,12 +10497,14 @@ function wireControlPaneListeners() {
   const modelInp = $('control-codex-model');
   const reasoningSel = $('control-codex-reasoning');
   const webSearch = $('control-codex-web-search');
+  const managedContextSel = $('control-codex-managed-context');
   const networkCb = $('control-codex-network');
   const rootsTA = $('control-codex-writable-roots');
   if (sandboxSel) sandboxSel.addEventListener('change', onControlSandboxChange);
   if (approvalSel) approvalSel.addEventListener('change', onControlApprovalChange);
   if (reasoningSel) reasoningSel.addEventListener('change', onControlReasoningChange);
   if (webSearch) webSearch.addEventListener('change', onControlWebSearchChange);
+  if (managedContextSel) managedContextSel.addEventListener('change', onControlManagedContextChange);
   if (networkCb) networkCb.addEventListener('change', onControlNetworkChange);
   // Commit text inputs on blur or Enter so every keystroke doesn't ping the server.
   if (modelInp) {
@@ -11618,7 +11696,11 @@ function applyPromptTargetLogSessionBadgeState(entry, target = resolvePromptTarg
 function resolvePromptTargetSessionId() {
   const sid = foregroundSessionFullId || currentSessionFullId || '';
   const win = sid ? sessionWindows.get(sid) : null;
-  return win && win.ended ? '' : sid;
+  if (sid && (!win || !win.ended)) return sid;
+  const candidates = Array.from(sessionWindows.entries())
+    .filter(([id, win]) => id !== daemonSessionFullId && win && !win.ended)
+    .map(([id]) => id);
+  return candidates.length === 1 ? candidates[0] : '';
 }
 
 function compactSessionText(value) {
@@ -24042,6 +24124,7 @@ async function loadSettings() {
     document.getElementById('set-live-audio-timeout').value = d.live_audio_timeout_secs || 300;
     document.getElementById('set-codex-command').value = d.codex_command || 'codex';
     controlCodexConfig.command = d.codex_command || 'codex';
+    controlCodexConfig.managed_context = d.codex_managed_context || 'vanilla';
     setNewSessionAgentDefaults(d);
     // External agent: persisted to intendant.toml via `[agent]
     // default_backend`. Sync both the Settings dropdown AND the
@@ -24128,6 +24211,7 @@ async function saveSettings() {
     codex_writable_roots: Array.isArray(controlCodexConfig.writable_roots)
       ? controlCodexConfig.writable_roots
       : [],
+    codex_managed_context: controlCodexConfig.managed_context || 'vanilla',
     gemini_model: controlGeminiConfig.model || null,
     gemini_approval_mode: controlGeminiConfig.approval_mode || 'default',
     gemini_sandbox: !!controlGeminiConfig.sandbox,
@@ -24776,21 +24860,27 @@ function onSessionAttached(sessionId, source) {
 function onSessionEnded(sessionId, reason) {
   const sid = String(sessionId || '').trim();
   const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
+  const win = sid ? sessionWindows.get(sid) : null;
+  const externalSource = sid ? externalSourceForSessionWindow(sid, win) : '';
   const shouldRemoveSideWindow = sid && (
     meta.relationshipKind === 'side' ||
     String(reason || '').toLowerCase().includes('side conversation closed')
   );
+  const keepExternalDetached = sid && !!externalSource && !shouldRemoveSideWindow;
   if (shouldRemoveSideWindow) {
     clearPendingFollowUpsForSession(sid, 'side conversation closed');
     removeSessionRelationshipsForSession(sid);
     removeSessionWindow(sid);
+  } else if (keepExternalDetached) {
+    updateSessionWindow(sid, { phase: 'idle', ended: false });
+    setSessionWindowDetached(sid, true, reason || 'session ended');
   } else if (sid) {
     updateSessionWindow(sid, { phase: 'done', ended: true });
   }
-  if (!sessionId || sessionId === currentSessionFullId) {
+  if (!keepExternalDetached && (!sessionId || sessionId === currentSessionFullId)) {
     currentSessionFullId = '';
   }
-  if (!sessionId || sessionId === foregroundSessionFullId) {
+  if (!keepExternalDetached && (!sessionId || sessionId === foregroundSessionFullId)) {
     foregroundSessionFullId = '';
     const next = Array.from(sessionWindows.entries())
       .find(([id, win]) => id !== sessionId && win.phase !== 'done')?.[0] || '';
@@ -24800,6 +24890,8 @@ function onSessionEnded(sessionId, reason) {
       setPhase('idle');
       updateTaskTargetChip();
     }
+  } else if (keepExternalDetached) {
+    updateTaskTargetChip();
   }
   scheduleSessionRelationshipRender();
   // Refresh sessions list if already loaded
@@ -25046,7 +25138,10 @@ window.submitActivityTask = function(options = {}) {
   const attachmentReceipt = pendingAttachments.slice();
   const direct = document.getElementById('direct-mode-toggle')?.checked || false;
   const targetSessionId = resolvePromptTargetSessionId();
-  const msg = targetSessionId && sessionWindowIsDetached(targetSessionId)
+  const shouldResumeExternalTarget = targetSessionId
+    && !!externalSourceForSessionWindow(targetSessionId)
+    && !isSessionWindowEffectivelyActive(targetSessionId);
+  const msg = targetSessionId && (sessionWindowIsDetached(targetSessionId) || shouldResumeExternalTarget)
     ? detachedSessionResumeMessage(targetSessionId, text, direct, attachments)
     : (targetSessionId
       ? { action: 'start_task', task: text, session_id: targetSessionId }

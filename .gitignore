@@ -1,5 +1,7 @@
 .DS_Store
 target/
+__pycache__/
+*.py[cod]
 .intendant/
 .env
 .env.*

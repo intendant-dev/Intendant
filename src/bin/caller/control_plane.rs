@@ -31,6 +31,7 @@ pub struct CodexRuntimeConfig {
     pub web_search: bool,
     pub network_access: bool,
     pub writable_roots: Vec<String>,
+    pub managed_context: String,
 }
 
 pub type SharedCodexConfig = Arc<RwLock<CodexRuntimeConfig>>;
@@ -327,6 +328,7 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             // owns the persistent Codex agent) can pick it up and run the
             // RPC. We don't own the agent here, so we only translate.
             state.bus.send(AppEvent::CodexThreadActionRequested {
+                request_id: uuid::Uuid::new_v4().simple().to_string(),
                 session_id: session_id.clone(),
                 action: op.clone(),
                 params: params.clone(),
@@ -349,6 +351,26 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             }
             state.bus.send(codex_config_changed_event(CodexConfigDelta {
                 writable_roots: Some(normalized),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetCodexManagedContext { mode } => {
+            let normalized = crate::project::normalize_codex_managed_context(mode);
+            {
+                let mut guard = state.codex_config.write().await;
+                guard.managed_context = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_codex_field(root, |cfg| {
+                    cfg.managed_context = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist codex.managed_context to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                managed_context: Some(normalized),
                 ..Default::default()
             }));
         }
@@ -615,6 +637,7 @@ struct CodexConfigDelta {
     web_search: Option<bool>,
     network_access: Option<bool>,
     writable_roots: Option<Vec<String>>,
+    managed_context: Option<String>,
 }
 
 fn codex_config_changed_event(delta: CodexConfigDelta) -> AppEvent {
@@ -629,6 +652,7 @@ fn codex_config_changed_event(delta: CodexConfigDelta) -> AppEvent {
         web_search: delta.web_search,
         network_access: delta.network_access,
         writable_roots: delta.writable_roots,
+        managed_context: delta.managed_context,
     }
 }
 
@@ -738,6 +762,7 @@ mod tests {
             web_search: false,
             network_access: false,
             writable_roots: Vec::new(),
+            managed_context: "vanilla".to_string(),
         }))
     }
 
@@ -1190,10 +1215,12 @@ mod tests {
         for _ in 0..20 {
             match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
                 Ok(Ok(AppEvent::CodexThreadActionRequested {
+                    request_id,
                     session_id,
                     action,
                     params,
                 })) => {
+                    assert!(!request_id.is_empty());
                     assert_eq!(session_id.as_deref(), Some("sess-action"));
                     assert_eq!(action, "compact");
                     assert_eq!(params["extra"], "data");
@@ -1299,6 +1326,44 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let got = codex_config.read().await.writable_roots.clone();
         assert_eq!(got, vec!["/tmp/a".to_string(), "/tmp/b".to_string()]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_codex_managed_context_normalizes_and_updates_shared_state() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexManagedContext {
+                mode: "on".to_string(),
+            },
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.managed_context, "managed");
+
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexManagedContext {
+                mode: "vanilla".to_string(),
+            },
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.managed_context, "vanilla");
 
         handle.abort();
     }

@@ -1948,6 +1948,7 @@ impl SessionSupervisor {
                 cfg.web_search = current.web_search;
                 cfg.network_access = current.network_access;
                 cfg.writable_roots = current.writable_roots;
+                cfg.managed_context = current.managed_context;
             }
             Some(external_agent::AgentBackend::GeminiCli) => {
                 let current = self.config.shared_gemini_config.read().await.clone();
@@ -2477,6 +2478,7 @@ mod tests {
                     web_search: false,
                     network_access: false,
                     writable_roots: Vec::new(),
+                    managed_context: "vanilla".to_string(),
                 },
             )),
             shared_gemini_config: Arc::new(tokio::sync::RwLock::new(

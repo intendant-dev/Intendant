@@ -13,8 +13,8 @@ use crate::error::CallerError;
 
 use super::{
     AgentConfig, AgentContextSnapshot, AgentEvent, AgentImageAttachment, AgentThread,
-    AgentUsageSnapshot, ApprovalCategory, ApprovalDecision, ExternalAgent, SubAgentState,
-    ToolCompletionStatus,
+    AgentThreadSnapshot, AgentUsageSnapshot, ApprovalCategory, ApprovalDecision, ExternalAgent,
+    RollbackAnchorPosition, SubAgentState, ToolCompletionStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -46,6 +46,10 @@ External tools may be available according to this thread's current permissions. 
 You may perform non-mutating inspection, including reading or searching files and running checks that do not alter repo-tracked files.
 
 Do not modify files, source, git state, permissions, configuration, or any other workspace state unless the user explicitly requests that mutation in this side conversation. Do not request escalated permissions or broader sandbox access unless the user explicitly requests a mutation that requires it. If the user explicitly requests a mutation, keep it minimal, local to the request, and avoid disrupting the main thread."#;
+
+const GENERATION_STARVATION_NEAR_LIMIT_PCT: f64 = 85.0;
+const GENERATION_STARVATION_HINT: &str = "The previous Codex response appears to have been cut off near the backend context limit. Avoid regenerating the same long output; rewind context first or produce a much shorter recovery response.";
+const CODEX_INITIALIZE_TIMEOUT_SECS: u64 = 60;
 
 /// Codex-specific thread-action helpers. Each wraps one of Codex's app-server
 /// JSON-RPC methods (`thread/compact/start`, `thread/fork`, `thread/inject_items`,
@@ -118,6 +122,10 @@ impl CodexAgent {
             "undo" => {
                 let turns = params.get("turns").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
                 self.rollback_turns_inner(params, turns).await
+            }
+            "rewind-anchor" | "rewind_anchor" | "rewind-to-item" | "rewind_to_item"
+            | "rollback-anchor" | "rollback_anchor" | "rollback-to-item" | "rollback_to_item" => {
+                self.rollback_anchor_inner(params).await
             }
             "review" => {
                 let prompt = params
@@ -399,6 +407,49 @@ impl CodexAgent {
         Ok(format!("rolled back {} turn(s)", turns))
     }
 
+    async fn rollback_anchor_inner(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
+        let thread_id = self.thread_id_for_action(params).await?;
+        let item_id = rollback_anchor_item_id(params)?;
+        let position = rollback_anchor_position(params)?;
+        self.rollback_item_anchor_rpc(&thread_id, &item_id, position)
+            .await?;
+        Ok(format!(
+            "rolled back to {} item {}",
+            position.as_str(),
+            item_id
+        ))
+    }
+
+    async fn rollback_item_anchor_rpc(
+        &mut self,
+        thread_id: &str,
+        item_id: &str,
+        position: RollbackAnchorPosition,
+    ) -> Result<(), CallerError> {
+        let item_id = item_id.trim();
+        if item_id.is_empty() {
+            return Err(CallerError::ExternalAgent(
+                "rollback anchor item id is required".into(),
+            ));
+        }
+        let params = serde_json::json!({
+            "threadId": thread_id,
+            "numTurns": 0,
+            "anchor": {
+                "itemId": item_id,
+                "position": position.as_str(),
+            },
+        });
+        let _ = self
+            .send_request("thread/rollback", Some(params))
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/rollback: {e}")))?;
+        Ok(())
+    }
+
     async fn start_review(
         &mut self,
         params: &serde_json::Value,
@@ -617,6 +668,35 @@ fn parse_goal_token_budget(params: &serde_json::Value) -> Result<Option<Option<u
     Ok(Some(Some(budget)))
 }
 
+fn rollback_anchor_item_id(params: &serde_json::Value) -> Result<String, CallerError> {
+    let item_id = params
+        .get("itemId")
+        .or_else(|| params.get("item_id"))
+        .or_else(|| params.pointer("/anchor/itemId"))
+        .or_else(|| params.pointer("/anchor/item_id"))
+        .and_then(|v| v.as_str())
+        .or_else(|| params.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| CallerError::ExternalAgent("rollback anchor item id is required".into()))?;
+    Ok(item_id.to_string())
+}
+
+fn rollback_anchor_position(
+    params: &serde_json::Value,
+) -> Result<RollbackAnchorPosition, CallerError> {
+    let raw = params
+        .get("position")
+        .or_else(|| params.pointer("/anchor/position"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("after");
+    RollbackAnchorPosition::from_str(raw).ok_or_else(|| {
+        CallerError::ExternalAgent(format!(
+            "rollback anchor position must be before or after, got {raw}"
+        ))
+    })
+}
+
 fn side_prompt_from_params(params: &serde_json::Value) -> Result<String, CallerError> {
     let prompt = ["prompt", "message", "text", "task"]
         .iter()
@@ -659,6 +739,15 @@ fn extract_thread_id(value: &serde_json::Value) -> Option<String> {
         .or_else(|| value.pointer("/threadId").and_then(|v| v.as_str()))
         .or_else(|| value.pointer("/thread_id").and_then(|v| v.as_str()))
         .map(str::to_string)
+}
+
+fn extract_thread_path(value: &serde_json::Value) -> Option<PathBuf> {
+    value
+        .pointer("/thread/path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
 fn format_goal_response(prefix: &str, response: &serde_json::Value) -> String {
@@ -747,7 +836,7 @@ fn format_duration_short(seconds: u64) -> String {
 }
 
 /// Guidance about the sandbox Codex is running under, appended to the first
-/// user message alongside [`DISPLAY_TOOLS_PROMPT`]. The string is dynamic so
+/// user message alongside the Intendant MCP tool prompt. The string is dynamic so
 /// the model sees the actual sandbox for this session, not a baked-in default.
 ///
 /// Steered by a concrete failure mode: under `workspace-write`, Codex tried
@@ -790,10 +879,19 @@ before retrying."
     format!("\n\n## Environment\n\n{}\n", body)
 }
 
+const MANAGED_CONTEXT_TOOLS_PROMPT: &str = "\n\
+### Managed Context (managed Codex only)\n\
+- **rewind_context(anchor, reason, primer, preserve?, discard?, artifacts?, next_steps?)**: Rewrite the active Codex thread to a denser continuation at an exact item/tool-call anchor. Use this proactively after noisy tool output, failed exploration, or a long research branch once the durable facts can be crystallized into the primer. Also use it when context pressure is high.\n\
+- **rewind_backout(record_id, mode?, allow_cache_reset?)**: Inspect or restore a prior managed-context record. Use `mode=\"restore\"` for same-thread recovery; `fork`/`backout` require `allow_cache_reset=true` because they create a new cache key.\n\
+\n";
+
 pub(super) const DISPLAY_TOOLS_PROMPT: &str = "\n\n\
 ## Intendant MCP Tools\n\
 \n\
 You have access to these tools through the `intendant` MCP server.\n\
+\n\
+### Session Status (always available)\n\
+- **get_status()**: Report current Intendant state, including backend-reported Codex context density/pressure.\n\
 \n\
 **GUI interaction rule:** For all GUI tasks, use take_screenshot and execute_cu_actions. Look at screenshots and click what you see. Do NOT use osascript, accessibility queries, shell commands, or app binary inspection for GUI interaction.\n\
 \n\
@@ -830,6 +928,32 @@ display stream. Returns empty if no dashboard is streaming.\n\
 \n\
 Display targets: \"user_session\" (user's display), \":99\" (virtual display 99).\n\
 ";
+
+fn intendant_mcp_tools_prompt(managed_context: bool) -> String {
+    if !managed_context {
+        return DISPLAY_TOOLS_PROMPT.to_string();
+    }
+    let mut out = DISPLAY_TOOLS_PROMPT.to_string();
+    if let Some(insert_at) = out.find("**GUI interaction rule:**") {
+        out.insert_str(insert_at, MANAGED_CONTEXT_TOOLS_PROMPT);
+    } else {
+        out.push_str(MANAGED_CONTEXT_TOOLS_PROMPT);
+    }
+    out
+}
+
+fn encode_mcp_query_value(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
 
 // ---------------------------------------------------------------------------
 // JSON-RPC wire types
@@ -916,7 +1040,11 @@ pub struct CodexAgent {
     network_access: bool,
     /// Extra writable roots beyond the project. Absolute paths.
     writable_roots: Vec<String>,
+    /// Enables Intendant's managed-context protocol. Disabled for
+    /// vanilla/fork-safe managed Codex.
+    managed_context: bool,
     web_port: Option<u16>,
+    mcp_session_id: Option<String>,
     resume_session: Option<String>,
     prompt_sent: bool,
     /// Working directory used to resolve Codex project config for config/read.
@@ -962,9 +1090,32 @@ pub struct CodexAgentOptions {
     pub web_search: bool,
     pub network_access: bool,
     pub writable_roots: Vec<String>,
+    pub managed_context: bool,
 }
 
 impl CodexAgent {
+    fn intendant_mcp_url(&self, port: u16) -> String {
+        let mode = if self.managed_context {
+            "managed"
+        } else {
+            "vanilla"
+        };
+        match self
+            .mcp_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(session_id) => format!(
+                "http://localhost:{}/mcp?session_id={}&managed_context={}",
+                port,
+                encode_mcp_query_value(session_id),
+                mode
+            ),
+            None => format!("http://localhost:{}/mcp?managed_context={}", port, mode),
+        }
+    }
+
     pub fn new(
         command: String,
         model: Option<String>,
@@ -999,7 +1150,9 @@ impl CodexAgent {
             web_search: opts.web_search,
             network_access: opts.network_access,
             writable_roots: opts.writable_roots,
+            managed_context: opts.managed_context,
             web_port,
+            mcp_session_id: None,
             resume_session: None,
             prompt_sent: false,
             working_dir: None,
@@ -1940,6 +2093,7 @@ async fn reader_task(
                 *latest_token_usage.lock().await = Some(usage);
             }
             if let Some(snapshot) = snapshot {
+                notification_state.latest_usage = Some(snapshot.clone());
                 send_scoped_agent_event(
                     &event_tx,
                     thread_id.as_deref(),
@@ -2368,6 +2522,96 @@ fn codex_plan_entries(params: &serde_json::Value) -> Vec<(String, String, String
 #[derive(Default)]
 struct CodexNotificationState {
     goal_known_active: bool,
+    latest_usage: Option<AgentUsageSnapshot>,
+}
+
+fn codex_backend_error_event(
+    params: &serde_json::Value,
+    latest_usage: Option<&AgentUsageSnapshot>,
+) -> Option<AgentEvent> {
+    let error = params.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Codex backend error")
+        .to_string();
+    let details = error
+        .get("additionalDetails")
+        .or_else(|| error.get("additional_details"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let code = error
+        .get("codexErrorInfo")
+        .or_else(|| error.get("codex_error_info"))
+        .and_then(codex_error_info_label);
+    let will_retry = params
+        .get("willRetry")
+        .or_else(|| params.get("will_retry"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let likely_generation_starvation = !will_retry
+        && codex_error_near_context_limit(
+            &message,
+            details.as_deref(),
+            code.as_deref(),
+            latest_usage,
+        );
+    let recovery_hint =
+        likely_generation_starvation.then(|| GENERATION_STARVATION_HINT.to_string());
+
+    Some(AgentEvent::BackendError {
+        message,
+        code,
+        details,
+        will_retry,
+        likely_generation_starvation,
+        recovery_hint,
+    })
+}
+
+fn codex_error_info_label(value: &serde_json::Value) -> Option<String> {
+    if let Some(label) = value.as_str() {
+        return Some(label.to_string());
+    }
+    value
+        .as_object()
+        .and_then(|object| object.keys().next().cloned())
+}
+
+fn codex_error_near_context_limit(
+    message: &str,
+    details: Option<&str>,
+    code: Option<&str>,
+    latest_usage: Option<&AgentUsageSnapshot>,
+) -> bool {
+    let near_limit = latest_usage.is_some_and(|usage| {
+        usage.context_window > 0
+            && (usage.tokens_used as f64 / usage.context_window as f64 * 100.0)
+                >= GENERATION_STARVATION_NEAR_LIMIT_PCT
+    });
+    if !near_limit {
+        return false;
+    }
+
+    let mut text = message.to_ascii_lowercase();
+    if let Some(details) = details {
+        text.push('\n');
+        text.push_str(&details.to_ascii_lowercase());
+    }
+    let incomplete = text.contains("incomplete response returned")
+        || text.contains("response.incomplete")
+        || text.contains("incomplete_details");
+    let context_limit = text.contains("context window")
+        || text.contains("context length")
+        || text.contains("maximum context")
+        || matches!(code, Some("contextWindowExceeded"));
+    let terminal_stream_failure = matches!(
+        code,
+        Some("responseStreamDisconnected" | "responseTooManyFailedAttempts")
+    );
+
+    incomplete || context_limit || terminal_stream_failure
 }
 
 /// Translate a Codex notification into one or more `AgentEvent`s.
@@ -2400,6 +2644,11 @@ fn translate_notification_with_scope(
     turn_id: Option<&str>,
 ) {
     match method {
+        "error" => {
+            if let Some(event) = codex_backend_error_event(params, state.latest_usage.as_ref()) {
+                send_scoped_agent_event(event_tx, thread_id, turn_id, event);
+            }
+        }
         "item/agentMessage/delta" => {
             let text = params
                 .get("delta")
@@ -2982,7 +3231,9 @@ impl ExternalAgent for CodexAgent {
         self.web_search = config.web_search;
         self.network_access = config.network_access;
         self.writable_roots = config.writable_roots;
+        self.managed_context = config.codex_managed_context;
         self.request_trace_root = config.request_trace_dir;
+        self.mcp_session_id = config.mcp_session_id;
         self.resume_session = config.resume_session;
         self.working_dir = Some(config.working_dir.clone());
 
@@ -2990,6 +3241,7 @@ impl ExternalAgent for CodexAgent {
         // Backup any existing config and restore on shutdown.
         let web_port = config.web_port.or(self.web_port);
         if let Some(port) = web_port {
+            let mcp_url = self.intendant_mcp_url(port);
             let codex_dir = config.working_dir.join(".codex");
             let _ = std::fs::create_dir_all(&codex_dir);
             let config_path = codex_dir.join("config.toml");
@@ -3010,8 +3262,8 @@ impl ExternalAgent for CodexAgent {
                  \n\
                  [mcp_servers.intendant]\n\
                  type = \"http\"\n\
-                 url = \"http://localhost:{}/mcp\"\n",
-                port
+                 url = \"{}\"\n",
+                mcp_url
             );
             if let Err(e) = std::fs::write(&config_path, &config_content) {
                 eprintln!(
@@ -3030,7 +3282,7 @@ impl ExternalAgent for CodexAgent {
         // appended here as `-c key=value` overrides so Codex's app-server picks
         // them up exactly as if they had been written to `~/.codex/config.toml`
         // before launch.
-        let mcp_url = format!("http://localhost:{}/mcp", self.web_port.unwrap_or(8765));
+        let mcp_url = self.intendant_mcp_url(web_port.unwrap_or(8765));
         let mut args: Vec<String> = vec![
             "app-server".to_string(),
             "-c".to_string(),
@@ -3038,6 +3290,17 @@ impl ExternalAgent for CodexAgent {
             "-c".to_string(),
             format!("mcp_servers.intendant.url=\"{}\"", mcp_url),
         ];
+        if self.managed_context {
+            // Intendant owns context rewind/backout policy for managed Codex
+            // sessions. Our minimal Codex fork treats this sentinel as
+            // disabling automatic compaction; stock Codex treats it as an
+            // unreachable body-after-prefix budget instead of compacting
+            // eagerly.
+            args.push("-c".to_string());
+            args.push("model_auto_compact_token_limit=9223372036854775807".to_string());
+            args.push("-c".to_string());
+            args.push("model_auto_compact_token_limit_scope=\"body_after_prefix\"".to_string());
+        }
         if self.web_search {
             args.push("-c".to_string());
             args.push("tools.web_search=true".to_string());
@@ -3119,7 +3382,8 @@ impl ExternalAgent for CodexAgent {
         ));
         self.reader_handle = Some(handle);
 
-        // Send initialize request with 10s timeout
+        // Cold debug builds and auth-backed app-server startup can take more
+        // than a few seconds, but this must still fail boundedly if Codex hangs.
         let init_params = serde_json::json!({
             "clientInfo": {
                 "name": "intendant",
@@ -3132,7 +3396,11 @@ impl ExternalAgent for CodexAgent {
         });
 
         let init_future = self.send_request("initialize", Some(init_params));
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), init_future).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(CODEX_INITIALIZE_TIMEOUT_SECS),
+            init_future,
+        )
+        .await;
 
         match result {
             Ok(Ok(_)) => {}
@@ -3143,9 +3411,9 @@ impl ExternalAgent for CodexAgent {
                 )));
             }
             Err(_) => {
-                return Err(CallerError::ExternalAgent(
-                    "initialize request timed out (10s)".into(),
-                ));
+                return Err(CallerError::ExternalAgent(format!(
+                    "initialize request timed out ({CODEX_INITIALIZE_TIMEOUT_SECS}s)"
+                )));
             }
         }
 
@@ -3225,7 +3493,12 @@ impl ExternalAgent for CodexAgent {
             // new thread, whether or not the MCP display tools are wired.
             let sandbox = sandbox_hint(&self.sandbox);
             if self.web_port.is_some() {
-                format!("{}{}{}", message, sandbox, DISPLAY_TOOLS_PROMPT)
+                format!(
+                    "{}{}{}",
+                    message,
+                    sandbox,
+                    intendant_mcp_tools_prompt(self.managed_context)
+                )
             } else {
                 format!("{}{}", message, sandbox)
             }
@@ -3372,6 +3645,10 @@ impl ExternalAgent for CodexAgent {
         true
     }
 
+    fn supports_item_anchor_rewind(&self) -> bool {
+        self.managed_context
+    }
+
     /// Native implementation of conversation rollback. Reuses the
     /// `thread/rollback` RPC under `numTurns` — same as `/undo`,
     /// just without the status string and with a guard allowing 0 to be
@@ -3397,6 +3674,145 @@ impl ExternalAgent for CodexAgent {
         }
         let params = serde_json::json!({ "threadId": thread_id });
         let _status = self.rollback_turns_inner(&params, turns_to_drop).await?;
+        Ok(())
+    }
+
+    async fn rollback_thread_to_item_anchor(
+        &mut self,
+        thread_id: &str,
+        item_id: &str,
+        position: RollbackAnchorPosition,
+    ) -> Result<(), CallerError> {
+        self.rollback_item_anchor_rpc(thread_id, item_id, position)
+            .await
+    }
+
+    async fn read_thread_snapshot(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<AgentThreadSnapshot, CallerError> {
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            return Err(CallerError::ExternalAgent(
+                "thread metadata read requires a thread id".into(),
+            ));
+        }
+        let params = serde_json::json!({
+            "threadId": thread_id,
+            "includeTurns": false,
+        });
+        let response = self
+            .send_request("thread/read", Some(params))
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/read: {e}")))?;
+        Ok(AgentThreadSnapshot {
+            thread_id: extract_thread_id(&response).unwrap_or_else(|| thread_id.to_string()),
+            rollout_path: extract_thread_path(&response),
+        })
+    }
+
+    async fn fork_thread_from_rollout_path(
+        &mut self,
+        rollout_path: &Path,
+        name: Option<&str>,
+    ) -> Result<AgentThread, CallerError> {
+        let path = rollout_path.to_string_lossy();
+        if path.trim().is_empty() {
+            return Err(CallerError::ExternalAgent(
+                "rollout-path fork requires a path".into(),
+            ));
+        }
+        let params = serde_json::json!({
+            "threadId": "",
+            "path": path.as_ref(),
+        });
+        let response = self
+            .send_request("thread/fork", Some(params))
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/fork: {e}")))?;
+        let thread_id = extract_thread_id(&response).ok_or_else(|| {
+            CallerError::ExternalAgent("thread/fork response missing thread id".into())
+        })?;
+        if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
+            let request = serde_json::json!({ "threadId": thread_id.clone(), "name": name });
+            self.send_request("thread/name/set", Some(request))
+                .await
+                .map_err(|e| CallerError::ExternalAgent(format!("thread/name/set: {e}")))?;
+        }
+        Ok(AgentThread { thread_id })
+    }
+
+    async fn restore_thread_from_rollout_path(
+        &mut self,
+        thread_id: &str,
+        rollout_path: &Path,
+        record_id: Option<&str>,
+    ) -> Result<(), CallerError> {
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            return Err(CallerError::ExternalAgent(
+                "same-thread restore requires a thread id".into(),
+            ));
+        }
+        let path = rollout_path.to_string_lossy();
+        if path.trim().is_empty() {
+            return Err(CallerError::ExternalAgent(
+                "same-thread restore requires a rollout path".into(),
+            ));
+        }
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "threadId".to_string(),
+            serde_json::Value::String(thread_id.to_string()),
+        );
+        params.insert(
+            "rolloutPath".to_string(),
+            serde_json::Value::String(path.to_string()),
+        );
+        if let Some(record_id) = record_id.map(str::trim).filter(|id| !id.is_empty()) {
+            params.insert(
+                "recordId".to_string(),
+                serde_json::Value::String(record_id.to_string()),
+            );
+        }
+        self.send_request("thread/restore", Some(serde_json::Value::Object(params)))
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/restore: {e}")))?;
+        *self.active_thread_id.lock().await = Some(thread_id.to_string());
+        Ok(())
+    }
+
+    async fn inject_thread_developer_message(
+        &mut self,
+        thread_id: &str,
+        message: &str,
+    ) -> Result<(), CallerError> {
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            return Err(CallerError::ExternalAgent(
+                "developer-message injection requires a thread id".into(),
+            ));
+        }
+        let message = message.trim();
+        if message.is_empty() {
+            return Err(CallerError::ExternalAgent(
+                "developer-message injection requires non-empty content".into(),
+            ));
+        }
+        let params = serde_json::json!({
+            "threadId": thread_id,
+            "items": [{
+                "type": "message",
+                "role": "developer",
+                "content": [{
+                    "type": "input_text",
+                    "text": message,
+                }],
+            }],
+        });
+        self.send_request("thread/inject_items", Some(params))
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/inject_items: {e}")))?;
         Ok(())
     }
 
@@ -4569,6 +4985,99 @@ mod tests {
     }
 
     #[test]
+    fn translate_incomplete_error_near_context_limit_marks_generation_starvation() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState {
+            latest_usage: Some(AgentUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 91_000,
+                context_window: 100_000,
+                usage_pct: 91.0,
+                prompt_tokens: 88_000,
+                completion_tokens: 3_000,
+                cached_tokens: 0,
+            }),
+            ..Default::default()
+        };
+        let params = serde_json::json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "willRetry": false,
+            "error": {
+                "message": "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens",
+                "codexErrorInfo": "other",
+                "additionalDetails": "response.incomplete had incomplete_details.reason=max_output_tokens"
+            }
+        });
+
+        translate_notification_with_state("error", &params, &tx, &mut state);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::BackendError {
+                message,
+                code,
+                details,
+                will_retry,
+                likely_generation_starvation,
+                recovery_hint,
+            } => {
+                assert!(message.contains("Incomplete response returned"));
+                assert_eq!(code.as_deref(), Some("other"));
+                assert!(details.as_deref().unwrap().contains("response.incomplete"));
+                assert!(!will_retry);
+                assert!(likely_generation_starvation);
+                let hint = recovery_hint.expect("near-limit incomplete response needs a hint");
+                assert!(hint.contains("rewind context first"));
+                assert!(
+                    !hint.contains("item-"),
+                    "hint should not prescribe a stale anchor"
+                );
+            }
+            other => panic!("expected BackendError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_incomplete_error_below_context_limit_does_not_mark_starvation() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState {
+            latest_usage: Some(AgentUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 20_000,
+                context_window: 100_000,
+                usage_pct: 20.0,
+                prompt_tokens: 18_000,
+                completion_tokens: 2_000,
+                cached_tokens: 0,
+            }),
+            ..Default::default()
+        };
+        let params = serde_json::json!({
+            "willRetry": false,
+            "error": {
+                "message": "Incomplete response returned, reason: max_output_tokens",
+                "codexErrorInfo": "other"
+            }
+        });
+
+        translate_notification_with_state("error", &params, &tx, &mut state);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::BackendError {
+                likely_generation_starvation,
+                recovery_hint,
+                ..
+            } => {
+                assert!(!likely_generation_starvation);
+                assert!(recovery_hint.is_none());
+            }
+            other => panic!("expected BackendError, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn translate_scoped_notification_preserves_thread_and_turn_ids() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({"message": "All done"});
@@ -5380,6 +5889,100 @@ mod tests {
     }
 
     #[test]
+    fn thread_rollback_anchor_wire_format_is_jsonrpc_request() {
+        let params = serde_json::json!({
+            "threadId": "thread-abc",
+            "numTurns": 0,
+            "anchor": {
+                "itemId": "call-keep",
+                "position": "after",
+            },
+        });
+        assert_eq!(params["threadId"], "thread-abc");
+        assert_eq!(params["numTurns"], 0);
+        assert_eq!(params["anchor"]["itemId"], "call-keep");
+        assert_eq!(params["anchor"]["position"], "after");
+    }
+
+    #[test]
+    fn thread_inject_developer_message_wire_format_is_raw_response_item() {
+        let params = serde_json::json!({
+            "threadId": "thread-abc",
+            "items": [{
+                "type": "message",
+                "role": "developer",
+                "content": [{
+                    "type": "input_text",
+                    "text": "<model_context_rewind_primer>...</model_context_rewind_primer>",
+                }],
+            }],
+        });
+        assert_eq!(params["threadId"], "thread-abc");
+        assert_eq!(params["items"][0]["type"], "message");
+        assert_eq!(params["items"][0]["role"], "developer");
+        assert_eq!(params["items"][0]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn thread_read_snapshot_extracts_rollout_path() {
+        let response = serde_json::json!({
+            "thread": {
+                "id": "thread-abc",
+                "path": "/tmp/rollout.jsonl",
+            },
+        });
+        assert_eq!(extract_thread_id(&response).as_deref(), Some("thread-abc"));
+        assert_eq!(
+            extract_thread_path(&response),
+            Some(PathBuf::from("/tmp/rollout.jsonl"))
+        );
+    }
+
+    #[test]
+    fn thread_fork_from_path_wire_format_uses_rollout_path() {
+        let params = serde_json::json!({
+            "threadId": "",
+            "path": "/tmp/rewind-source.jsonl",
+        });
+        assert_eq!(params["threadId"], "");
+        assert_eq!(params["path"], "/tmp/rewind-source.jsonl");
+    }
+
+    #[test]
+    fn rollback_anchor_params_accept_top_level_and_nested_forms() {
+        let top = serde_json::json!({
+            "itemId": "call-1",
+            "position": "before",
+        });
+        assert_eq!(rollback_anchor_item_id(&top).unwrap(), "call-1");
+        assert_eq!(
+            rollback_anchor_position(&top).unwrap(),
+            RollbackAnchorPosition::Before
+        );
+
+        let nested = serde_json::json!({
+            "anchor": {
+                "item_id": "call-2",
+                "position": "after",
+            },
+        });
+        assert_eq!(rollback_anchor_item_id(&nested).unwrap(), "call-2");
+        assert_eq!(
+            rollback_anchor_position(&nested).unwrap(),
+            RollbackAnchorPosition::After
+        );
+    }
+
+    #[test]
+    fn rollback_anchor_position_defaults_to_after() {
+        let params = serde_json::json!({ "itemId": "call-1" });
+        assert_eq!(
+            rollback_anchor_position(&params).unwrap(),
+            RollbackAnchorPosition::After
+        );
+    }
+
+    #[test]
     fn thread_fork_wire_format_with_name() {
         // The implementation constructs the params map conditionally; re-run
         // the same construction here to guarantee the shape doesn't drift.
@@ -5448,6 +6051,216 @@ mod tests {
         });
         assert_eq!(init_params["clientInfo"]["name"], "intendant");
         assert_eq!(init_params["capabilities"]["experimentalApi"], true);
+    }
+
+    #[test]
+    fn intendant_mcp_prompt_advertises_rewind_tools_only_for_managed_codex() {
+        let vanilla = intendant_mcp_tools_prompt(false);
+        assert!(vanilla.contains("take_screenshot"));
+        assert!(vanilla.contains("get_status"));
+        assert!(!vanilla.contains("rewind_context"));
+        assert!(!vanilla.contains("rewind_backout"));
+
+        let managed = intendant_mcp_tools_prompt(true);
+        assert!(managed.contains("take_screenshot"));
+        assert!(managed.contains("get_status"));
+        assert!(managed.contains("rewind_context"));
+        assert!(managed.contains("rewind_backout"));
+    }
+
+    #[test]
+    fn intendant_mcp_url_carries_session_scoped_managed_context() {
+        let mut agent = CodexAgent::with_options(
+            "codex".to_string(),
+            None,
+            "never".to_string(),
+            "workspace-write".to_string(),
+            Some(8765),
+            CodexAgentOptions {
+                managed_context: true,
+                ..CodexAgentOptions::default()
+            },
+        );
+        agent.mcp_session_id = Some("session with spaces".to_string());
+
+        let url = agent.intendant_mcp_url(8765);
+        assert_eq!(
+            url,
+            "http://localhost:8765/mcp?session_id=session%20with%20spaces&managed_context=managed"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires INTENDANT_CODEX_E2E_BIN to point at a Codex app-server binary; run with an isolated CODEX_HOME"]
+    async fn e2e_codex_app_server_initializes_and_starts_thread() {
+        let codex_bin = std::env::var("INTENDANT_CODEX_E2E_BIN")
+            .expect("set INTENDANT_CODEX_E2E_BIN to the patched Codex binary");
+        let tmp = tempfile::tempdir().unwrap();
+        let trace_dir = tmp.path().join("request-traces");
+        let tools = {
+            let autonomy =
+                crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default());
+            let mut mcp_state = crate::mcp::McpAppState::new(
+                "openai".to_string(),
+                "gpt-5".to_string(),
+                autonomy,
+                tmp.path().join("logs"),
+            );
+            mcp_state.codex_managed_context = true;
+            mcp_state.configured_codex_managed_context = true;
+            let state = std::sync::Arc::new(tokio::sync::RwLock::new(mcp_state));
+            let server = crate::mcp::IntendantServer::new(state, crate::event::EventBus::new());
+            server.list_tools_json().await
+        };
+        let (mcp_port, mcp_handle) = spawn_minimal_mcp_http_server(tools).await;
+        let mut agent = CodexAgent::with_options(
+            codex_bin,
+            None,
+            "never".into(),
+            "danger-full-access".into(),
+            Some(mcp_port),
+            CodexAgentOptions {
+                managed_context: true,
+                ..CodexAgentOptions::default()
+            },
+        );
+
+        let config = AgentConfig {
+            model: None,
+            working_dir: tmp.path().to_path_buf(),
+            request_trace_dir: Some(trace_dir),
+            approval_policy: "never".to_string(),
+            sandbox: "danger-full-access".to_string(),
+            reasoning_effort: None,
+            web_search: false,
+            network_access: false,
+            writable_roots: Vec::new(),
+            codex_managed_context: true,
+            web_port: Some(mcp_port),
+            mcp_session_id: Some("test-session".to_string()),
+            resume_session: None,
+        };
+
+        let _events = agent.initialize(config).await.unwrap();
+        let thread = agent.start_thread().await.unwrap();
+        assert!(
+            !thread.thread_id.trim().is_empty(),
+            "thread/start should return a concrete Codex thread id"
+        );
+
+        let snapshot = agent.read_thread_snapshot(&thread.thread_id).await.unwrap();
+        assert_eq!(snapshot.thread_id, thread.thread_id);
+        assert!(
+            snapshot.rollout_path.is_some(),
+            "thread/read should expose a rollout path for rewind restore"
+        );
+
+        agent.shutdown().await.unwrap();
+        mcp_handle.abort();
+    }
+
+    async fn spawn_minimal_mcp_http_server(
+        tools: serde_json::Value,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let tools = tools.clone();
+                tokio::spawn(async move {
+                    let _ = handle_minimal_mcp_http_connection(stream, tools).await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    async fn handle_minimal_mcp_http_connection(
+        mut stream: tokio::net::TcpStream,
+        tools: serde_json::Value,
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut bytes = Vec::new();
+        let header_end;
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            bytes.extend_from_slice(&chunk[..n]);
+            if let Some(idx) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = idx + 4;
+                break;
+            }
+        }
+
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_length {
+            let mut chunk = vec![0_u8; header_end + content_length - bytes.len()];
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..n]);
+        }
+
+        let body = &bytes[header_end..header_end + content_length.min(bytes.len() - header_end)];
+        let request: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+        let id = request.get("id").cloned();
+        let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        if id.is_none() {
+            write_http_response(&mut stream, 202, "").await?;
+            return Ok(());
+        }
+
+        let result = match method {
+            "initialize" => serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": "intendant-test",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            }),
+            "tools/list" => tools,
+            _ => serde_json::json!({}),
+        };
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        })
+        .to_string();
+        write_http_response(&mut stream, 200, &response).await
+    }
+
+    async fn write_http_response(
+        stream: &mut tokio::net::TcpStream,
+        status: u16,
+        body: &str,
+    ) -> std::io::Result<()> {
+        let reason = if status == 202 { "Accepted" } else { "OK" };
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await?;
+        stream.flush().await
     }
 
     #[test]

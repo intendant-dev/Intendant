@@ -1007,6 +1007,7 @@ impl AppEventUpcaster {
                 web_search,
                 network_access,
                 writable_roots,
+                managed_context,
             } => {
                 let mut parts: Vec<String> = Vec::new();
                 if let Some(v) = command {
@@ -1036,6 +1037,9 @@ impl AppEventUpcaster {
                 }
                 if let Some(v) = writable_roots {
                     parts.push(format!("writable_roots=[{} path(s)]", v.len()));
+                }
+                if let Some(v) = managed_context {
+                    parts.push(format!("managed_context={v}"));
                 }
                 if parts.is_empty() {
                     vec![]
@@ -2034,6 +2038,7 @@ impl WireEventUpcaster {
                 web_search,
                 network_access,
                 writable_roots,
+                managed_context,
             } => {
                 let mut parts: Vec<String> = Vec::new();
                 if let Some(v) = command {
@@ -2063,6 +2068,9 @@ impl WireEventUpcaster {
                 }
                 if let Some(v) = writable_roots {
                     parts.push(format!("writable_roots=[{} path(s)]", v.len()));
+                }
+                if let Some(v) = managed_context {
+                    parts.push(format!("managed_context={v}"));
                 }
                 if parts.is_empty() {
                     vec![]

@@ -161,6 +161,15 @@ pub struct CodexConfig {
     /// are resolved against the project root at dispatch time.
     #[serde(default)]
     pub writable_roots: Vec<String>,
+    /// Managed Codex context capability. `vanilla` is vanilla/fork-safe:
+    /// Codex keeps its normal compaction behavior and Intendant does not
+    /// advertise or enforce same-thread context rewinds. `managed` enables
+    /// Intendant's managed Codex protocol: proactive rewinds/fissions,
+    /// disabled auto-compaction, item-anchor rollback, developer-primer
+    /// injection, and same-thread restore/backout. This currently requires
+    /// the Intendant-aware Codex fork.
+    #[serde(default = "default_codex_managed_context", alias = "context_recovery")]
+    pub managed_context: String,
 }
 
 fn default_codex_command() -> String {
@@ -173,6 +182,10 @@ fn default_codex_approval_policy() -> String {
 
 fn default_codex_sandbox() -> String {
     "workspace-write".to_string()
+}
+
+fn default_codex_managed_context() -> String {
+    "vanilla".to_string()
 }
 
 /// Valid Codex sandbox modes, in the order we present them in the UI.
@@ -234,6 +247,17 @@ pub fn normalize_reasoning_effort(input: Option<&str>) -> Option<String> {
     }
 }
 
+pub fn normalize_codex_managed_context(input: &str) -> String {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "managed" | "patched" | "intendant" | "on" | "true" | "enabled" => "managed".to_string(),
+        _ => "vanilla".to_string(),
+    }
+}
+
+pub fn codex_managed_context_enabled(mode: &str) -> bool {
+    normalize_codex_managed_context(mode) == "managed"
+}
+
 impl Default for CodexConfig {
     fn default() -> Self {
         Self {
@@ -245,6 +269,7 @@ impl Default for CodexConfig {
             web_search: false,
             network_access: false,
             writable_roots: Vec::new(),
+            managed_context: default_codex_managed_context(),
         }
     }
 }
