@@ -103,6 +103,36 @@ fn mark_session_meta_interrupted(dir: &Path, last_turn: Option<usize>) -> bool {
     false
 }
 
+fn update_session_meta_after_round_complete(
+    dir: &Path,
+    last_turn: Option<usize>,
+    rounds: Option<usize>,
+) {
+    let meta_path = dir.join("session_meta.json");
+    let Ok(meta_str) = fs::read_to_string(&meta_path) else {
+        return;
+    };
+    let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&meta_str) else {
+        return;
+    };
+    match meta.status.as_deref() {
+        Some("completed" | "interrupted") => return,
+        _ => {}
+    }
+    meta.status = Some("idle".to_string());
+    if let Some(turn) = last_turn {
+        meta.last_turn = Some(meta.last_turn.unwrap_or(0).max(turn));
+    }
+    if let Some(rounds) = rounds {
+        meta.rounds = Some(meta.rounds.unwrap_or(0).max(rounds));
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&meta) {
+        if let Err(e) = fs::write(&meta_path, &json) {
+            eprintln!("session_log: failed to update session_meta.json: {}", e);
+        }
+    }
+}
+
 pub fn mark_registered_session_logs_interrupted_now() -> Vec<PathBuf> {
     let dirs: Vec<PathBuf> = lock_open_session_log_dirs().iter().cloned().collect();
     let mut updated = Vec::new();
@@ -1472,6 +1502,7 @@ impl SessionLog {
             file: None,
             file2: None,
         });
+        update_session_meta_after_round_complete(&self.dir, Some(self.current_turn), Some(round));
     }
 
     /// Log creation of a per-round file snapshot.
@@ -4069,6 +4100,24 @@ mod tests {
                 .unwrap();
         assert_eq!(meta.status.as_deref(), Some("completed"));
         assert_eq!(meta.last_turn, Some(5));
+    }
+
+    #[test]
+    fn round_complete_marks_running_session_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp")), Some("task"));
+        log.turn_start(3, 0.0, 100000);
+        log.round_complete(2, 1);
+        drop(log);
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.status.as_deref(), Some("idle"));
+        assert_eq!(meta.last_turn, Some(3));
+        assert_eq!(meta.rounds, Some(2));
     }
 
     #[test]

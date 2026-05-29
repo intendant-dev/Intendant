@@ -100,6 +100,35 @@ fn session_log_id(session_log: &SharedSessionLog) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
+fn record_external_done_and_round_inline(
+    session_log: &SharedSessionLog,
+    enabled: bool,
+    session_id: Option<&str>,
+    message: Option<&str>,
+    round: usize,
+    turns_in_round: usize,
+) {
+    if !enabled {
+        return;
+    }
+    slog(session_log, |log| {
+        log.done_signal_for_session(session_id, message);
+        log.round_complete(round, turns_in_round);
+    });
+}
+
+fn record_external_round_inline(
+    session_log: &SharedSessionLog,
+    enabled: bool,
+    round: usize,
+    turns_in_round: usize,
+) {
+    if !enabled {
+        return;
+    }
+    slog(session_log, |log| log.round_complete(round, turns_in_round));
+}
+
 fn event_targets_session(target: &Option<String>, session_id: &Option<String>) -> bool {
     match target {
         Some(target) => session_id.as_deref() == Some(target.as_str()),
@@ -13621,6 +13650,14 @@ async fn run_external_agent_mode(
             } => {
                 stats.rounds = round;
 
+                record_external_done_and_round_inline(
+                    &session_log,
+                    persist_model_responses_inline,
+                    live_session_id.as_deref(),
+                    message.as_deref(),
+                    round,
+                    turns_in_round,
+                );
                 bus.send(AppEvent::DoneSignal {
                     session_id: live_session_id.clone(),
                     message: message.clone(),
@@ -13638,6 +13675,14 @@ async fn run_external_agent_mode(
                 turns_in_round,
             } => {
                 stats.rounds = round;
+                record_external_done_and_round_inline(
+                    &session_log,
+                    persist_model_responses_inline,
+                    live_session_id.as_deref(),
+                    message.as_deref(),
+                    round,
+                    turns_in_round,
+                );
                 bus.send(AppEvent::DoneSignal {
                     session_id: live_session_id.clone(),
                     message: message.clone(),
@@ -13677,6 +13722,12 @@ async fn run_external_agent_mode(
                         recovery_hint.as_deref(),
                     ))
                 });
+                record_external_round_inline(
+                    &session_log,
+                    persist_model_responses_inline,
+                    round,
+                    turns_in_round,
+                );
                 bus.send(AppEvent::RoundComplete {
                     session_id: live_session_id.clone(),
                     round,
@@ -13699,6 +13750,12 @@ async fn run_external_agent_mode(
                 slog(&session_log, |l| {
                     l.info(&format!("External agent interrupted: {}", reason))
                 });
+                record_external_round_inline(
+                    &session_log,
+                    persist_model_responses_inline,
+                    round,
+                    stats.turns,
+                );
                 bus.send(AppEvent::RoundComplete {
                     session_id: live_session_id.clone(),
                     round,

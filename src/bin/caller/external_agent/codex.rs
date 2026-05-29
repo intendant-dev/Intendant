@@ -2121,6 +2121,16 @@ async fn reader_task(
             .as_ref()
             .is_some_and(|key| terminal_turns_observed.contains(key));
 
+        let final_answer_completed =
+            method == "item/completed" && codex_item_completed_final_answer(&params);
+        if matches!(
+            method,
+            "turn/completed" | "turn/interrupted" | "turn/failed"
+        ) && turn_terminal_observed
+        {
+            continue;
+        }
+
         let status_can_complete_turn = method != "thread/status/changed"
             || codex_thread_status_can_complete_turn(
                 &params,
@@ -2198,6 +2208,19 @@ async fn reader_task(
                     } else {
                         active_turn_id.lock().await.take();
                     }
+                }
+            }
+            "item/completed" if final_answer_completed => {
+                if let Some(key) = terminal_key.as_ref() {
+                    terminal_turns_observed.insert(key.clone());
+                }
+                if let Some(thread_id) = thread_id.as_deref() {
+                    active_turns.lock().await.remove(thread_id);
+                    if active_thread_snapshot.as_deref() == Some(thread_id) {
+                        active_turn_id.lock().await.take();
+                    }
+                } else {
+                    active_turn_id.lock().await.take();
                 }
             }
             _ => {}
@@ -2310,6 +2333,20 @@ fn codex_thread_status_can_complete_turn(
     }
 
     active_turn_id.is_some() || extract_turn_id(params).is_some()
+}
+
+fn codex_item_completed_final_answer(params: &serde_json::Value) -> bool {
+    let item = params.get("item").unwrap_or(params);
+    if item.get("type").and_then(|v| v.as_str()) != Some("agentMessage") {
+        return false;
+    }
+    if item.get("phase").and_then(|v| v.as_str()) != Some("final_answer") {
+        return false;
+    }
+    !matches!(
+        item.get("status").and_then(|v| v.as_str()),
+        Some("failed" | "cancelled")
+    )
 }
 
 fn non_empty_string_at(value: &serde_json::Value, paths: &[&str]) -> Option<String> {
@@ -2889,7 +2926,8 @@ fn translate_notification_with_scope(
             // already produce one. Skip the ToolCompleted marker — the
             // final message is not a tool.
             if item_type == "agentMessage" {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                let text = item.get("text").and_then(|v| v.as_str());
+                if let Some(text) = text {
                     if !text.is_empty() {
                         send_scoped_agent_event(
                             event_tx,
@@ -2900,6 +2938,15 @@ fn translate_notification_with_scope(
                             },
                         );
                     }
+                }
+                if codex_item_completed_final_answer(params) {
+                    let message = text.map(str::to_string).filter(|text| !text.is_empty());
+                    send_scoped_agent_event(
+                        event_tx,
+                        thread_id,
+                        turn_id,
+                        AgentEvent::TurnCompleted { message },
+                    );
                 }
                 return;
             }
@@ -5041,6 +5088,33 @@ mod tests {
     }
 
     #[test]
+    fn translate_final_answer_agent_message_completes_turn() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "id": "msg_001",
+                "type": "agentMessage",
+                "text": "Final response text",
+                "phase": "final_answer"
+            }
+        });
+        translate_notification("item/completed", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::Message { text } => assert_eq!(text, "Final response text"),
+            other => panic!("expected Message, got {:?}", other),
+        }
+        match rx.try_recv().unwrap() {
+            AgentEvent::TurnCompleted { message } => {
+                assert_eq!(message.as_deref(), Some("Final response text"));
+            }
+            other => panic!("expected TurnCompleted, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn translate_item_completed_user_message_observed() {
         // userMessage items are echoes of the user's input. Surface them
         // internally so the caller can confirm accepted steers reached Codex's
@@ -5412,6 +5486,37 @@ mod tests {
             "status": {"type": "idle"}
         });
         assert!(!codex_thread_status_can_complete_turn(&params, None, true));
+    }
+
+    #[test]
+    fn final_answer_agent_message_is_terminal_only_for_completed_messages() {
+        let completed = serde_json::json!({
+            "item": {
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "text": "done"
+            }
+        });
+        assert!(codex_item_completed_final_answer(&completed));
+
+        let streaming = serde_json::json!({
+            "item": {
+                "type": "agentMessage",
+                "phase": "answer",
+                "text": "not terminal"
+            }
+        });
+        assert!(!codex_item_completed_final_answer(&streaming));
+
+        let failed = serde_json::json!({
+            "item": {
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "status": "failed",
+                "text": "failed"
+            }
+        });
+        assert!(!codex_item_completed_final_answer(&failed));
     }
 
     #[test]
