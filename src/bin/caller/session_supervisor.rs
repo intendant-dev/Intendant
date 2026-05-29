@@ -262,6 +262,33 @@ impl SessionSupervisor {
         let _ = handle.await;
     }
 
+    fn attachment_project_roots(&self, primary: &Path) -> Vec<PathBuf> {
+        let mut roots = vec![primary.to_path_buf()];
+        if self.config.project_root != primary {
+            roots.push(self.config.project_root.clone());
+        }
+        roots
+    }
+
+    async fn resolve_session_attachments(
+        &self,
+        attachments: &[String],
+        session_dir: &Path,
+        primary_project_root: &Path,
+    ) -> Vec<external_agent::AgentAttachment> {
+        if attachments.is_empty() {
+            return Vec::new();
+        }
+        let roots = self.attachment_project_roots(primary_project_root);
+        resolve_attachments_with_project_roots(
+            attachments,
+            &self.config.frame_registry,
+            session_dir,
+            &roots,
+        )
+        .await
+    }
+
     async fn handle_control_msg(&self, msg: event::ControlMsg) {
         match msg {
             event::ControlMsg::CreateSession {
@@ -647,13 +674,9 @@ impl SessionSupervisor {
             .lock()
             .map(|log| log.dir().to_path_buf())
             .unwrap_or_else(|_| log_dir.clone());
-        let resolved_attachments = resolve_attachments(
-            &attachments,
-            &self.config.frame_registry,
-            &session_dir,
-            &project.root,
-        )
-        .await;
+        let resolved_attachments = self
+            .resolve_session_attachments(&attachments, &session_dir, &project.root)
+            .await;
         if resolved_attachments.len() < attachments.len() {
             self.warn(&format!(
                 "Only resolved {} of {} requested attachment(s) for new session",
@@ -909,17 +932,9 @@ impl SessionSupervisor {
             .lock()
             .map(|log| log.dir().to_path_buf())
             .unwrap_or_else(|_| log_dir.clone());
-        let resolved_attachments = if attachments.is_empty() {
-            Vec::new()
-        } else {
-            resolve_attachments(
-                &attachments,
-                &self.config.frame_registry,
-                &session_dir,
-                &project.root,
-            )
-            .await
-        };
+        let resolved_attachments = self
+            .resolve_session_attachments(&attachments, &session_dir, &project.root)
+            .await;
         if resolved_attachments.len() < attachments.len() {
             self.warn(&format!(
                 "Only resolved {} of {} requested attachment(s) while resuming {} session {}",
@@ -1288,17 +1303,9 @@ impl SessionSupervisor {
                     return;
                 }
 
-                let resolved_attachments = if attachments.is_empty() {
-                    Vec::new()
-                } else {
-                    resolve_attachments(
-                        &attachments,
-                        &self.config.frame_registry,
-                        &session_dir,
-                        &project_root,
-                    )
-                    .await
-                };
+                let resolved_attachments = self
+                    .resolve_session_attachments(&attachments, &session_dir, &project_root)
+                    .await;
                 if resolved_attachments.len() < attachments.len() {
                     self.warn(&format!(
                         "Only resolved {} of {} requested attachment(s) for {} session {}",
@@ -1487,17 +1494,9 @@ impl SessionSupervisor {
             return;
         };
 
-        let resolved_attachments = if attachments.is_empty() {
-            Vec::new()
-        } else {
-            resolve_attachments(
-                &attachments,
-                &self.config.frame_registry,
-                &target.session_dir,
-                &target.project_root,
-            )
-            .await
-        };
+        let resolved_attachments = self
+            .resolve_session_attachments(&attachments, &target.session_dir, &target.project_root)
+            .await;
         if resolved_attachments.len() < attachments.len() {
             self.warn(&format!(
                 "Only resolved {} of {} edit attachment(s) for {} session {}",
@@ -1635,13 +1634,9 @@ impl SessionSupervisor {
             return;
         }
 
-        let resolved_attachments = resolve_attachments(
-            &attachments,
-            &self.config.frame_registry,
-            &session_dir,
-            &project_root,
-        )
-        .await;
+        let resolved_attachments = self
+            .resolve_session_attachments(&attachments, &session_dir, &project_root)
+            .await;
         if resolved_attachments.len() < attachments.len() {
             self.warn(&format!(
                 "Only resolved {} of {} steer attachment(s) for {} session {}",

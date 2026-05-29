@@ -2090,6 +2090,15 @@ fn build_session_report_zip(session_dir: &std::path::Path) -> std::io::Result<Ve
     Ok(cursor.into_inner())
 }
 
+fn current_session_log_dir(
+    session_log: Option<&Arc<Mutex<crate::session_log::SessionLog>>>,
+    query_ctx: Option<&WebQueryCtx>,
+) -> Option<PathBuf> {
+    session_log
+        .and_then(|slog| slog.lock().ok().map(|log| log.dir().to_path_buf()))
+        .or_else(|| query_ctx.map(|ctx| ctx.log_dir.clone()))
+}
+
 /// Parse a raw HTTP request blob for the `Host:` header and return its
 /// hostname portion as an `IpAddr` if it's a literal IP (v4 or v6).
 ///
@@ -8725,6 +8734,41 @@ fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &
     }
 }
 
+fn settings_post_result(body_text: &str, project_root: Option<&Path>) -> (&'static str, String) {
+    let Some(root) = project_root else {
+        return (
+            "400 Bad Request",
+            serde_json::json!({"error": "No project root"}).to_string(),
+        );
+    };
+    let payload = match serde_json::from_str::<SettingsPayload>(body_text) {
+        Ok(payload) => payload,
+        Err(e) => {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": format!("Invalid settings: {}", e)}).to_string(),
+            );
+        }
+    };
+    let mut proj = match crate::project::Project::from_root(root.to_path_buf()) {
+        Ok(proj) => proj,
+        Err(e) => {
+            return (
+                "500 Internal Server Error",
+                serde_json::json!({"error": e.to_string()}).to_string(),
+            );
+        }
+    };
+    apply_settings_payload(&mut proj.config, &payload);
+    match proj.save_config() {
+        Ok(()) => ("200 OK", serde_json::json!({"ok": true}).to_string()),
+        Err(e) => (
+            "500 Internal Server Error",
+            serde_json::json!({"error": e.to_string()}).to_string(),
+        ),
+    }
+}
+
 /// Return JSON with boolean flags indicating which API keys are configured.
 fn get_api_key_status_json() -> String {
     let openai = std::env::var("OPENAI_API_KEY")
@@ -12400,45 +12444,9 @@ pub fn spawn_web_gateway(
                             body_owned = full;
                             &body_owned
                         };
-                        let result = match &project_root {
-                            Some(root) => match serde_json::from_str::<SettingsPayload>(body_text) {
-                                Ok(payload) => {
-                                    match crate::project::Project::from_root(root.clone()) {
-                                        Ok(mut proj) => {
-                                            apply_settings_payload(&mut proj.config, &payload);
-                                            match proj.save_config() {
-                                                Ok(()) => {
-                                                    serde_json::json!({"ok": true}).to_string()
-                                                }
-                                                Err(e) => {
-                                                    serde_json::json!({"error": e.to_string()})
-                                                        .to_string()
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            serde_json::json!({"error": e.to_string()}).to_string()
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    serde_json::json!({"error": format!("Invalid settings: {}", e)})
-                                        .to_string()
-                                }
-                            },
-                            None => serde_json::json!({"error": "No project root"}).to_string(),
-                        };
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            result.len(),
-                            result
-                        );
+                        let (status, result) =
+                            settings_post_result(body_text, project_root.as_deref());
+                        let response = json_response(status, result);
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST")
                         && request_line.contains("/api/diagnostics/visual-freshness")
@@ -12953,14 +12961,8 @@ pub fn spawn_web_gateway(
                         && request_line.contains(" /api/session/current/agent-output")
                     {
                         use tokio::io::AsyncWriteExt;
-                        let log_dir = if let Some(ref slog) = session_log {
-                            match slog.lock() {
-                                Ok(l) => Some(l.dir().to_path_buf()),
-                                Err(_) => None,
-                            }
-                        } else {
-                            query_ctx.as_ref().map(|ctx| ctx.log_dir.clone())
-                        };
+                        let log_dir =
+                            current_session_log_dir(session_log.as_ref(), query_ctx.as_ref());
                         let body_text = read_post_body(&header_text, &mut stream).await;
                         let response = match log_dir {
                             Some(dir) => current_agent_output_post_response(&body_text, &dir),
@@ -13575,7 +13577,7 @@ pub fn spawn_web_gateway(
                             use tokio::io::AsyncWriteExt;
                             let session_id = rest_parts[0];
                             let resolved_dir: Option<PathBuf> = if session_id == "current" {
-                                query_ctx.as_ref().map(|ctx| ctx.log_dir.clone())
+                                current_session_log_dir(session_log.as_ref(), query_ctx.as_ref())
                             } else {
                                 resolve_session_dir(session_id)
                             };
@@ -16119,6 +16121,20 @@ mod tests {
     #[test]
     fn test_default_port() {
         assert_eq!(DEFAULT_PORT, 8765);
+    }
+
+    #[test]
+    fn current_session_log_dir_uses_live_log_without_query_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("headless-session");
+        let session_log = Arc::new(Mutex::new(
+            crate::session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+
+        assert_eq!(
+            current_session_log_dir(Some(&session_log), None).unwrap(),
+            log_dir
+        );
     }
 
     #[test]
@@ -19771,6 +19787,22 @@ mod tests {
         assert_eq!(config.agent.codex.managed_context, "managed");
         assert_eq!(config.agent.claude_code.command, "/opt/claude/bin/claude");
         assert_eq!(config.agent.gemini_cli.command, "/opt/gemini/bin/gemini");
+    }
+
+    #[test]
+    fn settings_post_result_rejects_invalid_json_with_bad_request() {
+        let (status, body) = settings_post_result("{\"external_agent\":", Some(Path::new(".")));
+
+        assert_eq!(status, "400 Bad Request");
+        assert!(body.contains("Invalid settings"));
+    }
+
+    #[test]
+    fn settings_post_result_rejects_missing_project_root_with_bad_request() {
+        let (status, body) = settings_post_result("{}", None);
+
+        assert_eq!(status, "400 Bad Request");
+        assert!(body.contains("No project root"));
     }
 
     #[test]

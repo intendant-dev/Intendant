@@ -7223,6 +7223,59 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn resolve_attachments_falls_back_to_daemon_project_uploads() {
+        use std::io::Write as _;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"pending upload").unwrap();
+        file.flush().unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("new-session-log");
+        let launch_project_root = tmp.path().join("launch-project");
+        let daemon_project_root = tmp.path().join("daemon-project");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&launch_project_root).unwrap();
+        std::fs::create_dir_all(&daemon_project_root).unwrap();
+
+        let upload = upload_store::commit_upload(
+            file,
+            "pending.txt",
+            "text/plain",
+            14,
+            upload_store::UploadDestination::Task,
+            &session_dir,
+            "daemon-session",
+            &daemon_project_root,
+        )
+        .unwrap();
+
+        let registry = Arc::new(tokio::sync::RwLock::new(frames::FrameRegistry::new(
+            &session_dir,
+        )));
+        let ids = vec![format!("upload:{}", upload.id)];
+        assert!(
+            resolve_attachments(&ids, &registry, &session_dir, &launch_project_root)
+                .await
+                .is_empty(),
+            "single-root lookup should not find uploads committed under another project"
+        );
+
+        let roots = vec![launch_project_root, daemon_project_root];
+        let attachments =
+            resolve_attachments_with_project_roots(&ids, &registry, &session_dir, &roots).await;
+
+        assert_eq!(attachments.len(), 1);
+        match &attachments[0] {
+            external_agent::AgentAttachment::File(file) => {
+                assert_eq!(file.name, "pending.txt");
+                assert_eq!(file.local_path, upload.path);
+            }
+            other => panic!("expected fallback file upload attachment, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_diff_file_paths_new_file() {
         let diff = "\
@@ -13858,13 +13911,31 @@ async fn resolve_attachments(
     session_dir: &std::path::Path,
     project_root: &std::path::Path,
 ) -> Vec<external_agent::AgentAttachment> {
+    resolve_attachments_with_project_roots(
+        ids,
+        registry,
+        session_dir,
+        &[project_root.to_path_buf()],
+    )
+    .await
+}
+
+async fn resolve_attachments_with_project_roots(
+    ids: &[String],
+    registry: &Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
+    session_dir: &std::path::Path,
+    project_roots: &[PathBuf],
+) -> Vec<external_agent::AgentAttachment> {
     if ids.is_empty() {
         return Vec::new();
     }
     let mut out: Vec<external_agent::AgentAttachment> = Vec::with_capacity(ids.len());
     for raw in ids {
         if let Some(upload_id) = raw.strip_prefix("upload:") {
-            let Some(d) = upload_store::find_upload(upload_id, session_dir, project_root) else {
+            let Some(d) = project_roots
+                .iter()
+                .find_map(|root| upload_store::find_upload(upload_id, session_dir, root))
+            else {
                 continue;
             };
             if d.is_image() {
