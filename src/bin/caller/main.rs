@@ -15285,6 +15285,14 @@ async fn main() -> Result<(), CallerError> {
                 if let Ok(mut log) = signal_session_log.lock() {
                     log.mark_interrupted();
                 }
+                let cleaned_external_children =
+                    external_agent::cleanup_spawned_child_processes_now();
+                if !cleaned_external_children.is_empty() {
+                    eprintln!(
+                        "Cleaned up external-agent child processes during signal shutdown: {:?}",
+                        cleaned_external_children
+                    );
+                }
                 // Clean up control socket
                 control::cleanup();
                 // Restore terminal (best-effort) so the shell isn't left in raw mode

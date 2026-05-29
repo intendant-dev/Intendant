@@ -2,12 +2,48 @@ use crate::conversation::ImageData;
 use crate::error::CallerError;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
 use tokio::sync::mpsc;
 
 pub mod claude_code;
 pub mod codex;
 pub mod gemini;
+
+static SPAWNED_CHILD_PROCESSES: OnceLock<StdMutex<HashSet<u32>>> = OnceLock::new();
+
+fn spawned_child_processes() -> &'static StdMutex<HashSet<u32>> {
+    SPAWNED_CHILD_PROCESSES.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn lock_spawned_child_processes() -> StdMutexGuard<'static, HashSet<u32>> {
+    match spawned_child_processes().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+pub(crate) fn register_child_process(pid: u32) {
+    if pid != 0 {
+        lock_spawned_child_processes().insert(pid);
+    }
+}
+
+pub(crate) fn unregister_child_process(pid: u32) {
+    lock_spawned_child_processes().remove(&pid);
+}
+
+pub(crate) fn cleanup_spawned_child_processes_now() -> Vec<u32> {
+    let pids: Vec<u32> = lock_spawned_child_processes().drain().collect();
+    let mut cleaned = Vec::new();
+    for pid in pids {
+        cleaned.extend(crate::platform::terminate_process_tree_now(pid));
+    }
+    cleaned.sort_unstable();
+    cleaned.dedup();
+    cleaned
+}
 
 /// One image attachment passed alongside a user message.
 ///

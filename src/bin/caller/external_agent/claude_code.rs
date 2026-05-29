@@ -471,6 +471,7 @@ impl ExternalAgent for ClaudeCodeAgent {
             .map_err(|e| {
                 CallerError::ExternalAgent(format!("Failed to spawn '{}': {}", self.command, e))
             })?;
+        let child_pid = child.id();
 
         let stdin = child
             .stdin
@@ -481,6 +482,9 @@ impl ExternalAgent for ClaudeCodeAgent {
             .take()
             .ok_or_else(|| CallerError::ExternalAgent("Failed to capture child stdout".into()))?;
 
+        if let Some(pid) = child_pid {
+            super::register_child_process(pid);
+        }
         self.child = Some(child);
         let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
         self.writer = Some(writer.clone());
@@ -604,7 +608,11 @@ impl ExternalAgent for ClaudeCodeAgent {
         }
 
         if let Some(ref mut child) = self.child {
+            let child_pid = child.id();
             let _ = child.kill().await;
+            if let Some(pid) = child_pid {
+                super::unregister_child_process(pid);
+            }
         }
 
         self.writer = None;
@@ -618,7 +626,11 @@ impl ExternalAgent for ClaudeCodeAgent {
 impl Drop for ClaudeCodeAgent {
     fn drop(&mut self) {
         if let Some(ref mut child) = self.child {
+            let child_pid = child.id();
             let _ = child.start_kill();
+            if let Some(pid) = child_pid {
+                super::unregister_child_process(pid);
+            }
         }
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();

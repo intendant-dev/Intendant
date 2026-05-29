@@ -261,6 +261,43 @@ pub fn terminate_unprotected_descendants_now(root_pid: u32, protected: &HashSet<
     targets
 }
 
+/// Best-effort synchronous cleanup for an owned child process and every
+/// visible descendant. Intended for shutdown paths that cannot await the async
+/// child handle cleanup, such as the controller's SIGINT/SIGTERM handler.
+pub fn terminate_process_tree_now(root_pid: u32) -> Vec<u32> {
+    if root_pid == 0 {
+        return Vec::new();
+    }
+
+    let protected = HashSet::new();
+    let descendants = terminate_unprotected_descendants_now(root_pid, &protected);
+
+    #[cfg(unix)]
+    {
+        signal_pid(root_pid, libc::SIGTERM);
+    }
+
+    #[cfg(windows)]
+    {
+        terminate_pid(root_pid);
+    }
+
+    let mut targets = descendants;
+    targets.push(root_pid);
+    targets.sort_unstable();
+    targets.dedup();
+
+    #[cfg(unix)]
+    {
+        std::thread::sleep(Duration::from_millis(200));
+        for pid in targets.iter().rev().filter(|pid| process_alive(**pid)) {
+            signal_pid(*pid, libc::SIGKILL);
+        }
+    }
+
+    targets
+}
+
 /// Async variant of [`terminate_unprotected_descendants_now`] that escalates to
 /// SIGKILL on Unix after a short grace period.
 pub async fn terminate_unprotected_descendants(

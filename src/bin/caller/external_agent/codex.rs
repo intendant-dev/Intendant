@@ -3393,6 +3393,7 @@ impl ExternalAgent for CodexAgent {
         let mut child = command.spawn().map_err(|e| {
             CallerError::ExternalAgent(format!("Failed to spawn '{}': {}", self.command, e))
         })?;
+        let child_pid = child.id();
 
         let stdin = child
             .stdin
@@ -3403,6 +3404,9 @@ impl ExternalAgent for CodexAgent {
             .take()
             .ok_or_else(|| CallerError::ExternalAgent("Failed to capture child stdout".into()))?;
 
+        if let Some(pid) = child_pid {
+            super::register_child_process(pid);
+        }
         self.child = Some(child);
         self.writer = Some(BufWriter::new(stdin));
 
@@ -3897,11 +3901,15 @@ impl ExternalAgent for CodexAgent {
 
         // Kill child process
         if let Some(ref mut child) = self.child {
-            if let Some(pid) = child.id() {
+            let child_pid = child.id();
+            if let Some(pid) = child_pid {
                 let protected = HashSet::new();
                 let _ = crate::platform::terminate_unprotected_descendants(pid, &protected).await;
             }
             let _ = child.kill().await;
+            if let Some(pid) = child_pid {
+                super::unregister_child_process(pid);
+            }
         }
 
         // Restore .codex/config.toml from backup
@@ -3933,11 +3941,15 @@ impl Drop for CodexAgent {
     fn drop(&mut self) {
         // Kill the child process synchronously to prevent orphans.
         if let Some(ref mut child) = self.child {
-            if let Some(pid) = child.id() {
+            let child_pid = child.id();
+            if let Some(pid) = child_pid {
                 let protected = HashSet::new();
                 let _ = crate::platform::terminate_unprotected_descendants_now(pid, &protected);
             }
             let _ = child.start_kill();
+            if let Some(pid) = child_pid {
+                super::unregister_child_process(pid);
+            }
         }
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();

@@ -908,6 +908,7 @@ impl ExternalAgent for GeminiAgent {
             .map_err(|e| {
                 CallerError::ExternalAgent(format!("Failed to spawn '{}': {}", self.command, e))
             })?;
+        let child_pid = child.id();
 
         let stdin = child
             .stdin
@@ -918,6 +919,9 @@ impl ExternalAgent for GeminiAgent {
             .take()
             .ok_or_else(|| CallerError::ExternalAgent("Failed to capture child stdout".into()))?;
 
+        if let Some(pid) = child_pid {
+            super::register_child_process(pid);
+        }
         self.child = Some(child);
         let shared_writer: SharedWriter = Arc::new(Mutex::new(BufWriter::new(stdin)));
         self.writer = Some(Arc::clone(&shared_writer));
@@ -1207,7 +1211,11 @@ impl ExternalAgent for GeminiAgent {
         }
 
         if let Some(ref mut child) = self.child {
+            let child_pid = child.id();
             let _ = child.kill().await;
+            if let Some(pid) = child_pid {
+                super::unregister_child_process(pid);
+            }
         }
 
         // Undo the `mcpServers.intendant` merge in $HOME/.gemini/settings.json
@@ -1226,7 +1234,11 @@ impl ExternalAgent for GeminiAgent {
 impl Drop for GeminiAgent {
     fn drop(&mut self) {
         if let Some(ref mut child) = self.child {
+            let child_pid = child.id();
             let _ = child.start_kill();
+            if let Some(pid) = child_pid {
+                super::unregister_child_process(pid);
+            }
         }
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();
