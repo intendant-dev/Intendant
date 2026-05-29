@@ -16432,7 +16432,16 @@ function inferSessionPhaseFromLog(c) {
   else if (content.startsWith('Task complete:')) phase = 'done';
   else if (content.startsWith('Round ') && content.includes(' complete')) phase = 'idle';
   else if (content.startsWith('Agent interrupted:')) phase = 'interrupted';
-  else if (content.startsWith('Session ended:')) phase = 'done';
+  else if (content.startsWith('Session ended:')) {
+    phase = 'done';
+    if (
+      sid === currentSessionFullId ||
+      sid === foregroundSessionFullId ||
+      (!hasActiveSessionWindowExcept(sid) && isAgentActivePhase(currentPhase))
+    ) {
+      setPhase('idle');
+    }
+  }
   if (phase) updateSessionWindow(sid, { phase });
 }
 
