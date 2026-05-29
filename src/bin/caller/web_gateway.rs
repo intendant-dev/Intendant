@@ -2590,6 +2590,7 @@ fn session_log_search_from_home_with_projects(
 
     let sessions: Vec<serde_json::Value> =
         serde_json::from_str(&list_sessions_from_home(home)).unwrap_or_else(|_| Vec::new());
+    let deleted_external_sessions = read_deleted_external_sessions(home);
     let source_filter = normalize_session_source_filter(source_filter);
     let project_filter = normalize_session_project_filter(project_filter);
     let mut results = Vec::new();
@@ -2627,9 +2628,13 @@ fn session_log_search_from_home_with_projects(
         else {
             continue;
         };
-        let Some((matches, snippets, file_truncated)) =
-            search_session_log_file(&search_path, query, &terms, mode)
-        else {
+        let Some((matches, snippets, file_truncated)) = search_session_log_file(
+            &search_path,
+            query,
+            &terms,
+            mode,
+            &deleted_external_sessions,
+        ) else {
             continue;
         };
         if file_truncated {
@@ -2790,9 +2795,11 @@ fn search_session_log_file(
     query: &str,
     terms: &[String],
     mode: SessionLogSearchMode,
+    deleted_external_sessions: &HashSet<(String, String)>,
 ) -> Option<(usize, Vec<serde_json::Value>, bool)> {
     let (contents, truncated) = read_text_prefix(path, SESSION_LOG_SEARCH_READ_LIMIT)?;
-    let (matches, snippets) = search_session_log_text(&contents, query, terms, mode);
+    let (matches, snippets) =
+        search_session_log_text(&contents, query, terms, mode, deleted_external_sessions);
     Some((matches, snippets, truncated))
 }
 
@@ -2864,10 +2871,17 @@ fn search_session_log_text(
     query: &str,
     terms: &[String],
     mode: SessionLogSearchMode,
+    deleted_external_sessions: &HashSet<(String, String)>,
 ) -> (usize, Vec<serde_json::Value>) {
     let candidates: Vec<SessionLogSearchCandidate> = text
         .lines()
         .filter_map(session_log_search_candidate_from_line)
+        .filter(|candidate| {
+            !session_log_candidate_is_deleted_external_reference(
+                candidate,
+                deleted_external_sessions,
+            )
+        })
         .collect();
     if mode == SessionLogSearchMode::AnyKeywordSession
         && !candidates
@@ -2908,6 +2922,26 @@ fn search_session_log_text(
     }
 
     (matches, snippets)
+}
+
+fn session_log_candidate_is_deleted_external_reference(
+    candidate: &SessionLogSearchCandidate,
+    deleted_external_sessions: &HashSet<(String, String)>,
+) -> bool {
+    if deleted_external_sessions.is_empty() {
+        return false;
+    }
+
+    if candidate.event == "presence_log"
+        && candidate.text.contains("ControlMsg:")
+        && candidate.text.contains("CreateSession")
+    {
+        return true;
+    }
+
+    deleted_external_sessions
+        .iter()
+        .any(|(_source, id)| !id.is_empty() && candidate.text.contains(id))
 }
 
 fn session_log_candidate_matches(
@@ -17356,6 +17390,88 @@ mod tests {
             .and_then(|v| v.as_array())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn session_log_search_filters_deleted_external_references_from_parent_logs() {
+        let home = tempfile::tempdir().unwrap();
+        let parent_id = "intendant-parent-search-session";
+        let deleted_external_id = "019e37ae-deleted-search";
+        let deleted_marker = "deleted-parent-search-token";
+        let visible_marker = "visible-parent-search-token";
+        let log_dir = home.path().join(".intendant").join("logs").join(parent_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": parent_id,
+                "created_at": "2026-05-17T20:44:00",
+                "task": "parent daemon session",
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let lines = [
+            serde_json::json!({
+                "ts": "2026-05-17T20:44:01",
+                "event": "presence_log",
+                "level": "debug",
+                "message": format!("[ws] ControlMsg: \"CreateSession {{ task: \\\"{deleted_marker}\\\" }}\"")
+            }),
+            serde_json::json!({
+                "ts": "2026-05-17T20:44:02",
+                "event": "session_started",
+                "message": format!("Session started: {deleted_external_id} {deleted_marker}"),
+                "data": {
+                    "source": "codex",
+                    "session_id": deleted_external_id,
+                    "task": deleted_marker,
+                }
+            }),
+            serde_json::json!({
+                "ts": "2026-05-17T20:44:03",
+                "event": "info",
+                "message": visible_marker
+            }),
+        ];
+        std::fs::write(
+            log_dir.join("session.jsonl"),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        mark_external_session_deleted(home.path(), "codex", deleted_external_id).unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            deleted_marker,
+            "all",
+            "exact_phrase",
+        ))
+        .unwrap();
+        let results = response.get("results").and_then(|v| v.as_array()).unwrap();
+        assert!(
+            results.is_empty(),
+            "deleted external child references should not leak through parent log search: {results:?}"
+        );
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            visible_marker,
+            "all",
+            "exact_phrase",
+        ))
+        .unwrap();
+        let results = response.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("session_id").and_then(|v| v.as_str()),
+            Some(parent_id)
+        );
     }
 
     #[test]
