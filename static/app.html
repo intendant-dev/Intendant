@@ -28231,7 +28231,7 @@ function finishNewSessionSpawnNotice(sessionId, task) {
   newSessionSpawnTask = '';
   setNewSessionStartButtonPending(false);
   const shortId = sessionId ? ` (${shortSessionId(sessionId)})` : '';
-  setNewSessionSpawnNotice('ok', `Session started${shortId}. Opening Activity...`);
+  setNewSessionSpawnNotice('ok', `Session started${shortId}. Activity is ready.`);
   showControlToast('success', `Session started${shortId}`);
   rememberNewSessionSpawnRecent(sessionId, actualTask || expectedTask);
   newSessionSpawnClearTimeout = setTimeout(() => {
