@@ -10064,6 +10064,7 @@ function currentChangesTargetMismatchReason() {
   const source = externalSourceForSessionWindow(sid, win)
     || normalizeAgentId(meta.source || meta.backendSource || '');
   if (!source || source === 'intendant') return '';
+  if (currentChangesTargetQuery()) return '';
 
   const trackedRoot = normalizeChangesRootPath(dashboardProjectRoot);
   const targetRoot = normalizeChangesRootPath(meta.projectRoot || meta.cwd);
@@ -10071,6 +10072,31 @@ function currentChangesTargetMismatchReason() {
 
   const sourceLabel = meta.sourceLabel || meta.backendSource || source;
   return `Change tracking is attached to ${compactPathLabel(trackedRoot, true)}, but the selected ${sourceLabel} session is in ${compactPathLabel(targetRoot, true)}.`;
+}
+
+function currentChangesTargetQuery() {
+  const sid = String(currentSessionFullId || foregroundSessionFullId || '').trim();
+  if (!sid) return '';
+  const meta = sessionMetadataById.get(sid) || {};
+  const win = sessionWindows.get(sid) || null;
+  const source = externalSourceForSessionWindow(sid, win)
+    || normalizeAgentId(meta.source || meta.backendSource || meta.backend_source || '');
+  if (!source || source === 'intendant') return '';
+
+  const params = new URLSearchParams();
+  params.set('session_id', sid);
+  const backendId = String(meta.backendSessionId || meta.backend_session_id || '').trim();
+  const intendantId = String(meta.intendantSessionId || meta.intendant_session_id || '').trim();
+  if (backendId) params.set('backend_session_id', backendId);
+  if (intendantId) params.set('intendant_session_id', intendantId);
+  params.set('source', source);
+  return params.toString();
+}
+
+function changesRequestUrl(path = '') {
+  const suffix = path ? `/${encodeChangePath(path)}` : '';
+  const query = currentChangesTargetQuery();
+  return `/api/session/current/changes${suffix}${query ? `?${query}` : ''}`;
 }
 
 function showChangesTargetMismatch(message) {
@@ -10095,7 +10121,7 @@ async function refreshChangesList(options = {}) {
     return;
   }
   try {
-    const resp = await fetch('/api/session/current/changes');
+    const resp = await fetch(changesRequestUrl());
     const data = await parseChangesResponse(resp);
     if (seq !== changesRefreshSeq) return;
     changedFiles.clear();
@@ -10157,7 +10183,7 @@ async function selectChangesFile(path, options = {}) {
   renderChangesDiffHeader(path, changedFiles.get(path), 'Loading');
   content.innerHTML = '<span class="changes-empty">Loading...</span>';
   try {
-    const resp = await fetch(`/api/session/current/changes/${encodeChangePath(path)}`);
+    const resp = await fetch(changesRequestUrl(path));
     const data = await parseChangesResponse(resp);
     if (path !== activeChangesFile) return;
     if (changedFiles.has(path)) {

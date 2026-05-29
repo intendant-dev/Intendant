@@ -6219,10 +6219,43 @@ struct ChangeRecord {
     diff: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ChangesRequestTarget {
+    snapshot_dir: PathBuf,
+    project_root: PathBuf,
+    include_project_external_logs: bool,
+}
+
 fn handle_changes_request(
     request_line: &str,
     snapshot_dir: Option<&Path>,
     project_root: Option<&Path>,
+) -> (&'static str, String) {
+    handle_changes_request_inner(request_line, snapshot_dir, project_root, false)
+}
+
+fn handle_changes_request_for_home(
+    request_line: &str,
+    snapshot_dir: Option<&Path>,
+    project_root: Option<&Path>,
+    home: &Path,
+) -> (&'static str, String) {
+    if let Some(target) = changes_request_target_from_home(request_line, home) {
+        return handle_changes_request_inner(
+            request_line,
+            Some(&target.snapshot_dir),
+            Some(&target.project_root),
+            target.include_project_external_logs,
+        );
+    }
+    handle_changes_request(request_line, snapshot_dir, project_root)
+}
+
+fn handle_changes_request_inner(
+    request_line: &str,
+    snapshot_dir: Option<&Path>,
+    project_root: Option<&Path>,
+    include_project_external_logs: bool,
 ) -> (&'static str, String) {
     let (snapshot_dir, project_root) = match (snapshot_dir, project_root) {
         (Some(s), Some(p)) => (s, p),
@@ -6235,10 +6268,6 @@ fn handle_changes_request(
     };
 
     let baseline_dir = snapshot_dir.join("baseline");
-    if !baseline_dir.exists() {
-        return ("200 OK", serde_json::json!([]).to_string());
-    }
-
     // Extract the request target from `GET <target> HTTP/1.1`, then trim the
     // endpoint prefix. The list endpoint has no path suffix.
     let target = request_line.split_whitespace().nth(1).unwrap_or("");
@@ -6250,16 +6279,133 @@ fn handle_changes_request(
         .unwrap_or("")
         .trim_start_matches('/');
 
+    if !baseline_dir.exists() {
+        let records =
+            load_external_change_records(snapshot_dir, project_root, !file_path.is_empty(), true);
+        if file_path.is_empty() {
+            let changes: Vec<_> = records.iter().map(change_record_summary_json).collect();
+            return (
+                "200 OK",
+                serde_json::to_string(&changes).unwrap_or_else(|_| "[]".to_string()),
+            );
+        }
+
+        let decoded = url_path_decode(file_path);
+        if let Some(record) = records.into_iter().find(|record| record.path == decoded) {
+            return ("200 OK", change_record_detail_json(&record).to_string());
+        }
+        return (
+            "404 Not Found",
+            serde_json::json!({"error": "no changes for path"}).to_string(),
+        );
+    }
+
     if file_path.is_empty() {
         // List all changed files.
         (
             "200 OK",
-            handle_changes_list(snapshot_dir, &baseline_dir, project_root),
+            handle_changes_list(
+                snapshot_dir,
+                &baseline_dir,
+                project_root,
+                include_project_external_logs,
+            ),
         )
     } else {
         // Single-file diff.
-        handle_changes_file_diff(file_path, snapshot_dir, &baseline_dir, project_root)
+        handle_changes_file_diff(
+            file_path,
+            snapshot_dir,
+            &baseline_dir,
+            project_root,
+            include_project_external_logs,
+        )
     }
+}
+
+fn changes_request_target_id(request_line: &str) -> Option<String> {
+    [
+        "session_id",
+        "target_session_id",
+        "backend_session_id",
+        "intendant_session_id",
+    ]
+    .into_iter()
+    .find_map(|key| query_param(request_line, key))
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+}
+
+fn session_row_matches_changes_target(session: &serde_json::Value, target_id: &str) -> bool {
+    [
+        "session_id",
+        "resume_id",
+        "backend_session_id",
+        "intendant_session_id",
+    ]
+    .into_iter()
+    .any(|key| session.get(key).and_then(|v| v.as_str()) == Some(target_id))
+}
+
+fn changes_project_root_from_session(session: &serde_json::Value) -> Option<PathBuf> {
+    ["project_root", "cwd", "workdir", "workDir"]
+        .into_iter()
+        .find_map(|key| value_str(session, key))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn changes_log_dir_from_session(session: &serde_json::Value) -> Option<PathBuf> {
+    ["intendant_session_path", "path"]
+        .into_iter()
+        .filter_map(|key| value_str(session, key).map(PathBuf::from))
+        .find(|path| path.is_dir())
+}
+
+fn changes_request_target_from_home(
+    request_line: &str,
+    home: &Path,
+) -> Option<ChangesRequestTarget> {
+    let target_id = changes_request_target_id(request_line)?;
+    let logs_dir = home.join(".intendant").join("logs");
+    let entries = std::fs::read_dir(logs_dir).ok()?;
+
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let session_id = entry.file_name().to_string_lossy().to_string();
+        let Some(row) = intendant_session_list_row_from_dir(&dir, &session_id) else {
+            continue;
+        };
+        if !session_row_matches_changes_target(&row, &target_id) {
+            continue;
+        }
+        let project_root = changes_project_root_from_session(&row)?;
+        return Some(ChangesRequestTarget {
+            snapshot_dir: dir.join("file_snapshots"),
+            project_root,
+            include_project_external_logs: true,
+        });
+    }
+
+    let sessions: Vec<serde_json::Value> =
+        serde_json::from_str(&list_sessions_from_home(home)).unwrap_or_default();
+    for session in sessions {
+        if !session_row_matches_changes_target(&session, &target_id) {
+            continue;
+        }
+        let project_root = changes_project_root_from_session(&session)?;
+        let log_dir = changes_log_dir_from_session(&session)?;
+        return Some(ChangesRequestTarget {
+            snapshot_dir: log_dir.join("file_snapshots"),
+            project_root,
+            include_project_external_logs: true,
+        });
+    }
+
+    None
 }
 
 fn load_baseline_manifest(baseline_dir: &Path) -> crate::file_watcher::BaselineManifest {
@@ -6391,6 +6537,49 @@ fn diff_stats_from_unified_diff(diff: &str) -> (u32, u32) {
     (added, removed)
 }
 
+fn external_diff_project_root(diff: &str) -> Option<String> {
+    for line in diff.lines() {
+        let line = line.trim();
+        if let Some(root) = line.strip_prefix("# intendant-project-root:") {
+            let root = root.trim();
+            if !root.is_empty() {
+                return Some(root.to_string());
+            }
+        }
+        if line.starts_with("diff --git ") || line.starts_with("--- ") {
+            break;
+        }
+    }
+    None
+}
+
+fn path_keys_match(a: &Path, b: &Path) -> bool {
+    let clean = |path: &Path| {
+        path.canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .to_string()
+    };
+    clean(a) == clean(b)
+}
+
+fn external_diff_kind(diff: &str) -> &'static str {
+    if diff
+        .lines()
+        .any(|line| line.starts_with("new file mode") || line == "--- /dev/null")
+    {
+        return "created";
+    }
+    if diff
+        .lines()
+        .any(|line| line.starts_with("deleted file mode") || line == "+++ /dev/null")
+    {
+        return "deleted";
+    }
+    "modified"
+}
+
 fn path_is_inside_project_root(project_root: &Path, path: &Path) -> bool {
     if !path.is_absolute() {
         return true;
@@ -6407,10 +6596,43 @@ fn path_is_inside_project_root(project_root: &Path, path: &Path) -> bool {
     }
 }
 
+fn safe_relative_change_path(path: &str) -> Option<String> {
+    let rel = Path::new(path);
+    if rel.is_absolute() {
+        return None;
+    }
+    if rel
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && !crate::file_watcher::should_ignore(rel)
+    {
+        Some(crate::file_watcher::rel_path_key(rel))
+    } else {
+        None
+    }
+}
+
+fn project_relative_external_diff_path(project_root: &Path, path: &str) -> Option<String> {
+    let path_obj = Path::new(path);
+    if !path_obj.is_absolute() {
+        return safe_relative_change_path(path);
+    }
+    if let Ok(rel) = path_obj.strip_prefix(project_root) {
+        return safe_relative_change_path(&crate::file_watcher::rel_path_key(rel));
+    }
+    if let Ok(root) = project_root.canonicalize() {
+        if let Ok(rel) = path_obj.strip_prefix(root) {
+            return safe_relative_change_path(&crate::file_watcher::rel_path_key(rel));
+        }
+    }
+    None
+}
+
 fn load_external_change_records(
     snapshot_dir: &Path,
     project_root: &Path,
     include_diff: bool,
+    include_project_root_paths: bool,
 ) -> Vec<ChangeRecord> {
     let Some(log_dir) = snapshot_dir.parent() else {
         return Vec::new();
@@ -6430,24 +6652,42 @@ fn load_external_change_records(
         let Some(diff_body) = external_diff_log_body(message) else {
             continue;
         };
-        for (path, block) in split_external_unified_diff_by_file(diff_body) {
-            let path_obj = Path::new(&path);
-            if !path_obj.is_absolute() || path_is_inside_project_root(project_root, path_obj) {
+        if let Some(log_project_root) = external_diff_project_root(diff_body) {
+            if !path_keys_match(Path::new(&log_project_root), project_root) {
                 continue;
             }
-            let (lines_added, lines_removed) = diff_stats_from_unified_diff(&block);
-            by_path.insert(
-                path.clone(),
-                ChangeRecord {
-                    path,
-                    kind: "external",
-                    lines_added,
-                    lines_removed,
-                    diff_available: true,
-                    reason: Some(
+        }
+        for (path, block) in split_external_unified_diff_by_file(diff_body) {
+            let path_obj = Path::new(&path);
+            let project_relative = project_relative_external_diff_path(project_root, &path);
+            let (display_path, kind, reason) = if let Some(rel) = project_relative {
+                if !include_project_root_paths {
+                    continue;
+                }
+                (rel, external_diff_kind(&block), None)
+            } else {
+                if !path_obj.is_absolute() || path_is_inside_project_root(project_root, path_obj) {
+                    continue;
+                }
+                (
+                    path.clone(),
+                    "external",
+                    Some(
                         "outside tracked project root; shown from external agent diff log"
                             .to_string(),
                     ),
+                )
+            };
+            let (lines_added, lines_removed) = diff_stats_from_unified_diff(&block);
+            by_path.insert(
+                display_path.clone(),
+                ChangeRecord {
+                    path: display_path,
+                    kind,
+                    lines_added,
+                    lines_removed,
+                    diff_available: true,
+                    reason,
                     diff: include_diff.then_some(block),
                 },
             );
@@ -6732,7 +6972,12 @@ fn change_record_detail_json(record: &ChangeRecord) -> serde_json::Value {
 }
 
 /// List all files that have changed since the session baseline.
-fn handle_changes_list(snapshot_dir: &Path, baseline_dir: &Path, project_root: &Path) -> String {
+fn handle_changes_list(
+    snapshot_dir: &Path,
+    baseline_dir: &Path,
+    project_root: &Path,
+    include_project_external_logs: bool,
+) -> String {
     let baseline_manifest = load_baseline_manifest(baseline_dir);
     let baseline_paths = collect_baseline_text_paths(baseline_dir);
     let current_states = collect_current_change_states(project_root);
@@ -6766,7 +7011,12 @@ fn handle_changes_list(snapshot_dir: &Path, baseline_dir: &Path, project_root: &
                 .map(str::to_string)
         })
         .collect();
-    for record in load_external_change_records(snapshot_dir, project_root, false) {
+    for record in load_external_change_records(
+        snapshot_dir,
+        project_root,
+        false,
+        include_project_external_logs,
+    ) {
         if !existing_paths.contains(&record.path) {
             changes.push(change_record_summary_json(&record));
         }
@@ -6780,14 +7030,20 @@ fn handle_changes_file_diff(
     snapshot_dir: &Path,
     baseline_dir: &Path,
     project_root: &Path,
+    include_project_external_logs: bool,
 ) -> (&'static str, String) {
     let decoded = url_path_decode(file_path);
     // Reject path traversal.
     let rel = Path::new(&decoded);
     if rel.is_absolute() {
-        if let Some(record) = load_external_change_records(snapshot_dir, project_root, true)
-            .into_iter()
-            .find(|record| record.path == decoded)
+        if let Some(record) = load_external_change_records(
+            snapshot_dir,
+            project_root,
+            true,
+            include_project_external_logs,
+        )
+        .into_iter()
+        .find(|record| record.path == decoded)
         {
             return ("200 OK", change_record_detail_json(&record).to_string());
         }
@@ -6864,10 +7120,23 @@ fn handle_changes_file_diff(
         true,
     ) {
         Some(record) => ("200 OK", change_record_detail_json(&record).to_string()),
-        None => (
-            "404 Not Found",
-            serde_json::json!({"error": "no changes for path"}).to_string(),
-        ),
+        None => {
+            if let Some(record) = load_external_change_records(
+                snapshot_dir,
+                project_root,
+                true,
+                include_project_external_logs,
+            )
+            .into_iter()
+            .find(|record| record.path == decoded)
+            {
+                return ("200 OK", change_record_detail_json(&record).to_string());
+            }
+            (
+                "404 Not Found",
+                serde_json::json!({"error": "no changes for path"}).to_string(),
+            )
+        }
     }
 }
 
@@ -12985,10 +13254,11 @@ pub fn spawn_web_gateway(
                         //   GET /api/session/current/changes        — list all changed files
                         //   GET /api/session/current/changes/{path} — unified diff for one file
                         use tokio::io::AsyncWriteExt;
-                        let (status, body) = handle_changes_request(
+                        let (status, body) = handle_changes_request_for_home(
                             &request_line,
                             snapshot_dir.as_deref(),
                             project_root_for_changes.as_deref(),
+                            &crate::platform::home_dir(),
                         );
                         let response = format!(
                             "HTTP/1.1 {}\r\n\
@@ -19924,6 +20194,85 @@ mod tests {
         assert_eq!(json["path"], external_display.as_ref());
         assert_eq!(json["kind"], "external");
         assert!(json["diff"].as_str().unwrap().contains("+alpha"));
+    }
+
+    #[test]
+    fn changes_request_targets_external_wrapper_diff_without_baseline() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let logs_dir = home.path().join(".intendant/logs");
+        let wrapper_id = "wrapper-session";
+        let backend_id = "backend-session";
+        let wrapper_dir = logs_dir.join(wrapper_id);
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        std::fs::write(
+            wrapper_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": wrapper_id,
+                "created_at": "2026-05-29T06:11:20",
+                "project_root": project.path().to_string_lossy(),
+                "task": "external diff"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let diff = format!(
+            "External agent diff: 2 files (created.txt, tracked.txt)\n# intendant-project-root: {}\ndiff --git a/created.txt b/created.txt\nnew file mode 100644\n--- /dev/null\n+++ b/created.txt\n@@ -0,0 +1 @@\n+created\ndiff --git a/tracked.txt b/tracked.txt\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1 +1 @@\n-old\n+new\n",
+            project.path().display()
+        );
+        let session_lines = vec![
+            serde_json::json!({"event": "info", "message": "Mode: external agent (Codex)"}),
+            serde_json::json!({"event": "debug", "message": format!("External agent thread: {backend_id}")}),
+            serde_json::json!({"event": "info", "message": diff}),
+        ];
+        std::fs::write(
+            wrapper_dir.join("session.jsonl"),
+            session_lines
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let default_snapshot = tempfile::TempDir::new().unwrap();
+        let default_project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(default_snapshot.path().join("baseline")).unwrap();
+
+        let request = format!("GET /api/session/current/changes?session_id={backend_id} HTTP/1.1");
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(default_snapshot.path()),
+            Some(default_project.path()),
+            home.path(),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let paths: Vec<_> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("path").and_then(|path| path.as_str()))
+            .collect();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(paths, vec!["created.txt", "tracked.txt"]);
+        assert_eq!(json[0]["kind"], "created");
+        assert_eq!(json[1]["kind"], "modified");
+
+        let request = format!(
+            "GET /api/session/current/changes/created.txt?session_id={backend_id} HTTP/1.1"
+        );
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(default_snapshot.path()),
+            Some(default_project.path()),
+            home.path(),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json["path"], "created.txt");
+        assert!(json["diff"].as_str().unwrap().contains("+created"));
     }
 
     #[test]
