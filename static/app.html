@@ -1134,16 +1134,6 @@ html, body {
   white-space: nowrap;
 }
 .global-direct-toggle input { margin: 0; accent-color: var(--blue); }
-.global-upload-dest {
-  padding: 3px 6px;
-  font-size: 11px;
-  background: var(--surface0);
-  color: var(--text);
-  border: 1px solid var(--surface1);
-  border-radius: 4px;
-  cursor: pointer;
-}
-.global-upload-dest:focus { outline: 1px solid var(--blue); }
 .global-attach-btn {
   padding: 3px 8px;
   border: 1px solid var(--surface1);
@@ -6379,6 +6369,13 @@ html, body {
   .status-bar { font-size: 11px; gap: 8px; padding: 4px 8px; }
   .status-bar .session { display: inline; flex-shrink: 0; }
   .tab-btn { padding: 8px 12px; font-size: 12px; }
+  .subtabs {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .subtab-btn {
+    flex: 0 0 auto;
+  }
   .log-entry { padding: 1px 8px; }
   .log-entry .log-ts { width: 55px; font-size: 10px; }
   .session-detail-logs .log-ts { width: 118px; font-size: 10px; }
@@ -6414,9 +6411,57 @@ html, body {
   .video-btn { width: 40px; height: 40px; font-size: 16px; }
   .video-preview { width: 120px; height: 90px; }
   .video-preview-wrap { bottom: 70px; right: 8px; }
-  .global-task-bar { flex-wrap: wrap; }
-  .global-pending-attachments {
+  .global-task-bar {
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+  }
+  .global-task-bar .phase-banner {
+    order: 1;
+    flex: 1 1 0;
+    min-width: 0;
+  }
+  .phase-banner .phase-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .stop-btn,
+  .task-new-session-btn {
+    order: 1;
+  }
+  .task-target-chip,
+  .edit-message-chip {
+    order: 2;
+    flex: 1 0 100%;
+    max-width: 100%;
+  }
+  .task-target-session-badge {
+    max-width: none;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .global-task-input {
     order: 3;
+    flex: 1 0 100%;
+    width: 100%;
+  }
+  .global-attach-btn,
+  .global-direct-toggle,
+  .global-send-btn {
+    order: 4;
+    flex: 0 0 auto;
+  }
+  .global-send-btn {
+    min-width: 58px;
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+  .global-pending-attachments {
+    order: 5;
+    flex: 1 0 100%;
     width: 100%;
     max-width: none;
   }
@@ -6515,11 +6560,7 @@ html, body {
          (to /api/session/current/uploads) so progress is independent per
          attachment. -->
     <input type="file" id="upload-file-input" multiple style="display:none" />
-    <select id="upload-destination" class="global-upload-dest" title="Where uploaded files land. Workspace puts them under the project's workspace_files/ for the agent to reference across turns; Task drops them in the session's uploads/ and cleans up on session end.">
-      <option value="workspace" selected>Workspace</option>
-      <option value="task">Task</option>
-    </select>
-    <button id="upload-attach-btn" class="global-attach-btn" title="Attach file(s). Saved to the workspace or task scope picked in the dropdown. Images are attached to the next task as images; other files get a stage-and-point message prelude the agent can follow with its file-read tool.">&#x1F4CE;</button>
+    <button id="upload-attach-btn" class="global-attach-btn" title="Attach file(s). Files are staged under the project's ignored .intendant/uploads/ store and attached to the next task.">&#x1F4CE;</button>
     <div id="global-pending-attachments" class="global-pending-attachments hidden" aria-live="polite"></div>
     <label class="global-direct-toggle" title="Skip the presence AI and send the task straight to the worker agent (internal or external). Use this for testing, automation, or when you don't need conversational mediation."><input type="checkbox" id="direct-mode-toggle" />Direct</label>
     <button id="activity-submit-btn" class="global-send-btn" onclick="submitActivityOrSteer()" title="Start a new task or send a follow-up.">Send</button>
@@ -19836,9 +19877,7 @@ function uploadAttachButtons() {
 
 async function triggerUploadFlow(files) {
   if (!files || files.length === 0) return;
-  const dest = document.getElementById('upload-destination')?.value === 'task'
-    ? 'task'
-    : 'workspace';
+  const dest = 'task';
   const buttons = uploadAttachButtons();
   activeUploadFlows += 1;
   buttons.forEach(btn => btn.classList.add('uploading'));

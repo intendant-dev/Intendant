@@ -7053,9 +7053,12 @@ mod tests {
                 assert_eq!(file.name, "data.csv");
                 assert_eq!(file.mime_type, "text/csv");
                 assert_eq!(file.size, 8);
-                assert!(file
-                    .local_path
-                    .starts_with(project_root.join("workspace_files")));
+                assert!(file.local_path.starts_with(
+                    project_root
+                        .join(".intendant")
+                        .join("uploads")
+                        .join("sess-1")
+                ));
             }
             other => panic!("expected file upload attachment, got {other:?}"),
         }

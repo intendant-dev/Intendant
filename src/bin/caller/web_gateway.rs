@@ -7150,13 +7150,9 @@ fn managed_context_records_response(request_line: &str, log_dir: &Path) -> Strin
 
 fn effective_upload_destination(
     requested: crate::upload_store::UploadDestination,
-    has_active_session: bool,
+    _has_active_session: bool,
 ) -> crate::upload_store::UploadDestination {
-    if has_active_session {
-        requested
-    } else {
-        crate::upload_store::UploadDestination::Workspace
-    }
+    requested
 }
 
 /// Parse a query-string value by key out of a full `request_line`
@@ -12275,9 +12271,10 @@ pub fn spawn_web_gateway(
                         //   <raw bytes>
                         //
                         // Streams the body into a tempfile, commits it into
-                        // the upload store (per-session `uploads/` or
-                        // per-project `workspace_files/`), and broadcasts
-                        // UploadReady so all connected browsers see it.
+                        // the project-local ignored upload store
+                        // (`.intendant/uploads/<session-id>/`), and
+                        // broadcasts UploadReady so all connected browsers
+                        // see it.
                         //
                         // Route sits in the `/api/session/current/*` family
                         // alongside `changes`, `history`, `rollback`, etc.
@@ -12342,7 +12339,9 @@ pub fn spawn_web_gateway(
                                         } else {
                                             (
                                                 pending_upload_session_dir(root),
-                                                "pending".to_string(),
+                                                daemon_session_id
+                                                    .clone()
+                                                    .unwrap_or_else(|| "pending".to_string()),
                                             )
                                         }
                                     };
@@ -15451,10 +15450,10 @@ mod tests {
     }
 
     #[test]
-    fn upload_destination_falls_back_to_workspace_without_active_session() {
+    fn upload_destination_is_not_rewritten_without_active_session() {
         assert_eq!(
             effective_upload_destination(crate::upload_store::UploadDestination::Task, false,),
-            crate::upload_store::UploadDestination::Workspace
+            crate::upload_store::UploadDestination::Task
         );
         assert_eq!(
             effective_upload_destination(crate::upload_store::UploadDestination::Workspace, false,),

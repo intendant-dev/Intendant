@@ -2,14 +2,13 @@
 //!
 //! Uploads come in two flavours:
 //!
-//! - **Task-scoped** (default for ephemeral attachments like "look at this
-//!   screenshot"). Stored in `<session_dir>/uploads/` so the session zip
-//!   bundle picks them up and they disappear when the session is garbage-
-//!   collected.
-//! - **Workspace-durable** (files the agent should be able to reference
-//!   across turns — "read this CSV", "edit this config"). Stored under
-//!   `<project_root>/workspace_files/` so the agent's existing filesystem
-//!   tools (Read, Grep, etc.) find them under a stable path.
+//! - **Task-scoped** (the dashboard default). Stored under
+//!   `<project_root>/.intendant/uploads/<session-id>/` so sandboxed
+//!   external agents can read attachments with normal workspace access,
+//!   without polluting the project's tracked files.
+//! - **Workspace-durable** is a legacy API spelling retained for old
+//!   dashboards. It now uses the same ignored `.intendant/uploads` store
+//!   instead of the old `<project_root>/workspace_files/` directory.
 //!
 //! The browser-facing POST endpoint picks the destination based on a
 //! query param; both variants produce an [`UploadDescriptor`] that the
@@ -19,18 +18,20 @@
 use crate::error::CallerError;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::fs::OpenOptions;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Where an upload lives on disk. Changes the directory we write into and,
-/// more importantly, the lifetime policy (session-scoped vs project-scoped).
+/// User-requested upload scope. Kept in descriptors for compatibility, but
+/// dashboard uploads now share the project-local ignored store regardless of
+/// this value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UploadDestination {
-    /// Dropped in the session dir, cleaned up when the session ends.
+    /// Dropped under the project-local ignored `.intendant/uploads` store.
     Task,
-    /// Dropped in the project root under `workspace_files/`, persists across
-    /// sessions and is visible to the agent's file-read tools.
+    /// Legacy spelling; also uses the project-local ignored upload store.
     Workspace,
 }
 
@@ -114,21 +115,116 @@ pub fn sanitize_name(raw: &str) -> String {
 }
 
 /// Directory where task-scoped uploads live.
-fn task_uploads_dir(session_dir: &Path) -> PathBuf {
+fn legacy_task_uploads_dir(session_dir: &Path) -> PathBuf {
     session_dir.join("uploads")
 }
 
-/// Directory where workspace-durable uploads live.
-fn workspace_uploads_dir(project_root: &Path) -> PathBuf {
+/// Legacy directory where workspace-durable uploads used to live.
+fn legacy_workspace_uploads_dir(project_root: &Path) -> PathBuf {
     project_root.join("workspace_files")
 }
 
+/// Root of the project-local ignored upload store.
+fn project_uploads_root(project_root: &Path) -> PathBuf {
+    project_root.join(".intendant").join("uploads")
+}
+
+/// Directory for uploads associated with one Intendant wrapper/worker session.
+fn project_session_uploads_dir(project_root: &Path, session_id: &str) -> PathBuf {
+    let safe_session = sanitize_name(session_id);
+    project_uploads_root(project_root).join(safe_session)
+}
+
 /// Pick the target directory for a given destination.
-fn target_dir(destination: UploadDestination, session_dir: &Path, project_root: &Path) -> PathBuf {
-    match destination {
-        UploadDestination::Task => task_uploads_dir(session_dir),
-        UploadDestination::Workspace => workspace_uploads_dir(project_root),
+fn target_dir(
+    _destination: UploadDestination,
+    _session_dir: &Path,
+    session_id: &str,
+    project_root: &Path,
+) -> PathBuf {
+    project_session_uploads_dir(project_root, session_id)
+}
+
+fn ignore_rule_matches_intendant_uploads(line: &str) -> bool {
+    let trimmed = line.split('#').next().unwrap_or("").trim();
+    matches!(
+        trimmed,
+        ".intendant"
+            | ".intendant/"
+            | "/.intendant"
+            | "/.intendant/"
+            | ".intendant/uploads"
+            | ".intendant/uploads/"
+            | "/.intendant/uploads"
+            | "/.intendant/uploads/"
+            | ".intendant/**"
+            | "/.intendant/**"
+    )
+}
+
+fn ignore_file_has_intendant_rule(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|content| content.lines().any(ignore_rule_matches_intendant_uploads))
+        .unwrap_or(false)
+}
+
+fn git_info_exclude_path(project_root: &Path) -> Option<PathBuf> {
+    let mut dir = Some(project_root);
+    while let Some(current) = dir {
+        let dot_git = current.join(".git");
+        if dot_git.is_dir() {
+            return Some(dot_git.join("info").join("exclude"));
+        }
+        if dot_git.is_file() {
+            let content = fs::read_to_string(&dot_git).ok()?;
+            let raw = content.strip_prefix("gitdir:")?.trim();
+            let git_dir = {
+                let path = PathBuf::from(raw);
+                if path.is_absolute() {
+                    path
+                } else {
+                    current.join(path)
+                }
+            };
+            return Some(git_dir.join("info").join("exclude"));
+        }
+        dir = current.parent();
     }
+    None
+}
+
+fn append_intendant_ignore_rule(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let needs_leading_newline = fs::read(path)
+        .map(|bytes| !bytes.is_empty() && !bytes.ends_with(b"\n"))
+        .unwrap_or(false);
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    if needs_leading_newline {
+        file.write_all(b"\n")?;
+    }
+    file.write_all(b"# Intendant local uploads\n.intendant/\n")?;
+    Ok(())
+}
+
+/// Ensure project-local uploads do not show up as untracked files.
+///
+/// Prefer Git's local exclude file so Intendant does not modify tracked
+/// project metadata unless there is no Git metadata to attach to.
+fn ensure_project_uploads_ignored(project_root: &Path) -> io::Result<()> {
+    let project_gitignore = project_root.join(".gitignore");
+    if ignore_file_has_intendant_rule(&project_gitignore) {
+        return Ok(());
+    }
+    if let Some(exclude) = git_info_exclude_path(project_root) {
+        if ignore_file_has_intendant_rule(&exclude) {
+            return Ok(());
+        }
+        append_intendant_ignore_rule(&exclude)?;
+        return Ok(());
+    }
+    append_intendant_ignore_rule(&project_gitignore)
 }
 
 /// Commit a pending temp file into the upload store as a new descriptor.
@@ -149,7 +245,8 @@ pub fn commit_upload(
 ) -> Result<UploadDescriptor, CallerError> {
     let id = uuid::Uuid::new_v4().to_string();
     let safe_name = sanitize_name(original_name);
-    let dir = target_dir(destination, session_dir, project_root);
+    ensure_project_uploads_ignored(project_root)?;
+    let dir = target_dir(destination, session_dir, session_id, project_root);
     fs::create_dir_all(&dir)?;
 
     // Filename layout:
@@ -206,14 +303,25 @@ fn descriptor_extension(path: &Path) -> String {
     }
 }
 
-/// Read all descriptors currently stored for a session, across both Task
-/// and Workspace destinations. Order: newest first (by `created_at`).
+/// Read all descriptors currently stored for a project/session, including
+/// legacy pre-.intendant upload locations. Order: newest first (by
+/// `created_at`).
 pub fn list_uploads(session_dir: &Path, project_root: &Path) -> Vec<UploadDescriptor> {
     let mut out: Vec<UploadDescriptor> = Vec::new();
-    for dir in [
-        task_uploads_dir(session_dir),
-        workspace_uploads_dir(project_root),
-    ] {
+    let mut dirs = vec![
+        legacy_task_uploads_dir(session_dir),
+        legacy_workspace_uploads_dir(project_root),
+    ];
+    let root = project_uploads_root(project_root);
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    for dir in dirs {
         let entries = match fs::read_dir(&dir) {
             Ok(e) => e,
             Err(_) => continue,
@@ -252,7 +360,7 @@ fn find_task_upload_in_sibling_sessions(id: &str, session_dir: &Path) -> Option<
         if sibling_dir == session_dir || !sibling_dir.is_dir() {
             continue;
         }
-        let uploads_dir = task_uploads_dir(&sibling_dir);
+        let uploads_dir = legacy_task_uploads_dir(&sibling_dir);
         let uploads = match fs::read_dir(&uploads_dir) {
             Ok(entries) => entries,
             Err(_) => continue,
@@ -338,11 +446,19 @@ mod tests {
 
         assert!(descriptor.path.exists(), "upload file must exist on disk");
         assert!(
-            descriptor.path.starts_with(&session_dir),
-            "task-scope upload must live under session dir, got {}",
+            descriptor.path.starts_with(
+                project_root
+                    .join(".intendant")
+                    .join("uploads")
+                    .join("sess-1")
+            ),
+            "task-scope upload must live under project .intendant/uploads, got {}",
             descriptor.path.display()
         );
         assert_eq!(std::fs::read(&descriptor.path).unwrap(), b"hello world");
+        assert!(ignore_file_has_intendant_rule(
+            &project_root.join(".gitignore")
+        ));
 
         let listed = list_uploads(&session_dir, &project_root);
         assert_eq!(listed.len(), 1);
@@ -381,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_workspace_scope_lands_in_project_root() {
+    fn legacy_workspace_scope_uses_project_upload_store() {
         let tmp = tempfile::tempdir().unwrap();
         let session_dir = tmp.path().join("session");
         let project_root = tmp.path().join("project");
@@ -402,15 +518,46 @@ mod tests {
         .unwrap();
 
         assert!(
-            descriptor
-                .path
-                .starts_with(project_root.join("workspace_files")),
-            "workspace upload must land under workspace_files/, got {}",
+            descriptor.path.starts_with(
+                project_root
+                    .join(".intendant")
+                    .join("uploads")
+                    .join("sess-1")
+            ),
+            "legacy workspace upload must land under project .intendant/uploads, got {}",
             descriptor.path.display()
         );
         // Agent path: file is directly readable via the agent's file-read
         // tool because it's inside the project root.
         assert_eq!(std::fs::read(&descriptor.path).unwrap(), b"pdf bytes");
+    }
+
+    #[test]
+    fn ignore_rule_prefers_git_info_exclude() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("session");
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(project_root.join(".git").join("info")).unwrap();
+
+        let pending = mk_tempfile(b"ignore me");
+        let descriptor = commit_upload(
+            pending,
+            "ignore.txt",
+            "text/plain",
+            9,
+            UploadDestination::Task,
+            &session_dir,
+            "sess-1",
+            &project_root,
+        )
+        .unwrap();
+
+        assert!(descriptor.path.exists());
+        assert!(!project_root.join(".gitignore").exists());
+        assert!(ignore_file_has_intendant_rule(
+            &project_root.join(".git").join("info").join("exclude")
+        ));
     }
 
     #[test]
