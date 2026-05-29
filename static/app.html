@@ -2628,6 +2628,14 @@ html, body {
   padding: 4px 12px 8px;
 }
 
+#activity-log-pane .bottom-panel.visible {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 60;
+}
+
 /* Approval — modern card matching the dashboard notification banners */
 #approval-panel {
   border-top: none;
@@ -17226,6 +17234,12 @@ function clearPendingApproval() {
   setApprovalIndicator(false);
 }
 
+function revealActivityLogPanel() {
+  if (activeTab === 'activity' && activeActivitySubtab !== 'log') {
+    switchActivitySubtab('log');
+  }
+}
+
 function showApproval(id, command, category, sessionId) {
   if (processingLogReplay) return;
   hideAllPanels();
@@ -17241,6 +17255,7 @@ function showApproval(id, command, category, sessionId) {
   }
   document.getElementById('approval-command').textContent = command;
   document.getElementById('approval-category').textContent = category || '';
+  revealActivityLogPanel();
   document.getElementById('approval-panel').classList.add('visible');
   setApprovalIndicator(true);
 }
@@ -17248,6 +17263,7 @@ function showApproval(id, command, category, sessionId) {
 function showHumanInput(question) {
   hideAllPanels();
   document.getElementById('human-question').textContent = question;
+  revealActivityLogPanel();
   document.getElementById('human-panel').classList.add('visible');
 }
 
@@ -21661,6 +21677,9 @@ function switchTab(tabId) {
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tabId));
   if (tabId === 'activity') hideBadge('activity');
   if (app) processCommands(app.set_active_tab(tabId));
+  if (tabId === 'activity' && pendingApprovalId !== null && activeActivitySubtab !== 'log') {
+    switchActivitySubtab('log');
+  }
   if (tabId === 'terminal') {
     if (activeTermSubtab === 'tui') {
       if (!termInitialized) initTerminal();

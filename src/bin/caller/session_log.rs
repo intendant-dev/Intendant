@@ -86,6 +86,7 @@ pub struct SessionLog {
     /// Buffer for accumulating voice_log tokens into full utterances.
     /// Flushed to transcript on turnComplete or user_transcript.
     voice_utterance_buf: String,
+    last_approval_resolved: Option<(u64, String)>,
 }
 
 /// Accumulates session statistics as events are logged.
@@ -190,6 +191,7 @@ impl SessionLog {
                 ..Default::default()
             },
             voice_utterance_buf: String::new(),
+            last_approval_resolved: None,
         };
         log.emit(LogEvent {
             ts: Self::ts(),
@@ -1343,6 +1345,14 @@ impl SessionLog {
 
     /// Log a resolved approval decision.
     pub fn approval_resolved(&mut self, id: u64, action: &str) {
+        if self
+            .last_approval_resolved
+            .as_ref()
+            .is_some_and(|(last_id, last_action)| *last_id == id && last_action == action)
+        {
+            return;
+        }
+        self.last_approval_resolved = Some((id, action.to_string()));
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: Some(id as usize),
@@ -4647,6 +4657,35 @@ mod tests {
             }
             other => panic!("expected ApprovalResolved, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn approval_resolved_dedupes_repeated_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.approval_resolved(7, "approve");
+        log.approval_resolved(7, "approve");
+        log.approval_resolved(7, "reject");
+        log.approval_resolved(8, "approve");
+        drop(log);
+
+        let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let entries: Vec<serde_json::Value> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| {
+                entry.get("event").and_then(|event| event.as_str()) == Some("approval_resolved")
+            })
+            .collect();
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["turn"], 7);
+        assert_eq!(entries[0]["message"], "Approval approve (turn 7)");
+        assert_eq!(entries[1]["turn"], 7);
+        assert_eq!(entries[1]["message"], "Approval reject (turn 7)");
+        assert_eq!(entries[2]["turn"], 8);
+        assert_eq!(entries[2]["message"], "Approval approve (turn 8)");
     }
 
     #[test]
