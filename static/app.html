@@ -30139,54 +30139,63 @@ function renderSessionsList(sessions, el, options = {}) {
         actions.appendChild(configBtn);
       }
 
-      if (!isExternal && s.can_delete !== false) {
-      const btn = document.createElement('button');
-      btn.className = 'sc-delete-btn';
-      btn.textContent = 'Delete...';
-      btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        // Close any existing menu
-        document.querySelectorAll('.sc-delete-menu').forEach(m => m.remove());
-        const menu = document.createElement('div');
-        menu.className = 'sc-delete-menu';
-        menu.setAttribute('role', 'menu');
+      const canDeleteLocalSessionData = rawSource === 'intendant'
+        ? s.can_delete !== false
+        : !!(s.can_delete_intendant_log && s.intendant_session_id);
+      if (canDeleteLocalSessionData) {
+        const sessionDeleteLabel = rawSource === 'intendant'
+          ? 'Delete session'
+          : 'Delete Intendant log';
+        const sessionDeleteBytes = rawSource === 'intendant'
+          ? s.total_bytes
+          : (s.intendant_total_bytes || 0);
+        const btn = document.createElement('button');
+        btn.className = 'sc-delete-btn';
+        btn.textContent = 'Delete...';
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          // Close any existing menu
+          document.querySelectorAll('.sc-delete-menu').forEach(m => m.remove());
+          const menu = document.createElement('div');
+          menu.className = 'sc-delete-menu';
+          menu.setAttribute('role', 'menu');
 
-        const addItem = (label, target, bytes, danger) => {
-          const item = document.createElement('button');
-          item.type = 'button';
-          item.className = 'sc-delete-menu-item' + (danger ? ' danger' : '');
-          item.setAttribute('role', 'menuitem');
-          const txt = document.createElement('span');
-          txt.textContent = label;
-          item.appendChild(txt);
-          if (bytes > 0) {
-            const hint = document.createElement('span');
-            hint.className = 'size-hint';
-            hint.textContent = _fmtBytes(bytes);
-            item.appendChild(hint);
+          const addItem = (label, target, bytes, danger) => {
+            const item = document.createElement('button');
+            item.type = 'button';
+            item.className = 'sc-delete-menu-item' + (danger ? ' danger' : '');
+            item.setAttribute('role', 'menuitem');
+            const txt = document.createElement('span');
+            txt.textContent = label;
+            item.appendChild(txt);
+            if (bytes > 0) {
+              const hint = document.createElement('span');
+              hint.className = 'size-hint';
+              hint.textContent = _fmtBytes(bytes);
+              item.appendChild(hint);
+            }
+            item.addEventListener('click', (ev) => {
+              ev.stopPropagation();
+              menu.remove();
+              deleteSessionData(s.session_id, target, label);
+            });
+            menu.appendChild(item);
+          };
+
+          if ((s.recordings || 0) > 0) addItem('Delete recordings', 'recordings', s.recording_bytes || 0);
+          if ((s.frames_bytes || 0) > 0 || (s.annotations || 0) > 0 || (s.clips || 0) > 0) addItem('Delete frames', 'frames', s.frames_bytes || 0);
+          const hasMedia = (s.recordings || 0) > 0 || (s.frames_bytes || 0) > 0;
+          if (hasMedia) addItem('Delete all media', 'media', (s.recording_bytes || 0) + (s.frames_bytes || 0));
+          if ((s.turns_bytes || 0) > 0) addItem('Delete turn data', 'turns', s.turns_bytes);
+          if (!isCurrent) addItem(sessionDeleteLabel, 'session', sessionDeleteBytes, true);
+
+          if (menu.children.length > 0) {
+            actions.appendChild(menu);
+            const close = (ev) => { if (!menu.contains(ev.target)) { menu.remove(); document.removeEventListener('click', close); } };
+            setTimeout(() => document.addEventListener('click', close), 0);
           }
-          item.addEventListener('click', (ev) => {
-            ev.stopPropagation();
-            menu.remove();
-            deleteSessionData(s.session_id, target, label);
-          });
-          menu.appendChild(item);
-        };
-
-        if ((s.recordings || 0) > 0) addItem('Delete recordings', 'recordings', s.recording_bytes || 0);
-        if ((s.frames_bytes || 0) > 0 || (s.annotations || 0) > 0 || (s.clips || 0) > 0) addItem('Delete frames', 'frames', s.frames_bytes || 0);
-        const hasMedia = (s.recordings || 0) > 0 || (s.frames_bytes || 0) > 0;
-        if (hasMedia) addItem('Delete all media', 'media', (s.recording_bytes || 0) + (s.frames_bytes || 0));
-        if ((s.turns_bytes || 0) > 0) addItem('Delete turn data', 'turns', s.turns_bytes);
-        if (!isCurrent) addItem('Delete session', 'session', s.total_bytes, true);
-
-        if (menu.children.length > 0) {
-          actions.appendChild(menu);
-          const close = (ev) => { if (!menu.contains(ev.target)) { menu.remove(); document.removeEventListener('click', close); } };
-          setTimeout(() => document.addEventListener('click', close), 0);
-        }
-      });
-      actions.appendChild(btn);
+        });
+        actions.appendChild(btn);
       }
       card.appendChild(actions);
     }
@@ -30736,6 +30745,7 @@ async function confirmSessionDeleteModal() {
         s.total_bytes = Math.max(0, (s.total_bytes || 0) - freed);
       }
     }
+    sessionsListCache.set(selfPeerId, _cachedSessions);
     updateSessionProjectFilterOptions(_cachedSessions);
     renderSessionsAggregate(_cachedSessions, document.getElementById('sessions-aggregate'));
     _refilterSessions();
