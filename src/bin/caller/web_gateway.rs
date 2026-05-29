@@ -2336,6 +2336,17 @@ fn get_session_detail(session_id: &str) -> String {
     get_session_detail_from_home(&crate::platform::home_dir(), session_id)
 }
 
+fn session_detail_http_status(body: &str) -> &'static str {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return "200 OK";
+    };
+    if value.get("error").and_then(|v| v.as_str()) == Some("session not found") {
+        "404 Not Found"
+    } else {
+        "200 OK"
+    }
+}
+
 fn get_session_detail_from_home(home: &Path, session_id: &str) -> String {
     let session_dir = match resolve_session_dir_from_home(home, session_id) {
         Some(d) => d,
@@ -13802,8 +13813,9 @@ pub fn spawn_web_gateway(
                                     serde_json::json!({"error": "session not found"}).to_string()
                                 })
                             };
+                            let status = session_detail_http_status(&body);
                             let response = format!(
-                                "HTTP/1.1 200 OK\r\n\
+                                "HTTP/1.1 {status}\r\n\
                                  Content-Type: application/json\r\n\
                                  Content-Length: {}\r\n\
                                  Cache-Control: no-cache\r\n\
@@ -19640,6 +19652,16 @@ mod tests {
         assert_eq!(relationships[0]["child_session_id"], "child");
         assert_eq!(relationships[0]["relationship"], "subagent");
         assert_eq!(relationships[0]["ephemeral"], false);
+    }
+
+    #[test]
+    fn session_detail_http_status_marks_missing_sessions_not_found() {
+        let missing = serde_json::json!({"error": "session not found"}).to_string();
+        assert_eq!(session_detail_http_status(&missing), "404 Not Found");
+        assert_eq!(
+            session_detail_http_status(&serde_json::json!({"entries": []}).to_string()),
+            "200 OK"
+        );
     }
 
     #[test]
