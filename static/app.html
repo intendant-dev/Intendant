@@ -13656,12 +13656,36 @@ function applyPromptTargetLogSessionBadgeState(entry, target = resolvePromptTarg
   }
 }
 
+function promptTargetTerminalStatus(meta = {}) {
+  const status = String(meta.status || meta.intendantStatus || '').trim().toLowerCase();
+  return status === 'abandoned' || status === 'deleted' || status === 'missing';
+}
+
+function isPromptTargetSessionUsable(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || sid === daemonSessionFullId) return false;
+  const win = sessionWindows.get(sid);
+  if (!win || win.ended) return false;
+  const meta = sessionMetadataById.get(sid) || {};
+  if (meta.ended || promptTargetTerminalStatus(meta)) return false;
+  return true;
+}
+
+function discardPromptTargetReference(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  if (foregroundSessionFullId === sid) foregroundSessionFullId = '';
+  if (currentSessionFullId === sid) currentSessionFullId = '';
+}
+
 function resolvePromptTargetSessionId() {
-  const sid = foregroundSessionFullId || currentSessionFullId || '';
-  const win = sid ? sessionWindows.get(sid) : null;
-  if (sid && (!win || !win.ended)) return sid;
+  for (const sid of [foregroundSessionFullId, currentSessionFullId]) {
+    if (!sid) continue;
+    if (isPromptTargetSessionUsable(sid)) return sid;
+    discardPromptTargetReference(sid);
+  }
   const candidates = Array.from(sessionWindows.entries())
-    .filter(([id, win]) => id !== daemonSessionFullId && win && !win.ended)
+    .filter(([id]) => isPromptTargetSessionUsable(id))
     .map(([id]) => id);
   return candidates.length === 1 ? candidates[0] : '';
 }
@@ -13818,6 +13842,10 @@ function normalizeSessionWindowMeta(meta = {}) {
   }
   const source = compactSessionText(meta.source || meta.source_id || meta.sourceId);
   if (source) out.source = source;
+  const status = compactSessionText(meta.status);
+  if (status) out.status = status.toLowerCase();
+  const intendantStatus = compactSessionText(meta.intendant_status || meta.intendantStatus);
+  if (intendantStatus) out.intendantStatus = intendantStatus.toLowerCase();
   const sourceLabel = compactSessionText(meta.source_label || meta.sourceLabel);
   if (sourceLabel) out.sourceLabel = sourceLabel;
   const backendSource = compactSessionText(meta.backend_source || meta.backendSource);
@@ -13863,6 +13891,8 @@ function sessionWindowMetadataSignature(meta = {}) {
     meta.source || '',
     meta.sourceLabel || '',
     meta.backendSource || '',
+    meta.status || '',
+    meta.intendantStatus || '',
     meta.backendSessionId || '',
     meta.intendantSessionId || '',
     meta.agentCommand || '',
