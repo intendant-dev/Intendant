@@ -71,6 +71,8 @@ static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
 static SESSION_SEARCH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static EXTERNAL_TRANSCRIPT_CACHE: OnceLock<Mutex<HashMap<String, ExternalTranscriptCacheEntry>>> =
     OnceLock::new();
+static SESSION_LIST_RESPONSE_CACHE: OnceLock<Mutex<Option<SessionListResponseCacheEntry>>> =
+    OnceLock::new();
 static SESSION_LIST_ROW_CACHE: OnceLock<Mutex<HashMap<String, SessionListRowCacheEntry>>> =
     OnceLock::new();
 static CODEX_SESSION_LIST_CACHE: OnceLock<Mutex<HashMap<String, CodexSessionListCacheEntry>>> =
@@ -88,6 +90,7 @@ const EXTERNAL_TRANSCRIPT_CACHE_LIMIT: usize = 32;
 const EXTERNAL_TRANSCRIPT_DEDUPE_WINDOW_MILLIS: i64 = 2_000;
 const SESSION_LIST_ROW_CACHE_LIMIT: usize = 8_192;
 const SESSION_LIST_LIMIT: usize = 5_000;
+const SESSION_LIST_RESPONSE_CACHE_TTL_SECS: u64 = 2;
 const SESSION_SOURCE_FLOOR: usize = 100;
 const SESSION_LOG_SEARCH_LIMIT: usize = 150;
 const SESSION_LOG_SEARCH_READ_LIMIT: u64 = 2 * 1024 * 1024;
@@ -111,6 +114,12 @@ struct ExternalTranscriptCacheKey {
 struct ExternalTranscriptCacheEntry {
     key: ExternalTranscriptCacheKey,
     entries: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Debug)]
+struct SessionListResponseCacheEntry {
+    generated_at: std::time::Instant,
+    body: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5122,6 +5131,25 @@ fn session_ended_id_from_wire(line: &str) -> Option<String> {
 
 fn list_sessions() -> String {
     list_sessions_from_home(&crate::platform::home_dir())
+}
+
+fn cached_list_sessions() -> String {
+    let cache = SESSION_LIST_RESPONSE_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = guard.as_ref() {
+        if entry.generated_at.elapsed()
+            <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_CACHE_TTL_SECS)
+        {
+            return entry.body.clone();
+        }
+    }
+
+    let body = list_sessions();
+    *guard = Some(SessionListResponseCacheEntry {
+        generated_at: std::time::Instant::now(),
+        body: body.clone(),
+    });
+    body
 }
 
 fn empty_worktree_inventory_response() -> String {
@@ -14104,7 +14132,7 @@ pub fn spawn_web_gateway(
                         // multi-host Stats tab can fetch sibling
                         // daemons' session lists to populate its "All
                         // Sessions" and "Disk Usage" cards per host.
-                        let body = match tokio::task::spawn_blocking(list_sessions).await {
+                        let body = match tokio::task::spawn_blocking(cached_list_sessions).await {
                             Ok(body) => body,
                             Err(e) => serde_json::json!({
                                 "error": format!("session list task failed: {e}")
