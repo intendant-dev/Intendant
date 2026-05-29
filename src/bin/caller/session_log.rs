@@ -1,8 +1,10 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
 use uuid::Uuid;
 
 /// Structured event written as one JSON line in session.jsonl.
@@ -61,6 +63,55 @@ pub struct SessionMeta {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rounds: Option<usize>,
+}
+
+static OPEN_SESSION_LOG_DIRS: OnceLock<StdMutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn open_session_log_dirs() -> &'static StdMutex<HashSet<PathBuf>> {
+    OPEN_SESSION_LOG_DIRS.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn lock_open_session_log_dirs() -> StdMutexGuard<'static, HashSet<PathBuf>> {
+    match open_session_log_dirs().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn register_open_session_log_dir(dir: &Path) {
+    lock_open_session_log_dirs().insert(dir.to_path_buf());
+}
+
+fn unregister_open_session_log_dir(dir: &Path) {
+    lock_open_session_log_dirs().remove(dir);
+}
+
+fn mark_session_meta_interrupted(dir: &Path, last_turn: Option<usize>) -> bool {
+    let meta_path = dir.join("session_meta.json");
+    if let Ok(meta_str) = fs::read_to_string(&meta_path) {
+        if let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
+            if meta.status.as_deref() == Some("running") {
+                meta.status = Some("interrupted".to_string());
+                meta.last_turn = Some(last_turn.or(meta.last_turn).unwrap_or(0));
+                if let Ok(json) = serde_json::to_string_pretty(&meta) {
+                    let _ = fs::write(&meta_path, &json);
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+pub fn mark_registered_session_logs_interrupted_now() -> Vec<PathBuf> {
+    let dirs: Vec<PathBuf> = lock_open_session_log_dirs().iter().cloned().collect();
+    let mut updated = Vec::new();
+    for dir in dirs {
+        if mark_session_meta_interrupted(&dir, None) {
+            updated.push(dir);
+        }
+    }
+    updated
 }
 
 /// Comprehensive structured session logger.
@@ -154,6 +205,7 @@ impl SessionLog {
     pub fn open(dir: PathBuf) -> std::io::Result<Self> {
         fs::create_dir_all(&dir)?;
         fs::create_dir_all(dir.join("turns"))?;
+        let log_dir = dir.clone();
 
         // Try to read existing session_id from meta, or derive from directory name
         let session_id = if let Ok(meta_str) = fs::read_to_string(dir.join("session_meta.json")) {
@@ -206,6 +258,7 @@ impl SessionLog {
             file: None,
             file2: None,
         });
+        register_open_session_log_dir(&log_dir);
         Ok(log)
     }
 
@@ -2402,18 +2455,7 @@ impl SessionLog {
     pub fn mark_interrupted(&mut self) {
         self.flush_voice_utterance();
         let _ = self.writer.flush();
-        let meta_path = self.dir.join("session_meta.json");
-        if let Ok(meta_str) = fs::read_to_string(&meta_path) {
-            if let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
-                if meta.status.as_deref() == Some("running") {
-                    meta.status = Some("interrupted".to_string());
-                    meta.last_turn = Some(self.current_turn);
-                    if let Ok(json) = serde_json::to_string_pretty(&meta) {
-                        let _ = fs::write(&meta_path, &json);
-                    }
-                }
-            }
-        }
+        mark_session_meta_interrupted(&self.dir, Some(self.current_turn));
         // Write partial session summary even on interrupt
         self.write_session_summary();
     }
@@ -2425,18 +2467,8 @@ impl Drop for SessionLog {
         let _ = self.writer.flush();
 
         // If the session is still "running", mark it as "interrupted"
-        let meta_path = self.dir.join("session_meta.json");
-        if let Ok(meta_str) = fs::read_to_string(&meta_path) {
-            if let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
-                if meta.status.as_deref() == Some("running") {
-                    meta.status = Some("interrupted".to_string());
-                    meta.last_turn = Some(self.current_turn);
-                    if let Ok(json) = serde_json::to_string_pretty(&meta) {
-                        let _ = fs::write(&meta_path, &json);
-                    }
-                }
-            }
-        }
+        mark_session_meta_interrupted(&self.dir, Some(self.current_turn));
+        unregister_open_session_log_dir(&self.dir);
     }
 }
 
@@ -4072,6 +4104,37 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
                 .unwrap();
         assert_eq!(meta.status.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn mark_session_meta_interrupted_updates_running_meta_without_log_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        fs::create_dir_all(&log_dir).unwrap();
+        let meta = SessionMeta {
+            session_id: "session".to_string(),
+            created_at: "2026-05-29T00:00:00".to_string(),
+            project_root: Some("/tmp".to_string()),
+            name: None,
+            task: Some("task".to_string()),
+            status: Some("running".to_string()),
+            last_turn: None,
+            role: None,
+            rounds: None,
+        };
+        fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+
+        assert!(mark_session_meta_interrupted(&log_dir, None));
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.status.as_deref(), Some("interrupted"));
+        assert_eq!(meta.last_turn, Some(0));
     }
 
     #[test]

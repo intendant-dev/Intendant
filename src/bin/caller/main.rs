@@ -15285,6 +15285,14 @@ async fn main() -> Result<(), CallerError> {
                 if let Ok(mut log) = signal_session_log.lock() {
                     log.mark_interrupted();
                 }
+                let interrupted_session_logs =
+                    session_log::mark_registered_session_logs_interrupted_now();
+                if !interrupted_session_logs.is_empty() {
+                    eprintln!(
+                        "Marked open session logs interrupted during signal shutdown: {:?}",
+                        interrupted_session_logs
+                    );
+                }
                 let cleaned_external_children =
                     external_agent::cleanup_spawned_child_processes_now();
                 if !cleaned_external_children.is_empty() {
