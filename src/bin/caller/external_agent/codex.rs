@@ -242,6 +242,7 @@ impl CodexAgent {
             "threadId": child_thread_id.clone(),
             "input": [{"type": "text", "text": prompt}],
         });
+        self.capture_turn_descendant_baseline();
         match self.send_request("turn/start", Some(turn_params)).await {
             Ok(response) => {
                 if let Some(id) = extract_turn_id(&response) {
@@ -1079,6 +1080,10 @@ pub struct CodexAgent {
     active_turn_id: Arc<Mutex<Option<String>>>,
     /// Per-thread active turn ids for Codex's multiplexed app-server stream.
     active_turns: ActiveTurns,
+    /// Descendant process ids that existed before the current turn started.
+    /// On interrupt, any new descendants that Codex's own `turn/interrupt`
+    /// leaves behind are treated as leaked turn work and terminated.
+    turn_descendant_baseline: Option<HashSet<u32>>,
     /// Ephemeral side-conversation child threads keyed by child thread id,
     /// with the parent thread id as value. Used to keep slash/thread actions
     /// scoped to durable Codex threads while still allowing side follow-ups.
@@ -1176,6 +1181,7 @@ impl CodexAgent {
             active_thread_id: Arc::new(Mutex::new(None)),
             active_turn_id: Arc::new(Mutex::new(None)),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
+            turn_descendant_baseline: None,
             side_threads: Arc::new(Mutex::new(HashMap::new())),
             latest_token_usage: Arc::new(Mutex::new(None)),
         }
@@ -1259,6 +1265,15 @@ impl CodexAgent {
         writer.write_all(b"\n").await?;
         writer.flush().await?;
         Ok(())
+    }
+
+    fn capture_turn_descendant_baseline(&mut self) {
+        self.turn_descendant_baseline =
+            self.child.as_ref().and_then(|child| child.id()).map(|pid| {
+                crate::platform::process_descendants(pid)
+                    .into_iter()
+                    .collect::<HashSet<_>>()
+            });
     }
 
     async fn read_context_snapshot(&mut self) -> Result<AgentContextSnapshot, CallerError> {
@@ -3564,6 +3579,12 @@ impl ExternalAgent for CodexAgent {
             "threadId": thread.thread_id,
             "input": input,
         });
+        self.turn_descendant_baseline =
+            self.child.as_ref().and_then(|child| child.id()).map(|pid| {
+                crate::platform::process_descendants(pid)
+                    .into_iter()
+                    .collect::<HashSet<_>>()
+            });
         // turn/start is a request — Codex v2 requires an id to start processing.
         // The response carries the turn id; cache it so interrupt_turn() can
         // target this specific turn. Fall back to the reader task's
@@ -3647,6 +3668,11 @@ impl ExternalAgent for CodexAgent {
         // shortly after. The reader task handles that notification like any
         // other turn completion.
         let _ = self.send_request("turn/interrupt", Some(params)).await?;
+        if let Some(pid) = self.child.as_ref().and_then(|child| child.id()) {
+            let protected = self.turn_descendant_baseline.clone().unwrap_or_default();
+            let _ = crate::platform::terminate_unprotected_descendants(pid, &protected).await;
+        }
+        self.turn_descendant_baseline = None;
         // Clear pending approvals — the caller is also expected to resolve
         // them, but clearing here makes the agent's state consistent if the
         // caller forgets.
@@ -3871,6 +3897,10 @@ impl ExternalAgent for CodexAgent {
 
         // Kill child process
         if let Some(ref mut child) = self.child {
+            if let Some(pid) = child.id() {
+                let protected = HashSet::new();
+                let _ = crate::platform::terminate_unprotected_descendants(pid, &protected).await;
+            }
             let _ = child.kill().await;
         }
 
@@ -3891,6 +3921,7 @@ impl ExternalAgent for CodexAgent {
         self.writer = None;
         self.event_tx = None;
         self.child = None;
+        self.turn_descendant_baseline = None;
         self.active_turn_id.lock().await.take();
         self.active_thread_id.lock().await.take();
 
@@ -3902,6 +3933,10 @@ impl Drop for CodexAgent {
     fn drop(&mut self) {
         // Kill the child process synchronously to prevent orphans.
         if let Some(ref mut child) = self.child {
+            if let Some(pid) = child.id() {
+                let protected = HashSet::new();
+                let _ = crate::platform::terminate_unprotected_descendants_now(pid, &protected);
+            }
             let _ = child.start_kill();
         }
         if let Some(handle) = self.reader_handle.take() {

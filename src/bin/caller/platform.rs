@@ -3,6 +3,9 @@
 //! Replaces Linux-specific `/proc` filesystem access with POSIX-compatible
 //! implementations that work on both Linux and macOS.
 
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
 /// Ensure platform tool directories are in PATH.
 ///
 /// On macOS, Homebrew installs to `/opt/homebrew/bin` (Apple Silicon) or
@@ -95,6 +98,195 @@ pub fn process_cmdline(pid: u32) -> Option<String> {
     }
     // /proc/pid/cmdline is NUL-separated; replace NULs with spaces
     Some(String::from_utf8_lossy(&bytes).replace('\0', " "))
+}
+
+fn collect_descendants(root_pid: u32, parent_pairs: &[(u32, u32)]) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(pid, parent_pid) in parent_pairs {
+        if pid == 0 || pid == root_pid {
+            continue;
+        }
+        children.entry(parent_pid).or_default().push(pid);
+    }
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = children.get(&root_pid).cloned().unwrap_or_default();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        out.push(pid);
+        if let Some(grandchildren) = children.get(&pid) {
+            stack.extend(grandchildren.iter().copied());
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+fn parse_process_parent_pairs(output: &str) -> Vec<(u32, u32)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse::<u32>().ok()?;
+            let parent_pid = parts.next()?.parse::<u32>().ok()?;
+            Some((pid, parent_pid))
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn process_parent_pairs() -> Vec<(u32, u32)> {
+    let output = match std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_process_parent_pairs(&stdout)
+}
+
+#[cfg(windows)]
+fn process_parent_pairs() -> Vec<(u32, u32)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    // SAFETY: CreateToolhelp32Snapshot is called with the documented process
+    // snapshot flag and process id 0. On success the returned HANDLE is closed
+    // exactly once below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+
+    // SAFETY: PROCESSENTRY32W is a plain Win32 POD struct. Zero-initializing
+    // it and then setting dwSize is the documented setup before enumeration.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut pairs = Vec::new();
+
+    // SAFETY: `entry` points to writable memory whose `dwSize` field is set as
+    // required by the Toolhelp API. The snapshot handle remains valid for the
+    // whole enumeration loop.
+    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) != 0 };
+    while ok {
+        pairs.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        // SAFETY: Same invariant as Process32FirstW: valid snapshot handle and
+        // initialized PROCESSENTRY32W storage with dwSize set.
+        ok = unsafe { Process32NextW(snapshot, &mut entry) != 0 };
+    }
+
+    // SAFETY: `snapshot` was returned by CreateToolhelp32Snapshot and has not
+    // been closed yet.
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    pairs
+}
+
+#[cfg(windows)]
+fn terminate_pid(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    // SAFETY: OpenProcess is called with terminate-only access for a concrete
+    // PID obtained from the process table. If a handle is returned, we call
+    // TerminateProcess and close the handle exactly once.
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle.is_null() {
+            return;
+        }
+        let _ = TerminateProcess(handle, 1);
+        CloseHandle(handle);
+    }
+}
+
+#[cfg(unix)]
+fn signal_pid(pid: u32, signal: libc::c_int) {
+    let pid = match libc::pid_t::try_from(pid) {
+        Ok(pid) if pid > 0 => pid,
+        _ => return,
+    };
+    // SAFETY: `pid` is a positive pid_t converted from u32 and `signal` is one
+    // of the POSIX signals passed by this module (SIGTERM/SIGKILL).
+    unsafe {
+        let _ = libc::kill(pid, signal);
+    }
+}
+
+/// Return all currently visible descendants of `root_pid`, excluding the root
+/// itself. The order is parent-before-child and should be reversed before
+/// terminating processes.
+pub fn process_descendants(root_pid: u32) -> Vec<u32> {
+    collect_descendants(root_pid, &process_parent_pairs())
+}
+
+/// Best-effort cleanup for child processes spawned by a long-running external
+/// agent turn. `protected` should contain descendants that existed before the
+/// turn started, so interrupt cleanup only targets processes created by the
+/// interrupted turn and leaves the external-agent app-server itself alive.
+pub fn terminate_unprotected_descendants_now(root_pid: u32, protected: &HashSet<u32>) -> Vec<u32> {
+    let mut targets: Vec<u32> = process_descendants(root_pid)
+        .into_iter()
+        .filter(|pid| !protected.contains(pid))
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    if targets.is_empty() {
+        return targets;
+    }
+
+    #[cfg(unix)]
+    {
+        for pid in targets.iter().rev() {
+            signal_pid(*pid, libc::SIGTERM);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        for pid in targets.iter().rev() {
+            terminate_pid(*pid);
+        }
+    }
+
+    targets
+}
+
+/// Async variant of [`terminate_unprotected_descendants_now`] that escalates to
+/// SIGKILL on Unix after a short grace period.
+pub async fn terminate_unprotected_descendants(
+    root_pid: u32,
+    protected: &HashSet<u32>,
+) -> Vec<u32> {
+    let targets = terminate_unprotected_descendants_now(root_pid, protected);
+    if targets.is_empty() {
+        return targets;
+    }
+
+    #[cfg(unix)]
+    {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let still_alive: HashSet<u32> = process_descendants(root_pid).into_iter().collect();
+        for pid in targets.iter().rev().filter(|pid| still_alive.contains(pid)) {
+            signal_pid(*pid, libc::SIGKILL);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    targets
 }
 
 /// Read the command line of a process by PID.
@@ -735,6 +927,22 @@ mod tests {
     #[test]
     fn cmdline_of_dead_pid() {
         assert!(process_cmdline(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn collect_descendants_walks_tree_without_root_or_siblings() {
+        let pairs = vec![
+            (10, 1),
+            (20, 10),
+            (21, 10),
+            (30, 20),
+            (31, 20),
+            (40, 30),
+            (99, 1),
+        ];
+        let mut descendants = collect_descendants(10, &pairs);
+        descendants.sort_unstable();
+        assert_eq!(descendants, vec![20, 21, 30, 31, 40]);
     }
 
     #[test]
