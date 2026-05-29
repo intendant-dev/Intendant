@@ -9183,6 +9183,9 @@ async function main() {
       if (d.event === 'display_metrics') {
         updateDisplayMetrics(d);
       }
+      if (eventRefreshesSessionMetadata(d.event)) {
+        scheduleSessionsMetadataRefresh();
+      }
     } catch(_) {}
     const cmds = app.handle_server_message(msg);
     if (cmds) processCommands(cmds);
@@ -11324,6 +11327,7 @@ let managedContextRpcSeq = 1;
 let managedContextSessionManuallySelected = false;
 let managedContextSessionsLoadInFlight = null;
 let managedContextActiveSessionId = '';
+let sessionsMetadataRefreshTimer = null;
 
 function managedContextEl(id) {
   return document.getElementById(id);
@@ -28234,6 +28238,34 @@ function loadSessions(options = {}) {
         listEl.innerHTML = '<div class="empty-state">Failed to load sessions</div>';
       }
     });
+}
+
+function scheduleSessionsMetadataRefresh(delay = 700) {
+  if (!sessionsLoaded && !shouldPollSessionWindowMetadata()) return;
+  if (sessionsMetadataRefreshTimer) clearTimeout(sessionsMetadataRefreshTimer);
+  sessionsMetadataRefreshTimer = setTimeout(() => {
+    sessionsMetadataRefreshTimer = null;
+    if (sessionsLoaded) {
+      loadSessions({ force: true });
+    } else {
+      refreshSessionWindowMetadata(0, { force: true });
+    }
+  }, delay);
+}
+
+function eventRefreshesSessionMetadata(eventName) {
+  switch (eventName) {
+    case 'turn_started':
+    case 'model_response':
+    case 'done_signal':
+    case 'task_complete':
+    case 'round_complete':
+    case 'interrupted':
+    case 'session_ended':
+      return true;
+    default:
+      return false;
+  }
 }
 
 function renderSessionsViews() {
