@@ -6369,6 +6369,7 @@ fn changes_request_target_from_home(
     let target_id = changes_request_target_id(request_line)?;
     let logs_dir = home.join(".intendant").join("logs");
     let entries = std::fs::read_dir(logs_dir).ok()?;
+    let mut candidates = Vec::new();
 
     for entry in entries.flatten() {
         let dir = entry.path();
@@ -6382,12 +6383,13 @@ fn changes_request_target_from_home(
         if !session_row_matches_changes_target(&row, &target_id) {
             continue;
         }
-        let project_root = changes_project_root_from_session(&row)?;
-        return Some(ChangesRequestTarget {
-            snapshot_dir: dir.join("file_snapshots"),
-            project_root,
-            include_project_external_logs: true,
-        });
+        if let Some(project_root) = changes_project_root_from_session(&row) {
+            candidates.push(ChangesRequestTarget {
+                snapshot_dir: dir.join("file_snapshots"),
+                project_root,
+                include_project_external_logs: true,
+            });
+        }
     }
 
     let sessions: Vec<serde_json::Value> =
@@ -6396,16 +6398,61 @@ fn changes_request_target_from_home(
         if !session_row_matches_changes_target(&session, &target_id) {
             continue;
         }
-        let project_root = changes_project_root_from_session(&session)?;
-        let log_dir = changes_log_dir_from_session(&session)?;
-        return Some(ChangesRequestTarget {
-            snapshot_dir: log_dir.join("file_snapshots"),
-            project_root,
-            include_project_external_logs: true,
-        });
+        if let (Some(project_root), Some(log_dir)) = (
+            changes_project_root_from_session(&session),
+            changes_log_dir_from_session(&session),
+        ) {
+            candidates.push(ChangesRequestTarget {
+                snapshot_dir: log_dir.join("file_snapshots"),
+                project_root,
+                include_project_external_logs: true,
+            });
+        }
     }
 
-    None
+    best_changes_request_target(candidates)
+}
+
+fn best_changes_request_target(
+    candidates: Vec<ChangesRequestTarget>,
+) -> Option<ChangesRequestTarget> {
+    candidates
+        .into_iter()
+        .max_by_key(changes_request_target_score)
+}
+
+fn changes_request_target_score(target: &ChangesRequestTarget) -> usize {
+    let baseline_dir = target.snapshot_dir.join("baseline");
+    if baseline_dir.exists() {
+        let body = handle_changes_list(
+            &target.snapshot_dir,
+            &baseline_dir,
+            &target.project_root,
+            target.include_project_external_logs,
+        );
+        let count = serde_json::from_str::<Vec<serde_json::Value>>(&body)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        if count > 0 {
+            return 2_000 + count;
+        }
+    }
+
+    let external_count = load_external_change_records(
+        &target.snapshot_dir,
+        &target.project_root,
+        false,
+        target.include_project_external_logs,
+    )
+    .len();
+    if external_count > 0 {
+        return 1_000 + external_count;
+    }
+    if baseline_dir.exists() {
+        10
+    } else {
+        100
+    }
 }
 
 fn load_baseline_manifest(baseline_dir: &Path) -> crate::file_watcher::BaselineManifest {
@@ -20273,6 +20320,99 @@ mod tests {
         assert_eq!(status, "200 OK");
         assert_eq!(json["path"], "created.txt");
         assert!(json["diff"].as_str().unwrap().contains("+created"));
+    }
+
+    #[test]
+    fn changes_request_prefers_matching_external_log_with_changes() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::write(project.path().join("created.txt"), "created\n").unwrap();
+        std::fs::write(project.path().join("tracked.txt"), "new\n").unwrap();
+        let logs_dir = home.path().join(".intendant/logs");
+        let backend_id = "backend-session";
+
+        let attach_dir = logs_dir.join("attach-wrapper");
+        std::fs::create_dir_all(attach_dir.join("file_snapshots/baseline")).unwrap();
+        std::fs::write(
+            attach_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "attach-wrapper",
+                "project_root": project.path().to_string_lossy(),
+                "task": "reattach"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            attach_dir.join("session.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"event": "info", "message": "Mode: external agent (Codex)"}),
+                serde_json::json!({"event": "debug", "message": format!("External agent thread: {backend_id}")})
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            attach_dir.join("file_snapshots/baseline/created.txt"),
+            "created\n",
+        )
+        .unwrap();
+        std::fs::write(
+            attach_dir.join("file_snapshots/baseline/tracked.txt"),
+            "new\n",
+        )
+        .unwrap();
+
+        let wrapper_dir = logs_dir.join("original-wrapper");
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        std::fs::write(
+            wrapper_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "original-wrapper",
+                "project_root": project.path().to_string_lossy(),
+                "task": "external diff"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let diff = format!(
+            "External agent diff: 2 files (created.txt, tracked.txt)\n# intendant-project-root: {}\ndiff --git a/created.txt b/created.txt\nnew file mode 100644\n--- /dev/null\n+++ b/created.txt\n@@ -0,0 +1 @@\n+created\ndiff --git a/tracked.txt b/tracked.txt\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1 +1 @@\n-old\n+new\n",
+            project.path().display()
+        );
+        std::fs::write(
+            wrapper_dir.join("session.jsonl"),
+            [
+                serde_json::json!({"event": "info", "message": "Mode: external agent (Codex)"})
+                    .to_string(),
+                serde_json::json!({"event": "debug", "message": format!("External agent thread: {backend_id}")})
+                    .to_string(),
+                serde_json::json!({"event": "info", "message": diff}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let default_snapshot = tempfile::TempDir::new().unwrap();
+        let default_project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(default_snapshot.path().join("baseline")).unwrap();
+
+        let request = format!("GET /api/session/current/changes?session_id={backend_id} HTTP/1.1");
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(default_snapshot.path()),
+            Some(default_project.path()),
+            home.path(),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let paths: Vec<_> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("path").and_then(|path| path.as_str()))
+            .collect();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(paths, vec!["created.txt", "tracked.txt"]);
     }
 
     #[test]

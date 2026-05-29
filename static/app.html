@@ -27274,11 +27274,16 @@ function renderDiskUsage(sessions) {
   `;
 }
 
-function focusActivityForSessionEvent() {
+function focusActivityForSessionEvent(options = {}) {
+  const force = !!options.force;
   const route = parseRoute();
   if (route.tab === 'activity') {
     if (activeTab !== 'activity') switchTab('activity');
     hideBadge('activity');
+    return;
+  }
+  if (!force) {
+    showBadge('activity', '\u2022');
     return;
   }
   if (document.visibilityState === 'visible' && document.hasFocus()) {
@@ -27292,6 +27297,7 @@ function focusActivityForSessionEvent() {
 // ── Session Lifecycle ──
 function onSessionStarted(sessionId, task) {
   const sid = String(sessionId || '').trim();
+  const shouldFocusActivity = newSessionSpawnPending;
   finishNewSessionSpawnNotice(sid, task);
   const alias = externalBackendAliasForSession(sid);
   const visibleSessionId = alias?.backendSessionId || sid;
@@ -27310,7 +27316,7 @@ function onSessionStarted(sessionId, task) {
     updateTaskTargetChip();
   }
   resetChangesPane();
-  focusActivityForSessionEvent();
+  focusActivityForSessionEvent({ force: shouldFocusActivity });
   refreshChangesList({ selectFirst: activeActivitySubtab === 'changes', quiet: true });
   // New session: clear any stale timeline and let the first
   // `snapshot_created` event populate it, or populate from the current
