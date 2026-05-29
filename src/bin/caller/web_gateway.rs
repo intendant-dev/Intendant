@@ -6289,6 +6289,9 @@ fn handle_changes_request_for_home(
     home: &Path,
 ) -> (&'static str, String) {
     if let Some(target) = changes_request_target_from_home(request_line, home) {
+        if should_use_live_changes_for_target(request_line, &target, snapshot_dir, project_root) {
+            return handle_changes_request(request_line, snapshot_dir, project_root);
+        }
         return handle_changes_request_inner(
             request_line,
             Some(&target.snapshot_dir),
@@ -6318,14 +6321,7 @@ fn handle_changes_request_inner(
     let baseline_dir = snapshot_dir.join("baseline");
     // Extract the request target from `GET <target> HTTP/1.1`, then trim the
     // endpoint prefix. The list endpoint has no path suffix.
-    let target = request_line.split_whitespace().nth(1).unwrap_or("");
-    let file_path = target
-        .strip_prefix("/api/session/current/changes")
-        .unwrap_or("")
-        .split('?')
-        .next()
-        .unwrap_or("")
-        .trim_start_matches('/');
+    let file_path = changes_request_file_path(request_line);
 
     if !baseline_dir.exists() {
         let records =
@@ -6369,6 +6365,48 @@ fn handle_changes_request_inner(
             include_project_external_logs,
         )
     }
+}
+
+fn changes_request_file_path(request_line: &str) -> &str {
+    let target = request_line.split_whitespace().nth(1).unwrap_or("");
+    target
+        .strip_prefix("/api/session/current/changes")
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('/')
+}
+
+fn should_use_live_changes_for_target(
+    request_line: &str,
+    target: &ChangesRequestTarget,
+    snapshot_dir: Option<&Path>,
+    project_root: Option<&Path>,
+) -> bool {
+    let (Some(live_snapshot_dir), Some(live_project_root)) = (snapshot_dir, project_root) else {
+        return false;
+    };
+    if target.snapshot_dir.join("baseline").exists()
+        || !live_snapshot_dir.join("baseline").exists()
+        || !path_keys_match(&target.project_root, live_project_root)
+    {
+        return false;
+    }
+
+    let file_path = changes_request_file_path(request_line);
+    let records = load_external_change_records(
+        &target.snapshot_dir,
+        &target.project_root,
+        !file_path.is_empty(),
+        target.include_project_external_logs,
+    );
+    if file_path.is_empty() {
+        return records.is_empty();
+    }
+
+    let decoded = url_path_decode(file_path);
+    !records.iter().any(|record| record.path == decoded)
 }
 
 fn changes_request_target_id(request_line: &str) -> Option<String> {
@@ -20446,6 +20484,72 @@ mod tests {
             &request,
             Some(default_snapshot.path()),
             Some(default_project.path()),
+            home.path(),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json["path"], "created.txt");
+        assert!(json["diff"].as_str().unwrap().contains("+created"));
+    }
+
+    #[test]
+    fn changes_request_target_without_snapshot_falls_back_to_live_project() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let logs_dir = home.path().join(".intendant/logs");
+        let wrapper_id = "wrapper-session";
+        let backend_id = "backend-session";
+        let wrapper_dir = logs_dir.join(wrapper_id);
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        std::fs::write(
+            wrapper_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": wrapper_id,
+                "created_at": "2026-05-29T06:11:20",
+                "project_root": project.path().to_string_lossy(),
+                "task": "external session without watcher snapshots"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            wrapper_dir.join("session.jsonl"),
+            [
+                serde_json::json!({"event": "info", "message": "Mode: external agent (Codex)"})
+                    .to_string(),
+                serde_json::json!({"event": "debug", "message": format!("External agent thread: {backend_id}")})
+                    .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let live_snapshot = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(live_snapshot.path().join("baseline")).unwrap();
+        std::fs::write(project.path().join("created.txt"), "created\n").unwrap();
+
+        let request = format!("GET /api/session/current/changes?session_id={backend_id} HTTP/1.1");
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(live_snapshot.path()),
+            Some(project.path()),
+            home.path(),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["path"], "created.txt");
+        assert_eq!(json[0]["kind"], "created");
+
+        let request = format!(
+            "GET /api/session/current/changes/created.txt?session_id={backend_id} HTTP/1.1"
+        );
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(live_snapshot.path()),
+            Some(project.path()),
             home.path(),
         );
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
