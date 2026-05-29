@@ -111,6 +111,9 @@ pub enum UiCommand {
     RemoveRecording {
         stream_name: String,
     },
+    DeleteRecording {
+        stream_name: String,
+    },
     RecordingError {
         stream_name: String,
         message: String,
@@ -2089,6 +2092,20 @@ impl AppState {
                 ));
                 self.known_recordings.retain(|s| s != &stream);
                 cmds.push(UiCommand::RemoveRecording {
+                    stream_name: stream,
+                });
+            }
+
+            "recording_deleted" => {
+                let stream = msg["stream_name"].as_str().unwrap_or("").to_string();
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Recording deleted: {}", stream),
+                    None,
+                    "system",
+                ));
+                self.known_recordings.retain(|s| s != &stream);
+                cmds.push(UiCommand::DeleteRecording {
                     stream_name: stream,
                 });
             }

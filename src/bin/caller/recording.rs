@@ -24,6 +24,12 @@ pub struct RecordingGuard {
     bridge_task: Option<tokio::task::JoinHandle<()>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopRecordingOutcome {
+    Saved,
+    DiscardedEmpty,
+}
+
 impl RecordingGuard {
     /// Check if the ffmpeg process is still alive.
     pub fn is_alive(&mut self) -> bool {
@@ -282,9 +288,10 @@ pub async fn start_display_recording(
         })
         .kill_on_drop(true);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn ffmpeg for display recording: {}", e))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        let _ = std::fs::remove_dir_all(&segments_dir);
+        format!("Failed to spawn ffmpeg for display recording: {}", e)
+    })?;
 
     // Guard against fail-fast errors: x11grab on a Wayland-only session, or
     // avfoundation without Screen Recording permission, exits within ~50ms.
@@ -297,7 +304,11 @@ pub async fn start_display_recording(
             "x11grab"
         },
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        let _ = std::fs::remove_dir_all(&segments_dir);
+        e
+    })?;
 
     if use_screencapture_feeder {
         if let Some(stdin) = child.stdin.take() {
@@ -426,11 +437,19 @@ pub async fn start_frame_recording(
         )
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("Failed to spawn ffmpeg for frame recording: {}", e))?;
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(&segments_dir);
+            format!("Failed to spawn ffmpeg for frame recording: {}", e)
+        })?;
 
     // Catch startup-time failures (missing libx264, bad args, etc.) before we
     // hand out a RecordingGuard that will quietly produce empty segments.
-    verify_ffmpeg_started(&mut child, &log_path, "image2pipe").await?;
+    verify_ffmpeg_started(&mut child, &log_path, "image2pipe")
+        .await
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(&segments_dir);
+            e
+        })?;
 
     // Take stdin out of the child before moving it into the guard
     let stdin = child.stdin.take();
@@ -560,8 +579,9 @@ impl RecordingRegistry {
     }
 
     /// Stop recording a specific stream.
-    pub fn stop(&mut self, stream_name: &str) {
-        self.recordings.remove(stream_name);
+    pub fn stop(&mut self, stream_name: &str) -> Option<StopRecordingOutcome> {
+        let guard = self.recordings.remove(stream_name)?;
+        Some(finalize_stopped_recording(guard))
     }
 
     /// Delete a recording's files from disk. Stops it first if still active.
@@ -581,17 +601,20 @@ impl RecordingRegistry {
 
     /// Stop only agent-managed recordings, keeping external (--record-display) streams alive.
     /// Returns the names of streams that were stopped.
-    pub fn stop_agent_streams(&mut self) -> Vec<String> {
+    pub fn stop_agent_streams(&mut self) -> Vec<(String, StopRecordingOutcome)> {
         let to_stop: Vec<String> = self
             .recordings
             .keys()
             .filter(|name| !self.external_streams.contains(*name))
             .cloned()
             .collect();
-        for name in &to_stop {
-            self.recordings.remove(name);
+        let mut stopped = Vec::new();
+        for name in to_stop {
+            if let Some(guard) = self.recordings.remove(&name) {
+                stopped.push((name, finalize_stopped_recording(guard)));
+            }
         }
-        to_stop
+        stopped
     }
 
     /// List active recording stream names.
@@ -650,7 +673,11 @@ impl RecordingRegistry {
             for entry in entries.flatten() {
                 if entry.path().is_dir() {
                     if let Some(name) = entry.file_name().to_str() {
-                        streams.push(name.to_string());
+                        if self.recordings.contains_key(name)
+                            || recording_dir_has_playable_segments(&entry.path())
+                        {
+                            streams.push(name.to_string());
+                        }
                     }
                 }
             }
@@ -658,6 +685,31 @@ impl RecordingRegistry {
         streams.sort();
         streams
     }
+}
+
+fn finalize_stopped_recording(guard: RecordingGuard) -> StopRecordingOutcome {
+    let segments_dir = guard.segments_dir().to_path_buf();
+    drop(guard);
+
+    if recording_dir_has_playable_segments(&segments_dir) {
+        StopRecordingOutcome::Saved
+    } else {
+        let _ = std::fs::remove_dir_all(&segments_dir);
+        StopRecordingOutcome::DiscardedEmpty
+    }
+}
+
+pub fn recording_dir_has_playable_segments(segments_dir: &Path) -> bool {
+    parse_segment_csv(&segments_dir.join("segments.csv"), segments_dir)
+        .into_iter()
+        .any(|segment| {
+            segment.end_secs > segment.start_secs
+                && segment
+                    .path
+                    .metadata()
+                    .map(|metadata| metadata.is_file() && metadata.len() > 0)
+                    .unwrap_or(false)
+        })
 }
 
 /// Parse ffmpeg's segment list CSV (filename,start_time,end_time).
@@ -953,10 +1005,20 @@ pub fn spawn_recording_listener(
                         .into_iter()
                         .find(|s| *s == stream_name || s.starts_with(&format!("{}_", stream_name)));
                     if let Some(actual) = active {
-                        reg.stop(&actual);
+                        let outcome = reg.stop(&actual);
                         bus.send(AppEvent::RecordingStopped {
-                            stream_name: actual,
+                            stream_name: actual.clone(),
                         });
+                        if outcome == Some(StopRecordingOutcome::DiscardedEmpty) {
+                            bus.send(AppEvent::RecordingError {
+                                stream_name: actual.clone(),
+                                message: "No playable video frames were captured; empty recording discarded"
+                                    .to_string(),
+                            });
+                            bus.send(AppEvent::RecordingDeleted {
+                                stream_name: actual,
+                            });
+                        }
                     }
                 }
                 Ok(AppEvent::ControlCommand(crate::event::ControlMsg::DeleteRecording {
@@ -976,10 +1038,21 @@ pub fn spawn_recording_listener(
                     // Stop agent-managed recordings, keep external (--record-display) alive
                     let mut reg = registry.write().await;
                     let stopped = reg.stop_agent_streams();
-                    for stream in &stopped {
+                    for (stream, outcome) in &stopped {
                         bus.send(AppEvent::RecordingStopped {
                             stream_name: stream.clone(),
                         });
+                        if *outcome == StopRecordingOutcome::DiscardedEmpty {
+                            bus.send(AppEvent::RecordingError {
+                                stream_name: stream.clone(),
+                                message:
+                                    "No playable video frames were captured; empty recording discarded"
+                                        .to_string(),
+                            });
+                            bus.send(AppEvent::RecordingDeleted {
+                                stream_name: stream.clone(),
+                            });
+                        }
                     }
                     // Don't break — keep listening for new tasks (--continue)
                 }
@@ -1090,6 +1163,31 @@ max_retention_hours = 48
     }
 
     #[test]
+    fn recording_dir_has_playable_segments_rejects_manifest_only_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("manifest.json"), "{}").unwrap();
+        std::fs::write(tmp.path().join("segments.csv"), "").unwrap();
+
+        assert!(!recording_dir_has_playable_segments(tmp.path()));
+    }
+
+    #[test]
+    fn recording_dir_has_playable_segments_requires_non_empty_segment_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("segments.csv"),
+            "seg_00000.mp4,0.000000,1.000000\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("seg_00000.mp4"), b"").unwrap();
+
+        assert!(!recording_dir_has_playable_segments(tmp.path()));
+
+        std::fs::write(tmp.path().join("seg_00000.mp4"), b"fakedata").unwrap();
+        assert!(recording_dir_has_playable_segments(tmp.path()));
+    }
+
+    #[test]
     fn registry_new_and_defaults() {
         let tmp = tempfile::tempdir().unwrap();
         let reg = RecordingRegistry::new(tmp.path(), RecordingConfig::default());
@@ -1134,15 +1232,22 @@ max_retention_hours = 48
     }
 
     #[test]
-    fn registry_all_streams_reads_dirs() {
+    fn registry_all_streams_skips_empty_stopped_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         let rec_dir = tmp.path().join("recordings");
-        std::fs::create_dir_all(rec_dir.join("display_99")).unwrap();
+        let display_dir = rec_dir.join("display_99");
+        std::fs::create_dir_all(&display_dir).unwrap();
+        std::fs::write(
+            display_dir.join("segments.csv"),
+            "seg_00000.mp4,0.000000,1.000000\n",
+        )
+        .unwrap();
+        std::fs::write(display_dir.join("seg_00000.mp4"), b"fakedata").unwrap();
         std::fs::create_dir_all(rec_dir.join("cam0")).unwrap();
 
         let reg = RecordingRegistry::new(tmp.path(), RecordingConfig::default());
         let streams = reg.all_streams();
-        assert_eq!(streams, vec!["cam0", "display_99"]);
+        assert_eq!(streams, vec!["display_99"]);
     }
 
     #[test]

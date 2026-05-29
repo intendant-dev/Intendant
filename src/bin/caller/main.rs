@@ -4687,7 +4687,6 @@ async fn drain_external_agent_events(
                                 id,
                                 action: action_str.to_string(),
                             });
-                            slog(config.session_log, |l| l.approval_resolved(id, action_str));
                             if let Err(e) = agent.resolve_approval(&request_id, decision).await {
                                 slog(config.session_log, |l| {
                                     l.warn(&format!("Failed to resolve approval: {}", e))
@@ -4811,7 +4810,6 @@ async fn drain_external_agent_events(
                                 id,
                                 action: action_str.to_string(),
                             });
-                            slog(config.session_log, |l| l.approval_resolved(id, action_str));
                             if let Err(e) = agent.resolve_approval(&request_id, decision).await {
                                 slog(config.session_log, |l| {
                                     l.warn(&format!("Failed to resolve file approval: {}", e))
@@ -13466,7 +13464,6 @@ async fn run_external_agent_mode(
                     turns_in_round,
                     native_message_count: None,
                 });
-                slog(&session_log, |l| l.round_complete(round, turns_in_round));
             }
             DrainOutcome::ContextRewindRequested {
                 request,
@@ -13484,7 +13481,6 @@ async fn run_external_agent_mode(
                     turns_in_round,
                     native_message_count: None,
                 });
-                slog(&session_log, |l| l.round_complete(round, turns_in_round));
                 match apply_external_context_rewind(
                     &mut agent,
                     &thread.thread_id,
@@ -15126,6 +15122,16 @@ async fn main() -> Result<(), CallerError> {
     // in MCP/JSON modes that own stdio.
     let use_web = !flags.no_web && !flags.mcp && !flags.json_output;
 
+    // Resolve CLI/config external-agent choice once and share the effective
+    // runtime value with dashboard APIs. This intentionally happens before
+    // provider selection so `--agent codex` runs do not warn as if no worker is
+    // available when only native provider API keys are missing.
+    let initial_agent_backend =
+        resolve_agent_backend_from_config(flags.agent_backend.clone(), &project);
+    let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
+        Arc::new(tokio::sync::RwLock::new(initial_agent_backend.clone()));
+    let runtime_presence_enabled = !flags.no_presence && project.config.presence.enabled;
+
     // Resolve web port via auto-discovery, keeping the listener alive (no TOCTOU).
     let (web_port, mut web_listener) = if use_web {
         let (port, listener) = find_available_port(flags.web_port).await?;
@@ -15167,13 +15173,29 @@ async fn main() -> Result<(), CallerError> {
             // No API keys — start the dashboard anyway.
             // Display control, session browsing, annotations, and clipping
             // all work without inference.
-            eprintln!(
-                "Warning: {} AI features will be unavailable. \
-                 The web dashboard is starting without a model provider.",
-                e
-            );
+            if let Some(backend) = &initial_agent_backend {
+                eprintln!(
+                    "Warning: no native model provider: {}. Native-provider features are unavailable, \
+                     but the {} external agent can run with its own authentication.",
+                    e,
+                    backend
+                );
+            } else {
+                eprintln!(
+                    "Warning: {} AI features will be unavailable. \
+                     The web dashboard is starting without a model provider.",
+                    e
+                );
+            }
             slog(&session_log, |l| {
-                l.warn(&format!("No AI provider: {}", e));
+                if let Some(backend) = &initial_agent_backend {
+                    l.warn(&format!(
+                        "No native model provider: {}; external agent configured: {}",
+                        e, backend
+                    ));
+                } else {
+                    l.warn(&format!("No AI provider: {}", e));
+                }
             });
             None
         }
@@ -15297,13 +15319,17 @@ async fn main() -> Result<(), CallerError> {
             } else {
                 None
             };
-        let web_config = web_gateway::build_config(
+        let mut web_config = web_gateway::build_config(
             project.config.presence.live_provider.as_deref(),
             project.config.presence.live_model.as_deref(),
             project.config.transcription.enabled,
             project.config.webrtc.to_ice_config(),
             project.config.webrtc.federation_allow_h264,
         );
+        web_config.presence_enabled = runtime_presence_enabled;
+        web_config.external_agent = initial_agent_backend
+            .as_ref()
+            .map(|backend| backend.as_short_str().to_string());
         let shared_session = Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
             daemon_session_id: session_log_id(&session_log),
             query_ctx: None,
@@ -15313,6 +15339,10 @@ async fn main() -> Result<(), CallerError> {
             session_registry: Some(session_registry.clone()),
             snapshot_dir: Some(log_dir.join("file_snapshots")),
             project_root_for_changes: Some(project.root.clone()),
+            runtime_settings: web_gateway::RuntimeSettingsState {
+                external_agent: Some(shared_external_agent.clone()),
+                presence_enabled: Some(runtime_presence_enabled),
+            },
             file_watcher: shared_file_watcher.clone(),
         }));
         let mut mcp_http_state = mcp::McpAppState::new(
@@ -15357,10 +15387,6 @@ async fn main() -> Result<(), CallerError> {
         );
         eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
 
-        let agent_backend =
-            resolve_agent_backend_from_config(flags.agent_backend.clone(), &project);
-        let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
-            Arc::new(tokio::sync::RwLock::new(agent_backend));
         let shared_codex_config: control_plane::SharedCodexConfig = {
             let cfg = &project.config.agent.codex;
             Arc::new(tokio::sync::RwLock::new(
@@ -15520,13 +15546,17 @@ async fn main() -> Result<(), CallerError> {
                 } else {
                     None
                 };
-            let config = web_gateway::build_config(
+            let mut config = web_gateway::build_config(
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
                 project.config.webrtc.to_ice_config(),
                 project.config.webrtc.federation_allow_h264,
             );
+            config.presence_enabled = runtime_presence_enabled;
+            config.external_agent = initial_agent_backend
+                .as_ref()
+                .map(|backend| backend.as_short_str().to_string());
             let snapshot_dir = log_dir.join("file_snapshots");
             let shared_session =
                 Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
@@ -15538,6 +15568,10 @@ async fn main() -> Result<(), CallerError> {
                     session_registry: Some(session_registry.clone()),
                     snapshot_dir: Some(snapshot_dir.clone()),
                     project_root_for_changes: Some(project.root.clone()),
+                    runtime_settings: web_gateway::RuntimeSettingsState {
+                        external_agent: Some(shared_external_agent.clone()),
+                        presence_enabled: Some(runtime_presence_enabled),
+                    },
                     file_watcher: shared_file_watcher.clone(),
                 }));
             let mut mcp_http_state = mcp::McpAppState::new(
@@ -15601,6 +15635,7 @@ async fn main() -> Result<(), CallerError> {
             autonomy.clone(),
             log_dir.clone(),
         );
+        mcp_app_state.external_agent = initial_agent_backend.clone();
         mcp_app_state.codex_managed_context =
             project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
         mcp_app_state.configured_codex_managed_context = mcp_app_state.codex_managed_context;
@@ -16121,13 +16156,17 @@ async fn main() -> Result<(), CallerError> {
                 } else {
                     None
                 };
-            let config = web_gateway::build_config(
+            let mut config = web_gateway::build_config(
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
                 project.config.webrtc.to_ice_config(),
                 project.config.webrtc.federation_allow_h264,
             );
+            config.presence_enabled = runtime_presence_enabled;
+            config.external_agent = initial_agent_backend
+                .as_ref()
+                .map(|backend| backend.as_short_str().to_string());
             let snapshot_dir = log_dir.join("file_snapshots");
             let shared_session =
                 Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
@@ -16139,6 +16178,10 @@ async fn main() -> Result<(), CallerError> {
                     session_registry: Some(session_registry.clone()),
                     snapshot_dir: Some(snapshot_dir.clone()),
                     project_root_for_changes: Some(project.root.clone()),
+                    runtime_settings: web_gateway::RuntimeSettingsState {
+                        external_agent: Some(shared_external_agent.clone()),
+                        presence_enabled: Some(runtime_presence_enabled),
+                    },
                     file_watcher: shared_file_watcher.clone(),
                 }));
             web_shared_session_for_supervisor = Some(shared_session.clone());
@@ -16214,13 +16257,9 @@ async fn main() -> Result<(), CallerError> {
             None
         };
         let force_direct = flags.direct;
-        // Resolve external agent backend: CLI flag > config default > None
-        let agent_backend =
-            resolve_agent_backend_from_config(flags.agent_backend.clone(), &project);
-        // Shared state for dynamic external agent selection from the web UI.
-        // Seeded with the resolved CLI/config value; updated by SetExternalAgent ControlMsg.
-        let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
-            Arc::new(tokio::sync::RwLock::new(agent_backend.clone()));
+        // External agent backend resolved at startup; the shared runtime handle
+        // above is kept in sync by ControlPlane SetExternalAgent messages.
+        let agent_backend = initial_agent_backend.clone();
         // Live Codex config — seeded from TOML, updated by SetCodex* ControlMsgs.
         // The daemon loop reads this at the start of each task so a Control-tab
         // toggle takes effect on the next task without needing a restart.
@@ -16633,13 +16672,17 @@ async fn main() -> Result<(), CallerError> {
                 } else {
                     None
                 };
-            let config = web_gateway::build_config(
+            let mut config = web_gateway::build_config(
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
                 project.config.webrtc.to_ice_config(),
                 project.config.webrtc.federation_allow_h264,
             );
+            config.presence_enabled = runtime_presence_enabled;
+            config.external_agent = initial_agent_backend
+                .as_ref()
+                .map(|backend| backend.as_short_str().to_string());
             let snapshot_dir = log_dir.join("file_snapshots");
             let shared_session =
                 Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
@@ -16651,6 +16694,10 @@ async fn main() -> Result<(), CallerError> {
                     session_registry: Some(session_registry.clone()),
                     snapshot_dir: Some(snapshot_dir.clone()),
                     project_root_for_changes: Some(project.root.clone()),
+                    runtime_settings: web_gateway::RuntimeSettingsState {
+                        external_agent: Some(shared_external_agent.clone()),
+                        presence_enabled: Some(runtime_presence_enabled),
+                    },
                     file_watcher: shared_file_watcher.clone(),
                 }));
             let mut mcp_http_state = mcp::McpAppState::new(
@@ -16812,12 +16859,9 @@ async fn main() -> Result<(), CallerError> {
         let project_root = project.root.clone();
         let autonomy_for_daemon = autonomy.clone();
 
-        // Resolve external agent backend: CLI flag > config default > None
-        let agent_backend =
-            resolve_agent_backend_from_config(flags.agent_backend.clone(), &project);
-        // Shared state for dynamic external agent selection from the web UI (headless mode).
-        let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
-            Arc::new(tokio::sync::RwLock::new(agent_backend.clone()));
+        // External agent backend resolved at startup; the shared runtime handle
+        // above is kept in sync by ControlPlane SetExternalAgent messages.
+        let agent_backend = initial_agent_backend.clone();
         let shared_codex_config: control_plane::SharedCodexConfig = {
             let cfg = &project.config.agent.codex;
             Arc::new(tokio::sync::RwLock::new(

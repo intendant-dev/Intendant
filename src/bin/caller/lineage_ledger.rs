@@ -115,7 +115,9 @@ pub fn lineage_ledger_from_jsonl(contents: &str, source_session_id: &str) -> Opt
                     && !rel.child_session_id.is_empty()
                     && !rel.relationship.is_empty()
                 {
-                    facts.relationship_order.insert(rel.clone(), relationship_seq);
+                    facts
+                        .relationship_order
+                        .insert(rel.clone(), relationship_seq);
                     relationship_seq += 1;
                     facts.relationships.insert(rel);
                 }

@@ -54,6 +54,11 @@ pub struct HistoryRound {
     pub files_changed: Vec<String>,
     /// FULL project state at the end of this round: path → sha256 hex.
     pub files_at_end: HashMap<String, String>,
+    /// Display-state mirror that also includes non-restorable tracked files
+    /// such as binary/oversized files. Rollback still uses `files_at_end`;
+    /// this lets timeline counts match what the Changes tab reports.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub all_files_at_end: HashMap<String, String>,
     /// Number of agent turns executed in this round (from `RoundComplete.turns_in_round`).
     /// Used by conversation rollback to compute how many turns to drop
     /// when reverting to a specific round. Optional for backward compat
@@ -635,7 +640,7 @@ impl FileWatcher {
                 if !abs_path.is_file() {
                     return;
                 }
-                if existed_at_baseline {
+                if known_file {
                     FileChangeKind::Modified
                 } else {
                     FileChangeKind::Created
@@ -645,7 +650,7 @@ impl FileWatcher {
                 if !abs_path.is_file() {
                     return;
                 }
-                if existed_at_baseline {
+                if known_file {
                     FileChangeKind::Modified
                 } else {
                     FileChangeKind::Created
@@ -762,12 +767,12 @@ impl FileWatcher {
         native_message_count: Option<u32>,
     ) -> Result<(), CallerError> {
         // Walk project and compute file hashes + write objects.
-        let files_at_end = self.scan_and_store_objects()?;
+        let (files_at_end, all_files_at_end) = self.scan_and_store_objects()?;
 
         // Determine parent + files_changed by diffing against previous round
         // (or baseline if first round).
         let parent_id = self.history.current_head_id;
-        let files_changed = self.compute_files_changed(parent_id, &files_at_end);
+        let files_changed = self.compute_files_changed(parent_id, &all_files_at_end);
 
         // If current head is not the last round, branch: move trailing rounds
         // into abandoned_branches before appending.
@@ -793,6 +798,7 @@ impl FileWatcher {
             timestamp_unix: now_unix(),
             files_changed,
             files_at_end,
+            all_files_at_end,
             turn_count,
             native_message_count,
         };
@@ -924,8 +930,11 @@ impl FileWatcher {
 
     /// Walk the project tree, hash every eligible file, write new content to
     /// `objects/{hash}`, and return the path→hash map.
-    fn scan_and_store_objects(&self) -> Result<HashMap<String, String>, CallerError> {
+    fn scan_and_store_objects(
+        &self,
+    ) -> Result<(HashMap<String, String>, HashMap<String, String>), CallerError> {
         let mut out: HashMap<String, String> = HashMap::new();
+        let mut all: HashMap<String, String> = HashMap::new();
         let objects_dir = self.snapshot_dir.join("objects");
         std::fs::create_dir_all(&objects_dir)
             .map_err(|e| CallerError::Config(format!("create objects dir: {}", e)))?;
@@ -967,22 +976,30 @@ impl FileWatcher {
                     continue;
                 }
                 let snapshot = match inspect_file(&path) {
-                    Ok(InspectedFile::Text(snapshot)) => snapshot,
-                    Ok(InspectedFile::Unsupported(_)) | Err(_) => continue,
+                    Ok(snapshot) => snapshot,
+                    Err(_) => continue,
                 };
-                let obj_path = objects_dir.join(&snapshot.hash_hex);
-                if !obj_path.exists() {
-                    // Write into a tmp path first so a partial write can't
-                    // leave a corrupt blob under its hash.
-                    let tmp = obj_path.with_extension("tmp");
-                    if std::fs::write(&tmp, &snapshot.bytes).is_ok() {
-                        let _ = std::fs::rename(&tmp, &obj_path);
+                match snapshot {
+                    InspectedFile::Text(snapshot) => {
+                        all.insert(rel_path_key(&rel), snapshot.hash_hex.clone());
+                        let obj_path = objects_dir.join(&snapshot.hash_hex);
+                        if !obj_path.exists() {
+                            // Write into a tmp path first so a partial write can't
+                            // leave a corrupt blob under its hash.
+                            let tmp = obj_path.with_extension("tmp");
+                            if std::fs::write(&tmp, &snapshot.bytes).is_ok() {
+                                let _ = std::fs::rename(&tmp, &obj_path);
+                            }
+                        }
+                        out.insert(rel_path_key(&rel), snapshot.hash_hex);
+                    }
+                    InspectedFile::Unsupported(snapshot) => {
+                        all.insert(rel_path_key(&rel), snapshot.hash_hex);
                     }
                 }
-                out.insert(rel_path_key(&rel), snapshot.hash_hex);
             }
         }
-        Ok(out)
+        Ok((out, all))
     }
 
     /// Compute the list of paths whose content in `current` differs from the
@@ -996,7 +1013,11 @@ impl FileWatcher {
         let mut changed = Vec::new();
         if let Some(pid) = parent_id {
             if let Some(parent) = self.history.rounds.iter().find(|r| r.id == pid) {
-                let prev = &parent.files_at_end;
+                let prev = if parent.all_files_at_end.is_empty() {
+                    &parent.files_at_end
+                } else {
+                    &parent.all_files_at_end
+                };
                 // Union of keys from both sides.
                 let mut keys: HashSet<&String> = prev.keys().collect();
                 keys.extend(current.keys());
@@ -1012,8 +1033,13 @@ impl FileWatcher {
         }
         // First round: compare against baseline in-memory mirror.
         let mut baseline_hex: HashMap<String, String> = HashMap::new();
+        for (path, meta) in &self.baseline_manifest {
+            baseline_hex.insert(path.clone(), meta.hash.clone());
+        }
         for (rel, bytes) in &self.baselines {
-            baseline_hex.insert(rel_path_key(rel), hex_encode(&sha256_hash(bytes)));
+            baseline_hex
+                .entry(rel_path_key(rel))
+                .or_insert_with(|| hex_encode(&sha256_hash(bytes)));
         }
         let mut keys: HashSet<&String> = baseline_hex.keys().collect();
         keys.extend(current.keys());
@@ -1371,6 +1397,44 @@ mod tests {
     }
 
     #[test]
+    fn created_file_followup_modify_event_is_not_created_again() {
+        let root = TempDir::new().unwrap();
+        let snap = TempDir::new().unwrap();
+        let file_path = root.path().join("new.txt");
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut watcher =
+            FileWatcher::new(root.path().to_path_buf(), snap.path().to_path_buf(), bus)
+                .expect("watcher");
+
+        std::fs::write(&file_path, "first\n").unwrap();
+        watcher.process_change(
+            &file_path,
+            &notify::EventKind::Create(notify::event::CreateKind::File),
+        );
+        match rx.try_recv().expect("created event") {
+            AppEvent::FileChanged { kind, .. } => assert_eq!(kind, FileChangeKind::Created),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        std::fs::write(&file_path, "first\nsecond\n").unwrap();
+        watcher.process_change(
+            &file_path,
+            &notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )),
+        );
+        match rx.try_recv().expect("modified event") {
+            AppEvent::FileChanged { path, kind, .. } => {
+                assert_eq!(path, "new.txt");
+                assert_eq!(kind, FileChangeKind::Modified);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_binary_detection() {
         assert!(is_binary(&[0x00, 0x01, 0x02]));
         assert!(is_binary(b"hello\x00world"));
@@ -1482,6 +1546,29 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn round_files_changed_counts_unsupported_created_files() {
+        let root = TempDir::new().unwrap();
+        let snap = TempDir::new().unwrap();
+        let mut watcher = make_watcher(root.path(), snap.path());
+
+        std::fs::write(root.path().join("text.txt"), "hello\n").unwrap();
+        std::fs::write(root.path().join("data.dat"), b"hello\0binary").unwrap();
+
+        watcher
+            .on_round_complete("created files".to_string(), None, None)
+            .unwrap();
+        let round = watcher.history.rounds.last().expect("round");
+
+        assert_eq!(
+            round.files_changed,
+            vec!["data.dat".to_string(), "text.txt".to_string()]
+        );
+        assert!(round.files_at_end.contains_key("text.txt"));
+        assert!(!round.files_at_end.contains_key("data.dat"));
+        assert!(round.all_files_at_end.contains_key("data.dat"));
     }
 
     #[test]
@@ -1758,6 +1845,7 @@ mod tests {
                 timestamp_unix: now,
                 files_changed: vec![],
                 files_at_end: HashMap::new(),
+                all_files_at_end: HashMap::new(),
                 turn_count: None,
                 native_message_count: None,
             };

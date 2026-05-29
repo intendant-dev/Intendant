@@ -2284,7 +2284,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             log.recording_error(stream_name, message);
         }
         AppEvent::RecordingDeleted { stream_name } => {
-            log.info(&format!("Recording deleted: {}", stream_name));
+            log.recording_deleted(stream_name);
         }
 
         // Presence / voice

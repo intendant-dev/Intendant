@@ -1245,6 +1245,10 @@ pub struct ActiveSessionState {
     pub session_registry: Option<crate::display::SharedSessionRegistry>,
     pub snapshot_dir: Option<PathBuf>,
     pub project_root_for_changes: Option<PathBuf>,
+    /// Runtime-only daemon settings that may differ from persisted
+    /// `intendant.toml` because of CLI flags such as `--agent` or
+    /// `--no-presence`.
+    pub runtime_settings: RuntimeSettingsState,
     /// Shared handle to the live `FileWatcher`, used to serve the per-round
     /// history endpoints (GET history, POST rollback/redo/prune). The same
     /// mutex guards snapshot creation so concurrent rollback from the web
@@ -1263,12 +1267,20 @@ impl ActiveSessionState {
             session_registry: None,
             snapshot_dir: None,
             project_root_for_changes: None,
+            runtime_settings: RuntimeSettingsState::default(),
             file_watcher: None,
         }))
     }
 }
 
 pub type SharedActiveSession = Arc<tokio::sync::RwLock<ActiveSessionState>>;
+
+#[derive(Clone, Default)]
+pub struct RuntimeSettingsState {
+    pub external_agent:
+        Option<Arc<tokio::sync::RwLock<Option<crate::external_agent::AgentBackend>>>>,
+    pub presence_enabled: Option<bool>,
+}
 
 /// Context for answering presence tool queries from browser-side live models.
 /// Shared across all WebSocket connections (read-only for query tools).
@@ -1336,6 +1348,15 @@ pub struct VoiceDebugState {
 pub struct WebGatewayConfig {
     pub provider: String,
     pub model: String,
+    /// Effective server-side presence state for this running daemon. This is
+    /// intentionally runtime-scoped, because `--no-presence` can override the
+    /// persisted `[presence] enabled` setting.
+    #[serde(default)]
+    pub presence_enabled: bool,
+    /// Effective external-agent backend selected for this daemon at startup.
+    /// The voice provider/model above remain scoped to browser live audio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_agent: Option<String>,
     pub input_sample_rate: u32,
     pub output_sample_rate: u32,
     /// Whether server-side transcription is enabled (browser should send user_audio).
@@ -1362,6 +1383,8 @@ impl Default for WebGatewayConfig {
         Self {
             provider: "gemini".to_string(),
             model: "gemini-2.5-flash-native-audio-preview-12-2025".to_string(),
+            presence_enabled: false,
+            external_agent: None,
             input_sample_rate: 16000,
             output_sample_rate: 24000,
             transcription_enabled: false,
@@ -2220,6 +2243,11 @@ fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<serde_json::V
                 &stream_dir.join("segments.csv"),
                 &stream_dir,
             );
+            if segments.is_empty()
+                || !crate::recording::recording_dir_has_playable_segments(&stream_dir)
+            {
+                continue;
+            }
             let total_duration = segments.last().map(|s| s.end_secs).unwrap_or(0.0);
             let seg_json: Vec<serde_json::Value> = segments
                 .iter()
@@ -6224,10 +6252,13 @@ fn handle_changes_request(
 
     if file_path.is_empty() {
         // List all changed files.
-        ("200 OK", handle_changes_list(&baseline_dir, project_root))
+        (
+            "200 OK",
+            handle_changes_list(snapshot_dir, &baseline_dir, project_root),
+        )
     } else {
         // Single-file diff.
-        handle_changes_file_diff(file_path, &baseline_dir, project_root)
+        handle_changes_file_diff(file_path, snapshot_dir, &baseline_dir, project_root)
     }
 }
 
@@ -6240,6 +6271,192 @@ fn load_baseline_manifest(baseline_dir: &Path) -> crate::file_watcher::BaselineM
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => HashMap::new(),
     }
+}
+
+fn normalize_external_diff_path(path: &str) -> Option<String> {
+    let path = path.split('\t').next().unwrap_or(path).trim();
+    if path == "/dev/null" {
+        return None;
+    }
+    let path = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+fn parse_external_diff_file_paths(unified_diff: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in unified_diff.lines() {
+        let path = if let Some(rest) = line.strip_prefix("+++ ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            rest
+        } else {
+            continue;
+        };
+        if let Some(path) = normalize_external_diff_path(path) {
+            if !out.iter().any(|p| p == &path) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn external_diff_line_text(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
+}
+
+fn is_external_diff_file_boundary(lines: &[&str], idx: usize) -> bool {
+    let line = external_diff_line_text(lines[idx]);
+    line.starts_with("diff --git ")
+        || (line.starts_with("--- ")
+            && lines
+                .get(idx + 1)
+                .is_some_and(|next| external_diff_line_text(next).starts_with("+++ ")))
+}
+
+fn split_external_unified_diff_by_file(unified_diff: &str) -> Vec<(String, String)> {
+    if unified_diff.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines: Vec<&str> = unified_diff.split_inclusive('\n').collect();
+    if lines.is_empty() {
+        lines.push(unified_diff);
+    }
+
+    let mut starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            external_diff_line_text(line)
+                .starts_with("diff --git ")
+                .then_some(idx)
+        })
+        .collect();
+    if starts.is_empty() {
+        for idx in 0..lines.len() {
+            if is_external_diff_file_boundary(&lines, idx) {
+                starts.push(idx);
+            }
+        }
+    }
+    if starts.is_empty() {
+        return parse_external_diff_file_paths(unified_diff)
+            .into_iter()
+            .next()
+            .map(|path| vec![(path, unified_diff.to_string())])
+            .unwrap_or_default();
+    }
+
+    let mut out = Vec::new();
+    for (i, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(lines.len());
+        let block = lines[start..end].concat();
+        if let Some(path) = parse_external_diff_file_paths(&block).into_iter().next() {
+            out.push((path, block));
+        }
+    }
+    out
+}
+
+fn external_diff_log_body(message: &str) -> Option<&str> {
+    if !message.starts_with("External agent diff") {
+        return None;
+    }
+    let first_line_end = message.find('\n')?;
+    let body = &message[first_line_end + 1..];
+    if body.contains("diff --git ") || body.contains("--- ") || body.contains("@@ ") {
+        Some(body)
+    } else {
+        None
+    }
+}
+
+fn diff_stats_from_unified_diff(diff: &str) -> (u32, u32) {
+    let mut added = 0u32;
+    let mut removed = 0u32;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
+fn path_is_inside_project_root(project_root: &Path, path: &Path) -> bool {
+    if !path.is_absolute() {
+        return true;
+    }
+    if path.starts_with(project_root) {
+        return true;
+    }
+    let Ok(root) = project_root.canonicalize() else {
+        return false;
+    };
+    match path.canonicalize() {
+        Ok(resolved) => resolved.starts_with(root),
+        Err(_) => false,
+    }
+}
+
+fn load_external_change_records(
+    snapshot_dir: &Path,
+    project_root: &Path,
+    include_diff: bool,
+) -> Vec<ChangeRecord> {
+    let Some(log_dir) = snapshot_dir.parent() else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(log_dir.join("session.jsonl")) else {
+        return Vec::new();
+    };
+
+    let mut by_path: HashMap<String, ChangeRecord> = HashMap::new();
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(message) = value.get("message").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(diff_body) = external_diff_log_body(message) else {
+            continue;
+        };
+        for (path, block) in split_external_unified_diff_by_file(diff_body) {
+            let path_obj = Path::new(&path);
+            if !path_obj.is_absolute() || path_is_inside_project_root(project_root, path_obj) {
+                continue;
+            }
+            let (lines_added, lines_removed) = diff_stats_from_unified_diff(&block);
+            by_path.insert(
+                path.clone(),
+                ChangeRecord {
+                    path,
+                    kind: "external",
+                    lines_added,
+                    lines_removed,
+                    diff_available: true,
+                    reason: Some(
+                        "outside tracked project root; shown from external agent diff log"
+                            .to_string(),
+                    ),
+                    diff: include_diff.then_some(block),
+                },
+            );
+        }
+    }
+
+    let mut records: Vec<_> = by_path.into_values().collect();
+    records.sort_by(|a, b| a.path.cmp(&b.path));
+    records
 }
 
 fn collect_baseline_text_paths(baseline_dir: &Path) -> HashSet<String> {
@@ -6515,7 +6732,7 @@ fn change_record_detail_json(record: &ChangeRecord) -> serde_json::Value {
 }
 
 /// List all files that have changed since the session baseline.
-fn handle_changes_list(baseline_dir: &Path, project_root: &Path) -> String {
+fn handle_changes_list(snapshot_dir: &Path, baseline_dir: &Path, project_root: &Path) -> String {
     let baseline_manifest = load_baseline_manifest(baseline_dir);
     let baseline_paths = collect_baseline_text_paths(baseline_dir);
     let current_states = collect_current_change_states(project_root);
@@ -6540,18 +6757,45 @@ fn handle_changes_list(baseline_dir: &Path, project_root: &Path) -> String {
             changes.push(change_record_summary_json(&record));
         }
     }
+    let existing_paths: HashSet<String> = changes
+        .iter()
+        .filter_map(|value| {
+            value
+                .get("path")
+                .and_then(|path| path.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    for record in load_external_change_records(snapshot_dir, project_root, false) {
+        if !existing_paths.contains(&record.path) {
+            changes.push(change_record_summary_json(&record));
+        }
+    }
     serde_json::to_string(&changes).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Return a unified diff for a single file.
 fn handle_changes_file_diff(
     file_path: &str,
+    snapshot_dir: &Path,
     baseline_dir: &Path,
     project_root: &Path,
 ) -> (&'static str, String) {
     let decoded = url_path_decode(file_path);
     // Reject path traversal.
     let rel = Path::new(&decoded);
+    if rel.is_absolute() {
+        if let Some(record) = load_external_change_records(snapshot_dir, project_root, true)
+            .into_iter()
+            .find(|record| record.path == decoded)
+        {
+            return ("200 OK", change_record_detail_json(&record).to_string());
+        }
+        return (
+            "404 Not Found",
+            serde_json::json!({"error": "no changes for path"}).to_string(),
+        );
+    }
     for component in rel.components() {
         if !matches!(component, std::path::Component::Normal(_)) {
             return (
@@ -6570,31 +6814,38 @@ fn handle_changes_file_diff(
     let baseline_path = baseline_dir.join(rel);
     let current_path = project_root.join(rel);
 
-    // Verify resolved paths stay within their roots.
-    if let (Ok(resolved_baseline), Ok(resolved_root)) = (
-        baseline_path
-            .canonicalize()
-            .or_else(|_| Ok::<PathBuf, std::io::Error>(baseline_path.clone())),
-        baseline_dir
-            .canonicalize()
-            .or_else(|_| Ok::<PathBuf, std::io::Error>(baseline_dir.to_path_buf())),
-    ) {
-        if !resolved_baseline.starts_with(&resolved_root) {
+    // Verify existing resolved paths stay within their roots. Missing paths
+    // are safe after the component check above; canonicalizing a missing
+    // `baseline/<created-file>` path can otherwise mix `/tmp` and
+    // `/private/tmp` spellings on macOS and reject valid created files.
+    if baseline_path.exists() {
+        if let (Ok(resolved_baseline), Ok(resolved_root)) =
+            (baseline_path.canonicalize(), baseline_dir.canonicalize())
+        {
+            if !resolved_baseline.starts_with(&resolved_root) {
+                return (
+                    "400 Bad Request",
+                    serde_json::json!({"error": "invalid path"}).to_string(),
+                );
+            }
+        } else {
             return (
                 "400 Bad Request",
                 serde_json::json!({"error": "invalid path"}).to_string(),
             );
         }
     }
-    if let (Ok(resolved_current), Ok(resolved_root)) = (
-        current_path
-            .canonicalize()
-            .or_else(|_| Ok::<PathBuf, std::io::Error>(current_path.clone())),
-        project_root
-            .canonicalize()
-            .or_else(|_| Ok::<PathBuf, std::io::Error>(project_root.to_path_buf())),
-    ) {
-        if !resolved_current.starts_with(&resolved_root) {
+    if current_path.exists() {
+        if let (Ok(resolved_current), Ok(resolved_root)) =
+            (current_path.canonicalize(), project_root.canonicalize())
+        {
+            if !resolved_current.starts_with(&resolved_root) {
+                return (
+                    "400 Bad Request",
+                    serde_json::json!({"error": "invalid path"}).to_string(),
+                );
+            }
+        } else {
             return (
                 "400 Bad Request",
                 serde_json::json!({"error": "invalid path"}).to_string(),
@@ -8096,6 +8347,24 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
     }
 }
 
+async fn settings_payload_with_runtime_overrides(
+    config: &crate::project::ProjectConfig,
+    runtime: &RuntimeSettingsState,
+) -> SettingsPayload {
+    let mut payload = settings_payload_from_config(config);
+    if let Some(presence_enabled) = runtime.presence_enabled {
+        payload.presence_enabled = presence_enabled;
+    }
+    if let Some(shared_external_agent) = &runtime.external_agent {
+        payload.external_agent = shared_external_agent
+            .read()
+            .await
+            .as_ref()
+            .map(|backend| backend.as_short_str().to_string());
+    }
+    payload
+}
+
 fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &SettingsPayload) {
     config.computer_use.provider = payload.cu_provider.clone();
     config.computer_use.model = payload.cu_model.clone();
@@ -8928,6 +9197,7 @@ pub fn spawn_web_gateway(
                 let snapshot_dir = session_snap.snapshot_dir.clone();
                 let project_root_for_changes = session_snap.project_root_for_changes.clone();
                 let file_watcher = session_snap.file_watcher.clone();
+                let runtime_settings = session_snap.runtime_settings.clone();
                 drop(session_snap);
                 // Peek at the first bytes to detect (in order):
                 //  1. ICE-TCP STUN-framed traffic (RFC 4571 length prefix
@@ -11945,7 +12215,11 @@ pub fn spawn_web_gateway(
                         let body = match &project_root {
                             Some(root) => match crate::project::Project::from_root(root.clone()) {
                                 Ok(proj) => {
-                                    let payload = settings_payload_from_config(&proj.config);
+                                    let payload = settings_payload_with_runtime_overrides(
+                                        &proj.config,
+                                        &runtime_settings,
+                                    )
+                                    .await;
                                     serde_json::to_string(&payload)
                                         .unwrap_or_else(|_| "{}".to_string())
                                 }
@@ -19571,6 +19845,85 @@ mod tests {
         assert_eq!(json[0]["kind"], "created");
         assert_eq!(json[0]["lines_added"], 1);
         assert_eq!(json[0]["diff_available"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changes_request_created_file_detail_accepts_symlinked_snapshot_root() {
+        use std::os::unix::fs::symlink;
+
+        let holder = tempfile::TempDir::new().unwrap();
+        let real_log = holder.path().join("real-log");
+        let linked_log = holder.path().join("linked-log");
+        std::fs::create_dir_all(real_log.join("file_snapshots/baseline")).unwrap();
+        symlink(&real_log, &linked_log).unwrap();
+
+        let snapshot_dir = linked_log.join("file_snapshots");
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::write(project.path().join("new file.txt"), "created\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes/new%20file.txt HTTP/1.1",
+            Some(&snapshot_dir),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json["path"], "new file.txt");
+        assert_eq!(json["kind"], "created");
+        assert!(json["diff"].as_str().unwrap().contains("+created"));
+    }
+
+    #[test]
+    fn changes_request_surfaces_external_absolute_diff_from_session_log() {
+        let log = tempfile::TempDir::new().unwrap();
+        let snapshot_dir = log.path().join("file_snapshots");
+        let project = tempfile::TempDir::new().unwrap();
+        let external = tempfile::TempDir::new().unwrap();
+        let external_path = external.path().join("outside file.txt");
+        let external_display = external_path.to_string_lossy();
+        std::fs::create_dir_all(snapshot_dir.join("baseline")).unwrap();
+        let diff = format!(
+            "External agent diff: {external_display}\n# intendant-project-root: {}\n--- a/{external_display}\n+++ b/{external_display}\n@@ -0,0 +1,2 @@\n+alpha\n+beta\n",
+            project.path().display()
+        );
+        let entry = serde_json::json!({
+            "event": "info",
+            "message": diff,
+        });
+        std::fs::write(log.path().join("session.jsonl"), format!("{entry}\n")).unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(&snapshot_dir),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["path"], external_display.as_ref());
+        assert_eq!(json[0]["kind"], "external");
+        assert_eq!(json[0]["lines_added"], 2);
+        assert!(json[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("outside tracked project root"));
+
+        let encoded = external_display
+            .replace('%', "%25")
+            .replace('/', "%2F")
+            .replace(' ', "%20");
+        let request = format!("GET /api/session/current/changes/{encoded} HTTP/1.1");
+        let (status, body) =
+            handle_changes_request(&request, Some(&snapshot_dir), Some(project.path()));
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json["path"], external_display.as_ref());
+        assert_eq!(json["kind"], "external");
+        assert!(json["diff"].as_str().unwrap().contains("+alpha"));
     }
 
     #[test]

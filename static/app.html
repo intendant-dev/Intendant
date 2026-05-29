@@ -74,9 +74,16 @@ html, body {
   background: var(--crust);
   border-bottom: 1px solid var(--surface0);
   flex-shrink: 0;
-  overflow-x: auto;
-  white-space: nowrap;
+  flex-wrap: wrap;
+  overflow-x: hidden;
+  white-space: normal;
+  row-gap: 4px;
   font-size: 12px;
+}
+.status-bar > span,
+.status-bar > div {
+  min-width: 0;
+  white-space: nowrap;
 }
 .status-bar .host-label {
   color: var(--peach);
@@ -102,10 +109,32 @@ html, body {
 .hosts-aggregate-dot.ok { background: var(--green); }
 .hosts-aggregate-dot.warn { background: var(--yellow); }
 .hosts-aggregate-dot.err { background: var(--red); }
-.status-bar .provider { color: var(--blue); }
-.status-bar .model { color: var(--green); }
+.status-bar .provider,
+.status-bar .model,
+.status-bar .session,
+.status-bar #sb-voice-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.status-bar .provider {
+  color: var(--blue);
+  max-width: min(140px, 18vw);
+}
+.status-bar .model {
+  color: var(--green);
+  max-width: min(260px, 26vw);
+}
 .status-bar .turn { color: var(--yellow); }
-.status-bar .session { color: var(--overlay1); font-size: 11px; }
+.status-bar .session {
+  color: var(--overlay1);
+  font-size: 11px;
+  max-width: min(220px, 22vw);
+}
+.status-bar #sb-voice-label {
+  display: inline-block;
+  max-width: 96px;
+  vertical-align: bottom;
+}
 .status-bar .autonomy { font-weight: 600; }
 .status-bar .sep { color: var(--surface2); }
 .status-bar .field-label { color: var(--overlay0); font-size: 10px; margin-right: -6px; }
@@ -185,7 +214,10 @@ html, body {
   cursor: default;
 }
 .status-bar .sb-dot-group.clickable { cursor: pointer; }
-.status-bar .active-badge { margin-left: auto; }
+.status-bar .active-badge {
+  margin-left: 0;
+  flex-shrink: 0;
+}
 
 /* ── Active/Passive Badge ── */
 .active-badge {
@@ -243,6 +275,7 @@ html, body {
 }
 .tab-btn {
   padding: 8px 16px;
+  min-height: 36px;
   background: none;
   border: none;
   border-bottom: 2px solid transparent;
@@ -983,6 +1016,7 @@ html, body {
   color: var(--base);
   border: none;
   border-radius: 4px;
+  min-height: 32px;
   padding: 4px 10px;
   font-size: 12px;
   font-weight: 600;
@@ -1135,6 +1169,8 @@ html, body {
 }
 .global-direct-toggle input { margin: 0; accent-color: var(--blue); }
 .global-attach-btn {
+  min-width: 32px;
+  min-height: 32px;
   padding: 3px 8px;
   border: 1px solid var(--surface1);
   border-radius: 4px;
@@ -1176,6 +1212,7 @@ html, body {
   flex: 0 0 auto;
 }
 .global-send-btn {
+  min-height: 32px;
   padding: 4px 12px;
   border: 1px solid var(--green);
   border-radius: 4px;
@@ -4153,6 +4190,7 @@ html, body {
 }
 .subtab-btn {
   padding: 4px 12px;
+  min-height: 32px;
   background: transparent;
   border: 1px solid transparent;
   border-bottom: none;
@@ -4241,6 +4279,7 @@ html, body {
 .kind-badge.created { color: var(--green); border: 1px solid var(--green); }
 .kind-badge.modified { color: var(--yellow); border: 1px solid var(--yellow); }
 .kind-badge.deleted { color: var(--red); border: 1px solid var(--red); }
+.kind-badge.external { color: var(--sapphire); border: 1px solid var(--sapphire); }
 .changes-file-name,
 .changes-file-dir {
   min-width: 0;
@@ -6368,19 +6407,43 @@ html, body {
 /* ── Mobile ── */
 @media (max-width: 600px) {
   .status-bar { font-size: 11px; gap: 8px; padding: 4px 8px; }
-  .status-bar .session { display: inline; flex-shrink: 0; }
-  .tab-btn { padding: 8px 12px; font-size: 12px; }
+  .status-bar .provider { max-width: 92px; }
+  .status-bar .model { max-width: 150px; }
+  .status-bar .session { max-width: 120px; }
+  .status-bar #sb-voice-label { max-width: 72px; }
+  .ticker-collapsed {
+    flex-wrap: wrap;
+    white-space: normal;
+    row-gap: 2px;
+  }
+  .status-bar .session { display: inline-block; flex-shrink: 1; }
+  .tab-btn { padding: 8px 12px; min-height: 40px; font-size: 12px; }
   .subtabs {
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
   }
   .subtab-btn {
     flex: 0 0 auto;
+    min-height: 36px;
   }
+  .activity-toolbar {
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .verbosity-select { margin-left: 0; }
   .log-entry { padding: 1px 8px; }
   .log-entry .log-ts { width: 55px; font-size: 10px; }
   .session-detail-logs .log-ts { width: 118px; font-size: 10px; }
   .log-entry .log-level { width: 44px; font-size: 10px; }
+  .cost-section {
+    overflow-x: auto;
+    padding: 12px;
+  }
+  .cost-grid {
+    min-width: max-content;
+  }
+  #all-sessions-grid { min-width: 480px; }
+  #agent-usage-grid { min-width: 560px; }
   .usage-card { min-width: unset; }
   .usage-cards { flex-direction: column; }
   .sessions-header,
@@ -6448,6 +6511,7 @@ html, body {
     order: 3;
     flex: 1 0 100%;
     width: 100%;
+    min-height: 36px;
   }
   .global-attach-btn,
   .global-direct-toggle,
@@ -6455,7 +6519,12 @@ html, body {
     order: 4;
     flex: 0 0 auto;
   }
+  .global-attach-btn {
+    min-width: 40px;
+    min-height: 36px;
+  }
   .global-send-btn {
+    min-height: 36px;
     min-width: 58px;
     padding-left: 8px;
     padding-right: 8px;
@@ -6470,6 +6539,49 @@ html, body {
   .ann-btn, .ann-thick, .ann-act, .ann-close { width: 44px; height: 44px; font-size: 18px; }
   .ann-color { width: 28px; height: 28px; }
   .ann-note { width: 120px; }
+  .concurrent-log-label {
+    position: static;
+    align-self: flex-end;
+    margin: 4px 8px 0 8px;
+  }
+  .session-window-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+    padding: 6px;
+    max-height: 38vh;
+  }
+  .session-window {
+    min-height: 150px;
+    max-height: 260px;
+  }
+  .session-window-header {
+    flex-wrap: wrap;
+    gap: 5px;
+    padding: 6px;
+  }
+  .session-window-title {
+    order: 1;
+    flex: 1 1 100%;
+  }
+  .session-window-status { order: 2; }
+  .session-window-menu-cluster { order: 3; margin-left: auto; }
+  .session-window-state-cluster { order: 4; }
+  .session-window-action {
+    width: 28px;
+    height: 28px;
+  }
+  .session-window-log .log-entry {
+    flex-wrap: wrap;
+    row-gap: 1px;
+  }
+  .session-window-log .log-entry .log-ts,
+  .session-window-log .log-entry .log-level {
+    width: auto;
+    margin-right: 6px;
+  }
+  .session-window-log .log-entry .log-content {
+    flex-basis: 100%;
+  }
 }
 </style>
 </head>
@@ -8497,6 +8609,7 @@ let recPlayer = null;
 
 // Voice / Live mode
 let gatewayConfig = null;
+let currentExternalAgent = '';
 let micActive = false;
 let modelConnected = false;
 let audioCtx = null;
@@ -8852,7 +8965,7 @@ function showSettingsDialog() {
 
 // ── WASM Init ──
 async function main() {
-  await init('/wasm-web/presence_web_bg.wasm');
+  await init({ module_or_path: '/wasm-web/presence_web_bg.wasm' });
   app = new PresenceWeb();
 
   // Intercept all server messages for AppState routing
@@ -8891,6 +9004,7 @@ async function main() {
         // that move the live dashboard to Sessions. The URL remains the
         // navigation source of truth, so re-apply it after replay settles.
         applyCurrentRoute();
+        reconcileRecordingStreams();
         return;
       }
       if (d.t === 'state_snapshot' && d.session_id) {
@@ -9021,14 +9135,15 @@ async function main() {
       }
       // Track recording state on display slots
       if (d.event === 'recording_started' && d.stream_name) {
-        const slot = [...displaySlots.values()].find(s => 'display_' + s.displayId === d.stream_name);
-        if (slot) { slot.recording = true; slot.recordBtn.innerHTML = '&#x23F9; Stop'; slot.recordBtn.classList.add('active'); slot.deleteRecBtn.style.display = 'none'; }
+        const slot = slotForRecordingStream(d.stream_name);
+        if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = true; slot.recordBtn.innerHTML = '&#x23F9; Stop'; slot.recordBtn.classList.add('active'); slot.deleteRecBtn.style.display = 'none'; }
       } else if (d.event === 'recording_stopped' && d.stream_name) {
-        const slot = [...displaySlots.values()].find(s => 'display_' + s.displayId === d.stream_name);
-        if (slot) { slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = ''; }
+        const slot = slotForRecordingStream(d.stream_name);
+        if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = ''; }
       } else if (d.event === 'recording_deleted' && d.stream_name) {
-        const slot = [...displaySlots.values()].find(s => 'display_' + s.displayId === d.stream_name);
-        if (slot) { slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = 'none'; }
+        const slot = slotForRecordingStream(d.stream_name);
+        if (slot) { if (slot.recordingStreamName === d.stream_name) slot.recordingStreamName = null; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = 'none'; }
+        deleteRecordingStream(d.stream_name);
       }
       // Display transport metrics (per-display sections)
       if (d.event === 'display_metrics') {
@@ -9301,8 +9416,8 @@ async function main() {
       fetch('/.well-known/agent-card.json').then(r => r.json()).catch(() => null),
     ]);
     gatewayConfig = cfg;
-    if (cfg.provider) document.getElementById('sb-provider').textContent = cfg.provider;
-    if (cfg.model) document.getElementById('sb-model').textContent = cfg.model;
+    currentExternalAgent = normalizeAgentId(cfg.external_agent || currentExternalAgent);
+    applyMainBackendStatus();
     if (card && card.id && card.label) {
       const previousSelfPeerId = selfPeerId;
       // Stable host identity: shown in the status bar so the user
@@ -9362,7 +9477,7 @@ async function main() {
   applyCurrentRoute();
 
   // Check for existing recordings (late-connecting browser)
-  checkExistingRecordings();
+  reconcileRecordingStreams();
 
   // Passive mode from localStorage or ?passive=1 URL param
   const urlPassive = new URLSearchParams(window.location.search).get('passive') === '1';
@@ -9517,7 +9632,13 @@ function processCommands(cmds) {
         // the user is viewing a secondary's stats, primary updates
         // silently refresh the cache without stomping the view.
         hostStatsCache.set(selfPeerId, c);
-        if (isStatsShowingSelf()) renderUsageTab(c);
+        if (isStatsShowingSelf()) {
+          renderUsageTab(c);
+          if (activeTab === 'stats') {
+            renderCachedStatsSessionSections(currentStatsHostKey());
+            loadAllSessionsUsage(currentStatsHostKey(), { force: false });
+          }
+        }
         updateTickerFromUsage(c);
         renderForegroundSessionUsage();
         scheduleManagedContextRefresh(700);
@@ -9525,6 +9646,7 @@ function processCommands(cmds) {
       case 'add_display': addDisplaySlot(c.display_id, c.width, c.height); break;
       case 'add_recording': addRecordingStream(c.stream_name); break;
       case 'remove_recording': removeRecordingStream(c.stream_name); break;
+      case 'delete_recording': deleteRecordingStream(c.stream_name); break;
       case 'recording_error': /* logged via add_log_entry */ break;
       case 'session_started':
         managedContextSessionManuallySelected = false;
@@ -9729,7 +9851,10 @@ function renderChangesFileList(emptyMessage = 'No file changes yet') {
   const sorted = [...changedFiles.entries()].sort((a, b) => a[0].localeCompare(b[0]));
   container.innerHTML = sorted.map(([path, info]) => {
     const active = path === activeChangesFile ? ' active' : '';
-    const initial = info.kind === 'created' ? 'A' : info.kind === 'deleted' ? 'D' : 'M';
+    const initial = info.kind === 'created' ? 'A'
+      : info.kind === 'deleted' ? 'D'
+      : info.kind === 'external' ? 'X'
+      : 'M';
     const badge = `<span class="kind-badge ${info.kind}">${initial}</span>`;
     const stats = changesStatsHtml(info);
     const parts = path.split('/');
@@ -9773,6 +9898,7 @@ function renderChangesDiffHeader(path, info, stateText = '') {
 }
 
 function encodeChangePath(path) {
+  if (isAbsolutePath(path)) return encodeURIComponent(path);
   return String(path).split('/').map(part => encodeURIComponent(part)).join('/');
 }
 
@@ -16864,6 +16990,26 @@ function renderForegroundSessionUsage() {
   setContextUsagePct(main && typeof main.usage_pct === 'number' ? main.usage_pct : null);
 }
 
+function applyMainBackendStatus() {
+  const external = normalizeAgentId(
+    currentExternalAgent
+    || (gatewayConfig && gatewayConfig.external_agent)
+    || controlCurrentBackend
+  );
+  const providerEl = document.getElementById('sb-provider');
+  const modelEl = document.getElementById('sb-model');
+  if (!providerEl || !modelEl) return;
+
+  if (external) {
+    providerEl.textContent = prettyAgentName(external);
+    modelEl.textContent = 'external agent';
+    return;
+  }
+
+  providerEl.textContent = (gatewayConfig && gatewayConfig.provider) || '--';
+  modelEl.textContent = (gatewayConfig && gatewayConfig.model) || '--';
+}
+
 function updateStatusBar(d) {
   if (d.provider) document.getElementById('sb-provider').textContent = d.provider;
   if (d.model) document.getElementById('sb-model').textContent = d.model;
@@ -16903,6 +17049,7 @@ function updateStatusBar(d) {
     // Normalize to the canonical short form used by the dropdown
     // <option value> attributes, then derive a pretty label from that.
     const shortId = normalizeAgentId(d.external_agent);
+    currentExternalAgent = shortId;
     if (shortId) {
       el.textContent = prettyAgentName(shortId);
       el.style.display = '';
@@ -16929,6 +17076,7 @@ function updateStatusBar(d) {
     newSessionConfiguredAgent = shortId;
     renderNewSessionAgentControls();
   }
+  applyMainBackendStatus();
 }
 
 // Map any agent identifier form to the canonical short string used
@@ -17386,6 +17534,22 @@ function handleShellExited(status) {
   shellOpenSent = false;
 }
 
+function setTerminalPaneAccessible(pane, active) {
+  if (!pane) return;
+  if (active) {
+    pane.removeAttribute('aria-hidden');
+    try { pane.inert = false; } catch (_) {}
+  } else {
+    pane.setAttribute('aria-hidden', 'true');
+    try { pane.inert = true; } catch (_) {}
+  }
+}
+
+function syncTerminalPaneAccessibility() {
+  setTerminalPaneAccessible(document.getElementById('term-pane-tui'), activeTermSubtab === 'tui');
+  setTerminalPaneAccessible(document.getElementById('term-pane-shell'), activeTermSubtab === 'shell');
+}
+
 // Encode a string as base64 (UTF-8 safe).
 function utf8ToBase64(s) {
   return btoa(unescape(encodeURIComponent(s)));
@@ -17430,6 +17594,7 @@ function initTerminal() {
       fitAddon = new FitAddon.FitAddon();
       term.loadAddon(fitAddon);
       term.open(document.getElementById('terminal-container'));
+      syncTerminalPaneAccessibility();
       fitAddon.fit();
       term.onKey(({ domEvent }) => {
         app.send_key(domEvent.key, domEvent.ctrlKey, domEvent.altKey, domEvent.shiftKey);
@@ -17480,6 +17645,7 @@ function initShell() {
     shellFitAddon = new FitAddon.FitAddon();
     shellTerm.loadAddon(shellFitAddon);
     shellTerm.open(document.getElementById('shell-container'));
+    syncTerminalPaneAccessibility();
     shellFitAddon.fit();
 
     // Forward every byte the user types straight to the PTY. We use
@@ -17557,6 +17723,7 @@ function switchTerminalSubtab(name) {
   } else if (name === 'tui' && fitAddon) {
     requestAnimationFrame(() => fitAddon.fit());
   }
+  syncTerminalPaneAccessibility();
   // Only the TUI sub-tab consumes ratatui frames. Switching between
   // TUI and Shell flips the server-side subscription so the Shell
   // sub-tab doesn't receive term frames it wouldn't render.
@@ -17701,6 +17868,7 @@ function wireShellKeybar() {
 // Wire on DOM load so the click handler is live even before the user
 // has ever opened the Terminal tab.
 document.addEventListener('DOMContentLoaded', wireShellKeybar);
+document.addEventListener('DOMContentLoaded', syncTerminalPaneAccessibility);
 
 // ── Displays (WebRTC — video track + data channels for input) ──
 
@@ -17731,6 +17899,7 @@ class DisplaySlot {
     this._takeControlPending = false;
     this.connected = false;
     this.streaming = false;
+    this.recordingStreamName = null;
     this._answerApplied = false;     // true after setRemoteDescription completes
     this._pendingCandidates = [];    // queued until answer is applied
     this._reconnectAttempts = 0;     // ICE failure reconnect counter
@@ -18497,7 +18666,8 @@ class DisplaySlot {
   }
   toggleRecording() {
     if (!app) return;
-    const stream = 'display_' + this.displayId;
+    const baseStream = 'display_' + this.displayId;
+    const stream = this.recordingStreamName || baseStream;
     if (this.recording) {
       app.send_server_action({ action: 'stop_recording', stream_name: stream });
       this.recording = false;
@@ -18505,7 +18675,8 @@ class DisplaySlot {
       this.recordBtn.classList.remove('active');
       this.deleteRecBtn.style.display = '';
     } else {
-      app.send_server_action({ action: 'start_recording', stream_name: stream });
+      app.send_server_action({ action: 'start_recording', stream_name: baseStream });
+      this.recordingStreamName = baseStream;
       this.recording = true;
       this.recordBtn.innerHTML = '&#x23F9; Stop';
       this.recordBtn.classList.add('active');
@@ -18514,10 +18685,11 @@ class DisplaySlot {
   }
   deleteRecording() {
     if (!app) return;
-    const stream = 'display_' + this.displayId;
+    const stream = this.recordingStreamName || ('display_' + this.displayId);
     if (confirm('Delete recording for ' + stream + '?')) {
       app.send_server_action({ action: 'delete_recording', stream_name: stream });
       this.deleteRecBtn.style.display = 'none';
+      this.recordingStreamName = null;
     }
   }
   // Phase 5c: teardown.  `userInitiated` separates the user-close path
@@ -19277,6 +19449,51 @@ function _streamLabel(name) {
   return name;
 }
 
+function _recordingBaseStream(name) {
+  const m = String(name || '').match(/^(display_\d+)(?:_\d+)?$/);
+  return m ? m[1] : String(name || '');
+}
+
+function slotForRecordingStream(streamName) {
+  const base = _recordingBaseStream(streamName);
+  return [...displaySlots.values()].find(s => 'display_' + s.displayId === base);
+}
+
+function resetRecordingReplayUi() {
+  if (clipMode) exitClipMode();
+  if (annotationMode) exitAnnotationMode();
+  if (recPlayer) {
+    recPlayer.destroy();
+    recPlayer = null;
+  }
+  activeRecordingStream = null;
+  const section = document.getElementById('recording-section');
+  const select = document.getElementById('recording-stream-select');
+  const timeline = document.getElementById('recording-timeline');
+  section.classList.add('hidden');
+  section.style.flex = '';
+  section.style.minHeight = '';
+  select.value = '';
+  document.getElementById('displays-split-handle').style.display = 'none';
+  document.getElementById('displays-collapse-bar').classList.add('hidden');
+  document.getElementById('rec-status').textContent = '';
+  document.getElementById('rec-time').textContent = '0:00 / 0:00';
+  document.getElementById('rec-play-btn').textContent = '\u25B6';
+  document.getElementById('timeline-cursor').style.left = '0%';
+  document.getElementById('timeline-progress').style.width = '0%';
+  timeline.querySelectorAll('.timeline-segment-mark, .timeline-time-mark').forEach(el => el.remove());
+}
+
+function removeRecordingOption(streamName) {
+  const select = document.getElementById('recording-stream-select');
+  const opt = [...select.querySelectorAll('option')].find(o => o.value === streamName);
+  if (opt) {
+    const parent = opt.parentElement;
+    opt.remove();
+    if (parent && parent.tagName === 'OPTGROUP' && parent.children.length === 0) parent.remove();
+  }
+}
+
 function addRecordingStream(streamName) {
   if (recordingStreams.has(streamName)) return;
   recordingStreams.set(streamName, { active: true });
@@ -19309,6 +19526,40 @@ function removeRecordingStream(streamName) {
   // Refresh segments after recording stops — the final segment is now available
   if (recPlayer && activeRecordingStream === streamName) {
     setTimeout(() => recPlayer.refresh(), 500);
+  }
+}
+
+function deleteRecordingStream(streamName) {
+  if (!recordingStreams.has(streamName) && activeRecordingStream !== streamName) return;
+  recordingStreams.delete(streamName);
+  removeRecordingOption(streamName);
+  for (const slot of displaySlots.values()) {
+    if (slot.recordingStreamName === streamName) {
+      slot.recordingStreamName = null;
+      slot.recording = false;
+      slot.recordBtn.innerHTML = '&#x23FA; Record';
+      slot.recordBtn.classList.remove('active');
+      slot.deleteRecBtn.style.display = 'none';
+    }
+  }
+
+  const select = document.getElementById('recording-stream-select');
+  if (activeRecordingStream === streamName) {
+    if (recPlayer) {
+      recPlayer.destroy();
+      recPlayer = null;
+    }
+    activeRecordingStream = null;
+    const next = select.querySelector('option');
+    if (next) {
+      select.value = next.value;
+      switchRecordingStream(next.value);
+    }
+  }
+
+  if (recordingStreams.size === 0) {
+    select.innerHTML = '';
+    resetRecordingReplayUi();
   }
 }
 
@@ -19416,14 +19667,23 @@ document.getElementById('recording-stream-select').addEventListener('change', (e
   if (e.target.value) switchRecordingStream(e.target.value);
 });
 
-// Also check for existing recordings on page load (late-connecting browser)
-async function checkExistingRecordings() {
+// Reconcile replay UI with the backend. Historical log replay can mention a
+// recording that has since been deleted, so the disk/API list is authoritative.
+async function reconcileRecordingStreams() {
   try {
     const resp = await fetch('/recordings');
     const streams = await resp.json();
+    const liveNames = new Set();
     for (const s of streams) {
+      if (s.stream_name) liveNames.add(s.stream_name);
       if (s.stream_name && !recordingStreams.has(s.stream_name)) {
         addRecordingStream(s.stream_name);
+      }
+    }
+    for (const name of [...recordingStreams.keys()]) {
+      const info = recordingStreams.get(name);
+      if (!liveNames.has(name) && (!info || !info.active)) {
+        deleteRecordingStream(name);
       }
     }
   } catch { /* no recordings available */ }
@@ -21307,7 +21567,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 // We still use localStorage for preferences that aren't navigation
 // (verbosity, direct-mode, host filter, sessions filters).
 
-const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'sessions', 'settings'];
+const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'sessions', 'debug', 'settings'];
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['tui', 'shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
@@ -21344,7 +21604,8 @@ function routeTo(tab, subtab) {
     history.pushState(null, '', nextHash);
   }
   // Main tab first so sub-tab logic runs in the correct pane.
-  if (tab !== activeTab) {
+  const switched = tab !== activeTab;
+  if (switched) {
     switchTab(tab);
   }
   if (tab === 'activity' && subtab) {
@@ -21355,6 +21616,9 @@ function routeTo(tab, subtab) {
     switchSettingsSubtab(subtab);
   } else if (tab === 'sessions') {
     switchSessionsSubtab(subtab || 'recent');
+  }
+  if (tab === 'stats' && !switched) {
+    renderStatsForActiveHost({ forceSessions: true });
   }
 }
 
@@ -21370,7 +21634,8 @@ function applyCurrentRoute() {
   if (window.location.hash !== normalized && window.location.hash !== '') {
     history.replaceState(null, '', normalized);
   }
-  if (tab !== activeTab) {
+  const switched = tab !== activeTab;
+  if (switched) {
     switchTab(tab);
   }
   if (tab === 'activity' && subtab) {
@@ -21382,6 +21647,9 @@ function applyCurrentRoute() {
   } else if (tab === 'sessions') {
     switchSessionsSubtab(subtab || 'recent');
   }
+  if (tab === 'stats' && !switched) {
+    renderStatsForActiveHost({ forceSessions: true });
+  }
 }
 
 window.addEventListener('popstate', applyCurrentRoute);
@@ -21391,6 +21659,7 @@ function switchTab(tabId) {
   activeTab = tabId;
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tabId));
+  if (tabId === 'activity') hideBadge('activity');
   if (app) processCommands(app.set_active_tab(tabId));
   if (tabId === 'terminal') {
     if (activeTermSubtab === 'tui') {
@@ -25825,6 +26094,7 @@ function renderStatsForActiveHost(options = {}) {
   // /api/sessions. The loader caches per host so switching back is
   // instant, and guards against stale fetches winning a race against
   // the user switching away.
+  renderCachedStatsSessionSections(key);
   loadAllSessionsUsage(key, { force: !!options.forceSessions });
 
   // Display metrics: primary-only for now. Hide when viewing a
@@ -25881,6 +26151,7 @@ async function loadSettings() {
     // left the dropdown visually blank.
     {
       const shortId = normalizeAgentId(d.external_agent);
+      currentExternalAgent = shortId;
       document.getElementById('set-external-agent').value = shortId;
       newSessionConfiguredAgent = shortId;
       renderNewSessionAgentControls();
@@ -25898,6 +26169,7 @@ async function loadSettings() {
         sep.style.display = 'none';
         lbl.style.display = 'none';
       }
+      applyMainBackendStatus();
     }
     const envDiv = document.getElementById('settings-env-list');
     const envWrap = document.getElementById('settings-env-overrides');
@@ -26138,6 +26410,16 @@ function currentStatsHostKey() {
   return activeStatsHost || selfPeerId;
 }
 
+function renderStatsSessionSections(sessions) {
+  renderAllSessionsUsage(sessions);
+  renderDiskUsage(sessions);
+}
+
+function renderCachedStatsSessionSections(hostId) {
+  const sessions = sessionsListCache.get(hostId || selfPeerId);
+  if (Array.isArray(sessions)) renderStatsSessionSections(sessions);
+}
+
 function statsHostHasLiveUsage(hostId) {
   const cached = hostStatsCache.get(hostId || selfPeerId);
   return !!(cached && cached.main_json);
@@ -26359,8 +26641,7 @@ function loadAllSessionsUsage(hostId, options = {}) {
       // otherwise stomp the current view.
       const currentHost = activeStatsHost || selfPeerId;
       if (currentHost === hostId) {
-        renderAllSessionsUsage(sessions);
-        renderDiskUsage(sessions);
+        renderStatsSessionSections(sessions);
       }
     })
     .catch(err => {
@@ -26533,6 +26814,21 @@ function renderDiskUsage(sessions) {
   `;
 }
 
+function focusActivityForSessionEvent() {
+  const route = parseRoute();
+  if (route.tab === 'activity') {
+    if (activeTab !== 'activity') switchTab('activity');
+    hideBadge('activity');
+    return;
+  }
+  if (document.visibilityState === 'visible' && document.hasFocus()) {
+    routeTo('activity');
+    hideBadge('activity');
+  } else {
+    showBadge('activity', '\u2022');
+  }
+}
+
 // ── Session Lifecycle ──
 function onSessionStarted(sessionId, task) {
   const sid = String(sessionId || '').trim();
@@ -26554,7 +26850,7 @@ function onSessionStarted(sessionId, task) {
     updateTaskTargetChip();
   }
   resetChangesPane();
-  switchTab('activity');
+  focusActivityForSessionEvent();
   refreshChangesList({ selectFirst: activeActivitySubtab === 'changes', quiet: true });
   // New session: clear any stale timeline and let the first
   // `snapshot_created` event populate it, or populate from the current
@@ -26585,7 +26881,7 @@ function onSessionAttached(sessionId, source) {
     updateTaskTargetChip();
   }
   resetChangesPane();
-  switchTab('activity');
+  focusActivityForSessionEvent();
   refreshChangesList({ selectFirst: activeActivitySubtab === 'changes', quiet: true });
   if (typeof refreshHistory === 'function') refreshHistory();
   if (sessionsLoaded) {
@@ -27812,6 +28108,8 @@ function toggleDebugRecording() {
     if (app) app.send_server_action({ action: 'start_debug_recording' });
   }
 }
+window.toggleDebugScreen = toggleDebugScreen;
+window.toggleDebugRecording = toggleDebugRecording;
 
 function onDebugScreenReady(displayId) {
   debugScreenActive = true;
@@ -29469,7 +29767,7 @@ function resumeSession(s) {
     direct: true,
     ...overrides,
   });
-  switchTab('activity');
+  routeTo('activity');
 }
 
 function deleteSessionData(sessionId, target, label) {
@@ -30362,8 +30660,7 @@ document.getElementById('stats-host-select').addEventListener('change', (e) => {
 // bar — click jumps to the Daemons panel so the user can investigate
 // which host is disconnected/skewed.
 document.getElementById('sb-hosts-group').addEventListener('click', () => {
-  switchTab('settings');
-  switchSettingsSubtab('network');
+  routeTo('settings', 'network');
 });
 
 // Auto-scroll detection

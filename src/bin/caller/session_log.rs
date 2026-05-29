@@ -1678,6 +1678,20 @@ impl SessionLog {
         });
     }
 
+    /// Log recording deleted.
+    pub fn recording_deleted(&mut self, stream_name: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "recording_deleted".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Recording deleted: {}", stream_name)),
+            data: Some(serde_json::json!({ "stream_name": stream_name })),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log sub-agent result.
     pub fn sub_agent_result(&mut self, summary: &str) {
         self.emit(LogEvent {
@@ -3093,6 +3107,13 @@ pub fn session_log_entry_to_app_event(
                 .to_string(),
         }),
         "recording_stopped" => Some(AppEvent::RecordingStopped {
+            stream_name: data
+                .and_then(|d| d.get("stream_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        }),
+        "recording_deleted" => Some(AppEvent::RecordingDeleted {
             stream_name: data
                 .and_then(|d| d.get("stream_name"))
                 .and_then(|v| v.as_str())
@@ -4950,6 +4971,7 @@ mod tests {
         log.recording_started("rec-1");
         log.recording_error("rec-1", "encoder crashed");
         log.recording_stopped("rec-1");
+        log.recording_deleted("rec-1");
         drop(log);
 
         let started = read_last_event(&log_dir, "recording_started");
@@ -4978,6 +5000,14 @@ mod tests {
                 assert_eq!(stream_name, "rec-1")
             }
             other => panic!("expected RecordingStopped, got {:?}", other),
+        }
+
+        let deleted = read_last_event(&log_dir, "recording_deleted");
+        match session_log_entry_to_app_event(&deleted, &log_dir).unwrap() {
+            AppEvent::RecordingDeleted { stream_name } => {
+                assert_eq!(stream_name, "rec-1")
+            }
+            other => panic!("expected RecordingDeleted, got {:?}", other),
         }
     }
 
