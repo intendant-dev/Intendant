@@ -1776,18 +1776,27 @@ async fn apply_external_context_rewind(
         lineage_ledger,
         fission_ledger,
     };
-    context_rewind::persist_record(config.log_dir, &record)
-        .map_err(|e| format!("failed to persist context rewind record: {}", e))?;
-
-    agent
+    // Perform the rollback BEFORE persisting the durable record. The recovery
+    // rollout was copied above (copy-before-mutation), but the record itself is
+    // only written once the rollback succeeds, so an invalid/stale anchor (which
+    // the backend rejects as a normal tool error) never leaves a success-looking
+    // orphan record on disk. On failure, delete the orphaned recovery-rollout copy.
+    if let Err(e) = agent
         .rollback_thread_to_item_anchor(thread_id, &request.item_id, request.position)
         .await
-        .map_err(|e| {
-            format!(
-                "thread rollback failed after saving record {record_id}: {}",
-                e
-            )
-        })?;
+    {
+        if let Err(cleanup) = context_rewind::remove_recovery_rollout(config.log_dir, &record_id) {
+            slog(config.session_log, |log| {
+                log.warn(&format!(
+                    "Failed to clean up recovery rollout after failed rewind {record_id}: {cleanup}"
+                ))
+            });
+        }
+        return Err(format!("thread rollback failed: {}", e));
+    }
+
+    context_rewind::persist_record(config.log_dir, &record)
+        .map_err(|e| format!("failed to persist context rewind record: {}", e))?;
 
     if let Some(primer) = request.rendered_primer(Some(record_id.as_str())) {
         agent
@@ -2352,9 +2361,17 @@ async fn apply_context_rewind_backout_action(
         ));
     }
     if restore {
-        let target_thread_id = thread_id_from_action_params(params)
+        // Restore must target the exact Codex thread that was rewound. That is
+        // `record.thread_id` (captured from the thread snapshot at rewind time),
+        // never the Intendant session id/alias that `thread_action_params_for_target`
+        // may have injected into `params`, nor `record.session_id` (the Intendant id).
+        let target_thread_id = Some(record.thread_id.clone())
+            .filter(|id| !id.trim().is_empty())
+            .or_else(|| thread_id_from_action_params(params))
             .or_else(|| record.session_id.clone())
-            .unwrap_or_else(|| record.thread_id.clone());
+            .ok_or_else(|| {
+                format!("context rewind record {record_id} has no thread to restore into")
+            })?;
         agent
             .restore_thread_from_rollout_path(
                 &target_thread_id,
@@ -2365,6 +2382,16 @@ async fn apply_context_rewind_backout_action(
             .map_err(|e| {
                 format!("failed to restore recovery rollout into thread {target_thread_id}: {e}")
             })?;
+        // Record the restore in the durable lineage ledger so the TUI/dashboard can
+        // see that previously pruned context was reintroduced into this thread. This
+        // is a same-thread restore (parent == child), so emit the rewind-restore edge
+        // directly — the guarded `emit_session_relationship` helper drops self-edges.
+        config.bus.send(AppEvent::SessionRelationship {
+            parent_session_id: target_thread_id.clone(),
+            child_session_id: target_thread_id.clone(),
+            relationship: "rewind-restore".to_string(),
+            ephemeral: false,
+        });
         return Ok(format!(
             "restored context rewind record {} into existing Codex thread {}",
             record_id, target_thread_id

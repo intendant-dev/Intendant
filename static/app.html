@@ -4956,6 +4956,7 @@ html, body {
   overflow-wrap: anywhere;
 }
 .managed-context-stat.ok .value { color: var(--green); }
+.managed-context-stat.pressure .value,
 .managed-context-stat.high .value { color: var(--yellow); }
 .managed-context-stat.critical .value,
 .managed-context-stat.vanilla .value { color: var(--red); }
@@ -11283,8 +11284,10 @@ function managedContextSessionIsLive(sessionId, meta = {}) {
     if (!id) return false;
     const win = sessionWindows.get(id);
     if (!win) return false;
+    // Read the managed/detached flags from sessionMetadataById, the same map
+    // setSessionWindowDetached writes them to — the window object never carries them.
     const liveMeta = sessionMetadataById.get(id) || {};
-    return win.detached !== true && win.managed !== false && liveMeta.detached !== true;
+    return liveMeta.detached !== true && liveMeta.managed !== false;
   });
 }
 
@@ -11544,7 +11547,7 @@ function renderManagedContextStats() {
     fill.style.width = pct === null ? '0%' : Math.min(pct, 100).toFixed(1) + '%';
     fill.style.background = status === 'critical'
       ? 'var(--red)'
-      : status === 'high'
+      : (status === 'high' || status === 'pressure')
         ? 'var(--yellow)'
         : 'var(--green)';
   }

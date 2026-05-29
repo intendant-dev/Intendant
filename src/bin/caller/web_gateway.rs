@@ -4610,11 +4610,17 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                     let anchor = codex_thread_rollback_anchor(payload);
                     let ts = value_str(&obj, "timestamp").unwrap_or_default();
                     let mut superseded_user_turns = Vec::new();
+                    // `num_turns` is read from an untrusted on-disk rollout; bound the
+                    // loop by the actual transcript size by breaking as soon as there
+                    // is no further user turn to supersede, so a corrupt/huge count
+                    // (e.g. u64::MAX) can't spin the request thread.
                     for _ in 0..turns {
-                        if let Some(turn) = mark_latest_external_turn_superseded(&mut entries, &ts)
-                        {
-                            superseded_user_turns.push(turn);
-                            user_turn_revisions.rewind_from_turn(turn);
+                        match mark_latest_external_turn_superseded(&mut entries, &ts) {
+                            Some(turn) => {
+                                superseded_user_turns.push(turn);
+                                user_turn_revisions.rewind_from_turn(turn);
+                            }
+                            None => break,
                         }
                     }
                     if let Some(replacement_turn) = superseded_user_turns.iter().copied().min() {
@@ -4622,8 +4628,12 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                     }
                     if turns > 0 || anchor.is_some() {
                         let content = match (turns, anchor.as_ref()) {
+                            // Item-anchor rewinds carry num_turns==0 and do not mark
+                            // any rendered entry superseded (entries are not item-id
+                            // correlated), so the marker must not claim entries were
+                            // retired — that would contradict the still-live transcript.
                             (0, Some((item_id, position))) => format!(
-                                "Rewound to {position} item {item_id}; overwritten entries are no longer active context."
+                                "Rewound to {position} item {item_id}."
                             ),
                             (1, Some((item_id, position))) => format!(
                                 "Rewound 1 user turn and trimmed to {position} item {item_id}; overwritten entries are no longer active context."
@@ -6698,11 +6708,16 @@ fn managed_context_query_wrapper_session_id(request_line: &str) -> Option<String
 
 fn managed_context_safe_log_dir_id(id: &str) -> Option<String> {
     let id = id.trim();
+    // Reject anything that isn't a plain single path component. `:` matters on
+    // Windows, where `Path::join("C:")` (or `C:foo`) yields a drive-relative path
+    // that escapes the logs dir; we also reject path separators, NUL, and the
+    // `.`/`..` traversal components on every platform.
     if id.is_empty()
         || id == "."
         || id == ".."
         || id.contains('/')
         || id.contains('\\')
+        || id.contains(':')
         || id.contains('\0')
     {
         return None;

@@ -127,7 +127,7 @@ pub fn write_log_dir_config(log_dir: &Path, config: &SessionAgentConfig) -> Resu
     std::fs::create_dir_all(log_dir).map_err(|e| format!("create session dir: {e}"))?;
     let json =
         serde_json::to_string_pretty(config).map_err(|e| format!("serialize config: {e}"))?;
-    std::fs::write(log_dir.join(SESSION_AGENT_CONFIG_FILE), json)
+    crate::file_watcher::atomic_write(&log_dir.join(SESSION_AGENT_CONFIG_FILE), json.as_bytes())
         .map_err(|e| format!("write session config: {e}"))
 }
 
@@ -187,7 +187,11 @@ pub fn write_external_overlay(
         );
     let json =
         serde_json::to_string_pretty(&root).map_err(|e| format!("serialize overlay: {e}"))?;
-    std::fs::write(path, json).map_err(|e| format!("write overlay: {e}"))
+    // The overlay is a single global file shared across sessions (and processes);
+    // an atomic write keeps a concurrent reader from ever seeing a torn file and
+    // collapsing every other session's managed-context flag to the default.
+    crate::file_watcher::atomic_write(&path, json.as_bytes())
+        .map_err(|e| format!("write overlay: {e}"))
 }
 
 pub fn lookup_external_overlay(

@@ -65,8 +65,9 @@ pub fn persist_record(log_dir: &Path, record: &ContextRewindRecord) -> io::Resul
     let dir = records_dir(log_dir);
     fs::create_dir_all(&dir)?;
     let bytes = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
-    fs::write(record_path(log_dir, &record.record_id), bytes)?;
-    Ok(())
+    // Atomic write so a crash mid-write can't leave a truncated record that
+    // `list_records` would silently skip (defeating durable recovery).
+    crate::file_watcher::atomic_write(&record_path(log_dir, &record.record_id), &bytes)
 }
 
 pub fn read_record(log_dir: &Path, record_id: &str) -> io::Result<ContextRewindRecord> {
@@ -110,6 +111,17 @@ pub fn copy_recovery_rollout(
     }
     fs::copy(source_rollout_path, &target)?;
     Ok(target)
+}
+
+/// Delete a recovery-rollout copy. Used to clean up the copy-before-mutation
+/// artifact when a rewind's rollback fails, so a failed rewind leaves no
+/// orphaned files behind. A missing file is not an error.
+pub fn remove_recovery_rollout(log_dir: &Path, record_id: &str) -> io::Result<()> {
+    match fs::remove_file(recovery_rollout_path(log_dir, record_id)) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 pub fn read_fission_snapshot(

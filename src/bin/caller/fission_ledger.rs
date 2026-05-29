@@ -125,10 +125,16 @@ pub fn ledger_path(log_dir: &Path) -> PathBuf {
 }
 
 pub fn group_id(parent_session_id: &str, anchor_item_id: &str) -> String {
+    // The slugs are lossy (non-alphanumerics collapse to `_`, truncated to 96
+    // chars) and are joined with `-`, which is itself a legal slug char — so
+    // distinct (parent, anchor) pairs can slug to the same string. Append a
+    // stable hash of the exact raw bytes so the id stays collision-resistant
+    // while the slug remains human-readable.
     format!(
-        "fission-{}-{}",
+        "fission-{}-{}-{}",
         stable_slug(parent_session_id),
-        stable_slug(anchor_item_id)
+        stable_slug(anchor_item_id),
+        stable_pair_hash(parent_session_id, anchor_item_id),
     )
 }
 
@@ -157,7 +163,9 @@ pub fn read_fission_ledger_for_session(
 pub fn persist_fission_ledger(log_dir: &Path, ledger: &FissionLedger) -> io::Result<()> {
     fs::create_dir_all(log_dir)?;
     let bytes = serde_json::to_vec_pretty(ledger).map_err(io::Error::other)?;
-    fs::write(ledger_path(log_dir), bytes)
+    // Atomic write so a crash mid-write can't truncate the ledger into invalid
+    // JSON that the read side would then silently drop.
+    crate::file_watcher::atomic_write(&ledger_path(log_dir), &bytes)
 }
 
 pub fn record_fission_observation(
@@ -227,7 +235,12 @@ pub fn record_fission_observation(
             .position(|existing| existing.session_id == session_id);
         if let Some(idx) = branch_idx {
             let existing = &mut group.branches[idx];
-            existing.status = status;
+            // Don't let a stale/coarser observation downgrade a terminal status
+            // (e.g. a receiver-only `wait`/`completed` collab call re-recording an
+            // already-completed child as `running`).
+            if !is_terminal_status(&existing.status) || is_terminal_status(&status) {
+                existing.status = status;
+            }
             if summary.is_some() {
                 existing.summary = summary;
             }
@@ -385,7 +398,11 @@ fn filter_ledger_for_session(ledger: FissionLedger, session_id: &str) -> Option<
 fn normalize_status(status: &str) -> String {
     match status.trim() {
         "inProgress" | "pendingInit" => "running".to_string(),
-        "errored" | "notFound" => "failed".to_string(),
+        "errored" => "failed".to_string(),
+        // `notFound` is frequently transient (a state lookup miss while a child is
+        // starting/migrating); treat it as non-terminal `unknown` rather than
+        // conflating it with a definitive failure.
+        "notFound" => "unknown".to_string(),
         "shutdown" => "ended".to_string(),
         "completed" | "interrupted" | "failed" | "running" => status.trim().to_string(),
         other if !other.is_empty() => other.to_string(),
@@ -400,6 +417,36 @@ fn clean_string(value: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+/// FNV-1a 64-bit fold; deterministic across processes and crate versions
+/// (unlike `std`'s `DefaultHasher`), so it is safe for a persisted, equality-
+/// matched key.
+fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Stable hex hash of the exact (parent, anchor) bytes, length-prefixed so a
+/// byte that straddles the field boundary can't forge a collision.
+fn stable_pair_hash(parent_session_id: &str, anchor_item_id: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    hash = fnv1a(hash, &(parent_session_id.len() as u64).to_le_bytes());
+    hash = fnv1a(hash, parent_session_id.as_bytes());
+    hash = fnv1a(hash, &(anchor_item_id.len() as u64).to_le_bytes());
+    hash = fnv1a(hash, anchor_item_id.as_bytes());
+    format!("{hash:016x}")
+}
+
+/// Terminal branch statuses that a later, coarser observation must not downgrade.
+fn is_terminal_status(status: &str) -> bool {
+    matches!(
+        status.trim(),
+        "completed" | "failed" | "ended" | "interrupted" | "cancelled"
+    )
 }
 
 fn stable_slug(value: &str) -> String {
@@ -485,6 +532,27 @@ mod tests {
         assert_eq!(group.branches.len(), 1);
         assert_eq!(group.branches[0].status, "completed");
         assert_eq!(group.branches[0].summary.as_deref(), Some("parser is fine"));
+    }
+
+    #[test]
+    fn terminal_status_is_not_downgraded_by_later_running_observation() {
+        let dir = tempdir().unwrap();
+        let mut done = observation("completed");
+        done.branches[0].summary = Some("done".to_string());
+        record_fission_observation(dir.path(), done).unwrap();
+        // A later coarser observation reports the child as running again.
+        let group = record_fission_observation(dir.path(), observation("running"))
+            .unwrap()
+            .expect("group");
+        assert_eq!(group.branches[0].status, "completed");
+        assert_eq!(group.branches[0].summary.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn group_id_is_collision_resistant_across_separator_ambiguity() {
+        // (x, y-z) and (x-y, z) slug to the same "fission-x-y-z" prefix; the hash
+        // suffix must keep the two group ids distinct.
+        assert_ne!(group_id("x", "y-z"), group_id("x-y", "z"));
     }
 
     #[test]

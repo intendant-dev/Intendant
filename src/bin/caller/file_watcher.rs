@@ -352,8 +352,9 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Write `content` to `path` atomically via tmp + rename.
-fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+/// Write `content` to `path` atomically via tmp + rename, so a crash mid-write
+/// can never leave a truncated/corrupt file for a reader to observe.
+pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
