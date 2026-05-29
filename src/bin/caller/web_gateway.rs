@@ -2221,7 +2221,20 @@ mod host_header_tests {
 /// for each session (newest first, capped at 100).
 /// Return session detail: replayed log entries + metadata for a single session.
 /// Resolve a session directory by exact ID or prefix match.
+fn session_lookup_id_is_safe(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.trim() == session_id
+        && session_id != "."
+        && !session_id.contains("..")
+        && !session_id.contains('/')
+        && !session_id.contains('\\')
+}
+
 fn resolve_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+    if !session_lookup_id_is_safe(session_id) {
+        return None;
+    }
+
     let logs_dir = home.join(".intendant").join("logs");
 
     if logs_dir.join(session_id).is_dir() {
@@ -8481,7 +8494,7 @@ async fn handle_history_prune(
 /// Returns a JSON result with `ok` and `bytes_freed`.
 fn delete_session_data(session_id: &str, target: &str) -> String {
     // Path traversal protection
-    if session_id.contains("..") || session_id.contains('/') || session_id.contains('\\') {
+    if !session_lookup_id_is_safe(session_id) {
         return serde_json::json!({"ok": false, "error": "invalid session id"}).to_string();
     }
 
@@ -13542,7 +13555,11 @@ pub fn spawn_web_gateway(
                             let session_id = rest_parts[0];
                             let rec_rest = &rest_parts[2..]; // parts after "recordings"
 
-                            if rec_rest.len() == 2 && rec_rest[1] == "segments" {
+                            if !session_lookup_id_is_safe(session_id) {
+                                let response =
+                                    upload_error_response("400 Bad Request", "invalid session id");
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            } else if rec_rest.len() == 2 && rec_rest[1] == "segments" {
                                 // GET /api/session/{id}/recordings/{stream}/segments
                                 let stream_name = rec_rest[0];
                                 let body =
@@ -13685,36 +13702,59 @@ pub fn spawn_web_gateway(
                             // live daemon's own session via WebQueryCtx.
                             use tokio::io::AsyncWriteExt;
                             let session_id = rest_parts[0];
-                            let resolved_dir: Option<PathBuf> = if session_id == "current" {
-                                current_session_log_dir(session_log.as_ref(), query_ctx.as_ref())
+                            if session_id != "current" && !session_lookup_id_is_safe(session_id) {
+                                let response =
+                                    upload_error_response("400 Bad Request", "invalid session id");
+                                let _ = stream.write_all(response.as_bytes()).await;
                             } else {
-                                resolve_session_dir(session_id)
-                            };
-                            match resolved_dir {
-                                Some(dir) => match build_session_report_zip(&dir) {
-                                    Ok(bytes) => {
-                                        let fname = dir
-                                            .file_name()
-                                            .map(|n| n.to_string_lossy().to_string())
-                                            .unwrap_or_else(|| "session".to_string());
-                                        let header = format!(
-                                            "HTTP/1.1 200 OK\r\n\
-                                             Content-Type: application/zip\r\n\
-                                             Content-Length: {}\r\n\
-                                             Content-Disposition: attachment; filename=\"intendant-session-{}.zip\"\r\n\
-                                             Cache-Control: no-cache\r\n\
-                                             Connection: close\r\n\
-                                             \r\n",
-                                            bytes.len(),
-                                            fname
-                                        );
-                                        let _ = stream.write_all(header.as_bytes()).await;
-                                        let _ = stream.write_all(&bytes).await;
-                                    }
-                                    Err(e) => {
-                                        let body = format!("Failed to build report: {}", e);
+                                let resolved_dir: Option<PathBuf> = if session_id == "current" {
+                                    current_session_log_dir(
+                                        session_log.as_ref(),
+                                        query_ctx.as_ref(),
+                                    )
+                                } else {
+                                    resolve_session_dir(session_id)
+                                };
+                                match resolved_dir {
+                                    Some(dir) => match build_session_report_zip(&dir) {
+                                        Ok(bytes) => {
+                                            let fname = dir
+                                                .file_name()
+                                                .map(|n| n.to_string_lossy().to_string())
+                                                .unwrap_or_else(|| "session".to_string());
+                                            let header = format!(
+                                                "HTTP/1.1 200 OK\r\n\
+                                                 Content-Type: application/zip\r\n\
+                                                 Content-Length: {}\r\n\
+                                                 Content-Disposition: attachment; filename=\"intendant-session-{}.zip\"\r\n\
+                                                 Cache-Control: no-cache\r\n\
+                                                 Connection: close\r\n\
+                                                 \r\n",
+                                                bytes.len(),
+                                                fname
+                                            );
+                                            let _ = stream.write_all(header.as_bytes()).await;
+                                            let _ = stream.write_all(&bytes).await;
+                                        }
+                                        Err(e) => {
+                                            let body = format!("Failed to build report: {}", e);
+                                            let response = format!(
+                                                "HTTP/1.1 500 Internal Server Error\r\n\
+                                                 Content-Type: text/plain\r\n\
+                                                 Content-Length: {}\r\n\
+                                                 Connection: close\r\n\
+                                                 \r\n\
+                                                 {}",
+                                                body.len(),
+                                                body
+                                            );
+                                            let _ = stream.write_all(response.as_bytes()).await;
+                                        }
+                                    },
+                                    None => {
+                                        let body = "Session not found";
                                         let response = format!(
-                                            "HTTP/1.1 500 Internal Server Error\r\n\
+                                            "HTTP/1.1 404 Not Found\r\n\
                                              Content-Type: text/plain\r\n\
                                              Content-Length: {}\r\n\
                                              Connection: close\r\n\
@@ -13725,20 +13765,6 @@ pub fn spawn_web_gateway(
                                         );
                                         let _ = stream.write_all(response.as_bytes()).await;
                                     }
-                                },
-                                None => {
-                                    let body = "Session not found";
-                                    let response = format!(
-                                        "HTTP/1.1 404 Not Found\r\n\
-                                         Content-Type: text/plain\r\n\
-                                         Content-Length: {}\r\n\
-                                         Connection: close\r\n\
-                                         \r\n\
-                                         {}",
-                                        body.len(),
-                                        body
-                                    );
-                                    let _ = stream.write_all(response.as_bytes()).await;
                                 }
                             }
                         } else if rest_parts.len() >= 2 && rest_parts[1] == "frames" {
@@ -13747,7 +13773,11 @@ pub fn spawn_web_gateway(
                             let session_id = rest_parts[0];
                             let frame_rest = &rest_parts[2..];
 
-                            if frame_rest.len() == 1 {
+                            if !session_lookup_id_is_safe(session_id) {
+                                let response =
+                                    upload_error_response("400 Bad Request", "invalid session id");
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            } else if frame_rest.len() == 1 {
                                 // GET /api/session/{id}/frames/{filename}
                                 let filename = frame_rest[0];
                                 let valid = (filename.ends_with(".jpg")
@@ -13872,14 +13902,20 @@ pub fn spawn_web_gateway(
                                     }
                                 })
                                 .unwrap_or("intendant");
-                            let body = if source == "intendant" {
+                            let body = if !session_lookup_id_is_safe(session_id) {
+                                serde_json::json!({"error": "invalid session id"}).to_string()
+                            } else if source == "intendant" {
                                 get_session_detail(session_id)
                             } else {
                                 external_session_detail(source, session_id).unwrap_or_else(|| {
                                     serde_json::json!({"error": "session not found"}).to_string()
                                 })
                             };
-                            let status = session_detail_http_status(&body);
+                            let status = if !session_lookup_id_is_safe(session_id) {
+                                "400 Bad Request"
+                            } else {
+                                session_detail_http_status(&body)
+                            };
                             let response = format!(
                                 "HTTP/1.1 {status}\r\n\
                                  Content-Type: application/json\r\n\
@@ -20556,6 +20592,33 @@ mod tests {
         assert_eq!(
             resolve_session_dir_from_home(home.path(), backend_id).as_deref(),
             Some(wrapper_dir.as_path())
+        );
+    }
+
+    #[test]
+    fn resolve_session_dir_rejects_unsafe_session_ids() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".intendant/logs/safe-session")).unwrap();
+
+        for session_id in [
+            "",
+            ".",
+            "..",
+            "../logs",
+            "safe/session",
+            "safe\\session",
+            " safe",
+        ] {
+            assert!(
+                resolve_session_dir_from_home(home.path(), session_id).is_none(),
+                "unsafe session id resolved: {session_id:?}"
+            );
+        }
+
+        let expected = home.path().join(".intendant/logs/safe-session");
+        assert_eq!(
+            resolve_session_dir_from_home(home.path(), "safe").as_deref(),
+            Some(expected.as_path())
         );
     }
 
