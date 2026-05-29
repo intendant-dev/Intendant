@@ -10360,9 +10360,12 @@ let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
 let newSessionSpawnTimeout = null;
 let newSessionSpawnClearTimeout = null;
+let newSessionSpawnRecent = null;
+let newSessionSpawnRecentTimeout = null;
 let sessionRenameEditing = null;
 let sessionConfigEditing = null;
 const NEW_SESSION_SPAWN_TIMEOUT_MS = 90000;
+const NEW_SESSION_LAUNCH_FAILURE_GRACE_MS = 15000;
 
 async function refreshControlPane() {
   try {
@@ -27035,6 +27038,7 @@ function onSessionAttached(sessionId, source) {
 
 function onSessionEnded(sessionId, reason) {
   const sid = String(sessionId || '').trim();
+  maybeFailRecentNewSessionSpawn(sid, reason);
   const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
   const win = sid ? sessionWindows.get(sid) : null;
   const externalSource = sid ? externalSourceForSessionWindow(sid, win) : '';
@@ -28086,8 +28090,62 @@ function clearNewSessionSpawnTimers() {
   newSessionSpawnClearTimeout = null;
 }
 
+function clearNewSessionSpawnRecent() {
+  if (newSessionSpawnRecentTimeout) clearTimeout(newSessionSpawnRecentTimeout);
+  newSessionSpawnRecent = null;
+  newSessionSpawnRecentTimeout = null;
+}
+
+function rememberNewSessionSpawnRecent(sessionId, task) {
+  clearNewSessionSpawnRecent();
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  newSessionSpawnRecent = {
+    sessionId: sid,
+    task: String(task || '').trim(),
+    expiresAt: Date.now() + NEW_SESSION_LAUNCH_FAILURE_GRACE_MS,
+  };
+  newSessionSpawnRecentTimeout = setTimeout(() => {
+    newSessionSpawnRecent = null;
+    newSessionSpawnRecentTimeout = null;
+  }, NEW_SESSION_LAUNCH_FAILURE_GRACE_MS);
+}
+
+function isNewSessionLaunchFailureReason(reason) {
+  const text = String(reason || '').toLowerCase();
+  return text.includes('error') || text.includes('failed') || text.includes('failure');
+}
+
+function formatNewSessionLaunchFailureReason(reason) {
+  const text = String(reason || '').trim();
+  if (!text) return 'Session failed shortly after it started.';
+  return `Session failed: ${text.replace(/^error:\s*/i, '')}`;
+}
+
+function maybeFailRecentNewSessionSpawn(sessionId, reason) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !newSessionSpawnRecent) return false;
+  if (newSessionSpawnRecent.sessionId !== sid) return false;
+  if (Date.now() > Number(newSessionSpawnRecent.expiresAt || 0)) {
+    clearNewSessionSpawnRecent();
+    return false;
+  }
+  if (!isNewSessionLaunchFailureReason(reason)) return false;
+
+  const message = formatNewSessionLaunchFailureReason(reason);
+  clearNewSessionSpawnTimers();
+  clearNewSessionSpawnRecent();
+  newSessionSpawnPending = false;
+  newSessionSpawnTask = '';
+  setNewSessionStartButtonPending(false);
+  setNewSessionSpawnNotice('error', message);
+  showControlToast('error', message);
+  return true;
+}
+
 function beginNewSessionSpawnNotice(task, text) {
   clearNewSessionSpawnTimers();
+  clearNewSessionSpawnRecent();
   newSessionSpawnPending = true;
   newSessionSpawnTask = String(task || '').trim();
   setNewSessionStartButtonPending(true);
@@ -28109,6 +28167,7 @@ function updateNewSessionSpawnNotice(kind, text) {
 
 function failNewSessionSpawnNotice(text) {
   clearNewSessionSpawnTimers();
+  clearNewSessionSpawnRecent();
   newSessionSpawnPending = false;
   newSessionSpawnTask = '';
   setNewSessionStartButtonPending(false);
@@ -28128,6 +28187,7 @@ function finishNewSessionSpawnNotice(sessionId, task) {
   const shortId = sessionId ? ` (${shortSessionId(sessionId)})` : '';
   setNewSessionSpawnNotice('ok', `Session started${shortId}. Opening Activity...`);
   showControlToast('success', `Session started${shortId}`);
+  rememberNewSessionSpawnRecent(sessionId, actualTask || expectedTask);
   newSessionSpawnClearTimeout = setTimeout(() => {
     setNewSessionSpawnNotice('', '');
     newSessionSpawnClearTimeout = null;
