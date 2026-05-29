@@ -4573,6 +4573,29 @@ html, body {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.dashboard-prompt-field {
+  display: grid;
+  gap: 6px;
+  color: var(--subtext0);
+  font-size: 12px;
+}
+.dashboard-prompt-field textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 38px;
+  max-height: 220px;
+  padding: 8px 10px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--mantle);
+  color: var(--text);
+  font: inherit;
+}
+.dashboard-prompt-field textarea:focus {
+  outline: none;
+  border-color: var(--blue);
+}
 .modal-actions {
   display: flex;
   justify-content: flex-end;
@@ -8278,6 +8301,20 @@ html, body {
   </div>
 </div>
 
+<div id="dashboard-prompt-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog dashboard-prompt-dialog">
+    <h3 id="dashboard-prompt-title">Enter value</h3>
+    <label class="dashboard-prompt-field" for="dashboard-prompt-input">
+      <span id="dashboard-prompt-label">Value</span>
+      <textarea id="dashboard-prompt-input" rows="3" autocomplete="off" spellcheck="false"></textarea>
+    </label>
+    <div class="modal-actions">
+      <button class="modal-cancel" type="button" id="dashboard-prompt-cancel">Cancel</button>
+      <button class="modal-confirm" type="button" id="dashboard-prompt-submit">Continue</button>
+    </div>
+  </div>
+</div>
+
 <!-- Voice Overlay -->
 <div class="voice-overlay" id="voiceOverlay" draggable="false">
   <div class="voice-drag-handle" id="voiceDragHandle"></div>
@@ -10379,6 +10416,54 @@ function showDashboardConfirm(opts = {}) {
 }
 window.showDashboardConfirm = showDashboardConfirm;
 
+let dashboardPromptPending = null;
+
+function closeDashboardPromptModal(result = null) {
+  const pending = dashboardPromptPending;
+  dashboardPromptPending = null;
+  const modal = document.getElementById('dashboard-prompt-modal');
+  if (modal) modal.style.display = 'none';
+  if (pending && typeof pending.resolve === 'function') pending.resolve(result);
+}
+window.closeDashboardPromptModal = closeDashboardPromptModal;
+
+function showDashboardPrompt(opts = {}) {
+  return new Promise(resolve => {
+    if (dashboardPromptPending) closeDashboardPromptModal(null);
+    dashboardPromptPending = { resolve };
+
+    const title = document.getElementById('dashboard-prompt-title');
+    const label = document.getElementById('dashboard-prompt-label');
+    const input = document.getElementById('dashboard-prompt-input');
+    const submit = document.getElementById('dashboard-prompt-submit');
+    const cancel = document.getElementById('dashboard-prompt-cancel');
+    const modal = document.getElementById('dashboard-prompt-modal');
+
+    if (title) title.textContent = opts.title || 'Enter value';
+    if (label) label.textContent = opts.label || 'Value';
+    if (input) {
+      input.value = opts.initialValue || '';
+      input.placeholder = opts.placeholder || '';
+      input.rows = opts.multiline === false ? 1 : Number(opts.rows || 3);
+      if (Number(opts.maxLength || 0) > 0) input.maxLength = Number(opts.maxLength);
+      else input.removeAttribute('maxlength');
+      input.dataset.multiline = opts.multiline === false ? 'false' : 'true';
+    }
+    if (submit) submit.textContent = opts.submitLabel || 'Continue';
+    if (cancel) cancel.textContent = opts.cancelLabel || 'Cancel';
+    if (modal) {
+      modal.style.display = 'flex';
+      setTimeout(() => {
+        input?.focus();
+        input?.select();
+      }, 0);
+    } else {
+      closeDashboardPromptModal(null);
+    }
+  });
+}
+window.showDashboardPrompt = showDashboardPrompt;
+
 async function confirmRollback() {
   if (pendingRollbackRoundId === null || pendingRollbackRoundId === undefined) return;
   const roundId = pendingRollbackRoundId;
@@ -11306,11 +11391,21 @@ function handleSessionRenameResult(evt) {
 async function promptCodexThreadActionParams(opts = {}) {
   let params = {};
   if (opts.promptName) {
-    const name = window.prompt('Fork name (leave empty for auto):', '');
+    const name = await showDashboardPrompt({
+      title: 'Fork thread',
+      label: 'Fork name',
+      placeholder: 'Leave empty for auto',
+      multiline: false,
+    });
     if (name === null) return null;
     if (name.trim()) params.name = name.trim();
   } else if (opts.promptSide) {
-    const prompt = window.prompt('Side prompt:', '');
+    const prompt = await showDashboardPrompt({
+      title: 'Start side thread',
+      label: 'Side prompt',
+      rows: 5,
+      submitLabel: 'Start side',
+    });
     if (prompt === null) return null;
     if (!prompt.trim()) {
       showControlToast('error', '/side failed: prompt is required');
@@ -11318,14 +11413,22 @@ async function promptCodexThreadActionParams(opts = {}) {
     }
     params.prompt = prompt.trim();
   } else if (opts.promptReview) {
-    const prompt = window.prompt(
-      'Review prompt (leave empty to review current changes with Codex defaults):',
-      ''
-    );
+    const prompt = await showDashboardPrompt({
+      title: 'Review prompt',
+      label: 'Prompt',
+      placeholder: 'Leave empty to review current changes with Codex defaults',
+      rows: 5,
+      submitLabel: 'Review',
+    });
     if (prompt === null) return null;
     if (prompt.trim()) params.prompt = prompt.trim();
   } else if (opts.promptRename) {
-    const name = window.prompt(opts.promptRenameLabel || 'Thread name:', '');
+    const name = await showDashboardPrompt({
+      title: 'Rename thread',
+      label: opts.promptRenameLabel || 'Thread name',
+      multiline: false,
+      submitLabel: 'Rename',
+    });
     if (name === null) return null;
     if (!name.trim()) {
       showControlToast('error', '/rename failed: thread name is required');
@@ -11333,7 +11436,13 @@ async function promptCodexThreadActionParams(opts = {}) {
     }
     params.name = name.trim();
   } else if (opts.promptGoal) {
-    const objective = window.prompt('Goal objective:', '');
+    const objective = await showDashboardPrompt({
+      title: 'Set goal',
+      label: 'Goal objective',
+      rows: 5,
+      maxLength: 4000,
+      submitLabel: 'Continue',
+    });
     if (objective === null) return null;
     if (!objective.trim()) {
       showControlToast('error', '/goal failed: objective is required');
@@ -11344,7 +11453,13 @@ async function promptCodexThreadActionParams(opts = {}) {
       return null;
     }
     params.objective = objective.trim();
-    const budget = window.prompt('Token budget (optional):', '');
+    const budget = await showDashboardPrompt({
+      title: 'Set token budget',
+      label: 'Token budget',
+      placeholder: 'Optional',
+      multiline: false,
+      submitLabel: 'Set goal',
+    });
     if (budget === null) return null;
     if (budget.trim()) {
       const parsed = parseInt(budget.trim(), 10);
@@ -20111,12 +20226,18 @@ class AnnotationCanvas {
     ];
   }
 
-  _pointerDown(e) {
+  async _pointerDown(e) {
     e.preventDefault();
     this.canvas.setPointerCapture(e.pointerId);
     const [x, y] = this._canvasCoords(e);
     if (this.tool === 'text') {
-      const text = prompt('Annotation text:');
+      try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+      const text = await showDashboardPrompt({
+        title: 'Annotation text',
+        label: 'Text',
+        rows: 2,
+        submitLabel: 'Add text',
+      });
       if (text) {
         this.shapes.push({ type: 'text', x, y, text, color: this.color, size: this.thickness * 5 });
         this.undoStack = [];
@@ -31087,6 +31208,11 @@ document.addEventListener('keydown', (e) => {
   const dashboardConfirmModal = document.getElementById('dashboard-confirm-modal');
   if (dashboardConfirmModal && dashboardConfirmModal.style.display !== 'none') {
     closeDashboardConfirmModal(false);
+    return;
+  }
+  const dashboardPromptModal = document.getElementById('dashboard-prompt-modal');
+  if (dashboardPromptModal && dashboardPromptModal.style.display !== 'none') {
+    closeDashboardPromptModal(null);
   }
 });
 document.getElementById('rollback-modal')?.addEventListener('click', (e) => {
@@ -31115,6 +31241,21 @@ document.getElementById('dashboard-confirm-modal')?.addEventListener('click', (e
 });
 document.getElementById('dashboard-confirm-cancel')?.addEventListener('click', () => closeDashboardConfirmModal(false));
 document.getElementById('dashboard-confirm-accept')?.addEventListener('click', () => closeDashboardConfirmModal(true));
+document.getElementById('dashboard-prompt-modal')?.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'dashboard-prompt-modal') closeDashboardPromptModal(null);
+});
+document.getElementById('dashboard-prompt-cancel')?.addEventListener('click', () => closeDashboardPromptModal(null));
+document.getElementById('dashboard-prompt-submit')?.addEventListener('click', () => {
+  const input = document.getElementById('dashboard-prompt-input');
+  closeDashboardPromptModal(input ? input.value : '');
+});
+document.getElementById('dashboard-prompt-input')?.addEventListener('keydown', (e) => {
+  const multiline = e.currentTarget?.dataset?.multiline !== 'false';
+  if (e.key === 'Enter' && (!multiline || e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    closeDashboardPromptModal(e.currentTarget.value || '');
+  }
+});
 
 // Enter to submit
 document.querySelector('#human-input')?.addEventListener('keydown', (e) => {
