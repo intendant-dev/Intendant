@@ -28794,6 +28794,7 @@ let _sessionDeepSearch = {
   sourceFilter: 'all',
   active: false,
   loading: false,
+  waiting: false,
   loaded: false,
   error: null,
   projectFilter: [],
@@ -29365,6 +29366,7 @@ function runSessionDeepSearch() {
       sourceFilter: 'all',
       active: false,
       loading: false,
+      waiting: false,
       loaded: false,
       error: 'Enter at least 2 characters for deep search.',
       projectFilter,
@@ -29388,6 +29390,7 @@ function runSessionDeepSearch() {
     sourceFilter: 'all',
     active: false,
     loading: true,
+    waiting: false,
     loaded: false,
     error: null,
     projectFilter,
@@ -29407,10 +29410,27 @@ function runSessionDeepSearch() {
     params.set('projects', JSON.stringify(projectFilter));
   }
   const url = `/api/sessions/search?${params.toString()}`;
-  authedFetch(url, { signal: controller.signal })
+  const retryDelay = attempt => Math.min(500 + attempt * 250, 2000);
+  const executeSearch = (attempt = 0) => {
+    authedFetch(url, { signal: controller.signal })
     .then(r => r.ok ? r.json() : Promise.reject(new Error(`/api/sessions/search returned ${r.status}`)))
     .then(data => {
       if (token !== _sessionDeepSearchToken) return;
+      if (data.busy) {
+        _sessionDeepSearch = {
+          ..._sessionDeepSearch,
+          loading: true,
+          waiting: true,
+          loaded: false,
+          error: null,
+        };
+        updateSessionsSearchStatus();
+        setTimeout(() => {
+          if (token !== _sessionDeepSearchToken || _sessionDeepSearchAbort !== controller) return;
+          executeSearch(attempt + 1);
+        }, retryDelay(attempt));
+        return;
+      }
       if (data.error) throw new Error(data.error);
       const results = new Map();
       for (const hit of data.results || []) {
@@ -29423,6 +29443,7 @@ function runSessionDeepSearch() {
         sourceFilter: 'all',
         active: true,
         loading: false,
+        waiting: false,
         loaded: true,
         error: null,
         projectFilter,
@@ -29446,6 +29467,7 @@ function runSessionDeepSearch() {
         sourceFilter: 'all',
         active: false,
         loading: false,
+        waiting: false,
         loaded: !aborted,
         error: aborted ? 'Deep search cancelled.' : (err.message || String(err)),
         projectFilter,
@@ -29459,6 +29481,8 @@ function runSessionDeepSearch() {
       setSessionDeepSearchLoading(false);
       _refilterSessions();
     });
+  };
+  executeSearch();
 }
 
 function cancelSessionDeepSearch(message = '') {
@@ -29471,6 +29495,7 @@ function cancelSessionDeepSearch(message = '') {
     ..._sessionDeepSearch,
     active: false,
     loading: false,
+    waiting: false,
     loaded: false,
     error: message || null,
     projectFilter: _sessionDeepSearch.projectFilter || [],
@@ -29491,6 +29516,7 @@ function clearSessionDeepSearch() {
     sourceFilter: 'all',
     active: false,
     loading: false,
+    waiting: false,
     loaded: false,
     error: null,
     projectFilter: [],
@@ -29515,7 +29541,10 @@ function updateSessionsSearchStatus() {
   el.textContent = '';
   if (_sessionDeepSearch.loading) {
     const projectScope = sessionDeepSearchProjectScopeText(_sessionDeepSearch.projectFilter);
-    el.textContent = `Deep search running${projectScope} for "${_sessionDeepSearch.query}" (${sessionDeepSearchModeLabel(_sessionDeepSearch.mode)}). This can take a while on large histories.`;
+    const prefix = _sessionDeepSearch.waiting
+      ? 'Deep search waiting for the previous search to finish'
+      : 'Deep search running';
+    el.textContent = `${prefix}${projectScope} for "${_sessionDeepSearch.query}" (${sessionDeepSearchModeLabel(_sessionDeepSearch.mode)}). This can take a while on large histories.`;
     return;
   }
   if (_sessionDeepSearch.error) {
