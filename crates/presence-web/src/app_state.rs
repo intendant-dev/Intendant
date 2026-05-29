@@ -2203,6 +2203,12 @@ impl AppState {
             "session_ended" => {
                 let session_id = msg["session_id"].as_str().unwrap_or("").to_string();
                 let reason = msg["reason"].as_str().unwrap_or("").to_string();
+                if current_session_event {
+                    self.phase = "idle".to_string();
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "idle".into(),
+                    });
+                }
                 if self.session_id == session_id {
                     self.session_id.clear();
                 }
@@ -4368,6 +4374,25 @@ mod tests {
         let mut s = AppState::new();
         let msg = json!({"event": "round_complete", "round": 2, "turns_in_round": 5});
         let cmds = s.handle_message(&msg);
+        assert_eq!(s.phase, "idle");
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "idle")));
+    }
+
+    #[test]
+    fn handle_event_session_ended_resets_current_phase() {
+        let mut s = AppState::new();
+        s.session_id = "failed-session".to_string();
+        s.phase = "running".to_string();
+
+        let msg = json!({
+            "event": "session_ended",
+            "session_id": "failed-session",
+            "reason": "error: failed to spawn"
+        });
+        let cmds = s.handle_message(&msg);
+
         assert_eq!(s.phase, "idle");
         assert!(cmds
             .iter()
