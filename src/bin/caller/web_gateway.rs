@@ -2236,6 +2236,34 @@ fn resolve_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBu
             }
         }
     }
+    resolve_session_dir_from_listed_external_row(home, session_id)
+}
+
+fn resolve_session_dir_from_listed_external_row(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let sessions: Vec<serde_json::Value> =
+        serde_json::from_str(&list_sessions_from_home(home)).unwrap_or_default();
+    for session in sessions {
+        let matches = [
+            "session_id",
+            "resume_id",
+            "backend_session_id",
+            "intendant_session_id",
+        ]
+        .into_iter()
+        .any(|key| session.get(key).and_then(|v| v.as_str()) == Some(session_id));
+        if !matches {
+            continue;
+        }
+        for key in ["intendant_session_path", "path"] {
+            let Some(path) = session.get(key).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let path = PathBuf::from(path);
+            if path.is_dir() {
+                return Some(path);
+            }
+        }
+    }
     None
 }
 
@@ -20491,6 +20519,44 @@ mod tests {
         assert_eq!(status, "200 OK");
         assert_eq!(json["path"], "created.txt");
         assert!(json["diff"].as_str().unwrap().contains("+created"));
+    }
+
+    #[test]
+    fn resolve_session_dir_accepts_external_backend_id() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let logs_dir = home.path().join(".intendant/logs");
+        let wrapper_id = "wrapper-session";
+        let backend_id = "backend-session";
+        let wrapper_dir = logs_dir.join(wrapper_id);
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        std::fs::write(
+            wrapper_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": wrapper_id,
+                "created_at": "2026-05-29T06:11:20",
+                "project_root": project.path().to_string_lossy(),
+                "task": "external report"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            wrapper_dir.join("session.jsonl"),
+            [
+                serde_json::json!({"event": "info", "message": "Mode: external agent (Codex)"})
+                    .to_string(),
+                serde_json::json!({"event": "debug", "message": format!("External agent thread: {backend_id}")})
+                    .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_session_dir_from_home(home.path(), backend_id).as_deref(),
+            Some(wrapper_dir.as_path())
+        );
     }
 
     #[test]
