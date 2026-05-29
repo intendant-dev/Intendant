@@ -329,15 +329,20 @@ impl McpAppState {
         success: bool,
         message: &str,
     ) {
+        let Some(key) = self.rewind_session_key(session_id) else {
+            return;
+        };
         if success {
-            if let (Some(key), Some(record_id)) = (
-                self.rewind_session_key(session_id),
-                context_rewind_record_id_from_message(message),
-            ) {
+            if let Some(record_id) = context_rewind_record_id_from_message(message) {
                 self.pending_rewind_pressure_checks
                     .insert(key.clone(), record_id);
                 self.insufficient_rewind_notices.remove(&key);
             }
+        } else {
+            // A failed rewind must not leave a pending pressure check behind: a
+            // later (possibly stale) usage sample could otherwise resolve it into a
+            // false "insufficient" notice against a record that never committed.
+            self.pending_rewind_pressure_checks.remove(&key);
         }
     }
 
@@ -391,13 +396,21 @@ impl McpAppState {
 
     fn session_usage_values(&self, session_id: Option<&str>) -> (u64, u64, Option<u64>) {
         if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
-            if let Some(usage) = self.session_usage.get(id) {
-                return (
-                    usage.tokens_used,
-                    usage.context_window,
-                    usage.hard_context_window,
-                );
-            }
+            // A concrete session that has not reported usage yet is *unknown* — do
+            // not borrow the globally-active session's totals. Borrowing would let a
+            // starting session A inherit a saturated session B's pressure and be
+            // wrongly forced into rewind-only mode during the startup race.
+            return self
+                .session_usage
+                .get(id)
+                .map(|usage| {
+                    (
+                        usage.tokens_used,
+                        usage.context_window,
+                        usage.hard_context_window,
+                    )
+                })
+                .unwrap_or((0, 0, None));
         }
         (
             self.session_tokens,
@@ -4726,8 +4739,10 @@ impl IntendantServer {
         if item_id.is_empty() {
             return "rewind_context anchor.item_id must not be empty".to_string();
         }
-        let position = params.anchor.position.trim();
-        if !matches!(position, "before" | "after") {
+        // Normalize case to match the action layer (RollbackAnchorPosition::from_str
+        // lowercases), so `After`/`BEFORE` are accepted consistently end-to-end.
+        let position = params.anchor.position.trim().to_ascii_lowercase();
+        if !matches!(position.as_str(), "before" | "after") {
             return "rewind_context anchor.position must be `before` or `after`".to_string();
         }
 

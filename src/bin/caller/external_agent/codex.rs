@@ -125,6 +125,14 @@ impl CodexAgent {
             }
             "rewind-anchor" | "rewind_anchor" | "rewind-to-item" | "rewind_to_item"
             | "rollback-anchor" | "rollback_anchor" | "rollback-to-item" | "rollback_to_item" => {
+                // Enforce the managed-context capability at the backend, matching
+                // `supports_item_anchor_rewind`, so no dispatch route can perform an
+                // item-anchor rollback when managed context is disabled.
+                if !self.managed_context {
+                    return Err(CallerError::ExternalAgent(format!(
+                        "/{op} item-anchor rewind requires Codex managed-context mode"
+                    )));
+                }
                 self.rollback_anchor_inner(params).await
             }
             "review" => {
