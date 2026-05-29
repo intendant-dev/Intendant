@@ -8238,6 +8238,19 @@ html, body {
   </div>
 </div>
 
+<div id="session-delete-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog session-delete-dialog">
+    <h3>Delete session data</h3>
+    <p class="modal-description" id="session-delete-message"></p>
+    <div class="modal-warning">This cannot be undone.</div>
+    <div class="session-config-status" id="session-delete-status"></div>
+    <div class="modal-actions">
+      <button class="modal-cancel" type="button" onclick="closeSessionDeleteModal()">Cancel</button>
+      <button class="modal-confirm danger" type="button" id="session-delete-confirm" onclick="confirmSessionDeleteModal()">Delete</button>
+    </div>
+  </div>
+</div>
+
 <!-- Voice Overlay -->
 <div class="voice-overlay" id="voiceOverlay" draggable="false">
   <div class="voice-drag-handle" id="voiceDragHandle"></div>
@@ -10418,6 +10431,7 @@ let newSessionSpawnRecent = null;
 let newSessionSpawnRecentTimeout = null;
 let sessionRenameEditing = null;
 let sessionConfigEditing = null;
+let sessionDeletePending = null;
 const NEW_SESSION_SPAWN_TIMEOUT_MS = 90000;
 const NEW_SESSION_LAUNCH_FAILURE_GRACE_MS = 15000;
 
@@ -14748,6 +14762,8 @@ window.closeSessionRenameModal = closeSessionRenameModal;
 window.saveSessionRenameModal = saveSessionRenameModal;
 window.closeSessionConfigModal = closeSessionConfigModal;
 window.saveSessionConfigModal = saveSessionConfigModal;
+window.closeSessionDeleteModal = closeSessionDeleteModal;
+window.confirmSessionDeleteModal = confirmSessionDeleteModal;
 
 const SESSION_WINDOW_GENERIC_ACTIONS = [
   { op: 'copy-session-id', label: 'Copy full session ID', title: 'Copy the full session ID' },
@@ -30056,39 +30072,94 @@ function resumeSession(s) {
   routeTo('activity');
 }
 
-function deleteSessionData(sessionId, target, label) {
-  const shortId = sessionId.substring(0, 8);
-  if (!confirm(`${label} for session ${shortId}?\nThis cannot be undone.`)) return;
+function showSessionDeleteStatus(message, kind = '') {
+  const status = document.getElementById('session-delete-status');
+  if (!status) return;
+  status.className = 'session-config-status' + (kind ? ` ${kind}` : '');
+  status.textContent = message || '';
+}
 
+function closeSessionDeleteModal() {
+  const modal = document.getElementById('session-delete-modal');
+  if (modal) modal.style.display = 'none';
+  sessionDeletePending = null;
+  showSessionDeleteStatus('');
+  const confirmBtn = document.getElementById('session-delete-confirm');
+  if (confirmBtn) {
+    confirmBtn.disabled = false;
+    confirmBtn.textContent = 'Delete';
+  }
+}
+
+function deleteSessionData(sessionId, target, label) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) {
+    showControlToast('error', 'Delete failed: session ID is missing');
+    return;
+  }
+  sessionDeletePending = { sessionId: sid, target, label };
+  const shortId = sid.substring(0, 8);
+  const message = document.getElementById('session-delete-message');
+  if (message) message.textContent = `${label} for session ${shortId}?`;
+  showSessionDeleteStatus('');
+  const confirmBtn = document.getElementById('session-delete-confirm');
+  if (confirmBtn) {
+    confirmBtn.disabled = false;
+    confirmBtn.textContent = 'Delete';
+  }
+  const modal = document.getElementById('session-delete-modal');
+  if (modal) modal.style.display = 'flex';
+  setTimeout(() => document.getElementById('session-delete-confirm')?.focus(), 0);
+}
+
+async function confirmSessionDeleteModal() {
+  if (!sessionDeletePending) return;
+  const { sessionId, target, label } = sessionDeletePending;
   const url = target === 'session'
     ? `/api/session/${sessionId}/delete`
     : `/api/session/${sessionId}/delete/${target}`;
 
-  fetch(url, { method: 'POST' })
-    .then(r => r.json())
-    .then(result => {
-      if (!result.ok) { alert('Delete failed: ' + (result.error || 'unknown')); return; }
-      if (target === 'session') {
-        _cachedSessions = _cachedSessions.filter(s => s.session_id !== sessionId);
-      } else {
-        const s = _cachedSessions.find(s => s.session_id === sessionId);
-        if (s) {
-          const freed = result.bytes_freed || 0;
-          if (target === 'media' || target === 'recordings') {
-            s.recordings = 0; s.recording_bytes = 0;
-          }
-          if (target === 'media' || target === 'frames') {
-            s.annotations = 0; s.clips = 0; s.frames_bytes = 0;
-          }
-          if (target === 'turns') { s.turns_bytes = 0; }
-          s.total_bytes = Math.max(0, (s.total_bytes || 0) - freed);
+  const confirmBtn = document.getElementById('session-delete-confirm');
+  if (confirmBtn) {
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = 'Deleting...';
+  }
+  showSessionDeleteStatus('Deleting...');
+
+  try {
+    const resp = await fetch(url, { method: 'POST' });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok || !result.ok) throw new Error(result.error || resp.statusText || 'unknown');
+    if (target === 'session') {
+      _cachedSessions = _cachedSessions.filter(s => s.session_id !== sessionId);
+    } else {
+      const s = _cachedSessions.find(s => s.session_id === sessionId);
+      if (s) {
+        const freed = result.bytes_freed || 0;
+        if (target === 'media' || target === 'recordings') {
+          s.recordings = 0; s.recording_bytes = 0;
         }
+        if (target === 'media' || target === 'frames') {
+          s.annotations = 0; s.clips = 0; s.frames_bytes = 0;
+        }
+        if (target === 'turns') { s.turns_bytes = 0; }
+        s.total_bytes = Math.max(0, (s.total_bytes || 0) - freed);
       }
-      updateSessionProjectFilterOptions(_cachedSessions);
-      renderSessionsAggregate(_cachedSessions, document.getElementById('sessions-aggregate'));
-      _refilterSessions();
-    })
-    .catch(e => alert('Delete failed: ' + e.message));
+    }
+    updateSessionProjectFilterOptions(_cachedSessions);
+    renderSessionsAggregate(_cachedSessions, document.getElementById('sessions-aggregate'));
+    _refilterSessions();
+    closeSessionDeleteModal();
+    showControlToast('success', `${label} complete`);
+  } catch (e) {
+    const message = e?.message || 'unknown';
+    showSessionDeleteStatus('Delete failed: ' + message, 'error');
+    showControlToast('error', 'Delete failed: ' + message);
+    if (confirmBtn) {
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = 'Delete';
+    }
+  }
 }
 
 function renderSessionDetailTitle(session) {
@@ -30903,6 +30974,11 @@ document.addEventListener('keydown', (e) => {
   const sessionConfigModal = document.getElementById('session-config-modal');
   if (sessionConfigModal && sessionConfigModal.style.display !== 'none') {
     closeSessionConfigModal();
+    return;
+  }
+  const sessionDeleteModal = document.getElementById('session-delete-modal');
+  if (sessionDeleteModal && sessionDeleteModal.style.display !== 'none') {
+    closeSessionDeleteModal();
   }
 });
 document.getElementById('rollback-modal')?.addEventListener('click', (e) => {
@@ -30922,6 +30998,9 @@ document.getElementById('session-rename-name')?.addEventListener('keydown', (e) 
 });
 document.getElementById('session-config-modal')?.addEventListener('click', (e) => {
   if (e.target && e.target.id === 'session-config-modal') closeSessionConfigModal();
+});
+document.getElementById('session-delete-modal')?.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'session-delete-modal') closeSessionDeleteModal();
 });
 
 // Enter to submit
