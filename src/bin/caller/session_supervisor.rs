@@ -37,6 +37,7 @@ pub struct SessionSupervisor {
 const EXTERNAL_ATTACH_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SESSION_STOP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const SESSION_RESTART_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+const EXTERNAL_ATTACH_DEDUPE_WINDOW: std::time::Duration = EXTERNAL_ATTACH_READY_TIMEOUT;
 
 #[derive(Default)]
 struct SupervisorState {
@@ -46,6 +47,7 @@ struct SupervisorState {
     active_session_id: Option<String>,
     next_session_instance: u64,
     restart_dedupe: HashMap<String, std::time::Instant>,
+    external_attach_dedupe: HashMap<String, std::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +197,33 @@ impl SupervisorState {
         self.restart_dedupe
             .insert(key.to_string(), now + SESSION_RESTART_DEDUPE_WINDOW);
         true
+    }
+
+    fn mark_external_attach_requested(&mut self, keys: &[String]) -> bool {
+        if keys.is_empty() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        self.external_attach_dedupe
+            .retain(|_, expires_at| *expires_at > now);
+        if keys
+            .iter()
+            .any(|key| self.external_attach_dedupe.contains_key(key))
+        {
+            return false;
+        }
+        let expires_at = now + EXTERNAL_ATTACH_DEDUPE_WINDOW;
+        for key in keys {
+            self.external_attach_dedupe
+                .insert(key.to_string(), expires_at);
+        }
+        true
+    }
+
+    fn clear_external_attach_requested(&mut self, keys: &[String]) {
+        for key in keys {
+            self.external_attach_dedupe.remove(key);
+        }
     }
 }
 
@@ -828,6 +857,11 @@ impl SessionSupervisor {
         };
         let is_external = external_backend.is_some();
         let resume_token = resume_id.unwrap_or_else(|| session_id.clone());
+        let external_attach_keys = if is_external && resume_task.is_none() && !force_new {
+            external_attach_dedupe_keys(&source_norm, &session_id, &resume_token)
+        } else {
+            Vec::new()
+        };
         let session_agent_config = external_backend.as_ref().map(|backend| {
             let mut config = crate::session_config::from_wire(
                 Some(backend.as_short_str()),
@@ -875,11 +909,25 @@ impl SessionSupervisor {
                 }
                 self.emit_attached_status(&session_id, &source_norm).await;
             } else {
+                if !external_attach_keys.is_empty() {
+                    let mut state = self.state.lock().await;
+                    if !state.mark_external_attach_requested(&external_attach_keys) {
+                        drop(state);
+                        self.info(&format!(
+                            "Attach ignored: {} session {} is already attaching",
+                            source_norm,
+                            short_session(&resume_token)
+                        ));
+                        return;
+                    }
+                }
                 let (ready_tx, ready_rx) = oneshot::channel();
                 let log_dir = session_log::SessionLog::resolve_path(None);
                 let session_log = match session_log::SessionLog::open(log_dir.clone()) {
                     Ok(log) => Arc::new(Mutex::new(log)),
                     Err(e) => {
+                        self.clear_external_attach_request(&external_attach_keys)
+                            .await;
                         self.loop_error(format!("Session open failed: {}", e));
                         return;
                     }
@@ -890,6 +938,8 @@ impl SessionSupervisor {
                 {
                     Ok(project) => project,
                     Err(e) => {
+                        self.clear_external_attach_request(&external_attach_keys)
+                            .await;
                         self.loop_error(format!("Project load failed: {}", e));
                         return;
                     }
@@ -921,6 +971,8 @@ impl SessionSupervisor {
                     Some(ready_tx),
                 )
                 .await;
+                self.clear_external_attach_request(&external_attach_keys)
+                    .await;
                 self.emit_external_attached_when_ready(resume_token, source_norm, ready_rx);
                 return;
             }
@@ -2291,6 +2343,14 @@ impl SessionSupervisor {
         state.session_is_managed(session_id)
     }
 
+    async fn clear_external_attach_request(&self, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        state.clear_external_attach_requested(keys);
+    }
+
     async fn register_session(
         &self,
         session_id: String,
@@ -2958,6 +3018,22 @@ fn short_text(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
+fn external_attach_dedupe_keys(source: &str, session_id: &str, resume_token: &str) -> Vec<String> {
+    let source = source.trim().to_lowercase();
+    if source.is_empty() {
+        return Vec::new();
+    }
+    let mut ids = Vec::new();
+    for id in [session_id, resume_token] {
+        let id = id.trim();
+        if id.is_empty() || ids.iter().any(|existing: &String| existing.as_str() == id) {
+            continue;
+        }
+        ids.push(id.to_string());
+    }
+    ids.into_iter().map(|id| format!("{source}:{id}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3111,6 +3187,30 @@ mod tests {
         assert!(state.mark_restart_requested("codex:thread"));
         assert!(!state.mark_restart_requested("codex:thread"));
         assert!(state.mark_restart_requested("codex:other-thread"));
+    }
+
+    #[test]
+    fn external_attach_dedupe_keys_include_session_and_resume_ids() {
+        assert_eq!(
+            external_attach_dedupe_keys(" Codex ", "wrapper", "thread"),
+            vec!["codex:wrapper".to_string(), "codex:thread".to_string()]
+        );
+        assert_eq!(
+            external_attach_dedupe_keys("codex", "thread", "thread"),
+            vec!["codex:thread".to_string()]
+        );
+    }
+
+    #[test]
+    fn supervisor_state_dedupes_in_flight_external_attaches_by_alias() {
+        let mut state = SupervisorState::default();
+        let first = external_attach_dedupe_keys("codex", "wrapper", "thread");
+        let duplicate_by_resume = external_attach_dedupe_keys("codex", "thread", "thread");
+
+        assert!(state.mark_external_attach_requested(&first));
+        assert!(!state.mark_external_attach_requested(&duplicate_by_resume));
+        state.clear_external_attach_requested(&first);
+        assert!(state.mark_external_attach_requested(&duplicate_by_resume));
     }
 
     #[tokio::test]
