@@ -14581,6 +14581,7 @@ function saveSessionConfigModal() {
   try {
     dispatchControlMsg(payload);
     applySessionConfigLocal(sessionConfigEditing, command, mode);
+    scheduleSessionsMetadataRefresh(200);
     const status = document.getElementById('session-config-status');
     if (status) {
       status.className = 'session-config-status ok';
