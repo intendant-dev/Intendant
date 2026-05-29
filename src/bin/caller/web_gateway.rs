@@ -7491,13 +7491,17 @@ fn managed_context_candidate_log_dirs(
     if let Some(wrapper_session_id) = wrapper_session_id {
         if let Some(path) = managed_context_named_log_dir(home, wrapper_session_id) {
             push_dir(path);
-            return dirs;
+            if session_id.is_none() || session_id == Some(wrapper_session_id) {
+                return dirs;
+            }
         }
     }
     if let Some(session_id) = session_id {
         if let Some(path) = managed_context_named_log_dir(home, session_id) {
             push_dir(path);
-            return dirs;
+            if wrapper_session_id.is_none() || wrapper_session_id == Some(session_id) {
+                return dirs;
+            }
         }
         let logs_dir = home.join(".intendant").join("logs");
         if let Ok(entries) = std::fs::read_dir(&logs_dir) {
@@ -16443,6 +16447,47 @@ mod tests {
         assert_eq!(anchors.len(), 1);
         assert_eq!(anchors[0]["item_id"], "call-wrapper");
         assert_eq!(anchors[0]["intendant_session_id"], "wrapper-a");
+    }
+
+    #[test]
+    fn managed_context_anchors_response_scans_backend_when_wrapper_alias_is_stale() {
+        let home = tempfile::tempdir().unwrap();
+        let active = tempfile::tempdir().unwrap();
+        let logs_dir = home.path().join(".intendant").join("logs");
+        let stale_log = logs_dir.join("wrapper-stale");
+        let resumed_log = logs_dir.join("wrapper-resumed");
+        std::fs::create_dir_all(stale_log.join("model-request-traces")).unwrap();
+        let trace_dir = resumed_log
+            .join("model-request-traces")
+            .join("codex-thread-a-trace");
+        std::fs::create_dir_all(&trace_dir).unwrap();
+        std::fs::write(
+            trace_dir.join("trace.jsonl"),
+            serde_json::json!({
+                "wall_time_unix_ms": 1779944111933i64,
+                "rollout_id": "codex-thread-a",
+                "thread_id": "codex-thread-a",
+                "payload": {
+                    "type": "tool_call_started",
+                    "tool_call_id": "call-resumed",
+                    "kind": { "type": "exec_command" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let response = managed_context_anchors_response_from_home(
+            "GET /api/managed-context/anchors?session_id=codex-thread-a&backend_session_id=codex-thread-a&intendant_session_id=wrapper-stale HTTP/1.1",
+            Some(active.path()),
+            home.path(),
+        );
+        let body = response_json_body(&response);
+        let anchors = body["anchors"].as_array().unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0]["item_id"], "call-resumed");
+        assert_eq!(anchors[0]["session_id"], "codex-thread-a");
+        assert_eq!(anchors[0]["intendant_session_id"], "wrapper-resumed");
     }
 
     #[test]
