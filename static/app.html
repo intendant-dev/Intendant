@@ -20650,13 +20650,20 @@ function onUploadReady(descriptor) {
   const dataUrl = isImage
     ? `/api/session/current/uploads/${encodeURIComponent(descriptor.id)}/raw`
     : null;
+  const safeName = String(descriptor.name || 'upload.bin');
+  const originalName = String(descriptor.original_name || descriptor.originalName || '').trim();
+  const displayName = originalName || safeName;
+  const noteName = originalName && originalName !== safeName
+    ? `${originalName} (stored as ${safeName})`
+    : displayName;
   addPendingAttachment({
     frameId,
     stream: 'upload',
-    note: `${descriptor.name} (${humanBytes(descriptor.size || 0)}, ${descriptor.destination})`,
+    note: `${noteName} (${humanBytes(descriptor.size || 0)}, ${descriptor.destination})`,
     dataUrl,
     uploadId: descriptor.id,
-    uploadName: descriptor.name,
+    uploadName: displayName,
+    uploadSafeName: safeName,
     uploadMime: descriptor.mime,
     uploadDestination: descriptor.destination,
   });
@@ -20712,10 +20719,31 @@ if (document.readyState === 'loading') {
   wireUploadControls();
 }
 
+function pendingAttachmentDisplayName(att) {
+  return String(att?.uploadName || att?.uploadSafeName || '').trim();
+}
+
+function pendingAttachmentDuplicateSuffix(att, displayName) {
+  if (!displayName || !att?.uploadId) return '';
+  const peers = pendingAttachments.filter(p => pendingAttachmentDisplayName(p) === displayName);
+  if (peers.length <= 1) return '';
+  const idx = peers.findIndex(p => p.uploadId === att.uploadId || p.frameId === att.frameId);
+  return idx >= 0 ? ` #${idx + 1}` : '';
+}
+
+function clippedAttachmentLabel(name, suffix) {
+  const maxLen = suffix ? 20 : 24;
+  const clipped = name.length > maxLen ? name.slice(0, Math.max(1, maxLen - 2)) + '…' : name;
+  return '📎 ' + clipped + suffix;
+}
+
 function buildPendingAttachmentChip(att) {
   const chip = document.createElement('span');
   chip.className = 'pending-attachment-chip';
-  chip.title = att.note ? `${att.frameId} — ${att.note}` : att.frameId;
+  const displayName = pendingAttachmentDisplayName(att);
+  chip.title = att.note
+    ? `${displayName || att.frameId} — ${att.note}`
+    : (displayName || att.frameId);
   if (att.dataUrl) {
     const img = document.createElement('img');
     img.className = 'chip-thumb';
@@ -20726,9 +20754,9 @@ function buildPendingAttachmentChip(att) {
   const label = document.createElement('span');
   // Upload chips get a paperclip + filename; frame chips keep the ID
   // (it's already short — `ann-*`, `clip-*`, `display_*`).
-  if (att.uploadName) {
-    const name = att.uploadName;
-    label.textContent = '📎 ' + (name.length > 24 ? name.slice(0, 22) + '…' : name);
+  if (displayName) {
+    const suffix = pendingAttachmentDuplicateSuffix(att, displayName);
+    label.textContent = clippedAttachmentLabel(displayName, suffix);
   } else {
     label.textContent = att.frameId.length > 24 ? '…' + att.frameId.slice(-22) : att.frameId;
   }

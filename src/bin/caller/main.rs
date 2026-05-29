@@ -13962,7 +13962,7 @@ async fn resolve_attachments_with_project_roots(
                 out.push(external_agent::AgentAttachment::File(
                     external_agent::AgentFileAttachment {
                         local_path: d.path.clone(),
-                        name: d.name.clone(),
+                        name: d.original_name.clone().unwrap_or_else(|| d.name.clone()),
                         mime_type: d.mime.clone(),
                         size: d.size,
                     },

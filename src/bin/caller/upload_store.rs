@@ -63,6 +63,10 @@ pub struct UploadDescriptor {
     pub id: String,
     /// Original filename from the browser, sanitized for disk use.
     pub name: String,
+    /// Original basename from the browser, preserved for display/model context.
+    /// Older sidecars do not have this field.
+    #[serde(default)]
+    pub original_name: Option<String>,
     /// MIME type the browser sent in `Content-Type`, or
     /// `application/octet-stream` if none.
     pub mime: String,
@@ -111,6 +115,15 @@ pub fn sanitize_name(raw: &str) -> String {
         "upload.bin".to_string()
     } else {
         cleaned
+    }
+}
+
+fn display_name(raw: &str, safe_name: &str) -> Option<String> {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw).trim();
+    if base.is_empty() || base == safe_name {
+        None
+    } else {
+        Some(base.to_string())
     }
 }
 
@@ -245,6 +258,7 @@ pub fn commit_upload(
 ) -> Result<UploadDescriptor, CallerError> {
     let id = uuid::Uuid::new_v4().to_string();
     let safe_name = sanitize_name(original_name);
+    let original_display_name = display_name(original_name, &safe_name);
     ensure_project_uploads_ignored(project_root)?;
     let dir = target_dir(destination, session_dir, session_id, project_root);
     fs::create_dir_all(&dir)?;
@@ -273,6 +287,7 @@ pub fn commit_upload(
     let descriptor = UploadDescriptor {
         id,
         name: safe_name,
+        original_name: original_display_name,
         mime: mime.to_string(),
         size,
         path: dest_path,
@@ -421,6 +436,33 @@ mod tests {
         assert_eq!(sanitize_name("hello world!.txt"), "hello_world_.txt");
         assert_eq!(sanitize_name(""), "upload.bin");
         assert_eq!(sanitize_name("...."), "upload.bin");
+    }
+
+    #[test]
+    fn commit_preserves_original_display_name_when_sanitized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("session");
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let descriptor = commit_upload(
+            mk_tempfile(b"hello"),
+            "duplicate name & symbols [one].txt",
+            "text/plain",
+            5,
+            UploadDestination::Task,
+            &session_dir,
+            "sess-1",
+            &project_root,
+        )
+        .unwrap();
+
+        assert_eq!(descriptor.name, "duplicate_name___symbols__one_.txt");
+        assert_eq!(
+            descriptor.original_name.as_deref(),
+            Some("duplicate name & symbols [one].txt")
+        );
     }
 
     #[test]
@@ -592,6 +634,7 @@ mod tests {
         let mut d = UploadDescriptor {
             id: "x".into(),
             name: "a".into(),
+            original_name: None,
             mime: "image/png".into(),
             size: 0,
             path: PathBuf::new(),
