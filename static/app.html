@@ -9814,7 +9814,7 @@ function processCommands(cmds) {
         onFileChanged(c.path, c.kind, c.lines_added, c.lines_removed);
         break;
       case 'upload_ready':
-        onUploadReady(c.descriptor);
+        onUploadReady(c.descriptor, { fromBroadcast: true });
         break;
       case 'upload_deleted':
         onUploadDeleted(c.id);
@@ -20472,13 +20472,12 @@ function clearPendingAttachments(options = {}) {
 //
 // Flow: user clicks Attach (or drops files on the task input) → we stream
 // each file to POST /api/session/current/uploads → the server replies
-// with an UploadDescriptor, broadcasts UploadReady to all connected
-// browsers →
-// the POST response immediately adds a chip in this browser; the UploadReady
-// broadcast lets any other connected browser mirror the same pending chip.
-// Submitting a task maps the chip's `frameId` (of the form "upload:<id>")
-// directly into the `attachments` array — the server's `resolve_attachments`
-// understands the prefix.
+// with an UploadDescriptor and also broadcasts UploadReady. Only the POSTing
+// browser queues a pending chip; broadcasts are informational so parallel
+// dashboards do not accidentally attach each other's uploads. Submitting a
+// task maps the chip's `frameId` (of the form "upload:<id>") directly into
+// the `attachments` array — the server's `resolve_attachments` understands
+// the prefix.
 
 // Cap mirrors UPLOAD_MAX_BYTES on the server. Front-end check is UX only
 // (the server bails with 413 even if the browser lies); nicer to catch it
@@ -20515,9 +20514,6 @@ async function uploadOneFile(file, destination) {
       logErrorToActivity(`Upload failed (${file.name}): ${json.error || resp.statusText}`);
       return null;
     }
-    // Add immediately from the POST response so this browser is not dependent
-    // on the WebSocket broadcast round-trip. The broadcast still updates any
-    // other open dashboard, and addPendingAttachment de-dupes this one.
     onUploadReady(json);
     return json;
   } catch (e) {
@@ -20642,8 +20638,9 @@ async function triggerUploadFlow(files) {
   }
 }
 
-function onUploadReady(descriptor) {
+function onUploadReady(descriptor, options = {}) {
   if (!descriptor || !descriptor.id) return;
+  if (options.fromBroadcast) return;
   const frameId = `upload:${descriptor.id}`;
   // Thumbnail for images, a paperclip + name label for files.
   const isImage = typeof descriptor.mime === 'string' && descriptor.mime.startsWith('image/');
