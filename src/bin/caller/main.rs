@@ -2138,6 +2138,34 @@ fn fork_session_name_from_params(params: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn codex_thread_rename_name_from_result(
+    params: &serde_json::Value,
+    message: &str,
+) -> Option<String> {
+    fork_session_name_from_params(params).or_else(|| {
+        message
+            .strip_prefix("Codex thread renamed to ")
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn persist_codex_thread_rename_overlay(
+    home: &Path,
+    session_id: Option<&str>,
+    params: &serde_json::Value,
+    message: &str,
+) -> Result<Option<String>, String> {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(name) = codex_thread_rename_name_from_result(params, message) else {
+        return Ok(None);
+    };
+    crate::session_names::rename_session(home, "codex", session_id, &name).map(Some)
+}
+
 fn side_session_prompt_from_params(params: &serde_json::Value) -> Option<String> {
     ["prompt", "message", "text", "task"]
         .iter()
@@ -2472,10 +2500,28 @@ async fn handle_external_thread_action(
             .await
             .map_err(|e| e.to_string())
     };
-    let (success, message) = match result {
+    let (success, mut message) = match result {
         Ok(msg) => (true, msg),
         Err(e) => (false, e),
     };
+    if success && op == "rename" {
+        if let Some(home) = dirs::home_dir() {
+            match persist_codex_thread_rename_overlay(
+                &home,
+                result_session_id.as_deref(),
+                &params,
+                &message,
+            ) {
+                Ok(Some(name)) => {
+                    message = format!("Codex thread renamed to {}", name);
+                }
+                Ok(None) => {}
+                Err(err) => slog(config.session_log, |l| {
+                    l.warn(&format!("Failed to persist Codex thread rename: {err}"))
+                }),
+            }
+        }
+    }
     slog(config.session_log, |l| {
         l.info(&format!(
             "Codex thread action /{}: {} — {}",
@@ -6479,6 +6525,45 @@ mod tests {
             None
         );
         assert_eq!(fork_session_name_from_params(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn codex_thread_rename_overlay_persists_native_rename() {
+        let home = tempfile::TempDir::new().unwrap();
+        let persisted = persist_codex_thread_rename_overlay(
+            home.path(),
+            Some("thread-1"),
+            &serde_json::json!({ "name": "  Better name  " }),
+            "Codex thread renamed to ignored fallback",
+        )
+        .unwrap();
+        assert_eq!(persisted.as_deref(), Some("Better name"));
+
+        let mut sessions = vec![serde_json::json!({
+            "source": "codex",
+            "session_id": "thread-1",
+            "name": "Old name"
+        })];
+        crate::session_names::apply_session_name_overlays(home.path(), &mut sessions);
+        assert_eq!(sessions[0]["name"], "Better name");
+    }
+
+    #[test]
+    fn codex_thread_rename_name_falls_back_to_result_message() {
+        assert_eq!(
+            codex_thread_rename_name_from_result(
+                &serde_json::json!({}),
+                "Codex thread renamed to Fallback name"
+            ),
+            Some("Fallback name".to_string())
+        );
+        assert_eq!(
+            codex_thread_rename_name_from_result(
+                &serde_json::json!({ "name": "Param name" }),
+                "Codex thread renamed to Fallback name"
+            ),
+            Some("Param name".to_string())
+        );
     }
 
     #[test]
