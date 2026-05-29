@@ -15014,12 +15014,13 @@ function codexThreadActionStateForSession(sessionId, op) {
   const capabilities = getSessionCapabilities(sessionId);
   if (capabilities && Array.isArray(capabilities.codexThreadActions)) {
     const allowed = capabilities.codexThreadActions.includes(normalized);
-    return allowed
-      ? { allowed: true, reason: '' }
-      : { allowed: false, reason: 'Unsupported for this session' };
+    if (!allowed) return { allowed: false, reason: 'Unsupported for this session' };
   }
   if (sessionWindowIsSubagent(sessionId)) {
     return { allowed: false, reason: 'Unsupported for Codex subagent threads' };
+  }
+  if (!isSessionWindowEffectivelyActive(sessionId)) {
+    return { allowed: false, reason: 'Start a task in this Codex session first' };
   }
   return { allowed: true, reason: '' };
 }
