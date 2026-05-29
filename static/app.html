@@ -20431,17 +20431,41 @@ function addPendingAttachment(att) {
   renderPendingAttachments();
 }
 
-function removePendingAttachment(frameId) {
+function pendingAttachmentUploadId(att) {
+  const explicit = String(att?.uploadId || '').trim();
+  if (explicit) return explicit;
+  const frameId = String(att?.frameId || '').trim();
+  return frameId.startsWith('upload:') ? frameId.slice('upload:'.length) : '';
+}
+
+function deletePendingUploadRecord(uploadId) {
+  const id = String(uploadId || '').trim();
+  if (!id) return;
+  fetch(`/api/session/current/uploads/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    .then(resp => {
+      if (!resp.ok && resp.status !== 404) {
+        console.warn(`[upload] Delete failed (${id}): ${resp.status}`);
+      }
+    })
+    .catch(err => console.warn(`[upload] Delete failed (${id}): ${err}`));
+}
+
+function removePendingAttachment(frameId, options = {}) {
   const idx = pendingAttachments.findIndex(p => p.frameId === frameId);
   if (idx >= 0) {
-    pendingAttachments.splice(idx, 1);
+    const [removed] = pendingAttachments.splice(idx, 1);
     renderPendingAttachments();
+    if (options.deleteUpload) deletePendingUploadRecord(pendingAttachmentUploadId(removed));
   }
 }
 
-function clearPendingAttachments() {
+function clearPendingAttachments(options = {}) {
+  const uploadIds = options.deleteUploads
+    ? pendingAttachments.map(pendingAttachmentUploadId).filter(Boolean)
+    : [];
   pendingAttachments.length = 0;
   renderPendingAttachments();
+  uploadIds.forEach(deletePendingUploadRecord);
 }
 
 // ── File upload ───────────────────────────────────────────────────────
@@ -20640,7 +20664,7 @@ function onUploadReady(descriptor) {
 
 function onUploadDeleted(id) {
   if (!id) return;
-  removePendingAttachment(`upload:${id}`);
+  removePendingAttachment(`upload:${id}`, { deleteUpload: false });
 }
 
 function wireUploadControls() {
@@ -20715,7 +20739,7 @@ function buildPendingAttachmentChip(att) {
   x.textContent = '×';
   x.addEventListener('click', (e) => {
     e.stopPropagation();
-    removePendingAttachment(att.frameId);
+    removePendingAttachment(att.frameId, { deleteUpload: true });
   });
   chip.appendChild(x);
   return chip;
@@ -20805,7 +20829,7 @@ function wirePendingAttachmentClearButtons() {
   document.querySelectorAll('[data-pending-attachments-clear]').forEach(clearBtn => {
     if (clearBtn._wired) return;
     clearBtn._wired = true;
-    clearBtn.addEventListener('click', () => clearPendingAttachments());
+    clearBtn.addEventListener('click', () => clearPendingAttachments({ deleteUploads: true }));
   });
 }
 
