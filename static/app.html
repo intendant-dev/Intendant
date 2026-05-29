@@ -4092,15 +4092,24 @@ html, body {
   box-shadow: 0 4px 12px rgba(0,0,0,0.3);
 }
 .sc-delete-menu-item {
+  width: 100%;
   padding: 6px 12px;
+  border: 0;
+  background: transparent;
   font-size: 12px;
+  font-family: inherit;
   color: var(--text);
   cursor: pointer;
   display: flex;
   justify-content: space-between;
   gap: 12px;
+  text-align: left;
 }
 .sc-delete-menu-item:hover { background: var(--surface0); }
+.sc-delete-menu-item:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: -2px;
+}
 .sc-delete-menu-item .size-hint { color: var(--overlay0); font-size: 11px; }
 .sc-delete-menu-item.danger { color: var(--red); }
 .session-card.dimmed {
@@ -29557,10 +29566,13 @@ function renderSessionsList(sessions, el, options = {}) {
         document.querySelectorAll('.sc-delete-menu').forEach(m => m.remove());
         const menu = document.createElement('div');
         menu.className = 'sc-delete-menu';
+        menu.setAttribute('role', 'menu');
 
         const addItem = (label, target, bytes, danger) => {
-          const item = document.createElement('div');
+          const item = document.createElement('button');
+          item.type = 'button';
           item.className = 'sc-delete-menu-item' + (danger ? ' danger' : '');
+          item.setAttribute('role', 'menuitem');
           const txt = document.createElement('span');
           txt.textContent = label;
           item.appendChild(txt);
