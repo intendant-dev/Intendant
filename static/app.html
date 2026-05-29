@@ -29171,6 +29171,29 @@ function sessionLogSearchKey(source, sessionId) {
   return `${source || 'intendant'}:${sessionId || ''}`;
 }
 
+function sessionDeepSearchHasMissingMetadata(results = _sessionDeepSearch.results) {
+  if (!results || typeof results.keys !== 'function' || results.size === 0) return false;
+  const known = new Set((_cachedSessions || []).map(session =>
+    sessionLogSearchKey(session.source || 'intendant', session.session_id)
+  ));
+  for (const key of results.keys()) {
+    if (!known.has(key)) return true;
+  }
+  return false;
+}
+
+function scheduleSessionMetadataRefreshForDeepSearch(token) {
+  for (const delay of [0, 2000, 10000]) {
+    setTimeout(() => {
+      if (token !== _sessionDeepSearchToken) return;
+      if (!_sessionDeepSearch.active || !_sessionDeepSearch.results?.size) return;
+      if (sessionDeepSearchHasMissingMetadata()) {
+        loadSessions({ force: true });
+      }
+    }, delay);
+  }
+}
+
 function sessionDeepSearchQuery() {
   return (document.getElementById('sessions-deep-search-query')?.value || '').trim();
 }
@@ -29284,6 +29307,7 @@ function runSessionDeepSearch() {
       _sessionDeepSearchAbort = null;
       setSessionDeepSearchLoading(false);
       _refilterSessions();
+      if (results.size > 0) scheduleSessionMetadataRefreshForDeepSearch(token);
     })
     .catch(err => {
       if (token !== _sessionDeepSearchToken) return;
@@ -29884,7 +29908,9 @@ function renderSessionsList(sessions, el, options = {}) {
   if (visibleCount === 0) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
-    empty.textContent = deepSearchActive
+    empty.textContent = deepSearchActive && sessionDeepSearchHasMissingMetadata()
+      ? 'Loading session metadata for matching log results...'
+      : deepSearchActive
       ? 'No sessions match the deep search results'
       : query
       ? 'No sessions match your search'
