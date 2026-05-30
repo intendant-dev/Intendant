@@ -2147,6 +2147,8 @@ fn managed_context_user_kickstart_is_trivial(text: &str) -> bool {
     )
 }
 
+const MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND: u8 = 2;
+
 fn managed_context_recovery_kickstart_text(
     pressure: ManagedContextRewindOnlyPressure,
     held_user_input: bool,
@@ -13151,6 +13153,7 @@ async fn run_external_agent_mode(
     let mut side_turn_revisions: HashMap<String, UserTurnRevisionState> = HashMap::new();
     let mut pending_managed_context_replays: std::collections::VecDeque<FollowUpMessage> =
         std::collections::VecDeque::new();
+    let mut managed_context_recovery_kickstarts_without_rewind = 0u8;
     let attach_only_resume = task.trim().is_empty() && resumed_external_session.is_some();
     let mut next_turn = if task.trim().is_empty() {
         None
@@ -14251,13 +14254,78 @@ async fn run_external_agent_mode(
                     native_message_count: None,
                 });
                 if managed_context_recovery_kickstart {
-                    if let Some(replay) = pending_managed_context_replays.pop_front() {
-                        slog(&session_log, |l| {
-                            l.warn(
-                                "Managed-context recovery kickstart completed without a context rewind; retrying held follow-up behind the pressure gate",
-                            )
-                        });
-                        next_turn = Some(replay);
+                    match agent.context_snapshot().await {
+                        Ok(Some(snapshot)) => {
+                            if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot)
+                            {
+                                managed_context_recovery_kickstarts_without_rewind =
+                                    managed_context_recovery_kickstarts_without_rewind
+                                        .saturating_add(1);
+                                if managed_context_recovery_kickstarts_without_rewind
+                                    < MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND
+                                {
+                                    let held_user_input =
+                                        !pending_managed_context_replays.is_empty();
+                                    let recovery_text = managed_context_recovery_kickstart_text(
+                                        pressure,
+                                        held_user_input,
+                                    );
+                                    slog(&session_log, |l| {
+                                        l.warn(&format!(
+                                            "Managed-context recovery kickstart completed without a context rewind while pressure remains {}/{} tokens; retrying recovery once",
+                                            pressure.used_tokens,
+                                            pressure.rewind_only_limit
+                                        ))
+                                    });
+                                    bus.send(AppEvent::LogEntry {
+                                        session_id: live_session_id.clone(),
+                                        level: "warn".to_string(),
+                                        source: "Intendant".to_string(),
+                                        content: format!(
+                                            "Managed-context recovery did not call rewind_context; context still reports {}/{} tokens. Retrying recovery before sending any normal follow-up.",
+                                            pressure.used_tokens,
+                                            pressure.rewind_only_limit
+                                        ),
+                                        turn: None,
+                                    });
+                                    next_turn = Some(
+                                        FollowUpMessage::text(recovery_text)
+                                            .managed_context_recovery_kickstart(),
+                                    );
+                                } else {
+                                    let message = format!(
+                                        "Managed-context recovery completed without rewind_context while context remains above the rewind-only threshold ({}/{} tokens); refusing to send normal follow-ups.",
+                                        pressure.used_tokens,
+                                        pressure.rewind_only_limit
+                                    );
+                                    slog(&session_log, |l| l.warn(&message));
+                                    bus.send(AppEvent::LoopError(message));
+                                }
+                            } else {
+                                managed_context_recovery_kickstarts_without_rewind = 0;
+                                if let Some(replay) = pending_managed_context_replays.pop_front() {
+                                    slog(&session_log, |l| {
+                                        l.warn(
+                                            "Managed-context recovery kickstart completed without a context rewind after pressure cleared; replaying held follow-up",
+                                        )
+                                    });
+                                    next_turn = Some(replay);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            let message = "Managed-context recovery completed without rewind_context, and Codex context pressure could not be re-read; refusing to send normal follow-ups.".to_string();
+                            slog(&session_log, |l| l.warn(&message));
+                            bus.send(AppEvent::LoopError(message));
+                        }
+                        Err(e) => {
+                            let message = format!(
+                                "Managed-context recovery completed without rewind_context, and Codex context pressure could not be re-read: {}; refusing to send normal follow-ups.",
+                                e
+                            );
+                            slog(&session_log, |l| l.warn(&message));
+                            bus.send(AppEvent::LoopError(message));
+                        }
                     }
                 }
             }
@@ -14266,6 +14334,7 @@ async fn run_external_agent_mode(
                 message,
                 turns_in_round,
             } => {
+                managed_context_recovery_kickstarts_without_rewind = 0;
                 stats.rounds = round;
                 record_external_done_and_round_inline(
                     &session_log,

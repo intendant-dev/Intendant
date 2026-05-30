@@ -814,6 +814,44 @@ fn extract_thread_path(value: &serde_json::Value) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+async fn latest_codex_token_usage_from_rollout(
+    path: &Path,
+) -> Result<Option<serde_json::Value>, CallerError> {
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(CallerError::ExternalAgent(format!(
+                "open Codex rollout {}: {}",
+                path.display(),
+                e
+            )));
+        }
+    };
+    let mut lines = BufReader::new(file).lines();
+    let mut latest = None;
+
+    while let Some(line) = lines.next_line().await.map_err(|e| {
+        CallerError::ExternalAgent(format!("read Codex rollout {}: {}", path.display(), e))
+    })? {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if event.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
+            continue;
+        }
+        let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
+        if payload.get("type").and_then(|v| v.as_str()) != Some("token_count") {
+            continue;
+        }
+        if let Some(info) = payload.get("info").filter(|value| !value.is_null()) {
+            latest = Some(info.clone());
+        }
+    }
+
+    Ok(latest)
+}
+
 fn format_goal_response(prefix: &str, response: &serde_json::Value) -> String {
     match response.get("goal") {
         Some(serde_json::Value::Null) | None => "no goal set".to_string(),
@@ -3516,6 +3554,37 @@ impl ExternalAgent for CodexAgent {
         // `turn/interrupt` params without requiring a thread handle.
         *self.active_thread_id.lock().await = Some(thread_id.clone());
 
+        if self.resume_session.is_some() {
+            let rollout_path = match extract_thread_path(&result) {
+                Some(path) => Some(path),
+                None => match self.read_thread_snapshot(&thread_id).await {
+                    Ok(snapshot) => snapshot.rollout_path,
+                    Err(e) => {
+                        eprintln!(
+                            "[codex] Warning: failed to read resumed thread metadata for token usage seed: {}",
+                            e
+                        );
+                        None
+                    }
+                },
+            };
+            if let Some(rollout_path) = rollout_path {
+                match latest_codex_token_usage_from_rollout(&rollout_path).await {
+                    Ok(Some(usage)) => {
+                        *self.latest_token_usage.lock().await = Some(usage);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "[codex] Warning: failed to seed token usage from rollout {}: {}",
+                            rollout_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(AgentThread { thread_id })
     }
 
@@ -4320,6 +4389,59 @@ mod tests {
         assert_eq!(snapshot.completion_tokens, 200);
         assert_eq!(snapshot.cached_tokens, 300);
         assert!((snapshot.usage_pct - (125.0 / 128000.0 * 100.0)).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn codex_rollout_token_usage_seed_reads_latest_non_null_info() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rollout = tmp.path().join("rollout.jsonl");
+        std::fs::write(
+            &rollout,
+            [
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": null
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {"total_tokens": 258400},
+                            "model_context_window": 258400
+                        }
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {"total_tokens": 259545},
+                            "model_context_window": 258400,
+                            "model_hard_context_window": 272000
+                        }
+                    }
+                })
+                .to_string(),
+                "not json".to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let usage = latest_codex_token_usage_from_rollout(&rollout)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(codex_usage_total_tokens(&usage), Some(259545));
+        assert_eq!(codex_usage_context_window(&usage), Some(258400));
+        assert_eq!(codex_usage_hard_context_window(&usage), Some(272000));
     }
 
     #[test]
