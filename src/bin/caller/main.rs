@@ -1342,6 +1342,14 @@ struct ExternalToolOutputState {
     truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManagedContextRewindOnlyPressure {
+    used_tokens: u64,
+    rewind_only_limit: u64,
+    hard_context_window: Option<u64>,
+    status: &'static str,
+}
+
 impl ExternalToolOutputLimiter {
     fn filter(&mut self, item_id: &str, text: String) -> Option<String> {
         if text.is_empty() {
@@ -2107,6 +2115,59 @@ fn external_context_snapshot_usage(
         completion_tokens: 0,
         cached_tokens: 0,
     })
+}
+
+fn managed_context_rewind_only_pressure(
+    snapshot: &external_agent::AgentContextSnapshot,
+) -> Option<ManagedContextRewindOnlyPressure> {
+    let used_tokens = snapshot.token_count?;
+    let rewind_only_limit = snapshot.context_window?;
+    if rewind_only_limit == 0 || used_tokens < rewind_only_limit {
+        return None;
+    }
+    let hard_context_window = snapshot.hard_context_window;
+    let status = if hard_context_window.is_some_and(|hard| hard > 0 && used_tokens >= hard) {
+        "critical"
+    } else {
+        "high"
+    };
+    Some(ManagedContextRewindOnlyPressure {
+        used_tokens,
+        rewind_only_limit,
+        hard_context_window,
+        status,
+    })
+}
+
+fn managed_context_user_kickstart_is_trivial(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "continue" | "resume" | "go on" | "carry on" | "keep going"
+    )
+}
+
+fn managed_context_recovery_kickstart_text(
+    pressure: ManagedContextRewindOnlyPressure,
+    held_user_input: bool,
+) -> String {
+    let hard = pressure
+        .hard_context_window
+        .map(|hard| format!(" hard_limit={hard}"))
+        .unwrap_or_default();
+    let held = if held_user_input {
+        " Intendant is holding the user's follow-up outside Codex history; replay it only after rewind_context succeeds."
+    } else {
+        ""
+    };
+    format!(
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. Call rewind_context now with an exact item/tool-call anchor and a dense carry-forward primer, then stop.{held}\n</managed_context_recovery>",
+        status = pressure.status,
+        used = pressure.used_tokens,
+        limit = pressure.rewind_only_limit,
+        hard = hard,
+        held = held,
+    )
 }
 
 async fn emit_external_context_snapshot_if_changed(
@@ -5382,6 +5443,7 @@ struct FollowUpMessage {
     edit_user_turn_index: Option<u32>,
     edit_user_turn_revision: Option<u32>,
     target_session_id: Option<String>,
+    managed_context_recovery_kickstart: bool,
 }
 
 impl FollowUpMessage {
@@ -5394,6 +5456,7 @@ impl FollowUpMessage {
             edit_user_turn_index: None,
             edit_user_turn_revision: None,
             target_session_id: None,
+            managed_context_recovery_kickstart: false,
         }
     }
 
@@ -5406,6 +5469,7 @@ impl FollowUpMessage {
             edit_user_turn_index: None,
             edit_user_turn_revision: None,
             target_session_id: None,
+            managed_context_recovery_kickstart: false,
         }
     }
 
@@ -5418,6 +5482,7 @@ impl FollowUpMessage {
             edit_user_turn_index: None,
             edit_user_turn_revision: None,
             target_session_id: None,
+            managed_context_recovery_kickstart: false,
         }
     }
 
@@ -5435,6 +5500,7 @@ impl FollowUpMessage {
             edit_user_turn_index: Some(user_turn_index),
             edit_user_turn_revision: Some(user_turn_revision),
             target_session_id: None,
+            managed_context_recovery_kickstart: false,
         }
     }
 
@@ -5445,6 +5511,11 @@ impl FollowUpMessage {
 
     fn with_follow_up_id(mut self, follow_up_id: Option<String>) -> Self {
         self.follow_up_id = follow_up_id;
+        self
+    }
+
+    fn managed_context_recovery_kickstart(mut self) -> Self {
+        self.managed_context_recovery_kickstart = true;
         self
     }
 }
@@ -6830,6 +6901,54 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 71_876);
         assert_eq!(usage.completion_tokens, 0);
         assert!((usage.usage_pct - (71_876.0 / 258_400.0 * 100.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn managed_context_rewind_only_pressure_uses_soft_limit() {
+        let below_soft = external_agent::AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex resolved request payload".to_string(),
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(258_399),
+            context_window: Some(258_400),
+            hard_context_window: Some(272_000),
+            item_count: Some(51),
+            raw: serde_json::json!({}),
+        };
+        assert_eq!(managed_context_rewind_only_pressure(&below_soft), None);
+
+        let at_soft = external_agent::AgentContextSnapshot {
+            token_count: Some(258_400),
+            ..below_soft.clone()
+        };
+        assert_eq!(
+            managed_context_rewind_only_pressure(&at_soft),
+            Some(ManagedContextRewindOnlyPressure {
+                used_tokens: 258_400,
+                rewind_only_limit: 258_400,
+                hard_context_window: Some(272_000),
+                status: "high",
+            })
+        );
+
+        let at_hard = external_agent::AgentContextSnapshot {
+            token_count: Some(272_000),
+            ..below_soft
+        };
+        assert_eq!(
+            managed_context_rewind_only_pressure(&at_hard).map(|pressure| pressure.status),
+            Some("critical")
+        );
+    }
+
+    #[test]
+    fn managed_context_trivial_kickstarts_do_not_hold_user_input() {
+        assert!(managed_context_user_kickstart_is_trivial(" Continue "));
+        assert!(managed_context_user_kickstart_is_trivial("keep going"));
+        assert!(!managed_context_user_kickstart_is_trivial(""));
+        assert!(!managed_context_user_kickstart_is_trivial(
+            "continue, but use the station prototype"
+        ));
     }
 
     #[test]
@@ -13030,6 +13149,8 @@ async fn run_external_agent_mode(
     let mut open_side_threads: HashMap<String, String> = HashMap::new();
     let mut side_rounds: HashMap<String, usize> = HashMap::new();
     let mut side_turn_revisions: HashMap<String, UserTurnRevisionState> = HashMap::new();
+    let mut pending_managed_context_replays: std::collections::VecDeque<FollowUpMessage> =
+        std::collections::VecDeque::new();
     let attach_only_resume = task.trim().is_empty() && resumed_external_session.is_some();
     let mut next_turn = if task.trim().is_empty() {
         None
@@ -13405,6 +13526,7 @@ async fn run_external_agent_mode(
         let edit_user_turn_index = followup.edit_user_turn_index;
         let edit_user_turn_revision = followup.edit_user_turn_revision;
         let target_session_id = followup.target_session_id.clone();
+        let managed_context_recovery_kickstart = followup.managed_context_recovery_kickstart;
 
         if let Some(side_thread_id) = target_session_id
             .as_deref()
@@ -13648,6 +13770,100 @@ async fn run_external_agent_mode(
                 bus.send(AppEvent::LoopError(message));
             }
             continue;
+        }
+
+        if backend == external_agent::AgentBackend::Codex
+            && project::codex_managed_context_enabled(&project.config.agent.codex.managed_context)
+            && !managed_context_recovery_kickstart
+            && edit_user_turn_index.is_none()
+        {
+            match agent.context_snapshot().await {
+                Ok(Some(snapshot)) => {
+                    if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot) {
+                        let drop_original = attachments.is_empty()
+                            && steer_id.is_none()
+                            && managed_context_user_kickstart_is_trivial(&turn_text);
+                        let held_user_input = !drop_original;
+                        if held_user_input {
+                            pending_managed_context_replays.push_back(FollowUpMessage {
+                                text: turn_text,
+                                attachments,
+                                steer_id,
+                                follow_up_id: follow_up_id.clone(),
+                                edit_user_turn_index,
+                                edit_user_turn_revision,
+                                target_session_id,
+                                managed_context_recovery_kickstart: false,
+                            });
+                            emit_follow_up_status(
+                                &bus,
+                                live_session_id.as_deref(),
+                                &follow_up_id,
+                                None,
+                                "queued",
+                                Some(
+                                    "managed context is above the rewind-only threshold; recovering before sending this follow-up",
+                                ),
+                            );
+                        } else {
+                            emit_follow_up_status(
+                                &bus,
+                                live_session_id.as_deref(),
+                                &follow_up_id,
+                                Some(&turn_text),
+                                "queued",
+                                Some(
+                                    "managed context is above the rewind-only threshold; treating this as a recovery kickstart",
+                                ),
+                            );
+                        }
+
+                        let recovery_text =
+                            managed_context_recovery_kickstart_text(pressure, held_user_input);
+                        slog(&session_log, |l| {
+                            l.info(&format!(
+                                "Holding Codex follow-up during managed-context {} pressure ({}/{} tokens); sending recovery kickstart",
+                                pressure.status,
+                                pressure.used_tokens,
+                                pressure.rewind_only_limit
+                            ))
+                        });
+                        bus.send(AppEvent::LogEntry {
+                            session_id: live_session_id.clone(),
+                            level: "info".to_string(),
+                            source: "Intendant".to_string(),
+                            content: format!(
+                                "Managed context is in rewind-only pressure ({}/{} tokens); {}.",
+                                pressure.used_tokens,
+                                pressure.rewind_only_limit,
+                                if held_user_input {
+                                    "holding the user follow-up until recovery succeeds"
+                                } else {
+                                    "using the request as a recovery kickstart"
+                                }
+                            ),
+                            turn: None,
+                        });
+                        let mut recovery_followup = FollowUpMessage::text(recovery_text)
+                            .managed_context_recovery_kickstart();
+                        if !held_user_input {
+                            recovery_followup =
+                                recovery_followup.with_follow_up_id(follow_up_id.clone());
+                        }
+                        next_turn = Some(recovery_followup);
+                        continue 'outer;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    slog(&session_log, |l| {
+                        l.debug(&format!(
+                            "Could not read Codex context snapshot before follow-up gate: {}",
+                            e
+                        ))
+                    });
+                }
+            }
         }
 
         let mut replacement_for_user_turn_index = None;
@@ -14034,6 +14250,16 @@ async fn run_external_agent_mode(
                     turns_in_round,
                     native_message_count: None,
                 });
+                if managed_context_recovery_kickstart {
+                    if let Some(replay) = pending_managed_context_replays.pop_front() {
+                        slog(&session_log, |l| {
+                            l.warn(
+                                "Managed-context recovery kickstart completed without a context rewind; retrying held follow-up behind the pressure gate",
+                            )
+                        });
+                        next_turn = Some(replay);
+                    }
+                }
             }
             DrainOutcome::ContextRewindRequested {
                 request,
@@ -14068,9 +14294,27 @@ async fn run_external_agent_mode(
                 .await
                 {
                     Ok(Some(followup)) => {
-                        next_turn = Some(followup);
+                        if let Some(replay) = pending_managed_context_replays.pop_front() {
+                            slog(&session_log, |l| {
+                                l.info(
+                                    "Managed-context rewind succeeded; replaying held user follow-up instead of automatic resume",
+                                )
+                            });
+                            next_turn = Some(replay);
+                        } else {
+                            next_turn = Some(followup);
+                        }
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if let Some(replay) = pending_managed_context_replays.pop_front() {
+                            slog(&session_log, |l| {
+                                l.info(
+                                    "Managed-context rewind succeeded; replaying held user follow-up",
+                                )
+                            });
+                            next_turn = Some(replay);
+                        }
+                    }
                     Err(message) => {
                         emit_context_rewind_failure(&request, message, &drain_config);
                     }
