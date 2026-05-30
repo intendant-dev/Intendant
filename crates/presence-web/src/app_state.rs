@@ -994,7 +994,7 @@ pub struct AppState {
     /// path.  Live callers pass `None` and wallclock is used as before.
     ///
     /// Set at the top of `handle_event` when the inbound message carries
-    /// a `ts` field; cleared by the guard returned from `begin_replay_ts`.
+    /// a `ts` field; cleared before `handle_event` returns.
     replay_ts: Option<String>,
     event_session_id: Option<String>,
 
@@ -2694,15 +2694,9 @@ impl AppState {
         superseded: bool,
         replacement_for_user_turn_index: Option<u32>,
     ) -> Vec<UiCommand> {
-        // Trim replay timestamps to HH:MM:SS so they render identically to
-        // the old replay path (which truncated via `ts[..8.min(ts.len())]`).
-        let ts = match &self.replay_ts {
-            Some(t) => {
-                let end = 8.min(t.len());
-                t[..end].to_string()
-            }
-            None => current_time_str(),
-        };
+        // Preserve replay timestamps verbatim. The browser owns compact label
+        // formatting; this value also backs the timestamp tooltip.
+        let ts = self.replay_ts.clone().unwrap_or_else(current_time_str);
         let source_str = source_label(source).to_string();
         let is_collapsible = !images.is_empty()
             || content.split('\n').count() > COLLAPSE_LINE_THRESHOLD
@@ -4167,7 +4161,7 @@ mod tests {
             "turn": 1,
             "summary": "hello",
             "source": "worker",
-            "ts": "12:34:56.789",
+            "ts": "2026-05-30T03:29:25.821Z",
         });
         let cmds = s.handle_event(&msg);
         let ts = cmds
@@ -4179,8 +4173,7 @@ mod tests {
                 _ => None,
             })
             .expect("model_response should emit an AddLogEntry for 'hello'");
-        // Trimmed to HH:MM:SS.
-        assert_eq!(ts, "12:34:56");
+        assert_eq!(ts, "2026-05-30T03:29:25.821Z");
         // After the call, replay_ts must be cleared so subsequent live calls
         // revert to wallclock.
         assert!(s.replay_ts.is_none());

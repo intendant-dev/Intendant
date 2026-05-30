@@ -2487,10 +2487,6 @@ fn session_relationships_from_log_dir(session_dir: &Path) -> Vec<serde_json::Val
         .collect()
 }
 
-fn get_session_detail(session_id: &str) -> String {
-    get_session_detail_from_home(&crate::platform::home_dir(), session_id)
-}
-
 fn session_detail_http_status(body: &str) -> &'static str {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return "200 OK";
@@ -4736,10 +4732,6 @@ fn find_codex_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
         .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))
 }
 
-fn external_session_detail(source: &str, session_id: &str) -> Option<String> {
-    external_session_detail_from_home(&crate::platform::home_dir(), source, session_id)
-}
-
 fn external_session_detail_from_home(
     home: &Path,
     source: &str,
@@ -5331,6 +5323,54 @@ fn cached_list_sessions() -> String {
         body: body.clone(),
     });
     body
+}
+
+fn session_ids_filter_from_request(request_line: &str) -> Option<Vec<String>> {
+    query_param(request_line, "ids").map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty() && session_lookup_id_is_safe(id))
+            .map(ToString::to_string)
+            .collect()
+    })
+}
+
+fn session_row_matches_any_id(row: &serde_json::Value, ids: &HashSet<String>) -> bool {
+    if ids.is_empty() {
+        return true;
+    }
+    [
+        "session_id",
+        "resume_id",
+        "backend_session_id",
+        "intendant_session_id",
+    ]
+    .into_iter()
+    .filter_map(|key| row.get(key).and_then(|v| v.as_str()))
+    .any(|id| ids.contains(id))
+}
+
+fn filter_session_list_by_ids(body: &str, ids: &[String]) -> String {
+    if ids.is_empty() {
+        return body.to_string();
+    }
+    let wanted: HashSet<String> = ids.iter().cloned().collect();
+    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(body) else {
+        return body.to_string();
+    };
+    let filtered: Vec<serde_json::Value> = rows
+        .into_iter()
+        .filter(|row| session_row_matches_any_id(row, &wanted))
+        .collect();
+    serde_json::to_string(&filtered).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn cached_list_sessions_for_ids(ids: &[String]) -> String {
+    if ids.is_empty() {
+        return "[]".to_string();
+    }
+    let body = cached_list_sessions();
+    filter_session_list_by_ids(&body, ids)
 }
 
 fn empty_worktree_inventory_response() -> String {
@@ -14068,24 +14108,22 @@ pub fn spawn_web_gateway(
                             // GET /api/session/{id} — session detail
                             let raw_id = rest_parts[0];
                             let session_id = raw_id.split('?').next().unwrap_or(raw_id);
-                            let query = raw_id.split_once('?').map(|(_, q)| q).unwrap_or("");
-                            let source = query
-                                .split('&')
-                                .find_map(|part| {
-                                    let (k, v) = part.split_once('=')?;
-                                    if k == "source" {
-                                        Some(v)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or("intendant");
+                            let source = query_param(request_line, "source")
+                                .unwrap_or_else(|| "intendant".to_string());
                             let body = if !session_lookup_id_is_safe(session_id) {
                                 serde_json::json!({"error": "invalid session id"}).to_string()
                             } else if source == "intendant" {
-                                get_session_detail(session_id)
+                                get_session_detail_from_home(
+                                    &crate::platform::home_dir(),
+                                    session_id,
+                                )
                             } else {
-                                external_session_detail(source, session_id).unwrap_or_else(|| {
+                                external_session_detail_from_home(
+                                    &crate::platform::home_dir(),
+                                    &source,
+                                    session_id,
+                                )
+                                .unwrap_or_else(|| {
                                     serde_json::json!({"error": "session not found"}).to_string()
                                 })
                             };
@@ -14424,7 +14462,13 @@ pub fn spawn_web_gateway(
                         // multi-host Stats tab can fetch sibling
                         // daemons' session lists to populate its "All
                         // Sessions" and "Disk Usage" cards per host.
-                        let body = match tokio::task::spawn_blocking(cached_list_sessions).await {
+                        let ids_filter = session_ids_filter_from_request(request_line);
+                        let body = match tokio::task::spawn_blocking(move || match ids_filter {
+                            Some(ids) => cached_list_sessions_for_ids(&ids),
+                            None => cached_list_sessions(),
+                        })
+                        .await
+                        {
                             Ok(body) => body,
                             Err(e) => serde_json::json!({
                                 "error": format!("session list task failed: {e}")
@@ -19120,6 +19164,51 @@ mod tests {
         assert_eq!(
             ids,
             vec!["recently-changed", "newer-created", "fallback-created"]
+        );
+    }
+
+    #[test]
+    fn filter_session_list_by_ids_matches_session_and_backend_ids() {
+        let body = serde_json::json!([
+            {
+                "session_id": "wrapper-a",
+                "backend_session_id": "backend-a",
+                "intendant_session_id": "intendant-a",
+                "source": "codex"
+            },
+            {
+                "session_id": "standalone-b",
+                "resume_id": "resume-b",
+                "source": "intendant"
+            },
+            {
+                "session_id": "other-c",
+                "source": "codex"
+            }
+        ])
+        .to_string();
+
+        let filtered =
+            filter_session_list_by_ids(&body, &["backend-a".to_string(), "resume-b".to_string()]);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&filtered).unwrap();
+        let ids: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.get("session_id").and_then(|v| v.as_str()))
+            .collect();
+
+        assert_eq!(ids, vec!["wrapper-a", "standalone-b"]);
+    }
+
+    #[test]
+    fn session_ids_filter_from_request_distinguishes_absent_and_empty_filters() {
+        assert!(session_ids_filter_from_request("GET /api/sessions HTTP/1.1").is_none());
+        assert_eq!(
+            session_ids_filter_from_request("GET /api/sessions?ids=ok-id,%2E%2E%2Fbad HTTP/1.1"),
+            Some(vec!["ok-id".to_string()])
+        );
+        assert_eq!(
+            session_ids_filter_from_request("GET /api/sessions?ids=..%2Fbad HTTP/1.1"),
+            Some(Vec::new())
         );
     }
 
