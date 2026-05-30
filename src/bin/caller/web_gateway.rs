@@ -92,9 +92,6 @@ const SESSION_LIST_ROW_CACHE_LIMIT: usize = 8_192;
 const SESSION_LIST_LIMIT: usize = 5_000;
 const SESSION_LIST_RESPONSE_CACHE_TTL_SECS: u64 = 2;
 const SESSION_SOURCE_FLOOR: usize = 100;
-const SESSION_LOG_SEARCH_LIMIT: usize = 150;
-const SESSION_LOG_SEARCH_READ_LIMIT: u64 = 2 * 1024 * 1024;
-const SESSION_LOG_SEARCH_FIELD_CHARS: usize = 8 * 1024;
 const SESSION_LOG_SEARCH_SNIPPETS_PER_SESSION: usize = 3;
 const SESSION_LOG_SEARCH_SNIPPET_CHARS: usize = 220;
 const DELETED_EXTERNAL_SESSIONS_FILE: &str = "deleted_external_sessions.json";
@@ -2581,7 +2578,7 @@ fn session_log_search_from_home_with_projects(
             "source_filter": normalize_session_source_filter(source_filter),
             "searched": 0,
             "truncated": false,
-            "limit": SESSION_LOG_SEARCH_LIMIT,
+            "exhaustive": true,
             "truncated_files": 0,
             "results": [],
         })
@@ -2589,14 +2586,13 @@ fn session_log_search_from_home_with_projects(
     }
 
     let sessions: Vec<serde_json::Value> =
-        serde_json::from_str(&list_sessions_from_home(home)).unwrap_or_else(|_| Vec::new());
+        serde_json::from_str(&list_sessions_for_deep_search_from_home(home))
+            .unwrap_or_else(|_| Vec::new());
     let deleted_external_sessions = read_deleted_external_sessions(home);
     let source_filter = normalize_session_source_filter(source_filter);
     let project_filter = normalize_session_project_filter(project_filter);
     let mut results = Vec::new();
     let mut searched = 0usize;
-    let mut truncated = false;
-    let mut truncated_files = 0usize;
 
     for session in sessions {
         let source = session
@@ -2613,11 +2609,6 @@ fn session_log_search_from_home_with_projects(
         let Some(session_id) = session.get("session_id").and_then(|v| v.as_str()) else {
             continue;
         };
-        if searched >= SESSION_LOG_SEARCH_LIMIT {
-            truncated = true;
-            break;
-        }
-        searched += 1;
 
         let session_path = session
             .get("path")
@@ -2628,7 +2619,7 @@ fn session_log_search_from_home_with_projects(
         else {
             continue;
         };
-        let Some((matches, snippets, file_truncated)) = search_session_log_file(
+        let Some((matches, snippets)) = search_session_log_file(
             &search_path,
             query,
             &terms,
@@ -2637,9 +2628,7 @@ fn session_log_search_from_home_with_projects(
         ) else {
             continue;
         };
-        if file_truncated {
-            truncated_files += 1;
-        }
+        searched += 1;
         if matches == 0 {
             continue;
         }
@@ -2649,6 +2638,7 @@ fn session_log_search_from_home_with_projects(
             "session_id": session_id,
             "matches": matches,
             "snippets": snippets,
+            "session": session,
         }));
     }
 
@@ -2657,9 +2647,9 @@ fn session_log_search_from_home_with_projects(
         "mode": mode.as_str(),
         "source_filter": source_filter,
         "searched": searched,
-        "truncated": truncated,
-        "limit": SESSION_LOG_SEARCH_LIMIT,
-        "truncated_files": truncated_files,
+        "truncated": false,
+        "exhaustive": true,
+        "truncated_files": 0,
         "results": results,
     })
     .to_string()
@@ -2767,7 +2757,7 @@ fn find_gemini_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
             == Some("chats")
     })
     .find(|path| {
-        let Some((contents, _)) = read_text_prefix(path, SESSION_LOG_SEARCH_READ_LIMIT) else {
+        let Ok(contents) = std::fs::read_to_string(path) else {
             return false;
         };
         serde_json::from_str::<serde_json::Value>(&contents)
@@ -2778,29 +2768,26 @@ fn find_gemini_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
     })
 }
 
-fn read_text_prefix(path: &Path, max_bytes: u64) -> Option<(String, bool)> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = Vec::new();
-    let mut limited = file.by_ref().take(max_bytes.saturating_add(1));
-    limited.read_to_end(&mut buf).ok()?;
-    let truncated = buf.len() as u64 > max_bytes;
-    if truncated {
-        buf.truncate(max_bytes as usize);
-    }
-    Some((String::from_utf8_lossy(&buf).to_string(), truncated))
-}
-
 fn search_session_log_file(
     path: &Path,
     query: &str,
     terms: &[String],
     mode: SessionLogSearchMode,
     deleted_external_sessions: &HashSet<(String, String)>,
-) -> Option<(usize, Vec<serde_json::Value>, bool)> {
-    let (contents, truncated) = read_text_prefix(path, SESSION_LOG_SEARCH_READ_LIMIT)?;
-    let (matches, snippets) =
-        search_session_log_text(&contents, query, terms, mode, deleted_external_sessions);
-    Some((matches, snippets, truncated))
+) -> Option<(usize, Vec<serde_json::Value>)> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let candidates = reader
+        .lines()
+        .filter_map(Result::ok)
+        .filter_map(|line| session_log_search_candidate_from_line(&line));
+    Some(search_session_log_candidates(
+        candidates,
+        query,
+        terms,
+        mode,
+        deleted_external_sessions,
+    ))
 }
 
 fn normalize_session_source_filter(source_filter: &str) -> String {
@@ -2866,31 +2853,16 @@ impl SessionLogSearchMode {
     }
 }
 
-fn search_session_log_text(
-    text: &str,
+fn search_session_log_candidates<I>(
+    candidates: I,
     query: &str,
     terms: &[String],
     mode: SessionLogSearchMode,
     deleted_external_sessions: &HashSet<(String, String)>,
-) -> (usize, Vec<serde_json::Value>) {
-    let candidates: Vec<SessionLogSearchCandidate> = text
-        .lines()
-        .filter_map(session_log_search_candidate_from_line)
-        .filter(|candidate| {
-            !session_log_candidate_is_deleted_external_reference(
-                candidate,
-                deleted_external_sessions,
-            )
-        })
-        .collect();
-    if mode == SessionLogSearchMode::AnyKeywordSession
-        && !candidates
-            .iter()
-            .any(|candidate| text_matches_any_session_term(&candidate.text, terms))
-    {
-        return (0, Vec::new());
-    }
-
+) -> (usize, Vec<serde_json::Value>)
+where
+    I: IntoIterator<Item = SessionLogSearchCandidate>,
+{
     let mut matches = 0usize;
     let mut snippets = Vec::new();
     let snippet_needles = if mode == SessionLogSearchMode::ExactPhrase {
@@ -2900,6 +2872,12 @@ fn search_session_log_text(
     };
 
     for candidate in candidates {
+        if session_log_candidate_is_deleted_external_reference(
+            &candidate,
+            deleted_external_sessions,
+        ) {
+            continue;
+        }
         if candidate.text.trim().is_empty()
             || !session_log_candidate_matches(&candidate, query, terms, mode)
         {
@@ -3047,7 +3025,7 @@ fn collect_session_log_search_strings(value: &serde_json::Value, out: &mut Vec<S
             if value.trim().is_empty() {
                 return;
             }
-            out.push(compact_text(value, SESSION_LOG_SEARCH_FIELD_CHARS));
+            out.push(value.to_string());
         }
         serde_json::Value::Array(items) => {
             for item in items {
@@ -4358,6 +4336,10 @@ fn codex_dir(home: &Path) -> PathBuf {
 }
 
 fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
+    list_codex_sessions_with_limit(home, EXTERNAL_SESSION_SCAN_LIMIT)
+}
+
+fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_json::Value> {
     let codex = codex_dir(home);
     let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
     let mut model_by_id: HashMap<String, String> = HashMap::new();
@@ -4397,18 +4379,14 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
         }
     }
 
-    let mut files = collect_recent_files(
-        &codex.join("sessions"),
-        ".jsonl",
-        EXTERNAL_SESSION_SCAN_LIMIT,
-    );
+    let mut files = collect_recent_files(&codex.join("sessions"), ".jsonl", scan_limit);
     files.extend(collect_recent_files(
         &codex.join("archived_sessions"),
         ".jsonl",
-        EXTERNAL_SESSION_SCAN_LIMIT,
+        scan_limit,
     ));
     files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
-    files.truncate(EXTERNAL_SESSION_SCAN_LIMIT);
+    files.truncate(scan_limit);
     let mut summaries = Vec::new();
     for path in files {
         let Some(summary) = codex_session_list_summary_from_file(&path) else {
@@ -4587,11 +4565,11 @@ fn claude_session_list_row_from_file(path: &Path) -> Option<serde_json::Value> {
 }
 
 fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
-    let files = collect_recent_files(
-        &home.join(".claude").join("projects"),
-        ".jsonl",
-        EXTERNAL_SESSION_SCAN_LIMIT,
-    );
+    list_claude_sessions_with_limit(home, EXTERNAL_SESSION_SCAN_LIMIT)
+}
+
+fn list_claude_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_json::Value> {
+    let files = collect_recent_files(&home.join(".claude").join("projects"), ".jsonl", scan_limit);
     let mut rows = Vec::new();
     for path in files {
         if let Some(session) = claude_session_list_row_from_file(&path) {
@@ -4703,14 +4681,14 @@ fn gemini_session_list_row_from_file(
 }
 
 fn list_gemini_sessions(home: &Path) -> Vec<serde_json::Value> {
+    list_gemini_sessions_with_limit(home, EXTERNAL_SESSION_SCAN_LIMIT)
+}
+
+fn list_gemini_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_json::Value> {
     let roots = gemini_project_roots(home);
     let roots_fingerprint =
         file_dependency_fingerprint(&home.join(".gemini").join("projects.json"));
-    let files = collect_recent_files(
-        &home.join(".gemini").join("tmp"),
-        ".json",
-        EXTERNAL_SESSION_SCAN_LIMIT,
-    );
+    let files = collect_recent_files(&home.join(".gemini").join("tmp"), ".json", scan_limit);
     let mut rows = Vec::new();
     for path in files {
         if let Some(session) = gemini_session_list_row_from_file(&path, &roots, &roots_fingerprint)
@@ -6369,11 +6347,32 @@ fn apply_external_context_to_intendant_wrapper(
 }
 
 fn list_sessions_from_home(home_path: &Path) -> String {
+    list_sessions_from_home_impl(home_path, true, EXTERNAL_SESSION_SCAN_LIMIT)
+}
+
+fn list_sessions_for_deep_search_from_home(home_path: &Path) -> String {
+    list_sessions_from_home_impl(home_path, false, usize::MAX)
+}
+
+fn list_sessions_from_home_impl(
+    home_path: &Path,
+    truncate_for_list_view: bool,
+    external_scan_limit: usize,
+) -> String {
     let logs_dir = home_path.join(".intendant").join("logs");
     let mut external_sessions = Vec::new();
-    external_sessions.extend(list_codex_sessions(home_path));
-    external_sessions.extend(list_claude_sessions(home_path));
-    external_sessions.extend(list_gemini_sessions(home_path));
+    external_sessions.extend(list_codex_sessions_with_limit(
+        home_path,
+        external_scan_limit,
+    ));
+    external_sessions.extend(list_claude_sessions_with_limit(
+        home_path,
+        external_scan_limit,
+    ));
+    external_sessions.extend(list_gemini_sessions_with_limit(
+        home_path,
+        external_scan_limit,
+    ));
     let deleted_external_sessions = read_deleted_external_sessions(home_path);
     if !deleted_external_sessions.is_empty() {
         external_sessions.retain(|session| {
@@ -6384,7 +6383,9 @@ fn list_sessions_from_home(home_path: &Path) -> String {
     crate::session_config::apply_overlays_to_sessions(home_path, &mut external_sessions);
     if !logs_dir.is_dir() {
         sort_sessions_newest_first(&mut external_sessions);
-        truncate_sessions_preserving_sources(&mut external_sessions);
+        if truncate_for_list_view {
+            truncate_sessions_preserving_sources(&mut external_sessions);
+        }
         return serde_json::to_string(&external_sessions).unwrap_or_else(|_| "[]".to_string());
     }
     let external_context_by_id = external_session_context_by_id(&external_sessions);
@@ -6439,7 +6440,9 @@ fn list_sessions_from_home(home_path: &Path) -> String {
     sessions.extend(external_sessions);
 
     sort_sessions_newest_first(&mut sessions);
-    truncate_sessions_preserving_sources(&mut sessions);
+    if truncate_for_list_view {
+        truncate_sessions_preserving_sources(&mut sessions);
+    }
 
     serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".to_string())
 }
@@ -17542,6 +17545,114 @@ mod tests {
             .and_then(|v| v.as_array())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn session_log_search_scans_beyond_recent_session_window() {
+        let home = tempfile::tempdir().unwrap();
+        for idx in 0..160 {
+            let session_id = format!("exhaustive-window-{idx:03}");
+            let log_dir = home
+                .path()
+                .join(".intendant")
+                .join("logs")
+                .join(&session_id);
+            std::fs::create_dir_all(&log_dir).unwrap();
+            std::fs::write(
+                log_dir.join("session_meta.json"),
+                serde_json::json!({
+                    "session_id": session_id,
+                    "created_at": format!("2026-05-17T{:02}:{:02}:00Z", 20 + idx / 60, idx % 60),
+                    "updated_at": format!("2026-05-17T{:02}:{:02}:00Z", 20 + idx / 60, idx % 60),
+                    "task": "exhaustive deep search window",
+                    "status": "completed"
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let message = if idx == 0 {
+                "oldest-session-only exhaustive-window-token"
+            } else {
+                "ordinary session log"
+            };
+            std::fs::write(
+                log_dir.join("session.jsonl"),
+                serde_json::json!({
+                    "ts": "2026-05-17T20:45:00",
+                    "event": "info",
+                    "message": message
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "exhaustive-window-token",
+            "all",
+            "exact_phrase",
+        ))
+        .unwrap();
+        assert_eq!(response.get("searched").and_then(|v| v.as_u64()), Some(160));
+        assert_eq!(
+            response.get("truncated").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        let results = response.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("session_id").and_then(|v| v.as_str()),
+            Some("exhaustive-window-000")
+        );
+    }
+
+    #[test]
+    fn session_log_search_scans_full_log_file_and_full_fields() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "exhaustive-full-file-session";
+        let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": session_id,
+                "created_at": "2026-05-17T20:44:00Z",
+                "task": "full file search task",
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut contents = String::new();
+        for _ in 0..50_000 {
+            contents.push_str("{\"event\":\"info\",\"message\":\"prefix filler line\"}\n");
+        }
+        let mut long_field = "x".repeat(10_000);
+        long_field.push_str(" exhaustive-full-field-token");
+        contents.push_str(
+            &serde_json::json!({
+                "ts": "2026-05-17T20:45:00",
+                "event": "info",
+                "message": long_field
+            })
+            .to_string(),
+        );
+        std::fs::write(log_dir.join("session.jsonl"), contents).unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "exhaustive-full-field-token",
+            "all",
+            "exact_phrase",
+        ))
+        .unwrap();
+        let results = response.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("session_id").and_then(|v| v.as_str()),
+            Some(session_id)
+        );
     }
 
     #[test]
