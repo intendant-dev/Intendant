@@ -7724,7 +7724,7 @@ html, body {
                 <div class="sessions-deep-search-row">
                   <div class="sessions-deep-search-title">
                     <span>Log Search</span>
-                    <span>Scans session log content, not just metadata. Large histories can take a while.</span>
+                    <span>Scans every matching session log, including full log files. Large histories can take minutes.</span>
                   </div>
                   <label class="sessions-deep-search-query" for="sessions-deep-search-query">
                     <span>Log query</span>
@@ -7743,7 +7743,7 @@ html, body {
                   <button type="button" class="sessions-deep-search-btn secondary hidden" id="sessions-deep-search-cancel">Cancel</button>
                   <button type="button" class="sessions-deep-search-btn secondary" id="sessions-deep-search-clear">Clear</button>
                 </div>
-                <div class="sessions-search-status">Project narrows the scan before it starts; the remaining controls refine matches after the scan.</div>
+                <div class="sessions-search-status">Project narrows the scan before it starts; the remaining controls refine matches after the exhaustive scan.</div>
                 <div class="sessions-search-status" id="sessions-deep-search-status"></div>
               </div>
               <div class="sessions-toolbar">
@@ -29549,6 +29549,28 @@ function sessionDeepSearchHasMissingMetadata(results = _sessionDeepSearch.result
   return false;
 }
 
+function mergeDeepSearchResultSessions(results = _sessionDeepSearch.results) {
+  if (!results || typeof results.values !== 'function' || results.size === 0) return;
+  const known = new Set((_cachedSessions || []).map(session =>
+    sessionLogSearchKey(session.source || 'intendant', session.session_id)
+  ));
+  const additions = [];
+  for (const hit of results.values()) {
+    if (!hit || typeof hit.session !== 'object' || hit.session === null) continue;
+    const session = { ...hit.session };
+    session.source = session.source || hit.source || 'intendant';
+    session.session_id = session.session_id || hit.session_id;
+    if (!session.session_id) continue;
+    const key = sessionLogSearchKey(session.source || 'intendant', session.session_id);
+    if (known.has(key)) continue;
+    known.add(key);
+    additions.push(session);
+  }
+  if (additions.length) {
+    _cachedSessions = [...additions, ..._cachedSessions];
+  }
+}
+
 function scheduleSessionMetadataRefreshForDeepSearch(token) {
   for (const delay of [0, 2000, 10000]) {
     setTimeout(() => {
@@ -29691,11 +29713,12 @@ function runSessionDeepSearch() {
         truncatedFiles: data.truncated_files || data.skipped_large || 0,
         results,
       };
-      _sessionDeepSearchAbort = null;
-      setSessionDeepSearchLoading(false);
+	      _sessionDeepSearchAbort = null;
+	      setSessionDeepSearchLoading(false);
+      mergeDeepSearchResultSessions(results);
       _refilterSessions();
-      if (results.size > 0) scheduleSessionMetadataRefreshForDeepSearch(token);
-    })
+	      if (results.size > 0) scheduleSessionMetadataRefreshForDeepSearch(token);
+	    })
     .catch(err => {
       if (token !== _sessionDeepSearchToken) return;
       const aborted = err?.name === 'AbortError';
@@ -29782,7 +29805,7 @@ function updateSessionsSearchStatus() {
     const prefix = _sessionDeepSearch.waiting
       ? 'Deep search waiting for the previous search to finish'
       : 'Deep search running';
-    el.textContent = `${prefix}${projectScope} for "${_sessionDeepSearch.query}" (${sessionDeepSearchModeLabel(_sessionDeepSearch.mode)}). This can take a while on large histories.`;
+    el.textContent = `${prefix}${projectScope} for "${_sessionDeepSearch.query}" (${sessionDeepSearchModeLabel(_sessionDeepSearch.mode)}). It is scanning every matching session log and can take a while on large histories.`;
     return;
   }
   if (_sessionDeepSearch.error) {
@@ -29794,12 +29817,9 @@ function updateSessionsSearchStatus() {
     const resultCount = _sessionDeepSearch.results.size;
     const projectScope = sessionDeepSearchProjectScopeText(_sessionDeepSearch.projectFilter);
     const suffix = _sessionDeepSearch.truncated
-      ? ` Search capped at ${_sessionDeepSearch.limit.toLocaleString()} sessions.`
+      ? ' Results were truncated before the exhaustive scan completed.'
       : '';
-    const truncatedFiles = _sessionDeepSearch.truncatedFiles
-      ? ` ${_sessionDeepSearch.truncatedFiles.toLocaleString()} large session log${_sessionDeepSearch.truncatedFiles === 1 ? ' was' : 's were'} scanned with a byte cap.`
-      : '';
-    el.textContent = `Deep search scanned ${_sessionDeepSearch.searched.toLocaleString()} sessions${projectScope} with ${sessionDeepSearchModeLabel(_sessionDeepSearch.mode)}; ${resultCount.toLocaleString()} had log matches.${suffix}${truncatedFiles}`;
+    el.textContent = `Deep search scanned all ${_sessionDeepSearch.searched.toLocaleString()} matching sessions${projectScope} with ${sessionDeepSearchModeLabel(_sessionDeepSearch.mode)}; ${resultCount.toLocaleString()} had log matches.${suffix}`;
   }
 }
 
