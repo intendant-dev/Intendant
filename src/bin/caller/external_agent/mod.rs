@@ -637,6 +637,14 @@ pub trait ExternalAgent: Send + Sync {
         )))
     }
 
+    /// Pause backend-owned autonomous work for a thread without starting a
+    /// user turn. Codex active goals can auto-continue immediately after a
+    /// resume; attach-only control paths use this to keep rehydration passive.
+    async fn pause_autonomous_goal(&mut self, thread_id: &str) -> Result<bool, CallerError> {
+        let _ = thread_id;
+        Ok(false)
+    }
+
     /// Read backend-owned thread metadata. The rollout path is important for
     /// Intendant-owned rewind records: copying it before a rollback preserves a
     /// backout/fork handle without teaching Codex about Intendant's policy.

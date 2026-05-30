@@ -623,6 +623,31 @@ impl CodexAgent {
     ) -> Result<String, CallerError> {
         self.set_goal(params, None, Some(status), None).await
     }
+
+    async fn pause_active_goal_for_thread(&mut self, thread_id: &str) -> Result<bool, CallerError> {
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            return Ok(false);
+        }
+        let params = serde_json::json!({ "threadId": thread_id });
+        let response = self
+            .send_request("thread/goal/get", Some(params))
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/goal/get: {e}")))?;
+        if codex_goal_status(&response) != Some("active") {
+            return Ok(false);
+        }
+
+        let params = serde_json::json!({
+            "threadId": thread_id,
+            "status": "paused",
+        });
+        let _ = self
+            .send_request("thread/goal/set", Some(params))
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/goal/set: {e}")))?;
+        Ok(true)
+    }
 }
 
 const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 4_000;
@@ -704,6 +729,15 @@ fn rollback_anchor_position(
             "rollback anchor position must be before or after, got {raw}"
         ))
     })
+}
+
+fn codex_goal_status(response: &serde_json::Value) -> Option<&str> {
+    response
+        .pointer("/goal/status")
+        .and_then(|v| v.as_str())
+        .or_else(|| response.get("status").and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
 }
 
 fn side_prompt_from_params(params: &serde_json::Value) -> Result<String, CallerError> {
@@ -3758,6 +3792,10 @@ impl ExternalAgent for CodexAgent {
         CodexAgent::dispatch_thread_action(self, op, params).await
     }
 
+    async fn pause_autonomous_goal(&mut self, thread_id: &str) -> Result<bool, CallerError> {
+        self.pause_active_goal_for_thread(thread_id).await
+    }
+
     fn supports_user_message_rewind(&self) -> bool {
         true
     }
@@ -6558,6 +6596,19 @@ mod tests {
         assert!(formatted.contains("status active"), "{}", formatted);
         assert!(formatted.contains("1200 / 200000 tokens"), "{}", formatted);
         assert!(formatted.contains("2m 5s"), "{}", formatted);
+    }
+
+    #[test]
+    fn goal_status_parser_accepts_nested_and_flat_shapes() {
+        assert_eq!(
+            codex_goal_status(&serde_json::json!({"goal": {"status": "active"}})),
+            Some("active")
+        );
+        assert_eq!(
+            codex_goal_status(&serde_json::json!({"status": " paused "})),
+            Some("paused")
+        );
+        assert_eq!(codex_goal_status(&serde_json::json!({})), None);
     }
 
     #[test]

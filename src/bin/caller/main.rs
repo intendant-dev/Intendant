@@ -129,6 +129,15 @@ fn record_external_round_inline(
     slog(session_log, |log| log.round_complete(round, turns_in_round));
 }
 
+fn external_rollback_turn_in_progress(err: &CallerError) -> bool {
+    let CallerError::ExternalAgent(message) = err else {
+        return false;
+    };
+    message
+        .to_ascii_lowercase()
+        .contains("cannot rollback while a turn is in progress")
+}
+
 fn event_targets_session(target: &Option<String>, session_id: &Option<String>) -> bool {
     match target {
         Some(target) => session_id.as_deref() == Some(target.as_str()),
@@ -6663,6 +6672,21 @@ mod tests {
     }
 
     #[test]
+    fn external_rollback_turn_in_progress_matches_codex_rpc_error() {
+        let err = CallerError::ExternalAgent(
+            "thread/rollback: External agent error: JSON-RPC error -32600: Cannot rollback while a turn is in progress"
+                .to_string(),
+        );
+        assert!(external_rollback_turn_in_progress(&err));
+
+        let unrelated = CallerError::ExternalAgent(
+            "thread/rollback: External agent error: JSON-RPC error -32600: thread not found"
+                .to_string(),
+        );
+        assert!(!external_rollback_turn_in_progress(&unrelated));
+    }
+
+    #[test]
     fn side_session_prompt_from_params_accepts_prompt_aliases() {
         assert_eq!(
             side_session_prompt_from_params(&serde_json::json!({ "prompt": "  quick question  " })),
@@ -12942,6 +12966,7 @@ async fn run_external_agent_mode(
     let mut open_side_threads: HashMap<String, String> = HashMap::new();
     let mut side_rounds: HashMap<String, usize> = HashMap::new();
     let mut side_turn_revisions: HashMap<String, UserTurnRevisionState> = HashMap::new();
+    let attach_only_resume = task.trim().is_empty() && resumed_external_session.is_some();
     let mut next_turn = if task.trim().is_empty() {
         None
     } else {
@@ -12974,6 +12999,31 @@ async fn run_external_agent_mode(
     // as new idle follow-ups after the turn completes.
     let mut external_control_rx = bus.subscribe();
     let mut codex_thread_action_dedupe = CodexThreadActionDedupe::default();
+    if backend == external_agent::AgentBackend::Codex && attach_only_resume {
+        match agent.pause_autonomous_goal(&thread.thread_id).await {
+            Ok(true) => {
+                let message =
+                    "Paused active Codex goal while attaching without a new prompt".to_string();
+                slog(&session_log, |l| l.info(&message));
+                bus.send(AppEvent::LogEntry {
+                    session_id: live_session_id.clone(),
+                    level: "info".to_string(),
+                    source: "Codex".to_string(),
+                    content: message,
+                    turn: None,
+                });
+            }
+            Ok(false) => {}
+            Err(e) => {
+                slog(&session_log, |l| {
+                    l.debug(&format!(
+                        "Could not pause Codex goal during attach-only resume: {}",
+                        e
+                    ))
+                });
+            }
+        }
+    }
     if let Some(ready_tx) = ready_for_thread_actions {
         let _ = ready_tx.send(());
     }
@@ -13546,7 +13596,160 @@ async fn run_external_agent_mode(
                 continue;
             }
             let turns_to_drop = round as u32 - user_turn_index + 1;
-            match agent.rollback_turns(turns_to_drop).await {
+            let mut rollback_result = agent.rollback_turns(turns_to_drop).await;
+            if let Err(err) = rollback_result.as_ref() {
+                if backend == external_agent::AgentBackend::Codex
+                    && external_rollback_turn_in_progress(err)
+                {
+                    let message = format!(
+                        "Codex still has a turn in progress; pausing autonomous goal work and waiting before editing user turn {}",
+                        user_turn_index
+                    );
+                    slog(&session_log, |l| l.info(&message));
+                    bus.send(AppEvent::LogEntry {
+                        session_id: live_session_id.clone(),
+                        level: "info".to_string(),
+                        source: "Codex".to_string(),
+                        content: message,
+                        turn: None,
+                    });
+                    if let Err(e) = agent.pause_autonomous_goal(&thread.thread_id).await {
+                        slog(&session_log, |l| {
+                            l.debug(&format!(
+                                "Could not pause Codex goal before edit rollback retry: {}",
+                                e
+                            ))
+                        });
+                    }
+
+                    let mut side_session_state = ExternalSideSessionState {
+                        open_side_threads: &mut open_side_threads,
+                        side_rounds: &mut side_rounds,
+                        side_turn_revisions: &mut side_turn_revisions,
+                    };
+                    match drain_external_agent_events(
+                        &mut agent,
+                        &mut event_rx,
+                        &mut external_control_rx,
+                        &drain_config,
+                        &mut stats,
+                        &mut diff_tracker,
+                        &mut pending_runtime_steers,
+                        &mut codex_thread_action_dedupe,
+                        Some(&mut side_session_state),
+                    )
+                    .await
+                    {
+                        DrainOutcome::TurnCompleted {
+                            message,
+                            turns_in_round,
+                        } => {
+                            stats.rounds = round;
+                            record_external_done_and_round_inline(
+                                &session_log,
+                                persist_model_responses_inline,
+                                live_session_id.as_deref(),
+                                message.as_deref(),
+                                round,
+                                turns_in_round,
+                            );
+                            bus.send(AppEvent::DoneSignal {
+                                session_id: live_session_id.clone(),
+                                message: message.clone(),
+                            });
+                            bus.send(AppEvent::RoundComplete {
+                                session_id: live_session_id.clone(),
+                                round,
+                                turns_in_round,
+                                native_message_count: None,
+                            });
+                        }
+                        DrainOutcome::ContextRewindRequested {
+                            request,
+                            message,
+                            turns_in_round,
+                        } => {
+                            stats.rounds = round;
+                            record_external_done_and_round_inline(
+                                &session_log,
+                                persist_model_responses_inline,
+                                live_session_id.as_deref(),
+                                message.as_deref(),
+                                round,
+                                turns_in_round,
+                            );
+                            bus.send(AppEvent::DoneSignal {
+                                session_id: live_session_id.clone(),
+                                message: message.clone(),
+                            });
+                            bus.send(AppEvent::RoundComplete {
+                                session_id: live_session_id.clone(),
+                                round,
+                                turns_in_round,
+                                native_message_count: None,
+                            });
+                            emit_context_rewind_failure(
+                                &request,
+                                "user edit superseded the pending context rewind".to_string(),
+                                &drain_config,
+                            );
+                        }
+                        DrainOutcome::Interrupted { reason } => {
+                            stats.rounds = round;
+                            slog(&session_log, |l| {
+                                l.info(&format!(
+                                    "External agent interrupted before edit rollback: {}",
+                                    reason
+                                ))
+                            });
+                            record_external_round_inline(
+                                &session_log,
+                                persist_model_responses_inline,
+                                round,
+                                stats.turns,
+                            );
+                            bus.send(AppEvent::RoundComplete {
+                                session_id: live_session_id.clone(),
+                                round,
+                                turns_in_round: stats.turns,
+                                native_message_count: None,
+                            });
+                        }
+                        DrainOutcome::RecoveryRequired {
+                            message,
+                            recovery_hint,
+                            ..
+                        } => {
+                            let message =
+                                recovery_required_message(&message, recovery_hint.as_deref());
+                            slog(&session_log, |l| l.warn(&message));
+                            bus.send(AppEvent::LoopError(message));
+                            continue;
+                        }
+                        DrainOutcome::Terminated { reason, exit_code } => {
+                            let message = format!(
+                                "{} terminated before edit rollback: {} (exit code: {:?})",
+                                agent.name(),
+                                reason,
+                                exit_code
+                            );
+                            slog(&session_log, |l| l.warn(&message));
+                            bus.send(AppEvent::LoopError(message));
+                            continue;
+                        }
+                        DrainOutcome::ChannelClosed => {
+                            let message =
+                                "External agent event channel closed before edit rollback"
+                                    .to_string();
+                            slog(&session_log, |l| l.warn(&message));
+                            bus.send(AppEvent::LoopError(message));
+                            continue;
+                        }
+                    }
+                    rollback_result = agent.rollback_turns(turns_to_drop).await;
+                }
+            }
+            match rollback_result {
                 Ok(()) => {
                     user_turn_revisions.rewind_from_turn(user_turn_index);
                     round = user_turn_index.saturating_sub(1) as usize;
