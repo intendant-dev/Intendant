@@ -13181,6 +13181,7 @@ function resetSessionWindowLog(win) {
   if (!win || !win.log) return;
   win.logHistory = [];
   win.renderStart = 0;
+  win.renderEnd = 0;
   win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
   win.followOutput = true;
   win.pendingOutput = false;
@@ -13556,9 +13557,8 @@ function transferSessionWindowHistory(fromWin, toWin, targetSessionId) {
   const shouldFollow = sessionWindowShouldFollowNextOutput(toWin);
   for (const entry of sourceHistory) {
     if (!entry || seen.has(entry)) continue;
-    retargetSessionWindowLogEntry(entry, targetSessionId);
-    entry.dataset.sessionWindowHistory = '1';
-    targetHistory.push(entry);
+    retargetSessionWindowHistoryItem(entry, targetSessionId);
+    targetHistory.push(prepareSessionWindowHistoryItem(entry));
     seen.add(entry);
   }
   sourceHistory.length = 0;
@@ -14210,6 +14210,34 @@ function cacheSessionWindowMetadata(sessions) {
   persistSessionWindowState();
 }
 
+function sessionWindowMetadataRequestIds() {
+  const ids = new Set();
+  const add = value => {
+    const id = String(value || '').trim();
+    if (id) ids.add(id);
+  };
+  for (const [sid, win] of sessionWindows) {
+    add(sid);
+    const meta = sessionMetadataById.get(sid) || {};
+    add(meta.backendSessionId);
+    add(meta.intendantSessionId);
+    for (const rel of sessionRelationships.values()) {
+      if (rel.parentId === sid || rel.childId === sid) {
+        add(rel.parentId);
+        add(rel.childId);
+      }
+    }
+    if (win?.source && sid) add(sid);
+  }
+  return Array.from(ids);
+}
+
+function sessionWindowMetadataUrl() {
+  const ids = sessionWindowMetadataRequestIds();
+  if (!ids.length) return '/api/sessions';
+  return `/api/sessions?ids=${encodeURIComponent(ids.join(','))}`;
+}
+
 function readPersistedSessionWindowState() {
   try {
     const raw = localStorage.getItem(SESSION_WINDOW_STATE_KEY);
@@ -14336,7 +14364,8 @@ async function restorePersistedSessionWindow(record) {
     });
     if (!win) return;
     setSessionWindowDetached(sid, true, 'restored from browser state');
-    const resp = await authedFetch(`/api/session/${encodeURIComponent(sid)}?source=${encodeURIComponent(source)}`);
+    const params = new URLSearchParams({ source });
+    const resp = await authedFetch(`/api/session/${encodeURIComponent(sid)}?${params.toString()}`);
     const data = await resp.json();
     if (!resp.ok || data?.error) return;
     applySessionRelationshipsFromSession(data);
@@ -14344,26 +14373,21 @@ async function restorePersistedSessionWindow(record) {
     if (!entries.length) return;
 
     resetSessionWindowLog(win);
-    if (logReplayAppendBatch && logReplayAppendBatch.added > 0) flushLogReplayAppendBatch();
-    const previousBatch = logReplayAppendBatch;
-    const wasProcessingLogReplay = processingLogReplay;
-    logReplayAppendBatch = createLogReplayAppendBatch();
-    processingLogReplay = true;
-    try {
-      for (const entry of entries) {
-        renderSessionWindowLogEntryOnly({
-          ...entry,
-          session_id: sid,
-          level: entry.level || 'info',
-          source: entry.source || source,
-          content: entry.content || entry.summary || '',
-        });
-      }
-      flushLogReplayAppendBatch();
-    } finally {
-      logReplayAppendBatch = previousBatch;
-      processingLogReplay = wasProcessingLogReplay;
-    }
+    appendSessionWindowHistoryBatch(
+      win,
+      entries
+        .map(entry => ({
+          record: {
+            ...entry,
+            session_id: sid,
+            level: entry.level || 'info',
+            source: entry.source || source,
+            content: entry.content || entry.summary || '',
+          },
+        }))
+        .filter(item => item.record.content || item.record.kind === 'rollback_marker'),
+      true
+    );
     updateSessionWindow(sid, {
       source,
       source_label: prettyAgentName(source),
@@ -14385,8 +14409,9 @@ function refreshSessionWindowMetadata(delay = 0, options = {}) {
   const run = () => {
     if (!options.force && !shouldPollSessionWindowMetadata()) return null;
     if (sessionMetadataRefreshInFlight) return sessionMetadataRefreshInFlight;
-    sessionMetadataRefreshInFlight = authedFetch('/api/sessions')
-      .then(r => r.ok ? r.json() : Promise.reject(new Error(`/api/sessions returned ${r.status}`)))
+    const url = sessionWindowMetadataUrl();
+    sessionMetadataRefreshInFlight = authedFetch(url)
+      .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
       .then(sessions => cacheSessionWindowMetadata(sessions))
       .catch(() => {})
       .finally(() => {
@@ -15222,14 +15247,121 @@ function sessionWindowLogIsAtBottom(log) {
 
 function sessionWindowShouldFollowNextOutput(win) {
   if (!win || !win.log) return true;
-  return !!win.followOutput || sessionWindowLogIsAtBottom(win.log);
+  return !!win.followOutput || (sessionWindowIsRenderingTail(win) && sessionWindowLogIsAtBottom(win.log));
 }
 
 function ensureSessionWindowHistory(win) {
   if (!win) return [];
   if (!Array.isArray(win.logHistory)) win.logHistory = [];
   if (!Number.isInteger(win.renderStart) || win.renderStart < 0) win.renderStart = 0;
+  if (!Number.isInteger(win.renderEnd) || win.renderEnd < win.renderStart) win.renderEnd = win.renderStart;
   return win.logHistory;
+}
+
+function sessionWindowHistoryNode(item) {
+  return item instanceof Node ? item : null;
+}
+
+function sessionWindowHistoryRecord(item) {
+  if (!item || item instanceof Node) return null;
+  if (item.record && typeof item.record === 'object') return item.record;
+  return typeof item === 'object' ? item : null;
+}
+
+function sessionWindowHistorySessionId(item) {
+  const node = sessionWindowHistoryNode(item);
+  if (node) return node.dataset?.sessionId || '';
+  return String(sessionWindowHistoryRecord(item)?.session_id || '').trim();
+}
+
+function sessionWindowHistoryUserTurnIndex(item) {
+  const node = sessionWindowHistoryNode(item);
+  if (node) return node.dataset?.userTurnIndex || '';
+  return sessionWindowHistoryRecord(item)?.user_turn_index;
+}
+
+function markSessionWindowHistoryItemSuperseded(item) {
+  const node = sessionWindowHistoryNode(item);
+  if (node) {
+    markLogEntrySuperseded(node);
+    return;
+  }
+  const record = sessionWindowHistoryRecord(item);
+  if (record) record.superseded = true;
+}
+
+function prepareSessionWindowHistoryItem(item) {
+  const node = sessionWindowHistoryNode(item);
+  if (node) node.dataset.sessionWindowHistory = '1';
+  return item;
+}
+
+function retargetSessionWindowHistoryItem(item, sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return item;
+  const node = sessionWindowHistoryNode(item);
+  if (node) {
+    retargetSessionWindowLogEntry(node, sid);
+    return item;
+  }
+  const record = sessionWindowHistoryRecord(item);
+  if (record) record.session_id = sid;
+  return item;
+}
+
+function buildSessionWindowLogEntry(c) {
+  if (!c || !c.session_id) return null;
+  const content = c.content || '';
+  if (!content && c.kind !== 'rollback_marker') return null;
+  if (isDiffLog(c)) {
+    const diffText = diffLogContent(c);
+    const parsed = parseUnifiedDiff(diffText);
+    const { entry } = createLogScaffold(c, 'diff-log-entry');
+    const wrap = document.createElement('span');
+    wrap.className = 'log-content diff-log-wrap';
+    const summary = document.createElement('span');
+    summary.className = 'diff-log-summary';
+    summary.innerHTML = diffLogSummaryHtml(parsed);
+    const body = document.createElement('span');
+    body.className = 'diff-log-body';
+    renderDiffLogBody(body, parsed, { sessionId: c.session_id || '' });
+    wrap.appendChild(summary);
+    wrap.appendChild(body);
+    const toggle = document.createElement('span');
+    toggle.className = 'collapse-toggle';
+    toggle.innerHTML = '<span class="arrow">\u25B8 diff</span><span class="arrow-up">\u25BE hide</span>';
+    entry.appendChild(wrap);
+    entry.appendChild(toggle);
+    appendCopyLogEntryButton(entry, diffText);
+    wireDiffLogEntry(entry);
+    return entry;
+  }
+
+  const { entry } = createLogScaffold(c, '');
+  const cnt = document.createElement('span');
+  cnt.className = 'log-content';
+  renderLogContentElement(cnt, c);
+  appendLogStateBadges(cnt, c);
+  entry.appendChild(cnt);
+  appendCopyLogEntryButton(entry, c.content ?? '');
+  appendEditUserMessageButton(entry, c);
+  return entry;
+}
+
+function materializeSessionWindowHistoryItem(win, item, index) {
+  let node = sessionWindowHistoryNode(item);
+  if (!node) {
+    const record = sessionWindowHistoryRecord(item);
+    if (!record) return null;
+    node = buildSessionWindowLogEntry(record);
+  }
+  if (!node) return null;
+  node.dataset.sessionWindowHistory = '1';
+  node.dataset.historyIndex = String(index);
+  if (win?.sessionId && node.dataset?.sessionId && node.dataset.sessionId !== win.sessionId) {
+    retargetSessionWindowLogEntry(node, win.sessionId);
+  }
+  return node;
 }
 
 function sessionWindowTailStart(historyLength) {
@@ -15248,13 +15380,21 @@ function renderSessionWindowRange(win, start) {
   const history = ensureSessionWindowHistory(win);
   if (history.length === 0) {
     win.renderStart = 0;
+    win.renderEnd = 0;
     win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
     scheduleSessionWindowGridFit();
     return;
   }
-  const safeStart = Math.max(0, Math.min(Number(start) || 0, history.length));
+  const safeStart = Math.max(0, Math.min(Number(start) || 0, sessionWindowTailStart(history.length)));
+  const safeEnd = Math.min(history.length, safeStart + SESSION_WINDOW_RENDER_LIMIT);
+  const nodes = [];
+  for (let i = safeStart; i < safeEnd; i++) {
+    const node = materializeSessionWindowHistoryItem(win, history[i], i);
+    if (node) nodes.push(node);
+  }
   win.renderStart = safeStart;
-  win.log.replaceChildren(...history.slice(safeStart));
+  win.renderEnd = safeEnd;
+  win.log.replaceChildren(...nodes);
   scheduleSessionWindowGridFit();
 }
 
@@ -15268,8 +15408,7 @@ function appendSessionWindowHistory(win, entry, shouldFollow) {
   if (!win || !entry) return;
   const history = ensureSessionWindowHistory(win);
   const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
-  entry.dataset.sessionWindowHistory = '1';
-  history.push(entry);
+  history.push(prepareSessionWindowHistoryItem(entry));
   if (shouldFollow || wasRenderingTail) {
     renderSessionWindowTail(win);
   }
@@ -15282,8 +15421,7 @@ function appendSessionWindowHistoryBatch(win, entries, shouldFollow) {
   const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
   for (const entry of entries) {
     if (!entry) continue;
-    entry.dataset.sessionWindowHistory = '1';
-    history.push(entry);
+    history.push(prepareSessionWindowHistoryItem(entry));
   }
   if (shouldFollow || wasRenderingTail) {
     renderSessionWindowTail(win);
@@ -15296,10 +15434,34 @@ function loadOlderSessionWindowEntries(win) {
   const history = ensureSessionWindowHistory(win);
   if (win.renderStart <= 0 || history.length === 0) return false;
   if (win.log.scrollTop > SESSION_WINDOW_TOP_LOAD_THRESHOLD_PX) return false;
-  const previousHeight = win.log.scrollHeight;
-  const previousTop = win.log.scrollTop;
+  const anchorIndex = win.renderStart;
+  const anchor = win.log.querySelector(`[data-history-index="${anchorIndex}"]`);
+  const anchorTop = anchor ? anchor.offsetTop - win.log.scrollTop : 0;
   renderSessionWindowRange(win, Math.max(0, win.renderStart - SESSION_WINDOW_PREPEND_CHUNK));
-  win.log.scrollTop = previousTop + Math.max(0, win.log.scrollHeight - previousHeight);
+  const nextAnchor = win.log.querySelector(`[data-history-index="${anchorIndex}"]`);
+  if (nextAnchor) win.log.scrollTop = Math.max(0, nextAnchor.offsetTop - anchorTop);
+  return true;
+}
+
+function loadNewerSessionWindowEntries(win) {
+  if (!win || !win.log) return false;
+  const history = ensureSessionWindowHistory(win);
+  if (win.renderEnd >= history.length || history.length === 0) return false;
+  if (!sessionWindowLogIsAtBottom(win.log)) return false;
+  const anchorIndex = Math.max(win.renderStart, win.renderEnd - 1);
+  const anchor = win.log.querySelector(`[data-history-index="${anchorIndex}"]`);
+  const anchorBottom = anchor
+    ? anchor.offsetTop + anchor.offsetHeight - win.log.scrollTop
+    : win.log.clientHeight;
+  const nextStart = Math.min(
+    sessionWindowTailStart(history.length),
+    win.renderStart + SESSION_WINDOW_PREPEND_CHUNK
+  );
+  renderSessionWindowRange(win, nextStart);
+  const nextAnchor = win.log.querySelector(`[data-history-index="${anchorIndex}"]`);
+  if (nextAnchor) {
+    win.log.scrollTop = Math.max(0, nextAnchor.offsetTop + nextAnchor.offsetHeight - anchorBottom);
+  }
   return true;
 }
 
@@ -15333,7 +15495,8 @@ function applySessionWindowOutputScroll(win, shouldFollow) {
 function updateSessionWindowFollowFromScroll(win) {
   if (!win || !win.log) return;
   loadOlderSessionWindowEntries(win);
-  if (sessionWindowLogIsAtBottom(win.log)) {
+  loadNewerSessionWindowEntries(win);
+  if (sessionWindowIsRenderingTail(win) && sessionWindowLogIsAtBottom(win.log)) {
     win.followOutput = true;
     win.pendingOutput = false;
   } else {
@@ -16322,6 +16485,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   grid.appendChild(el);
   const startHeaderCollapsed = sessionWindowShouldStartHeaderCollapsed(meta);
   win = {
+    sessionId: sid,
     el,
     log,
     id,
@@ -16347,6 +16511,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     pendingOutput: false,
     logHistory: [],
     renderStart: 0,
+    renderEnd: 0,
     headerCollapsed: startHeaderCollapsed,
   };
   sessionWindows.set(sid, win);
@@ -16932,6 +17097,8 @@ function formatLogTimestampLabel(value) {
   if (!raw) return '';
   const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})/);
   if (match) return `${match[2]}-${match[3]} ${match[4]}:${match[5]}`;
+  const time = raw.match(/^(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?$/);
+  if (time) return `${time[1]}:${time[2]}:${time[3]}`;
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
   return raw.length > 12 ? raw.substring(0, 12) : raw;
 }
@@ -17498,8 +17665,8 @@ function markActivityContextRewind(sessionId, userTurnIndex, turnsRemoved) {
     let inRewoundRegion = false;
     const entries = ensureSessionWindowHistory(win);
     for (const entry of entries) {
-      if (entry.dataset.sessionId !== sid) continue;
-      const turn = Number(entry.dataset.userTurnIndex || 0);
+      if (sessionWindowHistorySessionId(entry) !== sid) continue;
+      const turn = Number(sessionWindowHistoryUserTurnIndex(entry) || 0);
       if (Number.isInteger(turn) && turn > 0) {
         if (!inRewoundRegion && turn >= startTurn && turn <= endTurn) {
           inRewoundRegion = true;
@@ -17507,7 +17674,7 @@ function markActivityContextRewind(sessionId, userTurnIndex, turnsRemoved) {
           break;
         }
       }
-      if (inRewoundRegion) markLogEntrySuperseded(entry);
+      if (inRewoundRegion) markSessionWindowHistoryItemSuperseded(entry);
     }
   }
 }
@@ -17613,40 +17780,8 @@ function renderSessionWindowLogEntryOnly(c) {
   const content = c.content || '';
   if (!content && c.kind !== 'rollback_marker') return;
   inferSessionPhaseFromLog(c);
-  if (isDiffLog(c)) {
-    const diffText = diffLogContent(c);
-    const parsed = parseUnifiedDiff(diffText);
-    const { entry } = createLogScaffold(c, 'diff-log-entry');
-    const wrap = document.createElement('span');
-    wrap.className = 'log-content diff-log-wrap';
-    const summary = document.createElement('span');
-    summary.className = 'diff-log-summary';
-    summary.innerHTML = diffLogSummaryHtml(parsed);
-    const body = document.createElement('span');
-    body.className = 'diff-log-body';
-    renderDiffLogBody(body, parsed, { sessionId: c.session_id || '' });
-    wrap.appendChild(summary);
-    wrap.appendChild(body);
-    const toggle = document.createElement('span');
-    toggle.className = 'collapse-toggle';
-    toggle.innerHTML = '<span class="arrow">\u25B8 diff</span><span class="arrow-up">\u25BE hide</span>';
-    entry.appendChild(wrap);
-    entry.appendChild(toggle);
-    appendCopyLogEntryButton(entry, diffText);
-    wireDiffLogEntry(entry);
-    appendSessionWindowOnlyLogEntry(entry);
-    return;
-  }
-
-  const { entry } = createLogScaffold(c, '');
-  const cnt = document.createElement('span');
-  cnt.className = 'log-content';
-  renderLogContentElement(cnt, c);
-  appendLogStateBadges(cnt, c);
-  entry.appendChild(cnt);
-  appendCopyLogEntryButton(entry, c.content ?? '');
-  appendEditUserMessageButton(entry, c);
-  appendSessionWindowOnlyLogEntry(entry);
+  const entry = buildSessionWindowLogEntry(c);
+  if (entry) appendSessionWindowOnlyLogEntry(entry);
 }
 
 function setContextUsagePct(pct) {
@@ -27746,9 +27881,18 @@ function onSessionEnded(sessionId, reason) {
 
 function resizeTaskTextarea(input) {
   if (!input || input.tagName !== 'TEXTAREA') return;
-  const maxHeight = Number.parseFloat(window.getComputedStyle(input).maxHeight);
+  input._taskResizeFrame = 0;
+  if (!Number.isFinite(input._taskMaxHeightPx)) {
+    input._taskMaxHeightPx = Number.parseFloat(window.getComputedStyle(input).maxHeight);
+  }
+  const maxHeight = input._taskMaxHeightPx;
   input.style.height = 'auto';
   input.style.height = `${Math.min(input.scrollHeight, Number.isFinite(maxHeight) ? maxHeight : 120)}px`;
+}
+
+function scheduleTaskTextareaResize(input) {
+  if (!input || input.tagName !== 'TEXTAREA' || input._taskResizeFrame) return;
+  input._taskResizeFrame = requestAnimationFrame(() => resizeTaskTextarea(input));
 }
 
 function clearTaskTextarea(input) {
@@ -27870,7 +28014,7 @@ document.getElementById('edit-message-cancel')?.addEventListener('click', (e) =>
 function wireTaskTextarea(id, submit) {
   const input = document.getElementById(id);
   if (!input) return;
-  input.addEventListener('input', () => resizeTaskTextarea(input));
+  input.addEventListener('input', () => scheduleTaskTextareaResize(input));
   input.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter' || e.shiftKey || e.isComposing) return;
     e.preventDefault();
