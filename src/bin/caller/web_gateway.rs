@@ -4874,6 +4874,7 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
     let mut entries: Vec<serde_json::Value> = Vec::new();
     let mut user_turn_revisions = ReplayUserTurnRevisionState::default();
     let mut pending_replacement_for_user_turn: Option<u32> = None;
+    let canonical_user_message_events = codex_session_has_user_message_events(path);
     // (count_before, count_after) entry-count boundaries for each rollout item id,
     // so an item-anchor rewind can supersede exactly the entries after the anchor.
     let mut item_entry_boundaries: std::collections::HashMap<String, (usize, usize)> =
@@ -4993,6 +4994,12 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                 );
             }
             if let Some((role, text)) = codex_payload_text(payload) {
+                if canonical_user_message_events && role == "user" {
+                    if let Some(item_id) = response_item_id {
+                        item_entry_boundaries.insert(item_id, (entries_before, entries.len()));
+                    }
+                    continue;
+                }
                 push_codex_transcript_message(
                     &mut entries,
                     &mut user_turn_revisions,
@@ -5011,6 +5018,35 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
     }
 
     Some(entries)
+}
+
+fn codex_session_has_user_message_events(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.contains("\"user_message\"") {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) == Some("event_msg")
+            && obj
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("user_message")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
@@ -20058,6 +20094,58 @@ mod tests {
         assert_eq!(user_entries.len(), 2);
         assert_eq!(user_entries[0]["user_turn_index"], 1);
         assert_eq!(user_entries[1]["user_turn_index"], 2);
+    }
+
+    #[test]
+    fn codex_transcript_uses_user_message_events_as_editable_turns_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-event-user-canonical";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "provider request context" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "human prompt" }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let entries = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("codex session should parse");
+        assert!(!entries
+            .iter()
+            .any(|entry| entry.get("content").and_then(|v| v.as_str())
+                == Some("provider request context")));
+
+        let prompt = entries
+            .iter()
+            .find(|entry| entry.get("content").and_then(|v| v.as_str()) == Some("human prompt"))
+            .expect("event user message should be rendered");
+        assert_eq!(prompt["user_turn_index"], 1);
+        assert_eq!(prompt["user_turn_revision"], 1);
     }
 
     #[test]

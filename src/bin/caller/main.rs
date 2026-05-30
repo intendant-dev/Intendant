@@ -417,6 +417,24 @@ fn emit_user_message_log(
     });
 }
 
+fn emit_external_session_loop_error(
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+    session_id: Option<&str>,
+    source: &str,
+    message: String,
+) {
+    slog(session_log, |l| l.warn(&message));
+    bus.send(AppEvent::LogEntry {
+        session_id: session_id.map(str::to_string),
+        level: "warn".to_string(),
+        source: source.to_string(),
+        content: message.clone(),
+        turn: None,
+    });
+    bus.send(AppEvent::LoopError(message));
+}
+
 fn json_string_field(v: &serde_json::Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(str::to_string)
 }
@@ -460,9 +478,13 @@ fn codex_session_file_id(path: &Path) -> Option<String> {
 }
 
 fn find_codex_session_file_for_main(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let codex = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| home.join(".codex"));
     let mut files = Vec::new();
-    collect_jsonl_files(&home.join(".codex").join("sessions"), &mut files);
-    collect_jsonl_files(&home.join(".codex").join("archived_sessions"), &mut files);
+    collect_jsonl_files(&codex.join("sessions"), &mut files);
+    collect_jsonl_files(&codex.join("archived_sessions"), &mut files);
     files
         .into_iter()
         .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))
@@ -615,6 +637,10 @@ fn is_codex_injected_user_text_for_main(text: &str) -> bool {
 fn codex_user_turn_state_from_history(session_id: &str) -> Option<UserTurnRevisionState> {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
     let path = find_codex_session_file_for_main(&home, session_id)?;
+    codex_user_turn_state_from_history_file(&path)
+}
+
+fn codex_user_turn_state_from_history_file(path: &Path) -> Option<UserTurnRevisionState> {
     let contents = std::fs::read_to_string(path).ok()?;
     let mut saw_user_message_event = false;
     let mut event_state = UserTurnRevisionState::default();
@@ -6936,6 +6962,56 @@ mod tests {
         let stale = state.validate_expected_revision(1, Some(1)).unwrap_err();
         assert!(stale.contains("stale"), "got: {stale}");
         assert!(state.validate_expected_revision(1, Some(2)).is_ok());
+    }
+
+    #[test]
+    fn codex_user_turn_state_prefers_user_message_events_over_provider_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let session_id = "019e37b2-main-event-user-canonical";
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "provider request context 1" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "provider request context 2" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "human prompt" }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let state = codex_user_turn_state_from_history_file(&path).expect("state");
+        assert_eq!(state.active_count(), 1);
+        assert_eq!(state.active_revision(1), Some(1));
+        assert_eq!(state.active_revision(2), None);
     }
 
     #[test]
@@ -13578,8 +13654,13 @@ async fn run_external_agent_mode(
         if let Some(user_turn_index) = edit_user_turn_index {
             if !agent.supports_user_message_rewind() {
                 let message = format!("{} does not support user-message rewind", agent.name());
-                slog(&session_log, |l| l.warn(&message));
-                bus.send(AppEvent::LoopError(message));
+                emit_external_session_loop_error(
+                    &bus,
+                    &session_log,
+                    live_session_id.as_deref(),
+                    agent.name(),
+                    message,
+                );
                 continue;
             }
             if user_turn_index == 0 || user_turn_index as usize > round {
@@ -13593,15 +13674,25 @@ async fn run_external_agent_mode(
                         .unwrap_or_else(|| "unknown".to_string()),
                     round
                 );
-                slog(&session_log, |l| l.warn(&message));
-                bus.send(AppEvent::LoopError(message));
+                emit_external_session_loop_error(
+                    &bus,
+                    &session_log,
+                    live_session_id.as_deref(),
+                    &backend.to_string(),
+                    message,
+                );
                 continue;
             }
             if let Err(message) = user_turn_revisions
                 .validate_expected_revision(user_turn_index, edit_user_turn_revision)
             {
-                slog(&session_log, |l| l.warn(&message));
-                bus.send(AppEvent::LoopError(message));
+                emit_external_session_loop_error(
+                    &bus,
+                    &session_log,
+                    live_session_id.as_deref(),
+                    &backend.to_string(),
+                    message,
+                );
                 continue;
             }
             let turns_to_drop = round as u32 - user_turn_index + 1;
@@ -13798,8 +13889,13 @@ async fn run_external_agent_mode(
                         "Cannot edit user turn {} in {} session: {}",
                         user_turn_index, backend, e
                     );
-                    slog(&session_log, |l| l.warn(&message));
-                    bus.send(AppEvent::LoopError(message));
+                    emit_external_session_loop_error(
+                        &bus,
+                        &session_log,
+                        live_session_id.as_deref(),
+                        &backend.to_string(),
+                        message,
+                    );
                     continue;
                 }
             }
