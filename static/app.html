@@ -958,12 +958,20 @@ html, body {
 .context-toolbar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 8px 12px;
   background: var(--mantle);
   border-bottom: 1px solid var(--surface0);
   flex-shrink: 0;
   overflow-x: auto;
+}
+.context-toolbar-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 280px;
 }
 .context-title {
   color: var(--text);
@@ -987,9 +995,222 @@ html, body {
   color: var(--overlay2);
   font-weight: 500;
 }
-.context-raw {
-  flex: 1;
+.context-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.context-mode-btn,
+.context-focus-btn,
+.context-hotspot-btn {
+  appearance: none;
+  border: 1px solid var(--surface1);
+  background: var(--surface0);
+  color: var(--subtext0);
+  border-radius: 4px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.2;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+.context-mode-btn:hover,
+.context-focus-btn:hover,
+.context-hotspot-btn:hover {
+  border-color: var(--blue);
+  color: var(--text);
+}
+.context-mode-btn.active {
+  background: color-mix(in srgb, var(--blue) 26%, var(--surface0));
+  border-color: var(--blue);
+  color: var(--text);
+}
+.context-replay-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  background: #11111a;
+  border-bottom: 1px solid var(--surface0);
+  flex-shrink: 0;
+}
+.context-replay-range {
+  flex: 1 1 240px;
+  min-width: 180px;
+  accent-color: var(--blue);
+}
+.context-replay-label {
+  color: var(--subtext1);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.context-body {
+  flex: 1 1 auto;
   min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(270px, 0.75fr);
+  border-bottom: 1px solid var(--surface0);
+  overflow: hidden;
+}
+.context-scene-wrap {
+  position: relative;
+  min-height: 260px;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 18% 20%, rgba(137, 180, 250, 0.18), transparent 30%),
+    radial-gradient(circle at 84% 78%, rgba(166, 227, 161, 0.12), transparent 28%),
+    linear-gradient(145deg, #101018 0%, #181825 62%, #11111a 100%);
+}
+#context-scene {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+}
+#context-scene.dragging { cursor: grabbing; }
+.context-scene-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--overlay1);
+  font-size: 12px;
+  pointer-events: none;
+}
+.context-scene-overlay {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  top: 10px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  pointer-events: none;
+}
+.context-scene-caption {
+  color: var(--subtext1);
+  font-size: 11px;
+  line-height: 1.35;
+  max-width: 440px;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.45);
+}
+.context-legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 520px;
+}
+.context-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--subtext1);
+  font-size: 10px;
+  background: rgba(17, 17, 26, 0.7);
+  border: 1px solid rgba(108, 112, 134, 0.45);
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+.context-legend-swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  display: inline-block;
+}
+.context-inspector {
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid var(--surface0);
+  background: var(--mantle);
+  display: flex;
+  flex-direction: column;
+}
+.context-inspector-header {
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--surface0);
+}
+.context-inspector-title {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.context-inspector-subtitle {
+  color: var(--subtext0);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.context-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--surface0);
+}
+.context-detail-stat {
+  min-width: 0;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  padding: 6px 7px;
+}
+.context-detail-stat strong {
+  display: block;
+  color: var(--overlay2);
+  font-size: 10px;
+  font-weight: 500;
+  margin-bottom: 2px;
+}
+.context-detail-stat span {
+  color: var(--text);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.context-detail-preview {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  color: var(--subtext1);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  border-bottom: 1px solid var(--surface0);
+}
+.context-hotspots {
+  flex: 0 0 auto;
+  padding: 10px 12px 12px;
+}
+.context-hotspots-title {
+  color: var(--overlay2);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0;
+  margin-bottom: 6px;
+}
+.context-hotspots-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.context-hotspot-btn {
+  max-width: 100%;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.context-raw {
+  flex: 0 0 28%;
+  min-height: 0;
+  max-height: 38%;
   margin: 0;
   padding: 14px 16px;
   overflow: auto;
@@ -6601,6 +6822,11 @@ html, body {
     align-items: flex-start;
     overflow-x: hidden;
   }
+  .context-toolbar-main {
+    flex-wrap: wrap;
+    min-width: 0;
+    width: 100%;
+  }
   .context-title {
     flex: 1 1 100%;
   }
@@ -6608,6 +6834,41 @@ html, body {
     max-width: 100%;
     white-space: normal;
     overflow-wrap: anywhere;
+  }
+  .context-controls {
+    width: 100%;
+    margin-left: 0;
+    flex-wrap: wrap;
+  }
+  .context-replay-strip {
+    flex-wrap: wrap;
+  }
+  .context-replay-range {
+    flex-basis: 100%;
+    min-width: 0;
+  }
+  .context-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(200px, 38vh) minmax(200px, auto);
+    overflow: auto;
+  }
+  .context-scene-wrap {
+    min-height: 200px;
+  }
+  .context-scene-overlay {
+    flex-direction: column;
+  }
+  .context-legend {
+    justify-content: flex-start;
+  }
+  .context-inspector {
+    border-left: none;
+    border-top: 1px solid var(--surface0);
+  }
+  .context-raw {
+    flex-basis: 20%;
+    max-height: none;
+    min-height: 104px;
   }
   .verbosity-select { margin-left: 0; }
   .log-entry { padding: 1px 8px; }
@@ -6969,12 +7230,50 @@ html, body {
         <div class="subtab-pane" id="activity-context-pane">
           <div class="context-pane">
             <div class="context-toolbar">
-              <span class="context-title" id="context-title">Context</span>
-              <span class="context-meta"><strong>Source</strong><span id="context-source">--</span></span>
-              <span class="context-meta"><strong>Turn</strong><span id="context-turn">--</span></span>
-              <span class="context-meta"><strong>Items</strong><span id="context-items">--</span></span>
-              <span class="context-meta"><strong>Tokens</strong><span id="context-tokens">--</span></span>
-              <span class="context-meta"><strong>Format</strong><span id="context-format">--</span></span>
+              <div class="context-toolbar-main">
+                <span class="context-title" id="context-title">Context</span>
+                <span class="context-meta"><strong>Source</strong><span id="context-source">--</span></span>
+                <span class="context-meta"><strong>Turn</strong><span id="context-turn">--</span></span>
+                <span class="context-meta"><strong>Items</strong><span id="context-items">--</span></span>
+                <span class="context-meta"><strong>Tokens</strong><span id="context-tokens">--</span></span>
+                <span class="context-meta"><strong>Format</strong><span id="context-format">--</span></span>
+              </div>
+              <div class="context-controls">
+                <button class="context-mode-btn active" id="context-live-btn" type="button">Live</button>
+                <button class="context-mode-btn" id="context-replay-btn" type="button">Replay</button>
+                <button class="context-focus-btn" id="context-reset-view-btn" type="button">Reset view</button>
+              </div>
+            </div>
+            <div class="context-replay-strip">
+              <input class="context-replay-range" id="context-replay-range" type="range" min="0" max="0" value="0" step="1">
+              <span class="context-replay-label" id="context-replay-label">No snapshots</span>
+            </div>
+            <div class="context-body">
+              <div class="context-scene-wrap">
+                <canvas id="context-scene" aria-label="3D context visualization"></canvas>
+                <div class="context-scene-empty" id="context-scene-empty">No context snapshot yet</div>
+                <div class="context-scene-overlay">
+                  <div class="context-scene-caption" id="context-scene-caption">Semantic token mass by category, sequence, and replay time.</div>
+                  <div class="context-legend" id="context-legend"></div>
+                </div>
+              </div>
+              <aside class="context-inspector">
+                <div class="context-inspector-header">
+                  <div class="context-inspector-title" id="context-detail-title">No segment selected</div>
+                  <div class="context-inspector-subtitle" id="context-detail-subtitle">No context segment focused.</div>
+                </div>
+                <div class="context-detail-grid">
+                  <div class="context-detail-stat"><strong>Share</strong><span id="context-detail-share">--</span></div>
+                  <div class="context-detail-stat"><strong>Estimate</strong><span id="context-detail-estimate">--</span></div>
+                  <div class="context-detail-stat"><strong>Category</strong><span id="context-detail-category">--</span></div>
+                  <div class="context-detail-stat"><strong>Path</strong><span id="context-detail-path">--</span></div>
+                </div>
+                <pre class="context-detail-preview" id="context-detail-preview">Large context consumers appear here with a short preview.</pre>
+                <div class="context-hotspots">
+                  <div class="context-hotspots-title">Largest context consumers</div>
+                  <div class="context-hotspots-list" id="context-hotspots-list"></div>
+                </div>
+              </aside>
             </div>
             <pre class="context-raw" id="context-raw">No context snapshot yet</pre>
           </div>
@@ -8519,6 +8818,7 @@ html, body {
 'use strict';
 
 import init, { PresenceWeb } from '/wasm-web/presence_web.js';
+import * as THREE from '/three.module.min.js';
 
 // ── Federation auth ──
 //
@@ -9216,8 +9516,7 @@ async function main() {
         resetChangesPane();
         const snapshots = d.entries
           .filter(entry => entry && entry.event === 'context_snapshot');
-        const latest = snapshots.length ? snapshots[snapshots.length - 1] : null;
-        if (latest) handleContextSnapshot(latest);
+        handleContextReplaySnapshots(snapshots);
         const filtered = {
           ...d,
           entries: d.entries.filter(entry => !entry || entry.event !== 'context_snapshot'),
@@ -22661,6 +22960,59 @@ function switchTab(tabId) {
 let activeActivitySubtab = 'log';
 let latestContextSnapshot = null;
 const contextSnapshotsBySession = new Map();
+const contextSnapshotTimelinesBySession = new Map();
+const contextReplayIndexBySession = new Map();
+let contextReplayMode = 'live';
+let contextSelectedPartId = null;
+let contextSnapshotSeq = 1;
+let contextLastAnalysis = null;
+let contextListenersWired = false;
+
+const CONTEXT_GLOBAL_SESSION = '__global__';
+const CONTEXT_CATEGORY_ORDER = [
+  'instructions',
+  'user',
+  'assistant',
+  'tool_call',
+  'tool_output',
+  'reasoning',
+  'media',
+  'schema',
+  'config',
+  'other',
+];
+const CONTEXT_CATEGORY_DEFS = {
+  instructions: { label: 'Instructions', color: '#89b4fa' },
+  user: { label: 'User', color: '#a6e3a1' },
+  assistant: { label: 'Assistant', color: '#cba6f7' },
+  tool_call: { label: 'Tool calls', color: '#f9e2af' },
+  tool_output: { label: 'Tool output', color: '#fab387' },
+  reasoning: { label: 'Reasoning', color: '#f5c2e7' },
+  media: { label: 'Media', color: '#94e2d5' },
+  schema: { label: 'Tool schema', color: '#74c7ec' },
+  config: { label: 'Request config', color: '#b4befe' },
+  other: { label: 'Other', color: '#bac2de' },
+};
+
+const contextViz = {
+  canvas: null,
+  renderer: null,
+  scene: null,
+  camera: null,
+  root: null,
+  meshes: [],
+  raycaster: null,
+  pointer: null,
+  resizeObserver: null,
+  raf: null,
+  dragging: false,
+  dragMoved: false,
+  dragX: 0,
+  dragY: 0,
+  rotationX: -0.22,
+  rotationY: -0.48,
+  zoom: 38,
+};
 
 function contextValueText(value) {
   if (value === null || value === undefined) return '--';
@@ -22704,19 +23056,802 @@ function highlightJson(jsonText) {
   return html;
 }
 
-function handleContextSnapshot(snapshot) {
+function contextSessionKey(snapshot) {
   const sid = snapshot && String(snapshot.session_id || '').trim();
-  if (sid) {
-    contextSnapshotsBySession.set(sid, snapshot);
-  } else {
-    latestContextSnapshot = snapshot;
+  return sid || CONTEXT_GLOBAL_SESSION;
+}
+
+function contextSnapshotFingerprint(snapshot) {
+  const raw = Object.prototype.hasOwnProperty.call(snapshot || {}, 'raw') ? snapshot.raw : snapshot;
+  let rawSize = 0;
+  try {
+    rawSize = JSON.stringify(raw).length;
+  } catch (_) {
+    rawSize = String(raw || '').length;
   }
+  return [
+    contextSessionKey(snapshot),
+    snapshot?.ts || '',
+    snapshot?.turn ?? '',
+    snapshot?.label || '',
+    snapshot?.format || '',
+    snapshot?.token_count ?? '',
+    snapshot?.item_count ?? '',
+    rawSize,
+  ].join('|');
+}
+
+function normalizeContextSnapshot(snapshot) {
+  const copy = { ...(snapshot || {}) };
+  if (!copy.ts) copy.ts = new Date().toISOString();
+  copy.__context_seq = contextSnapshotSeq++;
+  copy.__context_key = contextSnapshotFingerprint(copy);
+  return copy;
+}
+
+function resetContextSnapshotState() {
+  latestContextSnapshot = null;
+  contextSnapshotsBySession.clear();
+  contextSnapshotTimelinesBySession.clear();
+  contextReplayIndexBySession.clear();
+  contextSelectedPartId = null;
+  contextLastAnalysis = null;
+}
+
+function storeContextSnapshot(snapshot) {
+  if (!snapshot) return null;
+  const normalized = normalizeContextSnapshot(snapshot);
+  const sid = contextSessionKey(normalized);
+  let timeline = contextSnapshotTimelinesBySession.get(sid);
+  if (!timeline) {
+    timeline = [];
+    contextSnapshotTimelinesBySession.set(sid, timeline);
+  }
+  const duplicate = timeline.some(existing => existing.__context_key === normalized.__context_key);
+  if (!duplicate) timeline.push(normalized);
+  if (sid === CONTEXT_GLOBAL_SESSION) {
+    latestContextSnapshot = normalized;
+  } else {
+    contextSnapshotsBySession.set(sid, normalized);
+  }
+  if (!latestContextSnapshot || normalized.__context_seq >= (latestContextSnapshot.__context_seq || 0)) {
+    latestContextSnapshot = normalized;
+  }
+  return normalized;
+}
+
+function handleContextReplaySnapshots(snapshots) {
+  resetContextSnapshotState();
+  for (const snapshot of snapshots || []) storeContextSnapshot(snapshot);
+  renderContextPane();
+}
+
+function contextTimelineForForegroundSession() {
+  const sid = resolvePromptTargetSessionId();
+  if (sid && contextSnapshotTimelinesBySession.has(sid)) {
+    return { key: sid, timeline: contextSnapshotTimelinesBySession.get(sid) || [] };
+  }
+  if (sid && contextSnapshotTimelinesBySession.size === 1) {
+    const first = contextSnapshotTimelinesBySession.entries().next().value;
+    return { key: first[0], timeline: first[1] || [] };
+  }
+  if (sid && contextSnapshotTimelinesBySession.size > 0) {
+    return { key: sid, timeline: [] };
+  }
+  if (latestContextSnapshot) {
+    const key = contextSessionKey(latestContextSnapshot);
+    return { key, timeline: contextSnapshotTimelinesBySession.get(key) || [] };
+  }
+  if (contextSnapshotTimelinesBySession.size === 1) {
+    const first = contextSnapshotTimelinesBySession.entries().next().value;
+    return { key: first[0], timeline: first[1] || [] };
+  }
+  return { key: CONTEXT_GLOBAL_SESSION, timeline: [] };
+}
+
+function formatContextTimestamp(ts) {
+  if (!ts) return '--';
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return String(ts);
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function contextRawValue(snapshot) {
+  return snapshot && Object.prototype.hasOwnProperty.call(snapshot, 'raw') ? snapshot.raw : snapshot;
+}
+
+function contextPreview(value, limit = 1600) {
+  let text = '';
+  if (typeof value === 'string') {
+    text = value;
+  } else {
+    try {
+      text = JSON.stringify(value, null, 2);
+    } catch (_) {
+      text = String(value ?? '');
+    }
+  }
+  text = text.replace(/\s+\n/g, '\n').trim();
+  if (text.length > limit) return text.slice(0, limit - 1) + '...';
+  return text;
+}
+
+function contextStringSize(value) {
+  if (value === null || value === undefined) return 0;
+  if (typeof value === 'string') return value.length;
+  try {
+    return JSON.stringify(value).length;
+  } catch (_) {
+    return String(value).length;
+  }
+}
+
+function contextEstimateTokens(value) {
+  const chars = contextStringSize(value);
+  if (!chars) return 1;
+  return Math.max(1, Math.ceil(chars / 4));
+}
+
+function contextFindFirstText(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = contextFindFirstText(item);
+      if (found) return found;
+    }
+    return '';
+  }
+  if (typeof value === 'object') {
+    for (const key of ['text', 'input_text', 'output_text', 'summary', 'content', 'output', 'arguments']) {
+      const candidate = value[key];
+      if (typeof candidate === 'string' && candidate.trim()) return candidate;
+    }
+    for (const key of ['parts', 'content']) {
+      const found = contextFindFirstText(value[key]);
+      if (found) return found;
+    }
+  }
+  return '';
+}
+
+function contextHasMedia(value) {
+  if (!value) return false;
+  if (Array.isArray(value)) return value.some(contextHasMedia);
+  if (typeof value !== 'object') return false;
+  const type = String(value.type || value.mime_type || value.mimeType || '').toLowerCase();
+  if (/(image|audio|video|file)/.test(type)) return true;
+  if (value.image_url || value.input_image || value.inline_data || value.inlineData || value.media) return true;
+  return Object.values(value).some(v => typeof v === 'object' && contextHasMedia(v));
+}
+
+function contextNormalizeCategory(category) {
+  return CONTEXT_CATEGORY_DEFS[category] ? category : 'other';
+}
+
+function contextAddPart(parts, category, title, subtitle, value, path, meta = {}) {
+  const normalizedCategory = contextNormalizeCategory(category);
+  const preview = contextPreview(value);
+  const cleanTitle = String(title || CONTEXT_CATEGORY_DEFS[normalizedCategory].label || 'Context item').trim();
+  parts.push({
+    id: `part-${parts.length}`,
+    index: parts.length,
+    category: normalizedCategory,
+    title: cleanTitle || 'Context item',
+    subtitle: String(subtitle || '').trim(),
+    path,
+    value,
+    preview,
+    estimatedTokens: contextEstimateTokens(value),
+    chars: contextStringSize(value),
+    meta,
+  });
+}
+
+function contextToolName(tool, fallbackIndex) {
+  return tool?.function?.name || tool?.name || tool?.tool?.name || `tool ${fallbackIndex + 1}`;
+}
+
+function contextMessageCategory(item) {
+  const role = String(item?.role || item?.speaker || '').toLowerCase();
+  const type = String(item?.type || item?.kind || '').toLowerCase();
+  if (type.includes('reasoning') || type.includes('thinking')) return 'reasoning';
+  if (type.includes('function_call_output') || type === 'tool_result' || type === 'functionresponse') return 'tool_output';
+  if (type.includes('function_call') || type === 'tool_use' || type === 'functioncall') return 'tool_call';
+  if (role === 'system' || role === 'developer') return 'instructions';
+  if (role === 'user' || role === 'human') return contextHasMedia(item) ? 'media' : 'user';
+  if (role === 'assistant' || role === 'model') return contextHasMedia(item) ? 'media' : 'assistant';
+  if (role === 'tool') return 'tool_output';
+  if (contextHasMedia(item)) return 'media';
+  return 'other';
+}
+
+function contextMessageTitle(item, index) {
+  const role = String(item?.role || '').trim();
+  const type = String(item?.type || item?.kind || '').trim();
+  if (item?.name) return `${item.name} ${type || 'item'}`;
+  if (item?.function?.name) return `${item.function.name} ${type || 'tool'}`;
+  if (role && type) return `${role} ${type}`;
+  if (role) return `${role} message`;
+  if (type) return type.replace(/_/g, ' ');
+  return `item ${index + 1}`;
+}
+
+function contextAddMessagePart(parts, item, index, path) {
+  const category = contextMessageCategory(item);
+  const title = contextMessageTitle(item, index);
+  const subtitle = contextFindFirstText(item).slice(0, 180);
+  contextAddPart(parts, category, title, subtitle, item, path, {
+    role: item?.role,
+    type: item?.type || item?.kind,
+  });
+}
+
+function contextAddRequestConfig(parts, raw, consumedKeys) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+  const config = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (consumedKeys.has(key)) continue;
+    if (value === null || value === undefined) continue;
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      config[key] = value;
+    } else if (key === 'reasoning' || key === 'metadata' || key === 'include' || key === 'tool_choice') {
+      config[key] = value;
+    }
+  }
+  if (Object.keys(config).length) {
+    contextAddPart(parts, 'config', 'request configuration', 'Model, reasoning, cache, and request knobs', config, '$.config');
+  }
+}
+
+function analyzeContextSnapshot(snapshot) {
+  const raw = contextRawValue(snapshot);
+  const parts = [];
+  const consumedKeys = new Set();
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const key of ['instructions', 'system', 'system_instruction', 'developer', 'developer_message']) {
+      if (raw[key]) {
+        consumedKeys.add(key);
+        contextAddPart(parts, 'instructions', key.replace(/_/g, ' '), contextFindFirstText(raw[key]).slice(0, 180), raw[key], `$.${key}`);
+      }
+    }
+    if (Array.isArray(raw.tools)) {
+      consumedKeys.add('tools');
+      raw.tools.forEach((tool, index) => {
+        contextAddPart(parts, 'schema', `tool schema: ${contextToolName(tool, index)}`, contextFindFirstText(tool).slice(0, 160), tool, `$.tools[${index}]`);
+      });
+    }
+    if (Array.isArray(raw.input)) {
+      consumedKeys.add('input');
+      raw.input.forEach((item, index) => contextAddMessagePart(parts, item, index, `$.input[${index}]`));
+    }
+    if (Array.isArray(raw.messages)) {
+      consumedKeys.add('messages');
+      raw.messages.forEach((item, index) => contextAddMessagePart(parts, item, index, `$.messages[${index}]`));
+    }
+    if (Array.isArray(raw.contents)) {
+      consumedKeys.add('contents');
+      raw.contents.forEach((item, index) => contextAddMessagePart(parts, item, index, `$.contents[${index}]`));
+    }
+    if (Array.isArray(raw.history)) {
+      consumedKeys.add('history');
+      raw.history.forEach((item, index) => contextAddMessagePart(parts, item, index, `$.history[${index}]`));
+    }
+    contextAddRequestConfig(parts, raw, consumedKeys);
+  } else if (Array.isArray(raw)) {
+    raw.forEach((item, index) => contextAddMessagePart(parts, item, index, `$[${index}]`));
+  }
+  if (!parts.length && raw !== undefined) {
+    contextAddPart(parts, 'other', 'raw context payload', 'Unrecognized context shape', raw, '$');
+  }
+
+  const estimateTotal = parts.reduce((sum, part) => sum + part.estimatedTokens, 0);
+  const exactTotal = Number(snapshot?.token_count || 0);
+  const totalTokens = exactTotal > 0 ? exactTotal : estimateTotal;
+  const scale = exactTotal > 0 && estimateTotal > 0 ? exactTotal / estimateTotal : 1;
+  for (const part of parts) {
+    part.tokens = Math.max(1, Math.round(part.estimatedTokens * scale));
+    part.share = totalTokens > 0 ? part.tokens / totalTokens : 0;
+  }
+  const byCategory = new Map();
+  for (const part of parts) {
+    const current = byCategory.get(part.category) || { tokens: 0, count: 0 };
+    current.tokens += part.tokens;
+    current.count += 1;
+    byCategory.set(part.category, current);
+  }
+  return {
+    snapshot,
+    raw,
+    parts,
+    byCategory,
+    totalTokens,
+    estimateTotal,
+    exactTotal,
+    effectiveWindow: Number(snapshot?.effective_context_window || snapshot?.context_window || 0),
+    hardWindow: Number(snapshot?.hard_context_window || snapshot?.hardContextWindow || 0),
+  };
+}
+
+function renderContextLegend(analysis) {
+  const host = document.getElementById('context-legend');
+  if (!host) return;
+  host.innerHTML = '';
+  if (!analysis || !analysis.parts.length) return;
+  const categories = [...analysis.byCategory.keys()].sort((a, b) => CONTEXT_CATEGORY_ORDER.indexOf(a) - CONTEXT_CATEGORY_ORDER.indexOf(b));
+  for (const category of categories) {
+    const def = CONTEXT_CATEGORY_DEFS[category] || CONTEXT_CATEGORY_DEFS.other;
+    const item = document.createElement('span');
+    item.className = 'context-legend-item';
+    const swatch = document.createElement('span');
+    swatch.className = 'context-legend-swatch';
+    swatch.style.background = def.color;
+    const label = document.createElement('span');
+    const stats = analysis.byCategory.get(category);
+    label.textContent = `${def.label} ${Math.round((stats.tokens / Math.max(1, analysis.totalTokens)) * 100)}%`;
+    item.append(swatch, label);
+    host.appendChild(item);
+  }
+}
+
+function renderContextDetail(analysis, part) {
+  const set = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = contextValueText(value);
+  };
+  if (!analysis || !analysis.parts.length) {
+    set('context-detail-title', 'No segment selected');
+    set('context-detail-subtitle', 'Context snapshots will appear here after the worker sends a model request.');
+    set('context-detail-share', '--');
+    set('context-detail-estimate', '--');
+    set('context-detail-category', '--');
+    set('context-detail-path', '--');
+    set('context-detail-preview', 'Large context consumers appear here with a short preview.');
+    return;
+  }
+  if (!part) {
+    const categories = [...analysis.byCategory.entries()]
+      .sort((a, b) => b[1].tokens - a[1].tokens)
+      .map(([category, stats]) => `${CONTEXT_CATEGORY_DEFS[category]?.label || category}: ${Math.round((stats.tokens / Math.max(1, analysis.totalTokens)) * 100)}%`)
+      .join(' | ');
+    set('context-detail-title', 'Context overview');
+    set('context-detail-subtitle', `${analysis.parts.length.toLocaleString()} segments across ${analysis.byCategory.size} categories. ${categories}`);
+    set('context-detail-share', '100%');
+    set('context-detail-estimate', `${analysis.totalTokens.toLocaleString()} tokens`);
+    set('context-detail-category', 'all');
+    set('context-detail-path', '$');
+    set('context-detail-preview', 'Focused segment details replace this overview.');
+    return;
+  }
+  const def = CONTEXT_CATEGORY_DEFS[part.category] || CONTEXT_CATEGORY_DEFS.other;
+  set('context-detail-title', part.title);
+  set('context-detail-subtitle', part.subtitle || 'No text preview available for this segment.');
+  set('context-detail-share', `${Math.round(part.share * 1000) / 10}%`);
+  set('context-detail-estimate', `~${part.tokens.toLocaleString()} tokens`);
+  set('context-detail-category', def.label);
+  set('context-detail-path', part.path || '--');
+  set('context-detail-preview', part.preview || '--');
+}
+
+function renderContextHotspots(analysis) {
+  const host = document.getElementById('context-hotspots-list');
+  if (!host) return;
+  host.innerHTML = '';
+  if (!analysis || !analysis.parts.length) {
+    const empty = document.createElement('span');
+    empty.className = 'context-replay-label';
+    empty.textContent = 'No snapshots';
+    host.appendChild(empty);
+    return;
+  }
+  const hotspots = [...analysis.parts].sort((a, b) => b.tokens - a.tokens).slice(0, 6);
+  for (const part of hotspots) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'context-hotspot-btn';
+    btn.textContent = `${part.title} - ~${part.tokens.toLocaleString()}`;
+    btn.title = `${part.path || ''} ${part.subtitle || ''}`.trim();
+    btn.addEventListener('click', () => focusContextPart(part.id));
+    host.appendChild(btn);
+  }
+}
+
+function selectedContextPart(analysis) {
+  if (!analysis || !contextSelectedPartId) return null;
+  return analysis.parts.find(part => part.id === contextSelectedPartId) || null;
+}
+
+function updateContextReplayControls(snapshot) {
+  const { key, timeline } = contextTimelineForForegroundSession();
+  const liveBtn = document.getElementById('context-live-btn');
+  const replayBtn = document.getElementById('context-replay-btn');
+  const range = document.getElementById('context-replay-range');
+  const label = document.getElementById('context-replay-label');
+  if (liveBtn) liveBtn.classList.toggle('active', contextReplayMode === 'live');
+  if (replayBtn) {
+    replayBtn.classList.toggle('active', contextReplayMode === 'replay');
+    replayBtn.disabled = timeline.length === 0;
+  }
+  const max = Math.max(0, timeline.length - 1);
+  let idx = timeline.indexOf(snapshot);
+  if (idx < 0 && timeline.length) idx = contextReplayIndexBySession.get(key) ?? max;
+  idx = Math.max(0, Math.min(max, idx));
+  if (range) {
+    range.min = '0';
+    range.max = String(max);
+    range.value = String(idx);
+    range.disabled = timeline.length <= 1;
+  }
+  if (label) {
+    if (!timeline.length) {
+      label.textContent = 'No snapshots';
+    } else {
+      const modeLabel = contextReplayMode === 'replay' ? 'Replay' : 'Live';
+      const turn = snapshot?.turn !== undefined && snapshot?.turn !== null ? `turn ${snapshot.turn}` : 'turn --';
+      label.textContent = `${modeLabel} snapshot ${idx + 1} / ${timeline.length} - ${turn} - ${formatContextTimestamp(snapshot?.ts)}`;
+    }
+  }
+}
+
+function wireContextPaneListeners() {
+  if (contextListenersWired) return;
+  contextListenersWired = true;
+  document.getElementById('context-live-btn')?.addEventListener('click', () => {
+    contextReplayMode = 'live';
+    contextSelectedPartId = null;
+    renderContextPane();
+  });
+  document.getElementById('context-replay-btn')?.addEventListener('click', () => {
+    const { key, timeline } = contextTimelineForForegroundSession();
+    if (!timeline.length) return;
+    contextReplayMode = 'replay';
+    if (!contextReplayIndexBySession.has(key)) contextReplayIndexBySession.set(key, timeline.length - 1);
+    renderContextPane();
+  });
+  document.getElementById('context-replay-range')?.addEventListener('input', ev => {
+    const { key, timeline } = contextTimelineForForegroundSession();
+    if (!timeline.length) return;
+    contextReplayMode = 'replay';
+    contextReplayIndexBySession.set(key, Math.max(0, Math.min(timeline.length - 1, Number(ev.currentTarget.value) || 0)));
+    contextSelectedPartId = null;
+    renderContextPane();
+  });
+  document.getElementById('context-reset-view-btn')?.addEventListener('click', () => {
+    contextViz.rotationX = -0.22;
+    contextViz.rotationY = -0.48;
+    contextViz.zoom = 38;
+    contextRenderThree();
+  });
+}
+
+function focusContextPart(partId) {
+  contextSelectedPartId = partId;
+  const part = selectedContextPart(contextLastAnalysis);
+  renderContextDetail(contextLastAnalysis, part);
+  contextUpdateMeshSelection();
+  contextViz.zoom = Math.min(contextViz.zoom, 28);
+  contextRenderThree();
+}
+
+function contextDisposeObject(object) {
+  object.traverse(child => {
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) {
+      const materials = Array.isArray(child.material) ? child.material : [child.material];
+      for (const material of materials) {
+        if (material.map) material.map.dispose();
+        material.dispose();
+      }
+    }
+  });
+}
+
+function contextInitThree() {
+  const canvas = document.getElementById('context-scene');
+  if (!canvas) return false;
+  if (contextViz.renderer) return true;
+  contextViz.canvas = canvas;
+  contextViz.scene = new THREE.Scene();
+  contextViz.camera = new THREE.PerspectiveCamera(42, 1, 0.1, 1000);
+  contextViz.camera.position.set(0, 18, contextViz.zoom);
+  contextViz.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  contextViz.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+  contextViz.root = new THREE.Group();
+  contextViz.scene.add(contextViz.root);
+  contextViz.raycaster = new THREE.Raycaster();
+  contextViz.pointer = new THREE.Vector2();
+  const ambient = new THREE.AmbientLight(0xffffff, 0.52);
+  const key = new THREE.DirectionalLight(0xffffff, 1.15);
+  key.position.set(-14, 24, 18);
+  const fill = new THREE.PointLight(0x94e2d5, 0.8, 90);
+  fill.position.set(18, 13, -16);
+  contextViz.scene.add(ambient, key, fill);
+
+  contextViz.resizeObserver = new ResizeObserver(() => contextRenderThree());
+  contextViz.resizeObserver.observe(canvas.parentElement || canvas);
+  canvas.addEventListener('pointerdown', ev => {
+    contextViz.dragging = true;
+    contextViz.dragMoved = false;
+    contextViz.dragX = ev.clientX;
+    contextViz.dragY = ev.clientY;
+    canvas.classList.add('dragging');
+    canvas.setPointerCapture?.(ev.pointerId);
+  });
+  canvas.addEventListener('pointermove', ev => {
+    if (!contextViz.dragging) return;
+    const dx = ev.clientX - contextViz.dragX;
+    const dy = ev.clientY - contextViz.dragY;
+    if (Math.abs(dx) + Math.abs(dy) > 2) contextViz.dragMoved = true;
+    contextViz.dragX = ev.clientX;
+    contextViz.dragY = ev.clientY;
+    contextViz.rotationY += dx * 0.008;
+    contextViz.rotationX = Math.max(-0.9, Math.min(0.35, contextViz.rotationX + dy * 0.006));
+    contextRenderThree();
+  });
+  canvas.addEventListener('pointerup', ev => {
+    canvas.classList.remove('dragging');
+    canvas.releasePointerCapture?.(ev.pointerId);
+    const shouldPick = !contextViz.dragMoved;
+    contextViz.dragging = false;
+    if (shouldPick) contextPickThreePart(ev);
+  });
+  canvas.addEventListener('pointercancel', () => {
+    contextViz.dragging = false;
+    canvas.classList.remove('dragging');
+  });
+  canvas.addEventListener('wheel', ev => {
+    ev.preventDefault();
+    contextViz.zoom = Math.max(16, Math.min(70, contextViz.zoom + ev.deltaY * 0.035));
+    contextRenderThree();
+  }, { passive: false });
+  return true;
+}
+
+function contextSetThreeSize() {
+  if (!contextViz.renderer || !contextViz.canvas) return;
+  const rect = contextViz.canvas.getBoundingClientRect();
+  const width = Math.max(1, Math.floor(rect.width));
+  const height = Math.max(1, Math.floor(rect.height));
+  const size = contextViz.renderer.getSize(new THREE.Vector2());
+  if (size.x !== width || size.y !== height) {
+    contextViz.renderer.setSize(width, height, false);
+    contextViz.camera.aspect = width / height;
+    contextViz.camera.updateProjectionMatrix();
+  }
+}
+
+function contextLabelSprite(text, color = '#cdd6f4', scale = 1) {
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  const fontSize = 44;
+  ctx.font = `600 ${fontSize}px system-ui, sans-serif`;
+  const metrics = ctx.measureText(text);
+  canvas.width = Math.ceil(metrics.width + 28);
+  canvas.height = 72;
+  ctx.font = `600 ${fontSize}px system-ui, sans-serif`;
+  ctx.fillStyle = 'rgba(17,17,26,0.78)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = color;
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, 14, canvas.height / 2);
+  const texture = new THREE.CanvasTexture(canvas);
+  const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
+  const sprite = new THREE.Sprite(material);
+  sprite.scale.set((canvas.width / canvas.height) * scale, scale, 1);
+  return sprite;
+}
+
+function contextClearThreeRoot() {
+  if (!contextViz.root) return;
+  for (const child of [...contextViz.root.children]) {
+    contextViz.root.remove(child);
+    contextDisposeObject(child);
+  }
+  contextViz.meshes = [];
+}
+
+function contextPressureColor(pct) {
+  if (pct >= 0.92) return '#f38ba8';
+  if (pct >= 0.75) return '#fab387';
+  if (pct >= 0.55) return '#f9e2af';
+  return '#a6e3a1';
+}
+
+function contextBuildThree(analysis, snapshot) {
+  const empty = document.getElementById('context-scene-empty');
+  if (empty) empty.style.display = analysis && analysis.parts.length ? 'none' : 'flex';
+  if (!contextInitThree()) return;
+  contextClearThreeRoot();
+  if (!analysis || !analysis.parts.length) {
+    contextRenderThree();
+    return;
+  }
+  const root = contextViz.root;
+  const categories = [...analysis.byCategory.keys()].sort((a, b) => CONTEXT_CATEGORY_ORDER.indexOf(a) - CONTEXT_CATEGORY_ORDER.indexOf(b));
+  const laneSpacing = 5.6;
+  const laneMap = new Map(categories.map((category, idx) => [category, (idx - (categories.length - 1) / 2) * laneSpacing]));
+  const zSpread = 24;
+  const maxTokens = Math.max(1, ...analysis.parts.map(part => part.tokens));
+  const baseMaterial = new THREE.MeshStandardMaterial({ color: 0x313244, transparent: true, opacity: 0.28, roughness: 0.84, metalness: 0.05 });
+  for (const category of categories) {
+    const x = laneMap.get(category) || 0;
+    const lane = new THREE.Mesh(new THREE.BoxGeometry(4.3, 0.08, zSpread + 4), baseMaterial.clone());
+    lane.position.set(x, -0.06, 0);
+    root.add(lane);
+    const def = CONTEXT_CATEGORY_DEFS[category] || CONTEXT_CATEGORY_DEFS.other;
+    const label = contextLabelSprite(def.label, def.color, 1.25);
+    label.position.set(x, 0.65, -zSpread / 2 - 2.2);
+    root.add(label);
+  }
+
+  analysis.parts.forEach((part, idx) => {
+    const def = CONTEXT_CATEGORY_DEFS[part.category] || CONTEXT_CATEGORY_DEFS.other;
+    const x = laneMap.get(part.category) || 0;
+    const z = analysis.parts.length <= 1 ? 0 : (idx / (analysis.parts.length - 1) - 0.5) * zSpread;
+    const height = Math.max(0.45, Math.min(8.8, 0.35 + Math.log10(part.tokens + 1) * 1.35));
+    const depth = Math.max(0.65, Math.min(3.8, 0.65 + Math.sqrt(part.tokens / maxTokens) * 3.1));
+    const width = Math.max(1.1, Math.min(3.9, 1.15 + Math.sqrt(part.share) * 5.0));
+    const geometry = new THREE.BoxGeometry(width, height, depth);
+    const material = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(def.color),
+      roughness: 0.56,
+      metalness: 0.08,
+      emissive: new THREE.Color(def.color),
+      emissiveIntensity: part.id === contextSelectedPartId ? 0.32 : 0.06,
+      transparent: true,
+      opacity: 0.92,
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.position.set(x, height / 2, z);
+    mesh.userData.partId = part.id;
+    mesh.userData.baseY = mesh.position.y;
+    mesh.userData.tokens = part.tokens;
+    root.add(mesh);
+    contextViz.meshes.push(mesh);
+    if (part.share > 0.16) {
+      const ring = new THREE.Mesh(
+        new THREE.TorusGeometry(Math.max(width, depth) * 0.72, 0.035, 8, 48),
+        new THREE.MeshBasicMaterial({ color: new THREE.Color(contextPressureColor(part.share)), transparent: true, opacity: 0.72 })
+      );
+      ring.rotation.x = Math.PI / 2;
+      ring.position.set(x, 0.08, z);
+      root.add(ring);
+    }
+  });
+
+  const effectiveWindow = analysis.effectiveWindow || analysis.hardWindow || analysis.totalTokens;
+  const hardWindow = analysis.hardWindow || effectiveWindow;
+  const pct = effectiveWindow > 0 ? Math.min(1.25, analysis.totalTokens / effectiveWindow) : 0;
+  const reservoirX = ((categories.length - 1) / 2) * laneSpacing + 7.2;
+  const reservoirHeight = 10;
+  const frame = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(2.4, reservoirHeight, 2.4)),
+    new THREE.LineBasicMaterial({ color: 0x6c7086, transparent: true, opacity: 0.72 })
+  );
+  frame.position.set(reservoirX, reservoirHeight / 2, 0);
+  root.add(frame);
+  const fillHeight = Math.max(0.08, Math.min(reservoirHeight, pct * reservoirHeight));
+  const fill = new THREE.Mesh(
+    new THREE.BoxGeometry(1.75, fillHeight, 1.75),
+    new THREE.MeshStandardMaterial({ color: new THREE.Color(contextPressureColor(pct)), transparent: true, opacity: 0.78, roughness: 0.45 })
+  );
+  fill.position.set(reservoirX, fillHeight / 2, 0);
+  root.add(fill);
+  const usageLabel = contextLabelSprite(`${Math.round(pct * 100)}% window`, contextPressureColor(pct), 1.1);
+  usageLabel.position.set(reservoirX, reservoirHeight + 1.1, 0);
+  root.add(usageLabel);
+  if (hardWindow && hardWindow !== effectiveWindow) {
+    const hardLabel = contextLabelSprite('hard limit tracked', '#f38ba8', 0.9);
+    hardLabel.position.set(reservoirX, -0.2, 2.7);
+    root.add(hardLabel);
+  }
+
+  const { timeline } = contextTimelineForForegroundSession();
+  if (timeline.length > 1) {
+    const selectedIdx = timeline.indexOf(snapshot);
+    const railWidth = Math.min(28, Math.max(10, timeline.length * 0.72));
+    timeline.forEach((entry, idx) => {
+      const entryWindow = Number(entry.effective_context_window || entry.context_window || effectiveWindow || 0);
+      const entryTokens = Number(entry.token_count || 0);
+      const entryPct = entryWindow > 0 ? Math.min(1.1, entryTokens / entryWindow) : (idx + 1) / timeline.length;
+      const barHeight = 0.25 + entryPct * 4.6;
+      const x = timeline.length <= 1 ? 0 : (idx / (timeline.length - 1) - 0.5) * railWidth;
+      const color = idx === selectedIdx ? '#ffffff' : contextPressureColor(entryPct);
+      const bar = new THREE.Mesh(
+        new THREE.BoxGeometry(0.22, barHeight, 0.55),
+        new THREE.MeshStandardMaterial({ color: new THREE.Color(color), transparent: true, opacity: idx === selectedIdx ? 0.95 : 0.5 })
+      );
+      bar.position.set(x, barHeight / 2, zSpread / 2 + 3.6);
+      root.add(bar);
+    });
+    const railLabel = contextLabelSprite('session replay timeline', '#bac2de', 1.0);
+    railLabel.position.set(0, 5.6, zSpread / 2 + 3.6);
+    root.add(railLabel);
+  }
+
+  contextUpdateMeshSelection();
+  contextRenderThree();
+}
+
+function contextUpdateMeshSelection() {
+  for (const mesh of contextViz.meshes) {
+    const selected = mesh.userData.partId === contextSelectedPartId;
+    mesh.scale.setScalar(selected ? 1.14 : 1);
+    if (mesh.material) {
+      mesh.material.emissiveIntensity = selected ? 0.45 : 0.06;
+      mesh.material.opacity = selected ? 1 : 0.92;
+    }
+  }
+}
+
+function contextPickThreePart(ev) {
+  if (!contextViz.raycaster || !contextViz.camera || !contextViz.canvas) return;
+  const rect = contextViz.canvas.getBoundingClientRect();
+  contextViz.pointer.x = ((ev.clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1;
+  contextViz.pointer.y = -(((ev.clientY - rect.top) / Math.max(1, rect.height)) * 2 - 1);
+  contextViz.raycaster.setFromCamera(contextViz.pointer, contextViz.camera);
+  const hits = contextViz.raycaster.intersectObjects(contextViz.meshes, false);
+  if (hits.length && hits[0].object.userData.partId) {
+    focusContextPart(hits[0].object.userData.partId);
+  }
+}
+
+function contextRenderThree(time = 0) {
+  if (!contextViz.renderer || !contextViz.scene || !contextViz.camera) return;
+  contextSetThreeSize();
+  contextViz.camera.position.set(0, 16, contextViz.zoom);
+  contextViz.camera.lookAt(0, 2.2, 0);
+  if (contextViz.root) {
+    contextViz.root.rotation.x = contextViz.rotationX;
+    contextViz.root.rotation.y = contextViz.rotationY;
+  }
+  if (time && contextViz.meshes.length) {
+    const t = time * 0.001;
+    for (const mesh of contextViz.meshes) {
+      const selected = mesh.userData.partId === contextSelectedPartId;
+      if (selected) {
+        mesh.position.y = mesh.userData.baseY + Math.sin(t * 3.2) * 0.08;
+      } else {
+        mesh.position.y = mesh.userData.baseY;
+      }
+    }
+  }
+  contextViz.renderer.render(contextViz.scene, contextViz.camera);
+}
+
+function contextStartThreeAnimation() {
+  if (contextViz.raf) return;
+  const frame = time => {
+    contextViz.raf = null;
+    if (activeTab === 'activity' && activeActivitySubtab === 'context') {
+      contextRenderThree(time);
+      contextViz.raf = requestAnimationFrame(frame);
+    }
+  };
+  contextViz.raf = requestAnimationFrame(frame);
+}
+
+function contextStopThreeAnimation() {
+  if (contextViz.raf) cancelAnimationFrame(contextViz.raf);
+  contextViz.raf = null;
+}
+
+function handleContextSnapshot(snapshot) {
+  storeContextSnapshot(snapshot);
   renderContextPane();
 }
 
 function contextSnapshotForForegroundSession() {
+  const { key, timeline } = contextTimelineForForegroundSession();
+  if (contextReplayMode === 'replay' && timeline.length) {
+    const requested = contextReplayIndexBySession.get(key);
+    const idx = Math.max(0, Math.min(timeline.length - 1, Number.isFinite(requested) ? requested : timeline.length - 1));
+    contextReplayIndexBySession.set(key, idx);
+    return timeline[idx];
+  }
   const sid = resolvePromptTargetSessionId();
   if (sid && contextSnapshotsBySession.has(sid)) return contextSnapshotsBySession.get(sid);
+  if (sid && contextSnapshotsBySession.size === 1) return contextSnapshotsBySession.values().next().value;
   if (sid && contextSnapshotsBySession.size > 0) return null;
   return latestContextSnapshot;
 }
@@ -22724,11 +23859,13 @@ function contextSnapshotForForegroundSession() {
 function renderContextPane() {
   const rawEl = document.getElementById('context-raw');
   if (!rawEl) return;
+  wireContextPaneListeners();
   const set = (id, value) => {
     const el = document.getElementById(id);
     if (el) el.textContent = contextValueText(value);
   };
   const snapshot = contextSnapshotForForegroundSession();
+  updateContextReplayControls(snapshot);
   if (!snapshot) {
     set('context-source', '--');
     set('context-turn', '--');
@@ -22736,6 +23873,11 @@ function renderContextPane() {
     set('context-tokens', '--');
     set('context-format', '--');
     rawEl.innerHTML = '<span class="json-null">No context snapshot yet</span>';
+    contextLastAnalysis = null;
+    renderContextLegend(null);
+    renderContextDetail(null, null);
+    renderContextHotspots(null);
+    contextBuildThree(null, null);
     return;
   }
   const d = snapshot;
@@ -22754,6 +23896,14 @@ function renderContextPane() {
     ? raw
     : JSON.stringify(raw, null, 2);
   rawEl.innerHTML = highlightJson(rawText);
+  const analysis = analyzeContextSnapshot(snapshot);
+  contextLastAnalysis = analysis;
+  const selected = selectedContextPart(analysis);
+  renderContextLegend(analysis);
+  renderContextDetail(analysis, selected);
+  renderContextHotspots(analysis);
+  contextBuildThree(analysis, snapshot);
+  if (activeTab === 'activity' && activeActivitySubtab === 'context') contextStartThreeAnimation();
 }
 
 function switchActivitySubtab(name) {
@@ -22770,6 +23920,9 @@ function switchActivitySubtab(name) {
   syncSessionWindowGridControls();
   if (name === 'context') {
     renderContextPane();
+    contextStartThreeAnimation();
+  } else {
+    contextStopThreeAnimation();
   }
   if (name === 'managed') {
     refreshManagedContextPane({ force: true });

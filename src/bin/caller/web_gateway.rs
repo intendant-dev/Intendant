@@ -1231,6 +1231,7 @@ const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.j
 const ICON_128_PNG: &[u8] = include_bytes!("../../../static/icon-128.png");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
+const THREE_MODULE_JS: &str = include_str!("../../../static/three.module.min.js");
 // 0 means replay every renderable entry from the external audit transcript.
 // External activity replay intentionally includes only user/assistant messages
 // and explicit context-rewind markers, not tool events or tool output.
@@ -9867,6 +9868,10 @@ pub fn spawn_web_gateway(
                 "/wasm-web/presence_web_bg.wasm",
                 &format!("/wasm-web/presence_web_bg.wasm?v={}", v),
             )
+            .replace(
+                "/three.module.min.js",
+                &format!("/three.module.min.js?v={}", v),
+            )
             .replace("/icon-128.png", &format!("/icon-128.png?v={}", v)),
     );
 
@@ -14654,6 +14659,12 @@ pub fn spawn_web_gateway(
                                 (
                                     "application/javascript",
                                     WASM_WEB_JS.to_string(),
+                                    "no-cache, must-revalidate",
+                                )
+                            } else if request_line.contains("/three.module.min.js") {
+                                (
+                                    "application/javascript",
+                                    THREE_MODULE_JS.to_string(),
                                     "no-cache, must-revalidate",
                                 )
                             } else if request_line.contains("/audio-processor.js") {
@@ -20939,6 +20950,8 @@ mod tests {
         assert!(APP_HTML.contains("tab-stats"));
         assert!(APP_HTML.contains("tab-terminal"));
         assert!(APP_HTML.contains("tab-displays"));
+        assert!(APP_HTML.contains("/three.module.min.js"));
+        assert!(THREE_MODULE_JS.contains("Three.js Authors"));
     }
 
     #[test]
