@@ -6785,9 +6785,6 @@ html, body {
     <span class="sep">|</span>
     <span class="field-label">autonomy</span>
     <span class="autonomy" id="sb-autonomy" style="cursor:pointer;text-decoration:underline dotted" onclick="cycleAutonomy()" title="Click to cycle: Low → Medium → High → Full">Medium</span>
-    <span class="sep" id="sb-agent-sep" style="display:none">|</span>
-    <span class="field-label" id="sb-agent-label" style="display:none">agent</span>
-    <span id="sb-external-agent" style="display:none;font-weight:600;color:var(--peach)"></span>
     <span class="sep">|</span>
     <span class="display-toggle-wrap">
       <span class="field-label" id="sb-display-label" style="cursor:pointer" onclick="toggleUserDisplay()" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">your display</span>
@@ -8846,7 +8843,7 @@ let recPlayer = null;
 
 // Voice / Live mode
 let gatewayConfig = null;
-let currentExternalAgent = '';
+let currentExternalAgent = null;
 let micActive = false;
 let modelConnected = false;
 let audioCtx = null;
@@ -9656,7 +9653,9 @@ async function main() {
       fetch('/.well-known/agent-card.json').then(r => r.json()).catch(() => null),
     ]);
     gatewayConfig = cfg;
-    currentExternalAgent = normalizeAgentId(cfg.external_agent || currentExternalAgent);
+    if (currentExternalAgent === null) {
+      currentExternalAgent = normalizeAgentId(cfg.external_agent);
+    }
     applyMainBackendStatus();
     if (card && card.id && card.label) {
       const previousSelfPeerId = selfPeerId;
@@ -17834,9 +17833,9 @@ function renderForegroundSessionUsage() {
 
 function applyMainBackendStatus() {
   const external = normalizeAgentId(
-    currentExternalAgent
-    || (gatewayConfig && gatewayConfig.external_agent)
-    || controlCurrentBackend
+    currentExternalAgent !== null
+      ? currentExternalAgent
+      : ((gatewayConfig && gatewayConfig.external_agent) || controlCurrentBackend)
   );
   const providerEl = document.getElementById('sb-provider');
   const modelEl = document.getElementById('sb-model');
@@ -17880,9 +17879,6 @@ function updateStatusBar(d) {
     }
   }
   if (d.external_agent !== undefined) {
-    const el = document.getElementById('sb-external-agent');
-    const sep = document.getElementById('sb-agent-sep');
-    const lbl = document.getElementById('sb-agent-label');
     // Accept any of the serialization forms we might see on the wire:
     //   short:      "codex" | "claude-code" | "gemini"
     //   display:    "Codex" | "Claude Code" | "Gemini CLI"
@@ -17892,18 +17888,8 @@ function updateStatusBar(d) {
     // <option value> attributes, then derive a pretty label from that.
     const shortId = normalizeAgentId(d.external_agent);
     currentExternalAgent = shortId;
-    if (shortId) {
-      el.textContent = prettyAgentName(shortId);
-      el.style.display = '';
-      sep.style.display = '';
-      lbl.style.display = '';
-      if (currentSessionFullId) {
-        updateSessionWindow(currentSessionFullId, { source: prettyAgentName(shortId) });
-      }
-    } else {
-      el.style.display = 'none';
-      sep.style.display = 'none';
-      lbl.style.display = 'none';
+    if (shortId && currentSessionFullId) {
+      updateSessionWindow(currentSessionFullId, { source: prettyAgentName(shortId) });
     }
     const sel = document.getElementById('set-external-agent');
     if (sel) {
@@ -27058,12 +27044,10 @@ async function loadSettings() {
     controlCodexConfig.managed_context = d.codex_managed_context || 'vanilla';
     setNewSessionAgentDefaults(d);
     // External agent: persisted to intendant.toml via `[agent]
-    // default_backend`. Sync both the Settings dropdown AND the
-    // status bar badge here — on a fresh daemon boot there are no
+    // default_backend`. Sync the Settings dropdown and status bar
+    // worker identity here — on a fresh daemon boot there are no
     // ExternalAgentChanged events yet, so updateStatusBar has never
-    // been called with an external_agent field, and without this
-    // branch the status bar badge would stay hidden until the user
-    // interacts with the dropdown.
+    // been called with an external_agent field.
     //
     // Route through normalizeAgentId so legacy TOML files written in
     // the Display form ("Gemini CLI") or serde-enum form ("gemini_cli")
@@ -27076,20 +27060,6 @@ async function loadSettings() {
       document.getElementById('set-external-agent').value = shortId;
       newSessionConfiguredAgent = shortId;
       renderNewSessionAgentControls();
-
-      const el = document.getElementById('sb-external-agent');
-      const sep = document.getElementById('sb-agent-sep');
-      const lbl = document.getElementById('sb-agent-label');
-      if (shortId) {
-        el.textContent = prettyAgentName(shortId);
-        el.style.display = '';
-        sep.style.display = '';
-        lbl.style.display = '';
-      } else {
-        el.style.display = 'none';
-        sep.style.display = 'none';
-        lbl.style.display = 'none';
-      }
       applyMainBackendStatus();
     }
     const envDiv = document.getElementById('settings-env-list');
