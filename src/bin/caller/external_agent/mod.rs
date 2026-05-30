@@ -498,6 +498,15 @@ pub struct AgentContextSnapshot {
     pub raw: serde_json::Value,
 }
 
+/// Result of making a backend-owned autonomous goal passive.
+#[derive(Debug, Clone, Default)]
+pub struct AutonomousGoalPauseResult {
+    /// The latest visible goal state, if the backend has one.
+    pub goal: Option<crate::types::SessionGoal>,
+    /// True when this call changed an active goal into a passive state.
+    pub paused: bool,
+}
+
 /// Trait for opaque external agent backends.
 ///
 /// Intendant supervises the agent, bridges approval requests to its
@@ -640,9 +649,12 @@ pub trait ExternalAgent: Send + Sync {
     /// Pause backend-owned autonomous work for a thread without starting a
     /// user turn. Codex active goals can auto-continue immediately after a
     /// resume; attach-only control paths use this to keep rehydration passive.
-    async fn pause_autonomous_goal(&mut self, thread_id: &str) -> Result<bool, CallerError> {
+    async fn pause_autonomous_goal(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<AutonomousGoalPauseResult, CallerError> {
         let _ = thread_id;
-        Ok(false)
+        Ok(AutonomousGoalPauseResult::default())
     }
 
     /// Read backend-owned thread metadata. The rollout path is important for

@@ -3486,6 +3486,16 @@ fn scoped_event_codex_subagent_thread_id(
         .map(str::to_string)
 }
 
+fn emit_external_session_goal(
+    config: &DrainConfig<'_>,
+    session_id: Option<String>,
+    goal: Option<types::SessionGoal>,
+) {
+    if let Some(session_id) = session_id.or_else(|| config.session_id.clone()) {
+        config.bus.send(AppEvent::SessionGoal { session_id, goal });
+    }
+}
+
 fn handle_idle_codex_subagent_event(
     config: &DrainConfig<'_>,
     stats: &mut LoopStats,
@@ -3689,16 +3699,10 @@ fn handle_idle_codex_subagent_event(
             });
         }
         external_agent::AgentEvent::GoalUpdated { goal } => {
-            config.bus.send(AppEvent::SessionGoal {
-                session_id: child_thread_id,
-                goal: Some(goal),
-            });
+            emit_external_session_goal(config, Some(child_thread_id), Some(goal));
         }
         external_agent::AgentEvent::GoalCleared => {
-            config.bus.send(AppEvent::SessionGoal {
-                session_id: child_thread_id,
-                goal: None,
-            });
+            emit_external_session_goal(config, Some(child_thread_id), None);
         }
         external_agent::AgentEvent::PlanUpdate { .. }
         | external_agent::AgentEvent::ApprovalRequest { .. }
@@ -4419,26 +4423,10 @@ async fn drain_external_agent_events(
                 });
             }
             external_agent::AgentEvent::GoalUpdated { goal } => {
-                let session_id = event_thread_id
-                    .clone()
-                    .or_else(|| config.session_id.clone());
-                if let Some(session_id) = session_id {
-                    config.bus.send(AppEvent::SessionGoal {
-                        session_id,
-                        goal: Some(goal),
-                    });
-                }
+                emit_external_session_goal(config, event_thread_id.clone(), Some(goal));
             }
             external_agent::AgentEvent::GoalCleared => {
-                let session_id = event_thread_id
-                    .clone()
-                    .or_else(|| config.session_id.clone());
-                if let Some(session_id) = session_id {
-                    config.bus.send(AppEvent::SessionGoal {
-                        session_id,
-                        goal: None,
-                    });
-                }
+                emit_external_session_goal(config, event_thread_id.clone(), None);
             }
             external_agent::AgentEvent::Log { level, message } => {
                 slog(config.session_log, |l| match level.as_str() {
@@ -13001,19 +12989,23 @@ async fn run_external_agent_mode(
     let mut codex_thread_action_dedupe = CodexThreadActionDedupe::default();
     if backend == external_agent::AgentBackend::Codex && attach_only_resume {
         match agent.pause_autonomous_goal(&thread.thread_id).await {
-            Ok(true) => {
-                let message =
-                    "Paused active Codex goal while attaching without a new prompt".to_string();
-                slog(&session_log, |l| l.info(&message));
-                bus.send(AppEvent::LogEntry {
-                    session_id: live_session_id.clone(),
-                    level: "info".to_string(),
-                    source: "Codex".to_string(),
-                    content: message,
-                    turn: None,
-                });
+            Ok(result) => {
+                if let Some(goal) = result.goal {
+                    emit_external_session_goal(&drain_config, live_session_id.clone(), Some(goal));
+                }
+                if result.paused {
+                    let message =
+                        "Paused active Codex goal while attaching without a new prompt".to_string();
+                    slog(&session_log, |l| l.info(&message));
+                    bus.send(AppEvent::LogEntry {
+                        session_id: live_session_id.clone(),
+                        level: "info".to_string(),
+                        source: "Codex".to_string(),
+                        content: message,
+                        turn: None,
+                    });
+                }
             }
-            Ok(false) => {}
             Err(e) => {
                 slog(&session_log, |l| {
                     l.debug(&format!(
@@ -13066,18 +13058,33 @@ async fn run_external_agent_mode(
                                     );
                                     continue;
                                 }
-                                if let external_agent::AgentEvent::Terminated { reason, exit_code } =
-                                    event
-                                {
-                                    let message = format!(
-                                        "{} terminated while idle: {} (exit code: {:?})",
-                                        agent.name(),
-                                        reason,
-                                        exit_code
-                                    );
-                                    slog(&session_log, |l| l.warn(&message));
-                                    bus.send(AppEvent::LoopError(message));
-                                    break 'outer;
+                                match event {
+                                    external_agent::AgentEvent::GoalUpdated { goal } => {
+                                        emit_external_session_goal(
+                                            &drain_config,
+                                            event_thread_id,
+                                            Some(goal),
+                                        );
+                                    }
+                                    external_agent::AgentEvent::GoalCleared => {
+                                        emit_external_session_goal(
+                                            &drain_config,
+                                            event_thread_id,
+                                            None,
+                                        );
+                                    }
+                                    external_agent::AgentEvent::Terminated { reason, exit_code } => {
+                                        let message = format!(
+                                            "{} terminated while idle: {} (exit code: {:?})",
+                                            agent.name(),
+                                            reason,
+                                            exit_code
+                                        );
+                                        slog(&session_log, |l| l.warn(&message));
+                                        bus.send(AppEvent::LoopError(message));
+                                        break 'outer;
+                                    }
+                                    _ => {}
                                 }
                                 continue;
                             }
@@ -13613,13 +13620,24 @@ async fn run_external_agent_mode(
                         content: message,
                         turn: None,
                     });
-                    if let Err(e) = agent.pause_autonomous_goal(&thread.thread_id).await {
-                        slog(&session_log, |l| {
-                            l.debug(&format!(
-                                "Could not pause Codex goal before edit rollback retry: {}",
-                                e
-                            ))
-                        });
+                    match agent.pause_autonomous_goal(&thread.thread_id).await {
+                        Ok(result) => {
+                            if let Some(goal) = result.goal {
+                                emit_external_session_goal(
+                                    &drain_config,
+                                    live_session_id.clone(),
+                                    Some(goal),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            slog(&session_log, |l| {
+                                l.debug(&format!(
+                                    "Could not pause Codex goal before edit rollback retry: {}",
+                                    e
+                                ))
+                            });
+                        }
                     }
 
                     let mut side_session_state = ExternalSideSessionState {

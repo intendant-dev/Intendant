@@ -13,8 +13,9 @@ use crate::error::CallerError;
 
 use super::{
     AgentConfig, AgentContextSnapshot, AgentEvent, AgentImageAttachment, AgentThread,
-    AgentThreadSnapshot, AgentUsageSnapshot, ApprovalCategory, ApprovalDecision, ExternalAgent,
-    RollbackAnchorPosition, SubAgentState, ToolCompletionStatus,
+    AgentThreadSnapshot, AgentUsageSnapshot, ApprovalCategory, ApprovalDecision,
+    AutonomousGoalPauseResult, ExternalAgent, RollbackAnchorPosition, SubAgentState,
+    ToolCompletionStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -624,29 +625,46 @@ impl CodexAgent {
         self.set_goal(params, None, Some(status), None).await
     }
 
-    async fn pause_active_goal_for_thread(&mut self, thread_id: &str) -> Result<bool, CallerError> {
+    async fn pause_active_goal_for_thread(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<AutonomousGoalPauseResult, CallerError> {
         let thread_id = thread_id.trim();
         if thread_id.is_empty() {
-            return Ok(false);
+            return Ok(AutonomousGoalPauseResult::default());
         }
         let params = serde_json::json!({ "threadId": thread_id });
         let response = self
             .send_request("thread/goal/get", Some(params))
             .await
             .map_err(|e| CallerError::ExternalAgent(format!("thread/goal/get: {e}")))?;
-        if codex_goal_status(&response) != Some("active") {
-            return Ok(false);
+        let current_goal = response.get("goal").and_then(session_goal_from_value);
+        if !codex_goal_status(&response).is_some_and(|status| status.eq_ignore_ascii_case("active"))
+        {
+            return Ok(AutonomousGoalPauseResult {
+                goal: current_goal,
+                paused: false,
+            });
         }
 
         let params = serde_json::json!({
             "threadId": thread_id,
             "status": "paused",
         });
-        let _ = self
+        let response = self
             .send_request("thread/goal/set", Some(params))
             .await
             .map_err(|e| CallerError::ExternalAgent(format!("thread/goal/set: {e}")))?;
-        Ok(true)
+        let goal = response
+            .get("goal")
+            .and_then(session_goal_from_value)
+            .or_else(|| {
+                current_goal.map(|mut goal| {
+                    goal.status = Some("paused".to_string());
+                    goal
+                })
+            });
+        Ok(AutonomousGoalPauseResult { goal, paused: true })
     }
 }
 
@@ -3792,7 +3810,10 @@ impl ExternalAgent for CodexAgent {
         CodexAgent::dispatch_thread_action(self, op, params).await
     }
 
-    async fn pause_autonomous_goal(&mut self, thread_id: &str) -> Result<bool, CallerError> {
+    async fn pause_autonomous_goal(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<AutonomousGoalPauseResult, CallerError> {
         self.pause_active_goal_for_thread(thread_id).await
     }
 

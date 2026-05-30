@@ -1974,7 +1974,7 @@ html, body {
 .session-window-log .log-entry .log-session {
   display: none;
 }
-.session-window-log .log-ts { width: 58px; }
+.session-window-log .log-ts { width: 88px; }
 .session-window-log .log-level { width: 46px; }
 .session-window-empty {
   padding: 12px 10px;
@@ -2030,10 +2030,13 @@ html, body {
 }
 .log-entry .log-ts {
   color: var(--overlay1);
-  width: 70px;
+  width: 88px;
   flex-shrink: 0;
   font-size: 11px;
   padding-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .log-entry .log-level {
   width: 52px;
@@ -16924,6 +16927,20 @@ function isCommandOutputLog(c) {
   return level === 'agent';
 }
 
+function formatLogTimestampLabel(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})/);
+  if (match) return `${match[2]}-${match[3]} ${match[4]}:${match[5]}`;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  return raw.length > 12 ? raw.substring(0, 12) : raw;
+}
+
+function formatLogTimestampTitle(value) {
+  const raw = String(value || '').trim();
+  return raw;
+}
+
 function createLogScaffold(c, extraClass) {
   const entry = document.createElement('div');
   entry.className = 'log-entry level-' + c.level + (extraClass ? ' ' + extraClass : '');
@@ -16956,7 +16973,8 @@ function createLogScaffold(c, extraClass) {
 
   const ts = document.createElement('span');
   ts.className = 'log-ts';
-  ts.textContent = (c.ts || '').substring(0, 8);
+  ts.textContent = formatLogTimestampLabel(c.ts);
+  ts.title = formatLogTimestampTitle(c.ts);
 
   const host = document.createElement('span');
   host.className = 'log-host';
