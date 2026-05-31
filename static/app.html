@@ -9495,12 +9495,15 @@ const SESSION_RELATIONSHIP_KINDS = new Set(['side', 'fork', 'subagent']);
 const CONCURRENT_LOG_MODE_NORMAL = 'normal';
 const CONCURRENT_LOG_MODE_MINIMIZED = 'minimized';
 const CONCURRENT_LOG_MODE_MAXIMIZED = 'maximized';
+const CONCURRENT_LOG_MODE_KEY = 'intendant_concurrent_log_mode_v1';
 let sessionMetadataRefreshTimer = null;
 let sessionMetadataRefreshInFlight = null;
 let sessionWindowGridHeightPx = readStoredSessionWindowGridHeight();
 let sessionWindowGridResizeDrag = null;
-let concurrentLogMode = CONCURRENT_LOG_MODE_NORMAL;
+let concurrentLogMode = readStoredConcurrentLogMode();
 let concurrentLogFitToSessionWindows = true;
+let concurrentLogDetachedFragment = null;
+let concurrentLogDetachedScrollTop = 0;
 let restoredPersistedSessionWindows = false;
 let restoringPersistedSessionWindows = false;
 const sessionWindowRestoreInFlight = new Set();
@@ -14147,7 +14150,7 @@ function resetSessionWindowsForReplay(entries) {
 
 function clearLogs(options = {}) {
   const clearSessionWindows = options.clearSessionWindows !== false;
-  document.getElementById('log-stream').innerHTML = '';
+  clearMainLogContainers();
   logEntryCount = 0;
   activeCommandOutputGroups.clear();
   commandOutputGroups.clear();
@@ -14160,7 +14163,8 @@ function clearLogs(options = {}) {
 
 function renderTurnSeparator(turn) {
   finalizeActiveCommandOutputGroup();
-  const stream = document.getElementById('log-stream');
+  const stream = currentMainLogContainer();
+  if (!stream) return;
   const sep = document.createElement('div');
   sep.className = 'log-turn-sep';
   sep.textContent = '\u2500\u2500 Turn ' + turn + ' \u2500\u2500';
@@ -14717,6 +14721,11 @@ function updatePromptTargetLogSessionBadges() {
   document.querySelectorAll('.log-entry[data-session-id]').forEach(entry => {
     applyPromptTargetLogSessionBadgeState(entry, target);
   });
+  if (concurrentLogDetachedFragment) {
+    concurrentLogDetachedFragment.querySelectorAll('.log-entry[data-session-id]').forEach(entry => {
+      applyPromptTargetLogSessionBadgeState(entry, target);
+    });
+  }
 }
 
 function applyPromptTargetLogSessionBadgeState(entry, target = resolvePromptTargetSessionId()) {
@@ -15457,6 +15466,88 @@ function storeSessionWindowGridHeight(heightPx) {
   } catch {}
 }
 
+function readStoredConcurrentLogMode() {
+  try {
+    const mode = localStorage.getItem(CONCURRENT_LOG_MODE_KEY);
+    return [CONCURRENT_LOG_MODE_NORMAL, CONCURRENT_LOG_MODE_MINIMIZED, CONCURRENT_LOG_MODE_MAXIMIZED].includes(mode)
+      ? mode
+      : CONCURRENT_LOG_MODE_NORMAL;
+  } catch {
+    return CONCURRENT_LOG_MODE_NORMAL;
+  }
+}
+
+function storeConcurrentLogMode(mode) {
+  try {
+    if (mode === CONCURRENT_LOG_MODE_NORMAL) localStorage.removeItem(CONCURRENT_LOG_MODE_KEY);
+    else localStorage.setItem(CONCURRENT_LOG_MODE_KEY, mode);
+  } catch {}
+}
+
+function mainLogContainers() {
+  const containers = [];
+  if (concurrentLogDetachedFragment) containers.push(concurrentLogDetachedFragment);
+  const stream = document.getElementById('log-stream');
+  if (stream) containers.push(stream);
+  return containers;
+}
+
+function currentMainLogContainer() {
+  return concurrentLogDetachedFragment || document.getElementById('log-stream');
+}
+
+function clearMainLogContainers() {
+  const stream = document.getElementById('log-stream');
+  if (stream) stream.replaceChildren();
+  if (concurrentLogDetachedFragment) concurrentLogDetachedFragment.replaceChildren();
+}
+
+function pruneMainLogContainer(container = currentMainLogContainer()) {
+  if (!container) return;
+  while (logEntryCount > 10000) {
+    const first = container.querySelector('.log-entry, .log-turn-sep');
+    if (!first) break;
+    first.remove();
+    logEntryCount--;
+  }
+}
+
+function shouldDetachConcurrentLogStream() {
+  const grid = document.getElementById('session-window-grid');
+  return !!grid
+    && !grid.classList.contains('hidden')
+    && concurrentLogMode === CONCURRENT_LOG_MODE_MINIMIZED;
+}
+
+function detachConcurrentLogStream() {
+  const stream = document.getElementById('log-stream');
+  if (!stream || concurrentLogDetachedFragment) return;
+  concurrentLogDetachedScrollTop = stream.scrollTop || 0;
+  const fragment = document.createDocumentFragment();
+  while (stream.firstChild) fragment.appendChild(stream.firstChild);
+  concurrentLogDetachedFragment = fragment;
+}
+
+function attachConcurrentLogStream() {
+  const stream = document.getElementById('log-stream');
+  if (!stream || !concurrentLogDetachedFragment) return;
+  const fragment = concurrentLogDetachedFragment;
+  concurrentLogDetachedFragment = null;
+  stream.appendChild(fragment);
+  applyHostFilter();
+  updatePromptTargetLogSessionBadges();
+  if (autoScroll) {
+    stream.scrollTop = stream.scrollHeight;
+  } else {
+    stream.scrollTop = Math.min(concurrentLogDetachedScrollTop, stream.scrollHeight);
+  }
+}
+
+function syncConcurrentLogStreamMount() {
+  if (shouldDetachConcurrentLogStream()) detachConcurrentLogStream();
+  else attachConcurrentLogStream();
+}
+
 function sessionWindowGridAvailableHeight() {
   const pane = document.getElementById('activity-log-pane');
   const grid = document.getElementById('session-window-grid');
@@ -15538,9 +15629,6 @@ function syncSessionWindowGridControls() {
   const logLabel = document.getElementById('concurrent-log-label');
   if (!grid || !handle) return;
   const showGrid = !grid.classList.contains('hidden');
-  if (!showGrid && concurrentLogMode !== CONCURRENT_LOG_MODE_NORMAL) {
-    concurrentLogMode = CONCURRENT_LOG_MODE_NORMAL;
-  }
   syncConcurrentLogModeUi();
   const showResize =
     showGrid
@@ -15585,6 +15673,7 @@ function syncConcurrentLogModeUi() {
     maximize.setAttribute('aria-label', maximize.title);
     maximize.setAttribute('aria-pressed', maximized ? 'true' : 'false');
   }
+  syncConcurrentLogStreamMount();
 }
 
 function setConcurrentLogMode(mode) {
@@ -15592,6 +15681,7 @@ function setConcurrentLogMode(mode) {
     ? mode
     : CONCURRENT_LOG_MODE_NORMAL;
   concurrentLogMode = next;
+  storeConcurrentLogMode(next);
   if (next === CONCURRENT_LOG_MODE_NORMAL) {
     applySessionWindowGridHeight();
   } else {
@@ -15603,6 +15693,7 @@ function setConcurrentLogFitToSessionWindows(fitted) {
   concurrentLogFitToSessionWindows = !!fitted;
   if (concurrentLogFitToSessionWindows) {
     concurrentLogMode = CONCURRENT_LOG_MODE_NORMAL;
+    storeConcurrentLogMode(concurrentLogMode);
   }
   applySessionWindowGridHeight();
 }
@@ -18042,16 +18133,14 @@ function flushLogReplayAppendBatch() {
   const batch = logReplayAppendBatch;
   if (!batch || batch.added <= 0) return;
 
-  const stream = document.getElementById('log-stream');
+  const stream = currentMainLogContainer();
   if (stream && batch.mainFragment.childNodes.length > 0) {
     stream.appendChild(batch.mainFragment);
-    while (logEntryCount > 10000) {
-      const first = stream.querySelector('.log-entry, .log-turn-sep');
-      if (!first) break;
-      stream.removeChild(first);
-      logEntryCount--;
+    pruneMainLogContainer(stream);
+    const liveStream = document.getElementById('log-stream');
+    if (!concurrentLogDetachedFragment && autoScroll && liveStream) {
+      liveStream.scrollTop = liveStream.scrollHeight;
     }
-    if (autoScroll) stream.scrollTop = stream.scrollHeight;
     batch.mainFragment = document.createDocumentFragment();
   }
 
@@ -18512,14 +18601,13 @@ function appendLogEntryElement(entry) {
   if (logReplayAppendBatch) flushLogReplayAppendBatch();
 
   const stream = document.getElementById('log-stream');
-  stream.appendChild(entry);
+  const container = currentMainLogContainer() || stream;
+  if (!container) return;
+  container.appendChild(entry);
   appendLogEntryToSessionWindow(entry);
   logEntryCount++;
-  if (logEntryCount > 10000) {
-    const first = stream.querySelector('.log-entry, .log-turn-sep');
-    if (first) { stream.removeChild(first); logEntryCount--; }
-  }
-  if (autoScroll) stream.scrollTop = stream.scrollHeight;
+  pruneMainLogContainer(container);
+  if (!concurrentLogDetachedFragment && autoScroll && stream) stream.scrollTop = stream.scrollHeight;
 }
 
 function commandOutputCloneViews(group) {
@@ -18736,7 +18824,7 @@ function renderCommandOutputEntry(c) {
   }
   appendCommandOutputChunk(activeCommandOutputGroup, c);
   const stream = document.getElementById('log-stream');
-  if (autoScroll) stream.scrollTop = stream.scrollHeight;
+  if (!concurrentLogDetachedFragment && autoScroll && stream) stream.scrollTop = stream.scrollHeight;
 }
 
 function finalizeCommandOutputGroup(group) {
@@ -18946,7 +19034,7 @@ function markActivityContextRewind(sessionId, userTurnIndex, turnsRemoved) {
   const endTurn = Number.isInteger(turnCount) && turnCount > 0
     ? startTurn + turnCount - 1
     : Number.MAX_SAFE_INTEGER;
-  const streams = [document.getElementById('log-stream')];
+  const streams = mainLogContainers();
   for (const win of sessionWindows.values()) {
     if (win?.log) streams.push(win.log);
   }
@@ -30078,14 +30166,14 @@ function refreshHostFilterOptions() {
 }
 
 function applyHostFilter() {
-  const stream = document.getElementById('log-stream');
-  if (!stream) return;
-  for (const entry of stream.querySelectorAll('.log-entry')) {
-    const hostId = entry.dataset.hostId || selfPeerId;
-    entry.classList.toggle(
-      'hidden-by-filter',
-      !!activeHostFilter && activeHostFilter !== hostId,
-    );
+  for (const stream of mainLogContainers()) {
+    for (const entry of stream.querySelectorAll('.log-entry')) {
+      const hostId = entry.dataset.hostId || selfPeerId;
+      entry.classList.toggle(
+        'hidden-by-filter',
+        !!activeHostFilter && activeHostFilter !== hostId,
+      );
+    }
   }
 }
 
