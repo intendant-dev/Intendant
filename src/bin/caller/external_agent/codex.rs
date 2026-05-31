@@ -1109,6 +1109,26 @@ impl CodexAgent {
         self.request_trace_temporary = false;
     }
 
+    async fn mark_existing_context_requests_seen(
+        &mut self,
+        thread_id: Option<&str>,
+    ) -> Result<usize, CallerError> {
+        let Some(root) = self.request_trace_root.as_deref() else {
+            return Ok(0);
+        };
+        let index = read_codex_trace_index(root, thread_id).await?;
+        let mut inserted = 0usize;
+        for request in index.requests {
+            if self
+                .context_seen_request_ids
+                .insert(codex_request_id(&request))
+            {
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
+    }
+
     fn intendant_mcp_url(&self, port: u16) -> String {
         let mode = if self.managed_context {
             "managed"
@@ -1383,6 +1403,14 @@ impl CodexAgent {
         let active_turn = self.active_turns.lock().await.get(thread_id).cloned();
         *self.active_turn_id.lock().await = active_turn;
         *self.active_thread_id.lock().await = Some(thread_id.to_string());
+        if let Err(e) = self
+            .mark_existing_context_requests_seen(Some(thread_id))
+            .await
+        {
+            eprintln!(
+                "[codex] Warning: failed to seed context request trace baseline for resumed thread {thread_id}: {e}"
+            );
+        }
         Ok(())
     }
 }
@@ -4019,6 +4047,14 @@ impl ExternalAgent for CodexAgent {
         *self.active_thread_id.lock().await = Some(thread_id.clone());
 
         if self.resume_session.is_some() {
+            if let Err(e) = self
+                .mark_existing_context_requests_seen(Some(&thread_id))
+                .await
+            {
+                eprintln!(
+                    "[codex] Warning: failed to seed context request trace baseline for resumed thread {thread_id}: {e}"
+                );
+            }
             let rollout_path = match extract_thread_path(&result) {
                 Some(path) => Some(path),
                 None => match self.read_thread_snapshot(&thread_id).await {
@@ -5010,6 +5046,77 @@ mod tests {
         assert!(snapshots
             .windows(2)
             .all(|pair| pair[0].request_id != pair[1].request_id));
+    }
+
+    #[tokio::test]
+    async fn resumed_thread_context_baseline_suppresses_old_trace_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = tmp.path().join("trace-thread-abc");
+        std::fs::create_dir_all(trace.join("payloads")).unwrap();
+
+        for (idx, text) in [(1, "first"), (2, "second"), (3, "third")] {
+            std::fs::write(
+                trace.join(format!("payloads/request-{idx}.json")),
+                serde_json::json!({
+                    "type": "response.create",
+                    "input": [{"role": "user", "content": text}]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let line = |ts: u64, idx: u64, call_id: &str| {
+            serde_json::json!({
+                "schema_version": 1,
+                "wall_time_unix_ms": ts,
+                "payload": {
+                    "type": "inference_started",
+                    "provider_name": "OpenAI",
+                    "thread_id": "thread-abc",
+                    "inference_call_id": call_id,
+                    "request_payload": {
+                        "kind": {"type": "inference_request"},
+                        "path": format!("payloads/request-{idx}.json")
+                    }
+                }
+            })
+            .to_string()
+        };
+
+        std::fs::write(
+            trace.join("trace.jsonl"),
+            [line(10, 1, "inference:1"), line(20, 2, "inference:2")].join("\n"),
+        )
+        .unwrap();
+
+        let mut agent = test_agent();
+        agent.request_trace_root = Some(tmp.path().to_path_buf());
+        agent.context_archive = "exact".to_string();
+        let inserted = agent
+            .mark_existing_context_requests_seen(Some("thread-abc"))
+            .await
+            .unwrap();
+        assert_eq!(inserted, 2);
+        assert!(agent.context_snapshots().await.unwrap().is_empty());
+
+        std::fs::write(
+            trace.join("trace.jsonl"),
+            [
+                line(10, 1, "inference:1"),
+                line(20, 2, "inference:2"),
+                line(30, 3, "inference:3"),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let snapshots = agent.context_snapshots().await.unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].request_index, Some(3));
+        assert!(serde_json::to_string(&snapshots[0].raw)
+            .unwrap()
+            .contains("third"));
     }
 
     #[test]
