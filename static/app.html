@@ -1220,6 +1220,7 @@ html, body {
   white-space: nowrap;
 }
 .context-raw {
+  display: none;
   flex: 0 0 28%;
   min-height: 0;
   max-height: 38%;
@@ -1234,6 +1235,9 @@ html, body {
   line-height: 1.55;
   white-space: pre;
   tab-size: 2;
+}
+.context-pane.context-raw-open .context-raw {
+  display: block;
 }
 .json-key { color: var(--blue); }
 .json-string { color: var(--green); }
@@ -7467,7 +7471,7 @@ body.context-focus-active {
                 <button class="context-mode-btn" id="context-replay-btn" type="button">Replay</button>
                 <button class="context-focus-btn" id="context-reset-view-btn" type="button">Reset view</button>
                 <button class="context-focus-btn" id="context-open-focus-btn" type="button" title="Open context focus view" aria-label="Open context focus view">&#x26F6; Focus</button>
-                <button class="context-focus-btn context-focus-only" id="context-raw-toggle-btn" type="button" title="Show raw context snapshot" aria-pressed="false">Raw</button>
+                <button class="context-focus-btn" id="context-raw-toggle-btn" type="button" title="Render full raw context snapshot" aria-pressed="false">Raw</button>
                 <button class="context-focus-btn context-focus-only" id="context-close-focus-btn" type="button" title="Close context focus view">Close</button>
               </div>
             </div>
@@ -23289,6 +23293,7 @@ let contextLastAnalysis = null;
 let contextListenersWired = false;
 let contextFocusMode = false;
 let contextRawOpen = false;
+let contextRawRenderedKey = null;
 let contextRenderScheduled = false;
 
 const CONTEXT_GLOBAL_SESSION = '__global__';
@@ -23447,6 +23452,7 @@ function resetContextSnapshotState() {
   contextReplayIndexBySession.clear();
   contextSelectedPartId = null;
   contextLastAnalysis = null;
+  contextRawRenderedKey = null;
 }
 
 function storeContextSnapshot(snapshot) {
@@ -23517,20 +23523,44 @@ function contextRawValue(snapshot) {
   return snapshot && Object.prototype.hasOwnProperty.call(snapshot, 'raw') ? snapshot.raw : snapshot;
 }
 
-function contextPreview(value, limit = 1600) {
-  let text = '';
-  if (typeof value === 'string') {
-    text = value;
-  } else {
-    try {
-      text = JSON.stringify(value, null, 2);
-    } catch (_) {
-      text = String(value ?? '');
-    }
+function contextFullText(value) {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (_) {
+    return String(value ?? '');
   }
-  text = text.replace(/\s+\n/g, '\n').trim();
-  if (text.length > limit) return text.slice(0, limit - 1) + '...';
-  return text;
+}
+
+function contextPreviewText(text, limit) {
+  const cleaned = String(text ?? '').replace(/\s+\n/g, '\n').trim();
+  if (cleaned.length > limit) return cleaned.slice(0, limit - 1) + '...';
+  return cleaned;
+}
+
+function contextPreview(value, limit = 1600) {
+  if (typeof value === 'string') {
+    return contextPreviewText(value, limit);
+  }
+  if (value === null || value === undefined || typeof value !== 'object') {
+    return contextPreviewText(String(value ?? ''), limit);
+  }
+  const firstText = contextFindFirstText(value);
+  if (firstText) return contextPreviewText(firstText, limit);
+  try {
+    const seen = new WeakSet();
+    const json = JSON.stringify(value, (key, val) => {
+      if (typeof val === 'string' && val.length > 260) return val.slice(0, 257) + '...';
+      if (val && typeof val === 'object') {
+        if (seen.has(val)) return '[Circular]';
+        seen.add(val);
+      }
+      return val;
+    }, 2);
+    return contextPreviewText(json, limit);
+  } catch (_) {
+    return contextPreviewText(String(value ?? ''), limit);
+  }
 }
 
 function contextStringSize(value) {
@@ -23789,7 +23819,7 @@ function renderContextDetail(analysis, part) {
     set('context-detail-estimate', '--');
     set('context-detail-category', '--');
     set('context-detail-path', '--');
-    set('context-detail-preview', 'Large context consumers appear here with a short preview.');
+    set('context-detail-preview', 'Large context items appear here after selection.');
     return;
   }
   if (!part) {
@@ -23803,7 +23833,7 @@ function renderContextDetail(analysis, part) {
     set('context-detail-estimate', `${analysis.totalTokens.toLocaleString()} tokens`);
     set('context-detail-category', 'all');
     set('context-detail-path', '$');
-    set('context-detail-preview', 'Focused segment details replace this overview.');
+    set('context-detail-preview', 'Select a context item to render its full payload here.');
     return;
   }
   const def = CONTEXT_CATEGORY_DEFS[part.category] || CONTEXT_CATEGORY_DEFS.other;
@@ -23813,7 +23843,7 @@ function renderContextDetail(analysis, part) {
   set('context-detail-estimate', `~${part.tokens.toLocaleString()} tokens`);
   set('context-detail-category', def.label);
   set('context-detail-path', part.path || '--');
-  set('context-detail-preview', part.preview || '--');
+  set('context-detail-preview', contextFullText(part.value) || '--');
 }
 
 function renderContextHotspots(analysis) {
@@ -23904,12 +23934,13 @@ function updateContextFocusControls() {
   const pane = document.querySelector('.context-pane');
   if (pane) {
     pane.classList.toggle('context-focus', contextFocusMode);
-    pane.classList.toggle('context-raw-open', contextFocusMode && contextRawOpen);
+    pane.classList.toggle('context-raw-open', contextRawOpen);
   }
   document.body.classList.toggle('context-focus-active', contextFocusMode);
   const rawBtn = document.getElementById('context-raw-toggle-btn');
   if (rawBtn) {
     rawBtn.setAttribute('aria-pressed', contextRawOpen ? 'true' : 'false');
+    rawBtn.title = contextRawOpen ? 'Hide raw context snapshot' : 'Render full raw context snapshot';
     rawBtn.textContent = contextRawOpen ? 'Hide raw' : 'Raw';
   }
 }
@@ -23918,7 +23949,10 @@ function setContextFocusMode(open, opts = {}) {
   const next = Boolean(open);
   if (contextFocusMode === next && !opts.force) return;
   contextFocusMode = next;
-  if (!contextFocusMode) contextRawOpen = false;
+  if (!contextFocusMode) {
+    contextRawOpen = false;
+    contextRawRenderedKey = null;
+  }
   updateContextFocusControls();
   if (contextFocusMode) {
     const pane = document.querySelector('.context-pane');
@@ -23931,13 +23965,18 @@ function setContextFocusMode(open, opts = {}) {
     if (document.fullscreenElement?.classList?.contains('context-pane')) {
       document.exitFullscreen().catch(() => {});
     }
+    renderContextRaw(contextSnapshotForForegroundSession());
     contextRenderThree();
   }
 }
 
 function setContextRawOpen(open) {
-  contextRawOpen = Boolean(open);
+  const next = Boolean(open);
+  if (contextRawOpen === next) return;
+  contextRawOpen = next;
+  contextRawRenderedKey = null;
   updateContextFocusControls();
+  if (contextPaneVisible()) renderContextPane();
 }
 
 function wireContextPaneListeners() {
@@ -24470,6 +24509,32 @@ function contextSnapshotForForegroundSession() {
   return latestContextSnapshot;
 }
 
+function contextRawRenderKey(snapshot) {
+  if (!snapshot) return 'empty';
+  return snapshot.__context_key || contextSnapshotFingerprint(snapshot);
+}
+
+function renderContextRaw(snapshot) {
+  const rawEl = document.getElementById('context-raw');
+  if (!rawEl) return;
+  if (!snapshot) {
+    if (contextRawRenderedKey !== 'empty') rawEl.textContent = 'No context snapshot yet';
+    contextRawRenderedKey = 'empty';
+    return;
+  }
+  if (!contextRawOpen) {
+    if (contextRawRenderedKey !== 'collapsed') {
+      rawEl.textContent = 'Raw context collapsed. Press Raw to render the full snapshot.';
+    }
+    contextRawRenderedKey = 'collapsed';
+    return;
+  }
+  const renderKey = `raw:${contextRawRenderKey(snapshot)}`;
+  if (contextRawRenderedKey === renderKey) return;
+  rawEl.textContent = contextFullText(contextRawValue(snapshot));
+  contextRawRenderedKey = renderKey;
+}
+
 function renderContextPane() {
   const rawEl = document.getElementById('context-raw');
   if (!rawEl) return;
@@ -24487,7 +24552,7 @@ function renderContextPane() {
     set('context-items', '--');
     set('context-tokens', '--');
     set('context-format', '--');
-    rawEl.innerHTML = '<span class="json-null">No context snapshot yet</span>';
+    renderContextRaw(null);
     contextLastAnalysis = null;
     renderContextLegend(null);
     renderContextDetail(null, null);
@@ -24506,11 +24571,7 @@ function renderContextPane() {
     : d.token_count;
   set('context-tokens', tokens);
   set('context-format', d.format || '--');
-  const raw = Object.prototype.hasOwnProperty.call(d, 'raw') ? d.raw : d;
-  const rawText = typeof raw === 'string'
-    ? raw
-    : JSON.stringify(raw, null, 2);
-  rawEl.innerHTML = highlightJson(rawText);
+  renderContextRaw(snapshot);
   const analysis = analyzeContextSnapshot(snapshot);
   contextLastAnalysis = analysis;
   const selected = selectedContextPart(analysis);
