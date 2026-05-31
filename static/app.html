@@ -34718,10 +34718,8 @@ function openSessionDetail(sessionOrId, taskArg) {
   document.getElementById('sd-frames').style.display = 'none';
   document.getElementById('session-detail-frames').innerHTML = '';
 
-  const detailSessionId = source !== 'intendant' && (session.intendant_session_id || session.intendantSessionId)
-    ? (session.intendant_session_id || session.intendantSessionId)
-    : sessionId;
-  const detailSource = detailSessionId !== sessionId ? 'intendant' : source;
+  const detailSessionId = sessionId;
+  const detailSource = source;
   fetch('/api/session/' + encodeURIComponent(detailSessionId) + '?source=' + encodeURIComponent(detailSource))
     .then(r => r.json())
     .then(data => {
@@ -35007,12 +35005,14 @@ function renderSessionDetailEntries(entries, el) {
     if (!visibleLevels.includes(level)) continue;
     const source = e.source || '';
     const displaySource = sourceLabels[source] || source || '\u2139';
+    const content = e.content || e.summary || e.message || '';
+    if (!String(content).trim()) continue;
     const detailRecord = {
       ...e,
       level,
       source,
       session_id: e.session_id || currentSessionDetail?.backend_session_id || currentSessionDetail?.resume_id || currentSessionDetail?.session_id || '',
-      content: e.content || '',
+      content,
     };
 
     if (e.turn && e.turn !== lastTurn) {
@@ -35091,7 +35091,6 @@ function renderSessionDetailEntries(entries, el) {
     appendEditUserMessageButton(entry, detailRecord);
 
     // Collapsible for long entries
-    const content = detailRecord.content;
     if (content.split('\n').length > 3 || content.length > 300) {
       cnt.style.maxHeight = '1.5em';
       cnt.style.overflow = 'hidden';
