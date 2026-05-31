@@ -4360,7 +4360,6 @@ impl IntendantServer {
             "get_controller_loop_status" => {
                 Ok(text_tool_result(self.get_controller_loop_status().await))
             }
-            "reload" => Ok(text_tool_result(self.reload().await)),
             "list_displays" => Ok(text_tool_result(self.list_displays().await)),
             "take_display" => {
                 let params = parse_params::<TakeDisplayParams>(args)?;
@@ -5376,109 +5375,6 @@ impl IntendantServer {
         collect_controller_loop_status(&controller_loop_dir()).to_string()
     }
 
-    #[tool(
-        description = "Rebuild the intendant binary from source and hot-reload the MCP server. The server process is replaced in-place via exec() — the MCP connection survives seamlessly. Use this after making code changes so the running server picks them up without restarting Claude Code."
-    )]
-    async fn reload(&self) -> String {
-        // Find the project root (where Cargo.toml lives)
-        let exe = match std::env::current_exe() {
-            Ok(e) => e,
-            Err(e) => return format!("Failed to determine executable path: {}", e),
-        };
-
-        // Find project root by looking for Cargo.toml relative to the exe
-        // or via the INTENDANT_PROJECT_ROOT env var
-        let project_root = std::env::var("INTENDANT_PROJECT_ROOT")
-            .map(std::path::PathBuf::from)
-            .ok()
-            .or_else(|| {
-                // Walk up from exe to find Cargo.toml
-                let mut dir = exe.parent()?;
-                for _ in 0..10 {
-                    if dir.join("Cargo.toml").exists() {
-                        return Some(dir.to_path_buf());
-                    }
-                    dir = dir.parent()?;
-                }
-                None
-            });
-
-        // Build the binary
-        if let Some(root) = &project_root {
-            let output = std::process::Command::new("cargo")
-                .args(["build", "--release"])
-                .current_dir(root)
-                .output();
-
-            match output {
-                Ok(o) if o.status.success() => {
-                    let mut s = self.state.write().await;
-                    s.push_log(
-                        LogLevel::Info,
-                        "Binary rebuilt successfully, exec'ing...".to_string(),
-                    );
-                }
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    return format!("Build failed:\n{}", stderr);
-                }
-                Err(e) => {
-                    return format!("Failed to run cargo build: {}", e);
-                }
-            }
-        }
-
-        // Schedule the exec() after a brief delay so the JSON-RPC response
-        // can be flushed to stdout before the process is replaced.
-        let args: Vec<String> = std::env::args().collect();
-        tokio::spawn(async move {
-            // Give rmcp time to write the response
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-            // Flush stdout to ensure the response is delivered
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-
-            // exec() replaces the process image in place (stdin/stdout fds
-            // survive), which is what keeps the MCP stdio connection alive
-            // across the reload. `CommandExt::exec` is Unix-only; on
-            // Windows there is no in-place image replacement, so the
-            // hot-reload is unavailable in Tier-0.
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                let exe = match std::env::current_exe() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("reload failed: cannot determine current exe: {}", e);
-                        return;
-                    }
-                };
-                let err = std::process::Command::new(exe)
-                    .args(&args[1..])
-                    .env("INTENDANT_MCP_RELOAD", "1")
-                    .exec();
-                // exec only returns on error
-                eprintln!("reload exec failed: {}", err);
-                std::process::exit(1);
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = &args;
-                eprintln!("reload not supported on this platform (exec() is Unix-only)");
-            }
-        });
-
-        #[cfg(unix)]
-        {
-            "ok - reloading in-place (MCP connection preserved)".to_string()
-        }
-        #[cfg(not(unix))]
-        {
-            "error - in-place reload is not supported on this platform".to_string()
-        }
-    }
-
     #[tool(description = "Enumerate available displays with their IDs, names, and resolutions.")]
     async fn list_displays(&self) -> String {
         let session_registry = self.state.read().await.session_registry.clone();
@@ -6281,190 +6177,25 @@ impl ServerHandler for IntendantServer {
 }
 
 // ---------------------------------------------------------------------------
-// Reload transport: wraps stdio with fake initialization for post-exec reload
-// ---------------------------------------------------------------------------
-
-/// After an exec() reload, the MCP client (Claude Code) still considers the
-/// connection initialized. But rmcp's `serve()` requires the full init handshake.
-///
-/// `ReloadTransport` solves this by injecting a synthetic `initialize` request
-/// and `notifications/initialized` notification into the receive stream, and
-/// swallowing the server's init response on the send side. After this two-message
-/// preamble, all messages pass through to real stdio transparently.
-mod reload_transport {
-    use rmcp::model::{
-        ClientJsonRpcMessage, ClientNotification, ClientRequest, Implementation,
-        InitializeRequestParams, ProtocolVersion, ServerJsonRpcMessage,
-    };
-    use rmcp::service::RoleServer;
-    use rmcp::transport::Transport;
-    use std::borrow::Cow;
-    use std::future::Future;
-    use std::pin::Pin;
-
-    /// Phases of the reload handshake injection.
-    enum Phase {
-        /// Next `receive()` returns a fake Initialize request.
-        InjectInit,
-        /// Next `send()` swallows the Initialize response, then transitions.
-        SwallowInitResp,
-        /// Next `receive()` returns a fake Initialized notification.
-        InjectInitialized,
-        /// All subsequent messages pass through to the inner transport.
-        Normal,
-    }
-
-    pub struct ReloadTransport<T> {
-        inner: T,
-        phase: Phase,
-    }
-
-    impl<T> ReloadTransport<T> {
-        pub fn new(inner: T) -> Self {
-            Self {
-                inner,
-                phase: Phase::InjectInit,
-            }
-        }
-    }
-
-    fn fake_init_request() -> ClientJsonRpcMessage {
-        let params = InitializeRequestParams {
-            meta: None,
-            protocol_version: ProtocolVersion::V_2025_03_26,
-            capabilities: Default::default(),
-            client_info: Implementation {
-                name: "claude-code".to_string(),
-                title: None,
-                version: "1.0.0-reload".to_string(),
-                description: None,
-                icons: None,
-                website_url: None,
-            },
-        };
-        let request = ClientRequest::InitializeRequest(rmcp::model::InitializeRequest {
-            method: Default::default(),
-            params,
-            extensions: Default::default(),
-        });
-        ClientJsonRpcMessage::request(request, rmcp::model::RequestId::Number(0))
-    }
-
-    fn fake_initialized_notification() -> ClientJsonRpcMessage {
-        let notification =
-            ClientNotification::InitializedNotification(rmcp::model::InitializedNotification {
-                method: Default::default(),
-                extensions: Default::default(),
-            });
-        ClientJsonRpcMessage::notification(notification)
-    }
-
-    impl<T: Transport<RoleServer>> Transport<RoleServer> for ReloadTransport<T> {
-        type Error = T::Error;
-
-        fn name() -> Cow<'static, str> {
-            "ReloadTransport".into()
-        }
-
-        fn send(
-            &mut self,
-            item: ServerJsonRpcMessage,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-            match self.phase {
-                Phase::SwallowInitResp => {
-                    // Swallow the init response, advance to next phase
-                    self.phase = Phase::InjectInitialized;
-                    // Return a no-op future that succeeds
-                    let fut: Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> =
-                        Box::pin(async { Ok(()) });
-                    fut
-                }
-                _ => {
-                    // Normal passthrough
-                    let inner_fut = self.inner.send(item);
-                    let fut: Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> =
-                        Box::pin(inner_fut);
-                    fut
-                }
-            }
-        }
-
-        fn receive(&mut self) -> impl Future<Output = Option<ClientJsonRpcMessage>> + Send {
-            match self.phase {
-                Phase::InjectInit => {
-                    self.phase = Phase::SwallowInitResp;
-                    let msg = fake_init_request();
-                    let fut: Pin<Box<dyn Future<Output = Option<ClientJsonRpcMessage>> + Send>> =
-                        Box::pin(async move { Some(msg) });
-                    fut
-                }
-                Phase::InjectInitialized => {
-                    self.phase = Phase::Normal;
-                    let msg = fake_initialized_notification();
-                    let fut: Pin<Box<dyn Future<Output = Option<ClientJsonRpcMessage>> + Send>> =
-                        Box::pin(async move { Some(msg) });
-                    fut
-                }
-                _ => {
-                    // Normal passthrough
-                    let inner_fut = self.inner.receive();
-                    let fut: Pin<Box<dyn Future<Output = Option<ClientJsonRpcMessage>> + Send>> =
-                        Box::pin(inner_fut);
-                    fut
-                }
-            }
-        }
-
-        fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            self.inner.close()
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Public API: start the MCP server on stdio
 // ---------------------------------------------------------------------------
-
-/// Exit code used to signal a reload request to a parent wrapper script.
-#[allow(dead_code)]
-pub const RELOAD_EXIT_CODE: i32 = 42;
 
 /// Run the MCP server on stdio. This replaces the TUI — the external agent
 /// communicates via MCP over stdin/stdout.
 ///
 /// The server consumes AppEvents from the bus and exposes them as tools and
 /// resources.
-///
-/// When `reloaded` is true, the server wraps stdio in a [`ReloadTransport`]
-/// that injects a synthetic MCP initialization handshake, allowing seamless
-/// operation after an exec() reload.
 pub async fn run_mcp_server(
     state: SharedMcpState,
     bus: EventBus,
     event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
-    reloaded: bool,
     human_question_path: Option<crate::event::SharedQuestionPath>,
     control_tx: Option<broadcast::Sender<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server = IntendantServer::new(state.clone(), bus.clone());
 
-    // Start serving on stdio, using ReloadTransport if this is a post-exec reload
-    let running = if reloaded {
-        use rmcp::transport::IntoTransport;
-        let inner = rmcp::transport::io::stdio().into_transport();
-        let transport = reload_transport::ReloadTransport::new(inner);
-        server.serve(transport).await?
-    } else {
-        let transport = rmcp::transport::io::stdio();
-        server.serve(transport).await?
-    };
-
-    // After a reload, notify the client that tools may have changed so it
-    // re-fetches the tool list.  This is the MCP-standard mechanism for
-    // telling a client that server capabilities have been updated.
-    if reloaded {
-        let _ = running.peer().notify_tool_list_changed().await;
-    }
+    let transport = rmcp::transport::io::stdio();
+    let running = server.serve(transport).await?;
 
     // Store the peer for sending notifications
     let peer = Arc::new(Mutex::new(Some(running.peer().clone())));

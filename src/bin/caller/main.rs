@@ -16984,19 +16984,10 @@ async fn main() -> Result<(), CallerError> {
         }
 
         // Run the MCP server on stdio (blocks until client disconnects or quit)
-        let reloaded = env::var("INTENDANT_MCP_RELOAD").is_ok();
-        if reloaded {
-            // Clear the flag so a subsequent reload doesn't think it's still reloading
-            env::remove_var("INTENDANT_MCP_RELOAD");
-            slog(&session_log, |l| {
-                l.info("MCP server reloaded via exec (injecting synthetic init)");
-            });
-        }
         if let Err(e) = mcp::run_mcp_server(
             mcp_state,
             bus,
             event_rx,
-            reloaded,
             Some(human_question_path),
             mcp_control_tx,
         )

@@ -83,7 +83,6 @@ you normally never set them by hand (see
 | `INTENDANT_INHERIT_MEMORY` | `1` to inherit project memory |
 | `INTENDANT_SANDBOX_WRITE_PATHS` | Landlock write paths (set by the caller when sandboxing) |
 | `INTENDANT_MAX_PARALLEL_AGENTS` | Max concurrent sub-agents (from `[orchestrator]`) |
-| `INTENDANT_MCP_RELOAD` | `1` when the process was `exec()`'d for MCP hot-reload |
 | `INTENDANT_LOG_DIR` | Session log directory (set by the caller for the runtime) |
 
 ## `intendant.toml`

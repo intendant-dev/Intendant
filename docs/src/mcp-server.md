@@ -99,7 +99,7 @@ The MCP tool surface (dispatched in `call_tool_by_name`) is broad. Grouped:
 |--------------------|-------------|--------|
 | `spawn_live_audio` | Spawn an untrusted [live-audio](./computer-use-and-audio.md#live-audio) voice session. | `id`, `provider`, `playbook`, `response_schema`, … |
 
-### Controller orchestration & hot reload
+### Controller Orchestration
 
 | Tool                            | Description | Params |
 |---------------------------------|-------------|--------|
@@ -111,33 +111,11 @@ The MCP tool surface (dispatched in `call_tool_by_name`) is broad. Grouped:
 | `clear_controller_loop_halt`    | Clear loop-halt flags so restarts can resume. | — |
 | `intervene_controller_loop`     | Intervene in the active loop process. | `mode`: `stop`/`abort` |
 | `get_controller_loop_status`    | Unified loop-health snapshot. | — |
-| `reload`                        | Rebuild the binary and hot-reload via `exec()`. | — |
 
 `schedule_controller_restart`, `controller_turn_complete`, and
 `cancel_controller_restart` return JSON payloads with an `ok` boolean and status
 fields; rejections come back as JSON (`ok: false`) with an `error` message rather
 than plain text.
-
-## Hot Reload
-
-The `reload` tool rebuilds from source (`cargo build --release`) and replaces the
-running server process in-place with `exec()`. The MCP connection survives —
-no client restart needed.
-
-1. `reload` runs `cargo build --release` in the project directory.
-2. After sending the tool response (a short delay lets it flush), the process
-   `exec()`s the new binary with `INTENDANT_MCP_RELOAD=1` set.
-3. The new process detects that env var and uses a `ReloadTransport` that injects
-   a synthetic MCP initialization handshake.
-4. The client keeps using the same connection — the stdio file descriptors
-   survive `exec()`.
-
-> **Platform note:** `exec()` (`CommandExt::exec`) is Unix-only. On non-Unix
-> platforms `reload` rebuilds but reports that in-place exec reload isn't
-> supported.
-
-This is mainly a development convenience: edit code, call `reload`, and the
-server picks up the changes without dropping the connection.
 
 ## Resources
 
