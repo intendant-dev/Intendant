@@ -20320,15 +20320,16 @@ class DisplaySlot {
     }
   }
 
-  captureCurrentFrame(quality = 0.85) {
+  captureCurrentFrame(quality = 0.85, options = {}) {
     if (!this.connected || !this.videoEl || !this.videoEl.videoWidth) {
       return null;
     }
     const sw = this.videoEl.videoWidth;
     const sh = this.videoEl.videoHeight;
     const dpr = window.devicePixelRatio || 1;
-    const w = Math.round(sw / dpr);
-    const h = Math.round(sh / dpr);
+    const logicalResolution = options.logicalResolution === true;
+    const w = logicalResolution ? Math.round(sw / dpr) : sw;
+    const h = logicalResolution ? Math.round(sh / dpr) : sh;
     const c = document.createElement('canvas');
     c.width = w;
     c.height = h;
@@ -20342,7 +20343,7 @@ class DisplaySlot {
   /// attachment. Works whether or not the display is currently streaming —
   /// just rasterizes whatever the <video> element is showing right now.
   attachCurrentFrame() {
-    const frame = this.captureCurrentFrame(0.85);
+    const frame = this.captureCurrentFrame(0.85, { logicalResolution: true });
     if (!frame) {
       this.attachBtn.title = 'No frame available yet';
       setTimeout(() => { this.attachBtn.title = 'Capture current frame and attach to next task'; }, 2000);
