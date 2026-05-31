@@ -16789,14 +16789,24 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
   win.actionMenuButton.setAttribute('aria-label', win.actionMenuButton.title);
   win.actionMenu?.querySelectorAll('[data-session-window-generic-action]').forEach(item => {
     const op = item.dataset.sessionWindowAction || '';
-    if (op !== 'attach-session') return;
-    const visible = canAttachSessionWindow(sid, win);
-    item.classList.toggle('hidden', !visible);
-    item.disabled = !visible;
-    item.title = visible
-      ? 'Attach this backend without sending a prompt'
-      : 'Session is already attached';
-    item.setAttribute('aria-disabled', item.disabled ? 'true' : 'false');
+    if (op === 'attach-session') {
+      const visible = canAttachSessionWindow(sid, win);
+      item.classList.toggle('hidden', !visible);
+      item.disabled = !visible;
+      item.title = visible
+        ? 'Attach this backend without sending a prompt'
+        : 'Session is already attached';
+      item.setAttribute('aria-disabled', item.disabled ? 'true' : 'false');
+      return;
+    }
+    if (op === 'stop-session') {
+      const availability = sessionWindowStopAvailability(sid);
+      item.disabled = !availability.ok;
+      item.title = availability.ok
+        ? 'Stop the live backend and remove it from active dashboards'
+        : availability.reason;
+      item.setAttribute('aria-disabled', item.disabled ? 'true' : 'false');
+    }
   });
   win.actionMenu?.querySelectorAll('[data-session-window-codex-action]').forEach(item => {
     const op = item.dataset.sessionWindowAction || '';
@@ -17270,7 +17280,7 @@ function renderSessionRelationships() {
 
 function sessionWindowExternalActionContext(sessionId) {
   const sid = String(sessionId || '').trim();
-  const availability = sessionWindowStopAvailability(sid);
+  const availability = sessionWindowExternalActionAvailability(sid);
   if (!availability.ok) {
     if (availability.toast) showControlToast('error', availability.toast);
     return null;
@@ -17278,7 +17288,7 @@ function sessionWindowExternalActionContext(sessionId) {
   return availability.msg;
 }
 
-function sessionWindowStopAvailability(sessionId) {
+function sessionWindowExternalActionAvailability(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return { ok: false, reason: 'No session selected.', toast: '' };
   if (sessionWindowIsSide(sid) || sessionWindowIsSubagent(sid)) {
@@ -17307,9 +17317,27 @@ function sessionWindowStopAvailability(sessionId) {
   return { ok: true, reason: '', toast: '', msg };
 }
 
+function sessionWindowStopAvailability(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const availability = sessionWindowExternalActionAvailability(sid);
+  if (!availability.ok) return availability;
+  if (sessionWindowIsDetached(sid)) {
+    return {
+      ok: false,
+      reason: 'This session is not attached to a live backend. Hide the card, or attach it before stopping.',
+      toast: 'Attach this session before stopping it',
+    };
+  }
+  return availability;
+}
+
 async function stopSessionWindowAction(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
-  if (!sid || !sessionWindowExternalActionContext(sid)) return;
+  const availability = sessionWindowStopAvailability(sid);
+  if (!sid || !availability.ok) {
+    if (availability.toast) showControlToast('error', availability.toast);
+    return;
+  }
   if (!options.skipConfirm) {
     const ok = await showDashboardConfirm({
       title: 'Stop session',
