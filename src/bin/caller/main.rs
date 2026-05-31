@@ -4275,6 +4275,15 @@ async fn drain_external_agent_events(
                         let side_thread = external_agent::AgentThread {
                             thread_id: session_id.clone(),
                         };
+                        emit_external_turn_status(
+                            config.bus,
+                            &config.autonomy,
+                            Some(&session_id),
+                            side_round,
+                            "thinking",
+                            format!("{} side turn in progress", agent.name()),
+                        )
+                        .await;
                         let send_result = if attachments.is_empty() {
                             agent.send_message(&side_thread, &merged).await
                         } else {
@@ -5385,6 +5394,27 @@ fn emit_follow_up_status(
         text: text.map(str::to_string),
         status: status.to_string(),
         reason: reason.map(str::to_string),
+    });
+}
+
+async fn emit_external_turn_status(
+    bus: &EventBus,
+    autonomy: &SharedAutonomy,
+    session_id: Option<&str>,
+    turn: usize,
+    phase: &str,
+    task: String,
+) {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let autonomy = autonomy.read().await.level.to_string();
+    bus.send(AppEvent::StatusUpdate {
+        turn,
+        phase: phase.to_string(),
+        autonomy,
+        session_id: session_id.to_string(),
+        task,
     });
 }
 
@@ -12276,6 +12306,15 @@ async fn run_with_presence(
             )
             .unwrap_or_else(|| task_text.clone());
             persistent_diff_tracker.seed_from_session_log(&project.root, &log_dir);
+            emit_external_turn_status(
+                &bus,
+                &autonomy,
+                session_log_id(&session_log).as_deref(),
+                cumulative_stats.rounds.saturating_add(1),
+                "thinking",
+                format!("{} turn in progress", agent.name()),
+            )
+            .await;
             let send_result = if envelope.attachment_frame_ids.is_empty() {
                 agent.send_message(thread, &merged_text).await
             } else {
@@ -13775,6 +13814,15 @@ async fn run_external_agent_mode(
             let side_thread = external_agent::AgentThread {
                 thread_id: side_thread_id.clone(),
             };
+            emit_external_turn_status(
+                &bus,
+                &autonomy,
+                Some(&side_thread_id),
+                *side_round,
+                "thinking",
+                format!("{} side turn in progress", agent.name()),
+            )
+            .await;
             let send_result = if attachments.is_empty() {
                 agent.send_message(&side_thread, &merged).await
             } else {
@@ -13881,6 +13929,15 @@ async fn run_external_agent_mode(
                 .get(&subagent_thread_id)
                 .cloned()
                 .unwrap_or_else(|| thread.thread_id.clone());
+            emit_external_turn_status(
+                &bus,
+                &autonomy,
+                Some(&subagent_thread_id),
+                *subagent_round,
+                "thinking",
+                format!("{} subagent turn in progress", agent.name()),
+            )
+            .await;
             let send_result = if attachments.is_empty() {
                 agent.send_message(&subagent_thread, &merged).await
             } else {
@@ -14335,6 +14392,15 @@ async fn run_external_agent_mode(
             }
         });
         diff_tracker.seed_from_session_log(&project.root, &log_dir);
+        emit_external_turn_status(
+            &bus,
+            &autonomy,
+            live_session_id.as_deref(),
+            round,
+            "thinking",
+            format!("{} turn in progress", agent.name()),
+        )
+        .await;
         let send_result = if attachments.is_empty() {
             agent.send_message(&thread, &merged).await
         } else {

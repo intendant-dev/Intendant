@@ -9828,6 +9828,12 @@ async function main() {
           flushPendingDetachedCodexThreadActions(sid);
         }
       }
+      if (d.event === 'status' && d.session_id && d.phase) {
+        const sid = statusSessionWindowTarget(d.session_id);
+        if (sid && shouldMaterializeStatusSessionWindow(sid)) {
+          updateSessionWindow(sid, { phase: d.phase, ended: false });
+        }
+      }
       if (d.event === 'session_goal') {
         applySessionGoal(d);
       }
@@ -14129,7 +14135,10 @@ function shouldMaterializeStatusSessionWindow(sessionId) {
 function shouldApplyStatusPhaseForSession(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid || sid === daemonSessionFullId) return true;
-  return shouldMaterializeStatusSessionWindow(sid);
+  const targetSid = statusSessionWindowTarget(sid);
+  return !!targetSid
+    && shouldMaterializeStatusSessionWindow(targetSid)
+    && targetSid === resolvePromptTargetSessionId();
 }
 
 function focusSessionWindowFromLifecycle(sessionId) {
@@ -14303,6 +14312,13 @@ function clearSessionWindowPendingActive(sessionId, phase = '') {
   }
 }
 
+function shouldKeepSilentExternalSessionActive(sessionId, win = null) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || sessionWindowIsDetached(sid)) return false;
+  const source = externalSourceForSessionWindow(sid, win);
+  return !!source && source !== 'intendant';
+}
+
 function markSessionWindowPendingActive(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -14319,6 +14335,11 @@ function markSessionWindowPendingActive(sessionId) {
   setTimeout(() => {
     const latest = sessionWindows.get(sid);
     if (!latest || latest.pendingActiveUntil !== expiresAt) return;
+    if (shouldKeepSilentExternalSessionActive(sid, latest)) {
+      latest.pendingActiveUntil = 0;
+      persistSessionWindowState();
+      return;
+    }
     clearSessionWindowPendingActive(sid);
   }, SESSION_PENDING_ACTIVE_MS + 50);
 }
