@@ -5894,6 +5894,7 @@ body.display-fullscreen-open {
   font-weight: 600;
   color: var(--blue);
   font-family: monospace;
+  white-space: nowrap;
 }
 .display-status {
   font-size: 12px;
@@ -19876,9 +19877,10 @@ class DisplaySlot {
     this._boundHandlers = {};
     this.el = document.createElement('div');
     this.el.className = 'display-slot';
+    const label = displayLabel(displayId);
     this.el.innerHTML = `
       <div class="display-toolbar">
-        <span class="display-label">:${displayId}</span>
+        <span class="display-label">${label}</span>
         <span class="display-status" id="ds-status-${displayId}">Connecting...</span>
         <span class="display-input-authority" id="ds-authority-${displayId}" style="display:none" title="Input authority for this display: who can drive keyboard/mouse. Phase 5c."></span>
         <input class="release-note" id="ds-note-${displayId}" placeholder="Note (optional)" style="display:none">
@@ -20799,6 +20801,15 @@ function sharedViewDisplayLabel(displayId, displayTarget) {
   return target;
 }
 
+function displayLabel(displayId, compact = false) {
+  const n = Number(displayId);
+  if (Number.isFinite(n)) {
+    if (n === 0) return compact ? 'Primary' : 'Primary display';
+    return compact ? `Display ${n}` : `Display ${n}`;
+  }
+  return compact ? 'Display' : 'Display';
+}
+
 function clearSharedViewDecorations() {
   for (const slot of displaySlots.values()) {
     slot.el.classList.remove('shared-view-active');
@@ -21007,7 +21018,7 @@ function addDisplayThumb(displayId) {
 
   const thumb = document.createElement('div');
   thumb.className = 'activity-display-thumb';
-  thumb.innerHTML = `<span class="thumb-label">:${displayId}</span>`;
+  thumb.innerHTML = `<span class="thumb-label">${displayLabel(displayId, true)}</span>`;
   thumb.addEventListener('click', (e) => { e.stopPropagation(); toggleDisplayStrip(); }, true);
 
   displayThumbs.set(displayId, thumb);
