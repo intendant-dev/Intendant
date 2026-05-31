@@ -7005,8 +7005,16 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
                             .as_ref()
                             .and_then(|caps| caps.get("codex_context_archive"))
                             .and_then(|v| v.as_str());
+                        let service_tier = capabilities
+                            .as_ref()
+                            .and_then(|caps| caps.get("codex_service_tier"))
+                            .and_then(|v| v.as_str());
                         session_agent_config = Some(crate::session_config::from_wire(
-                            source, command, mode, archive,
+                            source,
+                            command,
+                            mode,
+                            archive,
+                            service_tier,
                         ));
                     }
                 }

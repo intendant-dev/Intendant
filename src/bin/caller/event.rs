@@ -1158,6 +1158,11 @@ pub enum ControlMsg {
         /// "off". Only applies when the resolved agent is Codex.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_context_archive: Option<String>,
+        /// Optional one-shot Codex service tier for this session. "priority"
+        /// enables Codex Fast for future turns. Only applies when the resolved
+        /// agent is Codex.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_service_tier: Option<String>,
         #[serde(default)]
         orchestrate: Option<bool>,
         /// Bypass presence/orchestration, matching StartTask.direct.
@@ -2920,6 +2925,7 @@ mod tests {
                 agent_command: Some("/opt/codex/bin/codex".to_string()),
                 codex_managed_context: Some("managed".to_string()),
                 codex_context_archive: Some("summary".to_string()),
+                codex_service_tier: Some("priority".to_string()),
                 orchestrate: Some(false),
                 direct: Some(true),
                 reference_frame_ids: vec!["display_99-f00001".to_string()],
@@ -3120,7 +3126,7 @@ mod tests {
 
     #[test]
     fn control_msg_create_session_deserialize() {
-        let json = r#"{"action":"create_session","task":"fix bug","name":"Bugfix work","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","codex_managed_context":"managed","codex_context_archive":"exact","direct":true,"attachments":["upload:u1"]}"#;
+        let json = r#"{"action":"create_session","task":"fix bug","name":"Bugfix work","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","codex_managed_context":"managed","codex_context_archive":"exact","codex_service_tier":"priority","direct":true,"attachments":["upload:u1"]}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::CreateSession {
@@ -3131,6 +3137,7 @@ mod tests {
                 agent_command,
                 codex_managed_context,
                 codex_context_archive,
+                codex_service_tier,
                 orchestrate,
                 direct,
                 reference_frame_ids,
@@ -3144,6 +3151,7 @@ mod tests {
                 assert_eq!(agent_command.as_deref(), Some("/opt/codex/bin/codex"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
                 assert_eq!(codex_context_archive.as_deref(), Some("exact"));
+                assert_eq!(codex_service_tier.as_deref(), Some("priority"));
                 assert!(orchestrate.is_none());
                 assert_eq!(direct, Some(true));
                 assert!(reference_frame_ids.is_empty());
