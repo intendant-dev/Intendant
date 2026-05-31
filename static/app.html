@@ -6026,9 +6026,10 @@ body.display-fullscreen-open {
   position: absolute;
   border: 2px solid var(--yellow);
   border-radius: 4px;
+  background: rgba(249, 226, 175, 0.05);
   box-shadow:
-    0 0 0 9999px rgba(0, 0, 0, 0.26),
-    0 0 18px rgba(249, 226, 175, 0.55);
+    0 0 0 1px rgba(17, 17, 27, 0.72),
+    0 0 12px rgba(249, 226, 175, 0.38);
   pointer-events: none;
   z-index: 3;
 }
@@ -19830,6 +19831,7 @@ class DisplaySlot {
     this._streamIntervalId = null;
     this._streamFrameCounter = 0;
     this._streamCanvas = document.createElement('canvas');
+    this._focusResizeObserver = null;
     this._boundHandlers = {};
     this.el = document.createElement('div');
     this.el.className = 'display-slot';
@@ -19871,6 +19873,18 @@ class DisplaySlot {
     this.videoEl.style.width = '100%';
     this.videoEl.style.backgroundColor = '#000';
     this.canvasEl.appendChild(this.videoEl);
+    const rerenderSharedFocus = () => {
+      if (!sharedViewState.visible) return;
+      if (sharedViewState.displayId !== null && Number(this.displayId) !== sharedViewState.displayId) return;
+      renderSharedViewFocus(this, sharedViewState.region, sharedViewState.note);
+    };
+    this.videoEl.addEventListener('loadedmetadata', rerenderSharedFocus);
+    this.videoEl.addEventListener('resize', rerenderSharedFocus);
+    if (typeof ResizeObserver !== 'undefined') {
+      this._focusResizeObserver = new ResizeObserver(rerenderSharedFocus);
+      this._focusResizeObserver.observe(this.canvasEl);
+      this._focusResizeObserver.observe(this.videoEl);
+    }
 
     this.takeBtn.addEventListener('click', () => this.takeControl());
     this.releaseBtn.addEventListener('click', () => this.releaseControl());
@@ -20676,6 +20690,7 @@ class DisplaySlot {
     if (this.pointerChannel) { this.pointerChannel.close(); this.pointerChannel = null; }
     if (this.clipboardChannel) { this.clipboardChannel.close(); this.clipboardChannel = null; }
     if (this.pc) { this.pc.close(); this.pc = null; }
+    if (this._focusResizeObserver) { this._focusResizeObserver.disconnect(); this._focusResizeObserver = null; }
     this.statusEl.className = 'display-status error';
   }
 }
@@ -20767,10 +20782,27 @@ function renderSharedViewFocus(slot, region, note) {
   const y = Math.max(0, Math.min(1, Number(region.y) || 0));
   const w = Math.max(0.01, Math.min(1 - x, Number(region.width) || 0.01));
   const h = Math.max(0.01, Math.min(1 - y, Number(region.height) || 0.01));
-  focus.style.left = (x * 100).toFixed(3) + '%';
-  focus.style.top = (y * 100).toFixed(3) + '%';
-  focus.style.width = (w * 100).toFixed(3) + '%';
-  focus.style.height = (h * 100).toFixed(3) + '%';
+  const video = slot.videoEl;
+  const canvasRect = slot.canvasEl.getBoundingClientRect();
+  const videoRect = video ? video.getBoundingClientRect() : null;
+  const videoWidth = video && Number(video.videoWidth);
+  const videoHeight = video && Number(video.videoHeight);
+  if (videoRect && videoRect.width > 0 && videoRect.height > 0 && canvasRect.width > 0 && canvasRect.height > 0 && videoWidth > 0 && videoHeight > 0) {
+    const scale = Math.min(videoRect.width / videoWidth, videoRect.height / videoHeight);
+    const frameW = videoWidth * scale;
+    const frameH = videoHeight * scale;
+    const frameX = videoRect.left - canvasRect.left + ((videoRect.width - frameW) / 2);
+    const frameY = videoRect.top - canvasRect.top + ((videoRect.height - frameH) / 2);
+    focus.style.left = (frameX + x * frameW).toFixed(1) + 'px';
+    focus.style.top = (frameY + y * frameH).toFixed(1) + 'px';
+    focus.style.width = (w * frameW).toFixed(1) + 'px';
+    focus.style.height = (h * frameH).toFixed(1) + 'px';
+  } else {
+    focus.style.left = (x * 100).toFixed(3) + '%';
+    focus.style.top = (y * 100).toFixed(3) + '%';
+    focus.style.width = (w * 100).toFixed(3) + '%';
+    focus.style.height = (h * 100).toFixed(3) + '%';
+  }
   focus.dataset.note = note || '';
 }
 
@@ -20814,7 +20846,7 @@ function applySharedViewToSlot(slot) {
   }
   updateSharedViewBanner();
   slot.el.classList.add('shared-view-active');
-  renderSharedViewFocus(slot, sharedViewState.region, sharedViewState.note || sharedViewState.reason);
+  renderSharedViewFocus(slot, sharedViewState.region, sharedViewState.note);
   if (activeTab === 'displays') {
     requestAnimationFrame(() => {
       try { slot.el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (_) {}
