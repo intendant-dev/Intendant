@@ -9817,6 +9817,13 @@ async function main() {
       if (d.event === 'session_capabilities') {
         applySessionCapabilities(d);
       }
+      if (d.event === 'session_attached') {
+        const sid = String(d.session_id || d.sessionId || '').trim();
+        if (sid) {
+          setSessionWindowDetached(sid, false);
+          flushPendingDetachedCodexThreadActions(sid);
+        }
+      }
       if (d.event === 'session_goal') {
         applySessionGoal(d);
       }
