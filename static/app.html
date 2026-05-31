@@ -16215,11 +16215,14 @@ function codexThreadActionStateForSession(sessionId, op) {
   if (sessionWindowIsSubagent(sessionId)) {
     return { allowed: false, reason: 'Unsupported for Codex subagent threads' };
   }
-  if (!isSessionWindowEffectivelyActive(sessionId)) {
+  // Codex thread actions operate on the attached backend thread, not on an
+  // active turn. An attached idle Codex app-server can fork/side/compact; only
+  // detached history cards need the attach-before-dispatch path.
+  if (sessionWindowIsDetached(sessionId)) {
     if (canQueueDetachedCodexThreadAction(sessionId)) {
       return { allowed: true, reason: 'Attach session to run this action' };
     }
-    return { allowed: false, reason: 'Start a task in this Codex session first' };
+    return { allowed: false, reason: 'Attach this Codex session before running thread actions' };
   }
   return { allowed: true, reason: '' };
 }
