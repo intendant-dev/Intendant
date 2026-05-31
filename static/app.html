@@ -9768,6 +9768,8 @@ async function main() {
     try {
       const d = typeof msg === 'string' ? JSON.parse(msg) : msg;
       if (d.event === 'context_snapshot') {
+        const contextSid = sessionWindowTargetForLogSession(d.session_id);
+        if (contextSid) markSessionWindowPendingActive(contextSid);
         handleContextSnapshot(d);
         return;
       }
@@ -23287,6 +23289,7 @@ let contextLastAnalysis = null;
 let contextListenersWired = false;
 let contextFocusMode = false;
 let contextRawOpen = false;
+let contextRenderScheduled = false;
 
 const CONTEXT_GLOBAL_SESSION = '__global__';
 const CONTEXT_CATEGORY_ORDER = [
@@ -23387,12 +23390,12 @@ function contextSessionKey(snapshot) {
 
 function contextSnapshotFingerprint(snapshot) {
   const raw = Object.prototype.hasOwnProperty.call(snapshot || {}, 'raw') ? snapshot.raw : snapshot;
-  let rawSize = 0;
-  try {
-    rawSize = JSON.stringify(raw).length;
-  } catch (_) {
-    rawSize = String(raw || '').length;
-  }
+  const rawMeta = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw._intendant_context || raw.context || {})
+    : {};
+  const rawMarker = rawMeta.raw_hash || rawMeta.request_id || rawMeta.raw_payload_id || (
+    typeof raw === 'string' ? `${raw.length}:${raw.slice(0, 64)}` : ''
+  );
   return [
     contextSessionKey(snapshot),
     snapshot?.ts || '',
@@ -23403,7 +23406,7 @@ function contextSnapshotFingerprint(snapshot) {
     snapshot?.format || '',
     snapshot?.token_count ?? '',
     snapshot?.item_count ?? '',
-    rawSize,
+    rawMarker,
   ].join('|');
 }
 
@@ -23471,7 +23474,7 @@ function handleContextReplaySnapshots(snapshots) {
     return String(a?.request_id || '').localeCompare(String(b?.request_id || ''));
   });
   for (const snapshot of sorted) storeContextSnapshot(snapshot);
-  renderContextPane();
+  if (contextPaneVisible()) scheduleContextPaneRender();
 }
 
 function contextTimelineForForegroundSession() {
@@ -24330,7 +24333,22 @@ function contextStopThreeAnimation() {
 
 function handleContextSnapshot(snapshot) {
   storeContextSnapshot(snapshot);
-  renderContextPane();
+  if (!contextPaneVisible()) return;
+  scheduleContextPaneRender();
+}
+
+function contextPaneVisible() {
+  return activeTab === 'activity' && activeActivitySubtab === 'context';
+}
+
+function scheduleContextPaneRender() {
+  if (contextRenderScheduled) return;
+  contextRenderScheduled = true;
+  requestAnimationFrame(() => {
+    contextRenderScheduled = false;
+    if (!contextPaneVisible()) return;
+    renderContextPane();
+  });
 }
 
 function contextSnapshotForForegroundSession() {
