@@ -8,6 +8,7 @@ mod context_rewind;
 mod control;
 mod control_plane;
 mod conversation;
+mod ctl;
 mod daemon_log_tee;
 mod debug;
 mod diagnostics;
@@ -5880,6 +5881,10 @@ fn print_help() {
         "                                   --advertise-url wss://node.tail-abcd.ts.net:8443/ws"
     );
     println!("    --help, -h            Show this help message");
+    println!();
+    println!("SUBCOMMANDS:");
+    println!("    ctl                   Control a running Intendant daemon over MCP");
+    println!("    lan                   Configure LAN mTLS access");
     println!();
     println!("SESSION LOGS:");
     println!(
@@ -16193,6 +16198,20 @@ async fn main() -> Result<(), CallerError> {
             eprintln!("error: `intendant lan` is not supported on Windows yet");
             std::process::exit(1);
         }
+    }
+
+    // Intercept `intendant ctl <command>` before normal project/provider
+    // initialization. The ctl namespace talks to a running daemon over MCP and
+    // should stay a lightweight agent-facing control surface.
+    if env::args().nth(1).as_deref() == Some("ctl") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        return match ctl::run(argv).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
     }
 
     // Load .env: cwd (+ parents) first, then project root, then ~/.config/intendant/

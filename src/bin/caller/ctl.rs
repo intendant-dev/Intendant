@@ -22,16 +22,8 @@ struct CommandArgs {
     bools: BTreeSet<String>,
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(e) = run().await {
-        eprintln!("intendantctl: {e}");
-        std::process::exit(1);
-    }
-}
-
-async fn run() -> Result<(), String> {
-    let (config, command) = parse_global_args(std::env::args().skip(1).collect())?;
+pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
+    let (config, command) = parse_global_args(raw_args)?;
     let (config, command) = parse_output_flags(config, command);
     if command.is_empty() {
         print_help();
@@ -64,7 +56,7 @@ async fn run() -> Result<(), String> {
         "audio" => run_audio(&client, &config, &command[1..]).await?,
         other => {
             return Err(format!(
-                "unknown command '{other}'. Run `intendantctl --help`."
+                "unknown command '{other}'. Run `intendant ctl --help`."
             ));
         }
     }
@@ -1329,9 +1321,9 @@ fn ensure_help(raw: &[String], help: fn()) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "intendantctl controls a running Intendant daemon through its HTTP MCP endpoint.\n\
+        "intendant ctl controls a running Intendant daemon through its HTTP MCP endpoint.\n\
 \n\
-Usage: intendantctl [global flags] <command> [args]\n\
+Usage: intendant ctl [global flags] <command> [args]\n\
 \n\
 Global flags:\n\
   --url URL                 MCP URL (default http://localhost:8765/mcp)\n\
@@ -1356,17 +1348,17 @@ Commands:\n\
   context                   Managed-context rewind/backout controls\n\
   audio                     Live-audio controls\n\
 \n\
-Run `intendantctl <command> --help` for focused help."
+Run `intendant ctl <command> --help` for focused help."
     );
 }
 
 fn help_status() {
-    println!("Usage: intendantctl status [--json|--raw]");
+    println!("Usage: intendant ctl status [--json|--raw]");
 }
 
 fn help_logs() {
     println!(
-        "Usage: intendantctl logs [--since-id N] [--level LEVEL] [--limit N]\n\
+        "Usage: intendant ctl logs [--since-id N] [--level LEVEL] [--limit N]\n\
 Levels include info, model, agent, error, warn, subagent, debug."
     );
 }
@@ -1374,42 +1366,42 @@ Levels include info, model, agent, error, warn, subagent, debug."
 fn help_tools() {
     println!(
         "Usage:\n\
-  intendantctl tools list\n\
-  intendantctl tools schema TOOL\n\
-  intendantctl tools call TOOL [--args JSON|@file|-] [--arg key=value]\n\
+  intendant ctl tools list\n\
+  intendant ctl tools schema TOOL\n\
+  intendant ctl tools call TOOL [--args JSON|@file|-] [--arg key=value]\n\
 \n\
 Use this for lazy discovery of rare or newly-added Intendant capabilities."
     );
 }
 
 fn help_tools_list() {
-    println!("Usage: intendantctl tools list [--json|--raw]");
+    println!("Usage: intendant ctl tools list [--json|--raw]");
 }
 
 fn help_tools_call() {
     println!(
-        "Usage: intendantctl tools call TOOL [--args JSON|@file|-] [--arg key=value]\n\
+        "Usage: intendant ctl tools call TOOL [--args JSON|@file|-] [--arg key=value]\n\
 Examples:\n\
-  intendantctl tools call get_status\n\
-  intendantctl tools call get_logs --arg limit=10"
+  intendant ctl tools call get_status\n\
+  intendant ctl tools call get_logs --arg limit=10"
     );
 }
 
 fn help_display() {
     println!(
         "Usage:\n\
-  intendantctl display list\n\
-  intendantctl display frames [--stream NAME] [--count N]\n\
-  intendantctl display read-frame [latest|ID] [--stream NAME]\n\
-  intendantctl display screenshot [--target TARGET] [--output out.png]\n\
-  intendantctl display take DISPLAY_ID\n\
-  intendantctl display release DISPLAY_ID [--note TEXT]"
+  intendant ctl display list\n\
+  intendant ctl display frames [--stream NAME] [--count N]\n\
+  intendant ctl display read-frame [latest|ID] [--stream NAME]\n\
+  intendant ctl display screenshot [--target TARGET] [--output out.png]\n\
+  intendant ctl display take DISPLAY_ID\n\
+  intendant ctl display release DISPLAY_ID [--note TEXT]"
     );
 }
 
 fn help_display_screenshot() {
     println!(
-        "Usage: intendantctl display screenshot [--target TARGET] [--output out.png]\n\
+        "Usage: intendant ctl display screenshot [--target TARGET] [--output out.png]\n\
 Targets include user_session, display_99, 99, and legacy :99."
     );
 }
@@ -1417,14 +1409,14 @@ Targets include user_session, display_99, 99, and legacy :99."
 fn help_cu() {
     println!(
         "Usage:\n\
-  intendantctl cu actions --actions JSON|@file|- [--target TARGET] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
-  intendantctl cu screenshot [--target TARGET] [--output out.png]"
+  intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
+  intendant ctl cu screenshot [--target TARGET] [--output out.png]"
     );
 }
 
 fn help_cu_actions() {
     println!(
-        "Usage: intendantctl cu actions --actions JSON|@file|- [--target TARGET] [--coordinate-space pixel|normalized_1000]\n\
+        "Usage: intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--coordinate-space pixel|normalized_1000]\n\
 Actions are the same tagged objects accepted by execute_cu_actions: click, double_click, type, key, scroll, move_mouse, drag, screenshot, wait."
     );
 }
@@ -1432,50 +1424,50 @@ Actions are the same tagged objects accepted by execute_cu_actions: click, doubl
 fn help_shared() {
     println!(
         "Usage:\n\
-  intendantctl shared show [--target TARGET|--display-id ID] [--reason TEXT] [--focus x,y,w,h]\n\
-  intendantctl shared focus --region x,y,w,h [--target TARGET|--display-id ID] [--note TEXT]\n\
-  intendantctl shared input [--target TARGET|--display-id ID] [--reason TEXT]\n\
-  intendantctl shared capture [--target TARGET|--display-id ID] [--output out.png]\n\
-  intendantctl shared hide [--reason TEXT]\n\
+  intendant ctl shared show [--target TARGET|--display-id ID] [--reason TEXT] [--focus x,y,w,h]\n\
+  intendant ctl shared focus --region x,y,w,h [--target TARGET|--display-id ID] [--note TEXT]\n\
+  intendant ctl shared input [--target TARGET|--display-id ID] [--reason TEXT]\n\
+  intendant ctl shared capture [--target TARGET|--display-id ID] [--output out.png]\n\
+  intendant ctl shared hide [--reason TEXT]\n\
 \n\
 Regions are normalized fractions from 0.0 to 1.0."
     );
 }
 
 fn help_shared_focus() {
-    println!("Usage: intendantctl shared focus --region x,y,width,height [--note TEXT]");
+    println!("Usage: intendant ctl shared focus --region x,y,width,height [--note TEXT]");
 }
 
 fn help_approval() {
     println!(
         "Usage:\n\
-  intendantctl approval pending\n\
-  intendantctl approval approve ID\n\
-  intendantctl approval deny ID\n\
-  intendantctl approval skip ID\n\
-  intendantctl approval approve-all ID"
+  intendant ctl approval pending\n\
+  intendant ctl approval approve ID\n\
+  intendant ctl approval deny ID\n\
+  intendant ctl approval skip ID\n\
+  intendant ctl approval approve-all ID"
     );
 }
 
 fn help_input() {
     println!(
         "Usage:\n\
-  intendantctl input pending\n\
-  intendantctl input respond TEXT..."
+  intendant ctl input pending\n\
+  intendant ctl input respond TEXT..."
     );
 }
 
 fn help_settings() {
     println!(
         "Usage:\n\
-  intendantctl settings autonomy low|medium|high|full\n\
-  intendantctl settings verbosity quiet|normal|verbose|debug"
+  intendant ctl settings autonomy low|medium|high|full\n\
+  intendant ctl settings verbosity quiet|normal|verbose|debug"
     );
 }
 
 fn help_task() {
     println!(
-        "Usage: intendantctl task start [--task TEXT] [--orchestrate|--direct] [--display-target TARGET] [--frame ID]\n\
+        "Usage: intendant ctl task start [--task TEXT] [--orchestrate|--direct] [--display-target TARGET] [--frame ID]\n\
 If --task is omitted, remaining positional text becomes the task."
     );
 }
@@ -1483,29 +1475,29 @@ If --task is omitted, remaining positional text becomes the task."
 fn help_controller() {
     println!(
         "Usage:\n\
-  intendantctl controller status\n\
-  intendantctl controller restart-status\n\
-  intendantctl controller halt [--one-shot]\n\
-  intendantctl controller clear-halt\n\
-  intendantctl controller intervene stop|abort\n\
-  intendantctl controller schedule --controller-id ID --goal TEXT [--after turn_end|now]\n\
-  intendantctl controller cancel [--restart-id ID]\n\
-  intendantctl controller complete --restart-id ID --token TOKEN [--status TEXT] [--summary TEXT]"
+  intendant ctl controller status\n\
+  intendant ctl controller restart-status\n\
+  intendant ctl controller halt [--one-shot]\n\
+  intendant ctl controller clear-halt\n\
+  intendant ctl controller intervene stop|abort\n\
+  intendant ctl controller schedule --controller-id ID --goal TEXT [--after turn_end|now]\n\
+  intendant ctl controller cancel [--restart-id ID]\n\
+  intendant ctl controller complete --restart-id ID --token TOKEN [--status TEXT] [--summary TEXT]"
     );
 }
 
 fn help_context() {
     println!(
         "Usage:\n\
-  intendantctl --managed-context managed context rewind --item-id ID --position before|after --reason TEXT --primer TEXT\n\
-  intendantctl --managed-context managed context backout --record-id ID [--mode inspect|restore|fork|backout]\n\
-  intendantctl context claim-fission --group-id ID --branch-session-id ID"
+  intendant ctl --managed-context managed context rewind --item-id ID --position before|after --reason TEXT --primer TEXT\n\
+  intendant ctl --managed-context managed context backout --record-id ID [--mode inspect|restore|fork|backout]\n\
+  intendant ctl context claim-fission --group-id ID --branch-session-id ID"
     );
 }
 
 fn help_audio() {
     println!(
-        "Usage: intendantctl audio spawn --args JSON|@file|-\n\
+        "Usage: intendant ctl audio spawn --args JSON|@file|-\n\
 The JSON object is the spawn_live_audio parameter object."
     );
 }

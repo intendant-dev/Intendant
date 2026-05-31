@@ -1206,6 +1206,7 @@ impl CodexAgent {
     }
 
     fn intendant_mcp_url(&self, port: u16) -> String {
+        let base_url = Self::intendant_mcp_base_url(port);
         let mode = if self.managed_context {
             "managed"
         } else {
@@ -1218,15 +1219,43 @@ impl CodexAgent {
             .filter(|s| !s.is_empty())
         {
             Some(session_id) => format!(
-                "http://localhost:{}/mcp?session_id={}&managed_context={}&tool_profile=core",
-                port,
+                "{}?session_id={}&managed_context={}&tool_profile=core",
+                base_url,
                 encode_mcp_query_value(session_id),
                 mode
             ),
-            None => format!(
-                "http://localhost:{}/mcp?managed_context={}&tool_profile=core",
-                port, mode
-            ),
+            None => format!("{}?managed_context={}&tool_profile=core", base_url, mode),
+        }
+    }
+
+    fn intendant_mcp_base_url(port: u16) -> String {
+        format!("http://localhost:{port}/mcp")
+    }
+
+    fn intendant_managed_context_mode(&self) -> &'static str {
+        if self.managed_context {
+            "managed"
+        } else {
+            "vanilla"
+        }
+    }
+
+    fn add_intendant_ctl_env(&self, command: &mut tokio::process::Command, port: u16) {
+        command.env("INTENDANT_MCP_URL", Self::intendant_mcp_base_url(port));
+        command.env(
+            "INTENDANT_MANAGED_CONTEXT",
+            self.intendant_managed_context_mode(),
+        );
+        if let Some(session_id) = self
+            .mcp_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            command.env("INTENDANT_SESSION_ID", session_id);
+        }
+        if let Ok(current_exe) = std::env::current_exe() {
+            command.env("INTENDANT", current_exe);
         }
     }
 
@@ -4203,7 +4232,8 @@ impl ExternalAgent for CodexAgent {
         // appended here as `-c key=value` overrides so Codex's app-server picks
         // them up exactly as if they had been written to `~/.codex/config.toml`
         // before launch.
-        let mcp_url = self.intendant_mcp_url(web_port.unwrap_or(8765));
+        let effective_web_port = web_port.unwrap_or(8765);
+        let mcp_url = self.intendant_mcp_url(effective_web_port);
         let mut args: Vec<String> = vec![
             "app-server".to_string(),
             "-c".to_string(),
@@ -4256,6 +4286,7 @@ impl ExternalAgent for CodexAgent {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
+        self.add_intendant_ctl_env(&mut command, effective_web_port);
         if let Some(root) = &self.request_trace_root {
             std::fs::create_dir_all(root)?;
             command.env("CODEX_ROLLOUT_TRACE_ROOT", root);
@@ -7471,6 +7502,27 @@ mod tests {
             url,
             "http://localhost:8765/mcp?session_id=session%20with%20spaces&managed_context=managed&tool_profile=core"
         );
+    }
+
+    #[test]
+    fn intendant_ctl_env_uses_base_mcp_url_and_context_mode() {
+        let agent = CodexAgent::with_options(
+            "codex".to_string(),
+            None,
+            "never".to_string(),
+            "workspace-write".to_string(),
+            Some(8765),
+            CodexAgentOptions {
+                managed_context: true,
+                ..CodexAgentOptions::default()
+            },
+        );
+
+        assert_eq!(
+            CodexAgent::intendant_mcp_base_url(9876),
+            "http://localhost:9876/mcp"
+        );
+        assert_eq!(agent.intendant_managed_context_mode(), "managed");
     }
 
     #[tokio::test]

@@ -58,7 +58,7 @@ Add Intendant to your MCP client config (Claude Code
 
 The full MCP tool surface (dispatched in `call_tool_by_name`) is broad. For
 model clients that front-load tool schemas into every request, prefer the
-HTTP transport's `tool_profile=core` query parameter and the `intendantctl`
+HTTP transport's `tool_profile=core` query parameter and the `intendant ctl`
 CLI for lazy discovery. `tool_profile=core` advertises only status, shared-view
 collaboration, and managed-context rewind/backout tools when managed context is
 enabled; omitting `tool_profile` keeps the historical full tool list.
@@ -67,10 +67,10 @@ The CLI mirrors the broad surface without loading every schema into model
 context:
 
 ```bash
-intendantctl --help
-intendantctl tools list
-intendantctl tools schema take_screenshot
-intendantctl display screenshot --target user_session --output screen.png
+"${INTENDANT:-intendant}" ctl --help
+"${INTENDANT:-intendant}" ctl tools list
+"${INTENDANT:-intendant}" ctl tools schema take_screenshot
+"${INTENDANT:-intendant}" ctl display screenshot --target user_session --output screen.png
 ```
 
 Full MCP tool groups:

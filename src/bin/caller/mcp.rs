@@ -630,7 +630,7 @@ fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&
     match profile.as_str() {
         "full" => true,
         // Codex should learn the broad Intendant surface lazily through
-        // `intendantctl --help` instead of receiving every MCP schema up front.
+        // `intendant ctl --help` instead of receiving every MCP schema up front.
         // Keep the tiny always-useful status/collaboration set first-class.
         "core" | "codex-core" | "cli" | "minimal" => {
             matches!(
