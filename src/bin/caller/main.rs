@@ -2418,6 +2418,11 @@ fn codex_drain_session_capabilities(
     service_tier: Option<&str>,
 ) -> types::SessionCapabilities {
     let launch = crate::session_config::read_log_dir_config(config.log_dir);
+    let effective_service_tier = service_tier.or_else(|| {
+        launch
+            .as_ref()
+            .and_then(|cfg| cfg.codex_service_tier.as_deref())
+    });
     types::SessionCapabilities {
         follow_up: true,
         steer: true,
@@ -2430,8 +2435,46 @@ fn codex_drain_session_capabilities(
             .as_ref()
             .and_then(|cfg| cfg.codex_context_archive.clone()),
         codex_command: launch.as_ref().and_then(|cfg| cfg.agent_command.clone()),
-        codex_fast_mode: Some(codex_service_tier_is_fast(service_tier)),
-        codex_service_tier: codex_service_tier_value(service_tier),
+        codex_fast_mode: Some(codex_service_tier_is_fast(effective_service_tier)),
+        codex_service_tier: codex_service_tier_value(effective_service_tier),
+    }
+}
+
+fn persist_codex_service_tier_for_drain(
+    config: &DrainConfig<'_>,
+    session_id: Option<&str>,
+    service_tier: Option<&str>,
+) {
+    let mut launch = crate::session_config::read_log_dir_config(config.log_dir).unwrap_or_default();
+    if launch.source.is_none() {
+        launch.source = Some("codex".to_string());
+    }
+    launch.codex_service_tier = codex_service_tier_value(service_tier);
+    if let Err(e) = crate::session_config::write_log_dir_config(config.log_dir, &launch) {
+        slog(config.session_log, |l| {
+            l.debug(&format!("Persist Codex service tier failed: {e}"))
+        });
+    }
+
+    let home = crate::platform::home_dir();
+    for id in [
+        session_id,
+        config.session_id.as_deref(),
+        config.alias_session_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|id| !id.is_empty())
+    {
+        if let Err(e) = crate::session_config::write_external_overlay(&home, "codex", id, &launch) {
+            slog(config.session_log, |l| {
+                l.debug(&format!(
+                    "Persist Codex service tier overlay for {} failed: {e}",
+                    short_external_session_id(id)
+                ))
+            });
+        }
     }
 }
 
@@ -2824,6 +2867,11 @@ async fn handle_external_thread_action(
 
     if success && op == "fast" {
         let service_tier = agent.service_tier().map(str::to_string);
+        persist_codex_service_tier_for_drain(
+            config,
+            result_session_id.as_deref(),
+            service_tier.as_deref(),
+        );
         emit_codex_session_capabilities_for_drain(
             config,
             result_session_id.as_deref(),
@@ -11907,10 +11955,33 @@ async fn run_with_presence(
                     let service_tier = persistent_agent
                         .as_ref()
                         .and_then(|agent| agent.service_tier().map(str::to_string));
-                    emit_codex_session_capabilities_for_project(
-                        &bus,
+                    let drain_config = DrainConfig {
+                        bus: &bus,
+                        web_port,
+                        session_id: local_session_id.clone(),
+                        alias_session_id: persistent_thread
+                            .as_ref()
+                            .map(|thread| thread.thread_id.clone()),
+                        autonomy: autonomy.clone(),
+                        session_log: &session_log,
+                        project_root: &project.root,
+                        log_dir: &log_dir,
+                        approval_registry: &approval_registry,
+                        json_approval: None,
+                        agent_source: Some("Codex".to_string()),
+                        suppress_agent_started: true,
+                        persist_model_responses_inline: false,
+                        headless: false,
+                        context_injection: &context_injection,
+                    };
+                    persist_codex_service_tier_for_drain(
+                        &drain_config,
                         result_session_id.as_deref(),
-                        &project,
+                        service_tier.as_deref(),
+                    );
+                    emit_codex_session_capabilities_for_drain(
+                        &drain_config,
+                        result_session_id.as_deref(),
                         service_tier.as_deref(),
                     );
                 }
@@ -13395,7 +13466,10 @@ async fn run_external_agent_mode(
         }
     };
     let backend_session_id = thread.thread_id.clone();
-    let session_agent_config = session_config::from_project(&backend, &project);
+    let mut session_agent_config = session_config::from_project(&backend, &project);
+    if backend == external_agent::AgentBackend::Codex {
+        session_agent_config.codex_service_tier = agent.service_tier().map(str::to_string);
+    }
     if let Err(e) = session_config::write_log_dir_config(&log_dir, &session_agent_config) {
         slog(&session_log, |l| {
             l.debug(&format!("Persist session launch config failed: {e}"))

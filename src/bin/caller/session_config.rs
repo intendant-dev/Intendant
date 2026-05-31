@@ -24,6 +24,8 @@ pub struct SessionAgentConfig {
     pub codex_managed_context: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_context_archive: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_service_tier: Option<String>,
 }
 
 impl SessionAgentConfig {
@@ -32,6 +34,7 @@ impl SessionAgentConfig {
             && self.agent_command.is_none()
             && self.codex_managed_context.is_none()
             && self.codex_context_archive.is_none()
+            && self.codex_service_tier.is_none()
     }
 
     pub fn merge_missing_from(&mut self, fallback: SessionAgentConfig) {
@@ -47,6 +50,9 @@ impl SessionAgentConfig {
         if self.codex_context_archive.is_none() {
             self.codex_context_archive = fallback.codex_context_archive;
         }
+        if self.codex_service_tier.is_none() {
+            self.codex_service_tier = fallback.codex_service_tier;
+        }
     }
 }
 
@@ -57,11 +63,18 @@ pub fn normalize_agent_command(command: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+pub fn normalize_codex_service_tier(tier: Option<&str>) -> Option<String> {
+    tier.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 pub fn from_wire(
     source: Option<&str>,
     agent_command: Option<&str>,
     codex_managed_context: Option<&str>,
     codex_context_archive: Option<&str>,
+    codex_service_tier: Option<&str>,
 ) -> SessionAgentConfig {
     let source = source
         .map(crate::session_names::normalize_source)
@@ -74,11 +87,16 @@ pub fn from_wire(
         Some("codex") => codex_context_archive.map(crate::project::normalize_codex_context_archive),
         _ => None,
     };
+    let codex_service_tier = match source.as_deref() {
+        Some("codex") => normalize_codex_service_tier(codex_service_tier),
+        _ => None,
+    };
     SessionAgentConfig {
         source,
         agent_command: normalize_agent_command(agent_command),
         codex_managed_context,
         codex_context_archive,
+        codex_service_tier,
     }
 }
 
@@ -93,18 +111,21 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             codex_context_archive: Some(crate::project::normalize_codex_context_archive(
                 &project.config.agent.codex.context_archive,
             )),
+            codex_service_tier: None,
         },
         AgentBackend::ClaudeCode => SessionAgentConfig {
             source: Some("claude-code".to_string()),
             agent_command: Some(project.config.agent.claude_code.command.clone()),
             codex_managed_context: None,
             codex_context_archive: None,
+            codex_service_tier: None,
         },
         AgentBackend::GeminiCli => SessionAgentConfig {
             source: Some("gemini".to_string()),
             agent_command: Some(project.config.agent.gemini_cli.command.clone()),
             codex_managed_context: None,
             codex_context_archive: None,
+            codex_service_tier: None,
         },
     }
 }
@@ -166,6 +187,9 @@ pub fn read_log_dir_config(log_dir: &Path) -> Option<SessionAgentConfig> {
     }
     if let Some(mode) = config.codex_context_archive.take() {
         config.codex_context_archive = Some(crate::project::normalize_codex_context_archive(&mode));
+    }
+    if let Some(tier) = config.codex_service_tier.take() {
+        config.codex_service_tier = normalize_codex_service_tier(Some(&tier));
     }
     (!config.is_empty()).then_some(config)
 }
@@ -534,11 +558,13 @@ mod tests {
             Some("  /tmp/codex  "),
             Some("true"),
             Some("raw"),
+            Some(" priority "),
         );
         assert_eq!(cfg.source.as_deref(), Some("codex"));
         assert_eq!(cfg.agent_command.as_deref(), Some("/tmp/codex"));
         assert_eq!(cfg.codex_managed_context.as_deref(), Some("managed"));
         assert_eq!(cfg.codex_context_archive.as_deref(), Some("exact"));
+        assert_eq!(cfg.codex_service_tier.as_deref(), Some("priority"));
     }
 
     #[test]
@@ -549,6 +575,7 @@ mod tests {
             Some("/tmp/codex"),
             Some("managed"),
             Some("summary"),
+            Some("priority"),
         );
         write_external_overlay(home.path(), "codex", "thread-1", &cfg).unwrap();
         let loaded = lookup_external_overlay(home.path(), "codex", "thread-1").unwrap();
@@ -569,6 +596,7 @@ mod tests {
             Some("/tmp/codex"),
             Some("managed"),
             Some("off"),
+            None,
         );
         write_external_overlay(home.path(), "codex", "thread-1", &cfg).unwrap();
 

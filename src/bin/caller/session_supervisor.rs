@@ -369,6 +369,7 @@ impl SessionSupervisor {
                 agent_command,
                 codex_managed_context,
                 codex_context_archive,
+                codex_service_tier,
                 orchestrate,
                 direct,
                 reference_frame_ids,
@@ -422,6 +423,7 @@ impl SessionSupervisor {
                         || agent_command.is_some()
                         || codex_managed_context.is_some()
                         || codex_context_archive.is_some()
+                        || codex_service_tier.is_some()
                         || name.is_some()
                     {
                         self.warn(
@@ -445,7 +447,7 @@ impl SessionSupervisor {
                     reference_frame_ids,
                     display_target,
                     attachments,
-                    None,
+                    codex_service_tier,
                 )
                 .await;
             }
@@ -867,6 +869,19 @@ impl SessionSupervisor {
                 return;
             }
         }
+        let codex_service_tier =
+            normalize_session_codex_service_tier(codex_service_tier.as_deref());
+        if codex_service_tier.is_some() {
+            match backend.as_ref() {
+                Some(external_agent::AgentBackend::Codex) => {}
+                Some(_) | None => {
+                    self.loop_error(
+                        "Session create failed: codex_service_tier requires Codex".to_string(),
+                    );
+                    return;
+                }
+            }
+        }
         if let Some(backend) = backend.as_ref() {
             let config = crate::session_config::from_project(backend, &project);
             if let Err(e) = crate::session_config::write_log_dir_config(&log_dir, &config) {
@@ -978,6 +993,7 @@ impl SessionSupervisor {
                 agent_command.as_deref(),
                 codex_managed_context.as_deref(),
                 codex_context_archive.as_deref(),
+                None,
             );
             if let Some(persisted) = crate::session_config::load_for_resume(
                 &crate::platform::home_dir(),
@@ -1065,6 +1081,9 @@ impl SessionSupervisor {
                 if let Some(config) = session_agent_config.as_ref() {
                     let _ = crate::session_config::write_log_dir_config(&log_dir, config);
                 }
+                let codex_service_tier = session_agent_config
+                    .as_ref()
+                    .and_then(|config| config.codex_service_tier.clone());
                 let intendant_session_id = session_log
                     .lock()
                     .map(|log| log.session_id().to_string())
@@ -1084,7 +1103,7 @@ impl SessionSupervisor {
                     Some(resume_token.clone()),
                     false,
                     Some(ready_tx),
-                    None,
+                    codex_service_tier,
                 )
                 .await;
                 self.clear_external_attach_request(&external_attach_keys)
@@ -1164,6 +1183,9 @@ impl SessionSupervisor {
         if let Some(config) = session_agent_config.as_ref() {
             let _ = crate::session_config::write_log_dir_config(&log_dir, config);
         }
+        let codex_service_tier = session_agent_config
+            .as_ref()
+            .and_then(|config| config.codex_service_tier.clone());
         self.activate_shared_session(session_log.clone()).await;
         self.config.bus.send(AppEvent::SessionStarted {
             session_id: live_session_id.clone(),
@@ -1215,7 +1237,7 @@ impl SessionSupervisor {
             Some(resume_token),
             false,
             None,
-            None,
+            codex_service_tier,
         )
         .await;
     }
@@ -2281,6 +2303,7 @@ impl SessionSupervisor {
             agent_command.as_deref(),
             codex_managed_context.as_deref(),
             codex_context_archive.as_deref(),
+            None,
         );
         if config.is_empty() {
             self.loop_error("Session config failed: no launch settings supplied".to_string());
@@ -2842,6 +2865,12 @@ fn normalize_session_codex_managed_context(mode: Option<&str>) -> Option<String>
 
 fn normalize_session_codex_context_archive(mode: Option<&str>) -> Option<String> {
     mode.map(crate::project::normalize_codex_context_archive)
+}
+
+fn normalize_session_codex_service_tier(tier: Option<&str>) -> Option<String> {
+    tier.map(str::trim)
+        .filter(|tier| !tier.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn normalize_session_name_option(name: Option<&str>) -> Result<Option<String>, String> {
