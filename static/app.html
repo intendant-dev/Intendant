@@ -3620,9 +3620,39 @@ body.context-focus-active {
 }
 .sessions-new-agent-row {
   display: grid;
-  grid-template-columns: minmax(140px, 0.35fr) minmax(220px, 1fr) minmax(130px, 0.35fr) minmax(130px, 0.35fr);
+  grid-template-columns: minmax(130px, 0.34fr) minmax(210px, 1fr) minmax(120px, 0.34fr) minmax(120px, 0.34fr) minmax(90px, 0.22fr);
   gap: 10px;
   align-items: end;
+}
+.sessions-new-fast-toggle {
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: none;
+  box-sizing: border-box;
+  cursor: pointer;
+}
+.sessions-new-fast-toggle input {
+  margin: 0;
+  accent-color: var(--green);
+}
+.sessions-new-fast-toggle.active {
+  border-color: rgba(166, 227, 161, 0.38);
+  background: rgba(166, 227, 161, 0.12);
+  color: var(--green);
+}
+.sessions-new-fast-toggle.disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 .sessions-agent-command-row {
   display: flex;
@@ -8649,6 +8679,13 @@ body.display-fullscreen-open {
                       <option value="off">off</option>
                     </select>
                   </label>
+                  <div class="sessions-new-session-field">
+                    Service tier
+                    <label class="sessions-new-fast-toggle disabled" id="new-session-codex-fast-wrap" title="Start the new Codex session with Fast service tier">
+                      <input id="new-session-codex-fast" type="checkbox" disabled>
+                      Fast
+                    </label>
+                  </div>
                 </div>
                 <div id="new-session-managed-context-note" class="sessions-agent-note"></div>
                 <button class="sessions-start-btn" id="new-session-start-btn" onclick="startNewSession()">Start session</button>
@@ -11510,6 +11547,7 @@ let newSessionAgentCommands = {
 };
 let newSessionCodexManagedContext = 'vanilla';
 let newSessionCodexContextArchive = 'summary';
+let newSessionCodexFastMode = false;
 let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
 let newSessionSpawnTimeout = null;
@@ -31593,6 +31631,8 @@ function renderNewSessionAgentControls(options = {}) {
   const browseBtn = document.getElementById('new-session-agent-command-browse');
   const managedContextSel = document.getElementById('new-session-codex-managed-context');
   const contextArchiveSel = document.getElementById('new-session-codex-context-archive');
+  const fastToggle = document.getElementById('new-session-codex-fast');
+  const fastWrap = document.getElementById('new-session-codex-fast-wrap');
   const managedContextNote = document.getElementById('new-session-managed-context-note');
   if (!select || !commandInput) return;
 
@@ -31623,6 +31663,18 @@ function renderNewSessionAgentControls(options = {}) {
     const appliesToCodex = effectiveAgent === 'codex';
     contextArchiveSel.disabled = !appliesToCodex;
     contextArchiveSel.value = normalizeContextArchiveMode(newSessionCodexContextArchive);
+  }
+  if (fastToggle) {
+    const appliesToCodex = effectiveAgent === 'codex';
+    fastToggle.disabled = !appliesToCodex;
+    fastToggle.checked = appliesToCodex && !!newSessionCodexFastMode;
+    if (fastWrap) {
+      fastWrap.classList.toggle('disabled', !appliesToCodex);
+      fastWrap.classList.toggle('active', appliesToCodex && !!newSessionCodexFastMode);
+      fastWrap.title = appliesToCodex
+        ? 'Start the new Codex session with Fast service tier'
+        : 'Fast service tier applies to Codex sessions';
+    }
   }
   if (managedContextNote) {
     const mode = managedContextSel?.value || newSessionCodexManagedContext;
@@ -31841,6 +31893,9 @@ async function startNewSession() {
       document.getElementById('new-session-codex-context-archive')?.value || newSessionCodexContextArchive
     );
     msg.codex_context_archive = archiveMode;
+    if (document.getElementById('new-session-codex-fast')?.checked) {
+      msg.codex_service_tier = 'priority';
+    }
   }
   if (direct) msg.direct = true;
   if (attachments.length > 0) msg.attachments = attachments;
@@ -32347,6 +32402,10 @@ document.getElementById('new-session-codex-managed-context')?.addEventListener('
 });
 document.getElementById('new-session-codex-context-archive')?.addEventListener('change', (ev) => {
   newSessionCodexContextArchive = normalizeContextArchiveMode(ev.currentTarget.value);
+  renderNewSessionAgentControls();
+});
+document.getElementById('new-session-codex-fast')?.addEventListener('change', (ev) => {
+  newSessionCodexFastMode = !!ev.currentTarget.checked;
   renderNewSessionAgentControls();
 });
 document.getElementById('fs-picker-path')?.addEventListener('keydown', (ev) => {
