@@ -4244,7 +4244,33 @@ body.context-focus-active {
 .sd-section-badge { font-size: 11px; color: var(--overlay0); }
 .sd-section-content { overflow: hidden; }
 .sd-section.collapsed .sd-section-content { display: none; }
-.session-detail-logs { padding: 4px 0; overflow-y: auto; flex: 1; }
+.session-detail-logs {
+  padding: 4px 0;
+  overflow: hidden;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.session-detail-log-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0;
+  flex-shrink: 0;
+}
+.session-detail-log-status {
+  color: var(--overlay0);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.session-detail-log-stream {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
 .session-detail-logs .log-entry {
   display: flex;
   align-items: flex-start;
@@ -34712,6 +34738,7 @@ function openSessionDetail(sessionOrId, taskArg) {
   currentSessionDetail = { ...session, source };
   renderSessionDetailTitle(currentSessionDetail);
   logsEl.innerHTML = '<div class="empty-state">Loading...</div>';
+  sessionDetailLogView = null;
 
   // Reset sections
   document.getElementById('sd-recordings').style.display = 'none';
@@ -34762,6 +34789,7 @@ function closeSessionDetail() {
   document.getElementById('session-detail').style.display = 'none';
   currentSessionDetail = null;
   currentSessionDetailContext = null;
+  sessionDetailLogView = null;
 }
 window.closeSessionDetail = closeSessionDetail;
 window.loadSessions = loadSessions;
@@ -34954,57 +34982,69 @@ function renderSessionFrames(sessionId, frames) {
   }
 }
 
+const SESSION_DETAIL_RENDER_LIMIT = 600;
+const SESSION_DETAIL_SCROLL_CHUNK = 300;
+const SESSION_DETAIL_SCROLL_THRESHOLD_PX = 64;
 let detailVerbosity = 'normal';
+let sessionDetailLogView = null;
 
 function renderSessionDetailLogs(entries, el) {
   el.innerHTML = '';
+  sessionDetailLogView = null;
 
   // Verbosity toggle
   const toolbar = document.createElement('div');
-  toolbar.style.cssText = 'display:flex;justify-content:flex-end;padding:4px 0;';
+  toolbar.className = 'session-detail-log-toolbar';
+  const status = document.createElement('div');
+  status.className = 'session-detail-log-status';
   const select = document.createElement('select');
   select.className = 'verbosity-select';
   select.innerHTML = '<option value="normal">Normal</option><option value="verbose">Verbose</option><option value="debug">Debug</option>';
   select.value = detailVerbosity;
   select.addEventListener('change', () => {
     detailVerbosity = select.value;
-    renderSessionDetailEntries(entries, logsContainer);
+    renderSessionDetailEntries(entries, logsContainer, status);
   });
+  toolbar.appendChild(status);
   toolbar.appendChild(select);
   el.appendChild(toolbar);
 
   const logsContainer = document.createElement('div');
-  logsContainer.style.cssText = 'flex:1;overflow-y:auto;';
+  logsContainer.className = 'session-detail-log-stream';
   el.appendChild(logsContainer);
 
-  renderSessionDetailEntries(entries, logsContainer);
+  renderSessionDetailEntries(entries, logsContainer, status);
 }
 
-function renderSessionDetailEntries(entries, el) {
-  el.innerHTML = '';
-  let lastTurn = null;
-
-  const levelColors = {
-    model: 'var(--blue)', agent: 'var(--teal)', error: 'var(--red)',
-    warn: 'var(--yellow)', subagent: 'var(--mauve)', presence: 'var(--green)',
-    detail: '#a2a8be', debug: 'var(--overlay1)',
-  };
-  const sourceLabels = {
-    system: '\u2139', worker: 'Model', agent: 'Run',
-    server: 'Servr', live: 'Live', sub: 'Sub', orch: 'Orch',
-    presence: 'Prsnc',
-  };
+function sessionDetailVisibleLevels() {
   const normalLevels = ['info', 'model', 'agent', 'error', 'warn', 'subagent', 'presence'];
   const verboseLevels = [...normalLevels, 'detail'];
   const debugLevels = [...verboseLevels, 'debug'];
-  const visibleLevels = detailVerbosity === 'debug' ? debugLevels :
-                        detailVerbosity === 'verbose' ? verboseLevels : normalLevels;
+  return detailVerbosity === 'debug' ? debugLevels :
+         detailVerbosity === 'verbose' ? verboseLevels : normalLevels;
+}
 
-  for (const e of entries) {
+const sessionDetailLevelColors = {
+  model: 'var(--blue)', agent: 'var(--teal)', error: 'var(--red)',
+  warn: 'var(--yellow)', subagent: 'var(--mauve)', presence: 'var(--green)',
+  detail: '#a2a8be', debug: 'var(--overlay1)',
+};
+const sessionDetailSourceLabels = {
+  system: '\u2139', worker: 'Model', agent: 'Run',
+  server: 'Servr', live: 'Live', sub: 'Sub', orch: 'Orch',
+  presence: 'Prsnc',
+};
+
+function buildSessionDetailRows(entries) {
+  const rows = [];
+  let lastTurn = null;
+  const visibleLevels = sessionDetailVisibleLevels();
+
+  for (const e of entries || []) {
     const level = e.level || 'info';
     if (!visibleLevels.includes(level)) continue;
     const source = e.source || '';
-    const displaySource = sourceLabels[source] || source || '\u2139';
+    const displaySource = sessionDetailSourceLabels[source] || source || '\u2139';
     const content = e.content || e.summary || e.message || '';
     if (!String(content).trim()) continue;
     const detailRecord = {
@@ -35017,105 +35057,242 @@ function renderSessionDetailEntries(entries, el) {
 
     if (e.turn && e.turn !== lastTurn) {
       lastTurn = e.turn;
-      const sep = document.createElement('div');
-      sep.className = 'log-turn-sep';
-      sep.textContent = '\u2500\u2500 Turn ' + e.turn + ' \u2500\u2500';
-      el.appendChild(sep);
+      rows.push({ kind: 'turn', turn: e.turn });
     }
 
-    const entry = document.createElement('div');
-    entry.className = 'log-entry level-' + level;
-    const sourceClass = String(source).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
-    if (sourceClass) entry.classList.add('source-' + sourceClass);
-    if (detailRecord.session_id) entry.dataset.sessionId = detailRecord.session_id;
-    if (e.user_turn_index !== undefined && e.user_turn_index !== null) {
-      entry.dataset.userTurnIndex = String(e.user_turn_index);
-    }
-    if (e.user_turn_revision !== undefined && e.user_turn_revision !== null) {
-      entry.dataset.userTurnRevision = String(e.user_turn_revision);
-    }
-    if (e.superseded) {
-      entry.classList.add('superseded');
-      entry.dataset.superseded = 'true';
-    }
-
-    const ts = document.createElement('span');
-    ts.className = 'log-ts';
-    ts.textContent = formatSessionDetailTimestamp(e.ts);
-    const tsTitle = formatLogTimestampTitle(e.ts);
-    if (tsTitle && ts.textContent !== tsTitle) ts.title = tsTitle;
-
-    const lvl = document.createElement('span');
-    lvl.className = 'log-level';
-    lvl.textContent = displaySource;
-    lvl.style.color = levelColors[level] || 'var(--text)';
-
-    if (isDiffLog({ level, source, content: detailRecord.content })) {
-      entry.classList.add('diff-log-entry');
-      const parsed = parseUnifiedDiff(diffLogContent({ source, content: detailRecord.content }));
-      const wrap = document.createElement('span');
-      wrap.className = 'log-content diff-log-wrap';
-      const summary = document.createElement('span');
-      summary.className = 'diff-log-summary';
-      summary.innerHTML = diffLogSummaryHtml(parsed);
-      const body = document.createElement('span');
-      body.className = 'diff-log-body';
-      renderDiffLogBody(body, parsed, { sessionId: e.session_id || '' });
-      wrap.appendChild(summary);
-      wrap.appendChild(body);
-      const toggle = document.createElement('span');
-      toggle.className = 'collapse-toggle';
-      toggle.innerHTML = '<span class="arrow">\u25B8 diff</span><span class="arrow-up">\u25BE hide</span>';
-      entry.appendChild(ts);
-      entry.appendChild(lvl);
-      entry.appendChild(wrap);
-      entry.appendChild(toggle);
-      wireDiffLogEntry(entry);
-      el.appendChild(entry);
-      continue;
-    }
-
-    const cnt = document.createElement('span');
-    cnt.className = 'log-content';
-    renderLogContentElement(cnt, {
-      level,
-      source: displaySource,
-      content: detailRecord.content
+    rows.push({
+      kind: 'entry',
+      record: detailRecord,
+      displaySource,
     });
-    appendLogStateBadges(cnt, detailRecord);
-    if (levelColors[level]) cnt.style.color = levelColors[level];
+  }
 
+  return rows;
+}
+
+function renderSessionDetailEntries(entries, el, statusEl = null) {
+  const view = {
+    rows: buildSessionDetailRows(entries),
+    scroller: el,
+    statusEl,
+    renderStart: 0,
+    renderEnd: 0,
+    expandedRows: new Set(),
+    pendingScrollFrame: 0,
+  };
+  view.entryCount = countSessionDetailEntries(view.rows, 0, view.rows.length);
+  sessionDetailLogView = view;
+  el._sessionDetailView = view;
+  if (el._sessionDetailScrollHandler) {
+    el.removeEventListener('scroll', el._sessionDetailScrollHandler);
+  }
+  el._sessionDetailScrollHandler = () => handleSessionDetailLogScroll(view);
+  el.addEventListener('scroll', el._sessionDetailScrollHandler);
+  renderSessionDetailRange(view, 0);
+}
+
+function renderSessionDetailRange(view, start) {
+  if (!view || !view.scroller) return;
+  const { rows, scroller } = view;
+  if (rows.length === 0) {
+    view.renderStart = 0;
+    view.renderEnd = 0;
+    scroller.innerHTML = '<div class="empty-state">No log entries at this verbosity</div>';
+    updateSessionDetailLogStatus(view);
+    return;
+  }
+
+  const maxStart = Math.max(0, rows.length - SESSION_DETAIL_RENDER_LIMIT);
+  const safeStart = Math.max(0, Math.min(Number(start) || 0, maxStart));
+  const safeEnd = Math.min(rows.length, safeStart + SESSION_DETAIL_RENDER_LIMIT);
+  const fragment = document.createDocumentFragment();
+  for (let i = safeStart; i < safeEnd; i++) {
+    const node = materializeSessionDetailRow(view, rows[i], i);
+    if (node) fragment.appendChild(node);
+  }
+  view.renderStart = safeStart;
+  view.renderEnd = safeEnd;
+  scroller.replaceChildren(fragment);
+  updateSessionDetailLogStatus(view);
+}
+
+function updateSessionDetailLogStatus(view) {
+  if (!view?.statusEl) return;
+  const total = view.entryCount || 0;
+  if (total === 0) {
+    view.statusEl.textContent = '0 entries';
+    return;
+  }
+  const before = countSessionDetailEntries(view.rows, 0, view.renderStart);
+  const current = countSessionDetailEntries(view.rows, view.renderStart, view.renderEnd);
+  view.statusEl.textContent = `Showing ${before + 1}-${before + current} of ${total} entries`;
+}
+
+function countSessionDetailEntries(rows, start, end) {
+  let count = 0;
+  const safeStart = Math.max(0, Number(start) || 0);
+  const safeEnd = Math.min(rows.length, Math.max(safeStart, Number(end) || 0));
+  for (let i = safeStart; i < safeEnd; i++) {
+    if (rows[i]?.kind === 'entry') count += 1;
+  }
+  return count;
+}
+
+function materializeSessionDetailRow(view, row, index) {
+  if (!row) return null;
+  if (row.kind === 'turn') {
+    const sep = document.createElement('div');
+    sep.className = 'log-turn-sep';
+    sep.dataset.detailRowIndex = String(index);
+    sep.textContent = '\u2500\u2500 Turn ' + row.turn + ' \u2500\u2500';
+    return sep;
+  }
+  if (row.kind !== 'entry') return null;
+
+  const e = row.record;
+  const entry = document.createElement('div');
+  entry.className = 'log-entry level-' + e.level;
+  entry.dataset.detailRowIndex = String(index);
+  const sourceClass = String(e.source).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  if (sourceClass) entry.classList.add('source-' + sourceClass);
+  if (e.session_id) entry.dataset.sessionId = e.session_id;
+  if (e.user_turn_index !== undefined && e.user_turn_index !== null) {
+    entry.dataset.userTurnIndex = String(e.user_turn_index);
+  }
+  if (e.user_turn_revision !== undefined && e.user_turn_revision !== null) {
+    entry.dataset.userTurnRevision = String(e.user_turn_revision);
+  }
+  if (e.superseded) {
+    entry.classList.add('superseded');
+    entry.dataset.superseded = 'true';
+  }
+
+  const ts = document.createElement('span');
+  ts.className = 'log-ts';
+  ts.textContent = formatSessionDetailTimestamp(e.ts);
+  const tsTitle = formatLogTimestampTitle(e.ts);
+  if (tsTitle && ts.textContent !== tsTitle) ts.title = tsTitle;
+
+  const lvl = document.createElement('span');
+  lvl.className = 'log-level';
+  lvl.textContent = row.displaySource;
+  lvl.style.color = sessionDetailLevelColors[e.level] || 'var(--text)';
+
+  if (isDiffLog({ level: e.level, source: e.source, content: e.content })) {
+    entry.classList.add('diff-log-entry');
+    if (view.expandedRows.has(index)) entry.classList.add('expanded');
+    const parsed = parseUnifiedDiff(diffLogContent({ source: e.source, content: e.content }));
+    const wrap = document.createElement('span');
+    wrap.className = 'log-content diff-log-wrap';
+    const summary = document.createElement('span');
+    summary.className = 'diff-log-summary';
+    summary.innerHTML = diffLogSummaryHtml(parsed);
+    const body = document.createElement('span');
+    body.className = 'diff-log-body';
+    renderDiffLogBody(body, parsed, { sessionId: e.session_id || '' });
+    wrap.appendChild(summary);
+    wrap.appendChild(body);
+    const toggle = document.createElement('span');
+    toggle.className = 'collapse-toggle';
+    toggle.innerHTML = '<span class="arrow">\u25B8 diff</span><span class="arrow-up">\u25BE hide</span>';
     entry.appendChild(ts);
     entry.appendChild(lvl);
-    entry.appendChild(cnt);
-    appendEditUserMessageButton(entry, detailRecord);
-
-    // Collapsible for long entries
-    if (content.split('\n').length > 3 || content.length > 300) {
-      cnt.style.maxHeight = '1.5em';
-      cnt.style.overflow = 'hidden';
-      cnt.style.cursor = 'pointer';
-      const toggle = document.createElement('span');
-      toggle.className = 'collapse-toggle';
-      toggle.innerHTML = '<span class="arrow">\u25B8 more</span><span class="arrow-up" style="display:none">\u25BE less</span>';
-      toggle.style.cssText = 'color:var(--blue);font-size:11px;flex-shrink:0;padding:2px 6px;cursor:pointer;';
-      entry.appendChild(toggle);
-      entry.addEventListener('click', (event) => {
-        if (event.target?.closest?.('.log-edit-message')) return;
-        const expanded = cnt.style.maxHeight === 'none';
-        cnt.style.maxHeight = expanded ? '1.5em' : 'none';
-        cnt.style.overflow = expanded ? 'hidden' : 'visible';
-        toggle.querySelector('.arrow').style.display = expanded ? '' : 'none';
-        toggle.querySelector('.arrow-up').style.display = expanded ? 'none' : '';
+    entry.appendChild(wrap);
+    entry.appendChild(toggle);
+    entry.addEventListener('click', (event) => {
+      if (event.target?.closest?.('a, button')) return;
+      requestAnimationFrame(() => {
+        if (entry.classList.contains('expanded')) view.expandedRows.add(index);
+        else view.expandedRows.delete(index);
       });
-    }
-
-    el.appendChild(entry);
+    });
+    wireDiffLogEntry(entry);
+    return entry;
   }
 
-  if (el.children.length === 0) {
-    el.innerHTML = '<div class="empty-state">No log entries at this verbosity</div>';
+  const cnt = document.createElement('span');
+  cnt.className = 'log-content';
+  renderLogContentElement(cnt, {
+    level: e.level,
+    source: row.displaySource,
+    content: e.content
+  });
+  appendLogStateBadges(cnt, e);
+  if (sessionDetailLevelColors[e.level]) cnt.style.color = sessionDetailLevelColors[e.level];
+
+  entry.appendChild(ts);
+  entry.appendChild(lvl);
+  entry.appendChild(cnt);
+  appendEditUserMessageButton(entry, e);
+
+  if (e.content.split('\n').length > 3 || e.content.length > 300) {
+    const expanded = view.expandedRows.has(index);
+    cnt.style.maxHeight = expanded ? 'none' : '1.5em';
+    cnt.style.overflow = expanded ? 'visible' : 'hidden';
+    cnt.style.cursor = 'pointer';
+    const toggle = document.createElement('span');
+    toggle.className = 'collapse-toggle';
+    toggle.innerHTML = '<span class="arrow">\u25B8 more</span><span class="arrow-up">\u25BE less</span>';
+    toggle.style.cssText = 'color:var(--blue);font-size:11px;flex-shrink:0;padding:2px 6px;cursor:pointer;';
+    toggle.querySelector('.arrow').style.display = expanded ? 'none' : '';
+    toggle.querySelector('.arrow-up').style.display = expanded ? '' : 'none';
+    entry.appendChild(toggle);
+    entry.addEventListener('click', (event) => {
+      if (event.target?.closest?.('.log-edit-message')) return;
+      const nextExpanded = cnt.style.maxHeight !== 'none';
+      cnt.style.maxHeight = nextExpanded ? 'none' : '1.5em';
+      cnt.style.overflow = nextExpanded ? 'visible' : 'hidden';
+      toggle.querySelector('.arrow').style.display = nextExpanded ? 'none' : '';
+      toggle.querySelector('.arrow-up').style.display = nextExpanded ? '' : 'none';
+      if (nextExpanded) view.expandedRows.add(index);
+      else view.expandedRows.delete(index);
+    });
   }
+
+  return entry;
+}
+
+function handleSessionDetailLogScroll(view) {
+  if (!view || view.pendingScrollFrame) return;
+  view.pendingScrollFrame = requestAnimationFrame(() => {
+    view.pendingScrollFrame = 0;
+    if (sessionDetailLogView !== view || view.scroller?._sessionDetailView !== view) return;
+    if (loadOlderSessionDetailRows(view)) return;
+    loadNewerSessionDetailRows(view);
+  });
+}
+
+function loadOlderSessionDetailRows(view) {
+  const scroller = view?.scroller;
+  if (!scroller || view.renderStart <= 0 || view.rows.length === 0) return false;
+  if (scroller.scrollTop > SESSION_DETAIL_SCROLL_THRESHOLD_PX) return false;
+  const anchorIndex = view.renderStart;
+  const anchor = scroller.querySelector(`[data-detail-row-index="${anchorIndex}"]`);
+  const anchorTop = anchor ? anchor.offsetTop - scroller.scrollTop : 0;
+  renderSessionDetailRange(view, Math.max(0, view.renderStart - SESSION_DETAIL_SCROLL_CHUNK));
+  const nextAnchor = scroller.querySelector(`[data-detail-row-index="${anchorIndex}"]`);
+  if (nextAnchor) scroller.scrollTop = Math.max(0, nextAnchor.offsetTop - anchorTop);
+  return true;
+}
+
+function loadNewerSessionDetailRows(view) {
+  const scroller = view?.scroller;
+  if (!scroller || view.renderEnd >= view.rows.length || view.rows.length === 0) return false;
+  const bottomDistance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+  if (bottomDistance > SESSION_DETAIL_SCROLL_THRESHOLD_PX) return false;
+  const anchorIndex = Math.max(view.renderStart, view.renderEnd - 1);
+  const anchor = scroller.querySelector(`[data-detail-row-index="${anchorIndex}"]`);
+  const anchorBottom = anchor
+    ? anchor.offsetTop + anchor.offsetHeight - scroller.scrollTop
+    : scroller.clientHeight;
+  const maxStart = Math.max(0, view.rows.length - SESSION_DETAIL_RENDER_LIMIT);
+  const nextStart = Math.min(maxStart, view.renderStart + SESSION_DETAIL_SCROLL_CHUNK);
+  renderSessionDetailRange(view, nextStart);
+  const nextAnchor = scroller.querySelector(`[data-detail-row-index="${anchorIndex}"]`);
+  if (nextAnchor) {
+    scroller.scrollTop = Math.max(0, nextAnchor.offsetTop + nextAnchor.offsetHeight - anchorBottom);
+  }
+  return true;
 }
 
 // ── Keyboard Shortcuts ──
