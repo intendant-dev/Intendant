@@ -10317,10 +10317,12 @@ async function main() {
       }
       // Track user display grant/revoke events
       if (d.event === 'user_display_granted') {
+        grantedDisplayId = Number(d.display_id || 0);
         setUserDisplayState(true);
       } else if (d.event === 'user_display_revoked') {
-        setUserDisplayState(false);
-        removeDisplaySlot(Number(d.display_id || 0));
+        const revokedId = Number(d.display_id || 0);
+        if (Number(grantedDisplayId) === revokedId) setUserDisplayState(false);
+        removeDisplaySlot(revokedId);
         const banner = document.getElementById('display-approval-banner');
         if (banner) banner.classList.add('hidden');
       }
@@ -20389,6 +20391,7 @@ class DisplaySlot {
         <button class="annotate-btn" id="ds-annotate-${displayId}" title="Freeze current frame and annotate it">&#9998; Annotate</button>
         <button class="record-btn" id="ds-record-${displayId}" title="Record this display (ffmpeg)">&#x23FA; Record</button>
         <button class="display-fullscreen-btn" id="ds-fullscreen-${displayId}" title="Full screen">&#x26F6;</button>
+        <button class="display-close-btn" id="ds-close-${displayId}" title="Close this display stream">&times;</button>
         <button class="take-control-btn" id="ds-take-${displayId}" title="Take interactive control of this display (keyboard and mouse)">Take Control</button>
         <button class="release-control-btn" id="ds-release-${displayId}" style="display:none" title="Release control and return display to view-only mode">Release</button>
         <button class="delete-recording-btn" id="ds-delete-rec-${displayId}" style="display:none" title="Delete recording files for this display">&#x1F5D1; Delete</button>
@@ -20405,6 +20408,7 @@ class DisplaySlot {
     this.canvasEl = this.el.querySelector(`#display-canvas-${displayId}`);
     this.recordBtn = this.el.querySelector(`#ds-record-${displayId}`);
     this.fullscreenBtn = this.el.querySelector(`#ds-fullscreen-${displayId}`);
+    this.closeBtn = this.el.querySelector(`#ds-close-${displayId}`);
     this.deleteRecBtn = this.el.querySelector(`#ds-delete-rec-${displayId}`);
     this.attachBtn = this.el.querySelector(`#ds-attach-${displayId}`);
     this.annotateBtn = this.el.querySelector(`#ds-annotate-${displayId}`);
@@ -20436,6 +20440,7 @@ class DisplaySlot {
     this.streamBtn.addEventListener('click', () => this.toggleStreaming());
     this.recordBtn.addEventListener('click', () => this.toggleRecording());
     this.fullscreenBtn.addEventListener('click', () => this.toggleFullscreen());
+    this.closeBtn.addEventListener('click', () => this.closeDisplay());
     this.deleteRecBtn.addEventListener('click', () => this.deleteRecording());
     this.attachBtn.addEventListener('click', () => this.attachCurrentFrame());
     this.annotateBtn.addEventListener('click', () => this.annotateCurrentFrame());
@@ -20463,6 +20468,19 @@ class DisplaySlot {
     if (this.fullscreenBtn) {
       this.fullscreenBtn.innerHTML = want ? '&times;' : '&#x26F6;';
       this.fullscreenBtn.title = want ? 'Exit full screen' : 'Full screen';
+    }
+  }
+
+  closeDisplay() {
+    const displayId = Number(this.displayId);
+    if (app && typeof app.revoke_user_display_with_id === 'function') {
+      app.revoke_user_display_with_id(displayId);
+    } else if (app && app.send_server_action) {
+      app.send_server_action({ action: 'revoke_user_display', display_id: displayId });
+    }
+    removeDisplaySlot(displayId);
+    if (Number(grantedDisplayId) === displayId) {
+      setUserDisplayState(false);
     }
   }
 

@@ -15420,6 +15420,15 @@ async fn deactivate_user_display(
     }
 }
 
+fn reject_user_display_activation(bus: &EventBus, display_id: u32, reason: impl Into<String>) {
+    let reason = reason.into();
+    eprintln!("[user_display] {reason}");
+    bus.send(AppEvent::UserDisplayRevoked {
+        display_id,
+        note: Some(reason),
+    });
+}
+
 /// Handle user display grant: create a `DisplaySession` and emit
 /// `DisplayReady` for the selected user display.
 ///
@@ -15433,7 +15442,6 @@ async fn activate_user_display(
     target_display_id: u32,
 ) {
     let display_id: u32 = target_display_id;
-    let (width, height) = query_display_resolution(display_id);
 
     // On Wayland: create a DisplaySession with WaylandBackend.
     // Detect Wayland even when WAYLAND_DISPLAY isn't in our env (e.g. started
@@ -15576,18 +15584,24 @@ async fn activate_user_display(
             if let Some(info) = displays.iter().find(|d| d.id == target_display_id) {
                 display::macos::MacOSBackend::with_display_id(info.platform_id as u32)
             } else {
-                eprintln!(
-                    "[user_display] display_id {} not found, falling back to primary",
-                    target_display_id
+                reject_user_display_activation(
+                    bus,
+                    display_id,
+                    format!("display {target_display_id} is not available on this Mac"),
                 );
-                display::macos::MacOSBackend::new()
+                return;
             }
         } else {
             display::macos::MacOSBackend::new()
         };
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
         if let Err(e) = session.start(30, frame_registry, Some(bus.clone())).await {
-            eprintln!("[user_display] macOS display session failed: {}", e);
+            reject_user_display_activation(
+                bus,
+                display_id,
+                format!("macOS display session failed: {e}"),
+            );
+            return;
         } else {
             let (width, height) = session.resolution();
             let session = Arc::new(session);
@@ -15612,18 +15626,24 @@ async fn activate_user_display(
             if let Some(info) = displays.iter().find(|d| d.id == target_display_id) {
                 display::windows::WindowsBackend::with_output_index(info.platform_id as u32)
             } else {
-                eprintln!(
-                    "[user_display] display_id {} not found, falling back to primary",
-                    target_display_id
+                reject_user_display_activation(
+                    bus,
+                    display_id,
+                    format!("display {target_display_id} is not available on this Windows host"),
                 );
-                display::windows::WindowsBackend::new()
+                return;
             }
         } else {
             display::windows::WindowsBackend::new()
         };
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
         if let Err(e) = session.start(30, frame_registry, Some(bus.clone())).await {
-            eprintln!("[user_display] Windows display session failed: {}", e);
+            reject_user_display_activation(
+                bus,
+                display_id,
+                format!("Windows display session failed: {e}"),
+            );
+            return;
         } else {
             let (width, height) = session.resolution();
             let session = Arc::new(session);
@@ -15640,7 +15660,7 @@ async fn activate_user_display(
 
     #[allow(unreachable_code)]
     {
-        eprintln!("[user_display] No supported display backend detected");
+        reject_user_display_activation(bus, display_id, "no supported display backend detected");
     }
 }
 

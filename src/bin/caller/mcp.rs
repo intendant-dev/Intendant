@@ -4720,10 +4720,9 @@ fn shared_view_target_label(display_id: Option<u32>, display_target: Option<&str
 fn shared_view_user_display_id(
     display_target: Option<&str>,
     display_id: Option<u32>,
-    explicit_display_id: bool,
 ) -> Option<u32> {
-    if explicit_display_id {
-        return display_id;
+    if let Some(display_id) = display_id {
+        return Some(display_id);
     }
     let Some(target) = display_target
         .map(str::trim)
@@ -5532,11 +5531,8 @@ impl IntendantServer {
         &self,
         display_target: Option<&str>,
         display_id: Option<u32>,
-        explicit_display_id: bool,
     ) {
-        let Some(display_id) =
-            shared_view_user_display_id(display_target, display_id, explicit_display_id)
-        else {
+        let Some(display_id) = shared_view_user_display_id(display_target, display_id) else {
             return;
         };
 
@@ -5563,16 +5559,11 @@ impl IntendantServer {
         params: ShowSharedViewParams,
         session_id: Option<&str>,
     ) -> String {
-        let explicit_display_id = params.display_id.is_some();
         let display_target = shared_view_display_target(params.display_target, params.display_id);
         let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
         let region = params.focus_region.map(normalize_shared_view_region);
-        self.ensure_shared_view_display_active(
-            display_target.as_deref(),
-            display_id,
-            explicit_display_id,
-        )
-        .await;
+        self.ensure_shared_view_display_active(display_target.as_deref(), display_id)
+            .await;
         self.emit_shared_view(
             session_id,
             "show",
@@ -5617,15 +5608,10 @@ impl IntendantServer {
         params: FocusSharedViewParams,
         session_id: Option<&str>,
     ) -> String {
-        let explicit_display_id = params.display_id.is_some();
         let display_target = shared_view_display_target(params.display_target, params.display_id);
         let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
-        self.ensure_shared_view_display_active(
-            display_target.as_deref(),
-            display_id,
-            explicit_display_id,
-        )
-        .await;
+        self.ensure_shared_view_display_active(display_target.as_deref(), display_id)
+            .await;
         self.emit_shared_view(
             session_id,
             "focus",
@@ -5653,15 +5639,10 @@ impl IntendantServer {
         params: RequestSharedViewInputParams,
         session_id: Option<&str>,
     ) -> String {
-        let explicit_display_id = params.display_id.is_some();
         let display_target = shared_view_display_target(params.display_target, params.display_id);
         let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
-        self.ensure_shared_view_display_active(
-            display_target.as_deref(),
-            display_id,
-            explicit_display_id,
-        )
-        .await;
+        self.ensure_shared_view_display_active(display_target.as_deref(), display_id)
+            .await;
         self.emit_shared_view(
             session_id,
             "input_request",
@@ -5690,15 +5671,10 @@ impl IntendantServer {
         params: CaptureSharedViewFrameParams,
         session_id: Option<&str>,
     ) -> Result<CallToolResult, McpError> {
-        let explicit_display_id = params.display_id.is_some();
         let display_target = shared_view_display_target(params.display_target, params.display_id);
         let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
-        self.ensure_shared_view_display_active(
-            display_target.as_deref(),
-            display_id,
-            explicit_display_id,
-        )
-        .await;
+        self.ensure_shared_view_display_active(display_target.as_deref(), display_id)
+            .await;
         self.emit_shared_view(
             session_id,
             "capture",
@@ -6638,12 +6614,13 @@ mod tests {
     }
 
     #[test]
-    fn shared_view_tool_emits_dashboard_event() {
+    fn shared_view_tool_activates_target_and_emits_dashboard_event() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
             let server = IntendantServer::new(test_state(), bus.clone());
@@ -6662,6 +6639,13 @@ mod tests {
                 .await
                 .expect("tool should dispatch");
             assert!(!result.is_error.unwrap_or(false));
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::UserDisplayGranted { display_id })) => {
+                    assert_eq!(display_id, 99);
+                }
+                other => panic!("expected UserDisplayGranted event, got {other:?}"),
+            }
 
             match timeout(Duration::from_secs(1), rx.recv()).await {
                 Ok(Ok(AppEvent::SharedView {
@@ -6685,6 +6669,7 @@ mod tests {
                 }
                 other => panic!("expected SharedView event, got {other:?}"),
             }
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
         });
     }
 
