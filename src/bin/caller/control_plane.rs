@@ -28,6 +28,7 @@ pub struct CodexRuntimeConfig {
     pub approval_policy: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
     pub web_search: bool,
     pub network_access: bool,
     pub writable_roots: Vec<String>,
@@ -265,6 +266,28 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             state.bus.send(codex_config_changed_event(CodexConfigDelta {
                 reasoning_effort: normalized,
                 reasoning_effort_cleared: cleared,
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetCodexServiceTier { service_tier } => {
+            let normalized = crate::project::normalize_codex_service_tier(service_tier.as_deref());
+            {
+                let mut guard = state.codex_config.write().await;
+                guard.service_tier = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_codex_field(root, |cfg| {
+                    cfg.service_tier = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist codex.service_tier to intendant.toml: {e}"
+                    );
+                }
+            }
+            let cleared = normalized.is_none();
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                service_tier: normalized,
+                service_tier_cleared: cleared,
                 ..Default::default()
             }));
         }
@@ -661,6 +684,8 @@ struct CodexConfigDelta {
     model_cleared: bool,
     reasoning_effort: Option<String>,
     reasoning_effort_cleared: bool,
+    service_tier: Option<String>,
+    service_tier_cleared: bool,
     web_search: Option<bool>,
     network_access: Option<bool>,
     writable_roots: Option<Vec<String>>,
@@ -677,6 +702,8 @@ fn codex_config_changed_event(delta: CodexConfigDelta) -> AppEvent {
         model_cleared: delta.model_cleared,
         reasoning_effort: delta.reasoning_effort,
         reasoning_effort_cleared: delta.reasoning_effort_cleared,
+        service_tier: delta.service_tier,
+        service_tier_cleared: delta.service_tier_cleared,
         web_search: delta.web_search,
         network_access: delta.network_access,
         writable_roots: delta.writable_roots,
@@ -788,6 +815,7 @@ mod tests {
             approval_policy: "on-request".to_string(),
             model: None,
             reasoning_effort: None,
+            service_tier: None,
             web_search: false,
             network_access: false,
             writable_roots: Vec::new(),
@@ -1168,6 +1196,52 @@ mod tests {
         ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(codex_config.read().await.reasoning_effort, None);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_codex_service_tier_normalizes_and_clears() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexServiceTier {
+            service_tier: Some("fast".to_string()),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            codex_config.read().await.service_tier.as_deref(),
+            Some("priority")
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexServiceTier {
+            service_tier: Some("normal".to_string()),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            codex_config.read().await.service_tier.as_deref(),
+            Some("standard")
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexServiceTier {
+            service_tier: None,
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.service_tier, None);
 
         handle.abort();
     }

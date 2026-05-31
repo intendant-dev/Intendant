@@ -883,7 +883,12 @@ impl SessionSupervisor {
             }
         }
         if let Some(backend) = backend.as_ref() {
-            let config = crate::session_config::from_project(backend, &project);
+            let mut config = crate::session_config::from_project(backend, &project);
+            if matches!(backend, external_agent::AgentBackend::Codex)
+                && codex_service_tier.is_some()
+            {
+                config.codex_service_tier = codex_service_tier.clone();
+            }
             if let Err(e) = crate::session_config::write_log_dir_config(&log_dir, &config) {
                 self.warn(&format!(
                     "Session launch config was not persisted for {}: {}",
@@ -2689,10 +2694,12 @@ impl SessionSupervisor {
                 cfg.approval_policy = current.approval_policy;
                 cfg.model = current.model;
                 cfg.reasoning_effort = current.reasoning_effort;
+                cfg.service_tier = current.service_tier;
                 cfg.web_search = current.web_search;
                 cfg.network_access = current.network_access;
                 cfg.writable_roots = current.writable_roots;
                 cfg.managed_context = current.managed_context;
+                cfg.context_archive = current.context_archive;
             }
             Some(external_agent::AgentBackend::GeminiCli) => {
                 let current = self.config.shared_gemini_config.read().await.clone();
@@ -2868,9 +2875,7 @@ fn normalize_session_codex_context_archive(mode: Option<&str>) -> Option<String>
 }
 
 fn normalize_session_codex_service_tier(tier: Option<&str>) -> Option<String> {
-    tier.map(str::trim)
-        .filter(|tier| !tier.is_empty())
-        .map(ToOwned::to_owned)
+    crate::project::normalize_codex_service_tier(tier)
 }
 
 fn normalize_session_name_option(name: Option<&str>) -> Result<Option<String>, String> {
@@ -3317,6 +3322,7 @@ mod tests {
                     approval_policy: "on-request".to_string(),
                     model: None,
                     reasoning_effort: None,
+                    service_tier: None,
                     web_search: false,
                     network_access: false,
                     writable_roots: Vec::new(),

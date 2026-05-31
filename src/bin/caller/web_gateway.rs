@@ -10366,6 +10366,10 @@ pub struct SettingsPayload {
     pub codex_model: Option<String>,
     #[serde(default)]
     pub codex_reasoning_effort: Option<String>,
+    // Empty / omitted = inherit Codex config; "standard" sends an explicit
+    // normal/clear override for Intendant-managed Codex sessions.
+    #[serde(default)]
+    pub codex_service_tier: Option<String>,
     #[serde(default)]
     pub codex_web_search: bool,
     #[serde(default)]
@@ -10501,6 +10505,9 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
         codex_reasoning_effort: crate::project::normalize_reasoning_effort(
             config.agent.codex.reasoning_effort.as_deref(),
         ),
+        codex_service_tier: crate::project::normalize_codex_service_tier(
+            config.agent.codex.service_tier.as_deref(),
+        ),
         codex_web_search: config.agent.codex.web_search,
         codex_network_access: config.agent.codex.network_access,
         codex_writable_roots: config.agent.codex.writable_roots.clone(),
@@ -10581,6 +10588,10 @@ fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &
     if payload.codex_command.is_some() {
         config.agent.codex.command =
             normalize_settings_codex_command(payload.codex_command.as_deref());
+    }
+    if payload.codex_service_tier.is_some() {
+        config.agent.codex.service_tier =
+            crate::project::normalize_codex_service_tier(payload.codex_service_tier.as_deref());
     }
     if let Some(mode) = payload.codex_managed_context.as_deref() {
         config.agent.codex.managed_context = crate::project::normalize_codex_managed_context(mode);
@@ -22138,6 +22149,7 @@ mod tests {
         config.agent.codex.command = "/opt/codex/bin/codex".to_string();
         config.agent.codex.sandbox = "danger-full-access".to_string();
         config.agent.codex.managed_context = "managed".to_string();
+        config.agent.codex.service_tier = Some("priority".to_string());
         config.agent.gemini_cli.approval_mode = "yolo".to_string();
         apply_settings_payload(&mut config, &payload);
 
@@ -22145,6 +22157,7 @@ mod tests {
         assert_eq!(config.agent.codex.command, "/opt/codex/bin/codex");
         assert_eq!(config.agent.codex.sandbox, "danger-full-access");
         assert_eq!(config.agent.codex.managed_context, "managed");
+        assert_eq!(config.agent.codex.service_tier.as_deref(), Some("priority"));
         assert_eq!(config.agent.gemini_cli.approval_mode, "yolo");
     }
 
@@ -22153,6 +22166,7 @@ mod tests {
         let mut config = crate::project::ProjectConfig::default();
         config.agent.codex.command = "/usr/local/bin/codex".to_string();
         config.agent.codex.managed_context = "managed".to_string();
+        config.agent.codex.service_tier = Some("priority".to_string());
         config.agent.claude_code.command = "/usr/local/bin/claude".to_string();
         config.agent.gemini_cli.command = "/usr/local/bin/gemini".to_string();
 
@@ -22162,6 +22176,7 @@ mod tests {
             Some("/usr/local/bin/codex")
         );
         assert_eq!(payload.codex_managed_context.as_deref(), Some("managed"));
+        assert_eq!(payload.codex_service_tier.as_deref(), Some("priority"));
         assert_eq!(
             payload.claude_command.as_deref(),
             Some("/usr/local/bin/claude")
@@ -22192,6 +22207,7 @@ mod tests {
             "live_audio_timeout_secs": 300,
             "external_agent": "codex",
             "codex_command": "  /opt/homebrew/bin/codex  ",
+            "codex_service_tier": "normal",
             "codex_managed_context": "true",
             "claude_command": "  /opt/claude/bin/claude  ",
             "gemini_command": "  /opt/gemini/bin/gemini  "
@@ -22202,6 +22218,7 @@ mod tests {
         apply_settings_payload(&mut config, &payload);
 
         assert_eq!(config.agent.codex.command, "/opt/homebrew/bin/codex");
+        assert_eq!(config.agent.codex.service_tier.as_deref(), Some("standard"));
         assert_eq!(config.agent.codex.managed_context, "managed");
         assert_eq!(config.agent.claude_code.command, "/opt/claude/bin/claude");
         assert_eq!(config.agent.gemini_cli.command, "/opt/gemini/bin/gemini");

@@ -364,6 +364,10 @@ pub enum OutboundEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         reasoning_effort_cleared: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
+        service_tier: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        service_tier_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
         web_search: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         network_access: Option<bool>,

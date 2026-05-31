@@ -1248,6 +1248,14 @@ impl App {
                     format!("Codex reasoning effort → {} (applies on next task)", label),
                 );
             }
+            ControlMsg::SetCodexServiceTier { ref service_tier } => {
+                let label = crate::project::normalize_codex_service_tier(service_tier.as_deref())
+                    .unwrap_or_else(|| "<inherit>".to_string());
+                self.log(
+                    LogLevel::Info,
+                    format!("Codex service tier → {} (applies on next task)", label),
+                );
+            }
             ControlMsg::SetCodexWebSearch { enabled } => {
                 self.log(
                     LogLevel::Info,
