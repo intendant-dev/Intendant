@@ -981,9 +981,13 @@ impl SessionSupervisor {
                 if let Some(config) = session_agent_config.as_ref() {
                     let _ = crate::session_config::write_log_dir_config(&log_dir, config);
                 }
+                let intendant_session_id = session_log
+                    .lock()
+                    .map(|log| log.session_id().to_string())
+                    .unwrap_or_else(|_| path_file_name(&log_dir));
                 self.activate_shared_session(session_log.clone()).await;
                 self.spawn_agent_session(
-                    resume_token.clone(),
+                    intendant_session_id,
                     source_norm.clone(),
                     String::new(),
                     project,
@@ -1109,7 +1113,11 @@ impl SessionSupervisor {
             attachments.len(),
         );
         self.spawn_agent_session(
-            live_session_id,
+            if external_backend.is_some() {
+                intendant_session_id
+            } else {
+                live_session_id
+            },
             source_norm,
             resume_task,
             project,
@@ -3231,6 +3239,46 @@ mod tests {
         assert!(removed.is_some());
         assert!(!state.session_is_managed("wrapper"));
         assert!(!state.session_is_managed("backend"));
+    }
+
+    #[tokio::test]
+    async fn external_identity_moves_wrapper_session_to_backend_id() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut session = managed_session("wrapper", "codex");
+            session.phase = "thinking".to_string();
+            state.sessions.insert("wrapper".to_string(), session);
+            state.active_session_id = Some("wrapper".to_string());
+        }
+
+        supervisor
+            .apply_session_identity(
+                "wrapper".to_string(),
+                "codex".to_string(),
+                "backend".to_string(),
+            )
+            .await;
+
+        let state = supervisor.state.lock().await;
+        assert!(!state.sessions.contains_key("wrapper"));
+        assert_eq!(
+            state.resolve_session_id("wrapper").as_deref(),
+            Some("backend")
+        );
+        assert_eq!(
+            state.resolve_session_id("backend").as_deref(),
+            Some("backend")
+        );
+        assert_eq!(state.active_session_id.as_deref(), Some("backend"));
+        assert_eq!(
+            state
+                .sessions
+                .get("backend")
+                .map(|session| session.phase.as_str()),
+            Some("thinking")
+        );
     }
 
     #[test]

@@ -13347,7 +13347,6 @@ async fn run_external_agent_mode(
     let mut pending_managed_context_replays: std::collections::VecDeque<FollowUpMessage> =
         std::collections::VecDeque::new();
     let mut managed_context_recovery_kickstarts_without_rewind = 0u8;
-    let attach_only_resume = task.trim().is_empty() && resumed_external_session.is_some();
     let mut next_turn = if task.trim().is_empty() {
         None
     } else {
@@ -13380,37 +13379,6 @@ async fn run_external_agent_mode(
     // as new idle follow-ups after the turn completes.
     let mut external_control_rx = bus.subscribe();
     let mut codex_thread_action_dedupe = CodexThreadActionDedupe::default();
-    if backend == external_agent::AgentBackend::Codex && attach_only_resume {
-        match agent.pause_autonomous_goal(&thread.thread_id).await {
-            Ok(result) => {
-                if let Some(goal) = result.goal {
-                    emit_external_session_goal(&drain_config, live_session_id.clone(), Some(goal));
-                } else if result.goal_absent {
-                    emit_external_session_goal(&drain_config, live_session_id.clone(), None);
-                }
-                if result.paused {
-                    let message =
-                        "Paused active Codex goal while attaching without a new prompt".to_string();
-                    slog(&session_log, |l| l.info(&message));
-                    bus.send(AppEvent::LogEntry {
-                        session_id: live_session_id.clone(),
-                        level: "info".to_string(),
-                        source: "Codex".to_string(),
-                        content: message,
-                        turn: None,
-                    });
-                }
-            }
-            Err(e) => {
-                slog(&session_log, |l| {
-                    l.debug(&format!(
-                        "Could not pause Codex goal during attach-only resume: {}",
-                        e
-                    ))
-                });
-            }
-        }
-    }
     if let Some(ready_tx) = ready_for_thread_actions {
         let _ = ready_tx.send(());
     }

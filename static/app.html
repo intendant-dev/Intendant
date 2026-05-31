@@ -30229,7 +30229,7 @@ function onSessionAttached(sessionId, source) {
   if (sessionId) {
     setSessionWindowDetached(sessionId, false);
     const existingPhase = normalizeSessionPhase(sessionWindows.get(sessionId)?.phase || '');
-    const phase = existingPhase && !isAgentActivePhase(existingPhase) && existingPhase !== 'done'
+    const phase = existingPhase && existingPhase !== 'done'
       ? existingPhase
       : 'idle';
     ensureSessionWindow(sessionId, { source: source || 'session', phase, ended: false });
