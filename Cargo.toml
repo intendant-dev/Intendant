@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "intendant"
 path = "src/bin/caller/main.rs"
 
+[[bin]]
+name = "intendantctl"
+path = "src/bin/intendantctl.rs"
+
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }

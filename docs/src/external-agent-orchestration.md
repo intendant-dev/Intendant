@@ -126,7 +126,7 @@ features they lack.
 
   [mcp_servers.intendant]
   type = "http"
-  url = "http://localhost:<web_port>/mcp"
+  url = "http://localhost:<web_port>/mcp?managed_context=vanilla&tool_profile=core"
   ```
 
   Any pre-existing `config.toml` that isn't already ours is copied to
@@ -138,6 +138,12 @@ features they lack.
   `tools.web_search=true`, `model_reasoning_effort="…"`,
   `sandbox_workspace_write.network_access=true` (only in `workspace-write`), and
   `sandbox_workspace_write.writable_roots=[…]`.
+
+  Codex uses `tool_profile=core` by default to avoid MCP tool-schema bloat. The
+  core profile keeps a small bootstrap surface (`get_status`, shared-view tools,
+  and managed-context tools when enabled). Broad or rare Intendant operations
+  should be discovered lazily through `intendantctl --help`,
+  `intendantctl tools list`, and focused subcommand help.
 
   `[agent.codex] managed_context = "vanilla"` is the default and is safe for
   upstream Codex or the original Codex fork. Set it to `"managed"` only when

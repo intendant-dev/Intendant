@@ -10779,15 +10779,18 @@ enum McpHttpOutcome {
     Accepted,
 }
 
-fn mcp_context_from_request_line(request_line: &str) -> (Option<String>, Option<bool>) {
+fn mcp_context_from_request_line(
+    request_line: &str,
+) -> (Option<String>, Option<bool>, Option<String>) {
     let Some(path) = request_line.split_whitespace().nth(1) else {
-        return (None, None);
+        return (None, None, None);
     };
     let Some((_, query)) = path.split_once('?') else {
-        return (None, None);
+        return (None, None, None);
     };
     let mut session_id = None;
     let mut managed_context = None;
+    let mut tool_profile = None;
     for pair in query.split('&') {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         match key {
@@ -10799,10 +10802,15 @@ fn mcp_context_from_request_line(request_line: &str) -> (Option<String>, Option<
             "managed_context" => {
                 managed_context = Some(crate::project::codex_managed_context_enabled(value));
             }
+            "tool_profile" | "tools" | "toolset" | "toolsets" => {
+                if !value.trim().is_empty() {
+                    tool_profile = Some(percent_decode_query_value(value));
+                }
+            }
             _ => {}
         }
     }
-    (session_id, managed_context)
+    (session_id, managed_context, tool_profile)
 }
 
 fn percent_decode_query_value(value: &str) -> String {
@@ -10837,6 +10845,7 @@ async fn handle_mcp_http_request(
     server: &crate::mcp::IntendantServer,
     session_id: Option<&str>,
     codex_managed_context: Option<bool>,
+    tool_profile: Option<&str>,
 ) -> McpHttpOutcome {
     let request: McpHttpRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -10874,7 +10883,7 @@ async fn handle_mcp_http_request(
             return McpHttpOutcome::Accepted;
         }
         "tools/list" => Ok(server
-            .list_tools_json_for_session(session_id, codex_managed_context)
+            .list_tools_json_for_session(session_id, codex_managed_context, tool_profile)
             .await),
         "tools/call" => {
             let params = request.params.unwrap_or_default();
@@ -16117,13 +16126,14 @@ pub fn spawn_web_gateway(
                                 body_owned = full;
                                 &body_owned
                             };
-                            let (mcp_session_id, codex_managed_context) =
+                            let (mcp_session_id, codex_managed_context, tool_profile) =
                                 mcp_context_from_request_line(&request_line);
                             let outcome = handle_mcp_http_request(
                                 body_text,
                                 mcp,
                                 mcp_session_id.as_deref(),
                                 codex_managed_context,
+                                tool_profile.as_deref(),
                             )
                             .await;
                             let http_response = match outcome {
@@ -22207,17 +22217,19 @@ mod tests {
 
     #[test]
     fn mcp_context_from_request_line_reads_session_scoped_managed_context() {
-        let (session_id, managed_context) = mcp_context_from_request_line(
-            "POST /mcp?session_id=abc-123&managed_context=managed HTTP/1.1",
+        let (session_id, managed_context, tool_profile) = mcp_context_from_request_line(
+            "POST /mcp?session_id=abc-123&managed_context=managed&tool_profile=core HTTP/1.1",
         );
         assert_eq!(session_id.as_deref(), Some("abc-123"));
         assert_eq!(managed_context, Some(true));
+        assert_eq!(tool_profile.as_deref(), Some("core"));
 
-        let (session_id, managed_context) = mcp_context_from_request_line(
+        let (session_id, managed_context, tool_profile) = mcp_context_from_request_line(
             "POST /mcp?intendant_session=wrapped%20id&managed_context=vanilla HTTP/1.1",
         );
         assert_eq!(session_id.as_deref(), Some("wrapped id"));
         assert_eq!(managed_context, Some(false));
+        assert_eq!(tool_profile, None);
     }
 
     /// A specific bind address is preserved verbatim in the

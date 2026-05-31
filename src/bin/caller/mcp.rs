@@ -616,6 +616,58 @@ fn managed_context_tool(name: &str) -> bool {
     matches!(name, "rewind_context" | "rewind_backout")
 }
 
+fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&str>) -> bool {
+    if !managed_context && managed_context_tool(name) {
+        return false;
+    }
+    let Some(profile) = profile
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+        .map(|profile| profile.to_ascii_lowercase())
+    else {
+        return true;
+    };
+    match profile.as_str() {
+        "full" => true,
+        // Codex should learn the broad Intendant surface lazily through
+        // `intendantctl --help` instead of receiving every MCP schema up front.
+        // Keep the tiny always-useful status/collaboration set first-class.
+        "core" | "codex-core" | "cli" | "minimal" => {
+            matches!(
+                name,
+                "get_status"
+                    | "show_shared_view"
+                    | "focus_shared_view"
+                    | "request_shared_view_input"
+                    | "capture_shared_view_frame"
+                    | "hide_shared_view"
+            ) || (managed_context && managed_context_tool(name))
+        }
+        "screen" | "display" => {
+            matches!(
+                name,
+                "get_status"
+                    | "list_displays"
+                    | "take_screenshot"
+                    | "execute_cu_actions"
+                    | "list_frames"
+                    | "read_frame"
+                    | "show_shared_view"
+                    | "focus_shared_view"
+                    | "request_shared_view_input"
+                    | "capture_shared_view_frame"
+                    | "hide_shared_view"
+            ) || (managed_context && managed_context_tool(name))
+        }
+        "managed" | "managed-context" => {
+            matches!(name, "get_status") || (managed_context && managed_context_tool(name))
+        }
+        // Unknown profiles fail open so typoed third-party URLs do not silently
+        // hide tools. Intendant-generated URLs use known profile names.
+        _ => true,
+    }
+}
+
 fn apply_session_capabilities_to_mcp_state(
     s: &mut McpAppState,
     session_id: &str,
@@ -4192,13 +4244,14 @@ impl IntendantServer {
     /// Schemas are flattened (all `$ref`/`$defs` inlined) for compatibility
     /// with clients that don't resolve JSON Schema references (e.g. Codex).
     pub async fn list_tools_json(&self) -> serde_json::Value {
-        self.list_tools_json_for_session(None, None).await
+        self.list_tools_json_for_session(None, None, None).await
     }
 
     pub async fn list_tools_json_for_session(
         &self,
         session_id: Option<&str>,
         managed_context_override: Option<bool>,
+        tool_profile: Option<&str>,
     ) -> serde_json::Value {
         let managed_context = self
             .state
@@ -4209,7 +4262,9 @@ impl IntendantServer {
             .tool_router
             .list_all()
             .iter()
-            .filter(|tool| managed_context || !managed_context_tool(tool.name.as_ref()))
+            .filter(|tool| {
+                tool_allowed_for_profile(tool.name.as_ref(), managed_context, tool_profile)
+            })
             .map(|tool| {
                 let mut schema = serde_json::to_value(&*tool.input_schema).unwrap_or_default();
                 inline_schema_refs(&mut schema);
@@ -6906,7 +6961,7 @@ mod tests {
             let server = IntendantServer::new(state, EventBus::new());
 
             let vanilla = server
-                .list_tools_json_for_session(Some("vanilla-session"), None)
+                .list_tools_json_for_session(Some("vanilla-session"), None, None)
                 .await;
             let vanilla_names: Vec<_> = vanilla["tools"]
                 .as_array()
@@ -6918,7 +6973,7 @@ mod tests {
             assert!(!vanilla_names.contains(&"rewind_backout"));
 
             let managed = server
-                .list_tools_json_for_session(Some("managed-session"), None)
+                .list_tools_json_for_session(Some("managed-session"), None, None)
                 .await;
             let managed_names: Vec<_> = managed["tools"]
                 .as_array()
@@ -6930,7 +6985,7 @@ mod tests {
             assert!(managed_names.contains(&"rewind_backout"));
 
             let managed_by_url = server
-                .list_tools_json_for_session(Some("vanilla-session"), Some(true))
+                .list_tools_json_for_session(Some("vanilla-session"), Some(true), None)
                 .await;
             let managed_by_url_names: Vec<_> = managed_by_url["tools"]
                 .as_array()
@@ -6939,6 +6994,55 @@ mod tests {
                 .filter_map(|tool| tool["name"].as_str())
                 .collect();
             assert!(managed_by_url_names.contains(&"rewind_context"));
+        });
+    }
+
+    #[test]
+    fn list_tools_core_profile_keeps_only_bootstrap_tools() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            state
+                .write()
+                .await
+                .session_codex_managed_context
+                .insert("managed-session".to_string(), true);
+            let server = IntendantServer::new(state, EventBus::new());
+
+            let vanilla = server
+                .list_tools_json_for_session(None, Some(false), Some("core"))
+                .await;
+            let vanilla_names: Vec<_> = vanilla["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(vanilla_names.contains(&"get_status"));
+            assert!(vanilla_names.contains(&"show_shared_view"));
+            assert!(vanilla_names.contains(&"focus_shared_view"));
+            assert!(vanilla_names.contains(&"request_shared_view_input"));
+            assert!(vanilla_names.contains(&"capture_shared_view_frame"));
+            assert!(vanilla_names.contains(&"hide_shared_view"));
+            assert!(!vanilla_names.contains(&"execute_cu_actions"));
+            assert!(!vanilla_names.contains(&"spawn_live_audio"));
+            assert!(!vanilla_names.contains(&"rewind_context"));
+
+            let managed = server
+                .list_tools_json_for_session(Some("managed-session"), None, Some("core"))
+                .await;
+            let managed_names: Vec<_> = managed["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(managed_names.contains(&"rewind_context"));
+            assert!(managed_names.contains(&"rewind_backout"));
+            assert!(!managed_names.contains(&"execute_cu_actions"));
         });
     }
 

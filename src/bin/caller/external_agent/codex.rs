@@ -1218,12 +1218,15 @@ impl CodexAgent {
             .filter(|s| !s.is_empty())
         {
             Some(session_id) => format!(
-                "http://localhost:{}/mcp?session_id={}&managed_context={}",
+                "http://localhost:{}/mcp?session_id={}&managed_context={}&tool_profile=core",
                 port,
                 encode_mcp_query_value(session_id),
                 mode
             ),
-            None => format!("http://localhost:{}/mcp?managed_context={}", port, mode),
+            None => format!(
+                "http://localhost:{}/mcp?managed_context={}&tool_profile=core",
+                port, mode
+            ),
         }
     }
 
@@ -7466,7 +7469,7 @@ mod tests {
         let url = agent.intendant_mcp_url(8765);
         assert_eq!(
             url,
-            "http://localhost:8765/mcp?session_id=session%20with%20spaces&managed_context=managed"
+            "http://localhost:8765/mcp?session_id=session%20with%20spaces&managed_context=managed&tool_profile=core"
         );
     }
 
