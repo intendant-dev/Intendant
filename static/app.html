@@ -9810,6 +9810,9 @@ async function main() {
       }
       if (d.event === 'session_identity') {
         applySessionIdentity(d);
+        const sid = String(d.session_id || d.sessionId || '').trim();
+        const backendSid = String(d.backend_session_id || d.backendSessionId || '').trim();
+        flushPendingDetachedCodexThreadActions(backendSid || sid);
       }
       if (d.event === 'session_relationship') {
         applySessionRelationship(d);
@@ -11664,7 +11667,9 @@ function applyCodexConfigChanged(evt) {
 // Track in-flight action dispatches so the UI can grey buttons out until a
 // matching CodexThreadActionResult arrives (or a short timeout elapses).
 const controlPendingActions = new Map(); // op -> { timeoutHandle, btnEl }
-const pendingDetachedCodexThreadActions = new Map(); // session id -> [{ op, params, timeoutHandle }]
+const DETACHED_CODEX_ACTION_ATTACH_NOTICE_MS = 15000;
+const DETACHED_CODEX_ACTION_ATTACH_TIMEOUT_MS = 120000;
+const pendingDetachedCodexThreadActions = new Map(); // session id -> [{ op, params, noticeHandle, timeoutHandle }]
 
 function sessionIdsForPendingDetachedActions(sessionId) {
   const sid = String(sessionId || '').trim();
@@ -11690,16 +11695,24 @@ function queueDetachedCodexThreadAction(sessionId, op, params = {}) {
     showControlToast('error', `/${op} failed: Codex session is not attached`);
     return false;
   }
-  const timeoutHandle = setTimeout(() => {
+  const item = { op, params: params || {}, noticeHandle: 0, timeoutHandle: 0 };
+  item.noticeHandle = setTimeout(() => {
     const queue = pendingDetachedCodexThreadActions.get(sid) || [];
-    const next = queue.filter(item => item.timeoutHandle !== timeoutHandle);
+    if (queue.includes(item)) {
+      showControlToast('info', `Still attaching Codex session before /${op}`);
+    }
+  }, DETACHED_CODEX_ACTION_ATTACH_NOTICE_MS);
+  item.timeoutHandle = setTimeout(() => {
+    const queue = pendingDetachedCodexThreadActions.get(sid) || [];
+    const next = queue.filter(entry => entry !== item);
     if (next.length > 0) pendingDetachedCodexThreadActions.set(sid, next);
     else pendingDetachedCodexThreadActions.delete(sid);
+    clearTimeout(item.noticeHandle);
     showControlToast('error', `/${op} failed: Codex session did not attach`);
-  }, 15000);
+  }, DETACHED_CODEX_ACTION_ATTACH_TIMEOUT_MS);
   const queue = pendingDetachedCodexThreadActions.get(sid) || [];
   const shouldRequestAttach = queue.length === 0;
-  queue.push({ op, params: params || {}, timeoutHandle });
+  queue.push(item);
   pendingDetachedCodexThreadActions.set(sid, queue);
   if (shouldRequestAttach) dispatchControlMsg(resume);
   showControlToast('info', `Attaching Codex session before /${op}`);
@@ -11728,6 +11741,7 @@ function flushPendingDetachedCodexThreadActions(sessionId) {
     if (!queue || queue.length === 0) continue;
     pendingDetachedCodexThreadActions.delete(sid);
     for (const item of queue) {
+      clearTimeout(item.noticeHandle);
       clearTimeout(item.timeoutHandle);
       dispatchCodexThreadAction(item.op, item.params, sid, { skipDetachedAttach: true });
     }
