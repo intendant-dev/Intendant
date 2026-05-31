@@ -5471,8 +5471,15 @@ fn append_external_context_snapshot_replay_entries(
         return;
     }
     let mut seen = HashSet::new();
+    let mut snapshot_entries = Vec::new();
     for dir in managed_context_candidate_log_dirs(home, None, Some(session_id), None) {
         let Ok(contents) = std::fs::read_to_string(dir.join("session.jsonl")) else {
+            append_external_context_trace_replay_entries(
+                &dir,
+                session_id,
+                &mut seen,
+                &mut snapshot_entries,
+            );
             continue;
         };
         for entry in replay_jsonl_to_outbound_entries(&contents, &dir) {
@@ -5484,10 +5491,74 @@ fn append_external_context_snapshot_replay_entries(
             }
             let key = context_snapshot_replay_entry_key(&entry);
             if seen.insert(key) {
-                entries.push(entry);
+                snapshot_entries.push(entry);
             }
         }
+        append_external_context_trace_replay_entries(
+            &dir,
+            session_id,
+            &mut seen,
+            &mut snapshot_entries,
+        );
     }
+    snapshot_entries.sort_by_key(context_snapshot_replay_entry_sort_key);
+    entries.extend(snapshot_entries);
+}
+
+fn append_external_context_trace_replay_entries(
+    log_dir: &Path,
+    session_id: &str,
+    seen: &mut HashSet<String>,
+    entries: &mut Vec<serde_json::Value>,
+) {
+    let trace_root = log_dir.join("model-request-traces");
+    if !trace_root.is_dir() {
+        return;
+    }
+    let Ok(snapshots) = crate::external_agent::codex::context_snapshots_from_trace_archive(
+        &trace_root,
+        session_id,
+        true,
+    ) else {
+        return;
+    };
+    for snapshot in snapshots {
+        let entry = external_context_snapshot_replay_entry_from_trace(session_id, snapshot);
+        let key = context_snapshot_replay_entry_key(&entry);
+        if seen.insert(key) {
+            entries.push(entry);
+        }
+    }
+}
+
+fn external_context_snapshot_replay_entry_from_trace(
+    session_id: &str,
+    snapshot: crate::external_agent::AgentContextSnapshot,
+) -> serde_json::Value {
+    serde_json::to_value(crate::types::OutboundEvent::ContextSnapshot {
+        session_id: Some(session_id.to_string()),
+        source: snapshot.source,
+        label: snapshot.label,
+        request_id: snapshot.request_id,
+        request_index: snapshot.request_index,
+        turn: None,
+        format: snapshot.format,
+        token_count: snapshot.token_count,
+        context_window: snapshot.context_window,
+        hard_context_window: snapshot.hard_context_window,
+        item_count: snapshot.item_count,
+        raw: snapshot.raw,
+    })
+    .unwrap_or_else(|_| {
+        serde_json::json!({
+            "event": "context_snapshot",
+            "session_id": session_id,
+            "source": "codex",
+            "label": "Codex request payload",
+            "format": "codex.inference_request_payload.v1",
+            "raw": serde_json::json!({}),
+        })
+    })
 }
 
 fn context_snapshot_replay_entry_matches_session(
@@ -5513,6 +5584,16 @@ fn context_snapshot_replay_entry_key(entry: &serde_json::Value) -> String {
         return format!("index:{session_id}:{request_index}");
     }
     serde_json::to_string(entry).unwrap_or_else(|_| format!("{entry:?}"))
+}
+
+fn context_snapshot_replay_entry_sort_key(entry: &serde_json::Value) -> (u64, String) {
+    (
+        entry
+            .get("request_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::MAX),
+        context_snapshot_replay_entry_key(entry),
+    )
 }
 
 fn external_attached_session_from_wire(line: &str) -> Option<(String, String)> {
@@ -22378,6 +22459,105 @@ mod tests {
         assert_eq!(
             context.pointer("/raw/_intendant_context/thread_id"),
             Some(&serde_json::json!(session_id))
+        );
+    }
+
+    #[test]
+    fn external_activity_replay_synthesizes_context_snapshots_from_codex_trace_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019e7adb-raw-replay";
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-31T02-45-00-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-31T02:45:00Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-31T02:45:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "show raw trace context" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let trace_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper-session")
+            .join("model-request-traces")
+            .join(format!("trace-aa6e5cc0-{session_id}"));
+        std::fs::create_dir_all(trace_dir.join("payloads")).unwrap();
+        std::fs::write(
+            trace_dir.join("payloads/request-1.json"),
+            serde_json::json!({
+                "model": "gpt-test",
+                "input": [{"role": "user", "content": "from raw trace"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            trace_dir.join("trace.jsonl"),
+            serde_json::json!({
+                "schema_version": 1,
+                "wall_time_unix_ms": 1780182481847_u64,
+                "payload": {
+                    "type": "inference_started",
+                    "provider_name": "OpenAI",
+                    "thread_id": session_id,
+                    "inference_call_id": "call-1",
+                    "request_payload": {
+                        "kind": {"type": "inference_request"},
+                        "path": "payloads/request-1.json"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+        let context = entries
+            .iter()
+            .find(|entry| entry["event"] == "context_snapshot")
+            .expect("trace archive context snapshot should replay with external transcript");
+        assert_eq!(context["session_id"], session_id);
+        assert_eq!(context["source"], "codex");
+        assert_eq!(context["label"], "Codex resolved request payload");
+        assert_eq!(context["format"], "openai.responses.resolved_request.v1");
+        assert_eq!(context["request_index"], 1);
+        assert!(context["request_id"]
+            .as_str()
+            .is_some_and(|request_id| request_id.starts_with("codex-request-")));
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/thread_id"),
+            Some(&serde_json::json!(session_id))
+        );
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/archive_mode"),
+            Some(&serde_json::json!("exact"))
+        );
+        assert_eq!(
+            context.pointer("/raw/input/0/content"),
+            Some(&serde_json::json!("from raw trace"))
         );
     }
 

@@ -1489,6 +1489,58 @@ async fn read_codex_context_payloads(
     read_codex_context_payloads_excluding(root, thread_id, &HashSet::new()).await
 }
 
+pub(crate) fn context_snapshots_from_trace_archive(
+    root: &Path,
+    thread_id: &str,
+    exact_archive: bool,
+) -> Result<Vec<AgentContextSnapshot>, CallerError> {
+    let traces = read_codex_context_payloads_sync(root, Some(thread_id))?;
+    Ok(traces
+        .into_iter()
+        .map(|trace| {
+            let item_count = codex_request_item_count(&trace.payload);
+            let raw = codex_context_archive_payload(
+                trace.payload,
+                &trace.request_id,
+                trace.request_index,
+                &trace.format,
+                exact_archive,
+            );
+            AgentContextSnapshot {
+                source: "codex".to_string(),
+                label: trace.label,
+                request_id: Some(trace.request_id),
+                request_index: Some(trace.request_index),
+                format: trace.format,
+                token_count: None,
+                context_window: None,
+                hard_context_window: None,
+                item_count,
+                raw,
+            }
+        })
+        .collect())
+}
+
+fn read_codex_context_payloads_sync(
+    root: &Path,
+    thread_id: Option<&str>,
+) -> Result<Vec<CodexRequestPayloadSnapshot>, CallerError> {
+    let index = read_codex_trace_index_sync(root, thread_id)?;
+    let mut requests = index.requests.clone();
+    requests.sort_by(|a, b| codex_request_sort_key(a).cmp(&codex_request_sort_key(b)));
+
+    let mut snapshots = Vec::with_capacity(requests.len());
+    for (idx, request_ref) in requests.iter().enumerate() {
+        snapshots.push(codex_context_payload_snapshot_sync(
+            &index,
+            request_ref,
+            idx as u64 + 1,
+        )?);
+    }
+    Ok(snapshots)
+}
+
 async fn read_codex_context_payloads_excluding(
     root: &Path,
     thread_id: Option<&str>,
@@ -1521,6 +1573,40 @@ async fn codex_context_payload_snapshot(
         let resolved =
             resolve_openai_responses_context_payload(index, request_ref, request_index, payload)
                 .await?;
+        return Ok(CodexRequestPayloadSnapshot {
+            label: "Codex resolved request payload".to_string(),
+            request_id,
+            request_index,
+            format: "openai.responses.resolved_request.v1".to_string(),
+            payload: resolved,
+        });
+    }
+
+    Ok(CodexRequestPayloadSnapshot {
+        label: "Codex request payload".to_string(),
+        request_id,
+        request_index,
+        format,
+        payload,
+    })
+}
+
+fn codex_context_payload_snapshot_sync(
+    index: &CodexTraceIndex,
+    request_ref: &CodexRequestPayloadRef,
+    request_index: u64,
+) -> Result<CodexRequestPayloadSnapshot, CallerError> {
+    let payload =
+        read_codex_json_payload_sync(&request_ref.bundle_dir, &request_ref.relative_path)?;
+    let format = codex_request_format(request_ref.provider_name.as_deref());
+    let request_id = codex_request_id(request_ref);
+    if format == "openai.responses.request.v1" {
+        let resolved = resolve_openai_responses_context_payload_sync(
+            index,
+            request_ref,
+            request_index,
+            payload,
+        )?;
         return Ok(CodexRequestPayloadSnapshot {
             label: "Codex resolved request payload".to_string(),
             request_id,
@@ -1978,6 +2064,56 @@ async fn read_codex_trace_index(
     })
 }
 
+fn read_codex_trace_index_sync(
+    root: &Path,
+    thread_id: Option<&str>,
+) -> Result<CodexTraceIndex, CallerError> {
+    let bundle_dirs = collect_codex_trace_bundle_dirs_sync(root, thread_id)?;
+    let mut requests = Vec::new();
+    let mut requests_by_call = HashMap::new();
+    let mut responses_by_id = HashMap::new();
+
+    for bundle_dir in bundle_dirs {
+        let trace_path = bundle_dir.join("trace.jsonl");
+        let contents = match std::fs::read_to_string(&trace_path) {
+            Ok(contents) => contents,
+            Err(_) => continue,
+        };
+
+        for (line_idx, line) in contents.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if let Some(candidate) =
+                codex_inference_request_ref(&bundle_dir, &event, line_idx as u64)
+            {
+                if thread_id
+                    .zip(candidate.thread_id.as_deref())
+                    .map(|(expected, actual)| expected != actual)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                requests_by_call.insert(codex_trace_call_key(&candidate), candidate.clone());
+                requests.push(candidate);
+                continue;
+            }
+            if let Some(response) = codex_inference_response_ref(&bundle_dir, &event) {
+                responses_by_id.insert(response.response_id.clone(), response);
+            }
+        }
+    }
+
+    Ok(CodexTraceIndex {
+        requests,
+        requests_by_call,
+        responses_by_id,
+    })
+}
+
 async fn collect_codex_trace_bundle_dirs(
     root: &Path,
     thread_id: Option<&str>,
@@ -2048,6 +2184,43 @@ async fn collect_codex_trace_bundle_dirs(
     Ok(bundle_dirs)
 }
 
+fn collect_codex_trace_bundle_dirs_sync(
+    root: &Path,
+    thread_id: Option<&str>,
+) -> Result<Vec<PathBuf>, CallerError> {
+    let entries = std::fs::read_dir(root).map_err(|e| {
+        CallerError::ExternalAgent(format!(
+            "read Codex request trace root {}: {e}",
+            root.display()
+        ))
+    })?;
+    let mut bundle_dirs = Vec::new();
+    let mut seen_bundles = HashSet::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let bundle_dir = entry.path();
+        if let Some(thread_id) = thread_id {
+            let name = bundle_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if !name.contains(thread_id) {
+                continue;
+            }
+        }
+        if seen_bundles.insert(bundle_dir.clone()) {
+            bundle_dirs.push(bundle_dir);
+        }
+    }
+
+    Ok(bundle_dirs)
+}
+
 fn codex_logs_root_for_trace_root(root: &Path) -> Option<PathBuf> {
     if root.file_name().and_then(|name| name.to_str()) != Some("model-request-traces") {
         return None;
@@ -2068,6 +2241,20 @@ async fn read_codex_json_payload(
                 payload_path.display()
             ))
         })?;
+    serde_json::from_str::<serde_json::Value>(&contents).map_err(CallerError::Json)
+}
+
+fn read_codex_json_payload_sync(
+    bundle_dir: &Path,
+    relative_path: &str,
+) -> Result<serde_json::Value, CallerError> {
+    let payload_path = bundle_dir.join(relative_path);
+    let contents = std::fs::read_to_string(&payload_path).map_err(|e| {
+        CallerError::ExternalAgent(format!(
+            "read Codex request payload {}: {e}",
+            payload_path.display()
+        ))
+    })?;
     serde_json::from_str::<serde_json::Value>(&contents).map_err(CallerError::Json)
 }
 
@@ -2101,6 +2288,78 @@ async fn resolve_openai_responses_context_payload(
             read_codex_json_payload(&request_ref.bundle_dir, &request_ref.relative_path).await?;
         let response_payload =
             read_codex_json_payload(&response_ref.bundle_dir, &response_ref.relative_path).await?;
+        previous_response_id = codex_previous_response_id(&request_payload).map(str::to_string);
+        previous_pairs.push((request_payload, response_payload));
+    }
+
+    previous_pairs.reverse();
+
+    let mut resolved_input = Vec::new();
+    for (request_payload, response_payload) in previous_pairs {
+        codex_extend_array_field(&mut resolved_input, &request_payload, "input");
+        codex_extend_array_field(&mut resolved_input, &response_payload, "output_items");
+    }
+    codex_extend_array_field(&mut resolved_input, &latest_payload, "input");
+
+    let latest_request_input_count = latest_payload
+        .get("input")
+        .and_then(|input| input.as_array())
+        .map(Vec::len)
+        .unwrap_or(0);
+    let mut resolved_payload = latest_payload;
+    if let serde_json::Value::Object(map) = &mut resolved_payload {
+        map.insert(
+            "input".to_string(),
+            serde_json::Value::Array(resolved_input.clone()),
+        );
+        map.insert(
+            "_intendant_context".to_string(),
+            serde_json::json!({
+                "source": "codex_rollout_trace_payloads",
+                "thread_id": latest_ref.thread_id.clone(),
+                "request_id": codex_request_id(latest_ref),
+                "request_index": request_index,
+                "inference_call_id": latest_ref.inference_call_id.clone(),
+                "latest_request_input_count": latest_request_input_count,
+                "resolved_input_count": resolved_input.len(),
+                "unresolved_previous_response_id": unresolved_previous_response_id,
+            }),
+        );
+    }
+
+    Ok(resolved_payload)
+}
+
+fn resolve_openai_responses_context_payload_sync(
+    index: &CodexTraceIndex,
+    latest_ref: &CodexRequestPayloadRef,
+    request_index: u64,
+    latest_payload: serde_json::Value,
+) -> Result<serde_json::Value, CallerError> {
+    let mut previous_pairs = Vec::new();
+    let mut unresolved_previous_response_id = None;
+    let mut seen_response_ids = HashSet::new();
+    let mut previous_response_id = codex_previous_response_id(&latest_payload).map(str::to_string);
+
+    while let Some(response_id) = previous_response_id {
+        if !seen_response_ids.insert(response_id.clone()) {
+            unresolved_previous_response_id = Some(response_id);
+            break;
+        }
+        let Some(response_ref) = index.responses_by_id.get(&response_id).cloned() else {
+            unresolved_previous_response_id = Some(response_id);
+            break;
+        };
+        let request_key =
+            codex_trace_call_key_parts(&response_ref.bundle_dir, &response_ref.inference_call_id);
+        let Some(request_ref) = index.requests_by_call.get(&request_key).cloned() else {
+            unresolved_previous_response_id = Some(response_id);
+            break;
+        };
+        let request_payload =
+            read_codex_json_payload_sync(&request_ref.bundle_dir, &request_ref.relative_path)?;
+        let response_payload =
+            read_codex_json_payload_sync(&response_ref.bundle_dir, &response_ref.relative_path)?;
         previous_response_id = codex_previous_response_id(&request_payload).map(str::to_string);
         previous_pairs.push((request_payload, response_payload));
     }
