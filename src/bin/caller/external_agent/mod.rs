@@ -435,8 +435,9 @@ pub struct AgentConfig {
     /// Codex reasoning-effort override (`low|medium|high|...`). Codex-only;
     /// other backends ignore.
     pub reasoning_effort: Option<String>,
-    /// Codex service-tier override (`priority` for `/fast`). Codex-only;
-    /// other backends ignore.
+    /// Codex service-tier override (`priority` for Fast, `flex`, or
+    /// Intendant's `standard` sentinel to send `serviceTier: null`).
+    /// Codex-only; other backends ignore.
     pub service_tier: Option<String>,
     /// Enable Codex's `web_search` Responses tool. Codex-only.
     pub web_search: bool,

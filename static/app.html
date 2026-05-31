@@ -8157,6 +8157,18 @@ body.display-fullscreen-open {
                   </select>
                 </div>
                 <div class="control-hint">Maps to <code>-c&nbsp;model_reasoning_effort=...</code>. Only meaningful for reasoning-capable models; ignored otherwise.</div>
+                <div class="control-row">
+                  <label for="control-codex-service-tier">Default service tier</label>
+                  <select id="control-codex-service-tier">
+                    <option value="">inherit Codex config</option>
+                    <option value="standard">normal</option>
+                    <option value="priority">fast</option>
+                    <option value="flex">flex</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  Applies to new Intendant-managed Codex sessions. <strong>inherit</strong> leaves <code>~/.codex/config.toml</code> and account defaults in charge; <strong>normal</strong> explicitly clears Fast for these sessions.
+                </div>
               </fieldset>
               <fieldset class="control-group">
                 <legend>Tools</legend>
@@ -8900,6 +8912,15 @@ body.display-fullscreen-open {
               <div class="settings-row">
                 <label>Codex binary</label>
                 <input id="set-codex-command" type="text" placeholder="codex or /usr/local/bin/codex" autocomplete="off">
+              </div>
+              <div class="settings-row">
+                <label>Codex tier</label>
+                <select id="set-codex-service-tier">
+                  <option value="">Inherit Codex config</option>
+                  <option value="standard">Normal</option>
+                  <option value="priority">Fast</option>
+                  <option value="flex">Flex</option>
+                </select>
               </div>
             </fieldset>
 
@@ -11652,6 +11673,7 @@ let controlCodexConfig = {
   approval_policy: null,
   model: null,
   reasoning_effort: '',
+  service_tier: '',
   web_search: false,
   network_access: false,
   writable_roots: [],
@@ -11685,7 +11707,9 @@ let newSessionAgentCommands = {
 };
 let newSessionCodexManagedContext = 'vanilla';
 let newSessionCodexContextArchive = 'summary';
+let newSessionCodexDefaultServiceTier = '';
 let newSessionCodexFastMode = false;
+let newSessionCodexFastModeTouched = false;
 let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
 let newSessionSpawnTimeout = null;
@@ -11710,12 +11734,17 @@ async function refreshControlPane() {
       approval_policy: d.codex_approval_policy || 'on-request',
       model: d.codex_model || '',
       reasoning_effort: d.codex_reasoning_effort || '',
+      service_tier: normalizeCodexServiceTier(d.codex_service_tier || ''),
       web_search: !!d.codex_web_search,
       network_access: !!d.codex_network_access,
       writable_roots: Array.isArray(d.codex_writable_roots) ? d.codex_writable_roots : [],
       managed_context: d.codex_managed_context || 'vanilla',
       context_archive: d.codex_context_archive || 'summary',
     };
+    newSessionCodexDefaultServiceTier = controlCodexConfig.service_tier || '';
+    if (!newSessionCodexFastModeTouched) {
+      newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
+    }
     controlGeminiConfig = {
       model: d.gemini_model || '',
       approval_mode: d.gemini_approval_mode || 'default',
@@ -11757,6 +11786,7 @@ function renderControlPane() {
     const approvalSel = $('control-codex-approval');
     const modelInp = $('control-codex-model');
     const reasoningSel = $('control-codex-reasoning');
+    const serviceTierSel = $('control-codex-service-tier');
     const webSearch = $('control-codex-web-search');
     const webSearchStatus = $('control-codex-web-search-status');
     const managedContextSel = $('control-codex-managed-context');
@@ -11770,6 +11800,7 @@ function renderControlPane() {
     if (approvalSel) approvalSel.value = controlCodexConfig.approval_policy;
     if (modelInp) modelInp.value = controlCodexConfig.model || '';
     if (reasoningSel) reasoningSel.value = controlCodexConfig.reasoning_effort || '';
+    if (serviceTierSel) serviceTierSel.value = normalizeCodexServiceTier(controlCodexConfig.service_tier || '');
     if (webSearch) webSearch.checked = !!controlCodexConfig.web_search;
     if (webSearchStatus) webSearchStatus.textContent = controlCodexConfig.web_search ? 'on' : 'off';
     if (managedContextSel) managedContextSel.value = controlCodexConfig.managed_context || 'vanilla';
@@ -11870,6 +11901,20 @@ function onControlReasoningChange(ev) {
   if (effort === (controlCodexConfig.reasoning_effort || '')) return;
   controlCodexConfig.reasoning_effort = effort;
   dispatchControlMsg({ action: 'set_codex_reasoning_effort', effort: effort || null });
+}
+
+function onControlServiceTierChange(ev) {
+  const serviceTier = normalizeCodexServiceTier(ev.target.value || '');
+  if (serviceTier === normalizeCodexServiceTier(controlCodexConfig.service_tier || '')) return;
+  controlCodexConfig.service_tier = serviceTier;
+  newSessionCodexDefaultServiceTier = serviceTier;
+  if (!newSessionCodexFastModeTouched) {
+    newSessionCodexFastMode = codexServiceTierIsFast(serviceTier);
+  }
+  const settingsSel = document.getElementById('set-codex-service-tier');
+  if (settingsSel) settingsSel.value = serviceTier;
+  renderNewSessionAgentControls();
+  dispatchControlMsg({ action: 'set_codex_service_tier', service_tier: serviceTier || null });
 }
 
 function onControlWebSearchChange(ev) {
@@ -12046,6 +12091,21 @@ function applyCodexConfigChanged(evt) {
     controlCodexConfig.reasoning_effort = evt.reasoning_effort;
   } else if (evt.reasoning_effort_cleared) {
     controlCodexConfig.reasoning_effort = '';
+  }
+  if (evt.service_tier !== undefined && evt.service_tier !== null) {
+    controlCodexConfig.service_tier = normalizeCodexServiceTier(evt.service_tier);
+  } else if (evt.service_tier_cleared) {
+    controlCodexConfig.service_tier = '';
+  }
+  if (evt.service_tier !== undefined || evt.service_tier_cleared) {
+    const tier = normalizeCodexServiceTier(controlCodexConfig.service_tier || '');
+    newSessionCodexDefaultServiceTier = tier;
+    if (!newSessionCodexFastModeTouched) {
+      newSessionCodexFastMode = codexServiceTierIsFast(tier);
+    }
+    const settingsSel = document.getElementById('set-codex-service-tier');
+    if (settingsSel) settingsSel.value = tier;
+    renderNewSessionAgentControls();
   }
   if (typeof evt.web_search === 'boolean') controlCodexConfig.web_search = evt.web_search;
   if (typeof evt.network_access === 'boolean') controlCodexConfig.network_access = evt.network_access;
@@ -12694,6 +12754,7 @@ function wireControlPaneListeners() {
   const approvalSel = $('control-codex-approval');
   const modelInp = $('control-codex-model');
   const reasoningSel = $('control-codex-reasoning');
+  const serviceTierSel = $('control-codex-service-tier');
   const webSearch = $('control-codex-web-search');
   const managedContextSel = $('control-codex-managed-context');
   const contextArchiveSel = $('control-codex-context-archive');
@@ -12702,6 +12763,7 @@ function wireControlPaneListeners() {
   if (sandboxSel) sandboxSel.addEventListener('change', onControlSandboxChange);
   if (approvalSel) approvalSel.addEventListener('change', onControlApprovalChange);
   if (reasoningSel) reasoningSel.addEventListener('change', onControlReasoningChange);
+  if (serviceTierSel) serviceTierSel.addEventListener('change', onControlServiceTierChange);
   if (webSearch) webSearch.addEventListener('change', onControlWebSearchChange);
   if (managedContextSel) managedContextSel.addEventListener('change', onControlManagedContextChange);
   if (contextArchiveSel) contextArchiveSel.addEventListener('change', onControlContextArchiveChange);
@@ -30444,7 +30506,9 @@ async function loadSettings() {
     document.getElementById('set-live-audio-enabled').checked = d.live_audio_enabled;
     document.getElementById('set-live-audio-timeout').value = d.live_audio_timeout_secs || 300;
     document.getElementById('set-codex-command').value = d.codex_command || 'codex';
+    document.getElementById('set-codex-service-tier').value = normalizeCodexServiceTier(d.codex_service_tier || '');
     controlCodexConfig.command = d.codex_command || 'codex';
+    controlCodexConfig.service_tier = normalizeCodexServiceTier(d.codex_service_tier || '');
     controlCodexConfig.managed_context = d.codex_managed_context || 'vanilla';
     controlCodexConfig.context_archive = d.codex_context_archive || 'summary';
     setNewSessionAgentDefaults(d);
@@ -30488,6 +30552,12 @@ async function loadSettings() {
 
 async function saveSettings() {
   const g = id => document.getElementById(id);
+  const selectedCodexServiceTier = normalizeCodexServiceTier(g('set-codex-service-tier')?.value ?? controlCodexConfig.service_tier ?? '');
+  controlCodexConfig.service_tier = selectedCodexServiceTier;
+  newSessionCodexDefaultServiceTier = selectedCodexServiceTier;
+  if (!newSessionCodexFastModeTouched) {
+    newSessionCodexFastMode = codexServiceTierIsFast(selectedCodexServiceTier);
+  }
   const payload = {
     cu_provider: g('set-cu-provider').value || null,
     cu_model: g('set-cu-model').value || null,
@@ -30514,6 +30584,7 @@ async function saveSettings() {
     codex_approval_policy: controlCodexConfig.approval_policy || 'on-request',
     codex_model: controlCodexConfig.model || null,
     codex_reasoning_effort: controlCodexConfig.reasoning_effort || null,
+    codex_service_tier: selectedCodexServiceTier,
     codex_web_search: !!controlCodexConfig.web_search,
     codex_network_access: !!controlCodexConfig.network_access,
     codex_writable_roots: Array.isArray(controlCodexConfig.writable_roots)
@@ -30568,6 +30639,10 @@ async function saveSettings() {
     app.send_server_action({
       action: 'set_codex_context_archive',
       mode: controlCodexConfig.context_archive || 'summary',
+    });
+    app.send_server_action({
+      action: 'set_codex_service_tier',
+      service_tier: selectedCodexServiceTier || null,
     });
   }
 }
@@ -32221,6 +32296,24 @@ function normalizeContextArchiveMode(mode) {
   return ['summary', 'exact', 'off'].includes(mode) ? mode : 'summary';
 }
 
+function normalizeCodexServiceTier(tier) {
+  const v = String(tier || '').trim().toLowerCase();
+  if (!v || v === 'inherit' || v === 'default' || v === 'auto' || v === 'codex') return '';
+  if (v === 'fast' || v === 'priority') return 'priority';
+  if (['standard', 'normal', 'none', 'off', 'clear', 'disabled', 'false', '0'].includes(v)) return 'standard';
+  if (v === 'flex') return 'flex';
+  return v;
+}
+
+function codexServiceTierIsFast(tier) {
+  return normalizeCodexServiceTier(tier) === 'priority';
+}
+
+function resetNewSessionCodexFastModeToDefault() {
+  newSessionCodexFastModeTouched = false;
+  newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
+}
+
 function setNewSessionAgentDefaults(settings) {
   newSessionAgentCommands = {
     codex: settings.codex_command || 'codex',
@@ -32230,6 +32323,10 @@ function setNewSessionAgentDefaults(settings) {
   newSessionCodexManagedContext =
     settings.codex_managed_context === 'managed' ? 'managed' : 'vanilla';
   newSessionCodexContextArchive = normalizeContextArchiveMode(settings.codex_context_archive || 'summary');
+  newSessionCodexDefaultServiceTier = normalizeCodexServiceTier(settings.codex_service_tier || '');
+  if (!newSessionCodexFastModeTouched) {
+    newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
+  }
   renderNewSessionAgentControls();
 }
 
@@ -32294,8 +32391,11 @@ function renderNewSessionAgentControls(options = {}) {
     if (fastWrap) {
       fastWrap.classList.toggle('disabled', !appliesToCodex);
       fastWrap.classList.toggle('active', appliesToCodex && !!newSessionCodexFastMode);
+      const defaultFast = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
       fastWrap.title = appliesToCodex
-        ? 'Start the new Codex session with Fast service tier'
+        ? (defaultFast
+          ? 'Global default is Fast; uncheck to force this new session to normal'
+          : 'Start the new Codex session with Fast service tier')
         : 'Fast service tier applies to Codex sessions';
     }
   }
@@ -32516,8 +32616,11 @@ async function startNewSession() {
       document.getElementById('new-session-codex-context-archive')?.value || newSessionCodexContextArchive
     );
     msg.codex_context_archive = archiveMode;
-    if (document.getElementById('new-session-codex-fast')?.checked) {
+    const fastChecked = !!document.getElementById('new-session-codex-fast')?.checked;
+    if (fastChecked) {
       msg.codex_service_tier = 'priority';
+    } else if (codexServiceTierIsFast(newSessionCodexDefaultServiceTier)) {
+      msg.codex_service_tier = 'standard';
     }
   }
   if (direct) msg.direct = true;
@@ -32534,6 +32637,8 @@ async function startNewSession() {
   showControlToast('info', 'Spawning new session...');
   clearTaskTextarea(input);
   if (nameInput) nameInput.value = '';
+  resetNewSessionCodexFastModeToDefault();
+  renderNewSessionAgentControls();
   if (attachments.length > 0) {
     renderAttachmentReceipt(task, attachmentReceipt, 'Sent');
     clearPendingAttachments();
@@ -33028,6 +33133,7 @@ document.getElementById('new-session-codex-context-archive')?.addEventListener('
   renderNewSessionAgentControls();
 });
 document.getElementById('new-session-codex-fast')?.addEventListener('change', (ev) => {
+  newSessionCodexFastModeTouched = true;
   newSessionCodexFastMode = !!ev.currentTarget.checked;
   renderNewSessionAgentControls();
 });

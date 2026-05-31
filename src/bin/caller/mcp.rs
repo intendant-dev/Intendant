@@ -1639,6 +1639,18 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::SetCodexServiceTier { service_tier } => {
+            let label = crate::project::normalize_codex_service_tier(service_tier.as_deref())
+                .unwrap_or_else(|| "<inherit>".to_string());
+            emit_control_result(
+                control_tx,
+                "set_codex_service_tier",
+                true,
+                format!("Codex service tier set to {} (applies on next task)", label),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::SetCodexWebSearch { enabled } => {
             emit_control_result(
                 control_tx,
@@ -7116,6 +7128,8 @@ mod tests {
                 model_cleared: false,
                 reasoning_effort: None,
                 reasoning_effort_cleared: false,
+                service_tier: None,
+                service_tier_cleared: false,
                 web_search: None,
                 network_access: None,
                 writable_roots: None,
@@ -7146,6 +7160,8 @@ mod tests {
                 model_cleared: false,
                 reasoning_effort: None,
                 reasoning_effort_cleared: false,
+                service_tier: None,
+                service_tier_cleared: false,
                 web_search: None,
                 network_access: None,
                 writable_roots: None,

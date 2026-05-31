@@ -1128,6 +1128,23 @@ impl CodexAgent {
         }
     }
 
+    fn apply_configured_service_tier(&mut self, service_tier: Option<String>) {
+        match crate::project::normalize_codex_service_tier(service_tier.as_deref()) {
+            Some(tier) if crate::project::codex_service_tier_is_standard_clear(&tier) => {
+                self.service_tier = None;
+                self.service_tier_clear_pending = true;
+            }
+            Some(tier) => {
+                self.service_tier = Some(tier);
+                self.service_tier_clear_pending = false;
+            }
+            None => {
+                self.service_tier = None;
+                self.service_tier_clear_pending = false;
+            }
+        }
+    }
+
     fn service_tier_override_value(&self) -> Option<serde_json::Value> {
         if let Some(service_tier) = self
             .service_tier
@@ -4172,8 +4189,7 @@ impl ExternalAgent for CodexAgent {
         self.approval_policy = config.approval_policy.clone();
         self.sandbox = config.sandbox;
         self.reasoning_effort = config.reasoning_effort;
-        self.service_tier = config.service_tier;
-        self.service_tier_clear_pending = false;
+        self.apply_configured_service_tier(config.service_tier);
         self.web_search = config.web_search;
         self.network_access = config.network_access;
         self.writable_roots = config.writable_roots;
@@ -7128,6 +7144,19 @@ mod tests {
         let mut later_params = serde_json::Map::new();
         agent.insert_service_tier_override_consuming_clear(&mut later_params);
         assert!(later_params.get("serviceTier").is_none());
+    }
+
+    #[test]
+    fn configured_standard_service_tier_serializes_null_once() {
+        let mut agent = test_agent();
+        agent.apply_configured_service_tier(Some("normal".to_string()));
+        assert_eq!(agent.service_tier, None);
+        assert!(agent.service_tier_clear_pending);
+
+        let mut params = serde_json::Map::new();
+        agent.insert_service_tier_override_consuming_clear(&mut params);
+        assert!(params["serviceTier"].is_null());
+        assert!(!agent.service_tier_clear_pending);
     }
 
     #[test]

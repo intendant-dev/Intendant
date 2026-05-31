@@ -147,6 +147,13 @@ pub struct CodexConfig {
     /// `"minimal" | "low" | "medium" | "high" | "xhigh"`. Empty = Codex default.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Optional Codex service-tier default for Intendant-managed Codex
+    /// sessions. Empty / omitted inherits Codex's own config and account
+    /// defaults. `"priority"` enables Fast, `"flex"` requests Flex, and
+    /// `"standard"` sends an explicit `serviceTier: null` to opt out of Fast
+    /// for managed sessions.
+    #[serde(default)]
+    pub service_tier: Option<String>,
     /// Whether to enable the Responses API `web_search` tool for this
     /// session. Maps to `codex --search` / `-c tool_suggest.web_search=true`.
     #[serde(default)]
@@ -215,6 +222,7 @@ pub const CODEX_APPROVAL_POLICIES: &[&str] = &["untrusted", "on-request", "never
 /// juggling layer. All other values map straight to
 /// `-c model_reasoning_effort=...`.
 pub const CODEX_REASONING_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh"];
+pub const CODEX_STANDARD_SERVICE_TIER: &str = "standard";
 
 /// Normalize a user-supplied sandbox value to one of `CODEX_SANDBOX_MODES`.
 /// Unknown or empty values fall back to the safest real policy
@@ -258,6 +266,26 @@ pub fn normalize_reasoning_effort(input: Option<&str>) -> Option<String> {
     }
 }
 
+pub fn normalize_codex_service_tier(input: Option<&str>) -> Option<String> {
+    let s = input.map(str::trim).unwrap_or("");
+    if s.is_empty() {
+        return None;
+    }
+    match s.to_ascii_lowercase().as_str() {
+        "inherit" | "default" | "auto" | "codex" => None,
+        "fast" | "priority" => Some("priority".to_string()),
+        "standard" | "normal" | "none" | "off" | "clear" | "disabled" | "false" | "0" => {
+            Some(CODEX_STANDARD_SERVICE_TIER.to_string())
+        }
+        "flex" => Some("flex".to_string()),
+        _ => Some(s.to_string()),
+    }
+}
+
+pub fn codex_service_tier_is_standard_clear(tier: &str) -> bool {
+    normalize_codex_service_tier(Some(tier)).as_deref() == Some(CODEX_STANDARD_SERVICE_TIER)
+}
+
 pub fn normalize_codex_managed_context(input: &str) -> String {
     match input.trim().to_ascii_lowercase().as_str() {
         "managed" | "patched" | "intendant" | "on" | "true" | "enabled" => "managed".to_string(),
@@ -289,6 +317,7 @@ impl Default for CodexConfig {
             approval_policy: default_codex_approval_policy(),
             sandbox: default_codex_sandbox(),
             reasoning_effort: None,
+            service_tier: None,
             web_search: false,
             network_access: false,
             writable_roots: Vec::new(),
@@ -1434,6 +1463,7 @@ allowed_tools = ["Read", "Edit", "Bash"]
         assert_eq!(config.agent.codex.model.as_deref(), Some("o4-mini"));
         assert_eq!(config.agent.codex.approval_policy, "never");
         assert_eq!(config.agent.codex.sandbox, "workspace-write");
+        assert!(config.agent.codex.service_tier.is_none());
         assert_eq!(config.agent.claude_code.command, "/usr/local/bin/claude");
         assert_eq!(
             config.agent.claude_code.model.as_deref(),
@@ -1473,7 +1503,17 @@ default_backend = "codex"
         assert_eq!(config.approval_policy, "on-request");
         assert_eq!(config.sandbox, "workspace-write");
         assert_eq!(config.context_archive, "summary");
+        assert!(config.service_tier.is_none());
         assert_eq!(normalize_codex_context_archive("raw"), "exact");
         assert_eq!(normalize_codex_context_archive("disabled"), "off");
+        assert_eq!(
+            normalize_codex_service_tier(Some("fast")).as_deref(),
+            Some("priority")
+        );
+        assert_eq!(
+            normalize_codex_service_tier(Some("normal")).as_deref(),
+            Some(CODEX_STANDARD_SERVICE_TIER)
+        );
+        assert_eq!(normalize_codex_service_tier(Some("inherit")), None);
     }
 }

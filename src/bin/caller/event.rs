@@ -652,6 +652,8 @@ pub enum AppEvent {
         model_cleared: bool,
         reasoning_effort: Option<String>,
         reasoning_effort_cleared: bool,
+        service_tier: Option<String>,
+        service_tier_cleared: bool,
         web_search: Option<bool>,
         network_access: Option<bool>,
         writable_roots: Option<Vec<String>>,
@@ -913,6 +915,14 @@ pub enum ControlMsg {
         #[serde(default)]
         effort: Option<String>,
     },
+    /// Set the Codex service-tier default for Intendant-managed Codex
+    /// sessions. `None` / missing inherits Codex's own config. `"priority"`
+    /// forces Fast, `"flex"` requests Flex, and `"standard"` sends an
+    /// explicit `serviceTier: null` at thread start to force normal.
+    SetCodexServiceTier {
+        #[serde(default)]
+        service_tier: Option<String>,
+    },
     /// Toggle the Responses API `web_search` tool for Codex.
     /// Maps to `codex --search`. Applies to the NEXT task.
     SetCodexWebSearch {
@@ -1160,8 +1170,8 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_context_archive: Option<String>,
         /// Optional one-shot Codex service tier for this session. "priority"
-        /// enables Codex Fast for future turns. Only applies when the resolved
-        /// agent is Codex.
+        /// enables Codex Fast; "standard" explicitly clears Fast and forces
+        /// normal. Only applies when the resolved agent is Codex.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_service_tier: Option<String>,
         #[serde(default)]
@@ -1919,6 +1929,8 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             model_cleared,
             reasoning_effort,
             reasoning_effort_cleared,
+            service_tier,
+            service_tier_cleared,
             web_search,
             network_access,
             writable_roots,
@@ -1932,6 +1944,8 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             model_cleared: *model_cleared,
             reasoning_effort: reasoning_effort.clone(),
             reasoning_effort_cleared: *reasoning_effort_cleared,
+            service_tier: service_tier.clone(),
+            service_tier_cleared: *service_tier_cleared,
             web_search: *web_search,
             network_access: *network_access,
             writable_roots: writable_roots.clone(),

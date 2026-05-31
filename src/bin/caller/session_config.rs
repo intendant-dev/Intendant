@@ -64,9 +64,7 @@ pub fn normalize_agent_command(command: Option<&str>) -> Option<String> {
 }
 
 pub fn normalize_codex_service_tier(tier: Option<&str>) -> Option<String> {
-    tier.map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+    crate::project::normalize_codex_service_tier(tier)
 }
 
 pub fn from_wire(
@@ -111,7 +109,9 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             codex_context_archive: Some(crate::project::normalize_codex_context_archive(
                 &project.config.agent.codex.context_archive,
             )),
-            codex_service_tier: None,
+            codex_service_tier: crate::project::normalize_codex_service_tier(
+                project.config.agent.codex.service_tier.as_deref(),
+            ),
         },
         AgentBackend::ClaudeCode => SessionAgentConfig {
             source: Some("claude-code".to_string()),
@@ -565,6 +565,12 @@ mod tests {
         assert_eq!(cfg.codex_managed_context.as_deref(), Some("managed"));
         assert_eq!(cfg.codex_context_archive.as_deref(), Some("exact"));
         assert_eq!(cfg.codex_service_tier.as_deref(), Some("priority"));
+
+        let normal_cfg = from_wire(Some("codex"), None, None, None, Some("normal"));
+        assert_eq!(
+            normal_cfg.codex_service_tier.as_deref(),
+            Some(crate::project::CODEX_STANDARD_SERVICE_TIER)
+        );
     }
 
     #[test]

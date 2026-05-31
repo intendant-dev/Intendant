@@ -1006,6 +1006,8 @@ impl AppEventUpcaster {
                 model_cleared,
                 reasoning_effort,
                 reasoning_effort_cleared,
+                service_tier,
+                service_tier_cleared,
                 web_search,
                 network_access,
                 writable_roots,
@@ -1031,6 +1033,11 @@ impl AppEventUpcaster {
                     parts.push(format!("reasoning_effort={v}"));
                 } else if *reasoning_effort_cleared {
                     parts.push("reasoning_effort=<default>".to_string());
+                }
+                if let Some(v) = service_tier {
+                    parts.push(format!("service_tier={v}"));
+                } else if *service_tier_cleared {
+                    parts.push("service_tier=<inherit>".to_string());
                 }
                 if let Some(v) = web_search {
                     parts.push(format!("web_search={v}"));
@@ -2042,6 +2049,8 @@ impl WireEventUpcaster {
                 model_cleared,
                 reasoning_effort,
                 reasoning_effort_cleared,
+                service_tier,
+                service_tier_cleared,
                 web_search,
                 network_access,
                 writable_roots,
@@ -2067,6 +2076,11 @@ impl WireEventUpcaster {
                     parts.push(format!("reasoning_effort={v}"));
                 } else if *reasoning_effort_cleared {
                     parts.push("reasoning_effort=<default>".to_string());
+                }
+                if let Some(v) = service_tier {
+                    parts.push(format!("service_tier={v}"));
+                } else if *service_tier_cleared {
+                    parts.push("service_tier=<inherit>".to_string());
                 }
                 if let Some(v) = web_search {
                     parts.push(format!("web_search={v}"));
