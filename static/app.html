@@ -3881,10 +3881,6 @@ body.context-focus-active {
 .worktrees-header .sessions-search {
   max-width: none;
 }
-.sessions-search-status.worktrees-scan-note {
-  margin-top: 0;
-  color: var(--subtext0);
-}
 .worktrees-list.is-busy {
   opacity: 0.82;
 }
@@ -8502,7 +8498,6 @@ body.display-fullscreen-open {
                 </label>
               </div>
             </div>
-            <div class="sessions-search-status worktrees-scan-note">Worktree scans can take a while on large repositories.</div>
             <div class="sessions-search-status" id="worktrees-status"></div>
             <div class="sessions-spawn-notice hidden" id="worktrees-activity-notice" role="status" aria-live="polite">
               <span class="sessions-spawn-spinner" aria-hidden="true"></span>
@@ -25022,8 +25017,7 @@ function switchSessionsSubtab(name) {
     if (worktreeHasScannedData(_cachedWorktreeScan)) {
       renderWorktrees(_cachedWorktreeScan);
       if (worktreesLoadInFlight === 'scan') {
-        setWorktreesStatus('Scanning known project, session, and common worktree roots. This can take a while.');
-        setWorktreesActivityNotice('pending', 'Scanning worktrees. This can take a while on large repositories.');
+        setWorktreesActivityNotice('pending', 'Scanning worktrees...');
       }
     } else {
       loadWorktrees({ forceScan: !worktreesLoaded });
@@ -32849,8 +32843,7 @@ function loadWorktrees(options = {}) {
   const listEl = document.getElementById('worktrees-list');
   if (!listEl) return;
   if (worktreesLoadInFlight === 'scan' && forceScan) {
-    setWorktreesStatus('A worktree scan is already running. This can take a while on large repositories.');
-    setWorktreesActivityNotice('pending', 'Scanning worktrees. This can take a while on large repositories.');
+    setWorktreesActivityNotice('pending', 'Scanning worktrees...');
     return;
   }
   const browserCachedScan = worktreeHasScannedData(_cachedWorktreeScan) ? _cachedWorktreeScan : null;
@@ -32859,10 +32852,10 @@ function loadWorktrees(options = {}) {
   setWorktreesLoadPending(true, worktreesLoadInFlight);
   if (forceScan) {
     if (!browserCachedScan) {
-      listEl.innerHTML = '<div class="empty-state">Scanning worktrees...</div>';
+      listEl.innerHTML = '';
     }
-    setWorktreesStatus('Scanning known project, session, and common worktree roots. This can take a while.');
-    setWorktreesActivityNotice('pending', 'Scanning worktrees. This can take a while on large repositories.');
+    setWorktreesStatus('');
+    setWorktreesActivityNotice('pending', 'Scanning worktrees...');
   } else {
     if (browserCachedScan) {
       renderWorktrees(browserCachedScan);
@@ -32913,7 +32906,7 @@ function renderWorktrees(scan) {
   renderWorktreesList(scan, document.getElementById('worktrees-list'));
   const scannedAt = scan && scan.scanned_at;
   if (!scannedAt) {
-    setWorktreesStatus('No worktree scan yet. Scans can take a while on large repositories.');
+    setWorktreesStatus('No worktree scan yet.');
     return;
   }
   const scanned = worktreeDate(scannedAt);
