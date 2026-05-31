@@ -10029,9 +10029,8 @@ async function main() {
       }
       if (d.event === 'session_identity') {
         applySessionIdentity(d);
-        const sid = String(d.session_id || d.sessionId || '').trim();
-        const backendSid = String(d.backend_session_id || d.backendSessionId || '').trim();
-        flushPendingDetachedCodexThreadActions(backendSid || sid);
+        // `session_identity` arrives before the external worker subscribes for
+        // thread actions; queued detached actions wait for `session_attached`.
       }
       if (d.event === 'session_relationship') {
         applySessionRelationship(d);
@@ -11897,6 +11896,10 @@ const DETACHED_CODEX_ACTION_ATTACH_TIMEOUT_MS = 120000;
 const pendingDetachedCodexThreadActions = new Map(); // session id -> [{ op, params, noticeHandle, timeoutHandle }]
 
 function sessionIdsForPendingDetachedActions(sessionId) {
+  return relatedSessionIdsForSession(sessionId);
+}
+
+function relatedSessionIdsForSession(sessionId) {
   const sid = String(sessionId || '').trim();
   const ids = new Set();
   if (sid) ids.add(sid);
@@ -12315,12 +12318,25 @@ function goalFromCodexActionResult(evt = {}) {
   });
 }
 
+function codexFastModeFromActionResult(evt = {}) {
+  const action = String(evt.action || '').trim().toLowerCase().replace(/_/g, '-');
+  if (action !== 'fast' || evt.success !== true) return null;
+  const message = String(evt.message || '').toLowerCase();
+  if (/\benabled\b/.test(message)) return true;
+  if (/\bdisabled\b/.test(message)) return false;
+  return null;
+}
+
 function handleCodexThreadActionResult(evt) {
   releaseActionPending(evt.action);
   const goal = goalFromCodexActionResult(evt);
   const goalSessionId = evt.session_id || evt.sessionId;
   if (goal !== undefined && goalSessionId) {
     applySessionGoal({ session_id: goalSessionId, goal });
+  }
+  const fastMode = codexFastModeFromActionResult(evt);
+  if (fastMode !== null && goalSessionId) {
+    applyCodexFastModeToSession(goalSessionId, fastMode);
   }
   let successText = `/${evt.action}: ${evt.message}`;
   if (evt.success && evt.action === 'rename') {
@@ -16475,6 +16491,14 @@ function mergeSessionCapabilities(existing = null, incoming = null) {
   if (!incoming) return existing;
   const merged = { ...existing, ...incoming };
   for (const key of ['codexThreadActions', 'codexManagedContext', 'codexContextArchive', 'codexCommand', 'codexFastMode', 'codexServiceTier']) {
+    if (
+      key === 'codexServiceTier' &&
+      incoming.codexFastMode === false &&
+      (incoming[key] === null || incoming[key] === undefined)
+    ) {
+      merged[key] = null;
+      continue;
+    }
     if (incoming[key] === null || incoming[key] === undefined) {
       merged[key] = existing[key] ?? null;
     }
@@ -16487,21 +16511,38 @@ function applySessionCapabilities(evt = {}) {
   if (!sid) return;
   const capabilities = normalizeSessionCapabilities(evt.capabilities || evt);
   if (!capabilities) return;
-  const related = new Set([sid]);
-  const meta = sessionMetadataById.get(sid) || {};
-  if (meta.backendSessionId) related.add(meta.backendSessionId);
-  if (meta.intendantSessionId) related.add(meta.intendantSessionId);
-  for (const [id, existing] of sessionMetadataById) {
-    if (existing.backendSessionId === sid || existing.intendantSessionId === sid) {
-      related.add(id);
-    }
-  }
+  const related = relatedSessionIdsForSession(sid);
   for (const id of related) {
     const existing = sessionMetadataById.get(id) || {};
     const mergedCapabilities = mergeSessionCapabilities(existing.capabilities, capabilities);
     sessionMetadataById.set(id, { ...existing, capabilities: mergedCapabilities });
     if (sessionWindows.has(id)) {
       updateSessionWindow(id, { capabilities: mergedCapabilities });
+    }
+  }
+  updateSessionWindowActionMenuVisibility(sid);
+  updateStopButtonVisibility(currentPhase);
+  updateSubmitButtonLabel(currentPhase);
+  updateControlFastButtonState();
+}
+
+function applyCodexFastModeToSession(sessionId, fastMode) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || typeof fastMode !== 'boolean') return;
+  const serviceTier = fastMode ? 'priority' : null;
+  for (const id of relatedSessionIdsForSession(sid)) {
+    const existing = sessionMetadataById.get(id) || {};
+    const capabilities = {
+      followUp: true,
+      steer: true,
+      interrupt: true,
+      ...(existing.capabilities || {}),
+      codexFastMode: fastMode,
+      codexServiceTier: serviceTier,
+    };
+    sessionMetadataById.set(id, { ...existing, capabilities });
+    if (sessionWindows.has(id)) {
+      updateSessionWindow(id, { capabilities });
     }
   }
   updateSessionWindowActionMenuVisibility(sid);
@@ -30439,7 +30480,6 @@ function onSessionStarted(sessionId, task) {
       ...(alias?.source ? { source: alias.source, backendSource: alias.source } : {}),
     });
     focusSessionWindowFromLifecycle(visibleSessionId);
-    flushPendingDetachedCodexThreadActions(visibleSessionId);
   } else {
     updateTaskTargetChip();
   }
