@@ -97,6 +97,7 @@ const SESSION_LOG_SEARCH_SNIPPET_CHARS: usize = 220;
 const DELETED_EXTERNAL_SESSIONS_FILE: &str = "deleted_external_sessions.json";
 const MANAGED_CONTEXT_ANCHOR_TRACE_LIMIT: usize = 64;
 const MANAGED_CONTEXT_ANCHOR_LIMIT: usize = 40;
+const EXTERNAL_CONTEXT_REPLAY_LOG_SCAN_LIMIT: usize = 16;
 const FS_LIST_LIMIT: usize = 500;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2395,6 +2396,98 @@ fn merge_intendant_wrapper_into_external_session(
     }
 }
 
+fn external_session_source_and_id(session: &serde_json::Value) -> Option<(String, String)> {
+    let source = value_str(session, "backend_source")
+        .or_else(|| value_str(session, "source"))
+        .map(|source| crate::session_names::normalize_source(&source))?;
+    if source.is_empty() || source == "intendant" {
+        return None;
+    }
+    let session_id = value_str(session, "backend_session_id")
+        .or_else(|| value_str(session, "resume_id"))
+        .or_else(|| value_str(session, "session_id"))?;
+    if !crate::external_agent::source_session_id_is_canonical(&source, &session_id) {
+        return None;
+    }
+    Some((source, session_id))
+}
+
+fn index_external_wrapper_session_row(home: &Path, session: &serde_json::Value) {
+    let Some(source) = value_str(session, "backend_source") else {
+        return;
+    };
+    let Some(backend_session_id) = value_str(session, "backend_session_id") else {
+        return;
+    };
+    let Some(intendant_session_id) =
+        value_str(session, "intendant_session_id").or_else(|| value_str(session, "session_id"))
+    else {
+        return;
+    };
+    let Some(log_path) =
+        value_str(session, "intendant_session_path").or_else(|| value_str(session, "path"))
+    else {
+        return;
+    };
+    let project_root = value_str(session, "project_root").map(PathBuf::from);
+    let _ = crate::external_wrapper_index::upsert(
+        home,
+        &source,
+        &backend_session_id,
+        &intendant_session_id,
+        Path::new(&log_path),
+        project_root.as_deref(),
+    );
+}
+
+fn apply_external_wrapper_index_to_session(home: &Path, session: &mut serde_json::Value) {
+    if value_str(session, "source")
+        .map(|source| crate::session_names::normalize_source(&source))
+        .as_deref()
+        == Some("intendant")
+    {
+        return;
+    }
+    let Some((source, backend_session_id)) = external_session_source_and_id(session) else {
+        return;
+    };
+    let wrappers = crate::external_wrapper_index::wrappers_for(home, &source, &backend_session_id);
+    if wrappers.is_empty() {
+        return;
+    }
+    let Some(obj) = session.as_object_mut() else {
+        return;
+    };
+    let latest = &wrappers[0];
+    obj.insert(
+        "intendant_session_id".to_string(),
+        serde_json::Value::String(latest.intendant_session_id.clone()),
+    );
+    obj.insert(
+        "intendant_session_path".to_string(),
+        serde_json::Value::String(latest.log_path.clone()),
+    );
+    obj.insert(
+        "intendant_wrappers".to_string(),
+        serde_json::Value::Array(
+            wrappers
+                .iter()
+                .map(crate::external_wrapper_index::record_to_json)
+                .collect(),
+        ),
+    );
+    obj.insert(
+        "can_delete_intendant_log".to_string(),
+        serde_json::json!(true),
+    );
+}
+
+fn apply_external_wrapper_index_to_sessions(home: &Path, sessions: &mut [serde_json::Value]) {
+    for session in sessions {
+        apply_external_wrapper_index_to_session(home, session);
+    }
+}
+
 fn external_agent_thread_id_from_message(message: &str) -> Option<String> {
     if let Some(thread_id) = message.strip_prefix("External agent thread: ") {
         return clean_external_thread_id(thread_id);
@@ -3078,7 +3171,21 @@ fn context_snapshot_candidate_log_dirs(
         push(&mut dirs, &mut seen, dir);
     }
     let source = crate::session_names::normalize_source(source);
-    if source != "intendant" || dirs.is_empty() {
+    if source != "intendant" {
+        for record in crate::external_wrapper_index::wrappers_for(home, &source, session_id) {
+            push(&mut dirs, &mut seen, PathBuf::from(record.log_path));
+        }
+        for dir in cached_intendant_log_dirs_for_session_id(session_id) {
+            push(&mut dirs, &mut seen, dir);
+        }
+        if dirs.is_empty() {
+            for dir in recent_intendant_log_dirs(home, EXTERNAL_CONTEXT_REPLAY_LOG_SCAN_LIMIT) {
+                if managed_context_log_dir_mentions_session(&dir, session_id) {
+                    push(&mut dirs, &mut seen, dir);
+                }
+            }
+        }
+    } else if dirs.is_empty() {
         for dir in managed_context_candidate_log_dirs(home, None, Some(session_id), None) {
             push(&mut dirs, &mut seen, dir);
         }
@@ -5417,6 +5524,19 @@ fn find_codex_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
     collect_files(&codex.join("sessions"), ".jsonl", &mut files);
     collect_files(&codex.join("archived_sessions"), ".jsonl", &mut files);
 
+    if let Some(path) = files
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(session_id))
+                && codex_session_file_id(path).as_deref() == Some(session_id)
+        })
+        .cloned()
+    {
+        return Some(path);
+    }
+
     files
         .into_iter()
         .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))
@@ -6004,7 +6124,7 @@ fn append_external_context_snapshot_replay_entries(
     }
     let mut seen = HashSet::new();
     let mut snapshot_entries = Vec::new();
-    for dir in managed_context_candidate_log_dirs(home, None, Some(session_id), None) {
+    for dir in external_context_snapshot_replay_log_dirs(home, source, session_id) {
         let Ok(contents) = std::fs::read_to_string(dir.join("session.jsonl")) else {
             append_external_context_trace_replay_entries(
                 &dir,
@@ -6035,6 +6155,77 @@ fn append_external_context_snapshot_replay_entries(
     }
     snapshot_entries.sort_by_key(context_snapshot_replay_entry_sort_key);
     entries.extend(snapshot_entries);
+}
+
+fn external_context_snapshot_replay_log_dirs(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen_dirs = HashSet::new();
+
+    if let Some(path) = managed_context_named_log_dir(home, session_id) {
+        push_external_context_replay_log_dir(&mut dirs, &mut seen_dirs, path);
+    }
+    for record in crate::external_wrapper_index::wrappers_for(home, source, session_id) {
+        push_external_context_replay_log_dir(
+            &mut dirs,
+            &mut seen_dirs,
+            PathBuf::from(record.log_path),
+        );
+    }
+    for path in cached_intendant_log_dirs_for_session_id(session_id) {
+        push_external_context_replay_log_dir(&mut dirs, &mut seen_dirs, path);
+    }
+
+    if dirs.is_empty() {
+        for path in recent_intendant_log_dirs(home, EXTERNAL_CONTEXT_REPLAY_LOG_SCAN_LIMIT) {
+            if managed_context_log_dir_mentions_session(&path, session_id) {
+                push_external_context_replay_log_dir(&mut dirs, &mut seen_dirs, path);
+            }
+        }
+    }
+
+    dirs
+}
+
+fn push_external_context_replay_log_dir(
+    dirs: &mut Vec<PathBuf>,
+    seen_dirs: &mut HashSet<String>,
+    path: PathBuf,
+) {
+    let key = std::fs::canonicalize(&path)
+        .unwrap_or_else(|_| path.clone())
+        .to_string_lossy()
+        .to_string();
+    if seen_dirs.insert(key) {
+        dirs.push(path);
+    }
+}
+
+fn recent_intendant_log_dirs(home: &Path, limit: usize) -> Vec<PathBuf> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let logs_dir = home.join(".intendant").join("logs");
+    let Ok(entries) = std::fs::read_dir(logs_dir) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<(u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let mtime = file_mtime_secs(&path.join("session.jsonl")).max(file_mtime_secs(&path));
+            Some((mtime, path))
+        })
+        .collect();
+    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    dirs.truncate(limit);
+    dirs.into_iter().map(|(_, path)| path).collect()
 }
 
 fn append_external_context_trace_replay_entries(
@@ -6188,6 +6379,12 @@ fn cached_list_sessions() -> String {
     body
 }
 
+fn cached_session_list_snapshot() -> Option<String> {
+    let cache = SESSION_LIST_RESPONSE_CACHE.get()?;
+    let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map(|entry| entry.body.clone())
+}
+
 fn session_ids_filter_from_request(request_line: &str) -> Option<Vec<String>> {
     query_param(request_line, "ids").map(|raw| {
         raw.split(',')
@@ -6234,6 +6431,44 @@ fn cached_list_sessions_for_ids(ids: &[String]) -> String {
     }
     let body = cached_list_sessions();
     filter_session_list_by_ids(&body, ids)
+}
+
+fn cached_intendant_log_dirs_for_session_id(session_id: &str) -> Vec<PathBuf> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Vec::new();
+    }
+    let Some(body) = cached_session_list_snapshot() else {
+        return Vec::new();
+    };
+    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(&body) else {
+        return Vec::new();
+    };
+    let wanted = std::iter::once(session_id.to_string()).collect::<HashSet<_>>();
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    for row in rows {
+        if !session_row_matches_any_id(&row, &wanted) {
+            continue;
+        }
+        for key in ["intendant_session_path", "path"] {
+            let Some(path) = row.get(key).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let path = PathBuf::from(path);
+            if !path.is_dir() {
+                continue;
+            }
+            let fingerprint = std::fs::canonicalize(&path)
+                .unwrap_or_else(|_| path.clone())
+                .to_string_lossy()
+                .to_string();
+            if seen.insert(fingerprint) {
+                dirs.push(path);
+            }
+        }
+    }
+    dirs
 }
 
 fn empty_worktree_inventory_response() -> String {
@@ -7324,6 +7559,7 @@ fn list_sessions_from_home_impl(
             .unwrap_or_default();
 
         if let Some(mut wrapper_session) = intendant_session_list_row_from_dir(&dir, &session_id) {
+            index_external_wrapper_session_row(home_path, &wrapper_session);
             apply_external_context_to_intendant_wrapper(
                 &mut wrapper_session,
                 &external_context_by_id,
@@ -7354,6 +7590,7 @@ fn list_sessions_from_home_impl(
     }
 
     sessions.extend(external_sessions);
+    apply_external_wrapper_index_to_sessions(home_path, &mut sessions);
 
     sort_sessions_newest_first(&mut sessions);
     if truncate_for_list_view {
@@ -13844,36 +14081,52 @@ pub fn spawn_web_gateway(
                                                     }
                                                 }
                                                 Ok(ctrl @ ControlMsg::ResumeSession { .. }) => {
-                                                    if let ControlMsg::ResumeSession {
+                                                    let ControlMsg::ResumeSession {
                                                         source,
                                                         session_id,
                                                         resume_id,
                                                         task,
                                                         ..
                                                     } = &ctrl
-                                                    {
-                                                        if let Some(replay) =
-                                                            resume_session_activity_replay(
-                                                                source,
-                                                                session_id,
-                                                                resume_id.as_deref(),
-                                                                task.as_deref(),
-                                                                EXTERNAL_ACTIVITY_REPLAY_LIMIT,
-                                                            )
-                                                        {
-                                                            let _ = direct_tx_inbound.send(replay);
+                                                    else {
+                                                        unreachable!();
+                                                    };
+                                                    let source = source.clone();
+                                                    let session_id = session_id.clone();
+                                                    let resume_id = resume_id.clone();
+                                                    let task = task.clone();
+                                                    let direct_tx_resume =
+                                                        direct_tx_inbound.clone();
+                                                    let bus_resume = bus_inbound.clone();
+                                                    tokio::spawn(async move {
+                                                        let replay = tokio::task::spawn_blocking(
+                                                            move || {
+                                                                resume_session_activity_replay(
+                                                                    &source,
+                                                                    &session_id,
+                                                                    resume_id.as_deref(),
+                                                                    task.as_deref(),
+                                                                    EXTERNAL_ACTIVITY_REPLAY_LIMIT,
+                                                                )
+                                                            },
+                                                        )
+                                                        .await
+                                                        .ok()
+                                                        .flatten();
+                                                        if let Some(replay) = replay {
+                                                            let _ = direct_tx_resume.send(replay);
                                                         }
-                                                    }
-                                                    bus_inbound.send(AppEvent::PresenceLog {
-                                                        message: format!(
-                                                            "[ws] ControlMsg: {:?}",
-                                                            ctrl
-                                                        ),
-                                                        level: Some(LogLevel::Debug),
-                                                        turn: None,
+                                                        bus_resume.send(AppEvent::PresenceLog {
+                                                            message: format!(
+                                                                "[ws] ControlMsg: {:?}",
+                                                                ctrl
+                                                            ),
+                                                            level: Some(LogLevel::Debug),
+                                                            turn: None,
+                                                        });
+                                                        bus_resume
+                                                            .send(AppEvent::ControlCommand(ctrl));
                                                     });
-                                                    bus_inbound
-                                                        .send(AppEvent::ControlCommand(ctrl));
                                                 }
                                                 Ok(ctrl) => {
                                                     bus_inbound.send(AppEvent::PresenceLog {
@@ -23961,6 +24214,94 @@ mod tests {
                 .get("preview")
                 .and_then(|v| v.as_str())
                 .is_some_and(|preview| preview.contains("show context")))));
+    }
+
+    #[test]
+    fn external_activity_replay_uses_wrapper_index_for_multiple_codex_attaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let session_id = "019e37b2-multiple-wrapper-index";
+        let sessions_dir = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "continue indexed thread" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        for (wrapper_id, request_id, request_index) in [
+            ("wrapper-before-daemon-restart", "req-before", 1_u64),
+            ("wrapper-after-daemon-restart", "req-after", 2_u64),
+        ] {
+            let wrapper_log_dir = home.join(".intendant").join("logs").join(wrapper_id);
+            let mut log = crate::session_log::SessionLog::open(wrapper_log_dir).unwrap();
+            log.session_identity(wrapper_id, "codex", session_id);
+            log.context_snapshot_for_session(
+                Some(session_id),
+                "codex",
+                "Codex resolved request payload",
+                Some(request_id),
+                Some(request_index),
+                Some(request_index as usize),
+                "openai.responses.resolved_request.v1",
+                Some(1200 + request_index),
+                Some(128_000),
+                Some(272_000),
+                Some(1),
+                &serde_json::json!({
+                    "_intendant_context": {
+                        "thread_id": session_id,
+                        "request_id": request_id,
+                        "request_index": request_index
+                    },
+                    "input": [{"role": "user", "content": request_id}]
+                }),
+            );
+            drop(log);
+        }
+
+        let indexed = crate::external_wrapper_index::wrappers_for(home, "codex", session_id);
+        assert_eq!(indexed.len(), 2);
+
+        let replay = external_session_activity_replay_from_home(home, "codex", session_id, 80)
+            .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let request_ids: HashSet<_> = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["event"] == "context_snapshot")
+            .filter_map(|entry| entry["request_id"].as_str())
+            .collect();
+        assert!(request_ids.contains("req-before"));
+        assert!(request_ids.contains("req-after"));
+
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(home)).unwrap();
+        let row = sessions
+            .iter()
+            .find(|session| session["session_id"] == session_id)
+            .expect("codex session row should be present");
+        assert_eq!(row["intendant_wrappers"].as_array().map(Vec::len), Some(2));
     }
 
     #[test]

@@ -11738,6 +11738,7 @@ let newSessionCodexFastMode = false;
 let newSessionCodexFastModeTouched = false;
 let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
+let newSessionSpawnName = '';
 let newSessionSpawnTimeout = null;
 let newSessionSpawnClearTimeout = null;
 let newSessionSpawnRecent = null;
@@ -32524,23 +32525,26 @@ function maybeFailRecentNewSessionSpawn(sessionId, reason) {
   clearNewSessionSpawnRecent();
   newSessionSpawnPending = false;
   newSessionSpawnTask = '';
+  newSessionSpawnName = '';
   setNewSessionStartButtonPending(false);
   setNewSessionSpawnNotice('error', message);
   showControlToast('error', message);
   return true;
 }
 
-function beginNewSessionSpawnNotice(task, text) {
+function beginNewSessionSpawnNotice(task, text, name = '') {
   clearNewSessionSpawnTimers();
   clearNewSessionSpawnRecent();
   newSessionSpawnPending = true;
   newSessionSpawnTask = String(task || '').trim();
+  newSessionSpawnName = String(name || '').trim();
   setNewSessionStartButtonPending(true);
   setNewSessionSpawnNotice('pending', text || 'Spawning new session...');
   newSessionSpawnTimeout = setTimeout(() => {
     if (!newSessionSpawnPending) return;
     newSessionSpawnPending = false;
     newSessionSpawnTask = '';
+    newSessionSpawnName = '';
     setNewSessionStartButtonPending(false);
     setNewSessionSpawnNotice('warn', 'No start confirmation yet. Check the Activity log before retrying.');
     showControlToast('info', 'No new-session start confirmation yet.');
@@ -32557,19 +32561,36 @@ function failNewSessionSpawnNotice(text) {
   clearNewSessionSpawnRecent();
   newSessionSpawnPending = false;
   newSessionSpawnTask = '';
+  newSessionSpawnName = '';
   setNewSessionStartButtonPending(false);
   setNewSessionSpawnNotice('error', text || 'New session did not start.');
   showControlToast('error', text || 'New session did not start.');
 }
 
+function clearNewSessionDraftIfUnchanged(task, name) {
+  const expectedTask = String(task || '').trim();
+  const input = document.getElementById('new-session-input');
+  if (input && expectedTask && input.value.trim() === expectedTask) {
+    clearTaskTextarea(input);
+  }
+  const expectedName = String(name || '').trim();
+  const nameInput = document.getElementById('new-session-name');
+  if (nameInput && expectedName && nameInput.value.trim() === expectedName) {
+    nameInput.value = '';
+  }
+}
+
 function finishNewSessionSpawnNotice(sessionId, task) {
   if (!newSessionSpawnPending) return;
   const expectedTask = newSessionSpawnTask;
+  const expectedName = newSessionSpawnName;
   const actualTask = String(task || '').trim();
   if (expectedTask && actualTask && expectedTask !== actualTask) return;
   clearNewSessionSpawnTimers();
   newSessionSpawnPending = false;
   newSessionSpawnTask = '';
+  newSessionSpawnName = '';
+  clearNewSessionDraftIfUnchanged(actualTask || expectedTask, expectedName);
   setNewSessionStartButtonPending(false);
   const shortId = sessionId ? ` (${shortSessionId(sessionId)})` : '';
   setNewSessionSpawnNotice('ok', `Session started${shortId}. Activity is ready.`);
@@ -32622,7 +32643,8 @@ async function startNewSession() {
   const requestedProjectRoot = document.getElementById('new-session-project-root')?.value.trim() || '';
   beginNewSessionSpawnNotice(
     task,
-    requestedProjectRoot ? 'Checking project directory...' : 'Spawning new session...'
+    requestedProjectRoot ? 'Checking project directory...' : 'Spawning new session...',
+    sessionName
   );
 
   let projectRoot = '';
@@ -32677,8 +32699,6 @@ async function startNewSession() {
 
   updateNewSessionSpawnNotice('pending', 'Spawning new session...');
   showControlToast('info', 'Spawning new session...');
-  clearTaskTextarea(input);
-  if (nameInput) nameInput.value = '';
   resetNewSessionCodexFastModeToDefault();
   renderNewSessionAgentControls();
   if (attachments.length > 0) {

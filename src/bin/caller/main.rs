@@ -17,6 +17,7 @@ mod display;
 mod error;
 mod event;
 mod external_agent;
+mod external_wrapper_index;
 mod file_watcher;
 mod fission_ledger;
 mod frames;

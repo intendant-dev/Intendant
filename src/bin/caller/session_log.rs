@@ -1259,6 +1259,12 @@ impl SessionLog {
             file: None,
             file2: None,
         });
+        let _ = crate::external_wrapper_index::upsert_from_log_dir(
+            source,
+            backend_session_id,
+            session_id,
+            &self.dir,
+        );
     }
 
     /// Log that a frontend-visible session is attached to an external agent.
