@@ -1850,16 +1850,34 @@ fn resolve_context_rewind_anchor(
     ))
 }
 
-fn active_context_rewind_thread_id<'a>(config: &'a DrainConfig<'_>) -> Option<&'a str> {
-    config
-        .alias_session_id
-        .as_deref()
-        .or(config.session_id.as_deref())
+fn context_rewind_thread_id_candidates(
+    session_id: Option<&str>,
+    alias_session_id: Option<&str>,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for id in [session_id, alias_session_id]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        if !ids.iter().any(|existing| existing == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+fn active_context_rewind_thread_ids(config: &DrainConfig<'_>) -> Vec<String> {
+    context_rewind_thread_id_candidates(
+        config.session_id.as_deref(),
+        config.alias_session_id.as_deref(),
+    )
 }
 
 async fn validate_context_rewind_request_before_schedule(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
-    thread_id: &str,
+    thread_ids: &[String],
     request: &ExternalContextRewindRequest,
 ) -> Result<(), String> {
     if !agent.supports_item_anchor_rewind() {
@@ -1868,14 +1886,31 @@ async fn validate_context_rewind_request_before_schedule(
             agent.name()
         ));
     }
-    let snapshot = agent
-        .read_thread_snapshot(thread_id)
-        .await
-        .map_err(|e| format!("failed to read thread metadata before rewind: {}", e))?;
-    let source_rollout_path = snapshot
-        .rollout_path
-        .ok_or_else(|| "thread metadata did not include a rollout path".to_string())?;
-    resolve_context_rewind_anchor(&source_rollout_path, &request.item_id).map(|_| ())
+    if thread_ids.is_empty() {
+        return Err(
+            "cannot validate context rewind: active Codex thread id is unknown".to_string(),
+        );
+    }
+
+    let mut metadata_errors = Vec::new();
+    for thread_id in thread_ids {
+        match agent.read_thread_snapshot(thread_id).await {
+            Ok(snapshot) => {
+                let source_rollout_path = snapshot.rollout_path.ok_or_else(|| {
+                    format!("thread metadata for {thread_id} did not include a rollout path")
+                })?;
+                return resolve_context_rewind_anchor(&source_rollout_path, &request.item_id)
+                    .map(|_| ());
+            }
+            Err(e) => metadata_errors.push(format!("{thread_id}: {e}")),
+        }
+    }
+
+    Err(format!(
+        "failed to read thread metadata before rewind for active thread candidates [{}]: {}",
+        thread_ids.join(", "),
+        metadata_errors.join("; ")
+    ))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -4970,22 +5005,12 @@ async fn drain_external_agent_events(
                                                     .to_string(),
                                         });
                                     } else {
-                                        let Some(thread_id) =
-                                            active_context_rewind_thread_id(config)
-                                        else {
-                                            config.bus.send(AppEvent::CodexThreadActionResult {
-                                                session_id: result_session_id.clone(),
-                                                action,
-                                                success: false,
-                                                message:
-                                                    "cannot validate context rewind: active Codex thread id is unknown"
-                                                        .to_string(),
-                                            });
-                                            continue;
-                                        };
+                                        let thread_ids = active_context_rewind_thread_ids(config);
                                         if let Err(message) =
                                             validate_context_rewind_request_before_schedule(
-                                                agent, thread_id, &request,
+                                                agent,
+                                                &thread_ids,
+                                                &request,
                                             )
                                             .await
                                         {
@@ -7771,6 +7796,22 @@ mod tests {
         assert_eq!(
             managed_context_rewind_only_pressure(&at_hard).map(|pressure| pressure.status),
             Some("critical")
+        );
+    }
+
+    #[test]
+    fn context_rewind_thread_id_candidates_prefers_session_then_alias() {
+        assert_eq!(
+            context_rewind_thread_id_candidates(Some("backend-thread"), Some("wrapper-session")),
+            vec!["backend-thread".to_string(), "wrapper-session".to_string()]
+        );
+        assert_eq!(
+            context_rewind_thread_id_candidates(Some("same"), Some(" same ")),
+            vec!["same".to_string()]
+        );
+        assert_eq!(
+            context_rewind_thread_id_candidates(Some("  "), Some("alias")),
+            vec!["alias".to_string()]
         );
     }
 
@@ -15329,7 +15370,11 @@ async fn run_external_agent_mode(
                     turns_in_round,
                     native_message_count: None,
                 });
-                if managed_context_recovery_kickstart {
+                if backend == external_agent::AgentBackend::Codex
+                    && project::codex_managed_context_enabled(
+                        &project.config.agent.codex.managed_context,
+                    )
+                {
                     match agent.context_snapshot().await {
                         Ok(Some(snapshot)) => {
                             if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot)
@@ -15346,9 +15391,14 @@ async fn run_external_agent_mode(
                                         pressure,
                                         held_user_input,
                                     );
+                                    let turn_kind = if managed_context_recovery_kickstart {
+                                        "recovery kickstart"
+                                    } else {
+                                        "managed Codex turn"
+                                    };
                                     slog(&session_log, |l| {
                                         l.warn(&format!(
-                                            "Managed-context recovery kickstart completed without a context rewind while pressure remains {}/{} tokens; retrying recovery once",
+                                            "Managed-context {turn_kind} completed without a context rewind while pressure remains {}/{} tokens; retrying recovery",
                                             pressure.used_tokens,
                                             pressure.rewind_only_limit
                                         ))
@@ -15358,7 +15408,7 @@ async fn run_external_agent_mode(
                                         level: "warn".to_string(),
                                         source: "Intendant".to_string(),
                                         content: format!(
-                                            "Managed-context recovery did not call rewind_context; context still reports {}/{} tokens. Retrying recovery before sending any normal follow-up.",
+                                            "Managed-context {turn_kind} did not reduce context below the rewind-only threshold; context still reports {}/{} tokens. Retrying recovery before sending any normal follow-up.",
                                             pressure.used_tokens,
                                             pressure.rewind_only_limit
                                         ),
@@ -15382,7 +15432,7 @@ async fn run_external_agent_mode(
                                 if let Some(replay) = pending_managed_context_replays.pop_front() {
                                     slog(&session_log, |l| {
                                         l.warn(
-                                            "Managed-context recovery kickstart completed without a context rewind after pressure cleared; replaying held follow-up",
+                                            "Managed-context pressure cleared without a context rewind; replaying held follow-up",
                                         )
                                     });
                                     next_turn = Some(replay);
@@ -15390,17 +15440,32 @@ async fn run_external_agent_mode(
                             }
                         }
                         Ok(None) => {
-                            let message = "Managed-context recovery completed without rewind_context, and Codex context pressure could not be re-read; refusing to send normal follow-ups.".to_string();
-                            slog(&session_log, |l| l.warn(&message));
-                            bus.send(AppEvent::LoopError(message));
+                            if managed_context_recovery_kickstart
+                                || !pending_managed_context_replays.is_empty()
+                            {
+                                let message = "Managed-context recovery completed without rewind_context, and Codex context pressure could not be re-read; refusing to send normal follow-ups.".to_string();
+                                slog(&session_log, |l| l.warn(&message));
+                                bus.send(AppEvent::LoopError(message));
+                            }
                         }
                         Err(e) => {
-                            let message = format!(
-                                "Managed-context recovery completed without rewind_context, and Codex context pressure could not be re-read: {}; refusing to send normal follow-ups.",
-                                e
-                            );
-                            slog(&session_log, |l| l.warn(&message));
-                            bus.send(AppEvent::LoopError(message));
+                            if managed_context_recovery_kickstart
+                                || !pending_managed_context_replays.is_empty()
+                            {
+                                let message = format!(
+                                    "Managed-context recovery completed without rewind_context, and Codex context pressure could not be re-read: {}; refusing to send normal follow-ups.",
+                                    e
+                                );
+                                slog(&session_log, |l| l.warn(&message));
+                                bus.send(AppEvent::LoopError(message));
+                            } else {
+                                slog(&session_log, |l| {
+                                    l.debug(&format!(
+                                        "Could not re-read Codex context pressure after managed turn: {}",
+                                        e
+                                    ))
+                                });
+                            }
                         }
                     }
                 }
