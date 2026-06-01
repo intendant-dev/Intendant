@@ -66,6 +66,20 @@ not already set, so env/CLI always win.
 These mirror the `[presence]` and `[computer_use]` sections below; the
 precedence is **explicit config > env var > auto-detect**.
 
+### Browser workspace overrides
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INTENDANT_BROWSER_WORKSPACE_EXECUTABLE` | managed browser cache | Explicit Chromium/Chrome-for-Testing executable for CDP browser workspaces |
+| `INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER` | `false` on macOS, `true` elsewhere | On macOS, explicitly permit CDP workspaces to launch system Chrome/Chromium apps such as `/Applications/Google Chrome.app` |
+
+The default CDP resolver prefers managed Playwright/Puppeteer/Chrome-for-Testing
+browser caches and Intendant's own browser cache locations. This avoids
+attributing Google Chrome updater/app-bundle activity to Intendant on macOS. Set
+the explicit executable variable when a managed browser lives in a custom path,
+or choose `provider=system_cdp` for a deliberate one-off system-browser launch.
+Intendant discovers existing managed browsers; it does not download one yet.
+
 ### Sub-agent variables (set automatically)
 
 When the orchestrator spawns sub-agents it sets these in the child environment;

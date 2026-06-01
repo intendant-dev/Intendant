@@ -114,8 +114,12 @@ Full MCP tool groups:
 
 Browser workspaces are addressable browser-control surfaces for agent/human
 collaboration and headed UI testing. The first executable backend launches a
-local Chromium-family browser with an isolated profile and Chrome DevTools
-Protocol metadata; the wire contract already carries `provider` and `peer_id`
+managed local Chromium-family browser with an isolated profile and Chrome
+DevTools Protocol metadata. On macOS, Intendant does not launch the user's
+installed `/Applications/Google Chrome.app` by default; use `provider=system_cdp`
+or `INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER=1` to opt into system
+Chrome/Chromium, and use `INTENDANT_BROWSER_WORKSPACE_EXECUTABLE` for an
+explicit browser binary. The wire contract already carries `provider` and `peer_id`
 fields so Playwright/Agent Browser adapters and federated peer-hosted browsers
 can slot in later. Each workspace has a lease, so concurrent agents must
 explicitly acquire it and use `force` to take over an active holder.

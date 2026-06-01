@@ -126,6 +126,9 @@ A raw view of internal state — the same data as the `GET /debug` endpoint
 (agent state, voice connection, active browser), useful when diagnosing the
 gateway or presence wiring. It also includes a browser-workspace panel for
 manual smoke testing of local CDP-backed browser workspaces and their leases.
+CDP workspaces prefer managed Chromium/Chrome-for-Testing executables; on macOS
+system Chrome/Chromium apps require choosing `system_cdp` or setting
+`INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER=1`.
 
 ### Settings
 
