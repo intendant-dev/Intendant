@@ -4027,7 +4027,7 @@ pub struct CreateBrowserWorkspaceParams {
     /// Human label shown in the dashboard.
     #[serde(default)]
     pub label: Option<String>,
-    /// Provider: auto, cdp, playwright, agent_browser, or stream. The first executable backend is cdp.
+    /// Provider: auto, cdp, system_cdp, playwright, agent_browser, or stream. The default cdp backend uses managed Chromium; system_cdp deliberately launches the user's installed browser.
     #[serde(default)]
     pub provider: Option<String>,
     /// Optional federation peer id. Remote placement is part of the contract but not wired yet.
@@ -5605,7 +5605,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Create a browser workspace. The first executable backend is provider=cdp, which launches local Chrome/Chromium with an isolated profile and CDP endpoint."
+        description = "Create a browser workspace. provider=cdp launches a managed local Chromium-family browser with an isolated profile and CDP endpoint; provider=system_cdp deliberately uses the installed system browser."
     )]
     async fn create_browser_workspace(
         &self,

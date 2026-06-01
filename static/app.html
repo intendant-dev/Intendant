@@ -8852,6 +8852,7 @@ body.display-fullscreen-open {
             <select id="browser-workspace-provider" style="padding:7px 9px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text)">
               <option value="auto">auto</option>
               <option value="cdp">cdp</option>
+              <option value="system_cdp">system_cdp</option>
               <option value="playwright">playwright</option>
               <option value="agent_browser">agent_browser</option>
             </select>
@@ -32751,10 +32752,11 @@ function renderBrowserWorkspaces() {
     meta.style.minWidth = '0';
     const lease = w.lease ? ` leased by ${w.lease.holder_id || 'unknown'}` : ' unleased';
     const url = w.url || 'about:blank';
+    const executableSource = w.browser_executable_source ? ` · ${w.browser_executable_source}` : '';
     meta.innerHTML =
       `<div style="font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(w.label || w.id)}</div>` +
       `<div style="color:var(--subtext0);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(url)}</div>` +
-      `<div style="color:var(--overlay1);font-size:11px;margin-top:4px">${escapeHtml(w.id || '')} · ${escapeHtml(w.provider || '')} · ${escapeHtml(w.status || '')} · ${escapeHtml(lease)}</div>`;
+      `<div style="color:var(--overlay1);font-size:11px;margin-top:4px">${escapeHtml(w.id || '')} · ${escapeHtml(w.provider || '')} · ${escapeHtml(w.status || '')}${escapeHtml(executableSource)} · ${escapeHtml(lease)}</div>`;
     const actions = document.createElement('div');
     actions.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end';
     const take = document.createElement('button');

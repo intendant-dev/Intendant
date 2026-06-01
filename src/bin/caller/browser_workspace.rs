@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::process::Child;
@@ -12,6 +13,10 @@ pub type SharedBrowserWorkspaceRegistry = Arc<RwLock<BrowserWorkspaceRegistry>>;
 static GLOBAL_BROWSER_WORKSPACES: OnceLock<SharedBrowserWorkspaceRegistry> = OnceLock::new();
 
 const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
+const BROWSER_EXECUTABLE_ENV: &str = "INTENDANT_BROWSER_WORKSPACE_EXECUTABLE";
+const LEGACY_BROWSER_EXECUTABLE_ENV: &str = "INTENDANT_BROWSER_EXECUTABLE";
+const ALLOW_SYSTEM_BROWSER_ENV: &str = "INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER";
+const LEGACY_ALLOW_SYSTEM_BROWSER_ENV: &str = "INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_CHROME";
 
 pub fn global_registry() -> SharedBrowserWorkspaceRegistry {
     GLOBAL_BROWSER_WORKSPACES
@@ -24,6 +29,7 @@ pub fn global_registry() -> SharedBrowserWorkspaceRegistry {
 pub enum BrowserWorkspaceProvider {
     Auto,
     Cdp,
+    SystemCdp,
     Playwright,
     AgentBrowser,
     Stream,
@@ -39,6 +45,7 @@ impl BrowserWorkspaceProvider {
             .as_str()
         {
             "cdp" | "chrome" | "chromium" => Self::Cdp,
+            "system_cdp" | "system-cdp" | "system_chrome" | "system-chrome" => Self::SystemCdp,
             "playwright" => Self::Playwright,
             "agent_browser" | "agent-browser" | "agentbrowser" => Self::AgentBrowser,
             "stream" | "streamed" | "remote_stream" | "remote-stream" => Self::Stream,
@@ -50,6 +57,7 @@ impl BrowserWorkspaceProvider {
         match self {
             Self::Auto => "auto",
             Self::Cdp => "cdp",
+            Self::SystemCdp => "system_cdp",
             Self::Playwright => "playwright",
             Self::AgentBrowser => "agent_browser",
             Self::Stream => "stream",
@@ -130,6 +138,8 @@ pub struct BrowserWorkspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_executable: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_executable_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debugging_port: Option<u16>,
@@ -152,6 +162,8 @@ pub struct BrowserProviderStatus {
     pub provider: BrowserWorkspaceProvider,
     pub available: bool,
     pub executable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub message: String,
 }
 
@@ -304,34 +316,66 @@ impl BrowserWorkspaceRegistry {
 }
 
 pub async fn provider_statuses() -> Vec<BrowserProviderStatus> {
-    let cdp_exe = find_chromium_executable();
+    let cdp_exe = resolve_chromium_executable(false);
+    let system_cdp_exe = resolve_chromium_executable(true);
+    let playwright_exe = find_executable("playwright").or_else(|| find_executable("npx"));
+    let agent_browser_exe = find_executable("agent-browser");
     vec![
-        BrowserProviderStatus {
-            provider: BrowserWorkspaceProvider::Cdp,
-            available: cdp_exe.is_some(),
-            executable: cdp_exe.map(|p| p.display().to_string()),
-            message: "Local Chrome/Chromium through the Chrome DevTools Protocol.".to_string(),
+        match cdp_exe {
+            Ok(exe) => BrowserProviderStatus {
+                provider: BrowserWorkspaceProvider::Cdp,
+                available: true,
+                executable: Some(exe.path.display().to_string()),
+                source: Some(exe.source),
+                message:
+                    "Local managed Chromium-family browser through the Chrome DevTools Protocol."
+                        .to_string(),
+            },
+            Err(err) => BrowserProviderStatus {
+                provider: BrowserWorkspaceProvider::Cdp,
+                available: false,
+                executable: None,
+                source: None,
+                message: err.to_string(),
+            },
+        },
+        match system_cdp_exe {
+            Ok(exe) => BrowserProviderStatus {
+                provider: BrowserWorkspaceProvider::SystemCdp,
+                available: true,
+                executable: Some(exe.path.display().to_string()),
+                source: Some(exe.source),
+                message:
+                    "Explicit opt-in CDP provider for the user's installed Chrome/Chromium browser."
+                        .to_string(),
+            },
+            Err(err) => BrowserProviderStatus {
+                provider: BrowserWorkspaceProvider::SystemCdp,
+                available: false,
+                executable: None,
+                source: None,
+                message: err.to_string(),
+            },
         },
         BrowserProviderStatus {
             provider: BrowserWorkspaceProvider::Playwright,
-            available: find_executable("playwright")
-                .or_else(|| find_executable("npx"))
-                .is_some(),
-            executable: find_executable("playwright")
-                .or_else(|| find_executable("npx"))
-                .map(|p| p.display().to_string()),
+            available: playwright_exe.is_some(),
+            source: playwright_exe.as_ref().map(|_| "PATH".to_string()),
+            executable: playwright_exe.map(|p| p.display().to_string()),
             message: "Provider contract reserved for the Playwright sidecar.".to_string(),
         },
         BrowserProviderStatus {
             provider: BrowserWorkspaceProvider::AgentBrowser,
-            available: find_executable("agent-browser").is_some(),
-            executable: find_executable("agent-browser").map(|p| p.display().to_string()),
+            available: agent_browser_exe.is_some(),
+            source: agent_browser_exe.as_ref().map(|_| "PATH".to_string()),
+            executable: agent_browser_exe.map(|p| p.display().to_string()),
             message: "Provider contract reserved for Vercel Agent Browser integration.".to_string(),
         },
         BrowserProviderStatus {
             provider: BrowserWorkspaceProvider::Stream,
             available: true,
             executable: None,
+            source: None,
             message:
                 "Fallback to Intendant display streaming for remote or non-browser workspaces."
                     .to_string(),
@@ -362,6 +406,7 @@ pub async fn create_workspace(
     let provider = match requested_provider {
         BrowserWorkspaceProvider::Auto => BrowserWorkspaceProvider::Cdp,
         BrowserWorkspaceProvider::Cdp => BrowserWorkspaceProvider::Cdp,
+        BrowserWorkspaceProvider::SystemCdp => BrowserWorkspaceProvider::SystemCdp,
         BrowserWorkspaceProvider::Playwright => {
             return Err(BrowserWorkspaceError::Unsupported(
                 "Playwright browser workspaces need the sidecar driver; use provider=cdp for the first executable backend"
@@ -423,6 +468,7 @@ pub async fn create_workspace(
             .map(str::to_string),
         profile_dir: Some(profile_dir.display().to_string()),
         browser_executable: None,
+        browser_executable_source: None,
         process_id: None,
         debugging_port: None,
         cdp_http_url: None,
@@ -436,7 +482,8 @@ pub async fn create_workspace(
     };
 
     let (child, cdp) = launch_cdp_browser(&workspace, &profile_dir).await?;
-    workspace.browser_executable = Some(cdp.executable.display().to_string());
+    workspace.browser_executable = Some(cdp.executable.path.display().to_string());
+    workspace.browser_executable_source = Some(cdp.executable.source);
     workspace.process_id = cdp.process_id;
     workspace.debugging_port = Some(cdp.port);
     workspace.cdp_http_url = Some(format!("http://127.0.0.1:{}", cdp.port));
@@ -492,7 +539,7 @@ pub async fn release_workspace(
 }
 
 struct CdpLaunch {
-    executable: PathBuf,
+    executable: ChromiumExecutable,
     process_id: Option<u32>,
     port: u16,
     web_socket_debugger_url: Option<String>,
@@ -503,28 +550,45 @@ async fn launch_cdp_browser(
     workspace: &BrowserWorkspace,
     profile_dir: &Path,
 ) -> Result<(Child, CdpLaunch), BrowserWorkspaceError> {
-    let executable = find_chromium_executable().ok_or_else(|| {
-        BrowserWorkspaceError::Launch(
-            "no Chrome/Chromium executable found for CDP browser workspace".to_string(),
-        )
-    })?;
+    let executable = resolve_chromium_executable(matches!(
+        workspace.provider,
+        BrowserWorkspaceProvider::SystemCdp
+    ))?;
     let port = reserve_local_port().await?;
-    let mut command = tokio::process::Command::new(&executable);
+    let mut command = tokio::process::Command::new(&executable.path);
     command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .arg(format!("--remote-debugging-port={port}"))
         .arg("--remote-debugging-address=127.0.0.1")
         .arg(format!("--user-data-dir={}", profile_dir.display()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-background-networking")
-        .arg("--disable-features=Translate");
+        .arg("--disable-breakpad")
+        .arg("--disable-client-side-phishing-detection")
+        .arg("--disable-component-update")
+        .arg("--disable-default-apps")
+        .arg("--disable-domain-reliability")
+        .arg("--disable-extensions")
+        .arg("--disable-features=AutofillServerCommunication,CertificateTransparencyComponentUpdater,MediaRouter,OptimizationHints,OptimizationGuideModelDownloading,Translate")
+        .arg("--disable-popup-blocking")
+        .arg("--disable-sync")
+        .arg("--metrics-recording-only")
+        .arg("--password-store=basic");
+    #[cfg(target_os = "macos")]
+    command.arg("--use-mock-keychain");
     if let Some(url) = workspace.url.as_ref() {
         command.arg(url);
     } else {
         command.arg("about:blank");
     }
     let child = command.spawn().map_err(|e| {
-        BrowserWorkspaceError::Launch(format!("failed to launch {}: {e}", executable.display()))
+        BrowserWorkspaceError::Launch(format!(
+            "failed to launch {}: {e}",
+            executable.path.display()
+        ))
     })?;
     let process_id = child.id();
     match wait_for_cdp_target(port).await {
@@ -607,7 +671,176 @@ fn first_page_target(value: &serde_json::Value) -> Option<(Option<String>, Optio
         })
 }
 
-fn find_chromium_executable() -> Option<PathBuf> {
+#[derive(Debug, Clone)]
+struct ChromiumExecutable {
+    path: PathBuf,
+    source: String,
+}
+
+fn resolve_chromium_executable(
+    allow_system_for_request: bool,
+) -> Result<ChromiumExecutable, BrowserWorkspaceError> {
+    if let Some((env_name, path)) = configured_browser_executable() {
+        if is_regular_file(&path) {
+            return Ok(ChromiumExecutable {
+                path,
+                source: format!("env:{env_name}"),
+            });
+        }
+        return Err(BrowserWorkspaceError::Launch(format!(
+            "{env_name} points to a missing or non-file browser executable: {}",
+            path.display()
+        )));
+    }
+
+    if !allow_system_for_request {
+        if let Some(path) = find_managed_chromium_executable() {
+            return Ok(ChromiumExecutable {
+                path,
+                source: "managed-cache".to_string(),
+            });
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if allow_system_for_request || allow_system_browser() {
+            return find_system_chromium_executable()
+                .map(|path| ChromiumExecutable {
+                    path,
+                    source: if allow_system_for_request {
+                        "system-browser-provider".to_string()
+                    } else {
+                        "system-browser-env-opt-in".to_string()
+                    },
+                })
+                .ok_or_else(|| {
+                    let message = if allow_system_for_request {
+                        "no system Chrome/Chromium executable found for provider=system_cdp"
+                    } else {
+                        "no managed Chromium or opted-in system Chrome/Chromium executable found for CDP browser workspace"
+                    };
+                    BrowserWorkspaceError::Launch(message.to_string())
+                });
+        }
+        Err(BrowserWorkspaceError::Launch(format!(
+            "no managed Chromium executable found for CDP browser workspace; install Playwright/Chrome-for-Testing Chromium, set {BROWSER_EXECUTABLE_ENV}, or set {ALLOW_SYSTEM_BROWSER_ENV}=1 to explicitly allow launching the system browser"
+        )))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        find_system_chromium_executable()
+            .map(|path| ChromiumExecutable {
+                path,
+                source: "system-browser".to_string(),
+            })
+            .ok_or_else(|| {
+                BrowserWorkspaceError::Launch(
+                    "no Chrome/Chromium executable found for CDP browser workspace".to_string(),
+                )
+            })
+    }
+}
+
+fn configured_browser_executable() -> Option<(&'static str, PathBuf)> {
+    for env_name in [BROWSER_EXECUTABLE_ENV, LEGACY_BROWSER_EXECUTABLE_ENV] {
+        if let Ok(raw) = std::env::var(env_name) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some((env_name, PathBuf::from(trimmed)));
+            }
+        }
+    }
+    None
+}
+
+fn allow_system_browser() -> bool {
+    env_truthy(ALLOW_SYSTEM_BROWSER_ENV) || env_truthy(LEGACY_ALLOW_SYSTEM_BROWSER_ENV)
+}
+
+fn env_truthy(env_name: &str) -> bool {
+    std::env::var(env_name)
+        .ok()
+        .map(|value| env_value_truthy(&value))
+        .unwrap_or(false)
+}
+
+fn env_value_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn find_managed_chromium_executable() -> Option<PathBuf> {
+    for root in managed_browser_roots() {
+        if let Some(path) = find_executable_under(&root, managed_browser_executable_names(), 6) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn managed_browser_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(cache_dir) = dirs::cache_dir() {
+        roots.push(cache_dir.join("ms-playwright"));
+        roots.push(cache_dir.join("puppeteer"));
+        roots.push(cache_dir.join("chrome-for-testing"));
+        roots.push(cache_dir.join("intendant").join("browser-workspaces"));
+    }
+    if let Some(data_dir) = dirs::data_dir() {
+        roots.push(data_dir.join("intendant").join("browser-workspaces"));
+        roots.push(data_dir.join("intendant").join("browsers"));
+    }
+    roots
+}
+
+fn managed_browser_executable_names() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        &["chrome.exe", "msedge.exe", "chromium.exe"]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        &["Google Chrome for Testing", "Chromium", "chrome"]
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        &["chrome", "chromium", "chromium-browser", "google-chrome"]
+    }
+}
+
+fn find_executable_under(root: &Path, names: &[&str], max_depth: usize) -> Option<PathBuf> {
+    if !root.is_dir() {
+        return None;
+    }
+    let mut entries = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            if max_depth > 0 {
+                if let Some(found) = find_executable_under(&path, names, max_depth - 1) {
+                    return Some(found);
+                }
+            }
+            continue;
+        }
+        if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+            if names.iter().any(|name| *name == file_name) && is_regular_file(&path) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn find_system_chromium_executable() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         for path in [
@@ -617,7 +850,7 @@ fn find_chromium_executable() -> Option<PathBuf> {
             "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
         ] {
             let p = PathBuf::from(path);
-            if p.exists() {
+            if is_regular_file(&p) {
                 return Some(p);
             }
         }
@@ -635,6 +868,10 @@ fn find_chromium_executable() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    path.metadata().map(|m| m.is_file()).unwrap_or(false)
 }
 
 fn find_executable(name: &str) -> Option<PathBuf> {
@@ -670,6 +907,7 @@ mod tests {
             owner_session_id: Some("session-1".to_string()),
             profile_dir: None,
             browser_executable: None,
+            browser_executable_source: None,
             process_id: None,
             debugging_port: None,
             cdp_http_url: None,
@@ -744,5 +982,47 @@ mod tests {
         let (ws, id) = first_page_target(&targets).unwrap();
         assert_eq!(id.as_deref(), Some("page-1"));
         assert_eq!(ws.as_deref(), Some("ws://127.0.0.1/devtools/page/page-1"));
+    }
+
+    #[test]
+    fn parses_explicit_system_cdp_provider() {
+        assert_eq!(
+            BrowserWorkspaceProvider::parse(Some("system_cdp")),
+            BrowserWorkspaceProvider::SystemCdp
+        );
+        assert_eq!(
+            BrowserWorkspaceProvider::parse(Some("system-chrome")),
+            BrowserWorkspaceProvider::SystemCdp
+        );
+    }
+
+    #[test]
+    fn truthy_env_parser_is_strict() {
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(env_value_truthy(value), "{value:?} should be truthy");
+        }
+        for value in ["", "0", "false", "off", "system"] {
+            assert!(!env_value_truthy(value), "{value:?} should not be truthy");
+        }
+    }
+
+    #[test]
+    fn finds_deep_managed_browser_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp
+            .path()
+            .join("chrome")
+            .join("mac_arm-123")
+            .join("chrome-mac-arm64")
+            .join("Google Chrome for Testing.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("Google Chrome for Testing");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, "").unwrap();
+
+        let found = find_executable_under(temp.path(), &["Google Chrome for Testing"], 6)
+            .expect("managed browser executable should be found");
+        assert_eq!(found, executable);
     }
 }

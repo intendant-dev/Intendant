@@ -1548,10 +1548,12 @@ fn help_browser() {
         "Usage:\n\
   intendant ctl browser providers\n\
   intendant ctl browser list\n\
-  intendant ctl browser create [URL] [--label TEXT] [--provider auto|cdp|playwright|agent_browser] [--peer PEER_ID] [--session ID] [--profile-dir PATH]\n\
+  intendant ctl browser create [URL] [--label TEXT] [--provider auto|cdp|system_cdp|playwright|agent_browser] [--peer PEER_ID] [--session ID] [--profile-dir PATH]\n\
   intendant ctl browser acquire WORKSPACE_ID [--holder ID] [--holder-kind agent|human] [--note TEXT] [--force]\n\
   intendant ctl browser release WORKSPACE_ID [--holder ID] [--note TEXT]\n\
-  intendant ctl browser close WORKSPACE_ID [--reason TEXT]"
+  intendant ctl browser close WORKSPACE_ID [--reason TEXT]\n\
+\n\
+CDP uses a managed Chromium/Chrome-for-Testing executable by default. Use --provider system_cdp, or set INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER=1, to opt into system Chrome/Chromium."
     );
 }
 
