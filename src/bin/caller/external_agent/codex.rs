@@ -1435,6 +1435,14 @@ impl CodexAgent {
         })?;
         let thread_id = self.active_thread_id.lock().await.clone();
         let trace = read_latest_codex_context_payload(root, thread_id.as_deref()).await?;
+        let rollout_path = match thread_id.as_deref() {
+            Some(thread_id) => self
+                .read_thread_snapshot(thread_id)
+                .await
+                .ok()
+                .and_then(|snapshot| snapshot.rollout_path),
+            None => None,
+        };
         let usage = self.latest_token_usage.lock().await.clone();
         let token_count = usage.as_ref().and_then(codex_usage_total_tokens);
         let context_window = usage.as_ref().and_then(codex_usage_context_window);
@@ -1452,6 +1460,7 @@ impl CodexAgent {
             label: trace.label,
             request_id: Some(trace.request_id),
             request_index: Some(trace.request_index),
+            rollout_path,
             format: trace.format,
             token_count,
             context_window,
@@ -1639,6 +1648,7 @@ pub(crate) fn context_snapshots_from_trace_archive(
                 label: trace.label,
                 request_id: Some(trace.request_id),
                 request_index: Some(trace.request_index),
+                rollout_path: None,
                 format: trace.format,
                 token_count: None,
                 context_window: None,
@@ -4581,6 +4591,14 @@ impl ExternalAgent for CodexAgent {
             Err(err) if codex_context_snapshot_not_ready(&err) => return Ok(Vec::new()),
             Err(err) => return Err(err),
         };
+        let rollout_path = match thread_id.as_deref() {
+            Some(thread_id) => self
+                .read_thread_snapshot(thread_id)
+                .await
+                .ok()
+                .and_then(|snapshot| snapshot.rollout_path),
+            None => None,
+        };
         let usage = self.latest_token_usage.lock().await.clone();
         let latest_request_id = traces.last().map(|trace| trace.request_id.clone());
         let exact_archive = self.context_archive_exact();
@@ -4601,6 +4619,7 @@ impl ExternalAgent for CodexAgent {
                     label: trace.label,
                     request_id: Some(trace.request_id),
                     request_index: Some(trace.request_index),
+                    rollout_path: rollout_path.clone(),
                     format: trace.format,
                     token_count: is_latest
                         .then(|| usage.as_ref().and_then(codex_usage_total_tokens))

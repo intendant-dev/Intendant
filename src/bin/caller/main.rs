@@ -66,6 +66,7 @@ use conversation::Conversation;
 use error::CallerError;
 use event::{AppEvent, EventBus};
 use project::Project;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -1625,6 +1626,23 @@ impl ExternalContextRewindRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedContextRewindAnchor {
+    item_id: String,
+}
+
+impl ResolvedContextRewindAnchor {
+    fn requested(item_id: &str) -> Self {
+        Self {
+            item_id: item_id.to_string(),
+        }
+    }
+
+    fn target_label(&self, position: external_agent::RollbackAnchorPosition) -> String {
+        format!("{} item {}", position.as_str(), self.item_id)
+    }
+}
+
 fn push_context_rewind_text_section(out: &mut String, label: &str, value: &str) {
     let value = value.trim();
     if value.is_empty() {
@@ -1806,6 +1824,370 @@ fn recovery_required_message(message: &str, recovery_hint: Option<&str>) -> Stri
     out
 }
 
+fn resolve_context_rewind_anchor(
+    source_rollout_path: &Path,
+    requested_item_id: &str,
+) -> Result<ResolvedContextRewindAnchor, String> {
+    let requested_item_id = requested_item_id.trim();
+    if requested_item_id.is_empty() {
+        return Err("rewind anchor item id is required".to_string());
+    }
+
+    let scan = scan_context_rewind_rollout_anchors(source_rollout_path, requested_item_id)
+        .map_err(|err| {
+            format!(
+                "failed to inspect rollout anchors in {}: {err}",
+                source_rollout_path.display()
+            )
+        })?;
+    if scan.requested_anchor_exists {
+        return Ok(ResolvedContextRewindAnchor::requested(requested_item_id));
+    }
+
+    Err(format!(
+        "rollback anchor item_id `{requested_item_id}` was not found in {}; call list_rewind_anchors to inspect valid exact anchors before retrying",
+        source_rollout_path.display()
+    ))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ContextRewindRolloutAnchorScan {
+    requested_anchor_exists: bool,
+}
+
+fn scan_context_rewind_rollout_anchors(
+    source_rollout_path: &Path,
+    requested_item_id: &str,
+) -> io::Result<ContextRewindRolloutAnchorScan> {
+    let file = std::fs::File::open(source_rollout_path)?;
+    let reader = io::BufReader::new(file);
+    let mut scan = ContextRewindRolloutAnchorScan::default();
+
+    for line in reader.lines() {
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(|value| value.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
+
+        for anchor_id in response_item_anchor_ids(payload) {
+            if anchor_id == requested_item_id {
+                scan.requested_anchor_exists = true;
+            }
+        }
+    }
+
+    Ok(scan)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContextRewindAnchorCatalogEntry {
+    ordinal: usize,
+    item_id: String,
+    first_line: usize,
+    last_line: usize,
+    first_item_type: String,
+    last_item_type: String,
+    positions: Vec<&'static str>,
+    position_hint: &'static str,
+    names: Vec<String>,
+    roles: Vec<String>,
+    summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContextRewindAnchorCatalog {
+    rollout_path: String,
+    total: usize,
+    filtered_total: usize,
+    offset: usize,
+    limit: usize,
+    next_offset: Option<usize>,
+    query: Option<String>,
+    anchors: Vec<ContextRewindAnchorCatalogEntry>,
+    usage: &'static str,
+}
+
+fn list_context_rewind_anchors_from_rollout(
+    source_rollout_path: &Path,
+    params: &serde_json::Value,
+) -> Result<String, String> {
+    let offset = params
+        .get("offset")
+        .or_else(|| params.get("start_index"))
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
+    let query = params
+        .get("query")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let reverse = params
+        .get("reverse")
+        .and_then(|value| value.as_bool())
+        .unwrap_or_else(|| {
+            params
+                .get("direction")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .is_some_and(|direction| direction.eq_ignore_ascii_case("backward"))
+        });
+
+    let mut anchors = scan_context_rewind_anchor_catalog(source_rollout_path).map_err(|err| {
+        format!(
+            "failed to inspect rewind anchors in {}: {err}",
+            source_rollout_path.display()
+        )
+    })?;
+    let total = anchors.len();
+    if reverse {
+        anchors.reverse();
+    }
+    if let Some(query) = query.as_deref() {
+        let needle = query.to_ascii_lowercase();
+        anchors.retain(|anchor| context_rewind_anchor_matches_query(anchor, &needle));
+    }
+    let filtered_total = anchors.len();
+    let page = anchors
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let next_offset =
+        (offset.saturating_add(limit) < filtered_total).then_some(offset.saturating_add(limit));
+    let catalog = ContextRewindAnchorCatalog {
+        rollout_path: source_rollout_path.display().to_string(),
+        total,
+        filtered_total,
+        offset,
+        limit,
+        next_offset,
+        query,
+        anchors: page,
+        usage: "Choose any returned item_id exactly in rewind_context.anchor.item_id. Use position=\"after\" to keep the matching item/group and drop later context, or position=\"before\" to drop the matching item/group too. Use additional pages or query to inspect any anchor from the full rollout.",
+    };
+    serde_json::to_string_pretty(&catalog).map_err(|err| err.to_string())
+}
+
+fn scan_context_rewind_anchor_catalog(
+    source_rollout_path: &Path,
+) -> io::Result<Vec<ContextRewindAnchorCatalogEntry>> {
+    let file = std::fs::File::open(source_rollout_path)?;
+    let reader = io::BufReader::new(file);
+    let mut anchors = Vec::<ContextRewindAnchorCatalogEntry>::new();
+    let mut by_item_id = HashMap::<String, usize>::new();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(|value| value.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
+        let item_type = payload
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let names = context_rewind_anchor_names(payload);
+        let roles = context_rewind_anchor_roles(payload);
+        let summary = context_rewind_anchor_summary(payload);
+        let line_number = line_index.saturating_add(1);
+        for item_id in response_item_anchor_ids(payload) {
+            if let Some(index) = by_item_id.get(&item_id).copied() {
+                let anchor = &mut anchors[index];
+                anchor.last_line = line_number;
+                anchor.last_item_type = item_type.clone();
+                merge_string_set(&mut anchor.names, names.iter().cloned());
+                merge_string_set(&mut anchor.roles, roles.iter().cloned());
+                if !summary.is_empty() && !anchor.summary.contains(&summary) {
+                    if !anchor.summary.is_empty() {
+                        anchor.summary.push_str(" | ");
+                    }
+                    anchor.summary.push_str(&summary);
+                    truncate_string(&mut anchor.summary, 360);
+                }
+                continue;
+            }
+            let index = anchors.len();
+            by_item_id.insert(item_id.clone(), index);
+            anchors.push(ContextRewindAnchorCatalogEntry {
+                ordinal: index,
+                item_id,
+                first_line: line_number,
+                last_line: line_number,
+                first_item_type: item_type.clone(),
+                last_item_type: item_type.clone(),
+                positions: vec!["before", "after"],
+                position_hint: "after",
+                names: names.clone(),
+                roles: roles.clone(),
+                summary: summary.clone(),
+            });
+        }
+    }
+
+    Ok(anchors)
+}
+
+fn context_rewind_anchor_matches_query(
+    anchor: &ContextRewindAnchorCatalogEntry,
+    needle: &str,
+) -> bool {
+    anchor.item_id.to_ascii_lowercase().contains(needle)
+        || anchor.first_item_type.to_ascii_lowercase().contains(needle)
+        || anchor.last_item_type.to_ascii_lowercase().contains(needle)
+        || anchor
+            .names
+            .iter()
+            .any(|name| name.to_ascii_lowercase().contains(needle))
+        || anchor
+            .roles
+            .iter()
+            .any(|role| role.to_ascii_lowercase().contains(needle))
+        || anchor.summary.to_ascii_lowercase().contains(needle)
+        || anchor.first_line.to_string() == needle
+        || anchor.last_line.to_string() == needle
+}
+
+fn context_rewind_anchor_names(item: &serde_json::Value) -> Vec<String> {
+    item.get("name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default()
+}
+
+fn context_rewind_anchor_roles(item: &serde_json::Value) -> Vec<String> {
+    item.get("role")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default()
+}
+
+fn context_rewind_anchor_summary(item: &serde_json::Value) -> String {
+    let item_type = item
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let mut summary = match item_type {
+        "message" => response_item_content_text(item)
+            .collect::<Vec<_>>()
+            .join(" "),
+        "function_call" | "custom_tool_call" | "local_shell_call" | "tool_search_call" => {
+            let name = item
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("tool");
+            let arguments = item
+                .get("arguments")
+                .or_else(|| item.get("input"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            format!("{name} {arguments}")
+        }
+        "function_call_output" | "custom_tool_call_output" | "tool_search_output" => item
+            .get("output")
+            .or_else(|| item.get("result"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("tool output")
+            .to_string(),
+        _ => item_type.to_string(),
+    };
+    summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_string(&mut summary, 240);
+    summary
+}
+
+fn merge_string_set(target: &mut Vec<String>, values: impl Iterator<Item = String>) {
+    for value in values {
+        if !target.iter().any(|existing| existing == &value) {
+            target.push(value);
+        }
+    }
+}
+
+fn truncate_string(value: &mut String, max_chars: usize) {
+    if value.chars().count() <= max_chars {
+        return;
+    }
+    *value = value.chars().take(max_chars).collect::<String>();
+    value.push_str("...");
+}
+
+fn response_item_content_text(item: &serde_json::Value) -> impl Iterator<Item = &str> {
+    item.get("content")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|content| {
+            content
+                .get("text")
+                .or_else(|| content.get("input_text"))
+                .or_else(|| content.get("output_text"))
+                .and_then(|value| value.as_str())
+        })
+}
+
+fn response_item_anchor_ids(item: &serde_json::Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    match item.get("type").and_then(|value| value.as_str()) {
+        Some("message")
+        | Some("reasoning")
+        | Some("web_search_call")
+        | Some("image_generation_call") => {
+            push_json_string_id(item, &mut ids, "id");
+        }
+        Some("local_shell_call")
+        | Some("function_call")
+        | Some("tool_search_call")
+        | Some("custom_tool_call") => {
+            push_json_string_id(item, &mut ids, "id");
+            push_json_string_id(item, &mut ids, "call_id");
+            push_json_string_id(item, &mut ids, "callId");
+        }
+        Some("function_call_output")
+        | Some("tool_search_output")
+        | Some("custom_tool_call_output") => {
+            push_json_string_id(item, &mut ids, "call_id");
+            push_json_string_id(item, &mut ids, "callId");
+        }
+        _ => {}
+    }
+    ids
+}
+
+fn push_json_string_id(item: &serde_json::Value, ids: &mut Vec<String>, key: &str) {
+    if let Some(id) = item
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        ids.push(id.to_string());
+    }
+}
+
 async fn apply_external_context_rewind(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     thread_id: &str,
@@ -1828,6 +2210,7 @@ async fn apply_external_context_rewind(
         .rollout_path
         .clone()
         .ok_or_else(|| "thread metadata did not include a rollout path".to_string())?;
+    let resolved_anchor = resolve_context_rewind_anchor(&source_rollout_path, &request.item_id)?;
     let recovery_rollout_path =
         context_rewind::copy_recovery_rollout(config.log_dir, &record_id, &source_rollout_path)
             .map_err(|e| format!("failed to copy pre-rewind rollout: {}", e))?;
@@ -1874,7 +2257,7 @@ async fn apply_external_context_rewind(
             .clone()
             .or_else(|| config.session_id.clone()),
         thread_id: snapshot.thread_id,
-        item_id: request.item_id.clone(),
+        item_id: resolved_anchor.item_id.clone(),
         position: request.position.as_str().to_string(),
         reason: request.reason.clone(),
         primer: request.primer.clone(),
@@ -1894,7 +2277,7 @@ async fn apply_external_context_rewind(
     // the backend rejects as a normal tool error) never leaves a success-looking
     // orphan record on disk. On failure, delete the orphaned recovery-rollout copy.
     if let Err(e) = agent
-        .rollback_thread_to_item_anchor(thread_id, &request.item_id, request.position)
+        .rollback_thread_to_item_anchor(thread_id, &resolved_anchor.item_id, request.position)
         .await
     {
         if let Err(cleanup) = context_rewind::remove_recovery_rollout(config.log_dir, &record_id) {
@@ -1920,13 +2303,13 @@ async fn apply_external_context_rewind(
     let message = if request.primer.is_some() {
         format!(
             "context rewound to {}; primer injected; record {}",
-            request.target_label(),
+            resolved_anchor.target_label(request.position),
             record_id
         )
     } else {
         format!(
             "rewound to {}; record {}",
-            request.target_label(),
+            resolved_anchor.target_label(request.position),
             record_id
         )
     };
@@ -2209,7 +2592,7 @@ fn managed_context_recovery_kickstart_text(
         ""
     };
     format!(
-        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. Call rewind_context now with an exact item/tool-call anchor and a dense carry-forward primer, then stop.{held}\n</managed_context_recovery>",
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. First call list_rewind_anchors, using pagination/query as needed to inspect any valid anchor in the rollout. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
         status = pressure.status,
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
@@ -2532,6 +2915,18 @@ fn is_context_rewind_backout_action(op: &str) -> bool {
     )
 }
 
+fn is_context_rewind_anchor_list_action(op: &str) -> bool {
+    matches!(
+        op,
+        "list_rewind_anchors"
+            | "list-rewind-anchors"
+            | "rewind_anchors"
+            | "rewind-anchors"
+            | "context_rewind_anchors"
+            | "context-rewind-anchors"
+    )
+}
+
 fn context_rewind_record_id_from_params(params: &serde_json::Value) -> Option<String> {
     params
         .get("recordId")
@@ -2814,6 +3209,31 @@ async fn apply_context_rewind_backout_action(
     ))
 }
 
+async fn apply_context_rewind_anchor_list_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    params: &serde_json::Value,
+) -> Result<String, String> {
+    let thread_id = thread_id_from_action_params(params);
+    let mut rollout_path = None;
+    if let Some(thread_id) = thread_id.as_deref() {
+        rollout_path = agent
+            .read_thread_snapshot(thread_id)
+            .await
+            .ok()
+            .and_then(|snapshot| snapshot.rollout_path);
+    }
+    if rollout_path.is_none() {
+        rollout_path = agent
+            .context_snapshot()
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|snapshot| snapshot.rollout_path);
+    }
+    let rollout_path = rollout_path
+        .ok_or_else(|| "Codex thread metadata did not include a rollout path".to_string())?;
+    list_context_rewind_anchors_from_rollout(&rollout_path, params)
+}
+
 async fn handle_external_thread_action(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     op: String,
@@ -2824,7 +3244,9 @@ async fn handle_external_thread_action(
     let params = thread_action_params_for_target(&op, params, &target_session_id, config);
     let action_thread_id = thread_id_from_action_params(&params);
     let result_session_id = target_session_id.or_else(|| config.session_id.clone());
-    let result = if is_context_rewind_backout_action(&op) {
+    let result = if is_context_rewind_anchor_list_action(&op) {
+        apply_context_rewind_anchor_list_action(agent, &params).await
+    } else if is_context_rewind_backout_action(&op) {
         apply_context_rewind_backout_action(agent, &op, &params, config).await
     } else {
         agent
@@ -7231,6 +7653,7 @@ mod tests {
             label: "Codex resolved request payload".to_string(),
             request_id: Some("req-1".to_string()),
             request_index: Some(1),
+            rollout_path: None,
             format: "openai.responses.resolved_request.v1".to_string(),
             token_count: Some(71_876),
             context_window: Some(258_400),
@@ -7260,6 +7683,7 @@ mod tests {
             label: "Codex resolved request payload".to_string(),
             request_id: Some("req-1".to_string()),
             request_index: Some(1),
+            rollout_path: None,
             format: "openai.responses.resolved_request.v1".to_string(),
             token_count: Some(258_399),
             context_window: Some(258_400),
@@ -7533,6 +7957,149 @@ mod tests {
         assert!(primer.contains("- bad assumption"));
         assert!(!primer.contains("- \n"));
         assert!(request.resume_followup().is_some());
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_lists_all_exact_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "rewind_context",
+                        "call_id": "call_prior_rewind",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_prior_rewind",
+                        "output": "ok"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<model_context_rewind_primer>dense state</model_context_rewind_primer>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "rewind_context",
+                        "call_id": "call_latest_rewind",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_rolled_back",
+                        "num_turns": 1
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_latest_rewind",
+                        "output": "ok"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<model_context_rewind_primer>newer dense state</model_context_rewind_primer>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "continue" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let catalog = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "offset": 0, "limit": 20 }),
+        )
+        .expect("anchor catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"call_prior_rewind"));
+        assert!(ids.contains(&"call_latest_rewind"));
+
+        let filtered = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "query": "latest", "offset": 0, "limit": 20 }),
+        )
+        .expect("filtered anchor catalog");
+        let filtered: serde_json::Value = serde_json::from_str(&filtered).unwrap();
+        let filtered_ids = filtered["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(filtered_ids, vec!["call_latest_rewind"]);
+
+        let missing = resolve_context_rewind_anchor(&path, "rewind_context-call_7")
+            .expect_err("synthetic anchors are not accepted");
+        assert!(missing.contains("call list_rewind_anchors"));
+    }
+
+    #[test]
+    fn context_rewind_anchor_keeps_exact_rollout_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_exact",
+                    "arguments": "{}"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let exact = resolve_context_rewind_anchor(&path, "call_exact").expect("exact anchor");
+        assert_eq!(exact.item_id, "call_exact");
     }
 
     #[test]
@@ -11883,6 +12450,28 @@ async fn run_with_presence(
                     persistent_side_rounds.clear();
                     persistent_side_turn_revisions.clear();
                     Ok("agent torn down; next task will start a fresh thread".to_string())
+                } else if is_context_rewind_anchor_list_action(&op) {
+                    let Some(ref mut agent) = persistent_agent else {
+                        turn_bus_rx = bus.subscribe();
+                        bus.send(AppEvent::CodexThreadActionResult {
+                            session_id: session_id.clone().or_else(|| local_session_id.clone()),
+                            action: op,
+                            success: false,
+                            message: "no active agent — start a task first".to_string(),
+                        });
+                        continue;
+                    };
+                    let target_thread_id = session_id
+                        .as_deref()
+                        .filter(|id| Some(*id) != local_session_id.as_deref())
+                        .or_else(|| {
+                            persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.as_str())
+                        });
+                    action_params =
+                        thread_action_params_with_thread_id(&op, action_params, target_thread_id);
+                    apply_context_rewind_anchor_list_action(agent, &action_params).await
                 } else if is_context_rewind_backout_action(&op) {
                     let Some(ref mut agent) = persistent_agent else {
                         turn_bus_rx = bus.subscribe();
