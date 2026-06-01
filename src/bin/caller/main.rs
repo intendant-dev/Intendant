@@ -43,6 +43,7 @@ mod session_config;
 mod session_log;
 mod session_names;
 mod session_supervisor;
+mod setup;
 mod skills;
 mod sub_agent;
 mod task_dispatch;
@@ -5936,6 +5937,7 @@ fn print_help() {
     println!("SUBCOMMANDS:");
     println!("    ctl                   Control a running Intendant daemon over MCP");
     println!("    lan                   Configure LAN mTLS access");
+    println!("    setup                 Install or verify host-level Intendant dependencies");
     println!();
     println!("SESSION LOGS:");
     println!(
@@ -16311,6 +16313,20 @@ async fn main() -> Result<(), CallerError> {
             eprintln!("error: `intendant lan` is not supported on Windows yet");
             std::process::exit(1);
         }
+    }
+
+    // Intercept `intendant setup <action>` before normal project/provider
+    // initialization. These are host setup/repair commands and must not need
+    // an API key or a detected project.
+    if env::args().nth(1).as_deref() == Some("setup") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        return match setup::run(argv).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
     }
 
     // Intercept `intendant ctl <command>` before normal project/provider

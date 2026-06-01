@@ -78,7 +78,9 @@ browser caches and Intendant's own browser cache locations. This avoids
 attributing Google Chrome updater/app-bundle activity to Intendant on macOS. Set
 the explicit executable variable when a managed browser lives in a custom path,
 or choose `provider=system_cdp` for a deliberate one-off system-browser launch.
-Intendant discovers existing managed browsers; it does not download one yet.
+Run `intendant setup browsers` to download Chrome for Testing into Intendant's
+managed cache, or `intendant setup browsers --check` to verify the cache without
+network access.
 
 ### Sub-agent variables (set automatically)
 

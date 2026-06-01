@@ -128,7 +128,8 @@ gateway or presence wiring. It also includes a browser-workspace panel for
 manual smoke testing of local CDP-backed browser workspaces and their leases.
 CDP workspaces prefer managed Chromium/Chrome-for-Testing executables; on macOS
 system Chrome/Chromium apps require choosing `system_cdp` or setting
-`INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER=1`.
+`INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER=1`. Run
+`intendant setup browsers` to install or repair the managed browser cache.
 
 ### Settings
 

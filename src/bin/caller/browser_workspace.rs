@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
@@ -17,6 +18,8 @@ const BROWSER_EXECUTABLE_ENV: &str = "INTENDANT_BROWSER_WORKSPACE_EXECUTABLE";
 const LEGACY_BROWSER_EXECUTABLE_ENV: &str = "INTENDANT_BROWSER_EXECUTABLE";
 const ALLOW_SYSTEM_BROWSER_ENV: &str = "INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER";
 const LEGACY_ALLOW_SYSTEM_BROWSER_ENV: &str = "INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_CHROME";
+const CHROME_FOR_TESTING_DOWNLOADS_URL: &str =
+    "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json";
 
 pub fn global_registry() -> SharedBrowserWorkspaceRegistry {
     GLOBAL_BROWSER_WORKSPACES
@@ -165,6 +168,38 @@ pub struct BrowserProviderStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedBrowserStatus {
+    pub installed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub install_root: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ManagedBrowserInstallOptions {
+    pub channel: String,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedBrowserInstallResult {
+    pub installed: bool,
+    pub channel: String,
+    pub version: String,
+    pub platform: String,
+    pub executable: String,
+    pub source: String,
+    pub install_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downloaded_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -381,6 +416,115 @@ pub async fn provider_statuses() -> Vec<BrowserProviderStatus> {
                     .to_string(),
         },
     ]
+}
+
+pub fn managed_chromium_status() -> ManagedBrowserStatus {
+    match find_managed_chromium_executable() {
+        Some(path) => ManagedBrowserStatus {
+            installed: true,
+            executable: Some(path.display().to_string()),
+            source: Some("managed-cache".to_string()),
+            install_root: managed_browser_install_root().display().to_string(),
+            message: "managed Chromium-family browser is available".to_string(),
+        },
+        None => ManagedBrowserStatus {
+            installed: false,
+            executable: None,
+            source: None,
+            install_root: managed_browser_install_root().display().to_string(),
+            message: format!(
+                "no managed Chromium executable found; run `intendant setup browsers` or set {BROWSER_EXECUTABLE_ENV}"
+            ),
+        },
+    }
+}
+
+pub async fn ensure_managed_chromium(
+    options: ManagedBrowserInstallOptions,
+) -> Result<ManagedBrowserInstallResult, String> {
+    if !options.force {
+        if let Some(path) = find_managed_chromium_executable() {
+            return Ok(ManagedBrowserInstallResult {
+                installed: false,
+                channel: normalize_cft_channel(&options.channel)?.to_string(),
+                version: "existing".to_string(),
+                platform: cft_platform()?.to_string(),
+                executable: path.display().to_string(),
+                source: "managed-cache".to_string(),
+                install_dir: path
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .display()
+                    .to_string(),
+                download_url: None,
+                downloaded_bytes: None,
+            });
+        }
+    }
+
+    let channel = normalize_cft_channel(&options.channel)?;
+    let platform = cft_platform()?;
+    let manifest = fetch_cft_manifest().await?;
+    let channel_info = manifest
+        .channels
+        .get(channel)
+        .ok_or_else(|| format!("Chrome for Testing manifest has no {channel} channel"))?;
+    let download = channel_info
+        .downloads
+        .chrome
+        .iter()
+        .find(|entry| entry.platform == platform)
+        .ok_or_else(|| {
+            format!(
+                "Chrome for Testing channel {channel} has no chrome download for platform {platform}"
+            )
+        })?;
+
+    let install_root = managed_browser_install_root();
+    let install_dir = install_root
+        .join("chrome-for-testing")
+        .join(channel.to_ascii_lowercase())
+        .join(platform)
+        .join(&channel_info.version);
+    if install_dir.exists() && !options.force {
+        if let Some(path) =
+            find_executable_under(&install_dir, managed_browser_executable_names(), 8)
+        {
+            return Ok(ManagedBrowserInstallResult {
+                installed: false,
+                channel: channel.to_string(),
+                version: channel_info.version.clone(),
+                platform: platform.to_string(),
+                executable: path.display().to_string(),
+                source: "managed-cache".to_string(),
+                install_dir: install_dir.display().to_string(),
+                download_url: None,
+                downloaded_bytes: None,
+            });
+        }
+    }
+
+    let downloaded_bytes =
+        download_and_extract_cft(&download.url, &install_root, &install_dir, options.force).await?;
+    let executable = find_executable_under(&install_dir, managed_browser_executable_names(), 8)
+        .ok_or_else(|| {
+            format!(
+                "Chrome for Testing extracted to {}, but no browser executable was found",
+                install_dir.display()
+            )
+        })?;
+
+    Ok(ManagedBrowserInstallResult {
+        installed: true,
+        channel: channel.to_string(),
+        version: channel_info.version.clone(),
+        platform: platform.to_string(),
+        executable: executable.display().to_string(),
+        source: "chrome-for-testing".to_string(),
+        install_dir: install_dir.display().to_string(),
+        download_url: Some(download.url.clone()),
+        downloaded_bytes: Some(downloaded_bytes),
+    })
 }
 
 pub async fn create_workspace(
@@ -773,13 +917,219 @@ fn env_value_truthy(value: &str) -> bool {
     )
 }
 
+#[derive(Debug, Deserialize)]
+struct CftManifest {
+    channels: BTreeMap<String, CftChannel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CftChannel {
+    version: String,
+    downloads: CftDownloads,
+}
+
+#[derive(Debug, Deserialize)]
+struct CftDownloads {
+    chrome: Vec<CftDownload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CftDownload {
+    platform: String,
+    url: String,
+}
+
+async fn fetch_cft_manifest() -> Result<CftManifest, String> {
+    let response = reqwest::Client::new()
+        .get(CHROME_FOR_TESTING_DOWNLOADS_URL)
+        .send()
+        .await
+        .map_err(|e| format!("failed to fetch Chrome for Testing manifest: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Chrome for Testing manifest request failed: {e}"))?;
+    response
+        .json::<CftManifest>()
+        .await
+        .map_err(|e| format!("failed to parse Chrome for Testing manifest: {e}"))
+}
+
+async fn download_and_extract_cft(
+    url: &str,
+    install_root: &Path,
+    install_dir: &Path,
+    force: bool,
+) -> Result<u64, String> {
+    fs::create_dir_all(install_root).map_err(|e| {
+        format!(
+            "failed to create managed browser root {}: {e}",
+            install_root.display()
+        )
+    })?;
+    if let Some(parent) = install_dir.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create managed browser directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let staging_dir = install_root.join(format!(".download-{}", uuid::Uuid::new_v4().simple()));
+    let extract_dir = staging_dir.join("extract");
+    let zip_path = staging_dir.join("chrome-for-testing.zip");
+    fs::create_dir_all(&extract_dir).map_err(|e| {
+        format!(
+            "failed to create managed browser staging directory {}: {e}",
+            extract_dir.display()
+        )
+    })?;
+
+    let result = async {
+        let bytes = download_to_file(url, &zip_path).await?;
+        extract_zip(&zip_path, &extract_dir)?;
+        if install_dir.exists() {
+            if force {
+                fs::remove_dir_all(install_dir).map_err(|e| {
+                    format!(
+                        "failed to replace existing managed browser directory {}: {e}",
+                        install_dir.display()
+                    )
+                })?;
+            } else {
+                return Err(format!(
+                    "managed browser directory already exists: {}",
+                    install_dir.display()
+                ));
+            }
+        }
+        fs::rename(&extract_dir, install_dir).map_err(|e| {
+            format!(
+                "failed to install managed browser into {}: {e}",
+                install_dir.display()
+            )
+        })?;
+        Ok(bytes)
+    }
+    .await;
+
+    let cleanup = fs::remove_dir_all(&staging_dir);
+    if let Err(err) = cleanup {
+        if staging_dir.exists() {
+            eprintln!(
+                "warning: failed to remove managed browser staging directory {}: {err}",
+                staging_dir.display()
+            );
+        }
+    }
+    result
+}
+
+async fn download_to_file(url: &str, path: &Path) -> Result<u64, String> {
+    let mut response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("failed to download Chrome for Testing from {url}: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Chrome for Testing download failed for {url}: {e}"))?;
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| format!("failed to create download file {}: {e}", path.display()))?;
+    let mut written = 0_u64;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("failed while downloading Chrome for Testing: {e}"))?
+    {
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+            .await
+            .map_err(|e| format!("failed to write download file {}: {e}", path.display()))?;
+        written += chunk.len() as u64;
+    }
+    tokio::io::AsyncWriteExt::flush(&mut file)
+        .await
+        .map_err(|e| format!("failed to flush download file {}: {e}", path.display()))?;
+    Ok(written)
+}
+
+fn extract_zip(zip_path: &Path, destination: &Path) -> Result<(), String> {
+    let file = fs::File::open(zip_path)
+        .map_err(|e| format!("failed to open {}: {e}", zip_path.display()))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("failed to read zip archive: {e}"))?;
+    archive
+        .extract_unwrapped_root_dir(destination, zip::read::root_dir_common_filter)
+        .map_err(|e| {
+            format!(
+                "failed to extract Chrome for Testing into {}: {e}",
+                destination.display()
+            )
+        })
+}
+
+fn normalize_cft_channel(raw: &str) -> Result<&'static str, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "stable" => Ok("Stable"),
+        "beta" => Ok("Beta"),
+        "dev" => Ok("Dev"),
+        "canary" => Ok("Canary"),
+        other => Err(format!(
+            "unsupported Chrome for Testing channel '{other}'; expected stable, beta, dev, or canary"
+        )),
+    }
+}
+
+fn cft_platform() -> Result<&'static str, String> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Ok("linux64")
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Ok("mac-arm64")
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        Ok("mac-x64")
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        Ok("win64")
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86"))]
+    {
+        Ok("win32")
+    }
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86")
+    )))]
+    {
+        Err(format!(
+            "Chrome for Testing does not publish a managed browser for {}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ))
+    }
+}
+
 fn find_managed_chromium_executable() -> Option<PathBuf> {
     for root in managed_browser_roots() {
-        if let Some(path) = find_executable_under(&root, managed_browser_executable_names(), 6) {
+        if let Some(path) = find_executable_under(&root, managed_browser_executable_names(), 8) {
             return Some(path);
         }
     }
     None
+}
+
+fn managed_browser_install_root() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("intendant")
+        .join("browser-workspaces")
 }
 
 fn managed_browser_roots() -> Vec<PathBuf> {
@@ -1004,6 +1354,21 @@ mod tests {
         for value in ["", "0", "false", "off", "system"] {
             assert!(!env_value_truthy(value), "{value:?} should not be truthy");
         }
+    }
+
+    #[test]
+    fn cft_channel_parser_accepts_known_channels() {
+        assert_eq!(normalize_cft_channel(""), Ok("Stable"));
+        assert_eq!(normalize_cft_channel("stable"), Ok("Stable"));
+        assert_eq!(normalize_cft_channel("BETA"), Ok("Beta"));
+        assert_eq!(normalize_cft_channel(" dev "), Ok("Dev"));
+        assert_eq!(normalize_cft_channel("canary"), Ok("Canary"));
+        assert!(normalize_cft_channel("nightly").is_err());
+    }
+
+    #[test]
+    fn cft_platform_is_supported_on_tier_one_targets() {
+        assert!(cft_platform().is_ok());
     }
 
     #[test]

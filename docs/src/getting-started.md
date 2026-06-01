@@ -44,7 +44,9 @@ Manual Linux install if you would rather not run the script:
 ```bash
 sudo apt install build-essential binutils pkg-config libclang-dev \
   libvpx-dev libpipewire-0.3-dev libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
-  xdotool x11-utils imagemagick ffmpeg xvfb pulseaudio-utils ripgrep xdg-utils
+  xdotool x11-utils imagemagick ffmpeg xvfb pulseaudio-utils ripgrep xdg-utils \
+  ca-certificates libnss3 libatk-bridge2.0-0 libgtk-3-0 libxcomposite1 \
+  libxdamage1 libxrandr2 libxss1 libgbm1 libdrm2 libxkbcommon0 libcups2
 ```
 
 See [Integrations](./integrations.md) for what each tool is used for, and
@@ -56,6 +58,7 @@ See [Integrations](./integrations.md) for what each tool is used for, and
 cargo build --release     # optimized
 cargo build               # debug
 cargo check               # type-check only (fast)
+./target/release/intendant setup browsers  # managed Chrome for Testing for browser workspaces
 ```
 
 A release build produces two binaries:
