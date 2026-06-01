@@ -67,7 +67,6 @@ use error::CallerError;
 use event::{AppEvent, EventBus};
 use project::Project;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -1551,7 +1550,6 @@ struct ExternalBackendRecovery {
 struct ExternalContextRewindRequest {
     session_id: Option<String>,
     item_id: String,
-    anchor_proof: Option<String>,
     position: external_agent::RollbackAnchorPosition,
     reason: Option<String>,
     primer: Option<String>,
@@ -1709,22 +1707,6 @@ fn context_rewind_anchor_item_id(params: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn context_rewind_anchor_proof(params: &serde_json::Value) -> Option<String> {
-    params
-        .pointer("/anchor/proof")
-        .and_then(|value| value.as_str())
-        .or_else(|| {
-            params
-                .pointer("/anchor/catalog_proof")
-                .and_then(|value| value.as_str())
-        })
-        .or_else(|| params.get("proof").and_then(|value| value.as_str()))
-        .or_else(|| params.get("catalog_proof").and_then(|value| value.as_str()))
-        .map(str::trim)
-        .filter(|proof| !proof.is_empty())
-        .map(str::to_string)
-}
-
 fn context_rewind_anchor_position(
     params: &serde_json::Value,
 ) -> Option<external_agent::RollbackAnchorPosition> {
@@ -1791,17 +1773,11 @@ fn external_context_rewind_request_from_action(
         if primer.is_none() {
             return Some(Err("rewind_context requires a non-empty primer".to_string()));
         }
-        if context_rewind_anchor_proof(params).is_none() {
-            return Some(Err(
-                "rewind_context requires anchor.proof from list_rewind_anchors; call list_rewind_anchors and copy the proof from the selected anchor".to_string(),
-            ));
-        }
     }
 
     Some(Ok(ExternalContextRewindRequest {
         session_id,
         item_id,
-        anchor_proof: context_rewind_anchor_proof(params),
         position,
         reason,
         primer,
@@ -1851,7 +1827,6 @@ fn recovery_required_message(message: &str, recovery_hint: Option<&str>) -> Stri
 fn resolve_context_rewind_anchor(
     source_rollout_path: &Path,
     requested_item_id: &str,
-    requested_proof: Option<&str>,
 ) -> Result<ResolvedContextRewindAnchor, String> {
     let requested_item_id = requested_item_id.trim();
     if requested_item_id.is_empty() {
@@ -1866,21 +1841,11 @@ fn resolve_context_rewind_anchor(
             )
         },
     )?;
-    let Some(anchor) = anchor else {
+    if anchor.is_none() {
         return Err(format!(
             "rollback anchor item_id `{requested_item_id}` was not found in {}; call list_rewind_anchors to inspect valid exact anchors before retrying",
             source_rollout_path.display()
         ));
-    };
-    if let Some(requested_proof) = requested_proof
-        .map(str::trim)
-        .filter(|proof| !proof.is_empty())
-    {
-        if requested_proof != anchor.proof {
-            return Err(format!(
-                "rollback anchor proof did not match item_id `{requested_item_id}`; call list_rewind_anchors again and copy both item_id and proof from the same selected anchor"
-            ));
-        }
     }
 
     Ok(ResolvedContextRewindAnchor::requested(requested_item_id))
@@ -1935,12 +1900,8 @@ async fn validate_context_rewind_request_before_schedule(
                 let source_rollout_path = snapshot.rollout_path.ok_or_else(|| {
                     format!("thread metadata for {thread_id} did not include a rollout path")
                 })?;
-                return resolve_context_rewind_anchor(
-                    &source_rollout_path,
-                    &request.item_id,
-                    request.anchor_proof.as_deref(),
-                )
-                .map(|_| ());
+                return resolve_context_rewind_anchor(&source_rollout_path, &request.item_id)
+                    .map(|_| ());
             }
             Err(e) => metadata_errors.push(format!("{thread_id}: {e}")),
         }
@@ -1966,7 +1927,6 @@ fn find_context_rewind_anchor_entry(
 struct ContextRewindAnchorCatalogEntry {
     ordinal: usize,
     item_id: String,
-    proof: String,
     first_line: usize,
     last_line: usize,
     first_item_type: String,
@@ -1991,8 +1951,30 @@ struct ContextRewindAnchorCatalog {
     usage: &'static str,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ContextRewindAnchorInspectItem {
+    line: usize,
+    item_type: String,
+    item_ids: Vec<String>,
+    names: Vec<String>,
+    roles: Vec<String>,
+    summary: String,
+    anchor_span: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextRewindAnchorInspection {
+    rollout_path: String,
+    anchor: ContextRewindAnchorCatalogEntry,
+    radius: usize,
+    context: Vec<ContextRewindAnchorInspectItem>,
+    usage: &'static str,
+}
+
 const CONTEXT_REWIND_ANCHOR_LIST_DEFAULT_LIMIT: usize = 5;
 const CONTEXT_REWIND_ANCHOR_LIST_MAX_LIMIT: usize = 10;
+const CONTEXT_REWIND_ANCHOR_INSPECT_DEFAULT_RADIUS: usize = 2;
+const CONTEXT_REWIND_ANCHOR_INSPECT_MAX_RADIUS: usize = 5;
 const CONTEXT_REWIND_ANCHOR_SUMMARY_LIMIT: usize = 120;
 const CONTEXT_REWIND_ANCHOR_MERGED_SUMMARY_LIMIT: usize = 160;
 
@@ -2060,9 +2042,98 @@ fn list_context_rewind_anchors_from_rollout(
         next_offset,
         query,
         anchors: page,
-        usage: "Choose any returned anchor and copy both item_id and proof exactly into rewind_context.anchor. Use position=\"after\" to keep the matching item/group and drop later context, or position=\"before\" to drop the matching item/group too. Use additional pages or query to inspect any anchor from the full rollout.",
+        usage: "Choose any returned item_id exactly in rewind_context.anchor.item_id. Use inspect_rewind_anchor to inspect nearby context before mutating the thread when the compact summary is ambiguous. Use position=\"after\" to keep the matching item/group and drop later context, or position=\"before\" to drop the matching item/group too.",
     };
     serde_json::to_string(&catalog).map_err(|err| err.to_string())
+}
+
+fn inspect_context_rewind_anchor_from_rollout(
+    source_rollout_path: &Path,
+    params: &serde_json::Value,
+) -> Result<String, String> {
+    let item_id = context_rewind_anchor_item_id(params)
+        .ok_or_else(|| "inspect_rewind_anchor requires anchor.item_id or item_id".to_string())?;
+    let radius = params
+        .get("radius")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(CONTEXT_REWIND_ANCHOR_INSPECT_DEFAULT_RADIUS)
+        .min(CONTEXT_REWIND_ANCHOR_INSPECT_MAX_RADIUS);
+    let anchors = scan_context_rewind_anchor_catalog(source_rollout_path).map_err(|err| {
+        format!(
+            "failed to inspect rewind anchors in {}: {err}",
+            source_rollout_path.display()
+        )
+    })?;
+    let anchor = anchors
+        .into_iter()
+        .find(|anchor| anchor.item_id == item_id)
+        .ok_or_else(|| {
+            format!(
+                "rollback anchor item_id `{item_id}` was not found in {}; call list_rewind_anchors to inspect valid exact anchors before retrying",
+                source_rollout_path.display()
+            )
+        })?;
+    let first_line = anchor.first_line.saturating_sub(radius).max(1);
+    let last_line = anchor.last_line.saturating_add(radius);
+    let file = std::fs::File::open(source_rollout_path).map_err(|err| {
+        format!(
+            "failed to inspect rewind anchor context in {}: {err}",
+            source_rollout_path.display()
+        )
+    })?;
+    let reader = io::BufReader::new(file);
+    let mut context = Vec::new();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line_number = line_index.saturating_add(1);
+        if line_number < first_line || line_number > last_line {
+            continue;
+        }
+        let line = line.map_err(|err| {
+            format!(
+                "failed to read rewind anchor context in {}: {err}",
+                source_rollout_path.display()
+            )
+        })?;
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(|value| value.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
+        let item_type = payload
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let item_ids = response_item_anchor_ids(payload);
+        let anchor_span = (line_number >= anchor.first_line && line_number <= anchor.last_line)
+            || item_ids
+                .iter()
+                .any(|candidate| candidate == &anchor.item_id);
+        context.push(ContextRewindAnchorInspectItem {
+            line: line_number,
+            item_type,
+            item_ids,
+            names: context_rewind_anchor_names(payload),
+            roles: context_rewind_anchor_roles(payload),
+            summary: context_rewind_anchor_summary(payload),
+            anchor_span,
+        });
+    }
+
+    let inspection = ContextRewindAnchorInspection {
+        rollout_path: source_rollout_path.display().to_string(),
+        anchor,
+        radius,
+        context,
+        usage: "Use this context to decide whether the selected item_id is the intended rewind point. If so, pass only the exact item_id and position to rewind_context; otherwise inspect another anchor.",
+    };
+    serde_json::to_string(&inspection).map_err(|err| err.to_string())
 }
 
 fn scan_context_rewind_anchor_catalog(
@@ -2117,7 +2188,6 @@ fn scan_context_rewind_anchor_catalog(
             anchors.push(ContextRewindAnchorCatalogEntry {
                 ordinal: index,
                 item_id,
-                proof: String::new(),
                 first_line: line_number,
                 last_line: line_number,
                 first_item_type: item_type.clone(),
@@ -2131,30 +2201,7 @@ fn scan_context_rewind_anchor_catalog(
         }
     }
 
-    for anchor in &mut anchors {
-        anchor.proof = context_rewind_anchor_proof_for_catalog_entry(anchor);
-    }
-
     Ok(anchors)
-}
-
-fn context_rewind_anchor_proof_for_catalog_entry(
-    anchor: &ContextRewindAnchorCatalogEntry,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(anchor.item_id.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(anchor.ordinal.to_string().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(anchor.first_line.to_string().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(anchor.last_line.to_string().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(anchor.first_item_type.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(anchor.last_item_type.as_bytes());
-    let digest: [u8; 32] = hasher.finalize().into();
-    file_watcher::hex_encode(&digest).chars().take(24).collect()
 }
 
 fn context_rewind_anchor_matches_query(
@@ -2162,7 +2209,6 @@ fn context_rewind_anchor_matches_query(
     needle: &str,
 ) -> bool {
     anchor.item_id.to_ascii_lowercase().contains(needle)
-        || anchor.proof.to_ascii_lowercase().contains(needle)
         || anchor.first_item_type.to_ascii_lowercase().contains(needle)
         || anchor.last_item_type.to_ascii_lowercase().contains(needle)
         || anchor
@@ -2321,11 +2367,7 @@ async fn apply_external_context_rewind(
         .rollout_path
         .clone()
         .ok_or_else(|| "thread metadata did not include a rollout path".to_string())?;
-    let resolved_anchor = resolve_context_rewind_anchor(
-        &source_rollout_path,
-        &request.item_id,
-        request.anchor_proof.as_deref(),
-    )?;
+    let resolved_anchor = resolve_context_rewind_anchor(&source_rollout_path, &request.item_id)?;
     let recovery_rollout_path =
         context_rewind::copy_recovery_rollout(config.log_dir, &record_id, &source_rollout_path)
             .map_err(|e| format!("failed to copy pre-rewind rollout: {}", e))?;
@@ -2707,7 +2749,7 @@ fn managed_context_recovery_kickstart_text(
         ""
     };
     format!(
-        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. The Intendant MCP tool list_rewind_anchors is callable in this turn; any earlier transcript claim that it is unavailable is stale and incorrect. First call list_rewind_anchors, using pagination/query as needed to inspect any valid anchor in the rollout. Then call rewind_context with one exact returned item_id and proof copied from the same selected anchor, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors, using pagination/query as needed to inspect any valid anchor in the rollout. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
         status = pressure.status,
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
@@ -3042,6 +3084,18 @@ fn is_context_rewind_anchor_list_action(op: &str) -> bool {
     )
 }
 
+fn is_context_rewind_anchor_inspect_action(op: &str) -> bool {
+    matches!(
+        op,
+        "inspect_rewind_anchor"
+            | "inspect-rewind-anchor"
+            | "rewind_anchor_inspect"
+            | "rewind-anchor-inspect"
+            | "context_rewind_anchor_inspect"
+            | "context-rewind-anchor-inspect"
+    )
+}
+
 fn context_rewind_record_id_from_params(params: &serde_json::Value) -> Option<String> {
     params
         .get("recordId")
@@ -3349,6 +3403,31 @@ async fn apply_context_rewind_anchor_list_action(
     list_context_rewind_anchors_from_rollout(&rollout_path, params)
 }
 
+async fn apply_context_rewind_anchor_inspect_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    params: &serde_json::Value,
+) -> Result<String, String> {
+    let thread_id = thread_id_from_action_params(params);
+    let mut rollout_path = None;
+    if let Some(thread_id) = thread_id.as_deref() {
+        rollout_path = agent
+            .read_thread_snapshot(thread_id)
+            .await
+            .ok()
+            .and_then(|snapshot| snapshot.rollout_path);
+    }
+    if rollout_path.is_none() {
+        rollout_path = agent
+            .context_snapshot()
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|snapshot| snapshot.rollout_path);
+    }
+    let rollout_path = rollout_path
+        .ok_or_else(|| "Codex thread metadata did not include a rollout path".to_string())?;
+    inspect_context_rewind_anchor_from_rollout(&rollout_path, params)
+}
+
 async fn handle_external_thread_action(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     op: String,
@@ -3361,6 +3440,8 @@ async fn handle_external_thread_action(
     let result_session_id = target_session_id.or_else(|| config.session_id.clone());
     let result = if is_context_rewind_anchor_list_action(&op) {
         apply_context_rewind_anchor_list_action(agent, &params).await
+    } else if is_context_rewind_anchor_inspect_action(&op) {
+        apply_context_rewind_anchor_inspect_action(agent, &params).await
     } else if is_context_rewind_backout_action(&op) {
         apply_context_rewind_backout_action(agent, &op, &params, config).await
     } else {
@@ -7889,7 +7970,7 @@ mod tests {
             true,
         );
 
-        assert!(text.contains("list_rewind_anchors is callable"));
+        assert!(text.contains("list_rewind_anchors and inspect_rewind_anchor are callable"));
         assert!(text.contains("stale and incorrect"));
         assert!(text.contains("Do not synthesize anchor ids"));
         assert!(text.contains("hard_limit=272000"));
@@ -8083,7 +8164,7 @@ mod tests {
     #[test]
     fn context_rewind_request_requires_primer_for_model_tool() {
         let params = serde_json::json!({
-            "anchor": {"item_id": "call-123", "proof": "proof-123", "position": "after"},
+            "anchor": {"item_id": "call-123", "position": "after"},
             "reason": "prune noisy output"
         });
         let err = external_context_rewind_request_from_action("rewind_context", &params, None)
@@ -8093,22 +8174,9 @@ mod tests {
     }
 
     #[test]
-    fn context_rewind_request_requires_catalog_proof_for_model_tool() {
-        let params = serde_json::json!({
-            "anchor": {"item_id": "call-123", "position": "after"},
-            "reason": "prune noisy output",
-            "primer": "dense continuation"
-        });
-        let err = external_context_rewind_request_from_action("rewind_context", &params, None)
-            .expect("rewind action")
-            .unwrap_err();
-        assert!(err.contains("anchor.proof"), "got: {err}");
-    }
-
-    #[test]
     fn context_rewind_request_renders_developer_primer() {
         let params = serde_json::json!({
-            "anchor": {"item_id": "call-123", "proof": "proof-123", "position": "before"},
+            "anchor": {"item_id": "call-123", "position": "before"},
             "reason": "dead end",
             "primer": "Keep the useful result.",
             "preserve": [" fact A ", ""],
@@ -8129,7 +8197,6 @@ mod tests {
             external_agent::RollbackAnchorPosition::Before
         );
         assert!(request.auto_resume);
-        assert_eq!(request.anchor_proof.as_deref(), Some("proof-123"));
 
         let primer = request
             .rendered_primer(Some("rewind-test-record"))
@@ -8244,13 +8311,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(ids.contains(&"call_prior_rewind"));
         assert!(ids.contains(&"call_latest_rewind"));
-        assert!(catalog["anchors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|anchor| anchor["proof"]
-                .as_str()
-                .is_some_and(|proof| proof.len() == 24)));
 
         let filtered = list_context_rewind_anchors_from_rollout(
             &path,
@@ -8266,7 +8326,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(filtered_ids, vec!["call_latest_rewind"]);
 
-        let missing = resolve_context_rewind_anchor(&path, "rewind_context-call_7", None)
+        let missing = resolve_context_rewind_anchor(&path, "rewind_context-call_7")
             .expect_err("synthetic anchors are not accepted");
         assert!(missing.contains("call list_rewind_anchors"));
     }
@@ -8343,42 +8403,81 @@ mod tests {
         )
         .unwrap();
 
-        let exact = resolve_context_rewind_anchor(&path, "call_exact", None).expect("exact anchor");
+        let exact = resolve_context_rewind_anchor(&path, "call_exact").expect("exact anchor");
         assert_eq!(exact.item_id, "call_exact");
     }
 
     #[test]
-    fn context_rewind_anchor_rejects_mismatched_catalog_proof() {
+    fn context_rewind_anchor_inspect_returns_neighbor_window() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
         std::fs::write(
             &path,
-            serde_json::json!({
-                "type": "response_item",
-                "payload": {
-                    "type": "function_call",
-                    "name": "exec_command",
-                    "call_id": "call_exact",
-                    "arguments": "{}"
-                }
-            })
-            .to_string(),
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "before anchor" }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_exact",
+                        "arguments": "{\"cmd\":\"pwd\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_exact",
+                        "output": "/tmp/project"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "after anchor" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
         )
         .unwrap();
 
-        let catalog = list_context_rewind_anchors_from_rollout(
+        let inspection = inspect_context_rewind_anchor_from_rollout(
             &path,
-            &serde_json::json!({ "offset": 0, "limit": 1 }),
+            &serde_json::json!({ "anchor": { "item_id": "call_exact" }, "radius": 1 }),
         )
-        .expect("catalog");
-        let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
-        let proof = catalog["anchors"][0]["proof"].as_str().unwrap();
-
-        assert!(resolve_context_rewind_anchor(&path, "call_exact", Some(proof)).is_ok());
-        let err = resolve_context_rewind_anchor(&path, "call_exact", Some("wrong-proof"))
-            .expect_err("proof mismatch must reject");
-        assert!(err.contains("proof did not match"), "got: {err}");
-        assert!(!err.contains(proof), "error must not suggest proof");
+        .expect("inspection");
+        let inspection: serde_json::Value = serde_json::from_str(&inspection).unwrap();
+        assert_eq!(inspection["anchor"]["item_id"], "call_exact");
+        assert_eq!(inspection["radius"], 1);
+        let context = inspection["context"].as_array().unwrap();
+        assert_eq!(context.len(), 4);
+        assert!(context.iter().any(|item| item["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("before anchor"))));
+        assert!(context.iter().any(|item| item["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("after anchor"))));
+        assert!(context
+            .iter()
+            .any(|item| item["anchor_span"].as_bool() == Some(true)));
+        assert!(inspection["usage"]
+            .as_str()
+            .unwrap()
+            .contains("pass only the exact item_id"));
     }
 
     #[test]
@@ -12729,7 +12828,9 @@ async fn run_with_presence(
                     persistent_side_rounds.clear();
                     persistent_side_turn_revisions.clear();
                     Ok("agent torn down; next task will start a fresh thread".to_string())
-                } else if is_context_rewind_anchor_list_action(&op) {
+                } else if is_context_rewind_anchor_list_action(&op)
+                    || is_context_rewind_anchor_inspect_action(&op)
+                {
                     let Some(ref mut agent) = persistent_agent else {
                         turn_bus_rx = bus.subscribe();
                         bus.send(AppEvent::CodexThreadActionResult {
@@ -12750,7 +12851,11 @@ async fn run_with_presence(
                         });
                     action_params =
                         thread_action_params_with_thread_id(&op, action_params, target_thread_id);
-                    apply_context_rewind_anchor_list_action(agent, &action_params).await
+                    if is_context_rewind_anchor_list_action(&op) {
+                        apply_context_rewind_anchor_list_action(agent, &action_params).await
+                    } else {
+                        apply_context_rewind_anchor_inspect_action(agent, &action_params).await
+                    }
                 } else if is_context_rewind_backout_action(&op) {
                     let Some(ref mut agent) = persistent_agent else {
                         turn_bus_rx = bus.subscribe();

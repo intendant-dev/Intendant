@@ -156,10 +156,10 @@ features they lack.
   dense. Rewinds are not just emergency context-limit recovery: they should also
   happen after noisy tool output, failed exploration, or a long research branch
   whose useful result can be crystallized into a compact primer. Model-driven
-  rewinds must first call `list_rewind_anchors` and then copy both `item_id` and
-  `proof` from the same catalog row into `rewind_context`; Intendant rejects
-  mismatched pairs so a remembered or stale anchor id is not enough to mutate the
-  Codex thread.
+  rewinds must first call `list_rewind_anchors`; when the compact row is
+  ambiguous, `inspect_rewind_anchor` returns a small before/after window for the
+  candidate. `rewind_context` still validates the exact `item_id` against the
+  current rollout before mutating the Codex thread.
 
 - **Rich `thread_action` ops** (`codex.rs`): `compact`, `fast`, `fork`,
   `side`/`btw` (open a side conversation) and `side-close`, `review`,

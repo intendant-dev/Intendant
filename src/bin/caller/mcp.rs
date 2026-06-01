@@ -484,7 +484,7 @@ impl McpAppState {
                     "used_tokens": notice.used_tokens,
                     "rewind_only_limit": notice.rewind_only_limit,
                     "context_window": notice.context_window,
-                    "message": "The previous managed-context rewind did not reduce backend-reported pressure enough. Call list_rewind_anchors to inspect the full valid anchor catalog, then choose an earlier anchor and copy both item_id and proof from the same row with a denser carry-forward primer before using ordinary tools.",
+                    "message": "The previous managed-context rewind did not reduce backend-reported pressure enough. Call list_rewind_anchors to inspect the full valid anchor catalog, use inspect_rewind_anchor when the compact row is ambiguous, then choose an earlier exact item_id with a denser carry-forward primer before using ordinary tools.",
                 })
             }),
         })
@@ -582,11 +582,11 @@ impl McpAppState {
         let (used_tokens, rewind_only_limit, status) =
             self.context_pressure_rewind_only_for(session_id)?;
         let mut message = format!(
-            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Managed context is now in density-preservation mode: only get_status, list_rewind_anchors, rewind_context, and rewind_backout are available until pressure is reduced below the threshold. The Intendant MCP tool list_rewind_anchors is available; any earlier transcript claim that it is unavailable is stale. Call list_rewind_anchors to inspect valid anchors, then call rewind_context with exact item_id and proof copied from the same selected anchor plus a dense carry-forward primer before using other tools. Do not synthesize anchor ids from prior failed tool calls."
+            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Managed context is now in density-preservation mode: only get_status, list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout are available until pressure is reduced below the threshold. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are available; any earlier transcript claim that either is unavailable is stale. Call list_rewind_anchors to inspect valid anchors, inspect a candidate if the compact row is ambiguous, then call rewind_context with an exact returned item_id and a dense carry-forward primer before using other tools. Do not synthesize anchor ids from prior failed tool calls."
         );
         if let Some(notice) = self.insufficient_rewind_notice_for(session_id) {
             message.push_str(&format!(
-                " Previous managed-context record {} was insufficient; choose an earlier anchor from list_rewind_anchors and copy both item_id and proof from the same row with a denser carry-forward primer.",
+                " Previous managed-context record {} was insufficient; choose an earlier exact item_id from list_rewind_anchors, using inspect_rewind_anchor if needed, with a denser carry-forward primer.",
                 notice.record_id
             ));
         }
@@ -611,14 +611,18 @@ impl McpAppState {
 fn rewind_only_allowed_tool(name: &str) -> bool {
     matches!(
         name,
-        "get_status" | "list_rewind_anchors" | "rewind_context" | "rewind_backout"
+        "get_status"
+            | "list_rewind_anchors"
+            | "inspect_rewind_anchor"
+            | "rewind_context"
+            | "rewind_backout"
     )
 }
 
 fn managed_context_tool(name: &str) -> bool {
     matches!(
         name,
-        "list_rewind_anchors" | "rewind_context" | "rewind_backout"
+        "list_rewind_anchors" | "inspect_rewind_anchor" | "rewind_context" | "rewind_backout"
     )
 }
 
@@ -3846,9 +3850,6 @@ pub struct StartTaskParams {
 pub struct RewindContextAnchorParams {
     /// Exact Codex thread item/tool-call id to roll back to. Use list_rewind_anchors first when the id is not already known.
     pub item_id: String,
-    /// Anchor proof copied from the same list_rewind_anchors row as item_id. Intendant rejects mismatched proof/item_id pairs.
-    #[serde(default)]
-    pub proof: Option<String>,
     /// Whether the anchored item itself should survive rollback: "before" or "after".
     pub position: String,
 }
@@ -3895,6 +3896,18 @@ pub struct ListRewindAnchorsParams {
     /// Return anchors from newest to oldest when true.
     #[serde(default)]
     pub reverse: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InspectRewindAnchorParams {
+    /// Optional Intendant or backend session id. Omit for the active Codex session.
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
+    /// Exact Codex thread item/tool-call id to inspect.
+    pub item_id: String,
+    /// Number of neighboring response items to include on each side. The backend caps this.
+    #[serde(default)]
+    pub radius: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -4449,7 +4462,7 @@ impl IntendantServer {
                 .exposed_codex_managed_context_enabled_for(session_id, managed_context_override)
         {
             return Ok(text_tool_error(
-                "Codex managed context is disabled for this session. Set `[agent.codex] managed_context = \"managed\"` before starting the task, or choose Managed context = managed in the dashboard, to enable list_rewind_anchors/rewind_context/rewind_backout.".to_string(),
+                "Codex managed context is disabled for this session. Set `[agent.codex] managed_context = \"managed\"` before starting the task, or choose Managed context = managed in the dashboard, to enable list_rewind_anchors/inspect_rewind_anchor/rewind_context/rewind_backout.".to_string(),
             ));
         }
 
@@ -4508,6 +4521,12 @@ impl IntendantServer {
                     args, session_id,
                 ))?;
                 Ok(text_tool_result(self.list_rewind_anchors(params).await))
+            }
+            "inspect_rewind_anchor" => {
+                let params = parse_params::<InspectRewindAnchorParams>(
+                    with_default_mcp_session_id(args, session_id),
+                )?;
+                Ok(text_tool_result(self.inspect_rewind_anchor(params).await))
             }
             "rewind_backout" => {
                 let params = parse_params::<RewindBackoutParams>(with_default_mcp_session_id(
@@ -5195,7 +5214,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Schedule a Codex context rewind to an exact item/tool-call anchor. First call list_rewind_anchors and choose one returned anchor, then copy both item_id and proof into this call. Intendant rejects mismatched proof/item_id pairs. Do not synthesize anchor ids from prior failed tool calls. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch."
+        description = "Schedule a Codex context rewind to an exact item/tool-call anchor. First call list_rewind_anchors and choose one returned item_id; call inspect_rewind_anchor when the compact row is ambiguous. Do not synthesize anchor ids from prior failed tool calls. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch."
     )]
     async fn rewind_context(&self, Parameters(params): Parameters<RewindContextParams>) -> String {
         let reason = params.reason.trim();
@@ -5210,15 +5229,6 @@ impl IntendantServer {
         if item_id.is_empty() {
             return "rewind_context anchor.item_id must not be empty".to_string();
         }
-        let proof = params
-            .anchor
-            .proof
-            .as_deref()
-            .map(str::trim)
-            .filter(|proof| !proof.is_empty());
-        let Some(proof) = proof else {
-            return "rewind_context requires anchor.proof copied from the selected list_rewind_anchors result".to_string();
-        };
         // Normalize case to match the action layer (RollbackAnchorPosition::from_str
         // lowercases), so `After`/`BEFORE` are accepted consistently end-to-end.
         let position = params.anchor.position.trim().to_ascii_lowercase();
@@ -5232,7 +5242,6 @@ impl IntendantServer {
             serde_json::json!({
                 "anchor": {
                     "item_id": item_id,
-                    "proof": proof,
                     "position": position,
                 },
                 "reason": reason,
@@ -5248,7 +5257,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "List valid exact Codex rewind anchors for the current managed session. Supports pagination and query so the model can choose any valid anchor from the rollout, from start to finish. Copy both item_id and proof from the chosen row into rewind_context."
+        description = "List valid exact Codex rewind anchors for the current managed session. Supports pagination and query so the model can choose any valid anchor from the rollout, from start to finish. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id into rewind_context."
     )]
     async fn list_rewind_anchors(
         &self,
@@ -5277,6 +5286,45 @@ impl IntendantServer {
             "list_rewind_anchors".to_string(),
             payload,
             "ok (managed-context rewind anchor listing dispatched)".to_string(),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Inspect a single exact Codex rewind anchor with a compact before/after context window. Use this before rewind_context when the list_rewind_anchors row is too lossy to choose safely."
+    )]
+    async fn inspect_rewind_anchor(
+        &self,
+        Parameters(params): Parameters<InspectRewindAnchorParams>,
+    ) -> String {
+        let item_id = params.item_id.trim();
+        if item_id.is_empty() {
+            return "inspect_rewind_anchor item_id must not be empty".to_string();
+        }
+        let mut payload = serde_json::json!({
+            "anchor": {
+                "item_id": item_id,
+            },
+            "radius": params.radius.unwrap_or(2),
+        });
+        if let Some(obj) = payload.as_object_mut() {
+            if let Some(session_id) = params
+                .session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|session_id| !session_id.is_empty())
+            {
+                obj.insert(
+                    "session_id".to_string(),
+                    serde_json::Value::String(session_id.to_string()),
+                );
+            }
+        }
+        self.dispatch_codex_thread_action_and_wait(
+            params.session_id.clone(),
+            "inspect_rewind_anchor".to_string(),
+            payload,
+            "ok (managed-context rewind anchor inspection dispatched)".to_string(),
         )
         .await
     }
@@ -7178,10 +7226,11 @@ mod tests {
                 .rewind_only_gate_message("take_screenshot")
                 .expect("Codex action tool should be gated");
             assert!(message.contains(
-                "only get_status, list_rewind_anchors, rewind_context, and rewind_backout"
+                "only get_status, list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout"
             ));
             assert!(s.rewind_only_gate_message("get_status").is_none());
             assert!(s.rewind_only_gate_message("list_rewind_anchors").is_none());
+            assert!(s.rewind_only_gate_message("inspect_rewind_anchor").is_none());
             assert!(s.rewind_only_gate_message("rewind_context").is_none());
             assert!(s.rewind_only_gate_message("rewind_backout").is_none());
         });
@@ -7478,7 +7527,7 @@ mod tests {
                 .call_tool_by_name_for_session(
                     "rewind_context",
                     serde_json::json!({
-                        "anchor": {"item_id": "call-1", "proof": "proof-1", "position": "after"},
+                        "anchor": {"item_id": "call-1", "position": "after"},
                         "reason": "trim noisy branch",
                         "primer": "carry forward the durable facts"
                     }),
@@ -7504,7 +7553,6 @@ mod tests {
             assert_eq!(event.0.as_deref(), Some("backend-session-1"));
             assert_eq!(event.1, "rewind_context");
             assert_eq!(event.2["anchor"]["item_id"], "call-1");
-            assert_eq!(event.2["anchor"]["proof"], "proof-1");
         });
     }
 
@@ -7549,7 +7597,7 @@ mod tests {
                 .call_tool_by_name_for_session(
                     "rewind_context",
                     serde_json::json!({
-                        "anchor": {"item_id": "rewind_context-call_6", "proof": "proof-6", "position": "after"},
+                        "anchor": {"item_id": "rewind_context-call_6", "position": "after"},
                         "reason": "recover pressure",
                         "primer": "dense continuation"
                     }),
@@ -7632,6 +7680,69 @@ mod tests {
                     .pointer("/content/0/text")
                     .and_then(|value| value.as_str()),
                 Some("{\"anchors\":[]}")
+            );
+            result_task.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn inspect_rewind_anchor_defaults_to_http_session_id_and_returns_result() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let responder_bus = bus.clone();
+            let server = IntendantServer::new(state, bus);
+
+            let result_task = tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+                            session_id,
+                            op,
+                            params,
+                        })) if op == "inspect_rewind_anchor" => {
+                            assert_eq!(session_id.as_deref(), Some("backend-session-1"));
+                            assert_eq!(params["anchor"]["item_id"], "call-1");
+                            assert_eq!(params["radius"], 3);
+                            responder_bus.send(AppEvent::CodexThreadActionResult {
+                                session_id,
+                                action: op,
+                                success: true,
+                                message: "{\"anchor\":{\"item_id\":\"call-1\"}}".to_string(),
+                            });
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(e) => panic!("event bus closed: {e}"),
+                    }
+                }
+            });
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "inspect_rewind_anchor",
+                    serde_json::json!({
+                        "item_id": "call-1",
+                        "radius": 3
+                    }),
+                    Some("backend-session-1"),
+                    Some(true),
+                )
+                .await
+                .unwrap();
+
+            assert!(!result.is_error.unwrap_or(false));
+            let result_json = serde_json::to_value(&result).unwrap();
+            assert_eq!(
+                result_json
+                    .pointer("/content/0/text")
+                    .and_then(|value| value.as_str()),
+                Some("{\"anchor\":{\"item_id\":\"call-1\"}}")
             );
             result_task.await.unwrap();
         });
