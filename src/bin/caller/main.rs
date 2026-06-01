@@ -1976,6 +1976,11 @@ struct ContextRewindAnchorCatalog {
     usage: &'static str,
 }
 
+const CONTEXT_REWIND_ANCHOR_LIST_DEFAULT_LIMIT: usize = 5;
+const CONTEXT_REWIND_ANCHOR_LIST_MAX_LIMIT: usize = 10;
+const CONTEXT_REWIND_ANCHOR_SUMMARY_LIMIT: usize = 120;
+const CONTEXT_REWIND_ANCHOR_MERGED_SUMMARY_LIMIT: usize = 160;
+
 fn list_context_rewind_anchors_from_rollout(
     source_rollout_path: &Path,
     params: &serde_json::Value,
@@ -1990,8 +1995,8 @@ fn list_context_rewind_anchors_from_rollout(
         .get("limit")
         .and_then(|value| value.as_u64())
         .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(100)
-        .clamp(1, 500);
+        .unwrap_or(CONTEXT_REWIND_ANCHOR_LIST_DEFAULT_LIMIT)
+        .clamp(1, CONTEXT_REWIND_ANCHOR_LIST_MAX_LIMIT);
     let query = params
         .get("query")
         .and_then(|value| value.as_str())
@@ -2042,7 +2047,7 @@ fn list_context_rewind_anchors_from_rollout(
         anchors: page,
         usage: "Choose any returned item_id exactly in rewind_context.anchor.item_id. Use position=\"after\" to keep the matching item/group and drop later context, or position=\"before\" to drop the matching item/group too. Use additional pages or query to inspect any anchor from the full rollout.",
     };
-    serde_json::to_string_pretty(&catalog).map_err(|err| err.to_string())
+    serde_json::to_string(&catalog).map_err(|err| err.to_string())
 }
 
 fn scan_context_rewind_anchor_catalog(
@@ -2085,7 +2090,10 @@ fn scan_context_rewind_anchor_catalog(
                         anchor.summary.push_str(" | ");
                     }
                     anchor.summary.push_str(&summary);
-                    truncate_string(&mut anchor.summary, 360);
+                    truncate_string(
+                        &mut anchor.summary,
+                        CONTEXT_REWIND_ANCHOR_MERGED_SUMMARY_LIMIT,
+                    );
                 }
                 continue;
             }
@@ -2178,7 +2186,7 @@ fn context_rewind_anchor_summary(item: &serde_json::Value) -> String {
         _ => item_type.to_string(),
     };
     summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_string(&mut summary, 240);
+    truncate_string(&mut summary, CONTEXT_REWIND_ANCHOR_SUMMARY_LIMIT);
     summary
 }
 
@@ -8196,6 +8204,59 @@ mod tests {
         let missing = resolve_context_rewind_anchor(&path, "rewind_context-call_7")
             .expect_err("synthetic anchors are not accepted");
         assert!(missing.contains("call list_rewind_anchors"));
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_is_compact_under_pressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let long_output = "large diagnostic output ".repeat(50);
+        let lines = (0..12)
+            .flat_map(|idx| {
+                let call_id = format!("call_{idx}");
+                [
+                    serde_json::json!({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "exec_command",
+                            "call_id": call_id,
+                            "arguments": "{\"command\":\"very long command output\"}"
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": long_output
+                        }
+                    }),
+                ]
+            })
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, lines).unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "offset": 0, "limit": 500 }),
+        )
+        .expect("anchor catalog");
+        assert!(!raw.contains('\n'), "catalog should use compact JSON");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            catalog["limit"].as_u64(),
+            Some(CONTEXT_REWIND_ANCHOR_LIST_MAX_LIMIT as u64)
+        );
+        let anchors = catalog["anchors"].as_array().unwrap();
+        assert_eq!(anchors.len(), CONTEXT_REWIND_ANCHOR_LIST_MAX_LIMIT);
+        for anchor in anchors {
+            let summary = anchor["summary"].as_str().unwrap_or_default();
+            assert!(summary.len() <= CONTEXT_REWIND_ANCHOR_MERGED_SUMMARY_LIMIT + 3);
+        }
+        assert!(raw.len() < 5_000, "catalog too large: {} bytes", raw.len());
     }
 
     #[test]
