@@ -154,6 +154,12 @@ startup) and the dashboard auto-discovers running instances; note your port so t
 can reach your instance. Don't kill intendant processes you didn't spawn — they belong to
 other agents.
 
+Never rewrite git history unless the user explicitly asks for it. This includes
+`git rebase`, `git commit --amend`, force-pushes, and rewriting already reported
+commits on a feature branch. When moving work from an agent worktree into `main`, use a
+fast-forward merge if possible; if not, create a normal merge commit or ask the user how
+to proceed.
+
 ## CI/CD
 
 GitHub Actions on push / PR to `main`:
