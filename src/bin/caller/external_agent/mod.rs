@@ -501,6 +501,7 @@ pub struct AgentContextSnapshot {
     pub label: String,
     pub request_id: Option<String>,
     pub request_index: Option<u64>,
+    pub rollout_path: Option<PathBuf>,
     pub format: String,
     pub token_count: Option<u64>,
     pub context_window: Option<u64>,

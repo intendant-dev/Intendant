@@ -65,6 +65,7 @@ use conversation::Conversation;
 use error::CallerError;
 use event::{AppEvent, EventBus};
 use project::Project;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -1627,30 +1628,17 @@ impl ExternalContextRewindRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedContextRewindAnchor {
     item_id: String,
-    requested_item_id: Option<String>,
 }
 
 impl ResolvedContextRewindAnchor {
     fn requested(item_id: &str) -> Self {
         Self {
             item_id: item_id.to_string(),
-            requested_item_id: None,
-        }
-    }
-
-    fn resolved(item_id: String, requested_item_id: &str) -> Self {
-        Self {
-            item_id,
-            requested_item_id: Some(requested_item_id.to_string()),
         }
     }
 
     fn target_label(&self, position: external_agent::RollbackAnchorPosition) -> String {
-        let mut label = format!("{} item {}", position.as_str(), self.item_id);
-        if let Some(requested) = self.requested_item_id.as_deref() {
-            label.push_str(&format!(" (resolved from {requested})"));
-        }
-        label
+        format!("{} item {}", position.as_str(), self.item_id)
     }
 }
 
@@ -1855,25 +1843,15 @@ fn resolve_context_rewind_anchor(
         return Ok(ResolvedContextRewindAnchor::requested(requested_item_id));
     }
 
-    if !context_rewind_anchor_allows_auto_resolution(requested_item_id) {
-        return Ok(ResolvedContextRewindAnchor::requested(requested_item_id));
-    }
-
-    let Some(anchor) = scan.latest_anchor_before_rewind_primer else {
-        return Err(format!(
-            "rollback anchor item_id `{requested_item_id}` was not found, and no prior model_context_rewind_primer boundary was available for automatic resolution"
-        ));
-    };
-    Ok(ResolvedContextRewindAnchor::resolved(
-        anchor,
-        requested_item_id,
+    Err(format!(
+        "rollback anchor item_id `{requested_item_id}` was not found in {}; call list_rewind_anchors to inspect valid exact anchors before retrying",
+        source_rollout_path.display()
     ))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ContextRewindRolloutAnchorScan {
     requested_anchor_exists: bool,
-    latest_anchor_before_rewind_primer: Option<String>,
 }
 
 fn scan_context_rewind_rollout_anchors(
@@ -1883,7 +1861,6 @@ fn scan_context_rewind_rollout_anchors(
     let file = std::fs::File::open(source_rollout_path)?;
     let reader = io::BufReader::new(file);
     let mut scan = ContextRewindRolloutAnchorScan::default();
-    let mut latest_anchor: Option<String> = None;
 
     for line in reader.lines() {
         let line = line?;
@@ -1897,43 +1874,264 @@ fn scan_context_rewind_rollout_anchors(
             continue;
         };
 
-        if response_item_contains_model_context_rewind_primer(payload) {
-            if let Some(anchor) = latest_anchor.as_ref() {
-                scan.latest_anchor_before_rewind_primer = Some(anchor.clone());
-            }
-        }
-
         for anchor_id in response_item_anchor_ids(payload) {
             if anchor_id == requested_item_id {
                 scan.requested_anchor_exists = true;
             }
-            latest_anchor = Some(anchor_id);
         }
     }
 
     Ok(scan)
 }
 
-fn context_rewind_anchor_allows_auto_resolution(item_id: &str) -> bool {
-    let item_id = item_id.trim();
-    item_id.eq_ignore_ascii_case("auto")
-        || item_id.eq_ignore_ascii_case("latest_rewind_primer")
-        || item_id.eq_ignore_ascii_case("latest_context_primer")
-        || looks_like_model_visible_synthetic_tool_anchor(item_id)
+#[derive(Debug, Clone, Serialize)]
+struct ContextRewindAnchorCatalogEntry {
+    ordinal: usize,
+    item_id: String,
+    first_line: usize,
+    last_line: usize,
+    first_item_type: String,
+    last_item_type: String,
+    positions: Vec<&'static str>,
+    position_hint: &'static str,
+    names: Vec<String>,
+    roles: Vec<String>,
+    summary: String,
 }
 
-fn looks_like_model_visible_synthetic_tool_anchor(item_id: &str) -> bool {
-    let Some((prefix, suffix)) = item_id.rsplit_once("-call_") else {
-        return false;
+#[derive(Debug, Clone, Serialize)]
+struct ContextRewindAnchorCatalog {
+    rollout_path: String,
+    total: usize,
+    filtered_total: usize,
+    offset: usize,
+    limit: usize,
+    next_offset: Option<usize>,
+    query: Option<String>,
+    anchors: Vec<ContextRewindAnchorCatalogEntry>,
+    usage: &'static str,
+}
+
+fn list_context_rewind_anchors_from_rollout(
+    source_rollout_path: &Path,
+    params: &serde_json::Value,
+) -> Result<String, String> {
+    let offset = params
+        .get("offset")
+        .or_else(|| params.get("start_index"))
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
+    let query = params
+        .get("query")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let reverse = params
+        .get("reverse")
+        .and_then(|value| value.as_bool())
+        .unwrap_or_else(|| {
+            params
+                .get("direction")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .is_some_and(|direction| direction.eq_ignore_ascii_case("backward"))
+        });
+
+    let mut anchors = scan_context_rewind_anchor_catalog(source_rollout_path).map_err(|err| {
+        format!(
+            "failed to inspect rewind anchors in {}: {err}",
+            source_rollout_path.display()
+        )
+    })?;
+    let total = anchors.len();
+    if reverse {
+        anchors.reverse();
+    }
+    if let Some(query) = query.as_deref() {
+        let needle = query.to_ascii_lowercase();
+        anchors.retain(|anchor| context_rewind_anchor_matches_query(anchor, &needle));
+    }
+    let filtered_total = anchors.len();
+    let page = anchors
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let next_offset =
+        (offset.saturating_add(limit) < filtered_total).then_some(offset.saturating_add(limit));
+    let catalog = ContextRewindAnchorCatalog {
+        rollout_path: source_rollout_path.display().to_string(),
+        total,
+        filtered_total,
+        offset,
+        limit,
+        next_offset,
+        query,
+        anchors: page,
+        usage: "Choose any returned item_id exactly in rewind_context.anchor.item_id. Use position=\"after\" to keep the matching item/group and drop later context, or position=\"before\" to drop the matching item/group too. Use additional pages or query to inspect any anchor from the full rollout.",
     };
-    !prefix.trim().is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+    serde_json::to_string_pretty(&catalog).map_err(|err| err.to_string())
 }
 
-fn response_item_contains_model_context_rewind_primer(item: &serde_json::Value) -> bool {
-    item.get("type").and_then(|value| value.as_str()) == Some("message")
-        && item.get("role").and_then(|value| value.as_str()) == Some("developer")
-        && response_item_content_text(item)
-            .any(|text| text.contains("<model_context_rewind_primer>"))
+fn scan_context_rewind_anchor_catalog(
+    source_rollout_path: &Path,
+) -> io::Result<Vec<ContextRewindAnchorCatalogEntry>> {
+    let file = std::fs::File::open(source_rollout_path)?;
+    let reader = io::BufReader::new(file);
+    let mut anchors = Vec::<ContextRewindAnchorCatalogEntry>::new();
+    let mut by_item_id = HashMap::<String, usize>::new();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(|value| value.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
+        let item_type = payload
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let names = context_rewind_anchor_names(payload);
+        let roles = context_rewind_anchor_roles(payload);
+        let summary = context_rewind_anchor_summary(payload);
+        let line_number = line_index.saturating_add(1);
+        for item_id in response_item_anchor_ids(payload) {
+            if let Some(index) = by_item_id.get(&item_id).copied() {
+                let anchor = &mut anchors[index];
+                anchor.last_line = line_number;
+                anchor.last_item_type = item_type.clone();
+                merge_string_set(&mut anchor.names, names.iter().cloned());
+                merge_string_set(&mut anchor.roles, roles.iter().cloned());
+                if !summary.is_empty() && !anchor.summary.contains(&summary) {
+                    if !anchor.summary.is_empty() {
+                        anchor.summary.push_str(" | ");
+                    }
+                    anchor.summary.push_str(&summary);
+                    truncate_string(&mut anchor.summary, 360);
+                }
+                continue;
+            }
+            let index = anchors.len();
+            by_item_id.insert(item_id.clone(), index);
+            anchors.push(ContextRewindAnchorCatalogEntry {
+                ordinal: index,
+                item_id,
+                first_line: line_number,
+                last_line: line_number,
+                first_item_type: item_type.clone(),
+                last_item_type: item_type.clone(),
+                positions: vec!["before", "after"],
+                position_hint: "after",
+                names: names.clone(),
+                roles: roles.clone(),
+                summary: summary.clone(),
+            });
+        }
+    }
+
+    Ok(anchors)
+}
+
+fn context_rewind_anchor_matches_query(
+    anchor: &ContextRewindAnchorCatalogEntry,
+    needle: &str,
+) -> bool {
+    anchor.item_id.to_ascii_lowercase().contains(needle)
+        || anchor.first_item_type.to_ascii_lowercase().contains(needle)
+        || anchor.last_item_type.to_ascii_lowercase().contains(needle)
+        || anchor
+            .names
+            .iter()
+            .any(|name| name.to_ascii_lowercase().contains(needle))
+        || anchor
+            .roles
+            .iter()
+            .any(|role| role.to_ascii_lowercase().contains(needle))
+        || anchor.summary.to_ascii_lowercase().contains(needle)
+        || anchor.first_line.to_string() == needle
+        || anchor.last_line.to_string() == needle
+}
+
+fn context_rewind_anchor_names(item: &serde_json::Value) -> Vec<String> {
+    item.get("name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default()
+}
+
+fn context_rewind_anchor_roles(item: &serde_json::Value) -> Vec<String> {
+    item.get("role")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default()
+}
+
+fn context_rewind_anchor_summary(item: &serde_json::Value) -> String {
+    let item_type = item
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let mut summary = match item_type {
+        "message" => response_item_content_text(item)
+            .collect::<Vec<_>>()
+            .join(" "),
+        "function_call" | "custom_tool_call" | "local_shell_call" | "tool_search_call" => {
+            let name = item
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("tool");
+            let arguments = item
+                .get("arguments")
+                .or_else(|| item.get("input"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            format!("{name} {arguments}")
+        }
+        "function_call_output" | "custom_tool_call_output" | "tool_search_output" => item
+            .get("output")
+            .or_else(|| item.get("result"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("tool output")
+            .to_string(),
+        _ => item_type.to_string(),
+    };
+    summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_string(&mut summary, 240);
+    summary
+}
+
+fn merge_string_set(target: &mut Vec<String>, values: impl Iterator<Item = String>) {
+    for value in values {
+        if !target.iter().any(|existing| existing == &value) {
+            target.push(value);
+        }
+    }
+}
+
+fn truncate_string(value: &mut String, max_chars: usize) {
+    if value.chars().count() <= max_chars {
+        return;
+    }
+    *value = value.chars().take(max_chars).collect::<String>();
+    value.push_str("...");
 }
 
 fn response_item_content_text(item: &serde_json::Value) -> impl Iterator<Item = &str> {
@@ -2012,14 +2210,6 @@ async fn apply_external_context_rewind(
         .clone()
         .ok_or_else(|| "thread metadata did not include a rollout path".to_string())?;
     let resolved_anchor = resolve_context_rewind_anchor(&source_rollout_path, &request.item_id)?;
-    if let Some(requested) = resolved_anchor.requested_item_id.as_deref() {
-        slog(config.session_log, |log| {
-            log.info(&format!(
-                "Resolved managed-context rewind anchor {requested} -> {}",
-                resolved_anchor.item_id
-            ))
-        });
-    }
     let recovery_rollout_path =
         context_rewind::copy_recovery_rollout(config.log_dir, &record_id, &source_rollout_path)
             .map_err(|e| format!("failed to copy pre-rewind rollout: {}", e))?;
@@ -2401,7 +2591,7 @@ fn managed_context_recovery_kickstart_text(
         ""
     };
     format!(
-        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. Call rewind_context now with anchor.item_id=\"auto\", anchor.position=\"after\", and a dense carry-forward primer, then stop. Intendant will resolve auto to the latest durable rewind-primer boundary; use a real call_/item anchor only when explicitly known.{held}\n</managed_context_recovery>",
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. First call list_rewind_anchors, using pagination/query as needed to inspect any valid anchor in the rollout. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
         status = pressure.status,
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
@@ -2724,6 +2914,18 @@ fn is_context_rewind_backout_action(op: &str) -> bool {
     )
 }
 
+fn is_context_rewind_anchor_list_action(op: &str) -> bool {
+    matches!(
+        op,
+        "list_rewind_anchors"
+            | "list-rewind-anchors"
+            | "rewind_anchors"
+            | "rewind-anchors"
+            | "context_rewind_anchors"
+            | "context-rewind-anchors"
+    )
+}
+
 fn context_rewind_record_id_from_params(params: &serde_json::Value) -> Option<String> {
     params
         .get("recordId")
@@ -3006,6 +3208,31 @@ async fn apply_context_rewind_backout_action(
     ))
 }
 
+async fn apply_context_rewind_anchor_list_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    params: &serde_json::Value,
+) -> Result<String, String> {
+    let thread_id = thread_id_from_action_params(params);
+    let mut rollout_path = None;
+    if let Some(thread_id) = thread_id.as_deref() {
+        rollout_path = agent
+            .read_thread_snapshot(thread_id)
+            .await
+            .ok()
+            .and_then(|snapshot| snapshot.rollout_path);
+    }
+    if rollout_path.is_none() {
+        rollout_path = agent
+            .context_snapshot()
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|snapshot| snapshot.rollout_path);
+    }
+    let rollout_path = rollout_path
+        .ok_or_else(|| "Codex thread metadata did not include a rollout path".to_string())?;
+    list_context_rewind_anchors_from_rollout(&rollout_path, params)
+}
+
 async fn handle_external_thread_action(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     op: String,
@@ -3016,7 +3243,9 @@ async fn handle_external_thread_action(
     let params = thread_action_params_for_target(&op, params, &target_session_id, config);
     let action_thread_id = thread_id_from_action_params(&params);
     let result_session_id = target_session_id.or_else(|| config.session_id.clone());
-    let result = if is_context_rewind_backout_action(&op) {
+    let result = if is_context_rewind_anchor_list_action(&op) {
+        apply_context_rewind_anchor_list_action(agent, &params).await
+    } else if is_context_rewind_backout_action(&op) {
         apply_context_rewind_backout_action(agent, &op, &params, config).await
     } else {
         agent
@@ -7422,6 +7651,7 @@ mod tests {
             label: "Codex resolved request payload".to_string(),
             request_id: Some("req-1".to_string()),
             request_index: Some(1),
+            rollout_path: None,
             format: "openai.responses.resolved_request.v1".to_string(),
             token_count: Some(71_876),
             context_window: Some(258_400),
@@ -7451,6 +7681,7 @@ mod tests {
             label: "Codex resolved request payload".to_string(),
             request_id: Some("req-1".to_string()),
             request_index: Some(1),
+            rollout_path: None,
             format: "openai.responses.resolved_request.v1".to_string(),
             token_count: Some(258_399),
             context_window: Some(258_400),
@@ -7727,7 +7958,7 @@ mod tests {
     }
 
     #[test]
-    fn context_rewind_auto_anchor_resolves_to_latest_primer_boundary() {
+    fn context_rewind_anchor_catalog_lists_all_exact_ids() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
         std::fs::write(
@@ -7812,17 +8043,38 @@ mod tests {
         )
         .unwrap();
 
-        let auto = resolve_context_rewind_anchor(&path, "auto").expect("auto anchor");
-        assert_eq!(auto.item_id, "call_latest_rewind");
-        assert_eq!(auto.requested_item_id.as_deref(), Some("auto"));
+        let catalog = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "offset": 0, "limit": 20 }),
+        )
+        .expect("anchor catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"call_prior_rewind"));
+        assert!(ids.contains(&"call_latest_rewind"));
 
-        let synthetic =
-            resolve_context_rewind_anchor(&path, "rewind_context-call_7").expect("synthetic");
-        assert_eq!(synthetic.item_id, "call_latest_rewind");
-        assert_eq!(
-            synthetic.requested_item_id.as_deref(),
-            Some("rewind_context-call_7")
-        );
+        let filtered = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "query": "latest", "offset": 0, "limit": 20 }),
+        )
+        .expect("filtered anchor catalog");
+        let filtered: serde_json::Value = serde_json::from_str(&filtered).unwrap();
+        let filtered_ids = filtered["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(filtered_ids, vec!["call_latest_rewind"]);
+
+        let missing = resolve_context_rewind_anchor(&path, "rewind_context-call_7")
+            .expect_err("synthetic anchors are not accepted");
+        assert!(missing.contains("call list_rewind_anchors"));
     }
 
     #[test]
@@ -7846,7 +8098,6 @@ mod tests {
 
         let exact = resolve_context_rewind_anchor(&path, "call_exact").expect("exact anchor");
         assert_eq!(exact.item_id, "call_exact");
-        assert_eq!(exact.requested_item_id, None);
     }
 
     #[test]
@@ -12197,6 +12448,28 @@ async fn run_with_presence(
                     persistent_side_rounds.clear();
                     persistent_side_turn_revisions.clear();
                     Ok("agent torn down; next task will start a fresh thread".to_string())
+                } else if is_context_rewind_anchor_list_action(&op) {
+                    let Some(ref mut agent) = persistent_agent else {
+                        turn_bus_rx = bus.subscribe();
+                        bus.send(AppEvent::CodexThreadActionResult {
+                            session_id: session_id.clone().or_else(|| local_session_id.clone()),
+                            action: op,
+                            success: false,
+                            message: "no active agent — start a task first".to_string(),
+                        });
+                        continue;
+                    };
+                    let target_thread_id = session_id
+                        .as_deref()
+                        .filter(|id| Some(*id) != local_session_id.as_deref())
+                        .or_else(|| {
+                            persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.as_str())
+                        });
+                    action_params =
+                        thread_action_params_with_thread_id(&op, action_params, target_thread_id);
+                    apply_context_rewind_anchor_list_action(agent, &action_params).await
                 } else if is_context_rewind_backout_action(&op) {
                     let Some(ref mut agent) = persistent_agent else {
                         turn_bus_rx = bus.subscribe();
