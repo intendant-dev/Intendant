@@ -366,6 +366,36 @@ function Check-Runtime {
     return $allOk
 }
 
+function Check-ManagedBrowser {
+    Write-Host ""
+    Write-Host "Managed browser workspace dependency:"
+
+    $intendant = Join-Path $RepoRoot "target\x86_64-pc-windows-msvc\release\intendant.exe"
+    if (Test-Path -LiteralPath $intendant) {
+        $output = & $intendant setup browsers --check --print-path 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Ok "Chrome for Testing / managed Chromium"
+            return $true
+        }
+        Miss "Chrome for Testing / managed Chromium" "$intendant setup browsers"
+        return $false
+    }
+
+    $cacheRoot = Join-Path $env:LOCALAPPDATA "intendant\browser-workspaces"
+    if (Test-Path -LiteralPath $cacheRoot) {
+        $found = Get-ChildItem -LiteralPath $cacheRoot -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -in @("chrome.exe", "msedge.exe", "chromium.exe") } |
+            Select-Object -First 1
+        if ($found) {
+            Ok "Chrome for Testing / managed Chromium"
+            return $true
+        }
+    }
+
+    Miss "Chrome for Testing / managed Chromium" "build first, then run target\x86_64-pc-windows-msvc\release\intendant.exe setup browsers"
+    return $false
+}
+
 # Detect the VB-CABLE virtual audio device by its driver/device name. The
 # Windows analogue of macOS BlackHole / Linux PulseAudio null sinks: a
 # loopback the WASAPI audio bridge plays into and captures from.
@@ -704,6 +734,26 @@ function Test-PostBuildSmoke {
     }
 }
 
+function Install-ManagedBrowser {
+    $intendant = Join-Path $RepoRoot "target\x86_64-pc-windows-msvc\release\intendant.exe"
+    if (-not (Test-Path -LiteralPath $intendant)) {
+        Warn "cannot install managed browser; missing $intendant"
+        Warn "after building, run: target\x86_64-pc-windows-msvc\release\intendant.exe setup browsers"
+        return
+    }
+
+    Info "installing managed Chrome for Testing browser..."
+    & $intendant setup browsers
+    if ($LASTEXITCODE -eq 0) {
+        Ok "managed browser ready"
+    } else {
+        Warn "managed browser install failed; browser workspaces need one of:"
+        Warn "  target\x86_64-pc-windows-msvc\release\intendant.exe setup browsers"
+        Warn "  INTENDANT_BROWSER_WORKSPACE_EXECUTABLE=/path/to/chrome"
+        Warn "  provider=system_cdp for an explicit system-browser launch"
+    }
+}
+
 function Show-CompletionSummary {
     param([bool]$Built)
 
@@ -770,6 +820,7 @@ function Run-Check {
     $coreOk    = [bool](@(Check-Core)[-1])
     $null      = Check-Wasm
     $null      = Check-Runtime
+    $browserOk = [bool](@(Check-ManagedBrowser)[-1])
 
     Write-Host ""
     Write-Host "--------------------------------------------------------"
@@ -778,6 +829,11 @@ function Run-Check {
         Write-Host "  Build toolchain (required):   ready" -ForegroundColor Green
     } else {
         Write-Host "  Build toolchain (required):   MISSING dependencies (run without -Check to install, or install manually)" -ForegroundColor Red
+    }
+    if ($browserOk) {
+        Write-Host "  Browser workspace:            ready" -ForegroundColor Green
+    } else {
+        Write-Host "  Browser workspace:            missing managed browser" -ForegroundColor Yellow
     }
     Write-Host "  Optional/runtime deps:        see notes above (wasm-pack, ffmpeg, VB-CABLE -- not required to build)"
     Write-Host ""
@@ -860,6 +916,8 @@ function Run-Install {
     } else {
         Write-Host ""
         Build-Intendant
+        Write-Host ""
+        Install-ManagedBrowser
         $built = $true
     }
 

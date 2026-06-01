@@ -62,9 +62,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1 -PackageMan
 powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1 -SkipSmoke
 ```
 
-After a successful build, the script verifies that both release binaries exist
-and runs a small `intendant-runtime` hello-command smoke check. It then prints a
-status summary split into build, web/display, voice, and LAN readiness.
+After a successful build, the script verifies that both release binaries exist,
+runs a small `intendant-runtime` hello-command smoke check, and provisions the
+managed Chrome for Testing browser used by CDP browser workspaces. It then
+prints a status summary split into build, web/display, voice, and LAN readiness.
 
 ## Package Manager Policy
 

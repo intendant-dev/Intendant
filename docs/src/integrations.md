@@ -164,12 +164,15 @@ X11 displays are auto-launched via Xvfb when the agent first needs one. See
 
 | Script | Purpose |
 |--------|---------|
-| `setup-linux.sh` | Install the Debian/Ubuntu `APT_PACKAGES` set + toolchain build deps; `--check` to report only |
-| `setup-macos.sh` | Install macOS deps (cliclick, ffmpeg, sox, SwitchAudioSource, Vortex/BlackHole, wasm-pack) and build; `--check` to report only |
-| `setup-windows.ps1` | Windows toolchain + build for `x86_64-pc-windows-msvc` (see [Windows Support](./windows-support.md)) |
+| `setup-linux.sh` | Install the Debian/Ubuntu `APT_PACKAGES` set + toolchain build deps, build, and provision a managed Chrome for Testing browser; `--check` to report only |
+| `setup-macos.sh` | Install macOS deps (cliclick, ffmpeg, sox, SwitchAudioSource, Vortex/BlackHole, wasm-pack), build, and provision a managed Chrome for Testing browser; `--check` to report only |
+| `setup-windows.ps1` | Windows toolchain + build for `x86_64-pc-windows-msvc`, plus managed Chrome for Testing provisioning (see [Windows Support](./windows-support.md)) |
 | `bundle-macos.sh` | Build and codesign the macOS `.app` (WKWebView wrapper over the `intendant://` scheme) and install to `/Applications` |
 | `setup-lan.sh`, `setup-lan-macos.sh`, `setup-lan-guest-macos.sh`, `setup-lan.bat` | Wrappers around the `intendant lan` mTLS reverse-proxy flow |
 | `intendant-ctl.sh` | Convenience wrapper over the control socket (`status`, `approve`, `follow`, `start`, …) |
+
+`intendant setup browsers` can also be run directly to install or repair the
+managed browser cache used by CDP browser workspaces.
 
 > **When you add a new `-sys` crate dependency, update both
 > `scripts/setup-linux.sh` (`APT_PACKAGES`) and `scripts/setup-macos.sh` in the
