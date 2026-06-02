@@ -3896,6 +3896,10 @@ pub struct ListRewindAnchorsParams {
     /// Return anchors from newest to oldest when true.
     #[serde(default)]
     pub reverse: bool,
+    /// Include managed-context maintenance calls such as list_rewind_anchors or rewind_context.
+    /// Omit this during ordinary recovery so discovery does not target its own tool calls.
+    #[serde(default, alias = "includeManagementTools")]
+    pub include_management_tools: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -5257,7 +5261,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "List valid exact Codex rewind anchors for the current managed session. Supports pagination and query so the model can choose any valid anchor from the rollout, from start to finish. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id into rewind_context."
+        description = "List valid exact Codex rewind anchors for the current managed session. Supports pagination and query so the model can choose any valid non-management anchor from the rollout, from start to finish. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id into rewind_context."
     )]
     async fn list_rewind_anchors(
         &self,
@@ -5267,6 +5271,7 @@ impl IntendantServer {
             "offset": params.offset.unwrap_or(0),
             "limit": params.limit.unwrap_or(100),
             "reverse": params.reverse,
+            "include_management_tools": params.include_management_tools,
         });
         if let Some(query) = params
             .query

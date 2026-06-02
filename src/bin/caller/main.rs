@@ -1960,6 +1960,7 @@ struct ContextRewindAnchorCatalog {
     limit: usize,
     next_offset: Option<usize>,
     query: Option<String>,
+    include_management_tools: bool,
     anchors: Vec<ContextRewindAnchorCatalogEntry>,
     usage: &'static str,
 }
@@ -2013,6 +2014,11 @@ fn list_context_rewind_anchors_from_rollout(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let include_management_tools = params
+        .get("include_management_tools")
+        .or_else(|| params.get("includeManagementTools"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let reverse = params
         .get("reverse")
         .and_then(|value| value.as_bool())
@@ -2031,6 +2037,9 @@ fn list_context_rewind_anchors_from_rollout(
         )
     })?;
     let total = anchors.len();
+    if !include_management_tools {
+        anchors.retain(|anchor| !context_rewind_anchor_is_management_tool(anchor));
+    }
     if reverse {
         anchors.reverse();
     }
@@ -2054,8 +2063,9 @@ fn list_context_rewind_anchors_from_rollout(
         limit,
         next_offset,
         query,
+        include_management_tools,
         anchors: page,
-        usage: "Choose any returned item_id exactly in rewind_context.anchor.item_id. Use inspect_rewind_anchor to inspect nearby context before mutating the thread when the compact summary is ambiguous. Use position=\"after\" to keep the matching item/group and drop later context, or position=\"before\" to drop the matching item/group too.",
+        usage: "Choose any returned item_id exactly in rewind_context.anchor.item_id. By default this catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout; pass include_management_tools=true only when intentionally targeting those internal calls. Use inspect_rewind_anchor to inspect nearby context before mutating the thread when the compact summary is ambiguous. Use position=\"after\" to keep the matching item/group and drop later context, or position=\"before\" to drop the matching item/group too.",
     };
     serde_json::to_string(&catalog).map_err(|err| err.to_string())
 }
@@ -2235,6 +2245,22 @@ fn context_rewind_anchor_matches_query(
         || anchor.summary.to_ascii_lowercase().contains(needle)
         || anchor.first_line.to_string() == needle
         || anchor.last_line.to_string() == needle
+}
+
+fn context_rewind_anchor_is_management_tool(anchor: &ContextRewindAnchorCatalogEntry) -> bool {
+    anchor.names.iter().any(|name| {
+        matches!(
+            name.as_str(),
+            "list_rewind_anchors"
+                | "inspect_rewind_anchor"
+                | "rewind_context"
+                | "rewind_backout"
+                | "context_rewind_anchors"
+                | "context_rewind_anchor_inspect"
+                | "context_rewind"
+                | "context_rewind_backout"
+        )
+    })
 }
 
 fn context_rewind_anchor_names(item: &serde_json::Value) -> Vec<String> {
@@ -2683,7 +2709,7 @@ fn external_context_snapshot_turn(stats: &LoopStats) -> Option<usize> {
 fn external_context_snapshot_usage(
     snapshot: &external_agent::AgentContextSnapshot,
 ) -> Option<frontend::ModelUsageSnapshot> {
-    let tokens_used = snapshot.token_count?;
+    let tokens_used = external_context_snapshot_effective_token_count(snapshot)?;
     let context_window = snapshot.context_window?;
     if context_window == 0 {
         return None;
@@ -2718,6 +2744,18 @@ fn external_context_snapshot_usage(
     })
 }
 
+fn external_context_snapshot_effective_token_count(
+    snapshot: &external_agent::AgentContextSnapshot,
+) -> Option<u64> {
+    let token_count = snapshot.token_count?;
+    if let Some(hard_context_window) = snapshot.hard_context_window {
+        if hard_context_window > 0 && token_count > hard_context_window {
+            return Some(hard_context_window);
+        }
+    }
+    Some(token_count)
+}
+
 fn managed_context_rewind_only_pressure(
     snapshot: &external_agent::AgentContextSnapshot,
 ) -> Option<ManagedContextRewindOnlyPressure> {
@@ -2731,7 +2769,7 @@ fn managed_context_rewind_only_pressure(
 fn managed_context_recovery_pressure(
     snapshot: &external_agent::AgentContextSnapshot,
 ) -> Option<ManagedContextRewindOnlyPressure> {
-    let used_tokens = snapshot.token_count?;
+    let used_tokens = external_context_snapshot_effective_token_count(snapshot)?;
     let rewind_only_limit = snapshot.context_window?;
     if rewind_only_limit == 0 {
         return None;
@@ -2788,7 +2826,7 @@ fn managed_context_recovery_kickstart_text(
         ""
     };
     format!(
-        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors, using pagination/query as needed to inspect any valid anchor in the rollout. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management anchor catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
         status = pressure.status,
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
@@ -2807,7 +2845,7 @@ fn managed_context_backend_recovery_kickstart_text(
         .map(|hint| format!(" Codex recovery hint: {hint}"))
         .unwrap_or_default();
     format!(
-        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors, using pagination/query as needed to inspect any valid anchor in the rollout. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
+        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management anchor catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
     )
 }
 
@@ -2827,6 +2865,7 @@ async fn emit_external_context_snapshot_if_changed(
                 }
                 emitted = true;
                 state.last_error = None;
+                let token_count = external_context_snapshot_effective_token_count(&snapshot);
                 let usage = external_context_snapshot_usage(&snapshot);
                 config.bus.send(AppEvent::ContextSnapshot {
                     session_id: config.session_id.clone(),
@@ -2836,7 +2875,7 @@ async fn emit_external_context_snapshot_if_changed(
                     request_index: snapshot.request_index,
                     turn,
                     format: snapshot.format,
-                    token_count: snapshot.token_count,
+                    token_count,
                     context_window: snapshot.context_window,
                     hard_context_window: snapshot.hard_context_window,
                     item_count: snapshot.item_count,
@@ -7970,6 +8009,15 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 71_876);
         assert_eq!(usage.completion_tokens, 0);
         assert!((usage.usage_pct - (71_876.0 / 258_400.0 * 100.0)).abs() < 1e-12);
+
+        let over_hard = external_agent::AgentContextSnapshot {
+            token_count: Some(312_502),
+            ..snapshot
+        };
+        let usage = external_context_snapshot_usage(&over_hard).unwrap();
+        assert_eq!(usage.tokens_used, 272_000);
+        assert_eq!(usage.prompt_tokens, 272_000);
+        assert_eq!(usage.hard_context_window, Some(272_000));
     }
 
     #[test]
@@ -8010,6 +8058,20 @@ mod tests {
         assert_eq!(
             managed_context_rewind_only_pressure(&at_hard).map(|pressure| pressure.status),
             Some("critical")
+        );
+
+        let over_hard = external_agent::AgentContextSnapshot {
+            token_count: Some(312_502),
+            ..at_hard
+        };
+        assert_eq!(
+            managed_context_rewind_only_pressure(&over_hard),
+            Some(ManagedContextRewindOnlyPressure {
+                used_tokens: 272_000,
+                rewind_only_limit: 258_400,
+                hard_context_window: Some(272_000),
+                status: "critical",
+            })
         );
     }
 
@@ -8092,6 +8154,7 @@ mod tests {
         );
 
         assert!(text.contains("list_rewind_anchors and inspect_rewind_anchor are callable"));
+        assert!(text.contains("First call list_rewind_anchors without a query"));
         assert!(text.contains("stale and incorrect"));
         assert!(text.contains("Do not synthesize anchor ids"));
         assert!(text.contains("hard_limit=272000"));
@@ -8111,6 +8174,7 @@ mod tests {
         assert!(text.contains("Codex recovery hint: rewind context first"));
         assert!(text.contains("list_rewind_anchors"));
         assert!(text.contains("inspect_rewind_anchor"));
+        assert!(text.contains("First call list_rewind_anchors without a query"));
         assert!(text.contains("rewind_context with one exact returned item_id"));
         assert!(text.contains("Do not synthesize anchor ids"));
         assert!(!text.contains("call_"));
@@ -8434,9 +8498,28 @@ mod tests {
         )
         .unwrap();
 
-        let catalog = list_context_rewind_anchors_from_rollout(
+        let default_catalog = list_context_rewind_anchors_from_rollout(
             &path,
             &serde_json::json!({ "offset": 0, "limit": 20 }),
+        )
+        .expect("default anchor catalog");
+        let default_catalog: serde_json::Value = serde_json::from_str(&default_catalog).unwrap();
+        let default_ids = default_catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!default_ids.contains(&"call_prior_rewind"));
+        assert!(!default_ids.contains(&"call_latest_rewind"));
+
+        let catalog = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 20,
+                "include_management_tools": true,
+            }),
         )
         .expect("anchor catalog");
         let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
@@ -8451,7 +8534,12 @@ mod tests {
 
         let filtered = list_context_rewind_anchors_from_rollout(
             &path,
-            &serde_json::json!({ "query": "latest", "offset": 0, "limit": 20 }),
+            &serde_json::json!({
+                "query": "latest",
+                "offset": 0,
+                "limit": 20,
+                "include_management_tools": true,
+            }),
         )
         .expect("filtered anchor catalog");
         let filtered: serde_json::Value = serde_json::from_str(&filtered).unwrap();
@@ -8466,6 +8554,94 @@ mod tests {
         let missing = resolve_context_rewind_anchor(&path, "rewind_context-call_7")
             .expect_err("synthetic anchors are not accepted");
         assert!(missing.contains("call list_rewind_anchors"));
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_query_hides_recovery_tools_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_launch_dashboard",
+                        "arguments": "{\"cmd\":\"./target/debug/intendant --web 8767 --no-presence\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_launch_dashboard",
+                        "output": "Web TUI: http://0.0.0.0:8767"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "list_rewind_anchors",
+                        "call_id": "call_recovery_list",
+                        "arguments": "{\"query\":\"target/debug/intendant --web 8767\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_recovery_list",
+                        "output": "target/debug/intendant --web 8767"
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "query": "target/debug/intendant --web 8767",
+                "reverse": true,
+                "limit": 10,
+            }),
+        )
+        .expect("anchor catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_launch_dashboard"]);
+        assert_eq!(catalog["include_management_tools"].as_bool(), Some(false));
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "query": "target/debug/intendant --web 8767",
+                "reverse": true,
+                "limit": 10,
+                "include_management_tools": true,
+            }),
+        )
+        .expect("anchor catalog with management tools");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_recovery_list", "call_launch_dashboard"]);
     }
 
     #[test]
