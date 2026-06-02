@@ -848,6 +848,8 @@ pub struct UsageSnapshot {
     pub model: String,
     pub tokens_used: u64,
     pub context_window: u64,
+    #[serde(default)]
+    pub hard_context_window: Option<u64>,
     pub usage_pct: f64,
     #[serde(default)]
     pub prompt_tokens: u64,
@@ -2268,6 +2270,7 @@ impl AppState {
                     model: msg["model"].as_str().unwrap_or("").to_string(),
                     tokens_used: msg["total_tokens"].as_u64().unwrap_or(0),
                     context_window: msg["context_window"].as_u64().unwrap_or(0),
+                    hard_context_window: msg["hard_context_window"].as_u64(),
                     usage_pct: msg["usage_pct"].as_f64().unwrap_or(0.0),
                     prompt_tokens: msg["prompt_tokens"].as_u64().unwrap_or(0),
                     completion_tokens: msg["completion_tokens"].as_u64().unwrap_or(0),
@@ -4575,14 +4578,17 @@ mod tests {
             model: "gpt-5".into(),
             tokens_used: 5000,
             context_window: 128000,
+            hard_context_window: Some(272000),
             usage_pct: 3.9,
             prompt_tokens: 4000,
             completion_tokens: 1000,
             cached_tokens: 500,
         };
         let json = serde_json::to_string(&u).unwrap();
+        assert!(json.contains("hard_context_window"));
         let back: UsageSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tokens_used, 5000);
+        assert_eq!(back.hard_context_window, Some(272000));
     }
 
     #[test]

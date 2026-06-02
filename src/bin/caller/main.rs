@@ -5522,8 +5522,18 @@ async fn drain_external_agent_events(
                 likely_generation_starvation,
                 recovery_hint,
             } => {
+                let recovery_required = likely_generation_starvation || recovery_hint.is_some();
                 let mut content = if let Some(code) = code.as_deref() {
-                    format!("{} backend error ({code}): {message}", agent.name())
+                    if recovery_required {
+                        format!(
+                            "{} context recovery required ({code}): {message}",
+                            agent.name()
+                        )
+                    } else {
+                        format!("{} backend error ({code}): {message}", agent.name())
+                    }
+                } else if recovery_required {
+                    format!("{} context recovery required: {message}", agent.name())
                 } else {
                     format!("{} backend error: {message}", agent.name())
                 };
@@ -5533,12 +5543,12 @@ async fn drain_external_agent_events(
                 }
                 if let Some(hint) = recovery_hint.as_deref() {
                     content.push('\n');
-                    content.push_str("Recovery: ");
+                    content.push_str("Recovery instruction: ");
                     content.push_str(hint);
                 }
 
                 slog(config.session_log, |l| {
-                    if will_retry {
+                    if will_retry || recovery_required {
                         l.warn(&content);
                     } else {
                         l.error(&content);
@@ -5546,7 +5556,12 @@ async fn drain_external_agent_events(
                 });
                 config.bus.send(AppEvent::LogEntry {
                     session_id: config.session_id.clone(),
-                    level: if will_retry { "warn" } else { "error" }.to_string(),
+                    level: if will_retry || recovery_required {
+                        "warn"
+                    } else {
+                        "error"
+                    }
+                    .to_string(),
                     source: external_agent_log_source(config.agent_source.as_deref()),
                     content,
                     turn: None,

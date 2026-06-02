@@ -13267,17 +13267,23 @@ function renderManagedContextStats() {
     : null;
   const rewindOnlyLimit = live ? managedContextPositiveNumber(pressure.rewind_only_limit) : null;
   const pct = managedContextPercent(used, effectiveWindow);
+  const hardPct = managedContextPercent(used, hardWindow);
+  const effectiveValue = `${managedContextFormatNumber(used)} / ${managedContextFormatNumber(effectiveWindow)}${pct === null ? '' : ` (${pct.toFixed(1)}%)`}`;
+  const hardValue = `${managedContextFormatNumber(used)} / ${managedContextFormatNumber(hardWindow)}${hardPct === null ? '' : ` (${hardPct.toFixed(1)}%)`}`;
   host.appendChild(managedContextStat('Mode', mode, mode === 'managed' ? 'ok' : 'vanilla'));
   host.appendChild(managedContextStat('Pressure', status, status));
-  host.appendChild(managedContextStat('Effective', `${managedContextFormatNumber(used)} / ${managedContextFormatNumber(effectiveWindow)}`, status));
-  host.appendChild(managedContextStat('Hard', `${managedContextFormatNumber(used)} / ${managedContextFormatNumber(hardWindow)}`, status));
-  host.appendChild(managedContextStat('Rewind at', managedContextFormatNumber(rewindOnlyLimit), status));
+  host.appendChild(managedContextStat('Effective pressure', effectiveValue, status));
+  host.appendChild(managedContextStat('Hard limit usage', hardValue, status));
+  host.appendChild(managedContextStat('Soft rewind at', managedContextFormatNumber(rewindOnlyLimit), status));
   host.appendChild(managedContextStat('Rewind-only', pressure.rewind_only ? 'on' : 'off', pressure.rewind_only ? 'critical' : 'ok'));
   if (fill) {
     fill.style.width = pct === null ? '0%' : Math.min(pct, 100).toFixed(1) + '%';
+    fill.title = pct === null
+      ? 'Context pressure unavailable'
+      : `Effective pressure ${pct.toFixed(1)}%${hardPct === null ? '' : `; hard usage ${hardPct.toFixed(1)}%`}`;
     fill.style.background = status === 'critical'
       ? 'var(--red)'
-      : (status === 'high' || status === 'pressure')
+      : (status === 'high' || status === 'pressure' || status === 'recovery_required')
         ? 'var(--yellow)'
         : 'var(--green)';
   }
@@ -19933,16 +19939,25 @@ function renderUsageTab(c) {
 function renderUsageCard(label, data) {
   const card = document.createElement('div');
   card.className = 'usage-card';
-  const color = data.usage_pct < 50 ? '#a6e3a1' : data.usage_pct < 85 ? '#f9e2af' : '#f38ba8';
+  const pctForWindow = (tokens, windowSize) => windowSize > 0 ? (tokens / windowSize) * 100 : null;
   const prompt = data.prompt_tokens || 0;
   const completion = data.completion_tokens || 0;
   const cached = data.cached_tokens || 0;
-  const uncachedInput = prompt - cached;
+  const uncachedInput = Math.max(0, prompt - cached);
   const effectiveWindow = data.context_window || 0;
   const hardWindow = data.hard_context_window || data.hardContextWindow || null;
+  const effectivePct = pctForWindow(data.tokens_used, effectiveWindow);
+  const hardPct = pctForWindow(data.tokens_used, hardWindow);
+  const displayPct = Number.isFinite(effectivePct) ? effectivePct : data.usage_pct;
+  const pressurePct = Number.isFinite(displayPct) ? displayPct : 0;
+  const color = pressurePct < 50 ? '#a6e3a1' : pressurePct < 85 ? '#f9e2af' : '#f38ba8';
   const remainingEffective = Math.max(0, effectiveWindow - data.tokens_used);
+  const remainingHard = hardWindow ? Math.max(0, hardWindow - data.tokens_used) : null;
+  const effectivePctText = Number.isFinite(displayPct) ? `${displayPct.toFixed(1)}% effective` : '--';
   const hardLine = hardWindow && hardWindow !== effectiveWindow
-    ? `<span class="label">Hard limit</span><span class="value">${hardWindow.toLocaleString()}</span>`
+    ? `<span class="label">Hard limit</span><span class="value">${hardWindow.toLocaleString()}</span>
+      <span class="label" style="padding-left:12px">Hard usage</span><span class="value">${hardPct === null ? '--' : hardPct.toFixed(1) + '%'}</span>
+      <span class="label">Hard remaining</span><span class="value">${remainingHard.toLocaleString()}</span>`
     : '';
   card.innerHTML = `
     <div class="card-title">${label}</div>
@@ -19950,9 +19965,9 @@ function renderUsageCard(label, data) {
     <div class="token-bar">
       <div class="bar-label">
         <span class="tokens">${data.tokens_used.toLocaleString()} / ${effectiveWindow.toLocaleString()} effective</span>
-        <span class="pct" style="color:${color}">${data.usage_pct.toFixed(1)}%</span>
+        <span class="pct" style="color:${color}">${effectivePctText}</span>
       </div>
-      <div class="bar-track"><div class="bar-fill" style="width:${Math.min(data.usage_pct, 100)}%;background:${color}"></div></div>
+      <div class="bar-track"><div class="bar-fill" style="width:${Math.min(pressurePct, 100)}%;background:${color}"></div></div>
     </div>
     <div class="token-breakdown">
       <span class="label">Input tokens</span><span class="value">${prompt.toLocaleString()}</span>
