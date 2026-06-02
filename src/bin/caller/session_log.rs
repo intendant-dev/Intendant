@@ -2078,6 +2078,7 @@ impl SessionLog {
         turn: Option<usize>,
         format: &str,
         token_count: Option<u64>,
+        token_count_kind: Option<&str>,
         context_window: Option<u64>,
         hard_context_window: Option<u64>,
         item_count: Option<usize>,
@@ -2092,6 +2093,7 @@ impl SessionLog {
             turn,
             format,
             token_count,
+            token_count_kind,
             context_window,
             hard_context_window,
             item_count,
@@ -2109,6 +2111,7 @@ impl SessionLog {
         turn: Option<usize>,
         format: &str,
         token_count: Option<u64>,
+        token_count_kind: Option<&str>,
         context_window: Option<u64>,
         hard_context_window: Option<u64>,
         item_count: Option<usize>,
@@ -2150,6 +2153,7 @@ impl SessionLog {
                     "request_index": request_index,
                     "format": format,
                     "token_count": token_count,
+                    "token_count_kind": token_count_kind,
                     "context_window": context_window,
                     "hard_context_window": hard_context_window,
                     "item_count": item_count,
@@ -2754,6 +2758,10 @@ pub fn session_log_entry_to_app_event(
             let token_count = data
                 .and_then(|d| d.get("token_count"))
                 .and_then(|v| v.as_u64());
+            let token_count_kind = data
+                .and_then(|d| d.get("token_count_kind"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let context_window = data
                 .and_then(|d| d.get("context_window"))
                 .and_then(|v| v.as_u64());
@@ -2777,6 +2785,7 @@ pub fn session_log_entry_to_app_event(
                 turn,
                 format,
                 token_count,
+                token_count_kind,
                 context_window,
                 hard_context_window,
                 item_count,
@@ -4010,6 +4019,7 @@ mod tests {
             Some(2),
             "codex.thread.read.v2",
             Some(42),
+            Some("backend_reported"),
             Some(128_000),
             Some(128_000),
             Some(1),
@@ -4036,6 +4046,7 @@ mod tests {
                 turn,
                 format,
                 token_count,
+                token_count_kind,
                 context_window,
                 hard_context_window,
                 item_count,
@@ -4049,6 +4060,7 @@ mod tests {
                 assert_eq!(turn, Some(2));
                 assert_eq!(format, "codex.thread.read.v2");
                 assert_eq!(token_count, Some(42));
+                assert_eq!(token_count_kind.as_deref(), Some("backend_reported"));
                 assert_eq!(context_window, Some(128_000));
                 assert_eq!(hard_context_window, Some(128_000));
                 assert_eq!(item_count, Some(1));

@@ -1738,6 +1738,10 @@ fn context_snapshot_replay_entry_without_raw(
     let token_count = data
         .and_then(|d| d.get("token_count"))
         .and_then(|v| v.as_u64());
+    let token_count_kind = data
+        .and_then(|d| d.get("token_count_kind"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let context_window = data
         .and_then(|d| d.get("context_window"))
         .and_then(|v| v.as_u64());
@@ -1773,6 +1777,7 @@ fn context_snapshot_replay_entry_without_raw(
         turn,
         format,
         token_count,
+        token_count_kind,
         context_window,
         hard_context_window,
         item_count,
@@ -6356,6 +6361,9 @@ fn external_context_snapshot_replay_entry_from_trace(
         turn: None,
         format: snapshot.format,
         token_count: snapshot.token_count,
+        token_count_kind: snapshot
+            .token_count_kind
+            .map(|kind| kind.as_str().to_string()),
         context_window: snapshot.context_window,
         hard_context_window: snapshot.hard_context_window,
         item_count: snapshot.item_count,
@@ -23907,6 +23915,7 @@ mod tests {
             Some(1),
             "openai.responses.resolved_request.v1",
             Some(1_000),
+            Some("backend_reported"),
             Some(128_000),
             Some(272_000),
             Some(1),
@@ -23921,6 +23930,7 @@ mod tests {
             Some(2),
             "openai.responses.resolved_request.v1",
             Some(1_100),
+            Some("backend_reported"),
             Some(128_000),
             Some(272_000),
             Some(1),
@@ -23990,6 +24000,7 @@ mod tests {
             Some(1),
             "openai.responses.resolved_request.v1",
             Some(1_000),
+            Some("backend_reported"),
             Some(128_000),
             Some(272_000),
             Some(1),
@@ -24038,6 +24049,7 @@ mod tests {
             Some(1),
             "openai.responses.resolved_request.v1",
             Some(1_000),
+            Some("backend_reported"),
             Some(128_000),
             Some(272_000),
             Some(1),
@@ -24086,6 +24098,7 @@ mod tests {
             Some(1),
             "openai.responses.resolved_request.v1",
             Some(1_000),
+            Some("backend_reported"),
             Some(128_000),
             Some(272_000),
             Some(1),
@@ -24244,6 +24257,7 @@ mod tests {
             Some(1),
             "intendant.conversation.messages.v1",
             None,
+            None,
             Some(200_000),
             Some(200_000),
             Some(1),
@@ -24314,6 +24328,7 @@ mod tests {
             Some(4),
             "openai.responses.resolved_request.v1",
             Some(1200),
+            Some("backend_reported"),
             Some(128_000),
             Some(272_000),
             Some(1),
@@ -24401,6 +24416,7 @@ mod tests {
             Some(4),
             "openai.responses.resolved_request.v1",
             Some(1200),
+            Some("backend_reported"),
             Some(128_000),
             Some(272_000),
             Some(1),
@@ -24490,6 +24506,7 @@ mod tests {
                 Some(request_index as usize),
                 "openai.responses.resolved_request.v1",
                 Some(1200 + request_index),
+                Some("backend_reported"),
                 Some(128_000),
                 Some(272_000),
                 Some(1),

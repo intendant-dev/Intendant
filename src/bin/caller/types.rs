@@ -445,6 +445,8 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         token_count: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        token_count_kind: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         context_window: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         hard_context_window: Option<u64>,

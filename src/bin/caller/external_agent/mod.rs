@@ -504,10 +504,28 @@ pub struct AgentContextSnapshot {
     pub rollout_path: Option<PathBuf>,
     pub format: String,
     pub token_count: Option<u64>,
+    pub token_count_kind: Option<AgentContextTokenCountKind>,
     pub context_window: Option<u64>,
     pub hard_context_window: Option<u64>,
     pub item_count: Option<usize>,
     pub raw: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, std::hash::Hash)]
+pub enum AgentContextTokenCountKind {
+    BackendReported,
+    LocalEstimate,
+    Unknown,
+}
+
+impl AgentContextTokenCountKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BackendReported => "backend_reported",
+            Self::LocalEstimate => "local_estimate",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// Result of making a backend-owned autonomous goal passive.

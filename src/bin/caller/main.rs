@@ -2688,6 +2688,7 @@ fn external_context_snapshot_key(snapshot: &external_agent::AgentContextSnapshot
     snapshot.label.hash(&mut h);
     snapshot.format.hash(&mut h);
     snapshot.token_count.hash(&mut h);
+    snapshot.token_count_kind.hash(&mut h);
     snapshot.context_window.hash(&mut h);
     snapshot.hard_context_window.hash(&mut h);
     snapshot.item_count.hash(&mut h);
@@ -2709,7 +2710,7 @@ fn external_context_snapshot_turn(stats: &LoopStats) -> Option<usize> {
 fn external_context_snapshot_usage(
     snapshot: &external_agent::AgentContextSnapshot,
 ) -> Option<frontend::ModelUsageSnapshot> {
-    let tokens_used = external_context_snapshot_effective_token_count(snapshot)?;
+    let tokens_used = external_context_snapshot_backend_token_count(snapshot)?;
     let context_window = snapshot.context_window?;
     if context_window == 0 {
         return None;
@@ -2744,16 +2745,12 @@ fn external_context_snapshot_usage(
     })
 }
 
-fn external_context_snapshot_effective_token_count(
+fn external_context_snapshot_backend_token_count(
     snapshot: &external_agent::AgentContextSnapshot,
 ) -> Option<u64> {
-    let token_count = snapshot.token_count?;
-    if let Some(hard_context_window) = snapshot.hard_context_window {
-        if hard_context_window > 0 && token_count > hard_context_window {
-            return Some(hard_context_window);
-        }
-    }
-    Some(token_count)
+    (snapshot.token_count_kind == Some(external_agent::AgentContextTokenCountKind::BackendReported))
+        .then_some(snapshot.token_count)
+        .flatten()
 }
 
 fn managed_context_rewind_only_pressure(
@@ -2769,7 +2766,7 @@ fn managed_context_rewind_only_pressure(
 fn managed_context_recovery_pressure(
     snapshot: &external_agent::AgentContextSnapshot,
 ) -> Option<ManagedContextRewindOnlyPressure> {
-    let used_tokens = external_context_snapshot_effective_token_count(snapshot)?;
+    let used_tokens = external_context_snapshot_backend_token_count(snapshot)?;
     let rewind_only_limit = snapshot.context_window?;
     if rewind_only_limit == 0 {
         return None;
@@ -2865,7 +2862,6 @@ async fn emit_external_context_snapshot_if_changed(
                 }
                 emitted = true;
                 state.last_error = None;
-                let token_count = external_context_snapshot_effective_token_count(&snapshot);
                 let usage = external_context_snapshot_usage(&snapshot);
                 config.bus.send(AppEvent::ContextSnapshot {
                     session_id: config.session_id.clone(),
@@ -2875,7 +2871,10 @@ async fn emit_external_context_snapshot_if_changed(
                     request_index: snapshot.request_index,
                     turn,
                     format: snapshot.format,
-                    token_count,
+                    token_count: snapshot.token_count,
+                    token_count_kind: snapshot
+                        .token_count_kind
+                        .map(|kind| kind.as_str().to_string()),
                     context_window: snapshot.context_window,
                     hard_context_window: snapshot.hard_context_window,
                     item_count: snapshot.item_count,
@@ -7991,6 +7990,7 @@ mod tests {
             rollout_path: None,
             format: "openai.responses.resolved_request.v1".to_string(),
             token_count: Some(71_876),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
             context_window: Some(258_400),
             hard_context_window: Some(272_000),
             item_count: Some(51),
@@ -8010,14 +8010,12 @@ mod tests {
         assert_eq!(usage.completion_tokens, 0);
         assert!((usage.usage_pct - (71_876.0 / 258_400.0 * 100.0)).abs() < 1e-12);
 
-        let over_hard = external_agent::AgentContextSnapshot {
+        let local_estimate = external_agent::AgentContextSnapshot {
             token_count: Some(312_502),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::LocalEstimate),
             ..snapshot
         };
-        let usage = external_context_snapshot_usage(&over_hard).unwrap();
-        assert_eq!(usage.tokens_used, 272_000);
-        assert_eq!(usage.prompt_tokens, 272_000);
-        assert_eq!(usage.hard_context_window, Some(272_000));
+        assert!(external_context_snapshot_usage(&local_estimate).is_none());
     }
 
     #[test]
@@ -8030,6 +8028,7 @@ mod tests {
             rollout_path: None,
             format: "openai.responses.resolved_request.v1".to_string(),
             token_count: Some(258_399),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
             context_window: Some(258_400),
             hard_context_window: Some(272_000),
             item_count: Some(51),
@@ -8062,17 +8061,10 @@ mod tests {
 
         let over_hard = external_agent::AgentContextSnapshot {
             token_count: Some(312_502),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::LocalEstimate),
             ..at_hard
         };
-        assert_eq!(
-            managed_context_rewind_only_pressure(&over_hard),
-            Some(ManagedContextRewindOnlyPressure {
-                used_tokens: 272_000,
-                rewind_only_limit: 258_400,
-                hard_context_window: Some(272_000),
-                status: "critical",
-            })
-        );
+        assert_eq!(managed_context_rewind_only_pressure(&over_hard), None);
     }
 
     #[test]
@@ -8085,6 +8077,7 @@ mod tests {
             rollout_path: None,
             format: "openai.responses.resolved_request.v1".to_string(),
             token_count: Some(253_741),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
             context_window: Some(258_400),
             hard_context_window: Some(272_000),
             item_count: Some(458),
@@ -10979,6 +10972,7 @@ async fn run_agent_loop(
                     turn: Some(turn),
                     format: context_format,
                     token_count: conversation.last_usage().map(|u| u.total_tokens),
+                    token_count_kind: None,
                     context_window: Some(conversation.context_window()),
                     hard_context_window: Some(conversation.context_window()),
                     item_count: provider_request_item_count(&raw_context),

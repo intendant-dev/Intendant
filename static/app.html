@@ -24926,6 +24926,7 @@ function contextSnapshotFingerprint(snapshot) {
     snapshot?.label || '',
     snapshot?.format || '',
     snapshot?.token_count ?? '',
+    snapshot?.token_count_kind || '',
     snapshot?.item_count ?? '',
     rawMarker,
   ].join('|');
@@ -25416,7 +25417,9 @@ function analyzeContextSnapshot(snapshot) {
   }
 
   const estimateTotal = parts.reduce((sum, part) => sum + part.estimatedTokens, 0);
-  const exactTotal = Number(snapshot?.token_count || 0);
+  const exactTotal = snapshot?.token_count_kind === 'backend_reported'
+    ? Number(snapshot?.token_count || 0)
+    : 0;
   const totalTokens = exactTotal > 0 ? exactTotal : estimateTotal;
   const scale = exactTotal > 0 && estimateTotal > 0 ? exactTotal / estimateTotal : 1;
   for (const part of parts) {
@@ -26037,7 +26040,9 @@ function contextBuildThree(analysis, snapshot) {
     const railWidth = Math.min(28, Math.max(10, timeline.length * 0.72));
     timeline.forEach((entry, idx) => {
       const entryWindow = Number(entry.effective_context_window || entry.context_window || effectiveWindow || 0);
-      const entryTokens = Number(entry.token_count || 0);
+      const entryTokens = entry.token_count_kind === 'backend_reported'
+        ? Number(entry.token_count || 0)
+        : 0;
       const entryPct = entryWindow > 0 ? Math.min(1.1, entryTokens / entryWindow) : (idx + 1) / timeline.length;
       const barHeight = 0.25 + entryPct * 4.6;
       const x = timeline.length <= 1 ? 0 : (idx / (timeline.length - 1) - 0.5) * railWidth;
@@ -26242,8 +26247,10 @@ function renderContextPane() {
   set('context-items', d.item_count);
   const effectiveWindow = d.effective_context_window || d.context_window;
   const hardWindow = d.hard_context_window || d.hardContextWindow || null;
+  const tokenKind = d.token_count_kind || '';
+  const tokenPrefix = tokenKind === 'local_estimate' ? 'local estimate ' : '';
   const tokens = d.token_count && effectiveWindow
-    ? `${Number(d.token_count).toLocaleString()} / ${Number(effectiveWindow).toLocaleString()} effective${hardWindow && hardWindow !== effectiveWindow ? ` (${Number(hardWindow).toLocaleString()} hard)` : ''}`
+    ? `${tokenPrefix}${Number(d.token_count).toLocaleString()} / ${Number(effectiveWindow).toLocaleString()} effective${hardWindow && hardWindow !== effectiveWindow ? ` (${Number(hardWindow).toLocaleString()} hard)` : ''}`
     : d.token_count;
   set('context-tokens', tokens);
   set('context-format', d.format || '--');

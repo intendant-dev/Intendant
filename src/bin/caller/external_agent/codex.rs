@@ -12,10 +12,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::error::CallerError;
 
 use super::{
-    AgentConfig, AgentContextSnapshot, AgentEvent, AgentImageAttachment, AgentThread,
-    AgentThreadSnapshot, AgentUsageSnapshot, ApprovalCategory, ApprovalDecision,
-    AutonomousGoalPauseResult, ExternalAgent, RollbackAnchorPosition, SubAgentState,
-    ToolCompletionStatus,
+    AgentConfig, AgentContextSnapshot, AgentContextTokenCountKind, AgentEvent,
+    AgentImageAttachment, AgentThread, AgentThreadSnapshot, AgentUsageSnapshot, ApprovalCategory,
+    ApprovalDecision, AutonomousGoalPauseResult, ExternalAgent, RollbackAnchorPosition,
+    SubAgentState, ToolCompletionStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -1445,6 +1445,7 @@ impl CodexAgent {
         };
         let usage = self.latest_token_usage.lock().await.clone();
         let token_count = usage.as_ref().and_then(codex_usage_total_tokens);
+        let token_count_kind = usage.as_ref().and_then(codex_usage_token_count_kind);
         let context_window = usage.as_ref().and_then(codex_usage_context_window);
         let hard_context_window = usage.as_ref().and_then(codex_usage_hard_context_window);
         let item_count = codex_request_item_count(&trace.payload);
@@ -1463,6 +1464,7 @@ impl CodexAgent {
             rollout_path,
             format: trace.format,
             token_count,
+            token_count_kind,
             context_window,
             hard_context_window,
             item_count,
@@ -1651,6 +1653,7 @@ pub(crate) fn context_snapshots_from_trace_archive(
                 rollout_path: None,
                 format: trace.format,
                 token_count: None,
+                token_count_kind: None,
                 context_window: None,
                 hard_context_window: None,
                 item_count,
@@ -2697,6 +2700,40 @@ fn codex_usage_total_tokens(value: &serde_json::Value) -> Option<u64> {
             "/total_tokens",
         ],
     )
+}
+
+fn codex_usage_component_tokens(value: &serde_json::Value) -> u64 {
+    first_u64_at(value, &["/inputTokens", "/input_tokens"])
+        .unwrap_or(0)
+        .saturating_add(
+            first_u64_at(value, &["/cachedInputTokens", "/cached_input_tokens"]).unwrap_or(0),
+        )
+        .saturating_add(first_u64_at(value, &["/outputTokens", "/output_tokens"]).unwrap_or(0))
+        .saturating_add(
+            first_u64_at(
+                value,
+                &["/reasoningOutputTokens", "/reasoning_output_tokens"],
+            )
+            .unwrap_or(0),
+        )
+}
+
+fn codex_usage_token_count_kind(value: &serde_json::Value) -> Option<AgentContextTokenCountKind> {
+    if let Some(last) = codex_usage_bucket(value, &["last", "last_token_usage"]) {
+        let total = first_u64_at(last, &["/totalTokens", "/total_tokens"])?;
+        return Some(if total > 0 && codex_usage_component_tokens(last) > 0 {
+            AgentContextTokenCountKind::BackendReported
+        } else {
+            AgentContextTokenCountKind::LocalEstimate
+        });
+    }
+
+    let total = first_u64_at(value, &["/totalTokens", "/total_tokens"])?;
+    Some(if total > 0 && codex_usage_component_tokens(value) > 0 {
+        AgentContextTokenCountKind::BackendReported
+    } else {
+        AgentContextTokenCountKind::Unknown
+    })
 }
 
 fn codex_usage_context_window(value: &serde_json::Value) -> Option<u64> {
@@ -4624,6 +4661,9 @@ impl ExternalAgent for CodexAgent {
                     token_count: is_latest
                         .then(|| usage.as_ref().and_then(codex_usage_total_tokens))
                         .flatten(),
+                    token_count_kind: is_latest
+                        .then(|| usage.as_ref().and_then(codex_usage_token_count_kind))
+                        .flatten(),
                     context_window: is_latest
                         .then(|| usage.as_ref().and_then(codex_usage_context_window))
                         .flatten(),
@@ -5556,6 +5596,10 @@ mod tests {
             "modelHardContextWindow": 272000
         });
         assert_eq!(codex_usage_total_tokens(&usage), Some(125));
+        assert_eq!(
+            codex_usage_token_count_kind(&usage),
+            Some(AgentContextTokenCountKind::BackendReported)
+        );
         assert_eq!(codex_usage_context_window(&usage), Some(128000));
         assert_eq!(codex_usage_hard_context_window(&usage), Some(272000));
         let snapshot = codex_usage_snapshot(&usage, "gpt-5.4").unwrap();
@@ -5619,6 +5663,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(codex_usage_total_tokens(&usage), Some(259545));
+        assert_eq!(
+            codex_usage_token_count_kind(&usage),
+            Some(AgentContextTokenCountKind::LocalEstimate)
+        );
         assert_eq!(codex_usage_context_window(&usage), Some(258400));
         assert_eq!(codex_usage_hard_context_window(&usage), Some(272000));
     }
