@@ -1955,30 +1955,174 @@ struct ManagedContextEditBranchTarget {
 fn rollout_user_turns(rollout_path: &Path) -> io::Result<Vec<RolloutUserTurn>> {
     let file = std::fs::File::open(rollout_path)?;
     let reader = io::BufReader::new(file);
-    let mut turns = Vec::new();
+    let mut saw_user_message_event = false;
+    let mut event_turns = Vec::new();
+    let mut fallback_turns = Vec::new();
 
     for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
         let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        if entry.get("type").and_then(|value| value.as_str()) != Some("response_item") {
-            continue;
+        match entry.get("type").and_then(|value| value.as_str()) {
+            Some("event_msg") => {
+                let Some(payload) = entry.get("payload") else {
+                    continue;
+                };
+                match payload.get("type").and_then(|value| value.as_str()) {
+                    Some("user_message") => {
+                        saw_user_message_event = true;
+                        if let Some(text) = payload
+                            .get("message")
+                            .and_then(|value| value.as_str())
+                            .filter(|text| !is_codex_injected_user_text_for_main(text))
+                        {
+                            push_rollout_user_turn(
+                                &mut event_turns,
+                                line_index.saturating_add(1),
+                                text.to_string(),
+                            );
+                        }
+                    }
+                    Some("thread_rolled_back") => {
+                        let turns_to_drop = payload
+                            .get("num_turns")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0) as u32;
+                        truncate_rollout_user_turns(&mut event_turns, turns_to_drop);
+                        truncate_rollout_user_turns(&mut fallback_turns, turns_to_drop);
+                    }
+                    _ => {}
+                }
+            }
+            Some("response_item") => {
+                let Some(payload) = entry.get("payload") else {
+                    continue;
+                };
+                if let Some(text) = codex_payload_user_text(payload) {
+                    push_rollout_user_turn(
+                        &mut fallback_turns,
+                        line_index.saturating_add(1),
+                        text,
+                    );
+                }
+            }
+            _ => {}
         }
-        let Some(payload) = entry.get("payload") else {
-            continue;
-        };
-        let Some(text) = codex_payload_user_text(payload) else {
-            continue;
-        };
-        turns.push(RolloutUserTurn {
-            index: turns.len().saturating_add(1) as u32,
-            line: line_index.saturating_add(1),
-            text,
-        });
     }
 
-    Ok(turns)
+    Ok(if saw_user_message_event {
+        event_turns
+    } else {
+        fallback_turns
+    })
+}
+
+fn push_rollout_user_turn(turns: &mut Vec<RolloutUserTurn>, line: usize, text: String) {
+    turns.push(RolloutUserTurn {
+        index: turns.len().saturating_add(1) as u32,
+        line,
+        text,
+    });
+}
+
+fn truncate_rollout_user_turns(turns: &mut Vec<RolloutUserTurn>, turns_to_drop: u32) {
+    if turns_to_drop == 0 || turns.is_empty() {
+        return;
+    }
+    let keep = turns.len().saturating_sub(turns_to_drop as usize);
+    turns.truncate(keep);
+}
+
+fn managed_context_edit_record_dirs(
+    log_dir: &Path,
+    thread_id: &str,
+    session_id: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_dir = |path: PathBuf| {
+        if !path.is_dir() {
+            return;
+        }
+        let key = std::fs::canonicalize(&path)
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .to_string();
+        if seen.insert(key) {
+            dirs.push(path);
+        }
+    };
+
+    push_dir(log_dir.to_path_buf());
+    let Some(home) = external_wrapper_index::home_from_log_dir(log_dir) else {
+        return dirs;
+    };
+
+    let ids = [Some(thread_id), session_id];
+    for id in ids
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        push_dir(home.join(".intendant").join("logs").join(id));
+        for record in external_wrapper_index::wrappers_for(&home, "codex", id) {
+            push_dir(PathBuf::from(record.log_path));
+        }
+    }
+
+    let logs_dir = home.join(".intendant").join("logs");
+    if let Ok(entries) = std::fs::read_dir(logs_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && context_rewind::records_dir(&path).is_dir() {
+                push_dir(path);
+            }
+        }
+    }
+
+    dirs
+}
+
+fn managed_context_edit_records(
+    log_dir: &Path,
+    thread_id: &str,
+    session_id: Option<&str>,
+) -> Result<Vec<context_rewind::ContextRewindRecord>, String> {
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    for dir in managed_context_edit_record_dirs(log_dir, thread_id, session_id) {
+        let mut from_dir = context_rewind::list_records(&dir).map_err(|err| {
+            format!(
+                "failed to list managed-context rewind records in {}: {err}",
+                dir.display()
+            )
+        })?;
+        from_dir.retain(|record| {
+            record.thread_id == thread_id
+                || session_id.is_some_and(|session_id| {
+                    record.session_id.as_deref() == Some(session_id)
+                })
+        });
+        for record in from_dir {
+            let key = format!(
+                "{}\0{}\0{}",
+                record.record_id,
+                record.thread_id,
+                record
+                    .recovery_rollout_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            );
+            if seen.insert(key) {
+                records.push(record);
+            }
+        }
+    }
+    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(records)
 }
 
 fn managed_context_edit_text_matches(recorded: &str, original: Option<&str>) -> bool {
@@ -1998,8 +2142,7 @@ fn resolve_managed_context_edit_branch_target(
     if user_turn_index == 0 {
         return Ok(None);
     }
-    let records = context_rewind::list_records(log_dir)
-        .map_err(|err| format!("failed to list managed-context rewind records: {err}"))?;
+    let records = managed_context_edit_records(log_dir, thread_id, session_id)?;
     let mut text_mismatches = Vec::new();
 
     for record in records {
@@ -8952,6 +9095,24 @@ mod tests {
         .unwrap();
     }
 
+    fn write_event_user_turn_rollout(path: &Path, events: &[serde_json::Value]) {
+        std::fs::write(
+            path,
+            events
+                .iter()
+                .map(|payload| {
+                    serde_json::json!({
+                        "type": "event_msg",
+                        "payload": payload
+                    })
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+    }
+
     fn write_rewind_record(
         log_dir: &Path,
         record_id: &str,
@@ -9019,6 +9180,91 @@ mod tests {
         assert_eq!(target.record_id, "rewind-new");
         assert_eq!(target.source_turn_count, 4);
         assert_eq!(target.target_turn_text, "clicked");
+    }
+
+    #[test]
+    fn rollout_user_turns_prefers_canonical_events_and_rewinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        write_event_user_turn_rollout(
+            &rollout,
+            &[
+                serde_json::json!({ "type": "user_message", "message": "first" }),
+                serde_json::json!({ "type": "user_message", "message": "continue" }),
+                serde_json::json!({ "type": "thread_rolled_back", "num_turns": 1 }),
+                serde_json::json!({ "type": "user_message", "message": "managed recovery" }),
+            ],
+        );
+
+        let turns = rollout_user_turns(&rollout).unwrap();
+
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| (turn.index, turn.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "first"), (2, "managed recovery")]
+        );
+    }
+
+    #[test]
+    fn managed_context_edit_branch_scans_historical_wrapper_logs() {
+        let home = tempfile::tempdir().unwrap();
+        let current_log_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("current-wrapper");
+        let historical_log_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("historical-wrapper");
+        std::fs::create_dir_all(&current_log_dir).unwrap();
+        std::fs::create_dir_all(&historical_log_dir).unwrap();
+
+        let old_rollout = historical_log_dir.join("old.jsonl");
+        let new_rollout = historical_log_dir.join("new.jsonl");
+        write_event_user_turn_rollout(
+            &old_rollout,
+            &[
+                serde_json::json!({ "type": "user_message", "message": "first" }),
+                serde_json::json!({ "type": "user_message", "message": "continue" }),
+            ],
+        );
+        write_event_user_turn_rollout(
+            &new_rollout,
+            &[
+                serde_json::json!({ "type": "user_message", "message": "first" }),
+                serde_json::json!({ "type": "user_message", "message": "managed recovery" }),
+            ],
+        );
+        write_rewind_record(
+            &historical_log_dir,
+            "rewind-old",
+            "2026-06-02T08:08:19Z",
+            &old_rollout,
+        );
+        write_rewind_record(
+            &historical_log_dir,
+            "rewind-new",
+            "2026-06-02T08:11:12Z",
+            &new_rollout,
+        );
+
+        let target = resolve_managed_context_edit_branch_target(
+            &current_log_dir,
+            "codex-thread",
+            Some("intendant-session"),
+            2,
+            Some("continue"),
+        )
+        .unwrap()
+        .expect("matching historical rollout");
+
+        assert_eq!(target.record_id, "rewind-old");
+        assert_eq!(target.source_turn_count, 2);
+        assert_eq!(target.target_turn_text, "continue");
     }
 
     #[test]
@@ -15980,6 +16226,7 @@ async fn run_external_agent_mode(
                 && user_turn_revisions
                     .validate_expected_revision(user_turn_index, edit_user_turn_revision)
                     .is_ok();
+            let mut archived_edit_branch_not_found = false;
             if !active_edit_revision_ok
                 && backend == external_agent::AgentBackend::Codex
                 && project::codex_managed_context_enabled(
@@ -16015,7 +16262,9 @@ async fn run_external_agent_mode(
                         );
                         continue 'outer;
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        archived_edit_branch_not_found = true;
+                    }
                     Err(message) => {
                         emit_external_session_loop_error(
                             &bus,
@@ -16051,6 +16300,13 @@ async fn run_external_agent_mode(
             if let Err(message) = user_turn_revisions
                 .validate_expected_revision(user_turn_index, edit_user_turn_revision)
             {
+                let message = if archived_edit_branch_not_found {
+                    format!(
+                        "{message}. No matching managed-context archive was found for the clicked message text; the selected turn is no longer active and cannot be safely edited from this attach wrapper."
+                    )
+                } else {
+                    message
+                };
                 emit_external_session_loop_error(
                     &bus,
                     &session_log,
