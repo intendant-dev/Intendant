@@ -1384,6 +1384,11 @@ pub enum ControlMsg {
         /// been overwritten and replaced.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_turn_revision: Option<u32>,
+        /// Original displayed text for the clicked user message. Managed
+        /// context uses this to avoid branching from the wrong archived turn
+        /// when an old turn number has been overwritten by later rewinds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original_text: Option<String>,
         text: String,
         /// Frame/upload IDs attached via the dashboard. These are resolved
         /// just like StartTask.attachments before the replacement turn is sent.
@@ -3474,6 +3479,7 @@ mod tests {
                 direct,
                 user_turn_index,
                 user_turn_revision,
+                original_text,
                 text,
                 attachments,
             } => {
@@ -3484,6 +3490,7 @@ mod tests {
                 assert_eq!(direct, Some(true));
                 assert_eq!(user_turn_index, 2);
                 assert_eq!(user_turn_revision, Some(1));
+                assert!(original_text.is_none());
                 assert_eq!(text, "replacement");
                 assert!(attachments.is_empty());
             }

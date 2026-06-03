@@ -167,6 +167,13 @@ features they lack.
   lineage prompt-cache key, so branch recovery is git-style without deliberately
   resetting cache routing. The old `allow_cache_reset` flag is accepted only for
   compatibility with older clients; it is not required for managed forks.
+  Dashboard edits of a user message that is still active use the normal precise
+  Codex rollback path. If the clicked message has been overwritten by a managed
+  rewind, Intendant treats the edit as a branch operation: it finds the newest
+  saved pre-rewind rollout that still contains that exact message text, forks that
+  rollout, rolls the child back to just before the selected user turn, and starts
+  the child with the replacement message. The original compacted thread is not
+  mutated silently.
 
 - **Rich `thread_action` ops** (`codex.rs`): `compact`, `fast`, `fork`,
   `side`/`btw` (open a side conversation) and `side-close`, `review`,
@@ -331,6 +338,12 @@ shared state (when driven over MCP) → config default → native.
   overrides, then the persisted per-session config, then the global Settings
   pane. This keeps old sessions from silently adopting a new global Codex binary
   or managed-context mode after a daemon restart.
+- **Managed historical edits are branches.** Once a managed rewind has replaced
+  old rollout context with a dense primer, the old user-turn number may no longer
+  exist in the active Codex thread. Editing or jumping to that overwritten message
+  must fork from the closest saved pre-rewind rollout containing the clicked
+  message, then roll the fork back to the selected turn. Do not send stale visible
+  turn numbers directly to the compacted active thread.
 - **Load-bearing fallback error strings.** Several trait methods return a *typed
   error* by default (`steer_turn`, `rollback_turns`, `interrupt_turn`,
   `thread_action`). `drain_external_agent_events` distinguishes "feature

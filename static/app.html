@@ -19289,7 +19289,18 @@ function markLogEntrySuperseded(entry) {
   if (!entry || entry.classList.contains('rollback-marker')) return;
   entry.classList.add('superseded');
   entry.dataset.superseded = 'true';
-  entry.querySelectorAll('.log-edit-message').forEach(btn => btn.remove());
+  const sid = String(entry.dataset.sessionId || '').trim();
+  const meta = sessionConfigMetadata(sid);
+  const keepHistoricalEdit =
+    sessionConfigSource(meta) === 'codex' && sessionConfigManagedMode(meta) === 'managed';
+  entry.querySelectorAll('.log-edit-message').forEach(btn => {
+    if (keepHistoricalEdit) {
+      btn.dataset.historical = 'true';
+      btn.title = 'Create a managed branch from this historical message';
+    } else {
+      btn.remove();
+    }
+  });
   ensureLogStateBadge(entry.querySelector('.log-content'), 'overwritten', 'overwritten');
 }
 
@@ -19340,8 +19351,11 @@ function markActivityContextRewind(sessionId, userTurnIndex, turnsRemoved) {
 }
 
 function isEditableUserMessage(c) {
-  if (c?.superseded) return false;
   const sid = String(c?.session_id || '').trim();
+  if (c?.superseded) {
+    const meta = sessionConfigMetadata(sid);
+    if (sessionConfigSource(meta) !== 'codex' || sessionConfigManagedMode(meta) !== 'managed') return false;
+  }
   const revision = Number(c?.user_turn_revision || 0);
   return !!sid && logUserTurnIndex(c) !== null && Number.isInteger(revision) && revision > 0;
 }
@@ -19352,12 +19366,15 @@ function appendEditUserMessageButton(entry, c) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = 'log-edit-message';
-  btn.title = 'Edit this user message and rerun from here';
+  btn.title = c.superseded
+    ? 'Create a managed branch from this historical message'
+    : 'Edit this user message and rerun from here';
   btn.innerHTML = '&#9998;';
   btn.dataset.sessionId = c.session_id || '';
   btn.dataset.userTurnIndex = String(c.user_turn_index);
   btn.dataset.userTurnRevision = String(c.user_turn_revision || '');
   btn.dataset.message = c.content || '';
+  if (c.superseded) btn.dataset.historical = 'true';
   entry.appendChild(btn);
 }
 
@@ -31479,8 +31496,11 @@ function renderEditMessageChip() {
     return;
   }
   const sid = shortSessionId(editMessageDraft.sessionId);
-  label.textContent = `Editing ${sid} #${editMessageDraft.userTurnIndex}`;
-  chip.title = `Replacing user turn ${editMessageDraft.userTurnIndex} in session ${editMessageDraft.sessionId}`;
+  const action = editMessageDraft.historical ? 'Branching' : 'Editing';
+  label.textContent = `${action} ${sid} #${editMessageDraft.userTurnIndex}`;
+  chip.title = editMessageDraft.historical
+    ? `Creating a managed branch from user turn ${editMessageDraft.userTurnIndex} in session ${editMessageDraft.sessionId}`
+    : `Replacing user turn ${editMessageDraft.userTurnIndex} in session ${editMessageDraft.sessionId}`;
 }
 
 function cancelEditMessageDraft() {
@@ -31489,13 +31509,14 @@ function cancelEditMessageDraft() {
   updateSubmitButtonLabel(currentPhase);
 }
 
-function beginEditUserMessage({ sessionId, userTurnIndex, userTurnRevision, text }) {
+function beginEditUserMessage({ sessionId, userTurnIndex, userTurnRevision, text, historical }) {
   if (!sessionId || !userTurnIndex || !userTurnRevision) return;
   editMessageDraft = {
     sessionId,
     userTurnIndex: Number(userTurnIndex),
     userTurnRevision: Number(userTurnRevision),
     originalText: text || '',
+    historical: !!historical,
   };
   ensureSessionWindow(sessionId);
   focusSessionWindow(sessionId);
@@ -31532,6 +31553,7 @@ function submitEditedUserMessage(input, text) {
     session_id: targetSessionId,
     user_turn_index: editMessageDraft.userTurnIndex,
     user_turn_revision: editMessageDraft.userTurnRevision,
+    original_text: editMessageDraft.originalText || '',
     text,
   };
   if (resumeContext) Object.assign(msg, resumeContext);
@@ -31559,6 +31581,7 @@ document.addEventListener('click', (e) => {
     userTurnIndex: editBtn.dataset.userTurnIndex || '',
     userTurnRevision: editBtn.dataset.userTurnRevision || '',
     text: editBtn.dataset.message || '',
+    historical: editBtn.dataset.historical === 'true',
   });
 });
 

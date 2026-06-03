@@ -123,6 +123,13 @@ The Managed activity view exposes rewind anchors, saved records, restore, and
 fork/backout actions. With the patched managed Codex binary, fork/backout starts
 a new Codex thread while inheriting the saved rollout's lineage prompt-cache key;
 there is no separate cache-reset opt-in in the dashboard.
+Editable user-message entries still perform an in-place rollback when the
+message is active in the current thread. Superseded user-message entries in a
+managed Codex session show the same edit control as a historical branch action:
+submitting the text creates a child thread from the newest saved pre-rewind
+rollout containing the clicked message, rolls that child back to the selected
+turn, and sends the replacement there. The edit chip labels this as branching so
+the active compacted session is not mistaken for the target of the mutation.
 
 ### Debug
 

@@ -618,6 +618,7 @@ impl SessionSupervisor {
                 direct,
                 user_turn_index,
                 user_turn_revision,
+                original_text,
                 text,
                 attachments,
             } => {
@@ -629,6 +630,7 @@ impl SessionSupervisor {
                     direct,
                     user_turn_index,
                     user_turn_revision,
+                    original_text,
                     text,
                     attachments,
                 )
@@ -1703,6 +1705,7 @@ impl SessionSupervisor {
         direct: Option<bool>,
         user_turn_index: u32,
         user_turn_revision: Option<u32>,
+        original_text: Option<String>,
         text: String,
         attachments: Vec<String>,
     ) {
@@ -1811,6 +1814,8 @@ impl SessionSupervisor {
             UserAttachments::from_items(resolved_attachments),
             user_turn_index,
             user_turn_revision,
+            original_text,
+            attachments,
         )
         .for_target(target_session_id);
         if target.follow_up_tx.send(msg).await.is_err() {
@@ -3933,6 +3938,7 @@ mod tests {
                 Some(true),
                 1,
                 Some(1),
+                None,
                 "replacement side prompt".to_string(),
                 Vec::new(),
             )
@@ -4212,6 +4218,7 @@ mod tests {
             direct: Some(true),
             user_turn_index: 1,
             user_turn_revision: Some(1),
+            original_text: None,
             text: "replacement".to_string(),
             attachments: Vec::new(),
         };

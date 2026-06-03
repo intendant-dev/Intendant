@@ -1936,6 +1936,113 @@ fn find_context_rewind_anchor_entry(
         .find(|anchor| anchor.item_id == requested_item_id))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RolloutUserTurn {
+    index: u32,
+    line: usize,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedContextEditBranchTarget {
+    record_id: String,
+    parent_thread_id: String,
+    recovery_rollout_path: PathBuf,
+    source_turn_count: u32,
+    target_turn_text: String,
+}
+
+fn rollout_user_turns(rollout_path: &Path) -> io::Result<Vec<RolloutUserTurn>> {
+    let file = std::fs::File::open(rollout_path)?;
+    let reader = io::BufReader::new(file);
+    let mut turns = Vec::new();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(|value| value.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
+        let Some(text) = codex_payload_user_text(payload) else {
+            continue;
+        };
+        turns.push(RolloutUserTurn {
+            index: turns.len().saturating_add(1) as u32,
+            line: line_index.saturating_add(1),
+            text,
+        });
+    }
+
+    Ok(turns)
+}
+
+fn managed_context_edit_text_matches(recorded: &str, original: Option<&str>) -> bool {
+    let Some(original) = original.map(str::trim).filter(|text| !text.is_empty()) else {
+        return true;
+    };
+    recorded.trim() == original
+}
+
+fn resolve_managed_context_edit_branch_target(
+    log_dir: &Path,
+    thread_id: &str,
+    session_id: Option<&str>,
+    user_turn_index: u32,
+    original_text: Option<&str>,
+) -> Result<Option<ManagedContextEditBranchTarget>, String> {
+    if user_turn_index == 0 {
+        return Ok(None);
+    }
+    let records = context_rewind::list_records(log_dir)
+        .map_err(|err| format!("failed to list managed-context rewind records: {err}"))?;
+    let mut text_mismatches = Vec::new();
+
+    for record in records {
+        let matches_thread = record.thread_id == thread_id
+            || session_id
+                .is_some_and(|session_id| record.session_id.as_deref() == Some(session_id));
+        if !matches_thread {
+            continue;
+        }
+        let Some(recovery_rollout_path) = record.recovery_rollout_path.as_deref() else {
+            continue;
+        };
+        let turns = rollout_user_turns(recovery_rollout_path).map_err(|err| {
+            format!(
+                "failed to inspect archived rollout for rewind record {}: {err}",
+                record.record_id
+            )
+        })?;
+        let Some(turn) = turns.get(user_turn_index.saturating_sub(1) as usize) else {
+            continue;
+        };
+        if !managed_context_edit_text_matches(&turn.text, original_text) {
+            text_mismatches.push(record.record_id.clone());
+            continue;
+        }
+        return Ok(Some(ManagedContextEditBranchTarget {
+            record_id: record.record_id,
+            parent_thread_id: record.thread_id,
+            recovery_rollout_path: recovery_rollout_path.to_path_buf(),
+            source_turn_count: turns.len() as u32,
+            target_turn_text: turn.text.clone(),
+        }));
+    }
+
+    if !text_mismatches.is_empty() {
+        return Err(format!(
+            "found archived managed-context rollout(s) containing user turn {}, but none matched the clicked message text; refusing to branch from an ambiguous stale edit",
+            user_turn_index
+        ));
+    }
+    Ok(None)
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ContextRewindAnchorCatalogEntry {
     ordinal: usize,
@@ -3233,6 +3340,98 @@ fn context_rewind_allows_cache_reset(params: &serde_json::Value) -> bool {
             .and_then(|value| value.as_bool())
             .unwrap_or(false)
     })
+}
+
+async fn fork_managed_context_edit_branch(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    thread_id: &str,
+    user_turn_index: u32,
+    original_text: Option<&str>,
+    replacement_text: String,
+    unresolved_attachment_ids: Vec<String>,
+    config: &DrainConfig<'_>,
+) -> Result<Option<String>, String> {
+    let Some(target) = resolve_managed_context_edit_branch_target(
+        config.log_dir,
+        thread_id,
+        config.session_id.as_deref(),
+        user_turn_index,
+        original_text,
+    )?
+    else {
+        return Ok(None);
+    };
+    let turns_to_drop = target
+        .source_turn_count
+        .saturating_sub(user_turn_index)
+        .saturating_add(1);
+    let name = format!(
+        "Edit turn {} from {}",
+        user_turn_index,
+        short_external_session_id(&target.parent_thread_id)
+    );
+    let child = agent
+        .fork_thread_from_rollout_path(&target.recovery_rollout_path, Some(&name))
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to fork archived managed-context rollout {} for edit: {e}",
+                target.record_id
+            )
+        })?;
+    agent
+        .rollback_thread_turns(&child.thread_id, turns_to_drop)
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to roll back edit branch {} to before user turn {}: {e}",
+                child.thread_id, user_turn_index
+            )
+        })?;
+
+    config
+        .bus
+        .send(AppEvent::ControlCommand(event::ControlMsg::RenameSession {
+            source: Some("codex".to_string()),
+            session_id: child.thread_id.clone(),
+            backend_session_id: Some(child.thread_id.clone()),
+            name: name.clone(),
+        }));
+    emit_session_relationship(
+        config.bus,
+        Some(target.parent_thread_id.as_str()),
+        &child.thread_id,
+        "managed-edit-branch",
+        false,
+    );
+    let launch = crate::session_config::read_log_dir_config(config.log_dir);
+    config
+        .bus
+        .send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+            source: "codex".to_string(),
+            session_id: child.thread_id.clone(),
+            resume_id: Some(child.thread_id.clone()),
+            project_root: Some(config.project_root.to_string_lossy().to_string()),
+            task: Some(replacement_text),
+            direct: Some(true),
+            attachments: unresolved_attachment_ids,
+            agent_command: launch.as_ref().and_then(|cfg| cfg.agent_command.clone()),
+            codex_managed_context: launch
+                .as_ref()
+                .and_then(|cfg| cfg.codex_managed_context.clone()),
+            codex_context_archive: launch
+                .as_ref()
+                .and_then(|cfg| cfg.codex_context_archive.clone()),
+        }));
+
+    Ok(Some(format!(
+        "created managed edit branch {} from rewind record {} at user turn {} (dropped {} archived turn{} before replay)",
+        child.thread_id,
+        target.record_id,
+        user_turn_index,
+        turns_to_drop,
+        if turns_to_drop == 1 { "" } else { "s" }
+    )))
 }
 
 fn thread_id_from_action_params(params: &serde_json::Value) -> Option<String> {
@@ -6506,6 +6705,8 @@ struct FollowUpMessage {
     follow_up_id: Option<String>,
     edit_user_turn_index: Option<u32>,
     edit_user_turn_revision: Option<u32>,
+    edit_original_text: Option<String>,
+    unresolved_attachment_ids: Vec<String>,
     target_session_id: Option<String>,
     managed_context_recovery_kickstart: bool,
 }
@@ -6519,6 +6720,8 @@ impl FollowUpMessage {
             follow_up_id: None,
             edit_user_turn_index: None,
             edit_user_turn_revision: None,
+            edit_original_text: None,
+            unresolved_attachment_ids: Vec::new(),
             target_session_id: None,
             managed_context_recovery_kickstart: false,
         }
@@ -6532,6 +6735,8 @@ impl FollowUpMessage {
             follow_up_id: None,
             edit_user_turn_index: None,
             edit_user_turn_revision: None,
+            edit_original_text: None,
+            unresolved_attachment_ids: Vec::new(),
             target_session_id: None,
             managed_context_recovery_kickstart: false,
         }
@@ -6545,6 +6750,8 @@ impl FollowUpMessage {
             follow_up_id: None,
             edit_user_turn_index: None,
             edit_user_turn_revision: None,
+            edit_original_text: None,
+            unresolved_attachment_ids: Vec::new(),
             target_session_id: None,
             managed_context_recovery_kickstart: false,
         }
@@ -6555,6 +6762,8 @@ impl FollowUpMessage {
         attachments: UserAttachments,
         user_turn_index: u32,
         user_turn_revision: u32,
+        original_text: Option<String>,
+        unresolved_attachment_ids: Vec<String>,
     ) -> Self {
         Self {
             text,
@@ -6563,6 +6772,8 @@ impl FollowUpMessage {
             follow_up_id: None,
             edit_user_turn_index: Some(user_turn_index),
             edit_user_turn_revision: Some(user_turn_revision),
+            edit_original_text: original_text,
+            unresolved_attachment_ids,
             target_session_id: None,
             managed_context_recovery_kickstart: false,
         }
@@ -8707,6 +8918,126 @@ mod tests {
 
         let exact = resolve_context_rewind_anchor(&path, "call_exact").expect("exact anchor");
         assert_eq!(exact.item_id, "call_exact");
+    }
+
+    fn write_user_turn_rollout(path: &Path, turns: &[&str]) {
+        let mut rows = vec![serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "<environment_context>ignored injected context</environment_context>"
+                }]
+            }
+        })];
+        rows.extend(turns.iter().map(|turn| {
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": turn }]
+                }
+            })
+        }));
+        std::fs::write(
+            path,
+            rows.into_iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_rewind_record(
+        log_dir: &Path,
+        record_id: &str,
+        created_at: &str,
+        recovery_rollout_path: &Path,
+    ) {
+        context_rewind::persist_record(
+            log_dir,
+            &context_rewind::ContextRewindRecord {
+                record_id: record_id.to_string(),
+                created_at: created_at.to_string(),
+                session_id: Some("intendant-session".to_string()),
+                thread_id: "codex-thread".to_string(),
+                item_id: "call_anchor".to_string(),
+                position: "after".to_string(),
+                reason: Some("test".to_string()),
+                primer: Some("dense".to_string()),
+                preserve: Vec::new(),
+                discard: Vec::new(),
+                artifacts: Vec::new(),
+                next_steps: Vec::new(),
+                source_rollout_path: None,
+                recovery_rollout_path: Some(recovery_rollout_path.to_path_buf()),
+                fission_snapshot: None,
+                lineage_ledger: None,
+                fission_ledger: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn managed_context_edit_branch_resolves_latest_matching_archived_rollout() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_rollout = dir.path().join("old.jsonl");
+        let new_rollout = dir.path().join("new.jsonl");
+        write_user_turn_rollout(&old_rollout, &["first", "clicked", "old tail"]);
+        write_user_turn_rollout(
+            &new_rollout,
+            &["first", "clicked", "new tail", "latest tail"],
+        );
+        write_rewind_record(
+            dir.path(),
+            "rewind-old",
+            "2026-06-01T00:00:00Z",
+            &old_rollout,
+        );
+        write_rewind_record(
+            dir.path(),
+            "rewind-new",
+            "2026-06-02T00:00:00Z",
+            &new_rollout,
+        );
+
+        let target = resolve_managed_context_edit_branch_target(
+            dir.path(),
+            "codex-thread",
+            Some("intendant-session"),
+            2,
+            Some("clicked"),
+        )
+        .unwrap()
+        .expect("matching archived rollout");
+
+        assert_eq!(target.record_id, "rewind-new");
+        assert_eq!(target.source_turn_count, 4);
+        assert_eq!(target.target_turn_text, "clicked");
+    }
+
+    #[test]
+    fn managed_context_edit_branch_rejects_text_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        write_user_turn_rollout(&rollout, &["first", "different"]);
+        write_rewind_record(dir.path(), "rewind-one", "2026-06-02T00:00:00Z", &rollout);
+
+        let err = resolve_managed_context_edit_branch_target(
+            dir.path(),
+            "codex-thread",
+            Some("intendant-session"),
+            2,
+            Some("clicked"),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("none matched the clicked message text"));
     }
 
     #[test]
@@ -15247,6 +15578,8 @@ async fn run_external_agent_mode(
         let follow_up_id = followup.follow_up_id;
         let edit_user_turn_index = followup.edit_user_turn_index;
         let edit_user_turn_revision = followup.edit_user_turn_revision;
+        let edit_original_text = followup.edit_original_text;
+        let unresolved_attachment_ids = followup.unresolved_attachment_ids;
         let target_session_id = followup.target_session_id.clone();
         let managed_context_recovery_kickstart = followup.managed_context_recovery_kickstart;
 
@@ -15530,13 +15863,15 @@ async fn run_external_agent_mode(
                         let held_user_input = !drop_original;
                         if held_user_input {
                             pending_managed_context_replays.push_back(FollowUpMessage {
-                                text: turn_text,
-                                attachments,
-                                steer_id,
+                                text: turn_text.clone(),
+                                attachments: attachments.clone(),
+                                steer_id: steer_id.clone(),
                                 follow_up_id: follow_up_id.clone(),
                                 edit_user_turn_index,
                                 edit_user_turn_revision,
-                                target_session_id,
+                                edit_original_text: edit_original_text.clone(),
+                                unresolved_attachment_ids: unresolved_attachment_ids.clone(),
+                                target_session_id: target_session_id.clone(),
                                 managed_context_recovery_kickstart: false,
                             });
                             emit_follow_up_status(
@@ -15623,7 +15958,77 @@ async fn run_external_agent_mode(
                 );
                 continue;
             }
-            if user_turn_index == 0 || user_turn_index as usize > round {
+            if user_turn_index == 0 {
+                let message = format!(
+                    "Cannot edit user turn 0 in {} session {}",
+                    backend,
+                    live_session_id
+                        .as_deref()
+                        .map(|sid| sid.chars().take(8).collect::<String>())
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+                emit_external_session_loop_error(
+                    &bus,
+                    &session_log,
+                    live_session_id.as_deref(),
+                    &backend.to_string(),
+                    message,
+                );
+                continue;
+            }
+            let active_edit_revision_ok = user_turn_index as usize <= round
+                && user_turn_revisions
+                    .validate_expected_revision(user_turn_index, edit_user_turn_revision)
+                    .is_ok();
+            if !active_edit_revision_ok
+                && backend == external_agent::AgentBackend::Codex
+                && project::codex_managed_context_enabled(
+                    &project.config.agent.codex.managed_context,
+                )
+            {
+                match fork_managed_context_edit_branch(
+                    &mut agent,
+                    &thread.thread_id,
+                    user_turn_index,
+                    edit_original_text.as_deref(),
+                    turn_text.clone(),
+                    unresolved_attachment_ids.clone(),
+                    &drain_config,
+                )
+                .await
+                {
+                    Ok(Some(message)) => {
+                        slog(&session_log, |l| l.info(&message));
+                        bus.send(AppEvent::CodexThreadActionResult {
+                            session_id: live_session_id.clone(),
+                            action: "managed-edit-branch".to_string(),
+                            success: true,
+                            message: message.clone(),
+                        });
+                        emit_follow_up_status(
+                            &bus,
+                            live_session_id.as_deref(),
+                            &follow_up_id,
+                            Some(&turn_text),
+                            "queued",
+                            Some("created managed edit branch from archived context"),
+                        );
+                        continue 'outer;
+                    }
+                    Ok(None) => {}
+                    Err(message) => {
+                        emit_external_session_loop_error(
+                            &bus,
+                            &session_log,
+                            live_session_id.as_deref(),
+                            &backend.to_string(),
+                            message,
+                        );
+                        continue;
+                    }
+                }
+            }
+            if user_turn_index as usize > round {
                 let message = format!(
                     "Cannot edit user turn {} in {} session {}; current user turn count is {}",
                     user_turn_index,

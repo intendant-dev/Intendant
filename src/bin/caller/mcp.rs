@@ -2471,6 +2471,7 @@ async fn handle_control_command_mcp(
             direct,
             user_turn_index,
             user_turn_revision,
+            original_text,
             text,
             attachments,
         } => {
@@ -2482,6 +2483,7 @@ async fn handle_control_command_mcp(
                 direct,
                 user_turn_index,
                 user_turn_revision,
+                original_text,
                 text,
                 attachments,
             }));
