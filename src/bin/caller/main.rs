@@ -1639,6 +1639,13 @@ impl ExternalContextRewindRequest {
     }
 }
 
+fn context_rewind_should_interrupt_active_turn(_request: &ExternalContextRewindRequest) -> bool {
+    // Rewind application only requires the current Codex turn to become idle.
+    // Interrupting the active turn can also cancel long-running tool sessions
+    // that have already returned a session id, such as a dev server launch.
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedContextRewindAnchor {
     item_id: String,
@@ -5598,11 +5605,21 @@ async fn drain_external_agent_events(
                                             continue;
                                         }
                                         let target = request.target_label();
-                                        let should_stop_turn = request.auto_resume;
+                                        let should_finish_naturally = request.auto_resume
+                                            && !context_rewind_should_interrupt_active_turn(
+                                                &request,
+                                            );
+                                        let should_stop_turn =
+                                            context_rewind_should_interrupt_active_turn(&request);
                                         pending_context_rewind = Some(request);
                                         let mut message = format!(
                                             "context rewind scheduled to {target}; it will apply when the current turn is idle"
                                         );
+                                        if should_finish_naturally {
+                                            message.push_str(
+                                                "; finish this turn now without starting more tools so the rewind can apply while preserving background tool sessions",
+                                            );
+                                        }
                                         if should_stop_turn {
                                             match agent.interrupt_turn().await {
                                                 Ok(()) => {
@@ -8741,6 +8758,7 @@ mod tests {
             external_agent::RollbackAnchorPosition::Before
         );
         assert!(request.auto_resume);
+        assert!(!context_rewind_should_interrupt_active_turn(&request));
 
         let primer = request
             .rendered_primer(Some("rewind-test-record"))
