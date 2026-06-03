@@ -1717,7 +1717,8 @@ impl SessionSupervisor {
             requested_id
         };
 
-        let (mut target_id, mut entry) = self.lookup_edit_route_target(&requested_id).await;
+        let (mut target_id, mut entry, mut relation) =
+            self.lookup_edit_route_target(&requested_id).await;
         if entry.is_none() {
             if let Some(attach) = edit_attach_request(source, resume_id, project_root, direct) {
                 let lookup_id = attach
@@ -1740,9 +1741,10 @@ impl SessionSupervisor {
                     false,
                 )
                 .await;
-                (target_id, entry) = self.lookup_edit_route_target(&lookup_id).await;
+                (target_id, entry, relation) = self.lookup_edit_route_target(&lookup_id).await;
                 if entry.is_none() && lookup_id != requested_id {
-                    (target_id, entry) = self.lookup_edit_route_target(&requested_id).await;
+                    (target_id, entry, relation) =
+                        self.lookup_edit_route_target(&requested_id).await;
                 }
             }
         }
@@ -1800,12 +1802,17 @@ impl SessionSupervisor {
                 short_session(&target.managed_id)
             ));
         }
+        let target_session_id = relation
+            .as_ref()
+            .filter(|rel| matches!(rel.relationship.as_str(), "side" | "subagent"))
+            .map(|_| requested_id.clone());
         let msg = FollowUpMessage::edit_user_message(
             text,
             UserAttachments::from_items(resolved_attachments),
             user_turn_index,
             user_turn_revision,
-        );
+        )
+        .for_target(target_session_id);
         if target.follow_up_tx.send(msg).await.is_err() {
             self.warn(&format!(
                 "Edit dropped: {} session {} in {} is not accepting input",
@@ -1819,8 +1826,9 @@ impl SessionSupervisor {
     async fn lookup_edit_route_target(
         &self,
         requested_id: &str,
-    ) -> (String, Option<EditRouteTarget>) {
+    ) -> (String, Option<EditRouteTarget>, Option<RelatedSession>) {
         let state = self.state.lock().await;
+        let relation = state.related_sessions.get(requested_id).cloned();
         let target_id = state
             .resolve_session_id(requested_id)
             .unwrap_or_else(|| requested_id.to_string());
@@ -1831,7 +1839,7 @@ impl SessionSupervisor {
             session_dir: s.session_dir.clone(),
             follow_up_tx: s.follow_up_tx.clone(),
         });
-        (target_id, entry)
+        (target_id, entry, relation)
     }
 
     async fn route_interrupt(&self, session_id: Option<String>) {
@@ -3889,6 +3897,54 @@ mod tests {
         let state = supervisor.state.lock().await;
         assert!(state.session_is_managed("parent-thread"));
         assert!(state.session_is_managed("side-thread"));
+    }
+
+    #[tokio::test]
+    async fn side_edit_preserves_child_target_on_parent_channel() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        let (tx, mut rx) = mpsc::channel(1);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "parent-thread".to_string(),
+                ManagedSession {
+                    session_id: "parent-thread".to_string(),
+                    source: "codex".to_string(),
+                    name: None,
+                    phase: "idle".to_string(),
+                    project_root: PathBuf::from("/tmp/project"),
+                    session_dir: PathBuf::from("/tmp/session"),
+                    follow_up_tx: tx,
+                    approval_registry: event::ApprovalRegistry::default(),
+                    instance_id: 0,
+                    finished_rx: None,
+                },
+            );
+            assert!(state.apply_related_session("parent-thread", "side-thread", "side"));
+        }
+
+        supervisor
+            .route_edit_user_message(
+                Some("side-thread".to_string()),
+                None,
+                None,
+                None,
+                Some(true),
+                1,
+                Some(1),
+                "replacement side prompt".to_string(),
+                Vec::new(),
+            )
+            .await;
+
+        let msg = rx
+            .try_recv()
+            .expect("side edit should queue on parent runner");
+        assert_eq!(msg.text, "replacement side prompt");
+        assert_eq!(msg.edit_user_turn_index, Some(1));
+        assert_eq!(msg.edit_user_turn_revision, Some(1));
+        assert_eq!(msg.target_session_id.as_deref(), Some("side-thread"));
     }
 
     #[tokio::test]
