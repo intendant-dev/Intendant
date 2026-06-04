@@ -8,7 +8,8 @@ const MAX_SESSION_ROOTS: usize = 120;
 const MAX_DISCOVERY_DIRS_PER_ROOT: usize = 12_000;
 const MAX_REPOS: usize = 256;
 const MAX_WORKTREES: usize = 1_000;
-const MAX_SIZE_ENTRIES_PER_WORKTREE: usize = 250_000;
+const MAX_SIZE_ENTRIES_PER_WORKTREE: usize = 75_000;
+const MAX_SIZE_ENTRIES_PER_SCAN: usize = 300_000;
 const DISCOVERY_DEPTH: usize = 4;
 const STALE_DAYS: i64 = 14;
 
@@ -160,6 +161,25 @@ struct TreeMeasure {
     truncated: bool,
 }
 
+#[derive(Debug)]
+struct SizeBudget {
+    remaining_entries: usize,
+}
+
+impl SizeBudget {
+    fn new(remaining_entries: usize) -> Self {
+        Self { remaining_entries }
+    }
+
+    fn take_entry(&mut self) -> bool {
+        if self.remaining_entries == 0 {
+            return false;
+        }
+        self.remaining_entries -= 1;
+        true
+    }
+}
+
 pub fn empty_scan() -> WorktreeScan {
     WorktreeScan {
         scanned_at: String::new(),
@@ -175,10 +195,20 @@ pub fn scan_worktrees(
     project_root: Option<&Path>,
     session_hints: &[WorktreeSessionHint],
 ) -> WorktreeScan {
+    scan_worktrees_with_size_budget(home, project_root, session_hints, MAX_SIZE_ENTRIES_PER_SCAN)
+}
+
+fn scan_worktrees_with_size_budget(
+    home: &Path,
+    project_root: Option<&Path>,
+    session_hints: &[WorktreeSessionHint],
+    max_size_entries: usize,
+) -> WorktreeScan {
     let mut roots = default_scan_roots(home, project_root, session_hints);
     let (repo_roots, mut errors) = discover_repos(&mut roots);
     let mut default_branches: HashMap<String, Option<String>> = HashMap::new();
     let mut raw_entries = Vec::new();
+    let mut size_budget = SizeBudget::new(max_size_entries);
 
     for repo in repo_roots.iter().take(MAX_REPOS) {
         match list_git_worktrees(repo) {
@@ -205,7 +235,7 @@ pub fn scan_worktrees(
         if !seen_worktrees.insert(path_key(&raw.path)) {
             continue;
         }
-        match enrich_worktree(raw, &default_branches, session_hints) {
+        match enrich_worktree(raw, &default_branches, session_hints, &mut size_budget) {
             Ok(entry) => worktrees.push(entry),
             Err(e) => errors.push(e),
         }
@@ -290,7 +320,8 @@ pub fn remove_worktree_if_safe(
 
     let mut default_branches = HashMap::new();
     default_branches.insert(path_key(&repo_root), default_branch_for_repo(&repo_root));
-    let entry = enrich_worktree(raw, &default_branches, session_hints)?;
+    let mut size_budget = SizeBudget::new(MAX_SIZE_ENTRIES_PER_WORKTREE);
+    let entry = enrich_worktree(raw, &default_branches, session_hints, &mut size_budget)?;
 
     if let Some(expected) = request
         .expected_head
@@ -384,6 +415,7 @@ fn default_scan_roots(
         }
     }
 
+    add(home.join("projects"), "common-projects");
     add(home.join(".intendant").join("worktrees"), "common");
     add(home.join(".codex").join("worktrees"), "common");
     add(home.join(".claude").join("worktrees"), "common");
@@ -476,6 +508,7 @@ fn enrich_worktree(
     raw: RawWorktree,
     default_branches: &HashMap<String, Option<String>>,
     session_hints: &[WorktreeSessionHint],
+    size_budget: &mut SizeBudget,
 ) -> Result<WorktreeEntry, String> {
     let repo_root = git_common_repo_root(&raw.path).unwrap_or_else(|| {
         git_repo_root(&raw.path)
@@ -537,7 +570,7 @@ fn enrich_worktree(
     .to_string();
 
     let tree = if raw.path.is_dir() && !is_main {
-        measure_tree(&raw.path)
+        measure_tree_with_budget(&raw.path, size_budget)
     } else {
         TreeMeasure::default()
     };
@@ -911,18 +944,24 @@ fn git_string(path: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+#[cfg(test)]
 fn measure_tree(root: &Path) -> TreeMeasure {
+    let mut budget = SizeBudget::new(MAX_SIZE_ENTRIES_PER_WORKTREE);
+    measure_tree_with_budget(root, &mut budget)
+}
+
+fn measure_tree_with_budget(root: &Path, size_budget: &mut SizeBudget) -> TreeMeasure {
     let mut measure = TreeMeasure::default();
     let mut stack = vec![root.to_path_buf()];
     let mut visited = 0usize;
     // Track inodes of multiply-linked files so each is counted once.
     let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
     while let Some(path) = stack.pop() {
-        visited += 1;
-        if visited >= MAX_SIZE_ENTRIES_PER_WORKTREE {
+        if visited >= MAX_SIZE_ENTRIES_PER_WORKTREE || !size_budget.take_entry() {
             measure.truncated = true;
             break;
         }
+        visited += 1;
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(meta) => meta,
             Err(_) => continue,
@@ -1244,6 +1283,74 @@ mod tests {
 
         assert_eq!(found.repo_name, "codex");
         assert!(found.detached);
+    }
+
+    #[test]
+    fn scan_discovers_sibling_project_repo_worktrees_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let current = projects.join("intendant");
+        let sibling = projects.join("codex");
+        init_repo_at(&current);
+        init_repo_at(&sibling);
+
+        let wt_parent = sibling.join(".worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let wt = wt_parent.join("minimal-lineage-upstream");
+        let wt_str = wt.to_string_lossy().to_string();
+        git(
+            &sibling,
+            &["worktree", "add", "-b", "minimal-lineage", &wt_str, "main"],
+        );
+
+        let scan = scan_worktrees(tmp.path(), Some(&current), &[]);
+        assert!(scan.roots.iter().any(|root| {
+            root.kind == "common-projects"
+                && same_path(&root.path, &projects)
+                && root.repo_count >= 1
+        }));
+        let found = scan
+            .worktrees
+            .iter()
+            .find(|entry| same_path(&entry.path, &wt))
+            .expect("sibling project worktree found");
+
+        assert_eq!(found.repo_name, "codex");
+        assert_eq!(found.branch.as_deref(), Some("minimal-lineage"));
+    }
+
+    #[test]
+    fn scan_keeps_worktrees_when_size_budget_is_exhausted() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+        let first = tmp.path().join("first-worktree");
+        let second = tmp.path().join("second-worktree");
+        let first_str = first.to_string_lossy().to_string();
+        let second_str = second.to_string_lossy().to_string();
+        git(
+            &repo,
+            &["worktree", "add", "-b", "first", &first_str, "main"],
+        );
+        git(
+            &repo,
+            &["worktree", "add", "-b", "second", &second_str, "main"],
+        );
+
+        let scan = scan_worktrees_with_size_budget(tmp.path(), Some(&repo), &[], 1);
+        let first_found = scan
+            .worktrees
+            .iter()
+            .find(|entry| same_path(&entry.path, &first))
+            .expect("first worktree found");
+        let second_found = scan
+            .worktrees
+            .iter()
+            .find(|entry| same_path(&entry.path, &second))
+            .expect("second worktree found");
+
+        assert!(first_found.size_truncated);
+        assert!(second_found.size_truncated);
+        assert!(scan.summary.truncated_sizes >= 2);
     }
 
     #[test]
