@@ -345,12 +345,7 @@ impl CodexAgent {
 
         let mut params = serde_json::Map::new();
         params.insert("includeLayers".into(), serde_json::Value::Bool(false));
-        if let Some(cwd) = self.working_dir.as_ref() {
-            params.insert(
-                "cwd".into(),
-                serde_json::Value::String(cwd.to_string_lossy().to_string()),
-            );
-        }
+        self.insert_working_dir_param(&mut params);
         let response = self
             .send_request("config/read", Some(serde_json::Value::Object(params)))
             .await?;
@@ -395,6 +390,7 @@ impl CodexAgent {
                 serde_json::Value::String(self.sandbox.clone()),
             );
         }
+        self.insert_working_dir_param(&mut obj);
         self.insert_service_tier_override(&mut obj);
         serde_json::Value::Object(obj)
     }
@@ -1192,6 +1188,38 @@ impl CodexAgent {
         self.service_tier_clear_pending = false;
     }
 
+    fn insert_working_dir_param(&self, params: &mut serde_json::Map<String, serde_json::Value>) {
+        if let Some(cwd) = self.working_dir.as_ref() {
+            params.insert(
+                "cwd".into(),
+                serde_json::Value::String(cwd.to_string_lossy().to_string()),
+            );
+        }
+    }
+
+    fn thread_lifecycle_params(&mut self) -> serde_json::Map<String, serde_json::Value> {
+        let mut params = serde_json::Map::new();
+        if let Some(ref model) = self.model {
+            params.insert("model".into(), serde_json::Value::String(model.clone()));
+        }
+        params.insert(
+            "approvalPolicy".into(),
+            serde_json::Value::String(self.approval_policy.clone()),
+        );
+        // Codex accepts `read-only`, `workspace-write`, or
+        // `danger-full-access`. Pass the configured value through verbatim
+        // so all three modes reach Codex's enforcer unchanged; the config
+        // layer is responsible for validation (see `normalize_sandbox_mode`
+        // in project.rs).
+        params.insert(
+            "sandbox".into(),
+            serde_json::Value::String(self.sandbox.clone()),
+        );
+        self.insert_working_dir_param(&mut params);
+        self.insert_service_tier_override_consuming_clear(&mut params);
+        params
+    }
+
     fn cleanup_temporary_request_trace_root(&mut self) {
         if !self.request_trace_temporary {
             return;
@@ -1502,24 +1530,12 @@ impl CodexAgent {
     }
 
     async fn resume_thread_for_followup(&mut self, thread_id: &str) -> Result<(), CallerError> {
-        let mut params = serde_json::Map::new();
+        let mut params = self.thread_lifecycle_params();
         params.insert(
             "threadId".into(),
             serde_json::Value::String(thread_id.to_string()),
         );
         params.insert("excludeTurns".into(), serde_json::Value::Bool(true));
-        params.insert(
-            "approvalPolicy".into(),
-            serde_json::Value::String(self.approval_policy.clone()),
-        );
-        params.insert(
-            "sandbox".into(),
-            serde_json::Value::String(self.sandbox.clone()),
-        );
-        if let Some(ref model) = self.model {
-            params.insert("model".into(), serde_json::Value::String(model.clone()));
-        }
-        self.insert_service_tier_override_consuming_clear(&mut params);
 
         let response = self
             .send_request("thread/resume", Some(serde_json::Value::Object(params)))
@@ -4479,24 +4495,7 @@ impl ExternalAgent for CodexAgent {
     }
 
     async fn start_thread(&mut self) -> Result<AgentThread, CallerError> {
-        let mut params = serde_json::Map::new();
-        if let Some(ref model) = self.model {
-            params.insert("model".into(), serde_json::Value::String(model.clone()));
-        }
-        params.insert(
-            "approvalPolicy".into(),
-            serde_json::Value::String(self.approval_policy.clone()),
-        );
-        // Codex accepts `read-only`, `workspace-write`, or
-        // `danger-full-access`. Pass the configured value through verbatim
-        // so all three modes reach Codex's enforcer unchanged; the config
-        // layer is responsible for validation (see `normalize_sandbox_mode`
-        // in project.rs).
-        params.insert(
-            "sandbox".into(),
-            serde_json::Value::String(self.sandbox.clone()),
-        );
-        self.insert_service_tier_override_consuming_clear(&mut params);
+        let mut params = self.thread_lifecycle_params();
 
         let method = if let Some(ref thread_id) = self.resume_session {
             params.insert(
@@ -7296,6 +7295,20 @@ mod tests {
     }
 
     #[test]
+    fn thread_lifecycle_params_include_workspace_cwd() {
+        let mut agent = test_agent();
+        agent.model = Some("gpt-5.5".to_string());
+        agent.working_dir = Some(PathBuf::from("/tmp/intendant-workspace"));
+
+        let params = agent.thread_lifecycle_params();
+
+        assert_eq!(params["model"], "gpt-5.5");
+        assert_eq!(params["approvalPolicy"], "on-request");
+        assert_eq!(params["sandbox"], "workspace-write");
+        assert_eq!(params["cwd"], "/tmp/intendant-workspace");
+    }
+
+    #[test]
     fn configured_standard_service_tier_serializes_null_once() {
         let mut agent = test_agent();
         agent.apply_configured_service_tier(Some("normal".to_string()));
@@ -7608,12 +7621,14 @@ mod tests {
     fn thread_side_fork_wire_format_is_ephemeral_with_guardrails() {
         let mut agent = test_agent();
         agent.model = Some("gpt-5.5".to_string());
+        agent.working_dir = Some(PathBuf::from("/tmp/intendant-side-workspace"));
         let params = agent.side_fork_params("thread-abc", side_developer_instructions(None));
         assert_eq!(params["threadId"], "thread-abc");
         assert_eq!(params["ephemeral"], true);
         assert_eq!(params["model"], "gpt-5.5");
         assert_eq!(params["approvalPolicy"], "on-request");
         assert_eq!(params["sandbox"], "workspace-write");
+        assert_eq!(params["cwd"], "/tmp/intendant-side-workspace");
         assert!(params["developerInstructions"]
             .as_str()
             .unwrap()
