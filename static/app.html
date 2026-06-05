@@ -10156,6 +10156,8 @@ function handleStationAction(action) {
     }
   } else if (action.type === 'open_display') {
     stationOpenDisplay(action.host_id);
+  } else if (action.type === 'thread_action') {
+    stationHandleThreadAction(action);
   } else if (action.type === 'session_action') {
     stationHandleSessionAction(action);
   } else if (action.type === 'managed_action') {
@@ -10246,6 +10248,14 @@ function stationHandleSessionAction(action) {
     return;
   }
   stationForceRouteTo('sessions', 'recent', () => openSessionDetail(session));
+}
+
+async function stationHandleThreadAction(action) {
+  const op = String(action.op || action.action || '').trim();
+  if (!op) return;
+  const sessionId = String(action.session_id || action.sessionId || '').trim();
+  const spec = sessionWindowCodexActionByOp(op) || {};
+  await runCodexThreadActionFromUi(op, spec, sessionId);
 }
 
 function stationHandleManagedAction(action) {
@@ -14151,7 +14161,7 @@ async function onControlActionBtnClick(ev) {
   if (btn.classList.contains('pending') || btn.disabled) return;
   const op = btn.dataset.codexAction;
   if (!op) return;
-  const params = await promptCodexThreadActionParams({
+  await runCodexThreadActionFromUi(op, {
     promptName: btn.dataset.promptName,
     promptSide: btn.dataset.promptSide,
     promptReview: btn.dataset.promptReview,
@@ -14161,6 +14171,20 @@ async function onControlActionBtnClick(ev) {
     confirm: btn.dataset.confirm,
     confirmTitle: btn.dataset.confirmTitle,
     confirmLabel: btn.dataset.confirmLabel,
+  });
+}
+
+async function runCodexThreadActionFromUi(op, opts = {}, sessionId = '') {
+  const params = await promptCodexThreadActionParams({
+    promptName: opts.promptName,
+    promptSide: opts.promptSide,
+    promptReview: opts.promptReview,
+    promptRename: opts.promptRename,
+    promptGoal: opts.promptGoal,
+    turns: opts.turns,
+    confirm: opts.confirm,
+    confirmTitle: opts.confirmTitle,
+    confirmLabel: opts.confirmLabel,
   });
   if (params === null) return;
   // Init is a task dispatch, not an RPC: send as a regular task instead so
@@ -14175,7 +14199,7 @@ async function onControlActionBtnClick(ev) {
     }
     return;
   }
-  if (dispatchCodexThreadAction(op, params)) {
+  if (dispatchCodexThreadAction(op, params, sessionId)) {
     markActionPending(op);
   }
 }

@@ -96,7 +96,7 @@ The web dashboard runs by default (port 8765; `--no-web` disables it) with a mul
 - **Stats** — Token usage per model with cost estimates, disk usage
 - **Terminal** — Embedded xterm.js for the server-side TUI and a live shell
 - **Video** — WebRTC display viewers with remote control, recording replay, annotations
-- **Station** — Immersive WASM control center for activity, context, managed Codex, changes, sessions, peers/displays, and launch config
+- **Station** — Immersive WASM control center for activity, context, managed Codex, changes, sessions, peers/displays, launch config, and Codex thread actions
 - **Sessions** — Browse, search, resume, and fork sessions across all backends
 - **Settings** — Provider/model, autonomy, external-agent backend, and approval rules
 - **Debug** — Diagnostics and internal state

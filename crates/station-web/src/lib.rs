@@ -2643,6 +2643,42 @@ impl StationInner {
             &nonempty(&controls.new_session_agent, "--"),
         );
         yy += 30.0;
+        self.section_title_color(x, yy, "Thread actions", C_MAUVE_CSS);
+        yy += 22.0;
+        let codex_target = if controls.session_source == "codex" {
+            controls.session_id.clone()
+        } else {
+            String::new()
+        };
+        let thread_actions = [
+            ("goal-get", "goal status", 92.0),
+            ("goal", "set goal", 72.0),
+            ("fast", "fast", 52.0),
+            ("side", "side", 52.0),
+            ("fork", "fork", 52.0),
+            ("compact", "compact", 72.0),
+        ];
+        let mut ax = x + 14.0;
+        let mut ay = yy - 14.0;
+        for (op, label, width) in thread_actions {
+            if ax + width > x + panel_w - 14.0 {
+                ax = x + 14.0;
+                ay += 25.0;
+            }
+            self.pill_at(ax, ay, width, 21.0, label, C_MAUVE_CSS);
+            self.hit_zones.push(HitZone::new(
+                ax,
+                ay,
+                width,
+                21.0,
+                HitAction::ThreadAction {
+                    op: op.to_string(),
+                    session_id: codex_target.clone(),
+                },
+            ));
+            ax += width + 8.0;
+        }
+        yy = ay + 35.0;
         self.section_title_color(x, yy, "Active session", C_PEACH_CSS);
         yy += 18.0;
         self.panel_row(x, yy, "session", &truncate(&controls.session_id, 38));
@@ -3434,6 +3470,11 @@ impl StationInner {
             HitAction::SessionAction { action, session_id } => Some(serde_json::json!({
                     "type": "session_action",
                     "action": action,
+                    "session_id": session_id,
+            })),
+            HitAction::ThreadAction { op, session_id } => Some(serde_json::json!({
+                    "type": "thread_action",
+                    "op": op,
                     "session_id": session_id,
             })),
         }
@@ -4438,6 +4479,10 @@ enum HitAction {
     },
     SessionAction {
         action: String,
+        session_id: String,
+    },
+    ThreadAction {
+        op: String,
         session_id: String,
     },
 }

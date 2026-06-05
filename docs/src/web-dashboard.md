@@ -119,8 +119,9 @@ context item, managed rows select rewind anchors or saved rewind records,
 session rows can resume or open Launch config, and the Sessions panel links
 straight to New Session and Deep Search. The Peers panel links to both the
 Network settings and the Video display surface, while the Control panel exposes
-the active external session's per-session binary and managed-context launch
-configuration when that backend supports it.
+Codex thread and goal actions through the same dispatcher used by
+**Activity → Control**, plus the active external session's per-session binary
+and managed-context launch configuration when that backend supports it.
 
 ### Sessions
 
