@@ -2282,11 +2282,16 @@ impl StationInner {
             ("refresh", "refresh", 68.0),
         ];
         let mut ax = x + 14.0;
+        let mut ay = yy - 14.0;
         for (action, label, width) in managed_actions {
-            self.pill_at(ax, yy - 14.0, width, 21.0, label, C_MAUVE_CSS);
+            if ax + width > x + panel_w - 14.0 {
+                ax = x + 14.0;
+                ay += 25.0;
+            }
+            self.pill_at(ax, ay, width, 21.0, label, C_MAUVE_CSS);
             self.hit_zones.push(HitZone::new(
                 ax,
-                yy - 14.0,
+                ay,
                 width,
                 21.0,
                 HitAction::ManagedAction {
@@ -2297,7 +2302,7 @@ impl StationInner {
             ));
             ax += width + 8.0;
         }
-        yy += 30.0;
+        yy = ay + 35.0;
         self.section_title_color(
             x,
             yy,

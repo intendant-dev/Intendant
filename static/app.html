@@ -9681,6 +9681,7 @@ const SESSION_WINDOW_RENDER_LIMIT = 600;
 const SESSION_WINDOW_PREPEND_CHUNK = 300;
 const SESSION_WINDOW_TOP_LOAD_THRESHOLD_PX = 64;
 const SESSION_WINDOW_STATE_KEY = 'intendant_session_windows_v1';
+const SESSION_WINDOW_RESTORE_LIMIT = 6;
 const SESSION_PENDING_ACTIVE_MS = 30000;
 const SESSION_METADATA_REFRESH_MS = 15000;
 const SESSION_WINDOW_GRID_HEIGHT_KEY = 'intendant_session_window_grid_height_v3';
@@ -10828,6 +10829,45 @@ function stationSessionWindowSummaries() {
   return rows;
 }
 
+function stationSessionMetadataSummaries() {
+  const rows = [];
+  for (const [sid, meta] of sessionMetadataById) {
+    if (!sid || sid === daemonSessionFullId || sessionWindowIsDetached(sid)) continue;
+    const backendSessionId = String(meta?.backendSessionId || meta?.backend_session_id || '').trim();
+    if (backendSessionId && backendSessionId !== sid) continue;
+    const source = normalizeAgentId(
+      meta?.backendSource ||
+      meta?.backend_source ||
+      meta?.source ||
+      meta?.sourceLabel ||
+      meta?.source_label ||
+      ''
+    );
+    if (!source || source === 'intendant') continue;
+    rows.push({
+      session_id: sid,
+      name: meta.name || meta.displayName || '',
+      task: meta.task || meta.initialMessage || 'Live external backend',
+      status: normalizeSessionPhase(meta.phase || '') || 'idle',
+      source,
+      source_label: meta.sourceLabel || meta.source_label || prettyAgentName(source) || source,
+      backend_source: meta.backendSource || meta.backend_source || source,
+      intendant_session_id: meta.intendantSessionId || meta.intendant_session_id || '',
+      updated_at: meta.updatedAt || meta.updated_at || '',
+      provider: meta.provider || '',
+      model: meta.model || '',
+      turns: stationNum(meta.turns),
+      total_tokens: stationNum(meta.totalTokens || meta.total_tokens),
+      prompt_tokens: stationNum(meta.promptTokens || meta.prompt_tokens),
+      completion_tokens: stationNum(meta.completionTokens || meta.completion_tokens),
+      cached_tokens: stationNum(meta.cachedTokens || meta.cached_tokens),
+      total_bytes: stationNum(meta.totalBytes || meta.total_bytes),
+      can_resume: true,
+    });
+  }
+  return rows;
+}
+
 function stationCurrentDaemonSessionSummary() {
   const sid = String(daemonSessionFullId || currentSessionFullId || foregroundSessionFullId || '').trim();
   if (!sid) return null;
@@ -10872,6 +10912,10 @@ function stationBuildSessionsSummary() {
     indexedIds.add(String(id));
   }
   for (const session of stationSessionWindowSummaries()) {
+    const id = session?.session_id || session?.resume_id || session?.backend_session_id || JSON.stringify(session);
+    if (!byId.has(String(id))) byId.set(String(id), session);
+  }
+  for (const session of stationSessionMetadataSummaries()) {
     const id = session?.session_id || session?.resume_id || session?.backend_session_id || JSON.stringify(session);
     if (!byId.has(String(id))) byId.set(String(id), session);
   }
@@ -10942,7 +10986,10 @@ function stationBuildControlsSummary() {
   const backend = controlCurrentBackend || currentExternalAgent || newSessionConfiguredAgent || '';
   const isGemini = backend === 'gemini';
   const promptTargetId = String(resolvePromptTargetSessionId() || '').trim();
-  const windowTargetId = String(currentSessionFullId || foregroundSessionFullId || '').trim();
+  const rawWindowTargetId = String(currentSessionFullId || foregroundSessionFullId || '').trim();
+  const windowTargetId = rawWindowTargetId && rawWindowTargetId !== daemonSessionFullId
+    ? rawWindowTargetId
+    : '';
   const fallbackTargetId = (!promptTargetId && !windowTargetId)
     ? stationLatestConfigurableExternalSessionId()
     : '';
@@ -10950,6 +10997,7 @@ function stationBuildControlsSummary() {
     promptTargetId ||
     windowTargetId ||
     fallbackTargetId ||
+    rawWindowTargetId ||
     daemonSessionFullId ||
     ''
   ).trim();
@@ -11002,25 +11050,55 @@ function stationBuildControlsSummary() {
 function stationLatestConfigurableExternalSessionId() {
   const seen = new Set();
   const candidates = [];
+  const pushCandidate = (id, session, meta = {}) => {
+    const sid = String(id || '').trim();
+    if (!sid || sid === daemonSessionFullId || seen.has(sid)) return;
+    const backendSessionId = String(meta?.backendSessionId || meta?.backend_session_id || '').trim();
+    if (backendSessionId && backendSessionId !== sid) return;
+    seen.add(sid);
+    const source = sessionConfigSource(meta) || normalizeAgentId(stationSessionSource(session));
+    if (!source || source === 'intendant') return;
+    const intendantId = String(
+      meta?.intendantSessionId ||
+      meta?.intendant_session_id ||
+      session?.intendant_session_id ||
+      session?.intendantSessionId ||
+      ''
+    ).trim();
+    candidates.push({
+      id: sid,
+      updated: stationSessionUpdatedMs(session),
+      liveDaemon: !!daemonSessionFullId && intendantId === daemonSessionFullId,
+    });
+  };
   const pools = [
     _cachedSessions || [],
     sessionsListCache.get(selfPeerId) || [],
     stationSessionWindowSummaries(),
+    stationSessionMetadataSummaries(),
   ];
   for (const pool of pools) {
     if (!Array.isArray(pool)) continue;
     for (const session of pool) {
       if (!session) continue;
-      const id = stationSessionId(session);
-      if (!id || id === daemonSessionFullId || seen.has(id)) continue;
-      seen.add(id);
       const meta = sessionConfigMetadata(session);
-      const source = sessionConfigSource(meta) || normalizeAgentId(stationSessionSource(session));
-      if (!source || source === 'intendant') continue;
-      candidates.push({ id, updated: stationSessionUpdatedMs(session) });
+      const sessionId = stationSessionId(session);
+      const backendId = String(meta?.backendSessionId || meta?.backend_session_id || '').trim();
+      const id = backendId || sessionId;
+      pushCandidate(id, session, meta);
     }
   }
-  candidates.sort((a, b) => b.updated - a.updated);
+  for (const [id, meta] of sessionMetadataById) {
+    if (sessionWindowIsDetached(id)) continue;
+    pushCandidate(id, {
+      session_id: id,
+      source: meta?.source || meta?.backendSource || meta?.backend_source || '',
+      source_label: meta?.sourceLabel || meta?.source_label || '',
+      intendant_session_id: meta?.intendantSessionId || meta?.intendant_session_id || '',
+      updated_at: meta?.updatedAt || meta?.updated_at || '',
+    }, meta || {});
+  }
+  candidates.sort((a, b) => Number(b.liveDaemon) - Number(a.liveDaemon) || b.updated - a.updated);
   return candidates[0]?.id || '';
 }
 
@@ -11722,6 +11800,7 @@ async function main() {
           entries: d.entries.filter(entry => !entry || entry.event !== 'context_snapshot'),
         };
         applySessionIdentitiesFromReplayEntries(filtered.entries);
+        applyExternalIdentitiesFromLogEntries(filtered.entries);
         applySessionGoalsFromReplayEntries(filtered.entries);
         resetSessionWindowsForReplay(filtered.entries);
         const wasProcessingLogReplay = processingLogReplay;
@@ -11748,6 +11827,7 @@ async function main() {
         // `session_identity` arrives before the external worker subscribes for
         // thread actions; queued detached actions wait for `session_attached`.
       }
+      applyExternalIdentityFromLogEntry(d);
       if (d.event === 'session_relationship') {
         applySessionRelationship(d);
       }
@@ -16103,6 +16183,8 @@ function setDaemonSessionId(sessionId) {
     el.textContent = shortSessionId(sid);
     el.title = sid;
   }
+  updateTaskTargetChip();
+  stationScheduleUpdate();
 }
 
 function applySessionIdentity(meta = {}) {
@@ -16140,6 +16222,8 @@ function applySessionIdentity(meta = {}) {
     updateSessionWindow(sid, next);
   }
   persistSessionWindowState();
+  updateTaskTargetChip();
+  stationScheduleUpdate();
 }
 
 function applySessionIdentitiesFromReplayEntries(entries) {
@@ -16147,6 +16231,52 @@ function applySessionIdentitiesFromReplayEntries(entries) {
   for (const entry of entries) {
     if (entry?.event !== 'session_identity') continue;
     applySessionIdentity(entry);
+  }
+}
+
+function applyExternalIdentityFromLogEntry(entry = {}) {
+  const message = String(entry?.message || entry?.data?.message || '').trim();
+  if (!message) return false;
+  let backendSessionId = '';
+  let source = '';
+  const modeMatch = message.match(/^Mode:\s*external agent\s*\(([^)]+)\).*?\bthread:\s*([^\s,]+)/i);
+  if (modeMatch) {
+    source = normalizeAgentId(modeMatch[1]);
+    backendSessionId = modeMatch[2];
+  } else {
+    const threadMatch = message.match(/^External agent thread:\s*([^\s,]+)/i);
+    if (threadMatch) backendSessionId = threadMatch[1];
+  }
+  if (!backendSessionId) return false;
+  source = source || normalizeAgentId(
+    entry?.backend_source ||
+    entry?.backendSource ||
+    entry?.source ||
+    currentExternalAgent ||
+    controlCurrentBackend ||
+    ''
+  );
+  const wrapperSessionId = String(
+    entry?.session_id ||
+    entry?.sessionId ||
+    entry?.intendant_session_id ||
+    entry?.intendantSessionId ||
+    daemonSessionFullId ||
+    ''
+  ).trim();
+  if (!wrapperSessionId || !source) return false;
+  applySessionIdentity({
+    session_id: wrapperSessionId,
+    backend_session_id: backendSessionId,
+    source,
+  });
+  return true;
+}
+
+function applyExternalIdentitiesFromLogEntries(entries) {
+  if (!Array.isArray(entries)) return;
+  for (const entry of entries) {
+    applyExternalIdentityFromLogEntry(entry);
   }
 }
 
@@ -16203,9 +16333,17 @@ function setSessionWindowDetached(sessionId, detached, reason = '') {
 }
 
 function markSessionWindowsDetachedAfterDaemonRestart() {
+  let clearedPromptTarget = false;
   for (const [sid, win] of sessionWindows) {
     if (!externalSourceForSessionWindow(sid, win)) continue;
     setSessionWindowDetached(sid, true, 'daemon restarted');
+    if (foregroundSessionFullId === sid || currentSessionFullId === sid) {
+      discardPromptTargetReference(sid);
+      clearedPromptTarget = true;
+    }
+  }
+  if (clearedPromptTarget) {
+    updateTaskTargetChip();
   }
 }
 
@@ -16522,14 +16660,37 @@ function promptTargetTerminalStatus(meta = {}) {
   return status === 'abandoned' || status === 'deleted' || status === 'missing';
 }
 
-function isPromptTargetSessionUsable(sessionId) {
+function isPromptTargetSessionUsable(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid || sid === daemonSessionFullId) return false;
   const win = sessionWindows.get(sid);
   if (!win || win.ended) return false;
+  if (sessionWindowIsDetached(sid) && !options.allowDetached) return false;
   const meta = sessionMetadataById.get(sid) || {};
   if (meta.ended || promptTargetTerminalStatus(meta)) return false;
   return true;
+}
+
+function isPromptTargetMetadataUsable(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || sid === daemonSessionFullId) return false;
+  const meta = sessionMetadataById.get(sid) || {};
+  if (meta.ended || promptTargetTerminalStatus(meta)) return false;
+  const source = normalizeAgentId(
+    meta.backendSource ||
+    meta.backend_source ||
+    meta.source ||
+    meta.sourceLabel ||
+    meta.source_label ||
+    ''
+  );
+  if (!source || source === 'intendant') return false;
+  const intendantSessionId = String(
+    meta.intendantSessionId ||
+    meta.intendant_session_id ||
+    ''
+  ).trim();
+  return !intendantSessionId || !daemonSessionFullId || intendantSessionId === daemonSessionFullId;
 }
 
 function discardPromptTargetReference(sessionId) {
@@ -16545,6 +16706,8 @@ function resolvePromptTargetSessionId() {
     if (isPromptTargetSessionUsable(sid)) return sid;
     discardPromptTargetReference(sid);
   }
+  const fallback = stationLatestConfigurableExternalSessionId();
+  if (isPromptTargetMetadataUsable(fallback)) return fallback;
   const candidates = Array.from(sessionWindows.entries())
     .filter(([id]) => isPromptTargetSessionUsable(id))
     .map(([id]) => id);
@@ -17104,10 +17267,20 @@ function persistedSessionWindowRecord(sessionId, win = null) {
 
 function persistSessionWindowState() {
   if (restoringPersistedSessionWindows) return;
-  const windows = [];
+  let windows = [];
   for (const [sid, win] of sessionWindows) {
     const record = persistedSessionWindowRecord(sid, win);
     if (record) windows.push(record);
+  }
+  if (windows.length > SESSION_WINDOW_RESTORE_LIMIT) {
+    const preferredIds = new Set([
+      resolvePromptTargetSessionId(),
+      currentSessionFullId,
+      foregroundSessionFullId,
+    ].filter(Boolean));
+    const preferred = windows.filter(record => preferredIds.has(record.session_id));
+    const rest = windows.filter(record => !preferredIds.has(record.session_id));
+    windows = [...preferred, ...rest].slice(0, SESSION_WINDOW_RESTORE_LIMIT);
   }
   try {
     if (windows.length) {
@@ -17138,7 +17311,8 @@ function restorePersistedSessionWindowsSoon(delay = 1200) {
 async function restorePersistedSessionWindows() {
   const records = readPersistedSessionWindowState()
     .map(normalizePersistedSessionWindowRecord)
-    .filter(Boolean);
+    .filter(Boolean)
+    .slice(0, SESSION_WINDOW_RESTORE_LIMIT);
   if (!records.length) return;
   restoringPersistedSessionWindows = true;
   try {
@@ -17183,36 +17357,6 @@ async function restorePersistedSessionWindow(record) {
     });
     if (!win) return;
     setSessionWindowDetached(sid, true, 'restored from browser state');
-    const detailSessionId = source !== 'intendant' && record.meta?.intendantSessionId
-      ? record.meta.intendantSessionId
-      : sid;
-    const detailSource = detailSessionId !== sid ? 'intendant' : source;
-    const params = new URLSearchParams({ source: detailSource });
-    const resp = await authedFetch(`/api/session/${encodeURIComponent(detailSessionId)}?${params.toString()}`);
-    const data = await resp.json();
-    if (!resp.ok || data?.error) return;
-    applySessionRelationshipsFromSession(data);
-    const entries = Array.isArray(data.entries) ? data.entries : [];
-    if (!entries.length) return;
-    applySessionIdentitiesFromReplayEntries(entries);
-    applySessionGoalsFromReplayEntries(entries);
-
-    resetSessionWindowLog(win);
-    appendSessionWindowHistoryBatch(
-      win,
-      entries
-        .map(entry => ({
-          record: {
-            ...entry,
-            session_id: sid,
-            level: entry.level || 'info',
-            source: entry.source || source,
-            content: entry.content || entry.summary || '',
-          },
-        }))
-        .filter(item => item.record.content || item.record.kind === 'rollback_marker'),
-      true
-    );
     updateSessionWindow(sid, {
       source,
       source_label: prettyAgentName(source),
