@@ -10237,6 +10237,10 @@ function stationFindSessionById(sessionId) {
 function stationHandleSessionAction(action) {
   const sessionId = String(action.session_id || '').trim();
   const op = String(action.action || 'detail').trim();
+  if (op === 'refresh') {
+    stationForceRouteTo('sessions', 'recent', () => loadSessions({ force: true }));
+    return;
+  }
   if (!sessionId) return;
   const session = stationFindSessionById(sessionId) || { session_id: sessionId };
   if (op === 'resume') {

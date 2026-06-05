@@ -2518,6 +2518,27 @@ impl StationInner {
             Some("deep"),
             C_MAUVE_CSS,
         );
+        yy += 25.0;
+        self.nav_button(
+            x + 14.0,
+            yy - 14.0,
+            88.0,
+            "worktrees",
+            "sessions",
+            Some("worktrees"),
+            C_BLUE_CSS,
+        );
+        self.pill_at(x + 112.0, yy - 14.0, 66.0, 21.0, "refresh", C_TEAL_CSS);
+        self.hit_zones.push(HitZone::new(
+            x + 112.0,
+            yy - 14.0,
+            66.0,
+            21.0,
+            HitAction::SessionAction {
+                action: "refresh".to_string(),
+                session_id: String::new(),
+            },
+        ));
         yy += 28.0;
         self.section_title(x, yy, "Latest session");
         yy += 18.0;
