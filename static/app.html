@@ -9985,6 +9985,52 @@ function stationUpdateSnapshot() {
   }
 }
 
+function stationLogEntryEvent(entry, index) {
+  if (!entry || entry.closest('.session-window-log, .session-detail-logs')) return null;
+  const hostId = entry.dataset.hostId || selfPeerId;
+  const sessionId = entry.dataset.sessionId || '';
+  const ts = entry.querySelector('.log-ts')?.textContent?.trim() || '';
+  const level = entry.dataset.level || [...entry.classList]
+    .find(cls => cls.startsWith('level-'))
+    ?.replace(/^level-/, '') || 'info';
+  const source = entry.querySelector('.log-level')?.textContent?.trim() || level;
+  const content = entry.querySelector('.log-content')?.textContent || entry.textContent || '';
+  const itemId = entry.dataset.itemId || '';
+  const msg = compactSessionText(content).replace(/\s+/g, ' ').trim();
+  return {
+    id: itemId || `${hostId}:${sessionId}:${ts}:${index}`,
+    hostId,
+    agentId: hostId === selfPeerId ? 'primary-agent' : 'peer-' + sanitizeStationId(hostId),
+    ts,
+    level,
+    msg: msg || source || level,
+  };
+}
+
+function stationDomLogEvents(limit = 80) {
+  const stream = document.getElementById('log-stream');
+  if (!stream) return [];
+  return Array.from(stream.querySelectorAll('.log-entry'))
+    .slice(-limit)
+    .map((entry, index) => stationLogEntryEvent(entry, index))
+    .filter(Boolean);
+}
+
+function stationActivityEvents() {
+  const events = [];
+  const seen = new Set();
+  const add = event => {
+    if (!event) return;
+    const id = String(event.id || '').trim() || `${event.hostId || selfPeerId}:${event.ts || ''}:${event.msg || ''}`;
+    if (seen.has(id)) return;
+    seen.add(id);
+    events.push(event);
+  };
+  for (const event of stationDomLogEvents()) add(event);
+  for (const event of stationLogEvents) add(event);
+  return events.slice(-80);
+}
+
 function handleStationAction(action) {
   if (!action || typeof action !== 'object') return;
   if (action.type === 'approval') {
@@ -10451,7 +10497,7 @@ function buildStationSnapshot() {
   return {
     hosts,
     agents,
-    events: stationLogEvents.slice(-80),
+    events: stationActivityEvents(),
     context,
     managed: stationBuildManagedSummary(context),
     sessions: stationBuildSessionsSummary(),
