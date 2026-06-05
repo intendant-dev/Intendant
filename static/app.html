@@ -10836,9 +10836,6 @@ function stationCurrentDaemonSessionSummary() {
     meta.backendSource ||
     meta.backend_source ||
     meta.source ||
-    controlCurrentBackend ||
-    currentExternalAgent ||
-    newSessionConfiguredAgent ||
     ''
   );
   const phase = normalizeSessionPhase(currentPhase || meta.phase || '');
@@ -10859,6 +10856,7 @@ function stationCurrentDaemonSessionSummary() {
     completion_tokens: stationNum(meta.completionTokens || meta.completion_tokens),
     cached_tokens: stationNum(meta.cachedTokens || meta.cached_tokens),
     total_bytes: stationNum(meta.totalBytes || meta.total_bytes),
+    can_resume: false,
   };
 }
 
@@ -10928,8 +10926,10 @@ function stationBuildSessionsSummary() {
     external: externalIds.size,
     totalTokens: sessions.reduce((sum, session) => sum + stationNum(session?.total_tokens), 0),
     diskBytes: sessions.reduce((sum, session) => sum + stationSessionBytes(session), 0),
-    latestTask: stationSessionTask(latest),
-    latestSource: stationSessionSource(latest),
+    latestTask: latest ? (stationSessionTask(latest) || 'Untitled session') : '',
+    latestSource: latest
+      ? (sessionConfigSource(sessionConfigMetadata(latest)) || stationSessionSource(latest) || latest?.source || 'session')
+      : '',
     latestUpdated: latest ? formatContextTimestamp(latest.updated_at || latest.updatedAt || latest.changed_at || latest.changedAt || latest.created_at || latest.createdAt) : '',
     indexStatus: sessionsLoaded
       ? 'loaded'
