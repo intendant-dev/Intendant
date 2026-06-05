@@ -10079,7 +10079,7 @@ function stationSessionWindowHistoryEvent(item, win, index) {
     session_id: sessionId,
     source,
     content,
-  }, index);
+  });
   const msg = compactSessionText(content).replace(/\s+/g, ' ').trim();
   return {
     id: eventId,
