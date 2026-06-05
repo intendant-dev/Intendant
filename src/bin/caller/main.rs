@@ -17556,6 +17556,50 @@ async fn run_external_agent_mode(
             }
             DrainOutcome::Terminated { reason, exit_code } => {
                 stats.rounds = round;
+                if backend == external_agent::AgentBackend::Codex
+                    && project::codex_managed_context_enabled(
+                        &project.config.agent.codex.managed_context,
+                    )
+                    && (managed_context_recovery_kickstart
+                        || !pending_managed_context_replays.is_empty())
+                {
+                    match agent.context_snapshot().await {
+                        Ok(Some(snapshot)) => {
+                            if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot)
+                            {
+                                let message = format!(
+                                    "Managed Codex terminated as {reason} during context recovery while backend-reported pressure remains {}/{} tokens; refusing to mark the session complete.",
+                                    pressure.used_tokens,
+                                    pressure.rewind_only_limit
+                                );
+                                slog(&session_log, |l| l.warn(&message));
+                                record_external_round_inline(
+                                    &session_log,
+                                    persist_model_responses_inline,
+                                    round,
+                                    stats.turns,
+                                );
+                                bus.send(AppEvent::RoundComplete {
+                                    session_id: live_session_id.clone(),
+                                    round,
+                                    turns_in_round: stats.turns,
+                                    native_message_count: None,
+                                });
+                                bus.send(AppEvent::LoopError(message));
+                                break;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            slog(&session_log, |l| {
+                                l.debug(&format!(
+                                    "Could not re-read Codex context pressure after managed termination: {}",
+                                    e
+                                ))
+                            });
+                        }
+                    }
+                }
                 slog(&session_log, |l| {
                     l.info(&format!(
                         "External agent terminated: {} (exit code: {:?})",

@@ -2769,7 +2769,7 @@ fn codex_usage_context_window(value: &serde_json::Value) -> Option<u64> {
 }
 
 fn codex_usage_hard_context_window(value: &serde_json::Value) -> Option<u64> {
-    first_u64_at(
+    let hard_context_window = first_u64_at(
         value,
         &[
             "/modelHardContextWindow",
@@ -2781,7 +2781,28 @@ fn codex_usage_hard_context_window(value: &serde_json::Value) -> Option<u64> {
             "/info/hardContextWindow",
             "/info/hard_context_window",
         ],
-    )
+    )?;
+    let context_window = codex_usage_context_window(value);
+    Some(normalize_codex_hard_context_window(
+        context_window,
+        hard_context_window,
+    ))
+}
+
+fn normalize_codex_hard_context_window(
+    context_window: Option<u64>,
+    hard_context_window: u64,
+) -> u64 {
+    const GPT_5_4_CODEX_SOFT_CONTEXT_WINDOW: u64 = 258_400;
+    const GPT_5_4_CODEX_HARD_CONTEXT_WINDOW: u64 = 272_000;
+
+    if context_window == Some(GPT_5_4_CODEX_SOFT_CONTEXT_WINDOW)
+        && hard_context_window <= GPT_5_4_CODEX_SOFT_CONTEXT_WINDOW
+    {
+        GPT_5_4_CODEX_HARD_CONTEXT_WINDOW
+    } else {
+        hard_context_window
+    }
 }
 
 fn codex_usage_preserving_hard_context_window(
@@ -5680,6 +5701,29 @@ mod tests {
         let merged = codex_usage_preserving_hard_context_window(collapsed, Some(&previous));
         assert_eq!(codex_usage_context_window(&merged), Some(258400));
         assert_eq!(codex_usage_hard_context_window(&merged), Some(272000));
+    }
+
+    #[test]
+    fn codex_usage_infers_known_hard_context_window_from_collapsed_first_sample() {
+        let usage = serde_json::json!({
+            "total_token_usage": {
+                "input_tokens": 258000,
+                "output_tokens": 400,
+                "total_tokens": 258400
+            },
+            "last_token_usage": {
+                "input_tokens": 258000,
+                "output_tokens": 400,
+                "total_tokens": 258400
+            },
+            "model_context_window": 258400,
+            "model_hard_context_window": 258400
+        });
+
+        assert_eq!(codex_usage_context_window(&usage), Some(258400));
+        assert_eq!(codex_usage_hard_context_window(&usage), Some(272000));
+        let snapshot = codex_usage_snapshot(&usage, "codex").unwrap();
+        assert_eq!(snapshot.hard_context_window, Some(272000));
     }
 
     #[test]
