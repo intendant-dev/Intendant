@@ -1492,7 +1492,10 @@ fn replay_jsonl_to_outbound_entries_inner(
     compact_historical_context: bool,
 ) -> Vec<serde_json::Value> {
     let (provider, model, autonomy) = scan_replay_status(contents);
-    let external_replay_session_id = external_backend_session_id_from_replay(contents);
+    let external_replay_session = external_backend_session_from_replay(contents);
+    let external_replay_session_id = external_replay_session
+        .as_ref()
+        .map(|(_, session_id)| session_id.clone());
     let wrapper_replay_session_id = replay_session_id_from_dir(log_dir);
     let replay_session_id = external_replay_session_id
         .clone()
@@ -1510,6 +1513,23 @@ fn replay_jsonl_to_outbound_entries_inner(
         "model": model,
         "autonomy": autonomy,
     }));
+    if let (Some((source, backend_session_id)), Some(wrapper_session_id)) = (
+        external_replay_session.as_ref(),
+        wrapper_replay_session_id.as_ref(),
+    ) {
+        if !source.is_empty()
+            && source != "intendant"
+            && !backend_session_id.is_empty()
+            && backend_session_id != wrapper_session_id
+        {
+            entries.push(serde_json::json!({
+                "event": "session_identity",
+                "session_id": wrapper_session_id,
+                "source": source,
+                "backend_session_id": backend_session_id,
+            }));
+        }
+    }
 
     for line in contents.lines() {
         let line = line.trim();
@@ -24007,6 +24027,54 @@ mod tests {
         assert_eq!(
             identity_row.get("session_id").and_then(|v| v.as_str()),
             Some("wrapper-session")
+        );
+        assert_eq!(
+            user_row.get("session_id").and_then(|v| v.as_str()),
+            Some(backend_id)
+        );
+    }
+
+    #[test]
+    fn test_external_wrapper_replay_synthesizes_missing_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("wrapper-session");
+        let backend_id = "019e99d5-b9b0-7ff1-a8b4-bdf0a7aade61";
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.session_started("wrapper-session", Some("external task"));
+        log.debug(&format!("External agent thread: {backend_id}"));
+        log.debug(&format!(
+            "Mode: external agent (Codex) via presence, thread: {backend_id}"
+        ));
+        log.info("[user] continue here");
+        drop(log);
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let entries = replay_jsonl_to_outbound_entries(&contents, &log_dir);
+        let identity_row = entries
+            .iter()
+            .find(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("session_identity"))
+            .expect("missing wrapper session_identity should be synthesized");
+        let user_row = entries
+            .iter()
+            .find(|entry| {
+                entry.get("event").and_then(|v| v.as_str()) == Some("log_entry")
+                    && entry.get("content").and_then(|v| v.as_str()) == Some("continue here")
+            })
+            .expect("wrapper log entry should replay");
+
+        assert_eq!(
+            identity_row.get("session_id").and_then(|v| v.as_str()),
+            Some("wrapper-session")
+        );
+        assert_eq!(
+            identity_row.get("source").and_then(|v| v.as_str()),
+            Some("codex")
+        );
+        assert_eq!(
+            identity_row
+                .get("backend_session_id")
+                .and_then(|v| v.as_str()),
+            Some(backend_id)
         );
         assert_eq!(
             user_row.get("session_id").and_then(|v| v.as_str()),

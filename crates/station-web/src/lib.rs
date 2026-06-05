@@ -1958,15 +1958,15 @@ impl StationInner {
             "bold",
         );
         self.nav_button(
-            x + panel_w - 124.0,
-            y + 10.0,
+            x + 14.0,
+            y + 38.0,
             86.0,
             "open log",
             "activity",
             Some("log"),
             C_TEAL_CSS,
         );
-        let mut yy = y + 54.0 - self.panel_scroll;
+        let mut yy = y + 82.0 - self.panel_scroll;
         self.panel_row(x, yy, "retained", &events.len().to_string());
         yy += 22.0;
         let latest = events.last();
@@ -2090,15 +2090,15 @@ impl StationInner {
             "bold",
         );
         self.nav_button(
-            x + panel_w - 132.0,
-            y + 10.0,
+            x + 14.0,
+            y + 38.0,
             94.0,
             "open context",
             "activity",
             Some("context"),
             C_BLUE_CSS,
         );
-        let mut yy = y + 54.0 - self.panel_scroll;
+        let mut yy = y + 82.0 - self.panel_scroll;
         self.panel_row(x, yy, "source", &nonempty(&ctx.source, "--"));
         yy += 22.0;
         self.panel_row(x, yy, "session", &truncate(&ctx.session_id, 42));
@@ -2117,11 +2117,16 @@ impl StationInner {
             ("reset", "reset", 54.0),
         ];
         let mut ax = x + 14.0;
+        let mut ay = yy - 14.0;
         for (action, label, width) in context_actions {
-            self.pill_at(ax, yy - 14.0, width, 21.0, label, C_BLUE_CSS);
+            if ax + width > x + panel_w - 14.0 {
+                ax = x + 14.0;
+                ay += 25.0;
+            }
+            self.pill_at(ax, ay, width, 21.0, label, C_BLUE_CSS);
             self.hit_zones.push(HitZone::new(
                 ax,
-                yy - 14.0,
+                ay,
                 width,
                 21.0,
                 HitAction::ContextAction {
@@ -2131,7 +2136,7 @@ impl StationInner {
             ));
             ax += width + 8.0;
         }
-        yy += 30.0;
+        yy = ay + 35.0;
         self.section_title(x, yy, "Token pressure");
         yy += 18.0;
         self.meter(
@@ -2214,15 +2219,15 @@ impl StationInner {
             "bold",
         );
         self.nav_button(
-            x + panel_w - 132.0,
-            y + 10.0,
+            x + 14.0,
+            y + 38.0,
             94.0,
             "open managed",
             "activity",
             Some("managed"),
             C_MAUVE_CSS,
         );
-        let mut yy = y + 54.0 - self.panel_scroll;
+        let mut yy = y + 82.0 - self.panel_scroll;
         self.panel_row(x, yy, "session", &truncate(&managed.session_id, 42));
         yy += 22.0;
         self.panel_row_color(
@@ -2359,15 +2364,15 @@ impl StationInner {
             "bold",
         );
         self.nav_button(
-            x + panel_w - 132.0,
-            y + 10.0,
+            x + 14.0,
+            y + 38.0,
             94.0,
             "open changes",
             "activity",
             Some("changes"),
             C_YELLOW_CSS,
         );
-        let mut yy = y + 54.0 - self.panel_scroll;
+        let mut yy = y + 82.0 - self.panel_scroll;
         self.panel_row_color(
             x,
             yy,
@@ -2474,15 +2479,15 @@ impl StationInner {
             "bold",
         );
         self.nav_button(
-            x + panel_w - 134.0,
-            y + 10.0,
+            x + 14.0,
+            y + 38.0,
             96.0,
             "open sessions",
             "sessions",
             Some("recent"),
             C_TEAL_CSS,
         );
-        let mut yy = y + 54.0 - self.panel_scroll;
+        let mut yy = y + 82.0 - self.panel_scroll;
         self.panel_row(x, yy, "active", &sessions.active.to_string());
         yy += 22.0;
         self.panel_row(x, yy, "external", &sessions.external.to_string());
@@ -2618,8 +2623,8 @@ impl StationInner {
             "bold",
         );
         self.nav_button(
-            x + panel_w - 202.0,
-            y + 10.0,
+            x + 14.0,
+            y + 38.0,
             78.0,
             "network",
             "settings",
@@ -2627,15 +2632,15 @@ impl StationInner {
             C_PEACH_CSS,
         );
         self.nav_button(
-            x + panel_w - 118.0,
-            y + 10.0,
+            x + 100.0,
+            y + 38.0,
             80.0,
             "open video",
             "displays",
             None,
             C_PEACH_CSS,
         );
-        let mut yy = y + 54.0 - self.panel_scroll;
+        let mut yy = y + 82.0 - self.panel_scroll;
         self.panel_row(x, yy, "peers", &hosts.len().saturating_sub(1).to_string());
         yy += 22.0;
         self.panel_row(x, yy, "streams", &displays.len().to_string());
@@ -2720,15 +2725,15 @@ impl StationInner {
             "bold",
         );
         self.nav_button(
-            x + panel_w - 132.0,
-            y + 10.0,
+            x + 14.0,
+            y + 38.0,
             94.0,
             "open control",
             "activity",
             Some("control"),
             C_MAUVE_CSS,
         );
-        let mut yy = y + 54.0 - self.panel_scroll;
+        let mut yy = y + 82.0 - self.panel_scroll;
         self.panel_row(x, yy, "model", &truncate(&controls.model, 42));
         yy += 22.0;
         self.panel_row(x, yy, "sandbox", &nonempty(&controls.sandbox, "--"));

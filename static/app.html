@@ -20157,7 +20157,20 @@ function inferSessionPhaseFromLog(c) {
       setPhase('idle');
     }
   }
-  if (phase) updateSessionWindow(sid, { phase });
+  if (phase) {
+    updateSessionWindow(sid, { phase });
+    if (
+      (phase === 'idle' || phase === 'done' || phase === 'interrupted') &&
+      (
+        sid === resolvePromptTargetSessionId() ||
+        sid === currentSessionFullId ||
+        sid === foregroundSessionFullId ||
+        (!hasActiveSessionWindowExcept(sid) && isAgentActivePhase(currentPhase))
+      )
+    ) {
+      setPhase(phase);
+    }
+  }
 }
 
 function renderInlineMarkdown(text) {
