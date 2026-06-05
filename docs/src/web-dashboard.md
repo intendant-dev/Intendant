@@ -122,9 +122,10 @@ Managed panel can jump straight into the rewind, backout/restore, or refresh
 workflows. Session rows can resume or open Launch config, and the Sessions panel
 links straight to New Session and Deep Search. The Peers panel links to both the
 Network settings and the Video display surface, while the Control panel exposes
-Codex thread and goal actions through the same dispatcher used by **Activity →
-Control**, plus the active external session's per-session binary and
-managed-context launch configuration when that backend supports it.
+the full Codex thread, goal, setup, and memory action groups through the same
+dispatcher, prompts, and confirmations used by **Activity → Control**, plus the
+active external session's per-session binary and managed-context launch
+configuration when that backend supports it.
 
 ### Sessions
 

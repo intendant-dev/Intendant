@@ -2700,34 +2700,39 @@ impl StationInner {
             String::new()
         };
         let thread_actions = [
-            ("goal-get", "goal status", 92.0),
-            ("goal", "set goal", 72.0),
+            ("new", "new", 48.0),
             ("fast", "fast", 52.0),
-            ("side", "side", 52.0),
-            ("fork", "fork", 52.0),
             ("compact", "compact", 72.0),
+            ("undo", "undo", 54.0),
+            ("fork", "fork", 52.0),
+            ("side", "side", 52.0),
+            ("review", "review", 66.0),
+            ("rename", "rename", 70.0),
         ];
-        let mut ax = x + 14.0;
-        let mut ay = yy - 14.0;
-        for (op, label, width) in thread_actions {
-            if ax + width > x + panel_w - 14.0 {
-                ax = x + 14.0;
-                ay += 25.0;
-            }
-            self.pill_at(ax, ay, width, 21.0, label, C_MAUVE_CSS);
-            self.hit_zones.push(HitZone::new(
-                ax,
-                ay,
-                width,
-                21.0,
-                HitAction::ThreadAction {
-                    op: op.to_string(),
-                    session_id: codex_target.clone(),
-                },
-            ));
-            ax += width + 8.0;
-        }
-        yy = ay + 35.0;
+        yy = self.draw_thread_action_pills(x, panel_w, yy - 14.0, &thread_actions, &codex_target);
+        self.section_title_color(x, yy, "Goal actions", C_MAUVE_CSS);
+        yy += 22.0;
+        let goal_actions = [
+            ("goal-get", "status", 62.0),
+            ("goal", "set goal", 72.0),
+            ("goal-pause", "pause", 58.0),
+            ("goal-resume", "resume", 72.0),
+            ("goal-clear", "clear", 58.0),
+        ];
+        yy = self.draw_thread_action_pills(x, panel_w, yy - 14.0, &goal_actions, &codex_target);
+        self.section_title_color(x, yy, "Setup and memory", C_MAUVE_CSS);
+        yy += 22.0;
+        let maintenance_actions = [
+            ("init", "init AGENTS", 92.0),
+            ("memory-reset", "reset memory", 104.0),
+        ];
+        yy = self.draw_thread_action_pills(
+            x,
+            panel_w,
+            yy - 14.0,
+            &maintenance_actions,
+            &codex_target,
+        );
         self.section_title_color(x, yy, "Active session", C_PEACH_CSS);
         yy += 18.0;
         self.panel_row(x, yy, "session", &truncate(&controls.session_id, 38));
@@ -2785,6 +2790,37 @@ impl StationInner {
                 "normal",
             );
         }
+    }
+
+    fn draw_thread_action_pills(
+        &mut self,
+        x: f32,
+        panel_w: f32,
+        y: f32,
+        actions: &[(&str, &str, f32)],
+        session_id: &str,
+    ) -> f32 {
+        let mut ax = x + 14.0;
+        let mut ay = y;
+        for (op, label, width) in actions.iter().copied() {
+            if ax + width > x + panel_w - 14.0 {
+                ax = x + 14.0;
+                ay += 25.0;
+            }
+            self.pill_at(ax, ay, width, 21.0, label, C_MAUVE_CSS);
+            self.hit_zones.push(HitZone::new(
+                ax,
+                ay,
+                width,
+                21.0,
+                HitAction::ThreadAction {
+                    op: op.to_string(),
+                    session_id: session_id.to_string(),
+                },
+            ));
+            ax += width + 8.0;
+        }
+        ay + 35.0
     }
 
     fn panel_row(&self, x: f32, y: f32, k: &str, v: &str) {

@@ -10254,8 +10254,26 @@ async function stationHandleThreadAction(action) {
   const op = String(action.op || action.action || '').trim();
   if (!op) return;
   const sessionId = String(action.session_id || action.sessionId || '').trim();
-  const spec = sessionWindowCodexActionByOp(op) || {};
+  const spec = stationControlThreadActionOptions(op) || sessionWindowCodexActionByOp(op) || {};
   await runCodexThreadActionFromUi(op, spec, sessionId);
+}
+
+function stationControlThreadActionOptions(op) {
+  const action = String(op || '').trim();
+  if (!action) return null;
+  const btn = document.querySelector(`.control-action-btn[data-codex-action="${stationCssEscape(action)}"]`);
+  if (!btn) return null;
+  return {
+    promptName: btn.dataset.promptName,
+    promptSide: btn.dataset.promptSide,
+    promptReview: btn.dataset.promptReview,
+    promptRename: btn.dataset.promptRename,
+    promptGoal: btn.dataset.promptGoal,
+    turns: btn.dataset.turns,
+    confirm: btn.dataset.confirm,
+    confirmTitle: btn.dataset.confirmTitle,
+    confirmLabel: btn.dataset.confirmLabel,
+  };
 }
 
 function stationHandleManagedAction(action) {
