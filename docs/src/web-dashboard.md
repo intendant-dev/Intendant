@@ -126,9 +126,10 @@ refresh, redo, and prune through **Activity → Changes**, including the existin
 prune confirmation. Session rows can resume or open Launch config, and the
 Sessions panel links straight to New Session, Deep Search, and Worktrees, with
 a refresh shortcut for the canonical session index. The Peers panel links to
-both the Network settings and the Video display surface, while the Control
-panel exposes the full Codex thread, goal, setup, and memory action groups
-through the same dispatcher, prompts, and confirmations used by
+both the Network settings and the Video display surface, and can start the
+canonical local display-share flow. The Control panel exposes the full Codex
+thread, goal, setup, and memory action groups through the same dispatcher,
+prompts, and confirmations used by
 **Activity → Control**, plus the active external session's per-session binary
 and managed-context launch configuration when that backend supports it.
 

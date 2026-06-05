@@ -2592,6 +2592,10 @@ impl StationInner {
 
     fn draw_peers_info(&mut self, x: f32, y: f32, panel_w: f32) {
         let hosts = self.snapshot.hosts.clone();
+        let local_host_id = hosts
+            .first()
+            .map(|host| host.id.clone())
+            .unwrap_or_else(|| "local".to_string());
         let displays = self
             .display_sources
             .values()
@@ -2635,6 +2639,17 @@ impl StationInner {
         self.panel_row(x, yy, "peers", &hosts.len().saturating_sub(1).to_string());
         yy += 22.0;
         self.panel_row(x, yy, "streams", &displays.len().to_string());
+        yy += 30.0;
+        self.section_title_color(x, yy, "Display controls", C_PEACH_CSS);
+        yy += 22.0;
+        self.pill_at(x + 14.0, yy - 14.0, 96.0, 21.0, "share local", C_PEACH_CSS);
+        self.hit_zones.push(HitZone::new(
+            x + 14.0,
+            yy - 14.0,
+            96.0,
+            21.0,
+            HitAction::OpenDisplay(local_host_id),
+        ));
         yy += 30.0;
         self.section_title(x, yy, "Hosts");
         yy += 18.0;
