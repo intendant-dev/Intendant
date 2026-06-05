@@ -2447,6 +2447,10 @@ body.context-focus-active {
 .log-entry:hover { background: var(--mantle); }
 .session-window .log-entry:hover { background: var(--session-window-hover-bg); }
 .concurrent-log-region .log-entry:hover { background: var(--concurrent-view-hover-bg); }
+.log-entry.station-focus {
+  background: rgba(137, 180, 250, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(137, 180, 250, 0.34);
+}
 .log-entry.level-model { border-left-color: rgba(137, 180, 250, 0.55); }
 .log-entry.level-agent { border-left-color: rgba(148, 226, 213, 0.55); }
 .log-entry.level-warn { border-left-color: rgba(249, 226, 175, 0.5); }
@@ -9985,6 +9989,23 @@ function stationUpdateSnapshot() {
   }
 }
 
+function stationLogEventId(c, fallbackIndex = '') {
+  const hostId = String(c?.host_id || c?.hostId || selfPeerId || 'local');
+  const sessionId = String(c?.session_id || c?.sessionId || '');
+  const itemId = String(c?.item_id || c?.itemId || '');
+  const explicit = String(c?.station_event_id || c?.stationEventId || c?.event_id || c?.eventId || c?.id || '');
+  if (itemId) return itemId;
+  if (explicit) return explicit;
+  const ts = String(c?.ts || c?.timestamp || '');
+  const source = String(c?.source || c?.level || c?.event || '');
+  const content = compactSessionText(c?.content || c?.msg || c?.message || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+  const parts = [hostId, sessionId, ts, source, content, String(fallbackIndex || '')].filter(Boolean);
+  return parts.length ? parts.join(':') : `event:${Date.now()}`;
+}
+
 function stationLogEntryEvent(entry, index) {
   if (!entry || entry.closest('.session-window-log, .session-detail-logs')) return null;
   const hostId = entry.dataset.hostId || selfPeerId;
@@ -9996,9 +10017,20 @@ function stationLogEntryEvent(entry, index) {
   const source = entry.querySelector('.log-level')?.textContent?.trim() || level;
   const content = entry.querySelector('.log-content')?.textContent || entry.textContent || '';
   const itemId = entry.dataset.itemId || '';
+  const eventId = stationLogEventId({
+    stationEventId: entry.dataset.stationEventId || '',
+    item_id: itemId,
+    host_id: hostId,
+    session_id: sessionId,
+    ts,
+    source,
+    content,
+  }, index);
+  if (!entry.dataset.stationEventId) entry.dataset.stationEventId = eventId;
   const msg = compactSessionText(content).replace(/\s+/g, ' ').trim();
   return {
-    id: itemId || `${hostId}:${sessionId}:${ts}:${index}`,
+    id: eventId,
+    action: 'log',
     hostId,
     agentId: hostId === selfPeerId ? 'primary-agent' : 'peer-' + sanitizeStationId(hostId),
     ts,
@@ -10051,6 +10083,8 @@ function handleStationAction(action) {
     stationHandleManagedAction(action);
   } else if (action.type === 'context_action') {
     stationHandleContextAction(action);
+  } else if (action.type === 'activity_action') {
+    stationHandleActivityAction(action);
   } else if (action.type === 'navigate') {
     const tab = String(action.tab || '').trim();
     const subtab = action.subtab ? String(action.subtab).trim() : undefined;
@@ -10176,6 +10210,31 @@ function stationHandleContextAction(action) {
     if (typeof renderContextPane === 'function') renderContextPane();
     if (typeof focusContextPart === 'function') focusContextPart(id);
   });
+}
+
+function stationCssEscape(value) {
+  const raw = String(value || '');
+  if (window.CSS && typeof CSS.escape === 'function') return CSS.escape(raw);
+  return raw.replace(/["\\]/g, '\\$&');
+}
+
+function stationHandleActivityAction(action) {
+  const op = String(action.action || '').trim();
+  const id = String(action.id || '').trim();
+  if (op !== 'log' || !id) return;
+  stationForceRouteTo('activity', 'log', () => focusActivityLogEvent(id));
+}
+
+function focusActivityLogEvent(id) {
+  const escaped = stationCssEscape(id);
+  let entry = document.querySelector(`.log-entry[data-station-event-id="${escaped}"]`);
+  if (!entry) entry = document.querySelector(`.log-entry[data-item-id="${escaped}"]`);
+  if (!entry) return;
+  entry.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  entry.classList.remove('station-focus');
+  void entry.offsetWidth;
+  entry.classList.add('station-focus');
+  setTimeout(() => entry.classList.remove('station-focus'), 1800);
 }
 
 function stationOpenDisplay(hostId) {
@@ -10821,9 +10880,10 @@ function stableStationMetric(seed, base, span) {
 
 function stationPushLogEvent(c) {
   const hostId = c.host_id || selfPeerId;
-  const eventId = `${hostId}:${stationLogEvents.length}:${Date.now()}`;
+  const eventId = stationLogEventId(c, stationLogEvents.length);
   stationLogEvents.push({
     id: eventId,
+    action: 'log',
     hostId,
     agentId: hostId === selfPeerId ? 'primary-agent' : 'peer-' + sanitizeStationId(hostId),
     ts: (c.ts || new Date().toTimeString()).substring(0, 8),
@@ -20032,6 +20092,7 @@ function createLogScaffold(c, extraClass) {
 
   const hostId = c.host_id || selfPeerId;
   entry.dataset.hostId = hostId;
+  entry.dataset.stationEventId = stationLogEventId(c);
   if (activeHostFilter && activeHostFilter !== hostId) {
     entry.classList.add('hidden-by-filter');
   }

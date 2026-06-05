@@ -1956,6 +1956,18 @@ impl StationInner {
                 .into_iter()
                 .rev()
             {
+                if ev.action == "log" && !ev.id.is_empty() {
+                    self.hit_zones.push(HitZone::new(
+                        x + 12.0,
+                        ey - 11.0,
+                        panel_w - 24.0,
+                        17.0,
+                        HitAction::ActivityAction {
+                            action: ev.action.clone(),
+                            id: ev.id.clone(),
+                        },
+                    ));
+                }
                 self.text(&ev.ts, x + 20.0, ey, 9.0, C_OVERLAY1_CSS, "normal");
                 self.text(
                     &truncate(&ev.level, 8),
@@ -3115,6 +3127,11 @@ impl StationInner {
                     "action": action,
                     "id": id,
             })),
+            HitAction::ActivityAction { action, id } => Some(serde_json::json!({
+                    "type": "activity_action",
+                    "action": action,
+                    "id": id,
+            })),
             HitAction::ManagedAction {
                 action,
                 id,
@@ -3794,6 +3811,7 @@ impl Default for StationAgent {
 #[serde(default, rename_all = "camelCase")]
 struct StationEvent {
     id: String,
+    action: String,
     host_id: String,
     agent_id: Option<String>,
     ts: String,
@@ -3805,6 +3823,7 @@ impl Default for StationEvent {
     fn default() -> Self {
         Self {
             id: "event".into(),
+            action: String::new(),
             host_id: "local".into(),
             agent_id: None,
             ts: String::new(),
@@ -4068,6 +4087,10 @@ enum HitAction {
         subtab: Option<String>,
     },
     ContextAction {
+        action: String,
+        id: String,
+    },
+    ActivityAction {
         action: String,
         id: String,
     },
