@@ -10262,7 +10262,8 @@ function stationHandleManagedAction(action) {
   const op = String(action.action || '').trim();
   const id = String(action.id || '').trim();
   const sessionId = String(action.session_id || '').trim();
-  if (!id) return;
+  const idOptionalOps = new Set(['rewind', 'backout', 'refresh']);
+  if (!id && !idOptionalOps.has(op)) return;
   stationForceRouteTo('activity', 'managed', () => {
     if (sessionId) {
       renderManagedContextSessionSelect();
@@ -10272,6 +10273,18 @@ function stationHandleManagedAction(action) {
         managedContextSessionManuallySelected = true;
         syncManagedContextActiveSession();
       }
+    }
+    if (op === 'rewind') {
+      managedContextEl('managed-context-anchor')?.focus();
+      return;
+    }
+    if (op === 'backout') {
+      managedContextEl('managed-context-record-id')?.focus();
+      return;
+    }
+    if (op === 'refresh') {
+      refreshManagedContextPane({ force: true });
+      return;
     }
     if (op === 'anchor') {
       fillManagedContextAnchor(id, sessionId);

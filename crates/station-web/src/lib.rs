@@ -2214,6 +2214,30 @@ impl StationInner {
             &format!("{} records · {} anchors", managed.records, managed.anchors),
         );
         yy += 30.0;
+        self.section_title_color(x, yy, "Actions", C_MAUVE_CSS);
+        yy += 22.0;
+        let managed_actions = [
+            ("rewind", "prepare rewind", 116.0),
+            ("backout", "backout", 72.0),
+            ("refresh", "refresh", 68.0),
+        ];
+        let mut ax = x + 14.0;
+        for (action, label, width) in managed_actions {
+            self.pill_at(ax, yy - 14.0, width, 21.0, label, C_MAUVE_CSS);
+            self.hit_zones.push(HitZone::new(
+                ax,
+                yy - 14.0,
+                width,
+                21.0,
+                HitAction::ManagedAction {
+                    action: action.to_string(),
+                    id: String::new(),
+                    session_id: managed.session_id.clone(),
+                },
+            ));
+            ax += width + 8.0;
+        }
+        yy += 30.0;
         self.section_title_color(
             x,
             yy,
