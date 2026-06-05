@@ -2462,6 +2462,33 @@ impl StationInner {
             "new task",
             &nonempty(&controls.new_session_agent, "--"),
         );
+        yy += 30.0;
+        self.section_title_color(x, yy, "Active session", C_PEACH_CSS);
+        yy += 18.0;
+        self.panel_row(x, yy, "session", &truncate(&controls.session_id, 38));
+        yy += 22.0;
+        self.panel_row(x, yy, "source", &nonempty(&controls.session_source, "--"));
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "binary",
+            &truncate(&nonempty(&controls.session_command, "--"), 42),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "managed",
+            &nonempty(&controls.session_managed_context, "--"),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "archive",
+            &nonempty(&controls.session_context_archive, "--"),
+        );
     }
 
     fn panel_row(&self, x: f32, y: f32, k: &str, v: &str) {
@@ -3665,6 +3692,11 @@ struct StationControlsSummary {
     network_access: bool,
     writable_roots: u32,
     new_session_agent: String,
+    session_id: String,
+    session_source: String,
+    session_command: String,
+    session_managed_context: String,
+    session_context_archive: String,
 }
 
 impl Default for StationControlsSummary {
@@ -3682,6 +3714,11 @@ impl Default for StationControlsSummary {
             network_access: false,
             writable_roots: 0,
             new_session_agent: String::new(),
+            session_id: String::new(),
+            session_source: String::new(),
+            session_command: String::new(),
+            session_managed_context: String::new(),
+            session_context_archive: String::new(),
         }
     }
 }

@@ -10429,6 +10429,22 @@ function stationBuildSessionsSummary() {
 function stationBuildControlsSummary() {
   const backend = controlCurrentBackend || currentExternalAgent || newSessionConfiguredAgent || '';
   const isGemini = backend === 'gemini';
+  const sessionId = String(
+    resolvePromptTargetSessionId() ||
+    currentSessionFullId ||
+    foregroundSessionFullId ||
+    daemonSessionFullId ||
+    ''
+  ).trim();
+  const sessionMeta = sessionId ? sessionConfigMetadata(sessionId) : {};
+  const rawSessionSource = sessionId ? sessionConfigSource(sessionMeta) : '';
+  const sessionSource = rawSessionSource || (sessionId ? 'intendant' : '');
+  const rawSessionCommand = sessionId ? sessionConfigCommand(sessionMeta) : '';
+  const sessionCommand = !sessionId
+    ? ''
+    : (sessionSource === 'intendant' ? 'internal' : (rawSessionCommand || 'global default'));
+  const sessionManagedContext = sessionSource === 'codex' ? sessionConfigManagedMode(sessionMeta) : '';
+  const sessionContextArchive = sessionSource === 'codex' ? sessionConfigArchiveMode(sessionMeta) : '';
   return {
     backend: backend || 'none',
     sandbox: isGemini
@@ -10450,6 +10466,11 @@ function stationBuildControlsSummary() {
       ? controlCodexConfig.writable_roots.length
       : 0,
     newSessionAgent: newSessionConfiguredAgent || backend || '',
+    sessionId,
+    sessionSource,
+    sessionCommand,
+    sessionManagedContext,
+    sessionContextArchive,
   };
 }
 
